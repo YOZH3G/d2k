@@ -59,11 +59,24 @@ static d2k_tally fragment(const char *ip,uint16_t port,int shape,d2k_hello h,uin
     fragment_calls++;
     d2k_tally t={0};t.pass=n;t.marked=1;*sent=n;return t;
 }
+static d2k_tally arm_probe(const d2k_quic_arm_question *q,const char *sni,
+    uint16_t port,uint32_t wait,uint32_t mark,int *sent) {
+    uint8_t initial[1500];size_t initial_len=0;
+    if(!sni || d2k_quic_probe_initial(sni,initial,sizeof initial,&initial_len)!=0) {
+        d2k_tally t={0};t.fail=t.err=D2K_QUIC_REPEATS;t.marked=(mark==0);*sent=0;return t;
+    }
+    d2k_hello msg={initial,initial_len};
+    if(q->frag)return d2k_quic_fragment_hook(q->addr,port,q->frag,msg,wait,mark,D2K_QUIC_REPEATS,sent);
+    if(q->ttl)return d2k_quic_ask_ttl_hook(q->addr,port,q->blob,q->blob_len,q->ttl,msg,wait,mark,D2K_QUIC_REPEATS,sent);
+    if(q->copies>1)return d2k_quic_ask_copies_hook(q->addr,port,q->blob,q->blob_len,q->copies,msg,wait,mark,D2K_QUIC_REPEATS,sent);
+    return d2k_quic_ask_hook(q->addr,port,q->blob,q->blob_len,msg,wait,mark,D2K_QUIC_REPEATS,NULL,NULL,sent,NULL);
+}
 int main(void) {
     d2k_quic_allow_local=1; d2k_quic_resolve_hook=resolve;
     d2k_quic_ask_hook=ask; d2k_quic_ask_copies_hook=copies; d2k_quic_ask_ttl_hook=copies;
     d2k_quic_ask_srcport_hook=srcport; d2k_quic_ask_split_hook=split;
     d2k_quic_fragment_hook=fragment;
+    d2k_quic_ask_arm_hook=arm_probe;
     uint8_t tb[1500],cb[1500];size_t tn=0,cn=0;
     CHECK(d2k_quic_probe_initial("target.example",tb,sizeof tb,&tn)==0);
     CHECK(d2k_quic_probe_initial("neutral.example",cb,sizeof cb,&cn)==0);

@@ -31,25 +31,7 @@ typedef struct {
 static d2k_tally original_probe(const d2k_quic_arm_question *q, void *user, int *sent) {
     original_wire *w=user;
     const char *sni=q->control?w->control_sni:w->target_sni;
-    uint8_t initial[D2K_QW_MAX_DGRAM]; size_t initial_len=0;
-    if(!sni[0] || d2k_quic_probe_initial(sni,initial,sizeof initial,&initial_len)!=0) {
-        d2k_tally failed={0};
-        failed.err=failed.fail=D2K_QUIC_REPEATS;
-        failed.marked=1;
-        if(sent)*sent=0;
-        return failed; /* no fresh donor Initial means this question was not measured */
-    }
-    d2k_hello msg={initial,initial_len};
-    if(q->frag) {
-        return d2k_quic_fragment_hook(q->addr,w->port,q->frag,msg,
-            w->wait_ms,w->mark,D2K_QUIC_REPEATS,sent);
-    }
-    if(q->ttl) return d2k_quic_ask_ttl_hook(q->addr,w->port,q->blob,q->blob_len,q->ttl,
-        msg,w->wait_ms,w->mark,D2K_QUIC_REPEATS,sent);
-    if(q->copies>1) return d2k_quic_ask_copies_hook(q->addr,w->port,q->blob,q->blob_len,
-        q->copies,msg,w->wait_ms,w->mark,D2K_QUIC_REPEATS,sent);
-    return d2k_quic_ask_hook(q->addr,w->port,q->blob,q->blob_len,msg,w->wait_ms,w->mark,
-        D2K_QUIC_REPEATS,NULL,NULL,sent,NULL);
+    return d2k_quic_ask_arm_hook(q,sni,w->port,w->wait_ms,w->mark,sent);
 }
 
 d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,

@@ -64,9 +64,9 @@ TESTHDR = test_stand.h
 # по себе, а настоящий бинарник d2kask, запущенный подпроцессом, плюс
 # настоящий ctlprobe (как и test_compose/test_link) — но stand ей тоже нужен
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
-TESTS   = test_stun test_voice test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_arms test_ipfrag test_quic_original_arms test_quic_run_order test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify test_measured
+TESTS   = test_stun test_voice test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_fresh_repeats test_quic_arms test_ipfrag test_quic_original_arms test_quic_run_order test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify test_measured
 
-.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify FORCE
+.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify FORCE
 
 all: meas.o verdict.o crypto.o quic.o quicprobe.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o match.o compose.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o quicconn.o quicwire.o h3.o d2kask d2kc d2kvoice
 
@@ -384,6 +384,12 @@ test-quichello: test_quichello
 test-quicprobe: test_quicprobe
 	./test_quicprobe
 
+test_quic_fresh_repeats: test_quic_fresh_repeats.c props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_fresh_repeats.c props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o $(TEST_LDFLAGS)
+
+test-quic-fresh-repeats: test_quic_fresh_repeats
+	./test_quic_fresh_repeats
+
 test-quic-arms: test_quic_arms
 	./test_quic_arms
 
@@ -419,7 +425,7 @@ test-link: test_link ../datapath/ctlprobe
 test-d2kask: test_d2kask d2kask ../datapath/ctlprobe
 	./test_d2kask
 
-check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify test-measured
+check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify test-measured
 
 test_measured: test_measured.c compose.o plantlv.o hello.o meas.o link.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h ../datapath/wire.c ../datapath/include/d2k_session.h
 	$(CC) $(CFLAGS) -o $@ test_measured.c compose.o plantlv.o hello.o meas.o link.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
@@ -523,7 +529,7 @@ cross: hello_profiles.inc
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quicprobe-mipsel \
 		test_quicprobe.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c -lpthread || exit 1
 	@echo "== original QUIC arm regressions целиком =="
-	@set -e; for t in test_ipfrag test_quic_original_arms test_quic_run_order; do \
+	@set -e; for t in test_ipfrag test_quic_original_arms test_quic_run_order test_quic_fresh_repeats; do \
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-$$t-a64 $$t.c $(SRC) -lpthread; \
 		$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-$$t-mipsel $$t.c $(SRC) -lpthread; \
 	done

@@ -24,6 +24,13 @@ typedef struct {
     void *limit_user;
 } d2k_quic_arm_context;
 
+/* Runtime transport for one original askArms question. It receives the SNI
+ * and question shape so the wire layer can rebuild a fresh donor Initial for
+ * each parallel repeat without changing snapshot-based probes elsewhere. */
+typedef d2k_tally (*d2k_quic_ask_arm_fn)(const d2k_quic_arm_question *,
+    const char *, uint16_t, uint32_t, uint32_t, int *);
+extern d2k_quic_ask_arm_fn d2k_quic_ask_arm_hook;
+
 d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *ctx);
 /* Immutable instrument data; NULL is not replaced with a similar packet. */
 const uint8_t *d2k_quic_original_blob(size_t index, size_t *len, const char **name);

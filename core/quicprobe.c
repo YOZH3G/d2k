@@ -961,7 +961,7 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                               d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                               int repeats, uint32_t *rtt_ms_out, int *refused_out,
                               int *sent_out, uint8_t *ttl_in_out, qp_verify_fn verify,
-                              const d2k_ipfrag_plan *fragment) {
+                              const d2k_ipfrag_plan *fragment, const char *fresh_sni) {
     d2k_tally t;
     memset(&t, 0, sizeof t);
     t.marked = 1;
@@ -1029,16 +1029,16 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
      * честно объявляло «измерению верить нельзя» ВСЕГДА.
      *
      * Ответ — не ослабить порог, а перестать слать один и тот же пакет
-     * одного и того же соединения: идентификатор назначения RFC 9000 §7.2
-     * велит выбирать заново на КАЖДОЕ соединение, и три попытки — это три
-     * соединения. Содержимое приветствия при этом не меняется ни на байт
-     * (d2k_quic_hello_recid): форма — то, что коробка сличает, и трогать её
-     * нельзя.
+     * одного и того же соединения. Для снимочных вопросов обновляем только
+     * CID через d2k_quic_hello_recid: там форма приветствия должна остаться
+     * прежней. Оригинальный askArms задаёт fresh_sni и, как donor
+     * arms.go:ask -> measure -> buildInitial, строит полное новое приветствие
+     * отдельно на каждый повтор. Этот режим локален для arm-hook.
      *
-     * Не вышло пересобрать (не Initial, чужая версия — так выглядит зонд
-     * согласования версий, склеенная датаграмма) — шлём снимок как есть.
-     * Это ровно прежнее поведение, и там оно верно: у тех вопросов
-     * состояния соединения на сервере не заводится. */
+     * Не удалось обновить CID (не Initial, чужая версия, склеенная
+     * датаграмма) — обычные вопросы сохраняют прежний fallback: снимок как
+     * есть. arm-hook такого fallback не имеет: не собрался свежий Initial —
+     * вопрос не отправляется. */
     static const size_t COPY_CAP = D2K_QW_MAX_DGRAM;
     uint8_t copies[D2K_QUIC_MAX_ADDRS][D2K_QW_MAX_DGRAM];
     uint8_t tails[D2K_QUIC_MAX_ADDRS][D2K_QW_MAX_DGRAM];
@@ -1049,7 +1049,14 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
         size_t clen = 0, tlen = 0;
         pfx[i] = prefix;
         pfx_len[i] = prefix_len;
-        if (split_sni) {
+        if (fresh_sni && fresh_sni[0]) {
+            if (d2k_quic_probe_initial(fresh_sni, copies[i], COPY_CAP, &clen) == 0) {
+                sent[i].bytes = copies[i];
+                sent[i].len = clen;
+            } else {
+                sent[i] = (d2k_hello){NULL,0};
+            }
+        } else if (split_sni) {
             /* ПАРА ДАТАГРАММ СОБИРАЕТСЯ НА КАЖДУЮ ПОПЫТКУ ЦЕЛИКОМ, а не
                пересобирается идентификатором, как одиночный пакет: обе
                половины обязаны нести ОДИН DCID (иначе сервер увидит два
@@ -1231,9 +1238,42 @@ static d2k_tally quic_fragment(const char *addr,uint16_t port,int shape,d2k_hell
         return t;
     }
     return quic_ask_ex(addr,port,NULL,0,0,1,0,NULL,msg,wait_ms,mark,repeats,
-        NULL,NULL,sent_out,NULL,qp_verify_aead,&p);
+        NULL,NULL,sent_out,NULL,qp_verify_aead,&p,NULL);
 }
 d2k_quic_fragment_fn d2k_quic_fragment_hook=quic_fragment;
+
+static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
+    uint16_t port, uint32_t wait_ms, uint32_t mark, int *sent_out) {
+    d2k_tally bad={0};
+    bad.marked=(mark==0);
+    bad.fail=bad.err=D2K_QUIC_REPEATS;
+    if(!q || !q->addr || !sni || !sni[0]) {
+        if(sent_out)*sent_out=0;
+        return bad;
+    }
+    d2k_ipfrag_plan plan;
+    const d2k_ipfrag_plan *fragment=NULL;
+    const uint8_t *prefix=q->blob;
+    size_t prefix_len=q->blob_len;
+    int ttl=q->ttl;
+    int copies=q->copies>1?q->copies:1;
+    if(q->frag) {
+        if(q->blob_len || d2k_ipfrag_shape(q->frag,&plan)!=0) {
+            if(sent_out)*sent_out=0;
+            return bad;
+        }
+        prefix=NULL;
+        prefix_len=0;
+        ttl=0;
+        copies=1;
+        fragment=&plan;
+    }
+    d2k_hello no_snapshot={NULL,0};
+    return quic_ask_ex(q->addr,port,prefix,prefix_len,ttl,copies,0,NULL,
+        no_snapshot,wait_ms,mark,D2K_QUIC_REPEATS,NULL,NULL,sent_out,NULL,
+        qp_verify_aead,fragment,sni);
+}
+d2k_quic_ask_arm_fn d2k_quic_ask_arm_hook=quic_ask_arm;
 
 static d2k_tally quic_ask(const char *addr, uint16_t port,
                            const uint8_t *prefix, size_t prefix_len,
@@ -1241,7 +1281,7 @@ static d2k_tally quic_ask(const char *addr, uint16_t port,
                            int repeats, uint32_t *rtt_ms_out, int *refused_out, int *sent_out,
                            uint8_t *ttl_in_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, 0, 1, 0, NULL, msg, wait_ms, mark,
-                        repeats, rtt_ms_out, refused_out, sent_out, ttl_in_out, qp_verify_aead, NULL);
+                        repeats, rtt_ms_out, refused_out, sent_out, ttl_in_out, qp_verify_aead, NULL,NULL);
 }
 
 /* Живость через согласование версии — та же дисциплина ПОВТОРОВ, метки и
@@ -1266,7 +1306,7 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
     msg.bytes = (tlen > 0) ? trig_buf : NULL;
     msg.len = tlen;
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, NULL, msg, wait_ms, mark,
-                        D2K_QUIC_REPEATS, NULL, NULL, sent_out, NULL, qp_verify_vn, NULL);
+                        D2K_QUIC_REPEATS, NULL, NULL, sent_out, NULL, qp_verify_vn, NULL,NULL);
 }
 
 /* Задача 6: как quic_ask (умолчание d2k_quic_ask_hook), но с TTL приманки —
@@ -1278,7 +1318,7 @@ static d2k_tally quic_ask_ttl(const char *addr, uint16_t port, const uint8_t *pr
                                int prefix_ttl, d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, prefix_ttl, 1, 0, NULL, msg, wait_ms,
-                        mark, repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL);
+                        mark, repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL);
 }
 d2k_quic_ask_ttl_fn d2k_quic_ask_ttl_hook = quic_ask_ttl;
 
@@ -1296,7 +1336,7 @@ static d2k_tally quic_ask_copies(const char *addr, uint16_t port,
                                   int copies, d2k_hello msg, uint32_t wait_ms,
                                   uint32_t mark, int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, 0, copies, 0, NULL, msg, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL);
 }
 d2k_quic_ask_copies_fn d2k_quic_ask_copies_hook = quic_ask_copies;
 
@@ -1307,7 +1347,7 @@ static d2k_tally quic_ask_srcport(const char *addr, uint16_t port, int src_port,
                                    d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                    int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, src_port, NULL, msg, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL);
 }
 d2k_quic_ask_srcport_fn d2k_quic_ask_srcport_hook = quic_ask_srcport;
 
@@ -1318,7 +1358,7 @@ static d2k_tally quic_ask_split(const char *addr, uint16_t port, d2k_hello snap,
                                  const char *sni, uint32_t wait_ms, uint32_t mark,
                                  int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, sni, snap, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL);
 }
 d2k_quic_ask_split_fn d2k_quic_ask_split_hook = quic_ask_split;
 
