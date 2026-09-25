@@ -45,6 +45,7 @@
 #include <pthread.h>
 
 #include "d2k_compose_internal.h"
+#include "d2k_plantlv.h"
 #include "d2k_quichello.h"
 #include "d2k_sched.h"
 #include "d2k_quic.h"
@@ -72,6 +73,7 @@ static int fails;
 /* --- подменённые оракулы ------------------------------------------------- */
 
 static int tcp_calls, quic_calls;
+static int voice_calls;
 static d2k_verdict tcp_answer = D2K_V_OPAQUE;
 static int tcp_owns_search;
 static int tcp_found_arm;
@@ -81,6 +83,24 @@ static char tcp_last_ip[64], quic_last_sni[256];
 static pthread_mutex_t snapshot_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t snapshot_cv = PTHREAD_COND_INITIALIZER;
 static int snapshot_enabled, snapshot_entered, snapshot_release, snapshot_ok;
+
+static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
+    d2k_voice_res r;
+    memset(&r, 0, sizeof r);
+    voice_calls++;
+    if (!opt || opt->mark != 0x2d || !opt->flow_port_a || !opt->flow_port_b) { return r; }
+    r.verdict = D2K_VOICE_BLOCKED;
+    r.ip = opt->flow_ip_a;
+    r.port = opt->flow_port_a;
+    r.client_ip = opt->flow_ip_b;
+    r.client_port = opt->flow_port_b;
+    r.marked = 1;
+    snprintf(r.fake_arm, sizeof r.fake_arm, "active_discord_udp");
+    memcpy(r.arm_bytes, "\xa1\xb2\xc3\xd4", 4);
+    r.arm_len = 4;
+    r.arm_copies = 6;
+    return r;
+}
 
 /* Сколько измеритель ждёт просьбы бросить, прежде чем сдаться сам. Пять
    секунд — не «достаточно», а «заведомо больше», чем позволено ждать циклу:
@@ -524,6 +544,14 @@ static void skip_ahead(d2k_sched *s, int64_t ms) {
 static int sent_has(const char *needle) {
     size_t n = strlen(needle);
     if (n == 0 || sent_len < n) { return 0; }
+    for (size_t i = 0; i + n <= sent_len; i++) {
+        if (memcmp(sentbuf + i, needle, n) == 0) { return 1; }
+    }
+    return 0;
+}
+
+static int sent_has_bytes(const uint8_t *needle, size_t n) {
+    if (!needle || n == 0 || sent_len < n) { return 0; }
     for (size_t i = 0; i + n <= sent_len; i++) {
         if (memcmp(sentbuf + i, needle, n) == 0) { return 1; }
     }
@@ -3195,14 +3223,16 @@ int main(void) {
         g_server_port = saved_port;
     }
 
-    /* --- ГОЛОС: ИСПЫТАНИЕ НА САМОМ РАЗГОВОРЕ -------------------------------
-       Зонда у голоса нет: точка Дискорда молчит посторонним (поле 17.09), и
-       ни замер, ни подтверждение своим обращением невозможны. Единственный
-       оракул — ответ сервера по потоку САМОГО клиента. Поэтому кандидат
-       ставится на класс голоса для всех потоков, а решает следующий поток
-       разговора. Обычный UDP-ответ — НЕ подтверждение разговора. */
+    /* --- ГОЛОС: C-ЗАМЕР И ВРЕМЕННЫЙ PLAN ----------------------------------
+       Сам голосовой сервер молчит на посторонние пробы (поле 17.09), поэтому
+       подтверждать обход ими нельзя. Измеритель берёт цель из живого потока,
+       спрашивает публичный STUN-контроль и подбирает arm по исходному списку.
+       Plan ставится на voice-класс, а последующий ответ самого разговора
+       остаётся только наблюдением: каталог от него не пополняется. */
     {
         uint16_t saved_port = g_server_port;
+        d2k_sched_voice_fn saved_voice_hook = d2k_sched_voice_hook;
+        d2k_sched_voice_hook = stub_voice;
         g_server_port = 50004;
         d2k_catalog cV;
         memset(&cV, 0, sizeof cV);
@@ -3211,8 +3241,13 @@ int main(void) {
         CHECK(s != NULL, "планировщик для голоса не завёлся");
         if (s) {
             d2k_sched_set_say(s, collect_say, NULL);
+            const uint8_t expected_arm[] = {0xa1, 0xb2, 0xc3, 0xd4};
+            const uint8_t expected_fake[] = {
+                0x01, 0x01, 0x00, 0x0a, 0x00, 0x01, 0x00, 0x01,
+                0x06, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
             tcp_calls = vol_calls = 0;
-            ver_calls = 0;
+            ver_calls = voice_calls = 0;
             forget_sent();
             d2k_ev h = ev_hello(17, 40200, D2K_LINK_VOICE_CLASS);
             d2k_sched_event(s, &h);
@@ -3220,17 +3255,33 @@ int main(void) {
             d2k_sched_event(s, &su);
             spin(s, 20);
             drain();
-            CHECK(said("на самом разговоре"),
-                  "голос не ушёл на испытание разговором");
+            CHECK(voice_calls == 1, "scheduler не вызвал C voice-измеритель");
+            CHECK(sent_has_bytes(expected_arm, sizeof expected_arm) &&
+                  sent_has_bytes(expected_fake, sizeof expected_fake) &&
+                  said("arm active_discord_udp ×6"),
+                  "voice Plan не сохранил точные байты найденного arm и его число повторов");
+            CHECK(said("найденный исходным перебором arm"),
+                  "результат C voice-измерителя не отражён в журнале");
             CHECK(sent_has(D2K_LINK_VOICE_CLASS), "кандидат голоса не поставлен на класс");
+            CHECK(sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0) == 1,
+                  "voice Plan не ограничен портом измеренного потока");
             CHECK(tcp_calls == 0 && ver_calls == 0,
                   "по голосу пошёл замер или зонд, которые мерить его не могут");
             CHECK(!said("жду форму приветствия"),
                   "голос принят за QUIC и ждёт снимка Initial");
-            /* Следующий поток разговора: план применился, сервер ответил. */
+            /* Посторонний голосовой поток не должен забрать план, найденный
+               измерением конкретной conntrack-пятёрки. */
             d2k_ev ap = ev_applied(17, 40201);
             d2k_sched_event(s, &ap);
             d2k_ev ex = ev_exchange(17, 40201, 0);
+            d2k_sched_event(s, &ex);
+            spin(s, 20);
+            CHECK(!said("UDP-ответ наблюдался"),
+                  "посторонний голосовой поток выбран для измеренного arm");
+            /* Только исходный поток, с которого снята цель, становится WATCH. */
+            ap = ev_applied(17, 40200);
+            d2k_sched_event(s, &ap);
+            ex = ev_exchange(17, 40200, 0);
             d2k_sched_event(s, &ex);
             spin(s, 20);
             const d2k_cat_binding *bd = binding_of(&cV, D2K_LINK_VOICE_CLASS, 17);
@@ -3260,11 +3311,11 @@ int main(void) {
             d2k_sched_event(s, &su);
             spin(s, 20);
             drain();
-            d2k_ev h2 = ev_hello(17, 40211, D2K_LINK_VOICE_CLASS);
+            d2k_ev h2 = ev_hello(17, 40210, D2K_LINK_VOICE_CLASS);
             d2k_sched_event(s, &h2);
-            d2k_ev ap = ev_applied(17, 40211);
+            d2k_ev ap = ev_applied(17, 40210);
             d2k_sched_event(s, &ap);
-            d2k_ev su2 = ev_suspect(17, 40211);
+            d2k_ev su2 = ev_suspect(17, 40210);
             d2k_sched_event(s, &su2);
             spin(s, 20);
             CHECK(binding_of(&cW, D2K_LINK_VOICE_CLASS, 17) == NULL,
@@ -3273,6 +3324,7 @@ int main(void) {
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cW);
+        d2k_sched_voice_hook = saved_voice_hook;
         g_server_port = saved_port;
     }
 

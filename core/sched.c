@@ -295,6 +295,10 @@ static d2k_vres classify_no_cancel(const char *ip, uint16_t port,
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
+static d2k_voice_res voice_default(const d2k_voice_opt *opt) {
+    return d2k_voice_run(opt);
+}
+d2k_sched_voice_fn d2k_sched_voice_hook = voice_default;
 
 /* --------------------------------------------------------------------
  * Состояние задачи.
@@ -329,9 +333,9 @@ typedef enum {
        прикладным подтверждением. */
     T_WATCHING,
     T_RESTING,       /* неудача, цель отдыхает */
-    /* ГОЛОС: приём стоит на классе голоса, ждём потока разговора, к которому
-       он применится. Зонда у голоса нет (точка молчит посторонним), и решает
-       только поток самого клиента. */
+    T_VOICE_MEASURE, /* C voice/STUN instrument runs in a worker */
+    /* ГОЛОС: временный arm измерен на конкретной conntrack-пятёрке и
+       ограничен её локальным портом, ждём применения только к этому потоку. */
     T_VOICE_TRIAL,
     /* Приём применился к потоку разговора — ждём по нему ответа сервера или
        молчания. */
@@ -340,7 +344,7 @@ typedef enum {
 
 /* Что делает рабочий поток задачи. Потоки заводятся только под сетевые
    оракулы; управляющего сокета они не касаются (см. шапку d2k_sched.h). */
-typedef enum { JOB_NONE = 0, JOB_CLASSIFY, JOB_CONTACT, JOB_VERIFY } task_job;
+typedef enum { JOB_NONE = 0, JOB_CLASSIFY, JOB_CONTACT, JOB_VERIFY, JOB_VOICE } task_job;
 
 typedef struct {
     task_state state;
@@ -361,6 +365,7 @@ typedef struct {
        от имени не зависит. Выдумывать имя запрещено (D2K_SPEC). */
     int         by_addr;
     d2k_flowkey voice_flow;
+    int         voice_flow_bound;
     int         voice_answered;
     int         voice_silent;
     int64_t     voice_watch_ms;
@@ -522,6 +527,7 @@ typedef struct {
     volatile sig_atomic_t stop;
     task_job   job;
     d2k_vres   res;
+    d2k_voice_res voice_res;
     d2k_vol_result vol;
     int        res_ready;   /* пишется потоком под мьютексом планировщика */
     /* Подобранное плечо QUIC и признак того, что подбор состоялся. Отдельно
@@ -959,6 +965,24 @@ static void *worker_run(void *vp) {
     d2k_hello trig = {trigger_bytes, a->trig_len};
     d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len};
     free(a);
+
+    if (t->job == JOB_VOICE) {
+        d2k_voice_opt opt;
+        memset(&opt, 0, sizeof opt);
+        opt.mark = s->mark;
+        memcpy(&opt.flow_ip_a, t->voice_flow.a_ip, sizeof opt.flow_ip_a);
+        opt.flow_port_a = t->voice_flow.a_port;
+        memcpy(&opt.flow_ip_b, t->voice_flow.b_ip, sizeof opt.flow_ip_b);
+        opt.flow_port_b = t->voice_flow.b_port;
+        d2k_voice_res vr = d2k_sched_voice_hook(&opt);
+        pthread_mutex_lock(&s->mu);
+        t->voice_res = vr;
+        t->res_ready = 1;
+        pthread_mutex_unlock(&s->mu);
+        ssize_t ign = write(s->wake[1], "w", 1);
+        (void)ign;
+        return NULL;
+    }
 
     if (t->job == JOB_VERIFY) {
         /* Испытание кандидата: своё рукопожатие TLS 1.3 своим ключом и
@@ -2131,6 +2155,7 @@ static const char *task_phase(const task *t) {
                                      : "проверяем выведенный план";
     case T_WATCHING:      return "подтверждено, смотрим живой трафик";
     case T_RESTING:       return "цель отдыхает после неудачи";
+    case T_VOICE_MEASURE: return "измеряем живой голосовой поток";
     case T_VOICE_TRIAL:   return "приём голоса стоит, ждём разговора";
     case T_VOICE_WATCH:   return "приём применился к разговору, ждём ответа сервера";
     default:              return "заводим поиск";
@@ -2517,59 +2542,88 @@ static void box_id_for(const task *t, const char *text, char *box_id, size_t cap
     }
 }
 
-/* --- ГОЛОС ДИСКОРДА: испытание на самом разговоре ----------------------
- *
- * ВРЕМЕННЫЙ ПУТЬ, НЕ ПОЛНЫЙ ПЕРЕНОС voiceprobe. В поле 17.09.2026
- * наблюдавшаяся голосовая точка отвечала установленной сессии (SSRC от
- * шлюза), но молчала на посторонние зонды. Это ограничение данной точки,
- * а не доказательство непригодности исходного STUN-пути для всех целей.
- * Здесь пока наблюдаем поток клиента; UDP EXCHANGE показывает только
- * обратный пакет, не успешный разговор. См. открытый пункт MVP_CHECKLIST.
- *
- * ПОЭТОМУ ИСПЫТАНИЕ ИДЁТ ЗА СЧЁТ РАЗГОВОРА. Приём ставится на класс голоса
- * для ВСЕХ потоков, а не под порт зонда — зонда нет. Это честно называется
- * вслух; стоит он не дольше общего срока задачи. Пока протокольное
- * подтверждение не подключено, в каталог успех НЕ записывается.
- *
- * ОДИН КАНДИДАТ, УНАСЛЕДОВАННЫЙ. Приманка Initial QUIC перед IP Discovery,
- * десять копий, без порчи — боевой профиль discord_udp z2k (strategy=1),
- * только приманка своя, а не чужой блоб. Этот фиксированный кандидат пока
- * обходит перенесённый измеритель и НЕ закрывает исходную задачу поиска. */
+/* --- ГОЛОС: замеряется перенесённым C voice/STUN-инструментом ------------
+ * Измеритель использует цель из живого conntrack и исходный перебор
+ * voiceprobe. Его результат запускается в worker: UDP-оракулы ждут сеть.
+ * Только BLOCKED + найденные и помеченные байты превращаются во временный
+ * voice Plan; проверка применением к самому разговору остаётся отдельной.
+ * Обычный UDP EXCHANGE не подтверждает приложение и не создаёт каталог. */
 static void voice_start(d2k_sched *s, task *t) {
-    uint8_t decoy[1500];
-    size_t dlen = 0;
-    if (d2k_qc_first_initial(SCHED_DECOY, decoy, sizeof decoy, &dlen) != 0 ||
-        d2k_voice_plan(decoy, dlen, t->plans[0], sizeof t->plans[0]) != 0) {
-        say(s, "по %s приманку голоса собрать не удалось — испытывать нечем", t->name);
+    t->n_plans = 0;
+    t->next_plan = 0;
+    t->state = T_VOICE_MEASURE;
+    if (start_worker(s, t, JOB_VOICE) != 0) {
+        say(s, "по %s голосовой C-замер не запустился", t->name);
         task_reset(t);
         return;
     }
+    say(s, "по %s (голос) запускаю C-замер живого потока и перебор исходных приманок",
+        t->name);
+}
+
+static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
+    d2k_voice_res r;
+    pthread_mutex_lock(&s->mu);
+    r = t->voice_res;
+    pthread_mutex_unlock(&s->mu);
+    join_worker(t);
+
+    if (r.verdict != D2K_VOICE_BLOCKED) {
+        say(s, "по %s (голос) временный Plan не ставлю: измерение не подтвердило "
+               "блокировку (%s)", t->name, r.reason[0] ? r.reason : "нет причины");
+        task_fail(s, t, now_ms);
+        return;
+    }
+    int flow_matches = t->voice_flow_bound &&
+        ((memcmp(&r.ip, t->voice_flow.a_ip, sizeof r.ip) == 0 &&
+          r.port == t->voice_flow.a_port &&
+          memcmp(&r.client_ip, t->voice_flow.b_ip, sizeof r.client_ip) == 0 &&
+          r.client_port == t->voice_flow.b_port) ||
+         (memcmp(&r.ip, t->voice_flow.b_ip, sizeof r.ip) == 0 &&
+          r.port == t->voice_flow.b_port &&
+          memcmp(&r.client_ip, t->voice_flow.a_ip, sizeof r.client_ip) == 0 &&
+          r.client_port == t->voice_flow.a_port));
+    if (!flow_matches || !r.marked || r.arm_len == 0 ||
+        r.arm_len > sizeof r.arm_bytes || r.arm_copies <= 0) {
+        say(s, "по %s (голос) блокировка измерена, но найденный arm неполон или "
+               "не помечен либо не относится к исходной пятёрке — Plan не ставлю", t->name);
+        task_fail(s, t, now_ms);
+        return;
+    }
+    if (d2k_voice_arm_plan(r.arm_bytes, r.arm_len, (unsigned)r.arm_copies,
+                           t->plans[0], sizeof t->plans[0]) != 0) {
+        say(s, "по %s (голос) найденный arm не выражается языком Plan", t->name);
+        task_fail(s, t, now_ms);
+        return;
+    }
+
     t->n_plans = 1;
     t->next_plan = 1;
     t->n_known = 0;
-    static char wire[sizeof t->plans[0]];
-    char cat_id[40], err[160];
+    char wire[sizeof t->plans[0]], cat_id[40], err[160];
     plan_ident(t->plans[0], cat_id, sizeof cat_id, t->ver_plan_id);
     snprintf(wire, sizeof wire, "%s", t->plans[0]);
     if (stamp_plan_id(wire, t->ver_plan_id) != 0) {
-        memset(t->ver_plan_id, 0, sizeof t->ver_plan_id);
+        say(s, "по %s (голос) не удалось идентифицировать измеренный Plan", t->name);
+        task_fail(s, t, now_ms);
+        return;
     }
-    static char hex[2 * D2K_PLAN_TLV_MAX + 1];
+    char hex[2 * D2K_PLAN_TLV_MAX + 1];
     if (d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0 ||
-        d2k_link_set_name(s->link_fd, t->name, 17, hex, D2K_LINK_SHAPE_VOICE,
-                          err, sizeof err) != 0) {
-        say(s, "по %s приём голоса не поставился: %s", t->name, err);
-        task_reset(t);
+        d2k_link_set_name_probe(s->link_fd, t->name, 17, hex, D2K_LINK_SHAPE_VOICE,
+                                htons(r.client_port), err, sizeof err) != 0) {
+        say(s, "по %s (голос) измеренный Plan не поставился: %s", t->name, err);
+        task_fail(s, t, now_ms);
         return;
     }
     t->trial_installed = 1;
-    t->probes++;
-    s->probes_used++;
+    t->probes += r.probes;
+    s->probes_used += r.probes;
     t->state = T_VOICE_TRIAL;
-    say(s, "по %s (голос) испытываю приём на самом разговоре: %s — приманка Initial "
-           "QUIC ×%u перед IP Discovery. Зонда у голоса нет: точка молчит посторонним, "
-           "поэтому приём стоит для ВСЕХ голосовых потоков, пока не решит ближайший "
-           "разговор", t->name, cat_id, (unsigned)D2K_VOICE_DECOY_REPEATS);
+    say(s, "по %s (голос) найденный исходным перебором arm %s ×%d (%zu байт) "
+           "поставлен только на измеренный клиентский порт %u. Это временный опыт",
+        t->name, r.fake_arm[0] ? r.fake_arm : "voice", r.arm_copies, r.arm_len,
+        (unsigned)r.client_port);
 }
 
 /* ЦЕЛЬ ПО АДРЕСУ ДЛЯ QUIC: приём разноса Initial-датаграмм.
@@ -2743,16 +2797,32 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         fp_add(&t->fp, &sig);
     }
     server_of(ev, t->ip, sizeof t->ip, &t->port);
+    if (is_voice_class(t->name, t->transport)) {
+        uint8_t target_ip[4];
+        memcpy(t->voice_flow.a_ip, ev->low_ip, sizeof t->voice_flow.a_ip);
+        memcpy(t->voice_flow.b_ip, ev->high_ip, sizeof t->voice_flow.b_ip);
+        t->voice_flow.a_port = ev->low_port;
+        t->voice_flow.b_port = ev->high_port;
+        t->voice_flow.transport = ev->transport;
+        if (inet_pton(AF_INET, t->ip, target_ip) == 1 &&
+            memcmp(ev->low_ip, target_ip, sizeof target_ip) == 0 &&
+            ev->low_port == t->port) {
+            t->voice_flow_bound = 1;
+        } else if (inet_pton(AF_INET, t->ip, target_ip) == 1 &&
+                   memcmp(ev->high_ip, target_ip, sizeof target_ip) == 0 &&
+                   ev->high_port == t->port) {
+            t->voice_flow_bound = 1;
+        }
+    }
     t->started_ms = 0;
     if (by_addr) {
         quic_addr_start(s, t);
         return t->state == T_VOICE_TRIAL;
     }
     if (is_voice_class(t->name, t->transport)) {
-        /* Голос — не QUIC: снимок Initial ему не нужен, замер и зонд
-           бесполезны. Своя дорога целиком. */
+        /* Голос измеряется отдельным C-инструментом по живой conntrack-цели. */
         voice_start(s, t);
-        return t->state == T_VOICE_TRIAL;
+        return t->state == T_VOICE_MEASURE || t->state == T_VOICE_TRIAL;
     }
     /* Снимок заказывается ДО подбора приветствий, а не после: для QUIC он не
        «уточнение», а единственный источник байт, и порядок здесь несущий. */
@@ -3053,19 +3123,25 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
         if (t->state == T_VOICE_TRIAL) {
-            /* Приём голоса применился к потоку разговора — ИМЕННО наш: чужой
-               план на голосовом потоке ничего не говорит о нашем. */
+            /* Приём голоса применяется только к исходной conntrack-пятёрке;
+               общий class/name сам по себе недостаточен для доказательства. */
             if (ev->transport != 17 || !plan_id_is_ours(t, ev)) { continue; }
             /* У адресных QUIC-целей один и тот же план имеет один ID.
                Чужой адрес/порт не может выбрать эту задачу для WATCH:
                последующий EXCHANGE иначе подтвердит не ту цель.
-               Голосовой класс намеренно общий, его этим не ограничиваем. */
+               Голосовой Plan тоже ограничен точной conntrack-пятёркой. */
             if (t->by_addr && !applied_of_candidate(t, ev)) { continue; }
-            memcpy(t->voice_flow.a_ip, ev->low_ip, 4);
-            memcpy(t->voice_flow.b_ip, ev->high_ip, 4);
-            t->voice_flow.a_port = ev->low_port;
-            t->voice_flow.b_port = ev->high_port;
-            t->voice_flow.transport = ev->transport;
+            if (!t->by_addr &&
+                (!t->voice_flow_bound || !ev_matches_flow(ev, &t->voice_flow))) {
+                continue;
+            }
+            if (t->by_addr) {
+                memcpy(t->voice_flow.a_ip, ev->low_ip, 4);
+                memcpy(t->voice_flow.b_ip, ev->high_ip, 4);
+                t->voice_flow.a_port = ev->low_port;
+                t->voice_flow.b_port = ev->high_port;
+                t->voice_flow.transport = ev->transport;
+            }
             t->voice_answered = 0;
             t->voice_silent = 0;
             t->voice_watch_ms = 0;
@@ -3448,9 +3524,24 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     say(s, "по %s замер не уложился в %d мин и брошен — "
                            "в каталог не идёт ничего",
                         t->name, SCHED_TASK_LIFE_MS / 60000);
+                } else if (t->state == T_VOICE_MEASURE) {
+                    say(s, "по %s голосовой замер не уложился в %d мин — "
+                           "результат не применяется",
+                        t->name, SCHED_TASK_LIFE_MS / 60000);
                 }
                 task_fail(s, t, now_ms);
             }
+            moved++;
+            continue;
+        }
+
+        if (t->state == T_VOICE_MEASURE) {
+            int ready;
+            pthread_mutex_lock(&s->mu);
+            ready = t->res_ready;
+            pthread_mutex_unlock(&s->mu);
+            if (!ready) { continue; }
+            voice_finish_measure(s, t, now_ms);
             moved++;
             continue;
         }

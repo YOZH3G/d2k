@@ -60,6 +60,7 @@
 #include "d2k_quicprobe.h"
 #include "d2k_verify.h"
 #include "d2k_volume.h"
+#include "d2k_voice.h"
 
 typedef struct d2k_sched d2k_sched;
 
@@ -137,6 +138,11 @@ extern d2k_sched_ver_fn  d2k_sched_ver_hook;
 
 extern d2k_sched_tcp_fn  d2k_sched_tcp_hook;
 extern d2k_sched_quic_fn d2k_sched_quic_hook;
+
+/* Голосовой измеритель блокирует на сетевых ответах и запускается
+ * асинхронно; крючок позволяет проверить scheduler без сети. */
+typedef d2k_voice_res (*d2k_sched_voice_fn)(const d2k_voice_opt *opt);
+extern d2k_sched_voice_fn d2k_sched_voice_hook;
 
 /* Заводит планировщик поверх уже открытого каталога и уже открытой связи с
  * датапатом. Владения ни тем, ни другим НЕ берёт: каталог переживает

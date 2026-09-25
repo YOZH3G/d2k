@@ -354,11 +354,22 @@ int main(void) {
         d2k_voice_opt o;
         memset(&o, 0, sizeof o);
         o.ct_path = path;
+        o.flow_ip_a = ip4(35, 217, 0, 67);
+        o.flow_port_a = 50004;
+        o.flow_ip_b = ip4(192, 168, 1, 117);
+        o.flow_port_b = 50013;
         d2k_voice_res r = d2k_voice_run(&o);
         CHECK(r.ip == ip4(35, 217, 0, 67),
               "целью взят поток собственного контрольного зонда, а не разговор");
+        CHECK(r.client_ip == o.flow_ip_b && r.client_port == o.flow_port_b,
+              "измеритель потерял клиентскую сторону выбранной conntrack-пятёрки");
         CHECK(r.verdict == D2K_VOICE_BLOCKED,
               "разговор без ответа при живом контроле не признан заглушённым");
+        int calls_after_match = g_calls;
+        o.flow_port_b = 59999;
+        r = d2k_voice_run(&o);
+        CHECK(r.verdict == D2K_VOICE_NO_CALL && g_calls == calls_after_match,
+              "client tuple фильтр измерил другую сессию или отправил лишние пробы");
         d2k_voice_alive_hook = stub_alive;
         remove(path);
     }

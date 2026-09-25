@@ -668,10 +668,10 @@ test-sched: test_sched sched.o quichello.o plantlv.o verify.o tls12.o quicconn.o
 # verify.o tls12.o quicconn.o quicwire.o h3.o — с 12.09 планировщик испытывает кандидата САМ (d2k_sched_ver_hook,
 # умолчание verify_default зовёт d2k_verify_probe). Тест зонд подменяет, но
 # умолчание всё равно линкуется: крючок — точка подмены, а не условная сборка.
-test_sched: test_sched.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
+test_sched: test_sched.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o stun.o \
             hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
-		hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(TEST_LDFLAGS)
+		voice.o stun.o hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 # Стенд test_verify.c — СВОЙ (не общий test_stand.h): он единственный умеет
 # довести рукопожатие TLS 1.3 до конца и умеет НЕ довести, а без этого уровни
@@ -695,11 +695,11 @@ DETECT_OBJ = ../detect/bridge.o ../detect/classify.o ../detect/poison.o \
 $(DETECT_OBJ): FORCE
 	$(MAKE) -C ../detect $(notdir $@)
 
-d2kc: d2kc.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
+d2kc: d2kc.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o stun.o \
       hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
       $(DETECT_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
-		hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
+		voice.o stun.o hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
 		$(DETECT_OBJ) $(TEST_LDFLAGS)
 
 clean:

@@ -464,6 +464,13 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
     for (size_t i = 0; i < n && !flow; i++) {
         if (ctl_resolved && t[i].ip == cip) { continue; }   /* свой же контроль */
         if (o.ip && o.port && (t[i].ip != o.ip || t[i].port != o.port)) { continue; }
+        if (o.flow_port_a && o.flow_port_b) {
+            int forward = t[i].ip == o.flow_ip_a && t[i].port == o.flow_port_a &&
+                          t[i].src_ip == o.flow_ip_b && t[i].sport == o.flow_port_b;
+            int reverse = t[i].ip == o.flow_ip_b && t[i].port == o.flow_port_b &&
+                          t[i].src_ip == o.flow_ip_a && t[i].sport == o.flow_port_a;
+            if (!forward && !reverse) { continue; }
+        }
         flow = &t[i];
     }
     r.ip = o.ip;
@@ -478,6 +485,10 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
         }
         r.ip = flow->ip;
         r.port = flow->port;
+    }
+    if (flow) {
+        r.client_ip = flow->src_ip;
+        r.client_port = flow->sport;
     }
 
     char addr[24];

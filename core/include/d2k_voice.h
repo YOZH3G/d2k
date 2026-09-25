@@ -137,6 +137,10 @@ size_t d2k_voice_targets(const char *path, d2k_voice_target *out, size_t cap);
 typedef struct {
     uint32_t    ip;           /* 0 — искать живой разговор */
     uint16_t    port;
+    uint32_t    flow_ip_a;   /* вместе задают обе стороны исходной пятёрки */
+    uint16_t    flow_port_a;
+    uint32_t    flow_ip_b;
+    uint16_t    flow_port_b;
     const char *ct_path;      /* NULL — /proc/net/nf_conntrack */
     const char *control;      /* NULL — умолчание (см. d2k_voice_control_default) */
     const char *blob_dir;     /* NULL — /opt/d2k/files/fake */
@@ -149,6 +153,8 @@ typedef struct {
     char     reason[D2K_REASON_MAX];
     uint32_t ip;
     uint16_t port;
+    uint32_t client_ip; /* сетевой порядок, из выбранной conntrack-пятёрки */
+    uint16_t client_port;
     int      probes;   /* сколько зондов реально ушло на провод */
     int      marked;   /* 1 — метка запрошена И подтверждена на каждом зонде */
     char     fake_arm[48];
