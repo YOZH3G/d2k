@@ -570,11 +570,11 @@ cross: hello_profiles.inc
 	@echo "== test_sched целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_sched-a64 \
 		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
+		props.c voice.c stun.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_sched-mipsel \
 		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
+		props.c voice.c stun.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c -lpthread || exit 1
 	@echo "== d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kask-a64 \
@@ -591,11 +591,11 @@ cross: hello_profiles.inc
 	@echo "== d2kc целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-a64 \
 		d2kc.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
+		props.c voice.c stun.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-mipsel \
 		d2kc.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
+		props.c voice.c stun.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
 	@echo "== test_measured целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_measured-a64 \
@@ -643,7 +643,7 @@ d2kc-linux-arm64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../detect/include -static \
 		-o $(BUILDDIR)/d2kc-linux-arm64 d2kc.c sched.c quichello.c plantlv.c verdict.c meas.c \
-		crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c hello.c catalog.c match.c compose.c link.c \
+		crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c stun.c hello.c catalog.c match.c compose.c link.c \
 		volume.c tls13.c tls12.c tls13core.c x25519.c verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread
 	@ls -l $(BUILDDIR)/d2kc-linux-arm64
 

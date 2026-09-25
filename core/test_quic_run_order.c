@@ -6,6 +6,9 @@
 static int calls, fails, lose_base_mark;
 static int fragment_calls;
 static size_t first_prefix;
+static uint8_t first_arm_hello[2048];
+static size_t first_arm_hello_len;
+static int arm_hello_count, arm_hello_changed;
 #define CHECK(x) do { if(!(x)) { printf("FAIL %d %s\n",__LINE__,#x); fails++; } } while(0)
 static size_t resolve(const char *sni,char out[][D2K_QUIC_ADDR_LEN],size_t cap) {
     (void)sni;(void)out;(void)cap;return 0;
@@ -18,8 +21,20 @@ static d2k_tally answer(int n,int *sent) {
 }
 static d2k_tally ask(const char *ip,uint16_t port,const uint8_t *pre,size_t len,
     d2k_hello msg,uint32_t wait,uint32_t mark,int n,uint32_t *rtt,int *ref,int *sent,uint8_t *ttl) {
-    (void)ip;(void)port;(void)msg;(void)wait;(void)mark;
+    (void)ip;(void)port;(void)wait;(void)mark;
     if(pre && !first_prefix) first_prefix=len;
+    if(pre) {
+        uint8_t hello[2048]; size_t hello_len=0;
+        CHECK(d2k_quic_client_hello(msg.bytes,msg.len,hello,sizeof hello,&hello_len)==0);
+        if(arm_hello_count==0) {
+            memcpy(first_arm_hello,hello,hello_len);
+            first_arm_hello_len=hello_len;
+        } else if(hello_len!=first_arm_hello_len ||
+                  memcmp(hello,first_arm_hello,hello_len)!=0) {
+            arm_hello_changed++;
+        }
+        arm_hello_count++;
+    }
     if(rtt)*rtt=1;
     if(ref)*ref=0;
     if(ttl)*ttl=64;
@@ -57,6 +72,7 @@ int main(void) {
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE);
     CHECK(first_prefix==1200); /* quic5 before properties' 16-byte junk */
+    CHECK(arm_hello_count>=2 && arm_hello_changed>0);
     CHECK(arm.original && arm.len==1200 && arm.ttl==3 && arm.copies==6);
     CHECK(fragment_calls==2 && arm.frag_kind==1 && arm.frag_survives==D2K_PROP_YES);
     calls=0;first_prefix=0;lose_base_mark=1;

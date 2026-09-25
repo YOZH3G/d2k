@@ -15,6 +15,8 @@
 #include <unistd.h>
 
 #include "d2k_meas.h"
+#include "d2k_quic.h"
+#include "d2k_quicwire.h"
 #include "d2k_quicprobe.h"
 /* d2k_quic_hello_rename — единственный источник приманки (см. ниже). */
 #include "d2k_quichello.h"
@@ -22,13 +24,22 @@
 
 typedef struct {
     uint16_t port;
-    d2k_hello trigger, control;
+    char target_sni[256], control_sni[256];
     uint32_t wait_ms, mark;
 } original_wire;
 
 static d2k_tally original_probe(const d2k_quic_arm_question *q, void *user, int *sent) {
     original_wire *w=user;
-    d2k_hello msg=q->control?w->control:w->trigger;
+    const char *sni=q->control?w->control_sni:w->target_sni;
+    uint8_t initial[D2K_QW_MAX_DGRAM]; size_t initial_len=0;
+    if(!sni[0] || d2k_quic_probe_initial(sni,initial,sizeof initial,&initial_len)!=0) {
+        d2k_tally failed={0};
+        failed.err=failed.fail=D2K_QUIC_REPEATS;
+        failed.marked=1;
+        if(sent)*sent=0;
+        return failed; /* no fresh donor Initial means this question was not measured */
+    }
+    d2k_hello msg={initial,initial_len};
     if(q->frag) {
         return d2k_quic_fragment_hook(q->addr,w->port,q->frag,msg,
             w->wait_ms,w->mark,D2K_QUIC_REPEATS,sent);
@@ -43,7 +54,15 @@ static d2k_tally original_probe(const d2k_quic_arm_question *q, void *user, int 
 
 d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
     d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark) {
-    original_wire wire={port,trigger,control,wait_ms,mark};
+    original_wire wire={.port=port,.wait_ms=wait_ms,.mark=mark};
+    if(d2k_quic_sni(trigger.bytes,trigger.len,wire.target_sni,sizeof wire.target_sni)!=0) {
+        wire.target_sni[0]='\0';
+    }
+    if(control.bytes && control.len) {
+        if(d2k_quic_sni(control.bytes,control.len,wire.control_sni,sizeof wire.control_sni)!=0) {
+            wire.control_sni[0]='\0';
+        }
+    }
     d2k_quic_arm_context local=*ctx;
     local.probe=original_probe; local.user=&wire;
     d2k_quic_arm r=d2k_quic_original_arms(&local);
