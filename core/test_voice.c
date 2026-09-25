@@ -111,6 +111,16 @@ static int stub_resolve(const char *hostport, uint32_t *ip, uint16_t *port) {
     return 0;
 }
 
+static int stub_blob(const char *dir, const char *file, uint8_t *out,
+                     size_t cap, size_t *len) {
+    (void)dir;
+    static const uint8_t fake[] = "donor-voice-fake-arm";
+    if (strcmp(file, "stun.bin") != 0 || cap < sizeof fake - 1) { return -1; }
+    memcpy(out, fake, sizeof fake - 1);
+    *len = sizeof fake - 1;
+    return 0;
+}
+
 /* --- мишень STUN на петле ------------------------------------------------
  *
  * Отвечает на ОДИН запрос и завершается. honest=1 — ответ с нашим
@@ -183,6 +193,7 @@ static void reset(void) {
 int main(void) {
     d2k_voice_ask_hook = stub_ask;
     d2k_voice_resolve_hook = stub_resolve;
+    d2k_voice_blob_hook = stub_blob;
     real_alive = d2k_voice_alive_hook;
     d2k_voice_alive_hook = stub_alive;
 
@@ -429,16 +440,10 @@ int main(void) {
         d2k_voice_res r = d2k_voice_run(&o);
         CHECK(r.verdict == D2K_VOICE_BLOCKED,
               "поток идёт без единого ответа, а контроль жив — это блокировка потока");
-        /* ПРИЁМ НЕ ПОДТВЕРЖДАЕТСЯ ЗОНДОМ STUN, И ВЫВОДА ПРО НЕГО НЕТ.
-           Базовый оракул заменён наблюдением разговора именно потому, что
-           голосовая точка не отвечает посторонним. Испытывать приманки тем же
-           отвергнутым способом и делать вывод «не пробивает» — повторять ту же
-           ошибку на шаг позже (ревью, P1-4). */
-        CHECK(strstr(r.reason, "не пробивает") == NULL,
-              "сказано «ни одна фальшивка не пробивает» — вывод из непригодного зонда");
-        CHECK(strstr(r.reason, "не подтвердить") != NULL ||
-              strstr(r.reason, "не проверялись") != NULL,
-              "не сказано, ПОЧЕМУ приёма нет");
+        CHECK(r.arm_len > 0 && r.arm_copies == 6,
+              "донорный голосовой поиск не вернул найденную фальшивку ×6");
+        CHECK(strstr(r.reason, "исходный поиск нашёл") != NULL,
+              "трасса не фиксирует найденное плечо");
     }
 
     /* --- СЛОЙ 1: голосовой сервер отвечает — резать нечего ---------------- */
@@ -593,6 +598,12 @@ int main(void) {
 
         CHECK(r.verdict == D2K_VOICE_BLOCKED,
               "контроль жив, голос молчит — режут именно этот поток");
+        CHECK(g_calls >= 3 && g_last_ip == o.ip && g_last_copies == 6,
+              "после подтверждённого blocked не перебраны donor voice arms на целевом IP");
+        CHECK(r.arm_len == strlen("donor-voice-fake-arm") && r.arm_copies == 6 &&
+              strcmp(r.fake_arm, "stun:repeats=6") == 0 &&
+              memcmp(r.arm_bytes, "donor-voice-fake-arm", r.arm_len) == 0,
+              "перебранное плечо не возвращено вызывающему для точной сборки Plan");
     }
 
 

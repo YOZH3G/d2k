@@ -17,6 +17,7 @@
 Продолжение: [точная отправка QUIC-фрагментов](docs/field/2026-09-19-quic-fragments.md).
 Продолжение: [fragment Plan и Linux/NAT-провод](docs/field/2026-09-19-quic-fragment-plan.md).
 Продолжение: [conntrack измерителя и настоящая NFQUEUE](docs/field/2026-09-19-quic-conntrack-nfqueue.md).
+Продолжение: [перенос voice askArms в C](docs/field/2026-09-25-voice-askarms-c.md).
 
 - [x] Разделить подтверждения двух IP-целей с одинаковым plan_id: учитывать
   адрес и порт кандидата. Регрессия сначала падала, после правки проходит.

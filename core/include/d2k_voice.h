@@ -61,6 +61,7 @@
  * это разные вещи, и держать их одним числом значит однажды поменять одно,
  * думая про другое. */
 #define D2K_VOICE_MAX_REPEATS 8
+#define D2K_VOICE_ARM_MAX 1600
 
 typedef enum {
     /* Голосовой сервер отвечает — резать нечего. */
@@ -138,6 +139,7 @@ typedef struct {
     uint16_t    port;
     const char *ct_path;      /* NULL — /proc/net/nf_conntrack */
     const char *control;      /* NULL — умолчание (см. d2k_voice_control_default) */
+    const char *blob_dir;     /* NULL — /opt/d2k/files/fake */
     uint32_t    wait_ms;      /* 0 — 3000 */
     uint32_t    mark;
 } d2k_voice_opt;
@@ -149,6 +151,10 @@ typedef struct {
     uint16_t port;
     int      probes;   /* сколько зондов реально ушло на провод */
     int      marked;   /* 1 — метка запрошена И подтверждена на каждом зонде */
+    char     fake_arm[48];
+    uint8_t  arm_bytes[D2K_VOICE_ARM_MAX];
+    size_t   arm_len;
+    int      arm_copies;
 } d2k_voice_res;
 
 /* Публичный STUN по умолчанию. Замер 04.09.2026 с роутера: Cloudflare на 3478
@@ -214,5 +220,12 @@ d2k_voice_ask_fn voice_ask_real(void);
 
 /* Меряет голосовой поток. См. три слоя в шапке файла. */
 d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt);
+
+/* Internal donor hypotheses, loaded from D2K's installed copy of the
+ * original fake files. The default hook uses the filesystem loader. Tests
+ * may supply deterministic bytes without importing a user strategy pool. */
+typedef int (*d2k_voice_blob_fn)(const char *dir, const char *file,
+                                 uint8_t *out, size_t cap, size_t *len);
+extern d2k_voice_blob_fn d2k_voice_blob_hook;
 
 #endif /* D2K_VOICE_H */

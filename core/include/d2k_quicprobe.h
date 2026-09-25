@@ -457,6 +457,9 @@ int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
  * страшно, он её выбрасывает (у профиля тоже ни TTL, ни суммы).
  * 0 — план в buf; -1 — приманки нет или буфер мал. */
 int d2k_voice_plan(const uint8_t *decoy, size_t dlen, char *buf, size_t cap);
+/* Same measured donor fake arm, with its selected copy count (1 or 6). */
+int d2k_voice_arm_plan(const uint8_t *decoy, size_t dlen, unsigned copies,
+                       char *buf, size_t cap);
 
 /* ПЛАН РАЗНОСА INITIAL-ДАТАГРАММ QUIC.
  *

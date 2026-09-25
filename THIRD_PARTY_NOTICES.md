@@ -12,6 +12,12 @@ The data in `core/profiles/quic_arms.h` is unchanged (1200 bytes per file);
 These are internal probe hypotheses, not imported user strategies.
 No Zapret/nfqws executable or runtime dependency is introduced.
 
+The C voice instrument uses the original internal voiceprobe hypotheses
+`files/fake/stun.bin` and `files/fake/quic_initial_dbankcloud_ru.bin` from the
+same revision. They are distributed with D2K and installed under
+`/opt/d2k/files/fake`; a missing donor hypothesis is skipped just as in the Go
+instrument. These are probe inputs, not a user strategy pool.
+
 The donor distributes this material under the following license:
 
 MIT License

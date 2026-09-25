@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdio.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -323,6 +324,24 @@ static int voice_resolve(const char *hostport, uint32_t *ip, uint16_t *port) {
     return 0;
 }
 
+static int voice_blob_load(const char *dir, const char *file,
+                           uint8_t *out, size_t cap, size_t *len) {
+    if (!dir || !*dir) { dir = "/opt/d2k/files/fake"; }
+    if (!file || !out || !len) { return -1; }
+    char path[512];
+    int n = snprintf(path, sizeof path, "%s/%s", dir, file);
+    if (n < 0 || (size_t)n >= sizeof path) { return -1; }
+    FILE *f = fopen(path, "rb");
+    if (!f) { return -1; }
+    size_t got = fread(out, 1, cap, f);
+    int extra = fgetc(f);
+    int read_error = ferror(f);
+    int close_error = fclose(f);
+    if (read_error || close_error || extra != EOF || got < 16) { return -1; }
+    *len = got;
+    return 0;
+}
+
 /* ОТВЕЧАЕТ ЛИ ТОЧКА ЭТОМУ ПОТОКУ — по пометке [UNREPLIED] из той же таблицы,
    откуда берётся цель (контракт и ответы — в d2k_voice.h).
 
@@ -348,6 +367,38 @@ d2k_voice_alive_fn d2k_voice_alive_hook = voice_alive;
 
 d2k_voice_ask_fn voice_ask_real(void) { return voice_ask; }
 d2k_voice_resolve_fn d2k_voice_resolve_hook = voice_resolve;
+d2k_voice_blob_fn d2k_voice_blob_hook = voice_blob_load;
+
+/* Same ordered hypotheses and copy counts as internal/voiceprobe/probe.go.
+ * Missing donor assets are skipped, as the Go implementation does. */
+static void voice_ask_arms(const d2k_voice_opt *o, d2k_voice_res *r) {
+    static const struct { const char *name, *file; } blobs[] = {
+        {"active_discord_udp", "active_discord_udp.bin"},
+        {"stun", "stun.bin"},
+        {"quic_dbankcloud", "quic_initial_dbankcloud_ru.bin"}
+    };
+    static const int copies[] = {1, 6};
+    uint8_t bytes[D2K_VOICE_ARM_MAX];
+    for (size_t b = 0; b < sizeof blobs / sizeof blobs[0]; b++) {
+        size_t len = 0;
+        if (!d2k_voice_blob_hook ||
+            d2k_voice_blob_hook(o->blob_dir, blobs[b].file, bytes, sizeof bytes, &len) != 0 ||
+            len == 0 || len > sizeof bytes) { continue; }
+        for (size_t c = 0; c < sizeof copies / sizeof copies[0]; c++) {
+            d2k_tally q = d2k_voice_ask_hook(r->ip, r->port, bytes, len, copies[c],
+                                             o->wait_ms, o->mark, D2K_VOICE_REPEATS, NULL);
+            r->probes += D2K_VOICE_REPEATS - q.err;
+            if (!q.marked) { r->marked = 0; }
+            if (q.pass != D2K_VOICE_REPEATS) { continue; }
+            memcpy(r->arm_bytes, bytes, len);
+            r->arm_len = len;
+            r->arm_copies = copies[c];
+            snprintf(r->fake_arm, sizeof r->fake_arm, "%s:repeats=%d",
+                     blobs[b].name, copies[c] < 2 ? 2 : copies[c]);
+            return;
+        }
+    }
+}
 
 /* --- прогон -------------------------------------------------------------- */
 
@@ -511,8 +562,13 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
                воздействие к его потоку и посмотрев, пошли ли ответы. Этого
                сегодня нет, и вместо вывода стоит причина, по которой его
                нет. */
-            add_reason(&r, "; приём не подтвердить: голосовая точка не отвечает "
-                           "посторонним, а воздействие на сам разговор не применяется");
+            voice_ask_arms(&o, &r);
+            if (r.arm_len) {
+                add_reason(&r, "; исходный поиск нашёл %s (%d копий), %zu байт",
+                           r.fake_arm, r.arm_copies, r.arm_len);
+            } else {
+                add_reason(&r, "; исходный перебор голосовых приманок ответа не получил");
+            }
         }
         if (!r.marked) {
             add_reason(&r, "; СОКЕТ НЕ ПОМЕЧЕН — зонд шёл через наш же обход");

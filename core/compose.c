@@ -1464,8 +1464,9 @@ int d2k_quic_delay_plan(char *buf, size_t cap) {
     return 0;
 }
 
-int d2k_voice_plan(const uint8_t *decoy, size_t dlen, char *buf, size_t cap) {
-    if (!decoy || dlen == 0 || !buf || cap == 0) { return -1; }
+int d2k_voice_arm_plan(const uint8_t *decoy, size_t dlen, unsigned copies,
+                       char *buf, size_t cap) {
+    if (!decoy || dlen == 0 || !buf || cap == 0 || copies == 0 || copies > 32) { return -1; }
     size_t pos = 0;
     if (emit_header_proto(buf, cap, &pos, "udp voice") != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "payload 1 ") != 0) { return -1; }
@@ -1475,7 +1476,7 @@ int d2k_voice_plan(const uint8_t *decoy, size_t dlen, char *buf, size_t cap) {
        копиями, выдержка перед правдой — pace. */
     if (append_fmt(buf, cap, &pos,
                    "fake payload=1 poison=1 repeats=%u gap_us=0 place=before\n",
-                   (unsigned)D2K_VOICE_DECOY_REPEATS) != 0) {
+                   copies) != 0) {
         return -1;
     }
     if (append_fmt(buf, cap, &pos, "order forward\n") != 0) { return -1; }
@@ -1483,6 +1484,10 @@ int d2k_voice_plan(const uint8_t *decoy, size_t dlen, char *buf, size_t cap) {
         return -1;
     }
     return 0;
+}
+
+int d2k_voice_plan(const uint8_t *decoy, size_t dlen, char *buf, size_t cap) {
+    return d2k_voice_arm_plan(decoy, dlen, D2K_VOICE_DECOY_REPEATS, buf, cap);
 }
 
 int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,

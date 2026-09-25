@@ -81,6 +81,8 @@ fetch "builds/d2kd-linux-$ARCH" "$TMP/d2kd"
 fetch "files/S99d2k"            "$TMP/S99d2k"
 fetch "files/d2k-fw-heal.sh"    "$TMP/d2k-fw-heal.sh"
 fetch "files/001-d2k.sh"        "$TMP/001-d2k.sh"
+fetch "files/fake/stun.bin" "$TMP/stun.bin"
+fetch "files/fake/quic_initial_dbankcloud_ru.bin" "$TMP/quic_initial_dbankcloud_ru.bin"
 
 chmod +x "$TMP/d2k" "$TMP/d2kc" "$TMP/d2kd" "$TMP/S99d2k" \
          "$TMP/d2k-fw-heal.sh" "$TMP/001-d2k.sh"
@@ -111,7 +113,7 @@ fi
 #
 # Переименование в пределах одной ФС атомарно. Копирование поверх работающего
 # бинарника — нет: на середине копирования файл уже не тот и ещё не этот.
-mkdir -p "$DIR/state" "$DIR/run" "$DIR/log" "$SBIN" /opt/etc/init.d
+mkdir -p "$DIR/state" "$DIR/run" "$DIR/log" "$DIR/files/fake" "$SBIN" /opt/etc/init.d
 
 install_atomic() {
     cp "$1" "$2.new" || die "не записать $2.new"
@@ -123,6 +125,8 @@ install_atomic "$TMP/d2kc"   "$SBIN/d2kc"
 install_atomic "$TMP/d2kd"   "$SBIN/d2kd"
 install_atomic "$TMP/S99d2k" "$INIT"
 install_atomic "$TMP/d2k-fw-heal.sh" "$DIR/d2k-fw-heal.sh"
+install_atomic "$TMP/stun.bin" "$DIR/files/fake/stun.bin"
+install_atomic "$TMP/quic_initial_dbankcloud_ru.bin" "$DIR/files/fake/quic_initial_dbankcloud_ru.bin"
 # Хук NDM — событийное восстановление правил. Каталог может отсутствовать на
 # прошивке без netfilter.d: тогда остаётся периодический сторож, и это
 # ухудшение страховки, а не отказ установки.
