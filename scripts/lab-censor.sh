@@ -76,9 +76,11 @@ if [ "${D2K_LAB_TLS12:-0}" = "1" ]; then
 fi
 
 real_client() {
+    client_ip=10.203.0.1
+    [ "$1" != "$NAME2" ] || client_ip=$SECOND_IP
     # shellcheck disable=SC2086
     body=$(timeout 10 curl -sS $CURL_VER --cacert /tmp/c.pem \
-        --resolve "$1:$PORT:10.203.0.1" "https://$1:$PORT/" 2>/tmp/curl.err) || return 1
+        --resolve "$1:$PORT:$client_ip" "https://$1:$PORT/" 2>/tmp/curl.err) || return 1
     [ "$body" = "ok" ] || return 1
     return 0
 }
@@ -93,6 +95,7 @@ dump() {
 
 NAME=zablokirovano.example
 NAME2=vtoraya-zablokirovannaya.example
+SECOND_IP=10.203.0.2
 PORT=4443
 QUEUE=2001
 MARK=0x2d
@@ -133,6 +136,10 @@ ip link set lo mtu 1500 2>/dev/null || true
 # A real, isolated lab address. The original domain tool correctly refuses
 # 127/8 targets; don't mask that refusal with the old fallback search.
 ip addr add 10.203.0.1/32 dev lo
+ip addr add "$SECOND_IP"/32 dev lo
+# d2kc uses the system resolver. Keep the second target independent at both
+# the hostname and destination-IP level, not just a second SNI on the same IP.
+printf '%s %s\n' "$SECOND_IP" "$NAME2" >> /etc/hosts
 
 # Цель: настоящий сервер TLS 1.3, ФОРКАЮЩИЙ.
 #
@@ -342,9 +349,10 @@ else
     # недоступности контролем по другому имени.
     iptables -t mangle -A PREROUTING -p tcp --dport "$PORT" \
         -m string --string "$NAME" --algo bm -j DROP
-    # ВТОРАЯ ЦЕЛЬ, той же коробкой. Нужна для второго критерия MVP: ранее
-    # неизвестная цель обязана получить пробу готового плана ДО новых
-    # вопросов. Без второй цели это утверждение проверить нечем.
+    # ВТОРАЯ ЦЕЛЬ: отдельные hostname И IP, но тот же лабораторный цензор.
+    # Нужна для второго критерия MVP: ранее неизвестная цель обязана получить
+    # пробу готового плана ДО новых вопросов. Это всё ещё одна игрушечная
+    # коробка и один TLS backend, не независимая полевая сеть/провайдер.
     iptables -t mangle -A PREROUTING -p tcp --dport "$PORT" \
         -m string --string "$NAME2" --algo bm -j DROP
 fi
@@ -434,9 +442,23 @@ if [ "${D2K_LAB_NOCENSOR:-0}" != "1" ]; then
     done
     i=0
     while [ $i -lt 40 ]; do
-        grep -q "готовых планов" /tmp/d2kc.log 2>/dev/null && break
+        grep -q "$NAME2.*ПОДТВЕРЖДЕНО" /tmp/d2kc.log 2>/dev/null && break
         i=$((i+1)); sleep 2
     done
+    SECOND_CLIENT_OK=0
+    if grep -q "$NAME2.*ПОДТВЕРЖДЕНО" /tmp/d2kc.log 2>/dev/null; then
+        # Повторяем уже после подтверждения: сам факт, что verifier принял
+        # план, ещё не означает, что независимый hostname получил содержимое.
+        for n in 1 2 3; do
+            if real_client "$NAME2"; then
+                SECOND_CLIENT_OK=$((SECOND_CLIENT_OK + 1))
+            else
+                break
+            fi
+            sleep 1
+        done
+    fi
+    echo "клиент NAME2 после reuse: $SECOND_CLIENT_OK/3 успешных ответов"
 fi
 
 # КРИТЕРИЙ 4 — ДО остановки служб и сервера. Проверять «работает ли
@@ -487,6 +509,15 @@ kill "$DPID" 2>/dev/null || true; wait "$DPID" 2>/dev/null || true
 kill "$SRV" 2>/dev/null || true
 
 dump
+
+if [ "${D2K_LAB_NOCENSOR:-0}" != "1" ] &&
+   [ "${D2K_LAB_WRONGCERT:-0}" != "1" ] &&
+   [ "${D2K_LAB_TINYMTU:-0}" != "1" ]; then
+    awk -v endpoint="$SECOND_IP:$PORT" -v name="$NAME2" \
+        'index($0, endpoint) && index($0, name) { found=1 } END { exit !found }' \
+        /tmp/d2kd.log || \
+        fail "вторая цель не прошла через отдельный адрес $SECOND_IP"
+fi
 
 grep -q "подозрение\|начинаю поиск" /tmp/d2kc.log || \
     fail "d2k не заметил проблемного трафика — поиск не начался"
@@ -571,6 +602,11 @@ if [ "${D2K_LAB_NOCENSOR:-0}" != "1" ]; then
             fail "вторая цель пошла в вопросы РАНЬШЕ пробы готового плана — порядок обучения нарушен"
         fi
         echo "критерий 3 показан: готовый план коробки пробуется до новых вопросов"
+    fi
+    if [ "${D2K_LAB_WRONGCERT:-0}" != "1" ] &&
+       [ "${D2K_LAB_TINYMTU:-0}" != "1" ] &&
+       [ "${SECOND_CLIENT_OK:-0}" -ne 3 ]; then
+        fail "коробочный reuse на независимом имени не дал 3/3 прикладных ответов"
     fi
 fi
 

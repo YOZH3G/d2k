@@ -67,12 +67,13 @@ echo "== сборка того, что будет установлено =="
 make -s -C core d2kc
 make -s -C datapath d2kd
 
-mkdir -p "$REL/builds" "$REL/files"
+mkdir -p "$REL/builds" "$REL/files/fake"
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
 [ -f "builds/d2k-linux-$ARCH" ] || fail "нет builds/d2k-linux-$ARCH — панель собирается отдельно (scripts/build.sh)"
 cp "builds/d2k-linux-$ARCH" "$REL/builds/"
 cp files/S99d2k files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
+cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fake/"
 
 # СНИМОК ЧИСТОЙ СИСТЕМЫ. По нему проверяются и остановка, и удаление: обе
 # обязаны вернуть экран ровно в то состояние, в каком его застали.
