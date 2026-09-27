@@ -1,0 +1,31 @@
+#ifndef D2K_PANEL_SERVER_H
+#define D2K_PANEL_SERVER_H
+
+#include <stddef.h>
+
+typedef struct {
+    const char *live_path;
+    const char *asset_dir;
+    const char *version;
+    const char *commit;
+    const char *built;
+    const char *mode;
+    const char *panel_listen;
+    const char *config_path;
+    const char *state_dir;
+    const char *state_dir_note;
+    const char *const *unknown_keys;
+    size_t unknown_key_count;
+    long long started_epoch;
+    int queue_num;
+    int config_exists;
+    int dirty;
+} d2k_panel_config;
+
+/* Serve one bounded HTTP/1.1 request on an already accepted socket. */
+int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg);
+
+/* Install process-wide handling so a disconnected HTTP client cannot kill the server. */
+int d2k_panel_ignore_sigpipe(void);
+
+#endif

@@ -1,0 +1,373 @@
+#define _POSIX_C_SOURCE 200809L
+#include "server.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef D2K_PANEL_VERSION
+#define D2K_PANEL_VERSION "dev"
+#endif
+#ifndef D2K_PANEL_COMMIT
+#define D2K_PANEL_COMMIT ""
+#endif
+#ifndef D2K_PANEL_BUILT
+#define D2K_PANEL_BUILT ""
+#endif
+#ifndef D2K_PANEL_DIRTY
+#define D2K_PANEL_DIRTY 0
+#endif
+
+#define UNKNOWN_MAX 64
+#define UNKNOWN_KEY_MAX 128
+#define CONFIG_LINE_MAX 2048
+
+static volatile sig_atomic_t stop_requested;
+
+static void on_signal(int sig) {
+    (void)sig;
+    stop_requested = 1;
+}
+
+static void say(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
+static void usage(FILE *f) {
+    fputs("d2kpanel --version | serve [--config FILE] [--live FILE] [--assets DIR] "
+          "[--listen HOST:PORT] [--state-dir DIR] [--mode MODE] [--queue N] [--log FILE]\n",
+          f);
+}
+
+static char *trim(char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') { s++; }
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' ||
+                     s[n - 1] == '\r' || s[n - 1] == '\n')) { s[--n] = '\0'; }
+    return s;
+}
+
+static int known_key(const char *key) {
+    static const char *const keys[] = {
+        "SCHEMA", "MODE", "PANEL_LISTEN", "STATE_DIR", "QUEUE_NUM",
+        "CONTROL_SOCKET", "DECOY_SNI", "MARK", "PROBE_MARK", "FLOWS",
+        "STATS_SEC", "HEAL_EVERY", "LOGMAX", "LOGKEEP", "PORTS",
+        "CONNBYTES", "VOICE_PORTS", "VOICE_CONNBYTES"
+    };
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        if (strcmp(key, keys[i]) == 0) { return 1; }
+    }
+    return 0;
+}
+
+static int valid_mode(const char *mode) {
+    return strcmp(mode, "off") == 0 || strcmp(mode, "observe") == 0 ||
+           strcmp(mode, "apply") == 0;
+}
+
+static void remember_unknown(char keys[UNKNOWN_MAX][UNKNOWN_KEY_MAX], size_t *n,
+                             const char *key) {
+    if (!key[0] || strlen(key) >= UNKNOWN_KEY_MAX || *n >= UNKNOWN_MAX) { return; }
+    for (size_t i = 0; i < *n; i++) {
+        if (strcmp(keys[i], key) == 0) { return; }
+    }
+    snprintf(keys[*n], UNKNOWN_KEY_MAX, "%s", key);
+    (*n)++;
+}
+
+static int copy_value(char *dst, size_t cap, const char *src) {
+    size_t n = strlen(src);
+    if (n >= cap) { return -1; }
+    memcpy(dst, src, n + 1);
+    return 0;
+}
+
+static int read_config(const char *path, char *mode, size_t mode_cap,
+                       char *listen, size_t listen_cap,
+                       char *state_dir, size_t state_cap, int *queue,
+                       int cli_mode, int cli_listen, int cli_state, int cli_queue,
+                       char unknown[UNKNOWN_MAX][UNKNOWN_KEY_MAX], size_t *n_unknown,
+                       int *exists) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        if (errno == ENOENT) { *exists = 0; return 0; }
+        return -1;
+    }
+    *exists = 1;
+    char line[CONFIG_LINE_MAX];
+    for (;;) {
+        if (!fgets(line, sizeof line, f)) { break; }
+        size_t line_len = strlen(line);
+        if (line_len == sizeof line - 1 && line[line_len - 1] != '\n') {
+            /* Reject an overlong line instead of silently parsing its tail. */
+            fclose(f);
+            return -1;
+        }
+        char *p = trim(line);
+        if (!p[0] || p[0] == '#') { continue; }
+        char *eq = strchr(p, '=');
+        if (!eq) { continue; }
+        *eq++ = '\0';
+        char *key = trim(p), *value = trim(eq);
+        if (!known_key(key)) { remember_unknown(unknown, n_unknown, key); continue; }
+        if (strcmp(key, "SCHEMA") == 0) {
+            char *end = NULL;
+            long schema = strtol(value, &end, 10);
+            if (!end || *end || schema < 0 || schema > 1) { fclose(f); return -1; }
+        } else if (strcmp(key, "MODE") == 0) {
+            if (!valid_mode(value)) { fclose(f); return -1; }
+            if (!cli_mode && copy_value(mode, mode_cap, value) != 0) { fclose(f); return -1; }
+        } else if (!cli_listen && strcmp(key, "PANEL_LISTEN") == 0) {
+            if (copy_value(listen, listen_cap, value) != 0) { fclose(f); return -1; }
+        } else if (strcmp(key, "STATE_DIR") == 0) {
+            if (value[0] && value[0] != '/') { fclose(f); return -1; }
+            if (!cli_state && copy_value(state_dir, state_cap, value) != 0) { fclose(f); return -1; }
+        } else if (strcmp(key, "QUEUE_NUM") == 0) {
+            char *end = NULL;
+            long v = strtol(value, &end, 10);
+            if (!end || *end || v < 0 || v > 65535) { fclose(f); return -1; }
+            if (!cli_queue) { *queue = (int)v; }
+        }
+    }
+    int err = ferror(f) ? -1 : 0;
+    fclose(f);
+    return err;
+}
+
+static int split_listen(const char *listen, char *host, size_t host_cap,
+                        char *port, size_t port_cap) {
+    const char *start = listen, *colon = NULL;
+    size_t host_len;
+    if (listen[0] == '[') {
+        const char *end = strchr(listen, ']');
+        if (!end || end[1] != ':') { return -1; }
+        start = listen + 1;
+        host_len = (size_t)(end - start);
+        colon = end + 1;
+    } else {
+        colon = strrchr(listen, ':');
+        if (!colon) { return -1; }
+        host_len = (size_t)(colon - start);
+    }
+    if (host_len == 0 || host_len >= host_cap || strlen(colon + 1) >= port_cap) { return -1; }
+    memcpy(host, start, host_len);
+    host[host_len] = '\0';
+    if (copy_value(port, port_cap, colon + 1) != 0) { return -1; }
+    char *end = NULL;
+    long p = strtol(port, &end, 10);
+    return end && *end == '\0' && p > 0 && p <= 65535 ? 0 : -1;
+}
+
+static int listen_socket(const char *addr) {
+    char host[256], port[16];
+    if (split_listen(addr, host, sizeof host, port, sizeof port) != 0) {
+        say("неверный адрес панели: %s", addr);
+        return -1;
+    }
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICSERV;
+    struct addrinfo *res = NULL;
+    int e = getaddrinfo(host, port, &hints, &res);
+    if (e != 0) { say("адрес панели %s: %s", addr, gai_strerror(e)); return -1; }
+    int listener = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        listener = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (listener < 0) { continue; }
+        int yes = 1;
+        (void)setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+        if (bind(listener, ai->ai_addr, ai->ai_addrlen) == 0 && listen(listener, 16) == 0) { break; }
+        close(listener);
+        listener = -1;
+    }
+    freeaddrinfo(res);
+    if (listener < 0) { say("не удалось открыть панель на %s: %s", addr, strerror(errno)); }
+    return listener;
+}
+
+static int is_loopback_addr(const char *addr) {
+    char host[256], port[16];
+    if (split_listen(addr, host, sizeof host, port, sizeof port) != 0) { return 0; }
+    return strcmp(host, "localhost") == 0 || strcmp(host, "127.0.0.1") == 0 ||
+           strcmp(host, "::1") == 0;
+}
+
+static void set_state_note(const char *dir, char *out, size_t cap) {
+    struct stat st;
+    if (stat(dir, &st) != 0) {
+        snprintf(out, cap, "%s", errno == ENOENT ? "не создан" : "недоступен");
+    } else if (!S_ISDIR(st.st_mode)) {
+        snprintf(out, cap, "существует, но это не каталог");
+    } else {
+        snprintf(out, cap, "есть");
+    }
+}
+
+static int serve(const char *listen_addr, const char *live_path, const char *asset_dir,
+                 const char *config_path, const char *mode, const char *state_dir,
+                 int queue, const char *log_path) {
+    if (log_path && log_path[0]) {
+        int logfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (logfd < 0) { say("не открыть журнал %s: %s", log_path, strerror(errno)); return 1; }
+        (void)dup2(logfd, STDOUT_FILENO);
+        (void)dup2(logfd, STDERR_FILENO);
+        close(logfd);
+    }
+    char unknown[UNKNOWN_MAX][UNKNOWN_KEY_MAX];
+    const char *unknown_ptrs[UNKNOWN_MAX];
+    size_t n_unknown = 0;
+    int config_exists = 0;
+    char config_mode[32];
+    char config_listen[256];
+    char config_state[512];
+    snprintf(config_mode, sizeof config_mode, "%s", mode);
+    snprintf(config_listen, sizeof config_listen, "%s", listen_addr);
+    snprintf(config_state, sizeof config_state, "%s", state_dir);
+    if (read_config(config_path, config_mode, sizeof config_mode,
+                    config_listen, sizeof config_listen,
+                    config_state, sizeof config_state, &queue,
+                    1, 1, 1, 1, unknown, &n_unknown, &config_exists) != 0) {
+        say("не прочитать конфигурацию %s", config_path);
+        return 1;
+    }
+    if (!listen_addr || !listen_addr[0]) {
+        say("PANEL_LISTEN пуст — панель выключена");
+        return 0;
+    }
+    int listener = listen_socket(listen_addr);
+    if (listener < 0) { return 1; }
+    if (!is_loopback_addr(listen_addr)) {
+        say("внимание: панель слушает не на петле (%s) и не имеет аутентификации", listen_addr);
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    (void)sigaction(SIGINT, &sa, NULL);
+    (void)sigaction(SIGTERM, &sa, NULL);
+
+    char state_note[128];
+    set_state_note(config_state, state_note, sizeof state_note);
+    for (size_t i = 0; i < n_unknown; i++) { unknown_ptrs[i] = unknown[i]; }
+    d2k_panel_config cfg = {
+        .live_path = live_path,
+        .asset_dir = asset_dir,
+        .version = D2K_PANEL_VERSION,
+        .commit = D2K_PANEL_COMMIT,
+        .built = D2K_PANEL_BUILT,
+        .mode = config_mode,
+        .panel_listen = config_listen,
+        .config_path = config_path,
+        .state_dir = config_state,
+        .state_dir_note = state_note,
+        .unknown_keys = unknown_ptrs,
+        .unknown_key_count = n_unknown,
+        .started_epoch = (long long)time(NULL),
+        .queue_num = queue,
+        .config_exists = config_exists,
+        .dirty = D2K_PANEL_DIRTY,
+    };
+    printf("d2kpanel %s\nhttp://%s/\n", D2K_PANEL_VERSION, listen_addr);
+    fflush(stdout);
+
+    while (!stop_requested) {
+        int client = accept(listener, NULL, NULL);
+        if (client < 0) {
+            if (errno == EINTR) { continue; }
+            if (stop_requested) { break; }
+            say("accept: %s", strerror(errno));
+            continue;
+        }
+        struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
+        (void)setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+        (void)setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+        (void)d2k_panel_handle_fd(client, &cfg);
+        close(client);
+    }
+    close(listener);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (d2k_panel_ignore_sigpipe() != 0) {
+        say("не удалось настроить обработку разрыва HTTP-клиента: %s", strerror(errno));
+        return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        printf("d2kpanel %s commit %s\n", D2K_PANEL_VERSION, D2K_PANEL_COMMIT);
+        return 0;
+    }
+    if (argc < 2 || strcmp(argv[1], "serve") != 0) {
+        usage(stderr);
+        return 2;
+    }
+    const char *config_path = "/opt/d2k/config";
+    char live_path[768] = "";
+    char asset_dir[768] = "/opt/d2k/panel";
+    char listen_addr[256] = "127.0.0.1:8090";
+    char mode[32] = "observe";
+    char state_dir[512] = "/opt/d2k/state";
+    int queue = 2000;
+    const char *log_path = NULL;
+    int cli_listen = 0, cli_mode = 0, cli_state = 0, cli_queue = 0;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) { config_path = argv[++i]; }
+        else if (strcmp(argv[i], "--live") == 0 && i + 1 < argc) {
+            if (copy_value(live_path, sizeof live_path, argv[++i]) != 0) { return 2; }
+        } else if (strcmp(argv[i], "--assets") == 0 && i + 1 < argc) {
+            if (copy_value(asset_dir, sizeof asset_dir, argv[++i]) != 0) { return 2; }
+        } else if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
+            if (copy_value(listen_addr, sizeof listen_addr, argv[++i]) != 0) { return 2; }
+            cli_listen = 1;
+        } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            if (copy_value(mode, sizeof mode, argv[++i]) != 0) { return 2; }
+            cli_mode = 1;
+        } else if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc) {
+            if (copy_value(state_dir, sizeof state_dir, argv[++i]) != 0) { return 2; }
+            cli_state = 1;
+        } else if (strcmp(argv[i], "--queue") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            long v = strtol(argv[++i], &end, 10);
+            if (!end || *end || v < 0 || v > 65535) { return 2; }
+            queue = (int)v;
+            cli_queue = 1;
+        } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) { log_path = argv[++i]; }
+        else { usage(stderr); return 2; }
+    }
+    if (!valid_mode(mode)) { say("недопустимый MODE: %s", mode); return 2; }
+    if (!cli_listen || !cli_mode || !cli_state || !cli_queue) {
+        char unknown[UNKNOWN_MAX][UNKNOWN_KEY_MAX];
+        size_t n_unknown = 0;
+        int exists = 0;
+        if (read_config(config_path, mode, sizeof mode, listen_addr, sizeof listen_addr,
+                        state_dir, sizeof state_dir, &queue,
+                        cli_mode, cli_listen, cli_state, cli_queue,
+                        unknown, &n_unknown, &exists) != 0) {
+            say("не разобрать конфигурацию %s", config_path);
+            return 1;
+        }
+    }
+    if (!live_path[0]) {
+        int n = snprintf(live_path, sizeof live_path, "%s/live.json", state_dir);
+        if (n < 0 || (size_t)n >= sizeof live_path) { return 2; }
+    }
+    return serve(listen_addr, live_path, asset_dir, config_path, mode,
+                 state_dir, queue, log_path);
+}

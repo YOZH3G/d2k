@@ -1,0 +1,10 @@
+# Конфигурация d2k. Файл принадлежит владельцу: установщик его не
+# перезаписывает при обновлении.
+SCHEMA=1
+MODE=observe
+PANEL_LISTEN=127.0.0.1:8090
+STATE_DIR=/opt/d2k/state
+QUEUE_NUM=2000
+CONTROL_SOCKET=/opt/d2k/run/d2kd.sock
+DECOY_SNI=disk.rzd.ru
+MARK=0x2d

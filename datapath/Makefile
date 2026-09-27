@@ -41,9 +41,9 @@ HDR     = include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h in
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_hold test_udp_hold test_udp_release test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_quic_session
+TESTS   = test_hold test_udp_hold test_udp_release test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session
 
-.PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-udp-release cross clean
+.PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release cross clean
 
 all: planlab ctlprobe
 
@@ -174,6 +174,10 @@ test_session: test_session.c session.o hold.o capture.o nat.o track.o tls.o wire
 test_quic_session: test_quic_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quic_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
 
+# Keep the STUN datapath proof independently runnable while QUIC acceptance is deferred.
+test_stun_session: test_stun_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_stun_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
+
 track.o: track.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -270,6 +274,9 @@ test-ctl: test_ctl
 test-quic-session: test_quic_session
 	./test_quic_session
 
+test-stun-session: test_stun_session
+	./test_stun_session
+
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а весь датапат состоит из разбора чужих байтов. Отдельная цель,
 # потому что -fsanitize замедляет и не собирается частью кросс-компиляторов.
@@ -285,7 +292,7 @@ SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=al
 san:
 	@set -e; for t in $(TESTS); do \
 		echo "== $$t =="; \
-		extra=; if [ "$$t" = test_quic_session ]; then extra="$(CORE_DIR)/quichello.c $(CORE_DIR)/hello.c $(CORE_DIR)/tls13core.c $(CORE_DIR)/x25519.c"; fi; \
+		extra=; if [ "$$t" = test_quic_session ] || [ "$$t" = test_stun_session ]; then extra="$(CORE_DIR)/quichello.c $(CORE_DIR)/hello.c $(CORE_DIR)/tls13core.c $(CORE_DIR)/x25519.c"; fi; \
 		$(CC) $(SANFLAGS) -o /tmp/d2k-san-$$t $$t.c \
 			$$(echo "$(SRC)" | tr ' ' '\n' | grep -v '^$$') $(CORESRC) $$extra; \
 		/tmp/d2k-san-$$t; \
@@ -365,7 +372,7 @@ test-ctlprobe: test_ctlprobe
 
 .PHONY: test-ctlprobe
 
-check: all test-hold test-udp-hold test-udp-release test-capture test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-ctlprobe
+check: all test-hold test-udp-hold test-udp-release test-capture test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-stun-session test-quic-session test-ctlprobe
 
 clean:
 	rm -f *.o $(TESTS) test_ctlprobe planlab ctlprobe d2kd

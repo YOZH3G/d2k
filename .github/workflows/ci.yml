@@ -18,6 +18,16 @@ env:
   GO_VERSION: "1.25.12"
 
 jobs:
+  panel:
+    name: C-панель — HTTP, CLI и безопасность
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Тесты C-панели и браузерного renderer
+        run: make -C panel test
+      - name: ASan и UBSan HTTP-handler
+        run: make -C panel san
+
   go:
     name: Go — формат, vet, тесты
     runs-on: ubuntu-latest

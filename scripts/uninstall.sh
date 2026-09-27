@@ -41,8 +41,8 @@ say "правила сняты"
 # Хук NDM снимается ПЕРВЫМ: оставленный, он будет звать сторожа, которого уже
 # нет, на каждое изменение netfilter — мусор в журнале на ровном месте.
 rm -f /opt/etc/ndm/netfilter.d/001-d2k.sh
-rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kc" "$SBIN/d2kd"
-rm -rf "$DIR/run" "$DIR/log"
+rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd"
+rm -rf "$DIR/run" "$DIR/log" "$DIR/panel"
 
 if [ "$KEEP" = "1" ]; then
     say "каталог изученных коробок оставлен в $DIR/state"

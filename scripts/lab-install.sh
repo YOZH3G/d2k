@@ -56,8 +56,7 @@ command -v start-stop-daemon >/dev/null || fail "нет start-stop-daemon — у
 
 case "$(uname -m)" in
     aarch64|arm64) ARCH=arm64 ;;
-    x86_64)        ARCH=amd64 ;;
-    *) fail "лаборатория умеет только arm64 и amd64, а здесь $(uname -m)" ;;
+    *) fail "C runtime устанавливается только под ARM64, а лаборатория запущена на $(uname -m)" ;;
 esac
 echo "арка: $(uname -m) -> $ARCH"
 
@@ -67,12 +66,14 @@ echo "== сборка того, что будет установлено =="
 make -s -C core d2kc
 make -s -C datapath d2kd
 
-mkdir -p "$REL/builds" "$REL/files/fake"
+mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets"
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
-[ -f "builds/d2k-linux-$ARCH" ] || fail "нет builds/d2k-linux-$ARCH — панель собирается отдельно (scripts/build.sh)"
-cp "builds/d2k-linux-$ARCH" "$REL/builds/"
-cp files/S99d2k files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
+make -s -C panel clean >/dev/null
+make -s -C panel d2kpanel
+cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
+cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js "$REL/internal/web/assets/"
+cp files/S99d2k files/config files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
 cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fake/"
 
 # СНИМОК ЧИСТОЙ СИСТЕМЫ. По нему проверяются и остановка, и удаление: обе
@@ -90,7 +91,26 @@ grep -q "готово" /tmp/install1.log || fail "установка с чист
 "$INIT" status | grep -q "очередь .*привязана" || fail "очередь не привязана"
 [ -x /opt/sbin/d2kd ] || fail "d2kd не установлен"
 [ -x /opt/sbin/d2kc ] || fail "d2kc не установлен"
+[ -x /opt/sbin/d2kpanel ] || fail "C-панель не установлена"
+[ ! -x /opt/sbin/d2k ] || fail "legacy Go-панель осталась установленной"
+[ -s "$DIR/panel/index.html" ] && [ -s "$DIR/panel/panel.css" ] && [ -s "$DIR/panel/panel.js" ] || fail "не установлены статические ресурсы панели"
 [ -x "$INIT" ]        || fail "init-скрипт не установлен"
+[ -f "$DIR/run/d2k-panel.pid" ] || fail "C-панель не получила pid-файл"
+PANEL_PID=$(cat "$DIR/run/d2k-panel.pid")
+[ -d "/proc/$PANEL_PID" ] || fail "C-панель умерла после старта"
+PANEL_OK=0
+i=0
+while [ "$i" -lt 30 ]; do
+    if curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-status.json; then
+        PANEL_OK=1
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.1
+done
+[ "$PANEL_OK" = 1 ] || fail "C-панель не отдала /api/status"
+grep -q '"snapshot"' /tmp/d2k-panel-status.json || fail "API не вернул status snapshot"
+curl -fsS http://127.0.0.1:8090/ | grep -q 'id="app"' || fail "C-панель не отдала главную страницу"
 echo "установлено и работает"
 
 echo "== 2. переход версии =="
@@ -101,15 +121,15 @@ PID_BEFORE=$(cat "$DIR/run/d2kd.pid")
 # ДРУГИЕ БАЙТЫ, ТО ЖЕ ПОВЕДЕНИЕ: пересобираем с другой оптимизацией. Это
 # настоящая смена версии с точки зрения установщика (файл другой), и при
 # этом не требует выдумывать «версию 2» там, где её ещё нет.
-make -s -C datapath clean >/dev/null
-make -s -C datapath d2kd CFLAGS="-std=c99 -O1 -Wall -Wextra -Werror -Iinclude -I../core/include"
-cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
-SHA_NEW=$(sha "$REL/builds/d2kd-linux-$ARCH")
-[ "$SHA_NEW" != "$(sha /opt/sbin/d2kd)" ] || fail "новая сборка побайтно совпала со старой — переход версии не проверить"
+make -s -C panel clean >/dev/null
+make -s -C panel d2kpanel CFLAGS="-O1 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L"
+cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
+SHA_NEW=$(sha "$REL/builds/d2kpanel-linux-$ARCH")
+[ "$SHA_NEW" != "$(sha /opt/sbin/d2kpanel)" ] || fail "новая сборка побайтно совпала со старой — переход версии не проверить"
 
 D2K_LOCAL="$REL" sh scripts/install.sh 2>&1 | tee /tmp/install2.log
 grep -q "готово" /tmp/install2.log || fail "переход версии не прошёл: $(tail -3 /tmp/install2.log)"
-[ "$(sha /opt/sbin/d2kd)" = "$SHA_NEW" ] || fail "после обновления на месте осталась старая версия"
+[ "$(sha /opt/sbin/d2kpanel)" = "$SHA_NEW" ] || fail "после обновления на месте осталась старая C-панель"
 grep -q "^# метка человека" "$DIR/config" || fail "обновление затёрло конфигурацию человека"
 PID_AFTER=$(cat "$DIR/run/d2kd.pid")
 [ "$PID_AFTER" != "$PID_BEFORE" ] || fail "служба не перезапустилась — работает старый процесс"
@@ -117,14 +137,14 @@ PID_AFTER=$(cat "$DIR/run/d2kd.pid")
 echo "версия сменилась, конфигурация сохранена, служба перезапущена"
 
 echo "== 3. неудачное обновление не трогает работающую =="
-SHA_OK=$(sha /opt/sbin/d2kd)
+SHA_OK=$(sha /opt/sbin/d2kpanel)
 PID_OK=$(cat "$DIR/run/d2kd.pid")
-printf 'это не бинарник' > "$REL/builds/d2kd-linux-$ARCH"
+printf 'это не бинарник' > "$REL/builds/d2kpanel-linux-$ARCH"
 if D2K_LOCAL="$REL" sh scripts/install.sh >/tmp/badinstall.log 2>&1; then
     fail "установщик принял испорченный бинарник"
 fi
 grep -q "не запускается" /tmp/badinstall.log || fail "отказ произошёл не там, где ждали: $(tail -1 /tmp/badinstall.log)"
-[ "$(sha /opt/sbin/d2kd)" = "$SHA_OK" ] || fail "неудачное обновление подменило рабочий бинарник"
+[ "$(sha /opt/sbin/d2kpanel)" = "$SHA_OK" ] || fail "неудачное обновление подменило рабочую C-панель"
 [ "$(cat "$DIR/run/d2kd.pid")" = "$PID_OK" ] || fail "неудачное обновление уронило работающую службу"
 [ -d "/proc/$PID_OK" ] || fail "процесс службы умер после неудачного обновления"
 "$INIT" status | grep -q "правила: стоят" || fail "неудачное обновление сняло правила"
@@ -152,6 +172,8 @@ echo "== 6. удаление =="
 sh scripts/uninstall.sh >/dev/null
 [ -e /opt/sbin/d2kd ] && fail "после удаления остался d2kd"
 [ -e /opt/sbin/d2kc ] && fail "после удаления остался d2kc"
+[ -e /opt/sbin/d2kpanel ] && fail "после удаления осталась C-панель"
+[ -e "$DIR/panel" ] && fail "после удаления остались ресурсы панели"
 [ -e "$INIT" ]        && fail "после удаления остался init-скрипт"
 [ "$(rules)" = "$CLEAN_RULES" ] || fail "после удаления список правил не совпал с исходным"
 # Каталог изученных коробок по умолчанию сохраняется — это заявленное

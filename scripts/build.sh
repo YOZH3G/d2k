@@ -1,15 +1,14 @@
 #!/bin/sh
-# Сборка d2k. Единственный источник правды о том, чем и подо что собирается
-# обвязка на Go.
+# Сборка артефактов D2K. Go CLI ниже остаётся инструментом разработки и
+# сверки; устанавливаемые runtime-компоненты собираются на C.
 #
 # Арки и их флаги унаследованы из build-matrix.tsv репозитория z2k, а не
 # выбраны заново: они подобраны на живых коробках, и расхождение здесь стоило
 # бы того же, чего стоило там — бинарника, который никто ни разу не проверил.
 # GOMIPS=softfloat обязателен: на MIPS-роутерах нет сопроцессора.
 #
-# Датапат на C здесь пока не собирается — его ещё нет. Когда появится, ему
-# нужен будет тулчейн Entware/OpenWrt с musl или uclibc: проверено 05-09, что
-# у обычного кросс-gcc нет soft-float-варианта glibc и -msoft-float падает.
+# Целевые C-runtime собираются статически через Zig/musl под реально
+# проверенную архитектуру ARM64. Нельзя выдавать Go CLI за продуктовую панель.
 set -eu
 
 GO=${GO:-go}
@@ -87,7 +86,9 @@ else
     ROOT=$(CDPATH='' cd -- "$HERE/.." && pwd)
     make -C "$ROOT/datapath" d2kd-linux-arm64 >/dev/null
     make -C "$ROOT/core"     d2kc-linux-arm64 >/dev/null
-    for f in d2kd-linux-arm64 d2kc-linux-arm64; do
+    make -C "$ROOT/panel" d2kpanel-linux-arm64 \
+        VERSION="$version" COMMIT="$commit" BUILT="$date" DIRTY="$dirty" >/dev/null
+    for f in d2kd-linux-arm64 d2kc-linux-arm64 d2kpanel-linux-arm64; do
         printf '  %-22s %8s байт\n' "$f" "$(wc -c < "$OUT/$f" | tr -d ' ')"
     done
 fi

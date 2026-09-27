@@ -4,7 +4,8 @@
 # BusyBox ash. Никаких башизмов: на роутере другого шелла нет.
 #
 # Два процесса, и это намеренно (§7.1 документа): падение планировщика не
-# должно ронять разбор пакетов. d2kd видит пакеты, d2k подбирает и показывает.
+# должно ронять разбор пакетов. d2kd видит пакеты, d2kc подбирает, d2kpanel
+# независимо показывает состояние.
 #
 # Правила firewall живут в СВОИХ цепочках. Не в общих с комментарием: уборка
 # по комментарию однажды промахнулась мимо правила, поставленного чуть иначе,
@@ -38,16 +39,10 @@ fi
 
 NAME=d2k
 DIR=/opt/d2k
-# Контроллер — d2kc, на C. До 11.09.2026 здесь стоял Go-процесс `d2k serve`;
-# он удалён вместе со своей половиной дерева (задача 6 плана перехода): §12
-# требовал держать Go ровно до тех пор, пока ядро на C не пройдёт те же живые
-# замеры, и оно их прошло. Бинарник /opt/sbin/d2k остаётся в системе только
-# ради панели — служба его больше не запускает.
+# Контроллер и панель — независимые процессы на C. Панель read-only.
 BIN=/opt/sbin/d2kc
-# Панель — тот самый Go-бинарник, но ТОЛЬКО панель: подкоманда serve после
-# 11.09.2026 поднимает веб-страницу и больше ничего, а узнанное читает из
-# файла, который пишет движок (state/live.json).
-PANELBIN=/opt/sbin/d2k
+PANELBIN=/opt/sbin/d2kpanel
+PANEL_ASSETS=$DIR/panel
 DPBIN=/opt/sbin/d2kd
 CONF=$DIR/config
 RUN=$DIR/run
@@ -75,6 +70,8 @@ CHAIN_IN=D2K_IN
 
 # Значения по умолчанию; конфигурация их перекрывает.
 QUEUE_NUM=2000
+PANEL_LISTEN=127.0.0.1:8090
+STATE_DIR=$DIR/state
 MARK=0x2d
 # Controller probes must traverse NFQUEUE for exact trial Plans, while raw
 # packets emitted by d2kd bypass it using MARK. Keep a distinct observable
@@ -371,7 +368,10 @@ start() {
     # а не die.
     if [ -x "$PANELBIN" ]; then
         start-stop-daemon -S -b -m -p "$PN_PID" -x "$PANELBIN" -- serve \
-            -log "$LOG/panel.log" || say "панель не запустилась — обход это не затрагивает"
+            --config "$CONF" --live "$STATE_DIR/live.json" --assets "$PANEL_ASSETS" \
+            --listen "$PANEL_LISTEN" --state-dir "$STATE_DIR" --mode "$MODE" \
+            --queue "$QUEUE_NUM" --log "$LOG/panel.log" \
+            || say "панель не запустилась — обход это не затрагивает"
     fi
 
     say "запущен: очередь $QUEUE_NUM, режим $MODE"
