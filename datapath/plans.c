@@ -186,6 +186,22 @@ static entry *find_name_shape_port(d2k_plantab *t, const uint8_t *name, size_t l
     return NULL;
 }
 
+/* Точный временный порт зонда остаётся авторитетным, если его первый
+   ClientHello-сегмент ещё не позволяет классифицировать форму. Это не
+   ослабляет постоянные записи: только запись, закреплённая за ненулевым
+   локальным портом, может быть найдена этим путём. */
+static entry *find_name_port(d2k_plantab *t, const uint8_t *name, size_t len,
+                             uint16_t sport_be) {
+    if (!sport_be) { return NULL; }
+    for (size_t i = 0; i < t->used; i++) {
+        if (t->v[i].kind == KEY_NAME && t->v[i].only_sport == sport_be &&
+            name_eq(t->v[i].name, t->v[i].name_len, name, len)) {
+            return &t->v[i];
+        }
+    }
+    return NULL;
+}
+
 static entry *find_name_shape(d2k_plantab *t, const uint8_t *name, size_t len,
                               uint8_t shape) {
     return find_name_shape_port(t, name, len, shape, 0);
@@ -591,11 +607,20 @@ const d2k_plan *d2k_plantab_find_sport(d2k_plantab *t, const uint8_t *name,
         entry *e = NULL;
         if (sport_be != 0) {
             e = find_name_shape_port(t, name, len, seen_shape, sport_be);
+            if (!e && seen_shape == D2K_PLAN_SHAPE_ANY) {
+                /* Probe-specific SET_NAME carries the verifier's known shape;
+                   a segmented ClientHello may not reveal it in its first
+                   packet. Exact name+ephemeral-port identity is sufficient. */
+                e = find_name_port(t, name, len, sport_be);
+            }
             if (!e) {
                 e = find_name_shape_port(t, name, len, D2K_PLAN_SHAPE_GRANDFATHER, sport_be);
             }
             if (e) {
                 e->last_used_ns = now_ns;
+                if (seen_shape == D2K_PLAN_SHAPE_ANY && e->only_sport == sport_be) {
+                    return e->plan;
+                }
                 if (shape_fits(e->shape, seen_shape)) {
                     return e->plan;
                 }

@@ -262,13 +262,23 @@ if [ $LEARN = 1 ]; then
     # Исходящее локальное УЖЕ проходит POSTROUTING, как и транзит.
     # Второе NFQUEUE в OUTPUT отдало бы пакет тому же движку дважды.
     # Только ответы зонду нуждаются в дополнительном INPUT вместо FORWARD.
+    # Router-originated probes не имеют LAN SRC/DST, поэтому сужать их INPUT
+    # по RNARROW нельзя. Их SO_MARK сохраняется в conntrack на OUTPUT, а в
+    # INPUT выбираются строго conntrack-потоки этой метки — чужие запросы
+    # самого роутера не попадают в очередь.
+    # Отдельное POSTROUTING также необходимо: обычное правило выше ограничено
+    # LAN-источником SRC, которого у локального зонда нет. Только сокеты с
+    # probe SO_MARK получают это исключение и попадают на datapath, чтобы
+    # выбранный Plan действительно применился к собственному verifier-зонду.
     #
     # Сужение здесь ОБЯЗАТЕЛЬНО, и его отсутствие стоило прогона: 06.09.2026
     # опыт по linkedin собрал подозрения по facebook, потому что эти два
     # правила забирали ВЕСЬ 443-й порт самого роутера — а на нём живут и
     # вебпанель, и прокси, и обновления. §2.6 требует узкого опыта не ради
     # вежливости: применение плана к чужому соединению это уже не эксперимент.
-    iptables -t mangle -I INPUT -p tcp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS -m mark --mark $CTL_MARK -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I OUTPUT -m mark --mark $CTL_MARK -m comment --comment $TOKEN -j CONNMARK --save-mark
+    iptables -t mangle -I INPUT -m connmark --mark $CTL_MARK -p tcp --sport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
 if [ $VOICE = 1 ]; then
     # Первые пакеты туда: IP Discovery и повторы — по ним датапат узнаёт

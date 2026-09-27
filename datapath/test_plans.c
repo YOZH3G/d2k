@@ -337,6 +337,9 @@ int main(void) {
             CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_MODERN, sport)
                       == probe_plan,
                   "поток зонда не получил пробный план");
+            CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_ANY, sport)
+                      == probe_plan,
+                  "точный поток зонда потерял временный план из-за неполного ClientHello");
             /* Чужой поток — НЕ получает: для него этой записи нет вовсе. */
             CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 3, D2K_PLAN_SHAPE_MODERN, 0x9988)
                       == NULL,

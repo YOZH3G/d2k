@@ -109,6 +109,12 @@ extern d2k_sched_vol_fn  d2k_sched_vol_hook;
 typedef int (*d2k_sched_bind_fn)(uint8_t transport, int *out_fd, uint16_t *sport_be);
 extern d2k_sched_bind_fn d2k_sched_bind_hook;
 
+/* Separate from the global measurement mark hook: scheduler tests replace
+ * only verifier-socket marking and must not alter unrelated measurement or
+ * voice fixtures. */
+typedef int (*d2k_sched_mark_fn)(int fd, uint32_t mark);
+extern d2k_sched_mark_fn d2k_sched_mark_hook;
+
 /* Зонд подтверждения (d2k_verify.h). Крючок нужен по той же причине, что и
  * три выше, и ещё по одной: этот зонд ведёт НАСТОЯЩЕЕ рукопожатие TLS 1.3 с
  * настоящим сервером, и модульный тест обязан утверждать, что планировщик

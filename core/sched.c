@@ -65,6 +65,7 @@
 #include "d2k_sched.h"
 #include "d2k_verify.h"
 #include "d2k_volume.h"
+#include "d2k_meas.h"
 
 /* --------------------------------------------------------------------
  * Пределы. Перенесены с Go-стороны (internal/controller/controller.go, блок
@@ -277,7 +278,12 @@ static int bind_default(uint8_t transport, int *out_fd, uint16_t *sport_be) {
                              : d2k_props_bind(out_fd, sport_be);
 }
 
+static int mark_default(int fd, uint32_t mark) {
+    return d2k_mark_hook(fd, mark);
+}
+
 d2k_sched_bind_fn d2k_sched_bind_hook = bind_default;
+d2k_sched_mark_fn d2k_sched_mark_hook = mark_default;
 d2k_sched_vol_fn  d2k_sched_vol_hook  = d2k_volume_probe;
 /* Прежнее дерево вердиктов (core/verdict.c) отмены не умеет: у него нет ни
    контекста, ни проверок между зондами. Переходник это НЕ скрывает — он
@@ -346,6 +352,8 @@ typedef enum {
 /* Что делает рабочий поток задачи. Потоки заводятся только под сетевые
    оракулы; управляющего сокета они не касаются (см. шапку d2k_sched.h). */
 typedef enum { JOB_NONE = 0, JOB_CLASSIFY, JOB_CONTACT, JOB_VERIFY, JOB_VOICE } task_job;
+
+static int is_voice_class(const char *name, uint8_t transport);
 
 typedef struct {
     task_state state;
@@ -1876,6 +1884,21 @@ static int install_next(d2k_sched *s, task *t) {
             if (bound == 0) {
                 t->probe_fd = pfd;
                 t->probe_sport_be = psport;
+                /* Проверочный сокет должен пройти те же NFQUEUE-правила,
+                   что и собственные измерения контроллера. Без SO_MARK
+                   широкая привязка по LAN-клиенту исключает локальный
+                   verifier: он подключается с адреса роутера и его Plan не
+                   применяется к собственному потоку. Не ставим trial, если
+                   метка не установилась — иначе verifier проверит обход
+                   мимо datapath и даст ложный отказ кандидата. */
+                if (s->mark != 0 && !is_voice_class(t->name, t->transport) &&
+                    d2k_sched_mark_hook(pfd, s->mark) != 0) {
+                    say(s, "по %s не удалось пометить сокет зонда меткой контроллера; "
+                           "кандидат не ставлю", t->name);
+                    close(t->probe_fd);
+                    t->probe_fd = -1;
+                    return -2;
+                }
             } else {
                 /* ПОРТ НЕ ЗАНЯЛСЯ — КАНДИДАТ НЕ СТАВИТСЯ ВОВСЕ (0010, R1).
                    Раньше здесь план уезжал с нулевым портом, то есть

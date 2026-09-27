@@ -186,6 +186,15 @@ static uint8_t ver_last_transport;
 static d2k_ver_level ver_answer = D2K_VER_APPLICATION;
 static uint16_t ver_answer_port;
 static uint8_t ver_local_ip4[4] = {192, 168, 1, 67};
+static int mark_calls;
+static uint32_t last_mark;
+
+static int stub_mark(int fd, uint32_t mark) {
+    (void)fd;
+    mark_calls++;
+    last_mark = mark;
+    return 0;
+}
 
 /* Подменённый подбор плеча QUIC: настоящий ходит в сеть десятками опытов, а
    тест обязан утверждать поведение планировщика, не выходя наружу. */
@@ -762,6 +771,7 @@ static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
 }
 
 int main(int argc, char **argv) {
+    d2k_sched_mark_fn saved_mark = d2k_sched_mark_hook;
     int voice_only = argc == 2 && strcmp(argv[1], "--voice-only") == 0;
     if (argc > 1 && !voice_only) {
         fprintf(stderr, "usage: test_sched [--voice-only]\n");
@@ -797,6 +807,7 @@ int main(int argc, char **argv) {
        рукопожатием TLS 1.3, а стенд этого теста TLS не умеет — тест мерил бы
        стенд. */
     d2k_sched_ver_hook = stub_ver;
+    d2k_sched_mark_hook = stub_mark;
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -820,6 +831,7 @@ int main(int argc, char **argv) {
         d2k_catalog empty = {0};
         d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
         tcp_owns_search = 1;
+        mark_calls = 0;
         tcp_answer = mode == 4 ? D2K_V_FLAKY :
             mode == 0 || mode == 3 ? D2K_V_OPAQUE : mode == 1 ? D2K_V_PREFIX : D2K_V_WHOLE;
         tcp_found_arm = mode == 3;
@@ -836,6 +848,10 @@ int main(int argc, char **argv) {
         CHECK(!said("запасного перебора"), "second fallback search after original");
         CHECK(mode == 0 || mode == 4 ? ver_calls == 0 : ver_calls == 1,
               "original split solution lost or extra candidates tested");
+        if (mode == 1) {
+            CHECK(mark_calls > 0 && last_mark == 0x2d,
+                  "сокет verifier-зонда не получил метку контроллера");
+        }
         d2k_sched_free(s); d2k_catalog_free(&empty);
     }
     tcp_owns_search = tcp_found_arm = 0; tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
@@ -4401,6 +4417,7 @@ voice_only_done:
     close(sv[0]);
     close(sv[1]);
     d2k_catalog_free(&cat);
+    d2k_sched_mark_hook = saved_mark;
 
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }
     printf(voice_only ? "voice scheduler: all checks passed\n" :
