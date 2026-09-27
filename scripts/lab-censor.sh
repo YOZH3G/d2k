@@ -421,17 +421,22 @@ echo "== обращение пользователя к заблокирован
 # ЖЕ клиента, которому потом предстоит работать. Мерить коротким приветствием
 # зонда, а проверять длинным приветствием браузера — это и есть седьмая
 # находка лаборатории.
+DIRECT_CLIENT_OK=0
 for n in 1 2 3; do
-    real_client "$NAME" >/dev/null 2>&1 || true
+    if real_client "$NAME"; then
+        DIRECT_CLIENT_OK=$((DIRECT_CLIENT_OK + 1))
+    fi
     sleep 2
 done
 
 # Поиск идёт своим ходом: ждём результата, а не спим наугад.
-i=0
-while [ $i -lt 60 ]; do
-    grep -q "подтверждено\|привязк" /tmp/d2kc.log 2>/dev/null && break
-    i=$((i+1)); sleep 2
-done
+if [ "${D2K_LAB_NOCENSOR:-0}" != "1" ]; then
+    i=0
+    while [ $i -lt 60 ]; do
+        grep -q "подтверждено\|привязк" /tmp/d2kc.log 2>/dev/null && break
+        i=$((i+1)); sleep 2
+    done
+fi
 
 # ВТОРАЯ ЦЕЛЬ — уже после того, как коробка узнана по первой.
 if [ "${D2K_LAB_NOCENSOR:-0}" != "1" ]; then
@@ -509,6 +514,19 @@ kill "$DPID" 2>/dev/null || true; wait "$DPID" 2>/dev/null || true
 kill "$SRV" 2>/dev/null || true
 
 dump
+
+if [ "${D2K_LAB_NOCENSOR:-0}" = "1" ]; then
+    [ "$DIRECT_CLIENT_OK" -eq 3 ] || \
+        fail "здоровый прямой TLS прошёл у клиента $DIRECT_CLIENT_OK/3 раз"
+    if grep -q "подозрение\|начинаю поиск\|спрашиваю коробку" /tmp/d2kc.log; then
+        fail "здоровый прямой TLS ошибочно запустил поиск"
+    fi
+    if [ -s "$CAT" ] && grep -q '"target"' "$CAT"; then
+        fail "здоровый прямой TLS создал подтверждённую привязку"
+    fi
+    echo "КРИТЕРИЙ 1 ПОКАЗАН: прямой TLS 3/3; поиска и каталожной привязки нет"
+    exit 0
+fi
 
 if [ "${D2K_LAB_NOCENSOR:-0}" != "1" ] &&
    [ "${D2K_LAB_WRONGCERT:-0}" != "1" ] &&
