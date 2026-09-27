@@ -119,6 +119,11 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
     if (a.seqovl && !a.disorder && !a.between && !a.badsum && !a.ttl && !a.seq_out) {
         CHECK(parametric);
     }
+    if (a.seqovl_hello && a.disorder && !a.between &&
+        !a.badsum && !a.ttl && !a.seq_out) {
+        CHECK(parametric);
+        CHECK(strstr(text, "split sni_middle +0") != NULL);
+    }
     if (parametric) {
         /* Packet metadata below models parsed SNI; provide its complete
            record/handshake envelope too. Full real profiles are tested below. */
@@ -194,6 +199,10 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
             CHECK(d2k_hello_from_profile(k == 0 ? D2K_SHAPE_LEGACY : D2K_SHAPE_MODERN,
                   names[k], tr, sizeof tr, &other.trigger_len) == 0);
             CHECK(d2k_hello_sni(tr, other.trigger_len, &other.sni_off, &other.sni_len) == 0);
+            /* The overlap is captured strategy data, not regenerated from
+               the different verification ClientHello. */
+            memcpy(other.decoy, in.decoy, in.decoy_len);
+            other.decoy_len = in.decoy_len;
             pkt.payload_len = other.trigger_len;
             pkt.sni_off = other.sni_off; pkt.sni_len = other.sni_len;
             CHECK(d2k_plan_apply(p, NULL, &pkt, &out) == 0);
@@ -258,6 +267,8 @@ int main(void) {
     a.disorder = 1; run_case("fake-overlap-disorder", a, 1538, 1465);
     a.between = 1; a.repeats = 7; run_case("fake-between-priority", a, 1538, 1465);
     memset(&a, 0, sizeof a); a.disorder = 1; run_case("disorder", a, 1538, 0);
+    memset(&a, 0, sizeof a); a.seqovl_hello = 1; a.disorder = 1;
+    run_case("captured-overlap-disorder-dynamic-sni", a, 289, 173);
     a.seqovl = 336; run_case("partial-captured-overlap", a, 1538, 500);
     memset(&a, 0, sizeof a); a.badsum = 1; a.repeats = 7;
     run_case("long-filler-not-64", a, 2048, 0);

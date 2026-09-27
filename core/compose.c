@@ -1541,16 +1541,23 @@ int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
     if (between) { if (mid >= n) { mid = 1; } ov = 0; }
     else { if (mid < 2) { mid = 2; } if (mid >= n) { mid = n - 1; } }
     if (!fake && !between && !disorder && !ov) { return -1; }
-    /* Pure disorder has no captured payload dependency. raw.c computes
-     * the cut from each input's SNI, not from a stored literal offset.
-     * Reproduce that parameterization, with a full-input guard. Other arms
-     * retain exact lengths/offsets until their dependencies are expressed. */
-    if (disorder && !fake && !ov && in->sni_off > 0 && in->sni_len > 1) {
-        return append_fmt(buf, cap, &pos,
+    /* Перестановка режет вход не по измеренному числу, а по середине SNI.
+     * Поэтому длина и смещения конкретного ClientHello не являются
+     * зависимостью плана: зонд TLS 1.2 может построить своё приветствие с
+     * другим расположением имени. Перекрытие при этом остаётся снятой
+     * приманкой — именно её байты нужны для распознавания коробкой; якоря
+     * входа, а не доказанная приманка, должны быть параметрическими. */
+    if (disorder && !fake && in->sni_off > 0 && in->sni_len > 1) {
+        if (append_fmt(buf, cap, &pos,
             "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
-            "wire detect-tcp-v1\ninput tls-sni\nsegment %u\n"
-            "split payload_start +1\nsplit sni_middle +0\norder reverse\npace 12000\n",
-            (unsigned)D2K_ARM_SEGMENT_MAX);
+            "wire detect-tcp-v1\ninput tls-sni\nsegment %u\n",
+            (unsigned)D2K_ARM_SEGMENT_MAX)) { return -1; }
+        if (ov) {
+            if (measured_payload(buf, cap, &pos, 2, ov, in->decoy, in->decoy_len) ||
+                append_fmt(buf, cap, &pos, "seqovl payload=2 poison=0\n")) { return -1; }
+        }
+        return append_fmt(buf, cap, &pos,
+            "split payload_start +1\nsplit sni_middle +0\norder reverse\npace 12000\n");
     }
     /* ВХОД ПРИШПИЛИВАЕТСЯ К ДЛИНЕ ТОЛЬКО ТАМ, ГДЕ ПЛАН ОТ НЕЁ ЗАВИСИТ.
      *
