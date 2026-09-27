@@ -137,6 +137,7 @@ struct d2k_session {
      * Признак по транспорту, а не один на всё: правила на TCP и на UDP —
      * разные строки, и наличие одной ничего не говорит о другой. */
     int      rev_seen[2];
+    int      udp_reverse_hook;
 
     int      shape_armed[2];
     uint8_t  shape_name[2][256];
@@ -325,7 +326,8 @@ static void on_flow_expire(void *ctx, const d2k_flow *f) {
        сервер невидим, и молчащим выглядит каждый поток. Улика тут сессионная
        (см. rev_seen): к моменту забвения поток мог не получить ни одного
        пакета оттуда именно потому, что его и не ждали. */
-    if (!s->rev_seen[slot_of(f->key.proto)]) {
+    if (!s->rev_seen[slot_of(f->key.proto)] &&
+        !(f->key.proto == 17 && s->udp_reverse_hook)) {
         return;
     }
     s->suspects++;
@@ -720,6 +722,8 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        первых датаграммах клиентской стороны потока (сама датаграмма, её
        повтор, новый Initial после Retry), а дальше разбор ничего не найдёт
        и будет чистой тратой на каждом пакете загрузки. */
+    int held_first_replay = fl->udp_hold_replay_first != 0;
+    fl->udp_hold_replay_first = 0;
     fl->fwd_pkts++; /* счётчик попыток разбора клиентской стороны потока */
     if (fl->saw_hello || fl->saw_initial) {
         /* Клиент шлёт ЕЩЁ, уже показав приветствие, — повтор Initial по
@@ -1039,7 +1043,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     memcpy(&c.dst_port, u + 2, 2);
     /* Транзитный поток обязан вестись conntrack — см. flow_tracked выше:
        иначе наши посылки уйдут с локальным адресом, мимо NAT. */
-    if (flow_tracked(fl, &c, 17, fl->fwd_pkts <= 1) != 0) {
+    if (flow_tracked(fl, &c, 17, held_first_replay || fl->fwd_pkts <= 1) != 0) {
         out->skipped = "поток не ведётся conntrack — посылки уйдут мимо NAT";
         refuse(s, now_ns, &key, out->skipped);
         d2k_actions_free(&acts);
@@ -1057,6 +1061,17 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         int found=d2k_nat_hook(D2K_NAT_PROC,17,c.src_ip,c.src_port,
                               c.dst_ip,c.dst_port,&ext,&port);
         if(found!=0 || !ext || !port) {
+            /* Первый QUIC Initial ещё не подтверждён conntrack, пока его
+               NFQUEUE-ID удерживается на разбор/исполнение. NODEFRAG нельзя
+               NAT-ить по догадке, поэтому этот пакет проходит нетронутым, но
+               кандидат сохраняется для повтора Initial: ко второму пакету
+               ядро уже подтвердило кортеж. Постоянный промах на последующих
+               пакетах остаётся обычным отказом ниже. */
+            if(found==-1 && (held_first_replay || fl->fwd_pkts<=1)) {
+                out->skipped="ожидаю подтверждения conntrack для IP-фрагментов";
+                d2k_actions_free(&acts);
+                return;
+            }
             /* Missing procfs is NOT evidence of no NAT. Ordinary packets
                can leave translation to the kernel; NODEFRAG packets cannot. */
             out->skipped="нет подтверждённого NAT-контекста для IP-фрагментов";
@@ -1876,6 +1891,10 @@ void d2k_session_set_hook(d2k_session *s, uint8_t hook) {
     if (s) { s->hook = hook; }
 }
 
+void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed) {
+    if (s) { s->udp_reverse_hook = installed != 0; }
+}
+
 int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
                                uint64_t now_ns, d2k_key *key_out) {
     if (!s || !p || n < 28 || (p[0] >> 4) != 4 || p[9] != 17) { return 0; }
@@ -1916,6 +1935,15 @@ void d2k_session_udp_hold_end(d2k_session *s, const d2k_key *key) {
     if (!s || !key) { return; }
     d2k_flow *fl = d2k_track_find(s->uflows, key);
     if (fl) { fl->udp_hold_active = 0; }
+}
+
+void d2k_session_udp_hold_replay(d2k_session *s, const d2k_key *key) {
+    if (!s || !key) { return; }
+    d2k_flow *fl = d2k_track_find(s->uflows, key);
+    if (fl) {
+        fl->udp_hold_active = 0;
+        fl->udp_hold_replay_first = 1;
+    }
 }
 
 void d2k_session_note_unassembled(d2k_session *s, const uint8_t *p, size_t n,
@@ -2189,7 +2217,7 @@ static void sweep_udp_one(void *ctx, d2k_flow *f) {
         f->last_rev_after_hello_ns >= f->last_fwd_after_hello_ns) {
         return;
     }
-    if (!c->s->rev_seen[slot_of(17)]) {
+    if (!c->s->rev_seen[slot_of(17)] && !c->s->udp_reverse_hook) {
         return;
     }
     if (f->fwd_after_hello == 0) {

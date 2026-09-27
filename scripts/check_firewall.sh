@@ -79,11 +79,12 @@ echo "$RULES" | grep -qE -- '-A D2K_IN -p tcp .*--sports 0:65535.*--queue-bypass
 MARK_LINE=$(echo "$RULES" | grep -E -- '-A D2K_OUT -m mark .* -j RETURN' || true)
 [ -n "$MARK_LINE" ] || fail "нет правила RETURN по метке в исходящей цепочке"
 echo "$MARK_LINE" | grep -q -- '-p ' && fail "правило RETURN по метке сузили протоколом -p — UDP перестанет исключаться"
+echo "$MARK_LINE" | grep -q -- '--mark 0x2f' || fail "измерительный зонд контроллера не исключён из собственного NFQUEUE"
 
 echo "== fw_up повторно (идемпотентность) =="
 fw_up
 COUNT_OUT=$(iptables -t mangle -S D2K_OUT | wc -l)
-[ "$COUNT_OUT" -eq 5 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 5 включая -N)"
+[ "$COUNT_OUT" -eq 6 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 6 включая -N)"
 
 echo "== пустые цепочки с сохранёнными переходами — НЕ работающий firewall =="
 iptables -t mangle -F D2K_OUT

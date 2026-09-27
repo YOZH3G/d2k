@@ -340,6 +340,16 @@ int main(void) {
             CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_ANY, sport)
                       == probe_plan,
                   "точный поток зонда потерял временный план из-за неполного ClientHello");
+            CHECK(d2k_plantab_find_sport(t, NULL, 0, 0, 2, D2K_PLAN_SHAPE_MODERN, sport)
+                      == probe_plan,
+                  "зонд без собранного SNI потерял свой план по порту");
+            const uint8_t other[] = "other.example";
+            CHECK(d2k_plantab_set_name_probe(t, other, sizeof other - 1, 2, mkplan(),
+                                             D2K_PLAN_SHAPE_MODERN, sport) == 0,
+                  "второй тестовый план не поставился");
+            CHECK(d2k_plantab_find_sport(t, NULL, 0, 0, 2, D2K_PLAN_SHAPE_MODERN, sport)
+                      == NULL,
+                  "неоднозначный пустой SNI выбрал чужой тестовый план");
             /* Чужой поток — НЕ получает: для него этой записи нет вовсе. */
             CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 3, D2K_PLAN_SHAPE_MODERN, 0x9988)
                       == NULL,

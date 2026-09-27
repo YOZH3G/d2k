@@ -288,11 +288,13 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
 
 static char quic_last_trig[256];
 static char quic_last_ctl[256];
+static uint32_t quic_last_mark;
 
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
                           d2k_hello trigger, d2k_hello control, uint32_t mark,
                           d2k_quic_arm *arm) {
-    (void)port; (void)mark;
+    (void)port;
+    quic_last_mark = mark;
     int call_index = quic_calls++;
     if (call_index < 2 && trigger.bytes && trigger.len <= sizeof quic_seen_triggers[0]) {
         memcpy(quic_seen_triggers[call_index], trigger.bytes, trigger.len);
@@ -1021,6 +1023,7 @@ int main(int argc, char **argv) {
     {
         tcp_calls = quic_calls = 0;
         d2k_sched *s = d2k_sched_new(&cat, sv[0], 0x2d);
+        d2k_sched_set_measure_mark(s, 0x2f);
         d2k_ev h = ev_hello(17, 40002, "instagram.com");
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(17, 40002);
@@ -1032,6 +1035,8 @@ int main(int argc, char **argv) {
         }
         settle(s);
         CHECK(quic_calls >= 1, "вопросник QUIC не вызван");
+        CHECK(quic_last_mark == 0x2f,
+              "QUIC-измерение не получило отдельную обходную метку");
         CHECK(tcp_calls == 0, "по UDP-подозрению позвано дерево вердиктов TCP");
         CHECK(strcmp(quic_last_sni, "instagram.com") == 0,
               "вопроснику QUIC досталось не имя цели");

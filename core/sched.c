@@ -588,6 +588,7 @@ struct d2k_sched {
     d2k_catalog *cat;
     int          link_fd;
     uint32_t     mark;
+    uint32_t     measure_mark;
 
     /* Часы последнего тика. Подтверждения приходят СОБЫТИЕМ, а не по часам, и
        спрашивать время у ОС в каждом обработчике незачем: тик идёт трижды в
@@ -1138,7 +1139,7 @@ static void *worker_run(void *vp) {
        Только TCP: у QUIC нет установленного потока в этом смысле, и лестница
        HTTP-запросов туда неприменима. */
     if (t->transport == 6) {
-        t->vol = d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80, s->mark);
+        t->vol = d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80, s->measure_mark);
         if (t->vol.verdict == D2K_VOL_CUT) {
             /* Разрезом этот класс не лечится вовсе: режется не рукопожатие.
                Дальше мерить дерево вердиктов незачем — оно ответит про имя и
@@ -1160,13 +1161,13 @@ static void *worker_run(void *vp) {
     if (t->transport == 17) {
         /* Original Run owns both diagnosis and askArms, BEFORE properties,
            with one residual-aware address pool. Never restart search here. */
-        r = d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->mark, &t->arm);
+        r = d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm);
         t->arm_ready = t->arm.original;
     } else {
         /* repeats<=0 — то же умолчание (три), что у d2k_meas: второе число
            здесь развело бы два места по умолчанию (d2k_verdict.h). gap/wait
            нулями — та же передача умолчания вниз. */
-        r = d2k_sched_tcp_hook(t->ip, t->port, trig, ctl, s->mark, 0, 0, 0, &t->stop);
+        r = d2k_sched_tcp_hook(t->ip, t->port, trig, ctl, s->measure_mark, 0, 0, 0, &t->stop);
     }
 
     pthread_mutex_lock(&s->mu);
@@ -2217,6 +2218,7 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     s->cat = cat;
     s->link_fd = link_fd;
     s->mark = mark;
+    s->measure_mark = mark;
     s->wake[0] = s->wake[1] = -1;
     s->wall_base_s = (int64_t)time(NULL);
     if (pipe(s->wake) != 0) {
@@ -2233,6 +2235,10 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
         return NULL;
     }
     return s;
+}
+
+void d2k_sched_set_measure_mark(d2k_sched *s, uint32_t mark) {
+    if (s) { s->measure_mark = mark; }
 }
 
 /* --------------------------------------------------------------------

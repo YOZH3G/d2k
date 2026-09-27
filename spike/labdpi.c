@@ -205,18 +205,28 @@ static void on_stop(int s) { (void)s; stop_now = 1; }
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "использование: labdpi <очередь> <имя> <хопов> [--last] [--quic] [--first] [--warm] [--naive]\n");
+        fprintf(stderr, "использование: labdpi <очередь> <имя> <хопов> [--last] [--quic] [--first] [--warm] [--probe-mark <mark>] [--naive]\n");
         return 2;
     }
     uint16_t queue = (uint16_t)atoi(argv[1]);
     const char *name = argv[2];
     int hops = atoi(argv[3]);
     int last_wins = 0, quic_mode = 0, first_only = 0, warm_first = 0, naive = 0;
+    uint32_t probe_mark = 45u;
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--last") == 0) { last_wins = 1; }
         if (strcmp(argv[i], "--quic") == 0) { quic_mode = 1; }
         if (strcmp(argv[i], "--first") == 0) { first_only = 1; }
         if (strcmp(argv[i], "--warm") == 0) { warm_first = 1; }
+        if (strcmp(argv[i], "--probe-mark") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            unsigned long value = strtoul(argv[++i], &end, 0);
+            if (!end || *end != '\0' || value > UINT32_MAX) {
+                fprintf(stderr, "labdpi: неверная --probe-mark\n");
+                return 2;
+            }
+            probe_mark = (uint32_t)value;
+        }
         if (strcmp(argv[i], "--naive") == 0) { naive = 1; }
     }
 
@@ -310,7 +320,7 @@ int main(int argc, char **argv) {
                            Initial; otherwise every probe would be allowed its
                            first packet and the fixture would report CLEAR. */
                         int warm_user = warm_first && first_decision &&
-                                        (!p.have_mark || p.mark != 45u);
+                                        (!p.have_mark || p.mark != probe_mark);
                         if (warm_user) {
                             verdict = NF_ACCEPT;
                             n_pass++;

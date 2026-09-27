@@ -114,12 +114,13 @@ static void sched_say(void *ctx, const char *line) {
 
 static void usage(void) {
     fprintf(stderr,
-        "использование: d2kc --control <сокет> [--catalog <файл>] [--mark 0x2d]\n"
+        "использование: d2kc --control <сокет> [--catalog <файл>] [--mark 0x2e] [--measure-mark 0x2f]\n"
         "  --control  управляющий сокет датапата (обязателен)\n"
         "  --catalog  где держать знание (умолчание /opt/d2k/catalog.json)\n"
         "  --live     куда писать вид для панели (умолчание — рядом с каталогом)\n"
         "  --log      куда писать журнал (умолчание — стандартный вывод)\n"
-        "  --mark     метка SO_MARK для зондов поиска (умолчание 0x2d)\n");
+        "  --mark     метка verifier-зондов; они идут через NFQUEUE (умолчание 0x2d)\n"
+        "  --measure-mark метка измерений; обычно обходит собственную NFQUEUE (по умолчанию --mark)\n");
 }
 
 int main(int argc, char **argv) {
@@ -128,6 +129,8 @@ int main(int argc, char **argv) {
     const char *livepath = NULL;
     const char *logpath = NULL;
     uint32_t mark = 0x2d;
+    uint32_t measure_mark = 0;
+    int have_measure_mark = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *f = argv[i];
@@ -137,6 +140,9 @@ int main(int argc, char **argv) {
         else if (strcmp(f, "--log") == 0 && i + 1 < argc) { logpath = argv[++i]; }
         else if (strcmp(f, "--mark") == 0 && i + 1 < argc) {
             mark = (uint32_t)strtoul(argv[++i], NULL, 0);
+        } else if (strcmp(f, "--measure-mark") == 0 && i + 1 < argc) {
+            measure_mark = (uint32_t)strtoul(argv[++i], NULL, 0);
+            have_measure_mark = 1;
         } else {
             usage();
             return 2;
@@ -194,6 +200,7 @@ int main(int argc, char **argv) {
         d2k_catalog_free(&cat);
         return 1;
     }
+    d2k_sched_set_measure_mark(s, have_measure_mark ? measure_mark : mark);
 
     d2k_sched_set_say(s, sched_say, NULL);
 

@@ -151,12 +151,19 @@ int d2k_session_stream_anchor(d2k_session *s, const uint8_t *p, size_t n,
                               uint32_t *anchor);
 
 void d2k_session_set_hook(d2k_session *s, uint8_t hook);
+/* Явное подтверждение конфигурации: правило обратного направления UDP
+   установлено. Нужен для распознавания полной тишины на заблокированном QUIC,
+   где обратный пакет физически не может прийти. По умолчанию выключено. */
+void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed);
 
 /* Начать/завершить внешнее удержание split QUIC. Begin вызывается до обработки
  * первой кандидатной датаграммы; payload никогда не склеивается здесь. */
 int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
                                uint64_t now_ns, d2k_key *key_out);
 void d2k_session_udp_hold_end(d2k_session *s, const d2k_key *key);
+/* End a successful hold and preserve first-packet semantics for the immediate
+ * replay of its original client datagram. */
+void d2k_session_udp_hold_replay(d2k_session *s, const d2k_key *key);
 
 int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n);
 /* Accounting/capture for originals released without intervention. Never

@@ -79,7 +79,7 @@ echo "== цензор по QUIC =="
 # укороченным TTL обязано умереть до сервера, но быть увиденным коробкой.
 BOXFLAG=
 [ "$BOX" = "first" ] && BOXFLAG="--first --warm"
-/tmp/labdpi "$QUEUE" "$NAME" 62 --quic $BOXFLAG > /tmp/labdpi.log 2>&1 &
+/tmp/labdpi "$QUEUE" "$NAME" 62 --quic $BOXFLAG --probe-mark "$PROBE_MARK" > /tmp/labdpi.log 2>&1 &
 DPI=$!
 sleep 1
 # ЦЕНЗОР — В POSTROUTING, ПОСЛЕ d2k, и это не стиль.

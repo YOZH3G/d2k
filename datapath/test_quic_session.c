@@ -31,6 +31,15 @@ static int fails;
         }                                                  \
     } while (0)
 
+static int quic_nat_not_ready(const char *path, uint8_t proto,
+                             uint32_t src, uint16_t sport,
+                             uint32_t dst, uint16_t dport,
+                             uint32_t *outside_src, uint16_t *outside_sport) {
+    (void)path; (void)proto; (void)src; (void)sport;
+    (void)dst; (void)dport; (void)outside_src; (void)outside_sport;
+    return -1;
+}
+
 /* Сколько раз в журнале встретился отказ плана (D2K_JRN_PLAN_REFUSED). */
 static size_t count_plan_refused(const d2k_session *s) {
     const d2k_journal *j = d2k_session_journal(s);
@@ -538,6 +547,40 @@ static void test_quic_split_hold_handshake(void) {
     CHECK(d2k_session_udp_hold_begin(s, pkt, n, 1300, NULL) == 0,
           "после Plan done поток снова ошибочно вошёл в UDP hold");
     d2k_session_free(s);
+}
+
+/* A held first Initial is replayed by d2kd after its ClientHello has been
+ * assembled. That replay is still the first packet seen by conntrack; counting
+ * the same datagram twice must not revoke the first-packet NAT exception. */
+static void test_quic_held_initial_replay_is_first_packet(void) {
+    d2k_nat_fn saved_nat = d2k_nat_hook;
+    d2k_nat_hook = quic_nat_not_ready;
+    d2k_session *s = d2k_session_new(64, 32);
+    d2k_plan *p = NULL;
+    char err[160];
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    CHECK(s && d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_name_shaped(d2k_session_plans(s),
+                  (const uint8_t *)"example.com", 11, 1, p,
+                  D2K_PLAN_SHAPE_QUIC) == 0,
+          "QUIC held-replay plan fixture не собрался");
+    if (!s) { d2k_nat_hook = saved_nat; return; }
+
+    size_t n = build_udp_pkt(pkt, 50601, 443, v1_initial, sizeof v1_initial);
+    d2k_key key;
+    CHECK(d2k_session_udp_hold_begin(s, pkt, n, 1000, &key) == 1,
+          "первый QUIC Initial не вошёл в hold");
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(r.udp_hold_ready && !r.applied,
+          "собранный Initial не запросил replay исходной датаграммы");
+
+    d2k_session_udp_hold_replay(s, &key);
+    d2k_session_packet(s, pkt, n, 1001, buf, sizeof buf, &r);
+    CHECK(r.applied && r.n_out > 0,
+          "replay первого Initial ошибочно отвергнут как второй пакет без conntrack");
+    d2k_session_free(s);
+    d2k_nat_hook = saved_nat;
 }
 
 /* После QUIC Retry клиент начинает новый Initial с новым DCID. Старый
@@ -1075,10 +1118,16 @@ static void test_fragments(void) {
               "short output buffer must pass untouched original without APPLIED");
         frag_nat_missing=1;
         n=build_udp_pkt(pkt,52001,443,v1_initial,sizeof v1_initial);
+        size_t refusals_before = count_plan_refused(s);
         d2k_session_packet(s,pkt,n,2100,buf,sizeof buf,&r);
         CHECK(!r.applied && !r.n_out && r.verdict==D2K_VERDICT_ACCEPT && r.skipped,
-              "first packet cannot guess fragment NAT mapping");
+              "first packet cannot guess unconfirmed fragment NAT mapping");
+        CHECK(count_plan_refused(s)==refusals_before,
+              "unconfirmed first-packet mapping is deferred, not reported as a rejected plan");
         frag_nat_missing=0;
+        d2k_session_packet(s,pkt,n,2101,buf,sizeof buf,&r);
+        CHECK(r.applied && r.n_out>0 && r.verdict==D2K_VERDICT_DROP,
+              "same QUIC flow retries its fragment plan after conntrack confirms");
         frag_nat_missing=2;
         n=build_udp_pkt(pkt,52002,443,v1_initial,sizeof v1_initial);
         d2k_session_packet(s,pkt,n,2200,buf,sizeof buf,&r);
@@ -1108,6 +1157,7 @@ int main(void) {
     test_quic_non443_client_hold();
     test_quic_cross_datagram_assembly();
     test_quic_split_hold_handshake();
+    test_quic_held_initial_replay_is_first_packet();
     test_quic_retry_resets_assembly();
     test_discord_voice();
     test_nameless_initial();
@@ -1647,6 +1697,24 @@ int main(void) {
             CHECK(d2k_session_suspects(s3) == 0,
                   "забвение UDP-потока объявило молчанием невидимую обратную сторону");
             d2k_session_free(s3);
+        }
+
+        /* 3b. Служба знает из собственной конфигурации, что обратное
+           направление QUIC поставлено в NFQUEUE. Для заблокированного
+           сервера ответного пакета не будет никогда, поэтому требовать
+           «доказательства видимости» именно ответом — тупик. Без такого
+           объявления остаётся проверка 3 выше: обычная сессия не угадывает,
+           был ли обратный крючок установлен. */
+        {
+            d2k_session *s3b = d2k_session_new(64, 64);
+            d2k_session_set_udp_reverse_hook(s3b, 1);
+            size_t n = build_udp_pkt(pkt, 50311, 443, v1_initial,
+                                     sizeof v1_initial);
+            d2k_session_packet(s3b, pkt, n, 2 * s_ns, buf, sizeof buf, &r);
+            d2k_session_packet(s3b, pkt, n, 3 * s_ns, buf, sizeof buf, &r);
+            CHECK(d2k_session_sweep(s3b, 4 * s_ns + 100000000ull) == 1,
+                  "установленный обратный QUIC-крючок не позволил обнаружить блокировку без ответа");
+            d2k_session_free(s3b);
         }
 
         /* 4. По ЭТОМУ потоку есть обратный трафик — это не полное молчание.

@@ -221,6 +221,7 @@ static void usage(void) {
         "  --mode observe|apply   умолчание observe: ничего не менять\n"
         "  --mark M           SO_MARK на собственных пакетах (умолчание 0)\n"
         "  --probe-mark M     SO_MARK контроллера; его зонды не становятся новыми целями\n"
+        "  --udp-reverse-hook обратное UDP-направление гарантированно стоит в NFQUEUE\n"
         "  --iface NAME       чей MTU берётся пределом длины посылки\n"
         "  --flows N          предел числа потоков — отдельно на TCP и на\n"
         "                     UDP/QUIC, не общий бюджет датапата (2048)\n"
@@ -463,6 +464,7 @@ int main(int argc, char **argv) {
     uint32_t slots = 128, idle_s = 120, stats_s = 10, duration_s = 0;
     uint32_t journal = 256;
     int fail_open = 1;
+    int udp_reverse_hook = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -474,6 +476,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--control") == 0)     { NEEDV(); ctl_path = v; }
         else if (strcmp(a, "--mark") == 0)        { NEEDV(); if (arg_u32(v, &mark)) goto badval; }
         else if (strcmp(a, "--probe-mark") == 0)  { NEEDV(); if (arg_u32(v, &probe_mark)) goto badval; }
+        else if (strcmp(a, "--udp-reverse-hook") == 0) { udp_reverse_hook = 1; }
         else if (strcmp(a, "--iface") == 0)       { NEEDV(); ifname = v; }
         else if (strcmp(a, "--flows") == 0)       { NEEDV(); if (arg_u32(v, &flows)) goto badval; }
         else if (strcmp(a, "--queue-len") == 0)   { NEEDV(); if (arg_u32(v, &qlen)) goto badval; }
@@ -619,6 +622,9 @@ int main(int argc, char **argv) {
     }
 
     d2k_session *sess = d2k_session_new(flows, journal);
+    if (sess && udp_reverse_hook) {
+        d2k_session_set_udp_reverse_hook(sess, 1);
+    }
     /* Вместимость ячейки — «сколько байт унесёт способ отправки», а не
        «сколько байт пакета мы берём у ядра» (--copy-range): посылка плана
        бывает длиннее пришедшего, перекрытие несёт приставку сверх нагрузки.
@@ -863,6 +869,8 @@ int main(int argc, char **argv) {
                        которых сессия не дошла, не должны выглядеть так, будто
                        нагрузка стоит первой. */
                     res.first_payload = 0xFF;
+                    int controller_probe = probe_mark != 0 && np.have_mark &&
+                                           np.mark == probe_mark;
 
                     if (!np.have_payload) {
                         st.no_payload++;
@@ -872,14 +880,28 @@ int main(int argc, char **argv) {
                         st.truncated++;
                         res.skipped = "пакет обрезан copy_range";
                     } else {
-                        int controller_probe = probe_mark != 0 && np.have_mark &&
-                                               np.mark == probe_mark;
                         if (controller_probe) {
                             d2k_session_packet_probe(sess, np.payload, np.payload_len, t,
                                                      obuf, sizeof obuf, &res);
                         } else {
                             d2k_session_packet(sess, np.payload, np.payload_len, t,
                                                obuf, sizeof obuf, &res);
+                        }
+                    }
+
+                    if (controller_probe && np.payload && np.payload_len >= 28 &&
+                        np.payload[9] == 17) {
+                        size_t ihl = (size_t)(np.payload[0] & 15u) * 4u;
+                        if ((np.payload[0] >> 4) == 4 && ihl >= 20 &&
+                            ihl + 8 <= np.payload_len) {
+                            const uint8_t *udp = np.payload + ihl;
+                            unsigned sport = ((unsigned)udp[0] << 8) | udp[1];
+                            unsigned dport = ((unsigned)udp[2] << 8) | udp[3];
+                            fprintf(stderr, "d2kd: verifier UDP %u -> %u hook=%u: %s; "
+                                            "applied=%u emits=%zu verdict=%u\n",
+                                    sport, dport, np.hook,
+                                    res.skipped ? res.skipped : "план исполнен",
+                                    (unsigned)res.applied, res.n_out, verdict);
                         }
                     }
 
@@ -890,7 +912,7 @@ int main(int argc, char **argv) {
                     if (res.udp_hold_ready && udp_holding &&
                         d2k_udp_hold_take(udp_holding, &udp_key, t, &udp_batch) &&
                         udp_batch.count > 0) {
-                        d2k_session_udp_hold_end(sess, &udp_key);
+                        d2k_session_udp_hold_replay(sess, &udp_key);
                         udp_replay = 1;
                         /* Apply the ordinary plan to the first original
                            datagram only.  The remaining originals retain
@@ -902,14 +924,17 @@ int main(int argc, char **argv) {
                         memset(&res, 0, sizeof res);
                         res.verdict = D2K_VERDICT_ACCEPT;
                         res.first_payload = 0xFF;
-                        int controller_probe = probe_mark != 0 && np.have_mark &&
-                                               np.mark == probe_mark;
                         if (controller_probe) {
                             d2k_session_packet_probe(sess, np.payload, np.payload_len, t,
                                                      obuf, sizeof obuf, &res);
                         } else {
                             d2k_session_packet(sess, np.payload, np.payload_len, t,
                                                obuf, sizeof obuf, &res);
+                        }
+                        if (controller_probe) {
+                            fprintf(stderr, "d2kd: verifier QUIC replay: %s; applied=%u emits=%zu\n",
+                                    res.skipped ? res.skipped : "план исполнен",
+                                    (unsigned)res.applied, res.n_out);
                         }
                     } else if (res.udp_hold_ready) {
                         /* A missing slot is an internal ownership failure, not

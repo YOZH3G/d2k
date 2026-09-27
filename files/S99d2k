@@ -77,6 +77,9 @@ MARK=0x2d
 # packets emitted by d2kd bypass it using MARK. Keep a distinct observable
 # mark so d2kd can parse verifier traffic without rediscovering its own probes.
 PROBE_MARK=0x2e
+# Контроллерские измерения обходят собственный NFQUEUE. Точные проверки
+# кандидата используют PROBE_MARK и специально идут через datapath.
+MEASURE_MARK=0x2f
 # Наблюдаем весь TCP/UDP трафик, а не только привычный HTTPS-порт. Протокол
 # определяется разбором первых пакетов в d2kd; ограничение портом 443 теряло
 # QUIC/DoT/нестандартные TLS и адресные потоки до того, как ядро могло выбрать
@@ -125,11 +128,13 @@ fw_up() {
     iptables -t mangle -N "$CHAIN_OUT" 2>/dev/null || return 1
     iptables -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
 
-    # Собственные сырые посылки датапата исключаются по MARK. Активные зонды
+    # Собственные сырые посылки датапата и измерительные запросы контроллера
+    # исключаются. Активные verifier-зонды
     # контроллера помечаются отдельным PROBE_MARK: им нужно попасть в очередь,
     # чтобы точный trial Plan достался verifier; d2kd разбирает их, но не
     # порождает из них новое обнаружение.
     iptables -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN || return 1
+    iptables -t mangle -A "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN || return 1
 
     # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
     # останавливать его (§10). Это касается и UDP-правил ниже в той же мере,
@@ -194,7 +199,6 @@ fw_up() {
     # непроверенное на живой линии нельзя.
     iptables -t nat -A POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE || say "не поставить MASQUERADE для своих посылок — QUIC за роутером не пойдёт"
-
     iptables -t mangle -I POSTROUTING -j "$CHAIN_OUT" || return 1
     iptables -t mangle -I FORWARD     -j "$CHAIN_IN"  || return 1
     iptables -t mangle -I INPUT       -j "$CHAIN_IN"  || return 1
@@ -226,16 +230,19 @@ fw_installed() {
     iptables -t mangle -C FORWARD -j "$CHAIN_IN" 2>/dev/null || return 1
     iptables -t mangle -C INPUT -j "$CHAIN_IN" 2>/dev/null || return 1
     iptables -t mangle -C "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN 2>/dev/null || return 1
+    iptables -t mangle -C "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN 2>/dev/null || return 1
     for proto in tcp udp; do
         iptables -t mangle -C "$CHAIN_OUT" -p "$proto" -m multiport --dports "$PORTS" \
             -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
             --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
             --queue-bypass 2>/dev/null || return 1
-        iptables -t mangle -C "$CHAIN_IN" -p "$proto" -m multiport --sports "$PORTS" \
+    iptables -t mangle -C "$CHAIN_IN" -p "$proto" -m multiport --sports "$PORTS" \
             -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
             --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
             --queue-bypass 2>/dev/null || return 1
     done
+    iptables -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" \
+        -j MASQUERADE 2>/dev/null || return 1
     return 0
 }
 
@@ -291,10 +298,11 @@ start() {
     dpmode=observe
     [ "$MODE" = "apply" ] && dpmode=apply
     [ "$PROBE_MARK" != "$MARK" ] || die "PROBE_MARK должен отличаться от MARK"
+    [ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$PROBE_MARK" ] || die "MEASURE_MARK должен отличаться от MARK и PROBE_MARK"
 
     start-stop-daemon -S -b -m -p "$DP_PID" -x "$DPBIN" -- \
         --queue "$QUEUE_NUM" --mode "$dpmode" --mark "$MARK" \
-        --probe-mark "$PROBE_MARK" \
+        --probe-mark "$PROBE_MARK" --udp-reverse-hook \
         --flows "$FLOWS" --control "$SOCK" --stats "${STATS_SEC:-60}" \
         --log "$LOG/d2kd.log" || die "датапат не запустился"
 
@@ -324,6 +332,7 @@ start() {
     # роутере, файл оставался нулевым при исправно работающем движке.
     start-stop-daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
         --control "$SOCK" --catalog "$DIR/state/catalog.json" --mark "$PROBE_MARK" \
+        --measure-mark "$MEASURE_MARK" \
         --log "$LOG/d2kc.log" || say "контроллер не запустился — датапат наблюдает без подбора"
 
     # ЖУРНАЛ НЕ РАСТЁТ БЕЗ КОНЦА, и это про износ флешки, а не про место.

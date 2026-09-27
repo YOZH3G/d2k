@@ -76,6 +76,10 @@ MARK=${D2K_MARK:-0}
 # коробку (проверено планом, 3/3), а подтверждение дало «зонд не дошёл до
 # приложения» и план был выброшен.
 CTL_MARK=${D2K_CTL_MARK:-0x2e}
+# Марка для собственных измерительных проб классификатора: они должны выйти
+# наружу без повторного попадания в измеряемый datapath. Проверочные пробы
+# d2kc остаются на CTL_MARK и, наоборот, проходят через NFQUEUE.
+MEASURE_MARK=${D2K_MEASURE_MARK:-0x2f}
 # Сужение опыта. §2.6 требует ограничивать последствия: на роутере живут
 # чужие устройства, и десинк всего 443-го порта — не эксперимент, а авария.
 SRC=${D2K_SRC:-}
@@ -95,6 +99,8 @@ VOICE=${D2K_VOICE:-0}
 # QUIC: UDP на тех же портах PORTS, что и TCP. Туда — первые пакеты потока,
 # оттуда — ответы (транзит на FORWARD, ответы собственному зонду на INPUT).
 QUIC=${D2K_QUIC:-0}
+UDP_REVERSE_OPT=
+[ "$QUIC" = 1 ] && UDP_REVERSE_OPT=--udp-reverse-hook
 VOICE_PORTS=50000:50099,1400,3478:3481,5349,19294:19344
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -242,9 +248,17 @@ NARROW=""
 RNARROW=""
 [ -n "$DST" ] && RNARROW="$RNARROW -s $DST"
 [ -n "$SRC" ] && RNARROW="$RNARROW -d $SRC"
+CTL_DST=""
+CTL_SRC=""
+[ -n "$DST" ] && CTL_DST="-d $DST"
+[ -n "$DST" ] && CTL_SRC="-s $DST"
 NOTSELF=""
 [ "$MARK" != 0 ] && NOTSELF="-m mark ! --mark $MARK"
 [ "$CTL_MARK" != "$MARK" ] || { say "D2K_CTL_MARK должен отличаться от D2K_MARK"; exit 2; }
+[ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$CTL_MARK" ] || {
+    say "D2K_MEASURE_MARK должен отличаться от D2K_MARK и D2K_CTL_MARK"; exit 2;
+}
+NOTMEASURE="-m mark ! --mark $MEASURE_MARK"
 
 say "== правила, жетон $TOKEN =="
 # Порядок: сперва снять офлоад, потом отдать в очередь. Правило PPE матчит
@@ -254,7 +268,7 @@ set -e
 if [ $PPE = 1 ]; then
     iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS $NARROW -m connskip --connskip 1000000 -m comment --comment $TOKEN -j PPE
 fi
-iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS $NARROW $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS $NARROW $NOTSELF $NOTMEASURE -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 if [ $REV = 1 ]; then
     iptables -t mangle -I FORWARD -p tcp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
@@ -279,6 +293,16 @@ if [ $LEARN = 1 ]; then
     iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS -m mark --mark $CTL_MARK -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
     iptables -t mangle -I OUTPUT -m mark --mark $CTL_MARK -m comment --comment $TOKEN -j CONNMARK --save-mark
     iptables -t mangle -I INPUT -m connmark --mark $CTL_MARK -p tcp --sport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    if [ $QUIC = 1 ]; then
+        # Собственный QUIC verifier-зонд — локально исходящий UDP, а не
+        # транзитный клиент. Без отдельного помеченного правила он минует
+        # datapath, и план испытывается на сокете «мимо обхода». Ответ
+        # маршрутизатора-зонда возвращается в INPUT, не FORWARD; connmark
+        # удерживает его в той же изолированной паре правил. В узком опыте
+        # фиксируем целевой сервер тем же DST.
+        iptables -t mangle -I POSTROUTING -p udp --dport $PORTS $CTL_DST -m mark --mark $CTL_MARK -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+        iptables -t mangle -I INPUT -p udp --sport $PORTS $CTL_SRC -m connmark --mark $CTL_MARK -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    fi
 fi
 if [ $VOICE = 1 ]; then
     # Первые пакеты туда: IP Discovery и повторы — по ним датапат узнаёт
@@ -288,7 +312,7 @@ if [ $VOICE = 1 ]; then
     iptables -t mangle -I FORWARD -p udp -m multiport --sports $VOICE_PORTS $RNARROW -m connbytes --connbytes 0:4 --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
 if [ $QUIC = 1 ]; then
-    iptables -t mangle -I POSTROUTING -p udp --dport $PORTS $NARROW $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I POSTROUTING -p udp --dport $PORTS $NARROW $NOTSELF $NOTMEASURE -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
     iptables -t mangle -I FORWARD -p udp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
     if [ $LEARN = 1 ]; then
         iptables -t mangle -I INPUT -p udp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
@@ -331,6 +355,7 @@ say "== запуск службы =="
 $SSH "
 start-stop-daemon -S -b -m -p /tmp/d2kd.$TOKEN.pid -x /tmp/d2kd.$TOKEN -- \
     --queue $QUEUE --mode $MODE --stats 15 --duration $DUR --mark $MARK --probe-mark $CTL_MARK \
+    $UDP_REVERSE_OPT \
     ${PLAN:+--plan /tmp/d2kd.$TOKEN.plan} \
     ${LEARN:+--control /tmp/d2kd.$TOKEN.sock} \
     --log /tmp/d2kd.$TOKEN.out
@@ -360,7 +385,7 @@ if [ "$LEARN" = 1 ]; then
         --control /tmp/d2kd.$TOKEN.sock \
         --catalog /tmp/d2k.$TOKEN.state/catalog.json \
         --live /tmp/d2k.$TOKEN.state/live.json \
-        --mark $CTL_MARK --log /tmp/d2k.$TOKEN.out
+        --mark $CTL_MARK --measure-mark $MEASURE_MARK --log /tmp/d2k.$TOKEN.out
     sleep 2
     echo \"  контроллер: \$(head -3 /tmp/d2k.$TOKEN.out 2>/dev/null | tr '\n' ' ')\"
     " >&2
