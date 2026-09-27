@@ -50,10 +50,11 @@
  *                    бит (тип-20). Для UDP: code=0, num — длина первой
  *                    обратной датаграммы (включая 0), протокольной проверки
  *                    в событии нет; это НЕ доказательство QUIC/STUN/голоса.
- *   D2K_EV_APPLIED:  ключ и plan_id (см. поле ниже); code/num/seen_types
- *                    значения не несут.
+ *   D2K_EV_APPLIED:  ключ, plan_id и trial_id (16 байт каждый; trial_id — нули
+ *                    для обычных планов); code/num/seen_types значения не несут.
  *   D2K_EV_REFUSED:  ключ, code — D2K_REFUSE_* (0: причина не кодирована),
- *                    plan_id — ID плана при отказе отправки, если прислан.
+ *                    plan_id и trial_id фиксированной ширины; нули, если
+ *                    применённого кандидата нет.
  *   D2K_EV_ACK:      code — тип подтверждаемой команды (D2K_CMD_*);
  *                    num  — упаковка (ok<<8)|reason: старший из двух занятых
  *                    байт — признак успеха (0/1), младший — код причины
@@ -70,7 +71,9 @@
  * shape_len — 0). Для D2K_EV_SHAPE, наоборот, code/num/seen_types не несут
  * значения.
  *
- * plan_id значим при D2K_EV_APPLIED и D2K_EV_REFUSED; у прочих видов он нулевой.
+ * plan_id и trial_id значимы при D2K_EV_APPLIED/D2K_EV_REFUSED; у остальных
+ * событий нулевые. Для адресной пробы планировщик требует точный ненулевой
+ * trial_id в дополнение к Plan ID и ключу потока.
  *
  * seen_types добавлено сверх контракта брифа задачи, измеренной причиной:
  * code (тип ПЕРВОЙ записи с обратной стороны) на проводе — липкое поле
@@ -133,11 +136,13 @@ typedef struct {
      * позже и засчитывается новому. d2k_ctl.h объявляет APPLIED как «ключ + id
      * плана» с самого начала — до 12.09 ехал только ключ.
      *
-     * Нули означают отсутствие идентичности. Новый APPLIED требует полные
-     * 16 байт на проводе; REFUSED может приходить без ID. У плана без REC_ID
-     * байты тоже нулевые — его нельзя приписать кандидату. Различать эти два
-     * повода нечем и незачем. Это НЕ «план с нулевым идентификатором». */
+     * Нули означают отсутствие идентичности. В версии 3 оба события требуют
+     * полный Plan ID и trial ID на проводе. У обычного плана trial ID нулевой;
+     * у адресной пробы он обязан совпасть с отдельным случайным поколением,
+     * иначе кандидат не подтверждается. У плана без REC_ID ID плана нулевой,
+     * и его нельзя приписать кандидату. */
     uint8_t  plan_id[D2K_PLAN_ID_LEN];
+    uint8_t  trial_id[D2K_TRIAL_ID_LEN];
     /* SUSPECT: чем подозрительный пакет отличался от остальных в этом же
      * потоке. Из этих байт складывается ОТПЕЧАТОК коробки, и без них каталог
      * хранил бы факт «был сброс», по которому одну коробку от другой не
@@ -301,6 +306,9 @@ int  d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
  * Отличие от D2K_CMD_CLEAR: CLEAR сносит ВСЮ таблицу, включая планы чужих
  * целей, которые никто не просил трогать. */
 int  d2k_link_del_name(int fd, const char *name, char *err, size_t errcap);
+int  d2k_link_del_name_probe(int fd, const char *name, uint8_t transport,
+                             uint8_t shape, uint16_t sport_be,
+                             char *err, size_t errcap);
 
 /* Ставит план на АДРЕС цели: команда D2K_CMD_SET_ADDR (адрес IPv4 четырьмя
  * байтами сетевого порядка, затем план TLV — d2k_ctl.h). Как и
@@ -312,6 +320,19 @@ int  d2k_link_del_name(int fd, const char *name, char *err, size_t errcap);
  * их — терять подтверждённое. */
 int  d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
                        char *err, size_t errcap);
+
+/* Временная адресная проба для одного UDP 5-tuple. Адреса/порты передаются
+ * байтами сетевого порядка; trial_id — случайный ненулевой токен поколения,
+ * lease_ms ограничен датапатом 120 секунд. */
+int  d2k_link_set_addr_probe(int fd, const uint8_t src_ip4[4], uint16_t src_port_be,
+                             const uint8_t dst_ip4[4], uint16_t dst_port_be,
+                             uint8_t transport, const uint8_t trial_id[D2K_TRIAL_ID_LEN],
+                             uint32_t lease_ms, const char *plan_hex,
+                             char *err, size_t errcap);
+int  d2k_link_del_addr_probe(int fd, const uint8_t src_ip4[4], uint16_t src_port_be,
+                             const uint8_t dst_ip4[4], uint16_t dst_port_be,
+                             uint8_t transport, const uint8_t trial_id[D2K_TRIAL_ID_LEN],
+                             char *err, size_t errcap);
 
 /* Снимает только адресную запись (DEL_ADDR, четыре байта сетевого порядка).
  * Текстовый IP в DEL_NAME адресную таблицу не затрагивает. */

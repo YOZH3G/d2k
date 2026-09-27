@@ -235,13 +235,13 @@ static int decrypt_initial(const uint8_t *p, const quic_hdr *h, uint8_t *plain, 
  * ни для неизвестного типа, ни для битого известного: оба случая одинаково
  * лишают нас точки, откуда продолжать. */
 static size_t collect_crypto_frames(const uint8_t *plain, size_t plen,
-                                     uint8_t *stream, size_t cap) {
+                                     uint8_t *stream, uint8_t *seen,
+                                     size_t cap) {
     /* Цена ограничена байтами, не произвольным числом кадров. Клиент вправе
        прислать сотни однобайтовых CRYPTO в обратном порядке: прежние восемь
        слотов теряли SNI в совершенно корректном Initial. Карта занятости
        позволяет собрать все кадры за один проход без массива на каждый. */
-    uint8_t seen[(D2K_QUIC_MAX_DGRAM + 7) / 8] = {0};
-    if (cap > D2K_QUIC_MAX_DGRAM) { cap = D2K_QUIC_MAX_DGRAM; }
+    if (cap > D2K_QUIC_ASSEMBLY_MAX) { cap = D2K_QUIC_ASSEMBLY_MAX; }
     size_t i = 0;
     while (i < plen) {
         uint8_t t = plain[i];
@@ -557,7 +557,8 @@ static size_t crypto_stream_of(const uint8_t *p, size_t n,
     if (decrypt_initial(p, &h, plain, &plain_len) != 0) {
         return 0;
     }
-    return collect_crypto_frames(plain, plain_len, stream, cap);
+    uint8_t seen[(D2K_QUIC_MAX_DGRAM + 7) / 8] = {0};
+    return collect_crypto_frames(plain, plain_len, stream, seen, cap);
 }
 
 int d2k_quic_client_hello(const uint8_t *p, size_t n,
@@ -603,4 +604,76 @@ int d2k_quic_sni(const uint8_t *p, size_t n, char *out, size_t cap) {
     memcpy(out, stream + sni_off, sni_len);
     out[sni_len] = '\0';
     return 0;
+}
+
+void d2k_quic_assembly_init(d2k_quic_assembly *a) {
+    if (a) { memset(a, 0, sizeof *a); }
+}
+
+int d2k_quic_assembly_feed(d2k_quic_assembly *a, const uint8_t *p, size_t n,
+                           char *out, size_t cap) {
+    if (!a || !p || !out || cap == 0) { return -1; }
+
+    d2k_qw_hdr h;
+    if (d2k_qw_hdr_parse(p, n, 0, &h) != 0 || !h.long_hdr ||
+        h.type != D2K_QW_LT_INITIAL || h.dcid_len > D2K_QW_CID_MAX ||
+        h.packet_len > n) {
+        return -1;
+    }
+
+    d2k_quic_assembly next;
+    int fresh = !a->active;
+    if (a->active && (a->version != h.version || a->dcid_len != h.dcid_len ||
+                      memcmp(a->dcid, p + h.dcid_off, h.dcid_len) != 0)) {
+        /* QUIC Retry starts a new Initial flight with a new DCID. Treat it as
+         * a new bounded assembly generation rather than poisoning the flow
+         * with the old keys; a failed decrypt below still leaves the caller's
+         * previous context untouched. */
+        fresh = 1;
+    }
+    if (fresh) {
+        memset(&next, 0, sizeof next);
+        next.version = h.version;
+        next.dcid_len = h.dcid_len;
+        memcpy(next.dcid, p + h.dcid_off, h.dcid_len);
+        uint8_t secret[32];
+        if (d2k_qw_initial_secret(h.version, next.dcid, next.dcid_len,
+                                  D2K_QW_CLIENT, secret) != 0 ||
+            d2k_qw_keys_from_secret(h.version, secret, &next.keys) != 0) {
+            return -1;
+        }
+        next.active = 1;
+    } else {
+        next = *a;
+    }
+
+    uint8_t plain[D2K_QW_MAX_DGRAM];
+    size_t plain_len = 0;
+    uint64_t pn = 0;
+    if (d2k_qw_open(&next.keys, &h, p,
+                    next.have_pn ? next.largest_pn : 0,
+                    plain, &plain_len, &pn) != 0) {
+        return -1;
+    }
+    if (!next.have_pn || pn > next.largest_pn) {
+        next.largest_pn = pn;
+        next.have_pn = 1;
+    }
+    (void)collect_crypto_frames(plain, plain_len, next.stream, next.seen,
+                                sizeof next.stream);
+    *a = next;
+
+    size_t sni_off = 0, sni_len = 0;
+    size_t filled = 0;
+    while (filled < sizeof a->stream &&
+           (a->seen[filled / 8] & (uint8_t)(1u << (filled % 8)))) {
+        filled++;
+    }
+    if (find_client_hello_sni(a->stream, filled, &sni_off, &sni_len) != 0) {
+        return 0;
+    }
+    if (sni_len + 1 > cap) { return -1; }
+    memcpy(out, a->stream + sni_off, sni_len);
+    out[sni_len] = '\0';
+    return 1;
 }

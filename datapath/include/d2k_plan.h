@@ -44,6 +44,8 @@
  * d2k_ctl.h тянет этот заголовок транзитивно (d2k_journal.h → d2k_track.h →
  * d2k_plan.h), и core/link.c читает её оттуда. */
 #define D2K_PLAN_ID_LEN 16
+/* Per-experience identity carried beside (never instead of) REC_ID. */
+#define D2K_TRIAL_ID_LEN 16
 
 typedef struct d2k_plan d2k_plan;
 int d2k_plan_stream_input(const d2k_plan *p);

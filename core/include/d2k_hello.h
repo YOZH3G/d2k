@@ -139,4 +139,11 @@ int d2k_hello_from_profile(d2k_shape s, const char *sni, uint8_t *out, size_t ca
 int d2k_hello_rename(const uint8_t *ch, size_t n, const char *sni,
                      uint8_t *out, size_t cap, size_t *out_len);
 
+/* Удаляет целое server_name extension из полного ClientHello, пересчитывая
+ * длины расширений и Handshake. Вход/выход — сообщение Handshake без TLS
+ * record; используется QUIC-переносом для буквальной IP-цели, для которой
+ * donor crypto/tls опускает SNI. */
+int d2k_hello_without_sni(const uint8_t *ch, size_t n,
+                          uint8_t *out, size_t cap, size_t *out_len);
+
 #endif /* D2K_HELLO_H */

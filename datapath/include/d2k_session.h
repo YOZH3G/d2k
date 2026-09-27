@@ -81,6 +81,7 @@ typedef struct {
     int      applied;
     d2k_key  key;
     uint8_t  plan_id[D2K_PLAN_ID_LEN];
+    uint8_t  trial_id[D2K_TRIAL_ID_LEN];
     /* Номер ПЕРВОЙ посылки нагрузки в out[], либо 0xFF — нагрузки в плане
      * нет (только фальшивки перед оригиналом).
      *
@@ -92,6 +93,8 @@ typedef struct {
      * испорчен, и утверждать, что трафик остался нетронутым, нельзя
      * (§4.1, docs/decisions/0009 U3). */
     uint8_t  first_payload;
+    uint8_t  udp_hold_wait;
+    uint8_t  udp_hold_ready;
 } d2k_result;
 
 
@@ -148,6 +151,12 @@ int d2k_session_stream_anchor(d2k_session *s, const uint8_t *p, size_t n,
                               uint32_t *anchor);
 
 void d2k_session_set_hook(d2k_session *s, uint8_t hook);
+
+/* Начать/завершить внешнее удержание split QUIC. Begin вызывается до обработки
+ * первой кандидатной датаграммы; payload никогда не склеивается здесь. */
+int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
+                               uint64_t now_ns, d2k_key *key_out);
+void d2k_session_udp_hold_end(d2k_session *s, const d2k_key *key);
 
 int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n);
 /* Accounting/capture for originals released without intervention. Never
@@ -214,6 +223,13 @@ void d2k_session_set_plan(d2k_session *s, d2k_plan *p);
 int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap,
                        d2k_result *out);
+
+/* Controller-owned active probe packet. It is still parsed and may receive
+ * its exact trial plan, but it must not become fresh user-traffic evidence
+ * (HELLO/SUSPECT/EXCHANGE) or replace an observed client's shape snapshot. */
+int d2k_session_packet_probe(d2k_session *s, const uint8_t *pkt, size_t len,
+                             uint64_t now_ns, uint8_t *buf, size_t bufcap,
+                             d2k_result *out);
 
 /* Освобождает потоки, молчавшие дольше idle_ns. Возвращает сколько освободил.
  * Зовётся вызывающим, а не сама: датапат не заводит таймеров и не решает, как

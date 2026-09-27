@@ -722,8 +722,12 @@ static void send_exchange(int fd, uint16_t target_port,
 static void send_applied(int fd, uint16_t target_port,
                          const uint8_t *peer_ip, uint16_t peer_port,
                          const uint8_t plan_id[D2K_PLAN_ID_LEN]) {
+    /* d2kask exercises TCP name probes, not temporary address trials. The v3
+       APPLIED record still carries the fixed-width, zero trial generation. */
+    uint8_t rest[D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN] = {0};
+    memcpy(rest, plan_id, D2K_PLAN_ID_LEN);
     send_event_frame(fd, D2K_EV_APPLIED, FAKECTL_LOOPBACK4, target_port,
-                     peer_ip, peer_port, 6, plan_id, D2K_PLAN_ID_LEN);
+                     peer_ip, peer_port, 6, rest, sizeof rest);
 }
 
 /* Обслуживает N раундов SET_NAME->ack->(настоящее подключение цели)->обмен,

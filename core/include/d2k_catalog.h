@@ -248,6 +248,9 @@ typedef struct {
 typedef struct {
     d2k_cat_box *boxes;
     size_t       n_boxes;
+    /* Process-local mutation counter for controller persistence decisions;
+       deliberately omitted from the on-disk catalog schema. */
+    uint64_t     revision;
 } d2k_catalog;
 
 /* Читает каталог из path. При успехе (0) *out заполнен и владеет всей

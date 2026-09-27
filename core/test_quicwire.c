@@ -204,10 +204,62 @@ static void test_retry(void) {
     CHECK(d2k_qw_retry_verify(D2K_QW_V1, odcid, 8, retry, n) == 0,
           "метка целостности Retry не сошлась с вектором A.4");
 
+    d2k_qw_hdr rh;
+    CHECK(d2k_qw_hdr_parse(retry, n, 0, &rh) == 0,
+          "заголовок Retry не разобрался");
+    CHECK(rh.type == D2K_QW_LT_RETRY && rh.token_len == 5 &&
+          rh.token_off + rh.token_len <= n &&
+          memcmp(retry + rh.token_off, "token", rh.token_len) == 0,
+          "парсер Retry не выделил token между SCID и integrity tag");
+
     /* Испорченная метка обязана отвергаться: иначе проверка бесполезна. */
     retry[n - 1] ^= 0x01;
     CHECK(d2k_qw_retry_verify(D2K_QW_V1, odcid, 8, retry, n) != 0,
           "испорченная метка Retry принята");
+
+    uint8_t built[128];
+    const uint8_t dcid[] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07};
+    const uint8_t scid[] = {0x08,0x09,0x0a,0x0b};
+    const uint8_t tok[] = {0xaa,0xbb,0xcc};
+    size_t bn = d2k_qw_retry_build(built, sizeof built, D2K_QW_V1,
+                                   odcid, sizeof odcid,
+                                   dcid, sizeof dcid, scid, sizeof scid,
+                                   tok, sizeof tok);
+    CHECK(bn > 0, "Retry-конструктор отказал на валидном вводе");
+    d2k_qw_hdr bh;
+    CHECK(bn > 0 && d2k_qw_hdr_parse(built, bn, 0, &bh) == 0,
+          "собранный Retry не разобрался");
+    CHECK(bn > 0 && bh.type == D2K_QW_LT_RETRY && bh.dcid_len == sizeof dcid &&
+          bh.scid_len == sizeof scid && bh.token_len == sizeof tok &&
+          memcmp(built + bh.token_off, tok, sizeof tok) == 0 &&
+          d2k_qw_retry_verify(D2K_QW_V1, odcid, sizeof odcid, built, bn) == 0,
+          "собранный Retry не прошёл разбор и integrity");
+    CHECK(d2k_qw_retry_build(built, bn - 1, D2K_QW_V1, odcid, sizeof odcid,
+                             dcid, sizeof dcid, scid, sizeof scid,
+                             tok, sizeof tok) == 0,
+          "Retry-конструктор проигнорировал малый буфер");
+    CHECK(d2k_qw_retry_build(built, sizeof built, D2K_QW_V1, NULL, sizeof odcid,
+                             dcid, sizeof dcid, scid, sizeof scid,
+                             tok, sizeof tok) == 0,
+          "Retry-конструктор принял NULL ODCID");
+}
+
+static void test_initial_token_header(void) {
+    uint8_t hdr[128], dcid[8] = {1,2,3,4,5,6,7,8};
+    uint8_t scid[8] = {8,7,6,5,4,3,2,1};
+    const uint8_t token[] = {0xde, 0xad, 0xbe, 0xef};
+    size_t n = d2k_qw_long_hdr_token(hdr, sizeof hdr, D2K_QW_V1,
+                                     D2K_QW_LT_INITIAL, dcid, sizeof dcid,
+                                     scid, sizeof scid, token, sizeof token,
+                                     2, 32);
+    CHECK(n > 0, "Initial с Retry-token не собрался");
+    if (n > 0) { memset(hdr + n, 0, 50); n += 50; }
+    d2k_qw_hdr h;
+    CHECK(n > 0 && d2k_qw_hdr_parse(hdr, n, 0, &h) == 0,
+          "заголовок Initial с token не разобрался");
+    CHECK(h.token_len == sizeof token && h.token_off + h.token_len <= n &&
+          memcmp(hdr + h.token_off, token, sizeof token) == 0,
+          "Initial token потерян или положен не перед Length");
 }
 
 /* --- свои свойства, которых в векторах нет -------------------------------- */
@@ -282,6 +334,7 @@ int main(void) {
     test_initial_keys();
     test_server_initial();
     test_retry();
+    test_initial_token_header();
     test_roundtrip_levels();
     test_hdr_guards();
 

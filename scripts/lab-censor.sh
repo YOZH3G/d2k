@@ -96,6 +96,7 @@ NAME2=vtoraya-zablokirovannaya.example
 PORT=4443
 QUEUE=2001
 MARK=0x2d
+PROBE_MARK=0x2e
 
 echo "== подготовка =="
 apt-get update -qq >/dev/null 2>&1
@@ -395,14 +396,14 @@ fi
 # Журнал включён: без него «подготовлен 15, доисполнен 1» остаётся загадкой,
 # а с ним видно судьбу КАЖДОЙ попытки.
 # shellcheck disable=SC2086
-/tmp/d2kd --mode apply --control "$SOCK" --queue "$QUEUE" --mark 45 $IFACE_ARG \
+/tmp/d2kd --mode apply --control "$SOCK" --queue "$QUEUE" --mark 45 --probe-mark "$PROBE_MARK" $IFACE_ARG \
     --journal 400 --duration 300 > /tmp/d2kd.log 2>&1 &
 DPID=$!
 i=0; while [ ! -S "$SOCK" ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
 [ -S "$SOCK" ] || fail "датапат не открыл управляющий сокет"
 
 echo "== контроллер, каталог ПУСТОЙ =="
-./core/d2kc --control "$SOCK" --catalog "$CAT" > /tmp/d2kc.log 2>&1 &
+./core/d2kc --control "$SOCK" --catalog "$CAT" --mark "$PROBE_MARK" > /tmp/d2kc.log 2>&1 &
 CPID=$!
 sleep 1
 
@@ -578,11 +579,11 @@ fi
 # перезапуск сам себе что-то дописал; падение — что знание потеряно.
 binds_before=$(grep -c '"target"' "$CAT")
 cp "$CAT" /tmp/lab-catalog-before.json
-/tmp/d2kd --mode apply --control "$SOCK" --queue "$QUEUE" --mark 45 \
+/tmp/d2kd --mode apply --control "$SOCK" --queue "$QUEUE" --mark 45 --probe-mark "$PROBE_MARK" \
     --journal 100 --duration 20 > /tmp/d2kd2.log 2>&1 &
 DPID2=$!
 i=0; while [ ! -S "$SOCK" ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
-./core/d2kc --control "$SOCK" --catalog "$CAT" > /tmp/d2kc2.log 2>&1 &
+./core/d2kc --control "$SOCK" --catalog "$CAT" --mark "$PROBE_MARK" > /tmp/d2kc2.log 2>&1 &
 CPID2=$!
 sleep 8
 kill "$CPID2" 2>/dev/null || true; wait "$CPID2" 2>/dev/null || true

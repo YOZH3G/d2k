@@ -205,17 +205,18 @@ static void on_stop(int s) { (void)s; stop_now = 1; }
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "использование: labdpi <очередь> <имя> <хопов> [--last] [--quic] [--first] [--naive]\n");
+        fprintf(stderr, "использование: labdpi <очередь> <имя> <хопов> [--last] [--quic] [--first] [--warm] [--naive]\n");
         return 2;
     }
     uint16_t queue = (uint16_t)atoi(argv[1]);
     const char *name = argv[2];
     int hops = atoi(argv[3]);
-    int last_wins = 0, quic_mode = 0, first_only = 0, naive = 0;
+    int last_wins = 0, quic_mode = 0, first_only = 0, warm_first = 0, naive = 0;
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--last") == 0) { last_wins = 1; }
         if (strcmp(argv[i], "--quic") == 0) { quic_mode = 1; }
         if (strcmp(argv[i], "--first") == 0) { first_only = 1; }
+        if (strcmp(argv[i], "--warm") == 0) { warm_first = 1; }
         if (strcmp(argv[i], "--naive") == 0) { naive = 1; }
     }
 
@@ -244,7 +245,9 @@ int main(int argc, char **argv) {
     printf("labdpi: очередь %u, имя \"%s\", коробка в %d хопах, %s\n",
            (unsigned)queue, name, hops,
            naive ? "без сборки потока (имя ищется в одном пакете)"
-                 : (last_wins ? "перекрытие: последний" : "перекрытие: первый"));
+                 : (last_wins ? "перекрытие: последний"
+                              : (warm_first ? "первый Initial пропускается, затем блокировка"
+                                            : "перекрытие: первый")));
     fflush(stdout);
 
     static uint8_t buf[65536];
@@ -285,6 +288,7 @@ int main(int argc, char **argv) {
                                   d2k_quic_is_initial(udp + 8, plen) &&
                                   d2k_quic_sni(udp + 8, plen, sni, sizeof sni) == 0 &&
                                   strcmp(sni, name) == 0;
+                    int first_decision = f && !f->decided;
                     if (f) {
                         /* ОСТАТОЧНАЯ БЛОКИРОВКА. Коробка, решившая «это наше
                            имя», закрывает ПОТОК, а не одну датаграмму: иначе
@@ -296,8 +300,24 @@ int main(int argc, char **argv) {
                         matched = f->blocked;
                     }
                     if (matched) {
-                        verdict = NF_DROP;
-                        n_dropped_name++;
+                        /* A warm first packet gives the UDP observer a real
+                           reverse response. The flow is still marked
+                           blocked, so every later Initial is censored. This
+                           is a lab fixture for the product's rev_seen gate,
+                           not a datapath policy. */
+                        /* The d2k controller marks its own verification/search
+                           probes (45 in the lab). Warm only the user's first
+                           Initial; otherwise every probe would be allowed its
+                           first packet and the fixture would report CLEAR. */
+                        int warm_user = warm_first && first_decision &&
+                                        (!p.have_mark || p.mark != 45u);
+                        if (warm_user) {
+                            verdict = NF_ACCEPT;
+                            n_pass++;
+                        } else {
+                            verdict = NF_DROP;
+                            n_dropped_name++;
+                        }
                     } else if (ip[8] <= (uint8_t)hops) {
                         /* Смерть по TTL — это СЕТЬ, а не решение коробки, и
                            она случается независимо от того, смотрела коробка

@@ -43,10 +43,10 @@
  *
  * 1 — состояние на 12.09.2026 (APPLIED 0x0009, SET_NAME с формой, REFUSED с
  * кодом и ID, EXCHANGE с признаком ответа сервера). */
-/* Версия 2: тело ARM_SHAPE получило ТРАНСПОРТ последним байтом, а снимок
- * приветствия стал храниться отдельно на транспорт. Старая пара молча отдавала
- * бы QUIC-задаче байты TLS — ровно та смесь, ради которой версия и заведена. */
-#define D2K_CTL_PROTO_VERSION 2
+/* Версия 2 добавила транспорт в ARM_SHAPE. Версия 3 добавляет временную
+ * адресную пробу с exact-flow key и поколением, а также trial ID в
+ * APPLIED/REFUSED. Смешанная пара должна остановиться на приветствии. */
+#define D2K_CTL_PROTO_VERSION 3
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */
@@ -135,6 +135,8 @@
  * Испытание кандидата — это единственное место, где план не должен достаться
  * никому, кроме зонда (см. d2k_plans.h про цену обратного). */
 #define D2K_CMD_SET_NAME_PROBE 0x0088
+#define D2K_CMD_SET_ADDR_PROBE 0x0089 /* flow(13), trial-id(16), lease-ms(u32), Plan */
+#define D2K_CMD_DEL_ADDR_PROBE 0x008A /* flow(13), trial-id(16); stale delete is no-op */
 #define D2K_CMD_SET_ADDR 0x0082  /* адрес u32 BE, план TLV */
 #define D2K_CMD_DEL_NAME 0x0083  /* длина имени u8, имя */
 #define D2K_CMD_DEL_ADDR 0x0084  /* адрес u32 BE */
@@ -143,6 +145,12 @@
 /* Поймать форму следующего приветствия к цели: длина имени u8, имя.
  * Взводится один раз и срабатывает один раз. */
 #define D2K_CMD_ARM_SHAPE 0x0087
+#define D2K_CMD_DEL_NAME_PROBE 0x008B /* имя u8, форма u8, местный порт u16 */
+
+/* Контроллер задаёт lease относительным временем, datapath сравнивает
+ * абсолютный monotonic expires_ns. Ограничение не даёт аварийному disconnect
+ * оставить временную адресную пробу бессрочно. */
+#define D2K_ADDR_PROBE_LEASE_MAX_MS 120000u
 
 /* Коды причин подозрения живут в d2k_journal.h: они про наблюдение, а сокет
  * их только везёт. */

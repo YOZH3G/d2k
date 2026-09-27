@@ -231,6 +231,7 @@ void d2k_track_new_connection(d2k_flow *f) {
     f->sends_failed = keep.sends_failed;
     f->execution_id = keep.execution_id;
     memcpy(f->execution_plan_id, keep.execution_plan_id, sizeof f->execution_plan_id);
+    memcpy(f->execution_trial_id, keep.execution_trial_id, sizeof f->execution_trial_id);
 }
 
 void d2k_track_remove(d2k_table *t, const d2k_key *k) {

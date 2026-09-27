@@ -245,10 +245,7 @@ int main(int argc, char **argv) {
     int64_t last_live = 0;
 
     int64_t last_tick = now_ms(), last_save = last_tick;
-    size_t dirty = 0;   /* сколько привязок было при последнем сохранении */
-    size_t known = 0;
-    for (size_t i = 0; i < cat.n_boxes; i++) { known += cat.boxes[i].n_binds; }
-    dirty = known;
+    uint64_t dirty = cat.revision; /* catalog contents changed since last save */
 
     while (!stop_asked) {
         struct pollfd pfd[2];
@@ -338,14 +335,13 @@ int main(int argc, char **argv) {
         }
 
         if (t - last_save >= SAVE_EVERY_MS) {
-            size_t n = 0;
-            for (size_t i = 0; i < cat.n_boxes; i++) { n += cat.boxes[i].n_binds; }
-            if (n != dirty) {
+            if (cat.revision != dirty) {
                 if (save_atomic(&cat, catpath, err, sizeof err) != 0) {
                     fprintf(stderr, "d2kc: каталог не сохранён: %s\n", err);
                 } else {
-                    dirty = n;
-                    printf("d2kc: каталог сохранён (%zu привязок)\n", n);
+                    dirty = cat.revision;
+                    printf("d2kc: каталог сохранён (изменение %llu)\n",
+                           (unsigned long long)dirty);
                     fflush(stdout);
                 }
             }
@@ -372,9 +368,7 @@ int main(int argc, char **argv) {
     fflush(stdout);
     d2k_detect_stop_all();
     d2k_sched_free(s);
-    size_t n = 0;
-    for (size_t i = 0; i < cat.n_boxes; i++) { n += cat.boxes[i].n_binds; }
-    if (n != dirty) {
+    if (cat.revision != dirty) {
         if (save_atomic(&cat, catpath, err, sizeof err) != 0) {
             fprintf(stderr, "d2kc: каталог не сохранён на выходе: %s\n", err);
         }

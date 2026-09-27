@@ -37,6 +37,8 @@
 #include "d2k_session.h"
 #include "d2k_time.h"
 #include "d2k_hold.h"
+#include "d2k_udp_hold.h"
+#include "d2k_udp_release.h"
 
 #define RECV_BUF   65536
 #define MAX_PKT     1600
@@ -153,6 +155,8 @@ static struct {
 
 typedef struct { d2k_session *sess; d2k_nfq *q; } hold_context;
 static d2k_hold *holding;
+static d2k_udp_hold *udp_holding;
+static d2k_udp_release *udp_releases;
 static int send_original_verdict(void *ctx, uint32_t id, uint32_t verdict) {
     hold_context *c = ctx;
     char err[256];
@@ -163,6 +167,22 @@ static int send_original_verdict(void *ctx, uint32_t id, uint32_t verdict) {
     }
     if (verdict == D2K_NF_DROP) { st.dropped++; } else { st.accepted++; }
     return rc;
+}
+
+static int send_delayed_verdict(void *ctx, uint32_t id, uint32_t verdict) {
+    return send_original_verdict(ctx, id, verdict);
+}
+
+static void delayed_verdict_done(void *ctx, const d2k_key *key,
+                                 uint64_t execution, int complete, size_t sent) {
+    hold_context *c = ctx;
+    uint64_t at = now_ns();
+    if (complete) {
+        d2k_session_sent(c->sess, at, key, execution);
+        return;
+    }
+    (void)d2k_session_exec_failed(c->sess, at, key, NULL, D2K_REFUSE_SEND,
+                                  execution, 0, sent != 0);
 }
 /* ОТПУЩЕН БЕЗ СБОРКИ — ЭТО ОТДЕЛЬНЫЙ ИСХОД, И ЕГО НАДО НАЗВАТЬ ПО ПОТОКУ.
  *
@@ -177,6 +197,13 @@ static int send_original_verdict(void *ctx, uint32_t id, uint32_t verdict) {
  * таймаутов=1») нельзя было сказать, ЧЕЙ это поток. Теперь можно. */
 static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n) {
     hold_context *c = ctx;
+    d2k_key udp_key;
+    /* A timeout/flush must close the UDP hold transaction as well as release
+       the NFQUEUE ID; otherwise the next packet on the same 5-tuple would be
+       held against a generation whose originals are already gone. */
+    if (d2k_session_udp_hold_begin(c->sess, p, n, now_ns(), &udp_key)) {
+        d2k_session_udp_hold_end(c->sess, &udp_key);
+    }
     d2k_session_note_unassembled(c->sess, p, n, now_ns());
     d2k_session_observe_tcp(c->sess, p, n, now_ns());
     (void)send_original_verdict(ctx, id, D2K_NF_ACCEPT);
@@ -193,6 +220,7 @@ static void usage(void) {
         "  --plan FILE        план в канонической форме TLV\n"
         "  --mode observe|apply   умолчание observe: ничего не менять\n"
         "  --mark M           SO_MARK на собственных пакетах (умолчание 0)\n"
+        "  --probe-mark M     SO_MARK контроллера; его зонды не становятся новыми целями\n"
         "  --iface NAME       чей MTU берётся пределом длины посылки\n"
         "  --flows N          предел числа потоков — отдельно на TCP и на\n"
         "                     UDP/QUIC, не общий бюджет датапата (2048)\n"
@@ -430,6 +458,7 @@ int main(int argc, char **argv) {
     const char *ctl_path = NULL;
     int mode = MODE_OBSERVE;
     uint32_t mark = 0;
+    uint32_t probe_mark = 0;
     uint32_t flows = 2048, qlen = 1024, copy_range = MAX_PKT;
     uint32_t slots = 128, idle_s = 120, stats_s = 10, duration_s = 0;
     uint32_t journal = 256;
@@ -444,6 +473,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--log") == 0)         { NEEDV(); log_path = v; }
         else if (strcmp(a, "--control") == 0)     { NEEDV(); ctl_path = v; }
         else if (strcmp(a, "--mark") == 0)        { NEEDV(); if (arg_u32(v, &mark)) goto badval; }
+        else if (strcmp(a, "--probe-mark") == 0)  { NEEDV(); if (arg_u32(v, &probe_mark)) goto badval; }
         else if (strcmp(a, "--iface") == 0)       { NEEDV(); ifname = v; }
         else if (strcmp(a, "--flows") == 0)       { NEEDV(); if (arg_u32(v, &flows)) goto badval; }
         else if (strcmp(a, "--queue-len") == 0)   { NEEDV(); if (arg_u32(v, &qlen)) goto badval; }
@@ -496,6 +526,10 @@ int main(int argc, char **argv) {
            очередь и обучат систему на её собственном эхе. */
         fprintf(stderr, "режим apply без --mark запрещён: собственные пакеты "
                         "нечем исключить из своей же очереди\n");
+        return 2;
+    }
+    if (probe_mark != 0 && probe_mark == mark) {
+        fprintf(stderr, "--probe-mark должен отличаться от --mark: иначе собственные raw-пакеты нельзя отличить от зондов контроллера\n");
         return 2;
     }
 
@@ -614,9 +648,9 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     printf("=== d2kd[%ld] запущен ===\n", (long)getpid());
-    printf("d2kd: очередь %u, режим %s, метка %u, потоков до %u, "
+    printf("d2kd: очередь %u, режим %s, метка %u, метка зондов %u, потоков до %u, "
            "fail-open %s%s\n",
-           queue, MODE_NAMES[mode], mark, flows, fail_open ? "да" : "НЕТ",
+           queue, MODE_NAMES[mode], mark, probe_mark, flows, fail_open ? "да" : "НЕТ",
            plan_path ? ", план загружен" : ", плана нет");
     if (mode == MODE_OBSERVE) {
         printf("d2kd: наблюдение. Ни один пакет не будет изменён, снят или "
@@ -634,8 +668,16 @@ int main(int argc, char **argv) {
     cx.send_maxlen = raw ? (uint32_t)d2k_raw_maxlen(raw) : 0;
     uint64_t events_seen = 0;
     holding = mode == MODE_APPLY ? d2k_hold_new() : NULL;
+    udp_holding = mode == MODE_APPLY ? d2k_udp_hold_new() : NULL;
+    udp_releases = mode == MODE_APPLY ? d2k_udp_release_new(16, D2K_UDP_HOLD_PACKETS) : NULL;
     if (mode == MODE_APPLY && !holding) {
         fprintf(stderr, "d2kd: нет памяти для составного входа — пакеты не удерживаются\n");
+    }
+    if (mode == MODE_APPLY && !udp_holding) {
+        fprintf(stderr, "d2kd: нет памяти для split QUIC — UDP будет пропускаться без удержания\n");
+    }
+    if (mode == MODE_APPLY && !udp_releases) {
+        fprintf(stderr, "d2kd: нет памяти для задержанных UDP-вердиктов — split Plan будет fail-open\n");
     }
     hold_context hc = {sess, q};
 
@@ -671,6 +713,8 @@ int main(int argc, char **argv) {
            округлялись бы вверх на его величину. */
         uint64_t wake = t + 200 * NS_PER_MS;      /* потолок ожидания: 200 мс */
         uint64_t due = d2k_sched_next_ns(sched);
+        if (due && due < wake) { wake = due; }
+        due = d2k_udp_release_next_ns(udp_releases);
         if (due && due < wake) { wake = due; }
         due = d2k_hold_next(holding);
         if (due && due < wake) { wake = due; }
@@ -724,14 +768,17 @@ int main(int argc, char **argv) {
 
         d2k_hold_flush(holding, now_ns(), d2k_session_plan_revision(sess), 0,
                         release_original, &hc);
+        d2k_udp_hold_flush(udp_holding, now_ns(), release_original, &hc);
         if (pr > 0 && (pfd[iq].revents & POLLIN)) {
             ssize_t n = d2k_nfq_recv(q, rbuf, sizeof rbuf, err, sizeof err);
             if (n == -1) {
                 st.recv_err++;
                 fprintf(stderr, "d2kd: %s\n", err);
                 d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
+                d2k_udp_hold_flush(udp_holding, now_ns(), release_original, &hc);
             } else if (n == -2) {
                 d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
+                d2k_udp_hold_flush(udp_holding, now_ns(), release_original, &hc);
             } else if (n > 0) {
                 t = now_ns();
                 d2k_nl_iter it;
@@ -763,6 +810,30 @@ int main(int argc, char **argv) {
 
                     d2k_hold_batch batch;
                     memset(&batch, 0, sizeof batch);
+                    d2k_udp_hold_batch udp_batch;
+                    memset(&udp_batch, 0, sizeof udp_batch);
+                    int udp_replay = 0;
+                    d2k_key udp_key;
+                    memset(&udp_key, 0, sizeof udp_key);
+
+                    /* Direction evidence is needed before split-QUIC hold:
+                       non-443 client Initials are accepted only when NFQUEUE
+                       supplied OUTPUT/POSTROUTING. */
+                    d2k_session_set_hook(sess, np.have_hdr ? np.hook : D2K_HOOK_UNKNOWN);
+
+                    /* QUIC split hold starts before session inspection, so the
+                       first tail cannot escape while the ClientHello is still
+                       incomplete.  The session only classifies; it never
+                       concatenates these datagrams. */
+                    if (udp_holding && np.have_payload && !np.truncated &&
+                        d2k_session_udp_hold_begin(sess, np.payload, np.payload_len,
+                                                   t, &udp_key)) {
+                        if (!d2k_udp_hold_feed(udp_holding, &udp_key, np.id,
+                                               np.payload, np.payload_len, t,
+                                               release_original, &hc)) {
+                            d2k_session_udp_hold_end(sess, &udp_key);
+                        }
+                    }
                     if (holding && np.have_payload && !np.truncated) {
                         /* НАЧАЛО ПОТОКА — ИЗ САМОГО ПОТОКА, а не из первого
                            байта куска: куски приветствия приходят в любом
@@ -801,13 +872,51 @@ int main(int argc, char **argv) {
                         st.truncated++;
                         res.skipped = "пакет обрезан copy_range";
                     } else {
-                        /* КРЮЧОК — ПЕРЕД ПАКЕТОМ, и это не украшение: по нему
-                           сессия называет сторону на ЛЮБОМ порту, а не только
-                           на 443 (см. d2k_session_set_hook). Провод его уже
-                           разбирал, дело было только донести. */
-                        d2k_session_set_hook(sess, np.have_hdr ? np.hook : D2K_HOOK_UNKNOWN);
-                        d2k_session_packet(sess, np.payload, np.payload_len, t,
-                                           obuf, sizeof obuf, &res);
+                        int controller_probe = probe_mark != 0 && np.have_mark &&
+                                               np.mark == probe_mark;
+                        if (controller_probe) {
+                            d2k_session_packet_probe(sess, np.payload, np.payload_len, t,
+                                                     obuf, sizeof obuf, &res);
+                        } else {
+                            d2k_session_packet(sess, np.payload, np.payload_len, t,
+                                               obuf, sizeof obuf, &res);
+                        }
+                    }
+
+                    if (res.udp_hold_wait) {
+                        /* The original ID is owned by udp_holding. */
+                        continue;
+                    }
+                    if (res.udp_hold_ready && udp_holding &&
+                        d2k_udp_hold_take(udp_holding, &udp_key, t, &udp_batch) &&
+                        udp_batch.count > 0) {
+                        d2k_session_udp_hold_end(sess, &udp_key);
+                        udp_replay = 1;
+                        /* Apply the ordinary plan to the first original
+                           datagram only.  The remaining originals retain
+                           their own datagram boundaries and are released
+                           separately below. */
+                        np.id = udp_batch.ids[0];
+                        np.payload = udp_batch.packets[0];
+                        np.payload_len = udp_batch.len[0];
+                        memset(&res, 0, sizeof res);
+                        res.verdict = D2K_VERDICT_ACCEPT;
+                        res.first_payload = 0xFF;
+                        int controller_probe = probe_mark != 0 && np.have_mark &&
+                                               np.mark == probe_mark;
+                        if (controller_probe) {
+                            d2k_session_packet_probe(sess, np.payload, np.payload_len, t,
+                                                     obuf, sizeof obuf, &res);
+                        } else {
+                            d2k_session_packet(sess, np.payload, np.payload_len, t,
+                                               obuf, sizeof obuf, &res);
+                        }
+                    } else if (res.udp_hold_ready) {
+                        /* A missing slot is an internal ownership failure, not
+                           a reason to leave the NFQUEUE ID pending forever. */
+                        d2k_session_udp_hold_end(sess, &udp_key);
+                        res.udp_hold_ready = 0;
+                        res.skipped = "split QUIC hold исчез до replay";
                     }
 
                     if (res.skipped) {
@@ -852,6 +961,7 @@ int main(int argc, char **argv) {
                      * испорчен, оригинал уходит нетронутым. Частичная
                      * отправка такого выхода уже не даёт, поэтому проверяем
                      * ВСЕ посылки разом, а не по одной на ходу. */
+                    int output_failed = 0;
                     if (mode == MODE_APPLY && raw && res.applied) {
                         /* Предел КАЖДОЙ ПОСЫЛКИ по ЕЁ направлению, а не один
                            общий на план: общий не знает ни про туннель,
@@ -880,6 +990,7 @@ int main(int argc, char **argv) {
                                 "d2kd: план не исполнен: посылка %zu байт при пределе %zu\n",
                                 too_long, cap);
                             st.send_fail++;
+                            output_failed = 1;
                             res.n_out = 0;
                             /* Ничего не ушло и вердикт не отправлен — исход
                                считает общая политика, а не эта ветка. */
@@ -896,7 +1007,7 @@ int main(int argc, char **argv) {
                             if(d2k_raw_prepare(raw,obuf+res.out[k].off,res.out[k].len,
                                                err,sizeof err)==0) continue;
                             fprintf(stderr,"d2kd: план не отправлен: %s\n",err);
-                            st.send_fail++;res.n_out=0;
+                            st.send_fail++; output_failed = 1; res.n_out=0;
                             if(d2k_session_exec_failed(sess,t,&res.key,res.plan_id,
                                  D2K_REFUSE_SEND,res.execution_id,0,0)) verdict=D2K_NF_ACCEPT;
                             break;
@@ -916,6 +1027,7 @@ int main(int argc, char **argv) {
                             if (d2k_raw_send(raw, p, plen, err, sizeof err) != 0) {
                                 uint8_t failure = refuse_of_errno(errno);
                                 st.send_fail++;
+                                output_failed = 1;
                                 fprintf(stderr, "d2kd: %s\n", err);
                                 /* НАША неудача — не свойство коробки. Пока её
                                    знал только этот счётчик, контроллер видел
@@ -951,6 +1063,7 @@ int main(int argc, char **argv) {
                         } else if (d2k_sched_push_serial(sched, at, p, plen,
                                                   res.applied ? &res.key : NULL, res.execution_id) != 0) {
                             st.send_fail++;
+                            output_failed = 1;
                             if (res.applied &&
                                 d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
                                                         D2K_REFUSE_QUEUE, res.execution_id,
@@ -963,10 +1076,53 @@ int main(int argc, char **argv) {
                         }
                     }
 
-                    const uint32_t *original_ids = batch.count ? batch.ids : &np.id;
-                    size_t original_count = batch.count ? batch.count : 1;
-                    if (d2k_hold_verdicts(original_ids, original_count, verdict,
-                                           send_original_verdict, &hc) != 0) {
+                    int delayed_originals = 0;
+                    if (udp_replay && res.applied && !output_failed &&
+                        udp_batch.count > 1 && at > t && udp_releases) {
+                        uint32_t ids[D2K_UDP_HOLD_PACKETS];
+                        uint32_t verdicts[D2K_UDP_HOLD_PACKETS];
+                        for (size_t i = 0; i < udp_batch.count; i++) {
+                            ids[i] = udp_batch.ids[i];
+                            verdicts[i] = (i == 0) ? verdict : D2K_NF_ACCEPT;
+                        }
+                        if (d2k_udp_release_enqueue(udp_releases, at, ids, verdicts,
+                                                    udp_batch.count, &res.key,
+                                                    res.execution_id) == 0) {
+                            delayed_originals = 1;
+                        } else {
+                            /* Bounded ownership is fail-open: never leave
+                               NFQUEUE IDs pending when the release ring is
+                               full. The generated plan is marked incomplete,
+                               then the ordinary verdict path below releases
+                               every original immediately. */
+                            output_failed = 1;
+                            if (d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
+                                                        D2K_REFUSE_QUEUE,
+                                                        res.execution_id, 0, 0)) {
+                                verdict = D2K_NF_ACCEPT;
+                            }
+                        }
+                    }
+
+                    int original_failed = 0;
+                    if (udp_replay && !delayed_originals) {
+                        /* Only the first original was replaced by the
+                           strategy.  Later QUIC datagrams are real client
+                           input and must remain in the stream. */
+                        for (size_t i = 0; i < udp_batch.count; i++) {
+                            uint32_t v = (i == 0) ? verdict : D2K_NF_ACCEPT;
+                            if (send_original_verdict(&hc, udp_batch.ids[i], v) != 0) {
+                                original_failed = 1;
+                            }
+                        }
+                    } else if (!delayed_originals) {
+                        const uint32_t *original_ids = batch.count ? batch.ids : &np.id;
+                        size_t original_count = batch.count ? batch.count : 1;
+                        original_failed = d2k_hold_verdicts(original_ids, original_count,
+                                                            verdict, send_original_verdict,
+                                                            &hc) != 0;
+                    }
+                    if (original_failed) {
                         if (res.applied && mode == MODE_APPLY) {
                             /* Возврат игнорируется намеренно: вердикт ядру не
                                дошёл, отпускать оригинал уже нечем. */
@@ -974,7 +1130,7 @@ int main(int argc, char **argv) {
                                                           D2K_REFUSE_SEND, res.execution_id,
                                                           payload_on_wire, 1);
                         }
-                    } else if (res.applied && mode == MODE_APPLY) {
+                    } else if (!delayed_originals && res.applied && mode == MODE_APPLY) {
                         d2k_session_sent(sess, t, &res.key, res.execution_id);
                     }
                 }
@@ -1024,6 +1180,15 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* A split QUIC batch may keep its original NFQUEUE verdict behind the
+           last delayed fake.  Drain only after the raw scheduler above has
+           emitted every due fake, so the tail cannot overtake REC_DELAY. */
+        if (udp_releases) {
+            (void)d2k_udp_release_flush(udp_releases, now_ns(),
+                                         send_delayed_verdict,
+                                         delayed_verdict_done, &hc);
+        }
+
         if (t >= next_expire) {
             /* Сперва заметить молчание, потом забывать. Обратный порядок
                означал бы, что о молчании узнаём только при забвении потока —
@@ -1066,6 +1231,12 @@ int main(int argc, char **argv) {
     }
 
     d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
+    d2k_udp_hold_flush(udp_holding, now_ns(), release_original, &hc);
+    if (udp_releases) {
+        (void)d2k_udp_release_flush(udp_releases, UINT64_MAX,
+                                     send_delayed_verdict,
+                                     delayed_verdict_done, &hc);
+    }
     /* Originals already committed by completed groups cannot be replayed
        on shutdown. Explicitly fail their remaining queued sends; never let
        freeing the queue silently leave an execution waiting for DONE. */
@@ -1090,6 +1261,10 @@ int main(int argc, char **argv) {
     d2k_sched_free(sched);
     d2k_hold_free(holding);
     holding = NULL;
+    d2k_udp_hold_free(udp_holding, release_original, &hc);
+    udp_holding = NULL;
+    d2k_udp_release_free(udp_releases);
+    udp_releases = NULL;
     d2k_session_free(sess);
     d2k_nfq_close(q);
     d2k_raw_close(raw);

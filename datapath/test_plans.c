@@ -128,6 +128,28 @@ int main(void) {
         d2k_plantab_free(t);
     }
 
+    /* Удаление пробного плана не должно сносить подтверждённый план того же
+       имени/формы: это отдельное поколение опыта, а не общая запись цели. */
+    {
+        d2k_plantab *t = d2k_plantab_new(4);
+        const uint8_t nm[] = "probe.example";
+        uint16_t sport = 0x1234;
+        d2k_plan *persistent = mkplan(), *probe = mkplan();
+        CHECK(d2k_plantab_set_name_shaped(t, nm, sizeof nm - 1, 1, persistent,
+                                          D2K_PLAN_SHAPE_QUIC) == 0,
+              "подтверждённый shaped-план не встал");
+        CHECK(d2k_plantab_set_name_probe(t, nm, sizeof nm - 1, 2, probe,
+                                         D2K_PLAN_SHAPE_QUIC, sport) == 0,
+              "пробный shaped-план не встал");
+        CHECK(d2k_plantab_del_name_probe(t, nm, sizeof nm - 1,
+                                         D2K_PLAN_SHAPE_QUIC, sport) == 1,
+              "точное удаление пробного плана не сработало");
+        CHECK(d2k_plantab_find_sport(t, nm, sizeof nm - 1, 0, 3,
+                                     D2K_PLAN_SHAPE_QUIC, sport) == persistent,
+              "удаление пробного плана задело подтверждённый");
+        d2k_plantab_free(t);
+    }
+
     /* --- переполнение: вытеснение самой давно не использованной записи, а не
      * отказ навсегда ------------------------------------------------------------
      * Замер на живом роутере (см. d2k_plans.h, 2026-09-06): без вытеснения
@@ -340,6 +362,65 @@ int main(void) {
                   "поток зонда перестал получать испытуемый план");
             d2k_plantab_free(t);
         }
+    }
+
+    /* Временная адресная проба совпадает по ПОЛНОМУ QUIC flow и поколению;
+       постоянный Plan по IP не заменяется и переживает любое probe cleanup. */
+    {
+        d2k_plantab *t = d2k_plantab_new(4);
+        d2k_addr_probe_flow f = {
+            .src_ip4 = {192, 0, 2, 10}, .src_port_be = 0x3412,
+            .dst_ip4 = {203, 0, 113, 7}, .dst_port_be = 0xbb01,
+            .transport = 17
+        };
+        d2k_addr_probe_flow other = f;
+        uint8_t trial1[D2K_TRIAL_ID_LEN] = {1};
+        uint8_t trial2[D2K_TRIAL_ID_LEN] = {2};
+        uint8_t seen[D2K_TRIAL_ID_LEN] = {0};
+        d2k_plan *persistent = mkplan();
+        d2k_plan *probe = mkplan();
+        CHECK(d2k_plantab_set_addr(t, addr(203, 0, 113, 7), 1, persistent) == 0,
+              "persistent address plan setup failed");
+        CHECK(d2k_plantab_set_addr_probe(t, &f, trial1, 10, 1000, probe) == 0,
+              "exact-flow probe plan setup failed");
+        CHECK(d2k_plantab_probe_count(t) == 1,
+              "temporary probe was not counted separately");
+        CHECK(d2k_plantab_find_addr_probe(t, &f, 11, seen) == probe &&
+              memcmp(seen, trial1, sizeof seen) == 0,
+              "exact QUIC verifier flow did not receive its probe and generation");
+
+        other.src_ip4[3]++;
+        CHECK(d2k_plantab_find_addr_probe(t, &other, 12, NULL) == NULL,
+              "same source port from another local IP received the probe");
+        other = f; other.src_port_be++;
+        CHECK(d2k_plantab_find_addr_probe(t, &other, 12, NULL) == NULL,
+              "another source port received the probe");
+        other = f; other.dst_port_be++;
+        CHECK(d2k_plantab_find_addr_probe(t, &other, 12, NULL) == NULL,
+              "another destination port received the probe");
+        other = f; other.transport = 6;
+        CHECK(d2k_plantab_find_addr_probe(t, &other, 12, NULL) == NULL,
+              "TCP flow received a QUIC probe");
+
+        CHECK(d2k_plantab_set_addr_probe(t, &f, trial2, 13, 1000, mkplan()) == -3,
+              "a concurrent generation silently replaced the same exact flow");
+        CHECK(d2k_plantab_del_addr_probe(t, &f, trial2) == 0 &&
+              d2k_plantab_find_addr_probe(t, &f, 14, seen) == probe &&
+              memcmp(seen, trial1, sizeof seen) == 0,
+              "stale-generation delete removed the active probe");
+
+        other = f; other.src_port_be++;
+        CHECK(d2k_plantab_set_addr_probe(t, &other, trial2, 15, 1000, mkplan()) == 0 &&
+              d2k_plantab_probe_count(t) == 2,
+              "independent flow to the same destination could not own a probe");
+        CHECK(d2k_plantab_find_addr_probe(t, &f, 1000, NULL) == NULL &&
+              d2k_plantab_probe_count(t) == 0,
+              "expired address probes remained eligible");
+        CHECK(d2k_plantab_find(t, NULL, 0, addr(203, 0, 113, 7), 1001,
+                               D2K_PLAN_SHAPE_QUIC) == persistent &&
+              d2k_plantab_count(t) == 1,
+              "probe expiry altered the permanent address Plan");
+        d2k_plantab_free(t);
     }
 
     if (fails) {

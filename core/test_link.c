@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -531,8 +532,9 @@ int main(void) {
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (APPLIED с id) не создался");
         if (sv[0] >= 0) {
-            uint8_t rest[16];
-            for (int i = 0; i < 16; i++) { rest[i] = (uint8_t)(0xA0 + i); }
+            uint8_t rest[D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN];
+            for (int i = 0; i < D2K_PLAN_ID_LEN; i++) { rest[i] = (uint8_t)(0xA0 + i); }
+            for (int i = 0; i < D2K_TRIAL_ID_LEN; i++) { rest[D2K_PLAN_ID_LEN + i] = (uint8_t)(0xD0 + i); }
             send_synthetic(sv[1], D2K_EV_APPLIED, rest, sizeof rest);
             d2k_ev ev; char e[200] = {0};
             CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
@@ -540,6 +542,8 @@ int main(void) {
             int same = 1;
             for (int i = 0; i < 16; i++) { if (ev.plan_id[i] != (uint8_t)(0xA0 + i)) { same = 0; } }
             CHECK(same, "идентификатор плана потерян при разборе события");
+            CHECK(memcmp(ev.trial_id, rest + D2K_PLAN_ID_LEN, D2K_TRIAL_ID_LEN) == 0,
+                  "trial ID потерян при разборе события");
             close(sv[0]); close(sv[1]);
         }
     }
@@ -563,7 +567,7 @@ int main(void) {
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (APPLIED с обрезанным id) не создался");
         if (sv[0] >= 0) {
-            uint8_t rest[15];
+            uint8_t rest[D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN - 1];
             memset(rest, 0xC7, sizeof rest);
             send_synthetic(sv[1], D2K_EV_APPLIED, rest, sizeof rest);
             d2k_ev ev; char e[200] = {0};
@@ -593,13 +597,16 @@ int main(void) {
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (отказ с ID) не создался");
         if (sv[0] >= 0) {
-            uint8_t rest[17]; memset(rest, 0xC7, sizeof rest); rest[0] = 3;
+            uint8_t rest[1 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN];
+            memset(rest, 0xC7, sizeof rest); rest[0] = 3;
             send_synthetic(sv[1], D2K_EV_REFUSED, rest, sizeof rest);
             d2k_ev ev; char e[200] = {0};
             CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
                   "отказ с ID не разобран");
             CHECK(ev.code == 3 && memcmp(ev.plan_id, rest + 1, 16) == 0,
                   "отказ потерял код или ID кандидата");
+            CHECK(memcmp(ev.trial_id, rest + 1 + D2K_PLAN_ID_LEN, D2K_TRIAL_ID_LEN) == 0,
+                  "отказ потерял trial ID");
             close(sv[0]); close(sv[1]);
         }
     }
@@ -697,6 +704,39 @@ int main(void) {
                   "имя длиннее 255 байт должно отклоняться");
             close(sv[0]);
             close(sv[1]);
+        }
+    }
+    /* Address-trial command encoding is byte-level protocol, not a struct ABI. */
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+              "socketpair (SET_ADDR_PROBE wire) не создался");
+        if (sv[0] >= 0 && sv[1] >= 0) {
+            const uint8_t src[4] = {192, 0, 2, 10}, dst[4] = {203, 0, 113, 7};
+            const uint8_t trial[D2K_TRIAL_ID_LEN] = {1, 2, 3, 4, 5, 6, 7, 8,
+                9, 10, 11, 12, 13, 14, 15, 16};
+            char err[160] = {0};
+            CHECK(d2k_link_set_addr_probe(sv[0], src, htons(40000), dst,
+                  htons(443), 17, trial, 120000, "00", err, sizeof err) == 0,
+                  "SET_ADDR_PROBE wire-команда не собралась");
+            uint8_t frame[128];
+            ssize_t n = read(sv[1], frame, sizeof frame);
+            CHECK(n == 6 + 13 + D2K_TRIAL_ID_LEN + 4 + 1,
+                  "SET_ADDR_PROBE имеет неверную длину кадра");
+            if (n >= 6 + 13 + D2K_TRIAL_ID_LEN + 4 + 1) {
+                CHECK(frame[4] == 0 && frame[5] == D2K_CMD_SET_ADDR_PROBE,
+                      "SET_ADDR_PROBE имеет неверный command type");
+                CHECK(memcmp(frame + 6, src, 4) == 0 &&
+                      memcmp(frame + 10, (uint8_t[]){0x9c, 0x40}, 2) == 0 &&
+                      memcmp(frame + 12, dst, 4) == 0 &&
+                      memcmp(frame + 16, (uint8_t[]){0x01, 0xbb, 17}, 3) == 0,
+                      "SET_ADDR_PROBE потерял exact flow tuple");
+                CHECK(memcmp(frame + 19, trial, sizeof trial) == 0 &&
+                      memcmp(frame + 35, (uint8_t[]){0, 1, 0xd4, 0xc0}, 4) == 0 &&
+                      frame[39] == 0,
+                      "SET_ADDR_PROBE потерял generation, lease или TLV");
+            }
+            close(sv[0]); close(sv[1]);
         }
     }
 

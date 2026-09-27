@@ -245,6 +245,9 @@ typedef d2k_tally (*d2k_quic_ask_fn)(const char *addr, uint16_t port,
                                       int repeats, uint32_t *rtt_ms_out, int *refused_out,
                                       int *sent_out, uint8_t *ttl_in_out);
 extern d2k_quic_ask_fn d2k_quic_ask_hook;
+/* Base/residual control rebuilds every repeat from the captured profile with
+ * a neutral random SNI and fresh CID. Other tree questions remain unchanged. */
+extern d2k_quic_ask_fn d2k_quic_ask_control_hook;
 
 /* РАЗРЕШИТЬ ЦЕЛЬ В ПРИВАТНОМ ДИАПАЗОНЕ. Ноль (умолчание) — такая цель даёт
  * вердикт D2K_V_LOCAL_ADDRESS и ни одного опыта: провайдерская коробка до неё

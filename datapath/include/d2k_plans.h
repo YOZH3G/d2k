@@ -82,6 +82,17 @@
 
 typedef struct d2k_plantab d2k_plantab;
 
+/* Полный поток собственного адресного QUIC-зонда. Все порты в сетевом
+ * порядке; адреса — четыре байта как в d2k_key. Не смешивать его с ключом
+ * постоянной адресной привязки, у которой намеренно только destination IP. */
+typedef struct {
+    uint8_t  src_ip4[4];
+    uint16_t src_port_be;
+    uint8_t  dst_ip4[4];
+    uint16_t dst_port_be;
+    uint8_t  transport;
+} d2k_addr_probe_flow;
+
 d2k_plantab *d2k_plantab_new(size_t cap);
 void         d2k_plantab_free(d2k_plantab *t);
 
@@ -182,7 +193,29 @@ int d2k_plantab_set_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
 
 /* Убирает план цели. Возвращает 1, если что-то убрано. */
 int d2k_plantab_del_name(d2k_plantab *t, const uint8_t *name, size_t len);
+int d2k_plantab_del_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
+                               uint8_t shape, uint16_t sport_be);
 int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be);
+
+/* Временный Plan для одного exact-flow опыта. plan ownership переходит
+ * таблице при любом результате. expires_ns — монотонное время datapath.
+ * 0 success; -1 capacity exhausted; -2 invalid args; -3 same flow already
+ * owned by a different trial generation. */
+int d2k_plantab_set_addr_probe(d2k_plantab *t,
+                               const d2k_addr_probe_flow *flow,
+                               const uint8_t trial_id[D2K_TRIAL_ID_LEN],
+                               uint64_t now_ns, uint64_t expires_ns,
+                               d2k_plan *p);
+/* Removes only exact (flow, generation); stale deletes return 0. */
+int d2k_plantab_del_addr_probe(d2k_plantab *t,
+                               const d2k_addr_probe_flow *flow,
+                               const uint8_t trial_id[D2K_TRIAL_ID_LEN]);
+/* Exact temporary match. Expired entries are removed lazily. trial_id_out may
+ * be NULL when caller needs only the Plan. */
+const d2k_plan *d2k_plantab_find_addr_probe(
+    d2k_plantab *t, const d2k_addr_probe_flow *flow, uint64_t now_ns,
+    uint8_t trial_id_out[D2K_TRIAL_ID_LEN]);
+size_t d2k_plantab_probe_count(const d2k_plantab *t);
 
 /* Сперва по имени, потом по адресу. NULL — плана для этой цели нет, и это
  * обычный исход: пустая база при первом запуске (§2.2).

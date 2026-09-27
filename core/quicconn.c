@@ -90,6 +90,12 @@ struct d2k_qc {
     size_t   dcid_len, scid_len;
     uint8_t  odcid[20];     /* DCID первого Initial — для проверки Retry и tp */
     size_t   odcid_len;
+    uint8_t  initial_scid[20]; /* SCID первого Initial для transport parameters */
+    size_t   initial_scid_len;
+    uint8_t  retry_token[D2K_QW_MAX_DGRAM];
+    size_t   retry_token_len;
+    unsigned retry_count;
+    int      retry_pending;
 
     level    lv[D2K_QW_LEVEL_COUNT];
     int      handshake_done;
@@ -226,9 +232,12 @@ static size_t seal_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
                от поля Length, то есть от длины тела. Два прохода дешевле, чем
                гадание. */
             uint8_t probe[64];
-            size_t h0 = d2k_qw_long_hdr(probe, sizeof probe, c->version, type,
-                                        c->dcid, c->dcid_len,
-                                        c->scid, c->scid_len, pn_len, blen);
+            size_t h0 = d2k_qw_long_hdr_token(probe, sizeof probe, c->version, type,
+                                              c->dcid, c->dcid_len,
+                                              c->scid, c->scid_len,
+                                              lvl == D2K_QW_LEVEL_INITIAL ? c->retry_token : NULL,
+                                              lvl == D2K_QW_LEVEL_INITIAL ? c->retry_token_len : 0,
+                                              pn_len, blen);
             if (h0 == 0) { say(err, errcap, "заголовок не собрался"); return 0; }
             size_t total = h0 + pn_len + blen + 16;
             if (total < pad_to && blen + (pad_to - total) <= sizeof body) {
@@ -237,9 +246,12 @@ static size_t seal_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
                 blen += add;
             }
         }
-        hlen = d2k_qw_long_hdr(pkt, pkt_cap, c->version, type,
-                               c->dcid, c->dcid_len,
-                               c->scid, c->scid_len, pn_len, blen);
+        hlen = d2k_qw_long_hdr_token(pkt, pkt_cap, c->version, type,
+                                     c->dcid, c->dcid_len,
+                                     c->scid, c->scid_len,
+                                     lvl == D2K_QW_LEVEL_INITIAL ? c->retry_token : NULL,
+                                     lvl == D2K_QW_LEVEL_INITIAL ? c->retry_token_len : 0,
+                                     pn_len, blen);
     }
 
     size_t n = d2k_qw_seal(&L->tx, lvl != D2K_QW_LEVEL_APP, pkt, hlen,
@@ -295,8 +307,8 @@ static size_t tp_build(const d2k_qc *c, uint8_t *out, size_t cap) {
     /* initial_source_connection_id ОБЯЗАТЕЛЕН (RFC 9000 §7.3): им сервер
        сверяет, что SCID наших пакетов не подменили по дороге. */
     o += d2k_qw_varint_write(v + o, sizeof v - o, 0x0f);
-    o += d2k_qw_varint_write(v + o, sizeof v - o, c->scid_len);
-    memcpy(v + o, c->scid, c->scid_len); o += c->scid_len;
+    o += d2k_qw_varint_write(v + o, sizeof v - o, c->initial_scid_len);
+    memcpy(v + o, c->initial_scid, c->initial_scid_len); o += c->initial_scid_len;
 
     if (cap < o + 4) { return 0; }
     out[0] = 0x00; out[1] = 0x39;                 /* тип расширения */
@@ -516,8 +528,22 @@ static int recv_dgram(d2k_qc *c, int wait_ms, char *err, size_t errcap) {
         } else if (h.type == D2K_QW_LT_HANDSHAKE) {
             lvl = D2K_QW_LEVEL_HANDSHAKE;
         } else if (h.type == D2K_QW_LT_RETRY) {
-            say(err, errcap, "сервер ответил Retry — повторное обращение не реализовано");
-            return -1;
+            if (c->retry_count != 0 || h.version != c->version ||
+                h.dcid_len != c->scid_len ||
+                memcmp(buf + off + h.dcid_off, c->scid, c->scid_len) != 0 ||
+                h.scid_len == 0 || h.scid_len > sizeof c->dcid ||
+                h.token_len > sizeof c->retry_token ||
+                d2k_qw_retry_verify(c->version, c->odcid, c->odcid_len,
+                                    buf + off, h.packet_len) != 0) {
+                say(err, errcap, "недействительный или повторный Retry");
+                return -1;
+            }
+            memcpy(c->dcid, buf + off + h.scid_off, h.scid_len);
+            c->dcid_len = h.scid_len;
+            memcpy(c->retry_token, buf + off + h.token_off, h.token_len);
+            c->retry_token_len = h.token_len;
+            c->retry_pending = 1;
+            return 2;
         } else {
             off += h.packet_len;
             continue;   /* 0-RTT нам не адресован */
@@ -591,6 +617,8 @@ static int first_flight(d2k_qc *c, const char *sni, const char *alpn, size_t pad
         say(err, errcap, "нет случайности: /dev/urandom недоступен");
         return -1;
     }
+    memcpy(c->initial_scid, c->scid, c->scid_len);
+    c->initial_scid_len = c->scid_len;
     memcpy(c->odcid, c->dcid, c->dcid_len);
     c->odcid_len = c->dcid_len;
     if (d2k_x25519_base(pub, priv) != 0) {
@@ -616,7 +644,8 @@ static int first_flight(d2k_qc *c, const char *sni, const char *alpn, size_t pad
     uint8_t ch[2560];
     d2k_t13_ch_opts cho;
     memset(&cho, 0, sizeof cho);
-    cho.sni = sni;
+    struct in_addr ip_target;
+    cho.sni = (sni && inet_pton(AF_INET, sni, &ip_target) == 1) ? NULL : sni;
     cho.pub = pub;
     cho.random = rnd;
     cho.session_id_len = 0;      /* RFC 9001 §8.4: у QUIC он обязан быть пуст */
@@ -631,6 +660,40 @@ static int first_flight(d2k_qc *c, const char *sni, const char *alpn, size_t pad
 
     *flen = crypto_frame(frame, cap, 0, ch, ch_len);
     if (*flen == 0) { say(err, errcap, "кадр CRYPTO не собрался"); return -1; }
+    return 0;
+}
+
+/* Retry не является новым TLS-сеансом: клиент пересылает тот же ClientHello,
+ * но с новым Destination CID сервера, новым своим SCID и token. Начальные
+ * ключи выводятся заново из CID Retry, тогда как initial_source_connection_id
+ * в уже собранном ClientHello остаётся SCID самого первого Initial. */
+static int prepare_retry(d2k_qc *c, char *err, size_t errcap) {
+    if (!c || !c->retry_pending || c->retry_count != 0 ||
+        c->dcid_len == 0 || c->dcid_len > D2K_QW_CID_MAX) {
+        say(err, errcap, "Retry нельзя применить к этому состоянию");
+        return -1;
+    }
+    c->scid_len = 8;
+    if (d2k_t13_random(c->scid, c->scid_len) != 0) {
+        say(err, errcap, "новый SCID Retry не собрался");
+        return -1;
+    }
+    memset(c->lv, 0, sizeof c->lv);
+    uint8_t sec[32];
+    if (d2k_qw_initial_secret(c->version, c->dcid, c->dcid_len,
+                              D2K_QW_CLIENT, sec) != 0 ||
+        d2k_qw_keys_from_secret(c->version, sec,
+                                &c->lv[D2K_QW_LEVEL_INITIAL].tx) != 0 ||
+        d2k_qw_initial_secret(c->version, c->dcid, c->dcid_len,
+                              D2K_QW_SERVER, sec) != 0 ||
+        d2k_qw_keys_from_secret(c->version, sec,
+                                &c->lv[D2K_QW_LEVEL_INITIAL].rx) != 0) {
+        say(err, errcap, "начальные ключи Retry не вывелись");
+        return -1;
+    }
+    c->peer_cid_fixed = 0;
+    c->retry_count = 1;
+    c->retry_pending = 0;
     return 0;
 }
 
@@ -718,6 +781,16 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
         int wait = left > 50 ? 50 : left;
         int r = recv_dgram(c, wait, err, errcap);
         if (r < 0) { d2k_qc_close(c); return -1; }
+        if (r == 2) {
+            if (prepare_retry(c, err, errcap) != 0 ||
+                send_level(c, D2K_QW_LEVEL_INITIAL, frame, flen, 1200,
+                           err, errcap) != 0) {
+                d2k_qc_close(c); return -1;
+            }
+            pto = now_ms() + 333;
+            tries = 0;
+            continue;
+        }
 
         /* Разбираем то, что собралось на уровне Initial: ServerHello. */
         if (!sh_done) {

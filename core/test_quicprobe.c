@@ -28,6 +28,7 @@
  */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -40,7 +41,11 @@
 
 #include "d2k_crypto.h"
 #include "d2k_meas.h"
+#include "d2k_quic.h"
+#include "d2k_quic_arms.h"
 #include "d2k_quicprobe.h"
+#include "d2k_quichello.h"
+#include "d2k_quicwire.h"
 #include "test_quic_vector.h"
 
 static int fails;
@@ -90,7 +95,7 @@ static size_t build_plain_initial(uint8_t dcid_byte, uint8_t *out, size_t cap) {
 #define QP_DCID_OFF 6
 #define QP_DCID_LEN 8
 
-static uint8_t g_trig_buf[64], g_ctl_buf[64];
+static uint8_t g_trig_buf[64], g_ctl_buf[2048];
 static size_t g_trig_len, g_ctl_len;
 static const uint8_t *g_trig_bytes, *g_ctl_bytes;
 
@@ -116,6 +121,7 @@ static int g_mock_poison_on_trigger = 1;
  * (шаг 0, тоже контроль на pool[0]) это стало ломать её без причины;
  * per-адресный флаг нацеливает "мёртвый сервер" ровно на нужный шаг. */
 static char g_mock_dead_addr[D2K_QUIC_ADDR_LEN];
+static int g_expect_no_sni, g_no_sni_failures, g_arm_calls;
 
 /* Очередь принудительных исходов — см. шапку файла и находку 4 ревью (круг 2).
  * g_mock_force_refused — ПАРАЛЛЕЛЬНЫЙ массив (не поле d2k_tally: refused —
@@ -210,6 +216,12 @@ static d2k_tally mock_ask(const char *addr, uint16_t port,
         t.marked = (mark == 0) || g_mock_mark_ok;
         int is_trig = (msg.bytes == g_trig_bytes && msg.len == g_trig_len);
         int is_ctl = (msg.bytes == g_ctl_bytes && msg.len == g_ctl_len);
+        if (g_expect_no_sni && !is_ctl && msg.bytes && msg.len) {
+            char seen_sni[256];
+            if (d2k_quic_sni(msg.bytes, msg.len, seen_sni, sizeof seen_sni) == 0) {
+                g_no_sni_failures++;
+            }
+        }
         int is_dead = (g_mock_dead_addr[0] != '\0' && strcmp(addr, g_mock_dead_addr) == 0);
         for (int i = 0; i < repeats; i++) {
             int passed;
@@ -239,6 +251,27 @@ static d2k_tally mock_ask(const char *addr, uint16_t port,
     if (rtt_ms_out) {
         *rtt_ms_out = (t.pass > 0) ? 10u : 0u;
     }
+    return t;
+}
+
+static d2k_tally mock_arm(const d2k_quic_arm_question *q, const char *sni,
+                          uint16_t port, uint32_t wait_ms, uint32_t mark,
+                          int *sent_out) {
+    (void)q; (void)port; (void)wait_ms; (void)mark;
+    uint8_t initial[1500]; size_t initial_len = 0;
+    char seen_sni[256];
+    g_arm_calls++;
+    int built = sni && d2k_quic_probe_initial(sni, initial, sizeof initial,
+                                               &initial_len) == 0;
+    int has_sni = built &&
+        d2k_quic_sni(initial, initial_len, seen_sni, sizeof seen_sni) == 0;
+    if (!built || (q && q->control ? !has_sni : has_sni)) {
+        g_no_sni_failures++;
+    }
+    if (sent_out) { *sent_out = D2K_QUIC_REPEATS; }
+    d2k_tally t = {0};
+    t.fail = D2K_QUIC_REPEATS;
+    t.marked = 1;
     return t;
 }
 
@@ -477,6 +510,20 @@ static size_t build_authentic_v1(const uint8_t *dcid, size_t dcid_len,
 static volatile int g_rs_respond;
 static int g_rs_fd = -1;
 
+static int is_neutral_control_packet(const uint8_t *packet, size_t packet_len) {
+    char sni[256];
+    if (d2k_quic_sni(packet, packet_len, sni, sizeof sni) != 0 ||
+        strlen(sni) != 23 || sni[0] != 'z' || strcmp(sni + 11, ".example.com") != 0) {
+        return 0;
+    }
+    for (size_t i = 1; i <= 10; i++) {
+        if (!isdigit((unsigned char)sni[i]) && !(sni[i] >= 'a' && sni[i] <= 'f')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Кадр ACK (RFC 9000 §19.3): тип, наибольший номер, задержка, число
    диапазонов, первый диапазон. Ровно то, чем настоящий сервер отвечает
    первым, подтверждая приём, но ещё не начиная рукопожатие. */
@@ -510,15 +557,25 @@ static void *rs_run(void *arg) {
             continue;
         }
         int is_trig = ((size_t)n == g_trig_len && memcmp(buf, g_trig_bytes, (size_t)n) == 0);
-        int is_ctl = ((size_t)n == g_ctl_len && memcmp(buf, g_ctl_bytes, (size_t)n) == 0);
+        int is_ctl = ((size_t)n == g_ctl_len && memcmp(buf, g_ctl_bytes, (size_t)n) == 0) ||
+                     is_neutral_control_packet(buf, (size_t)n);
         if (g_rs_respond == 3 && is_trig) {
             continue; /* триггер молчит нарочно */
         }
         const uint8_t *dcid = NULL;
+        size_t dcid_len = QP_DCID_LEN;
         if (is_trig) {
             dcid = g_trig_bytes + QP_DCID_OFF;
         } else if (is_ctl) {
-            dcid = g_ctl_bytes + QP_DCID_OFF;
+            if ((size_t)n == g_ctl_len && memcmp(buf, g_ctl_bytes, (size_t)n) == 0) {
+                dcid = g_ctl_bytes + QP_DCID_OFF;
+            } else {
+                d2k_qw_hdr hdr;
+                if (d2k_qw_hdr_parse(buf, (size_t)n, 0, &hdr) == 0) {
+                    dcid = buf + hdr.dcid_off;
+                    dcid_len = hdr.dcid_len;
+                }
+            }
         }
         if (dcid) {
             /* РЕЖИМ 5: СНАЧАЛА ACK, ПОТОМ ServerHello — ДВУМЯ ДАТАГРАММАМИ.
@@ -531,7 +588,7 @@ static void *rs_run(void *arg) {
             if (g_rs_respond == 5) {
                 uint8_t ack[32];
                 size_t al2 = build_ack_body(ack, sizeof ack);
-                size_t rl0 = build_authentic_v1(dcid, QP_DCID_LEN, ack, al2, resp, sizeof resp);
+                size_t rl0 = build_authentic_v1(dcid, dcid_len, ack, al2, resp, sizeof resp);
                 if (rl0 > 0) {
                     (void)sendto(g_rs_fd, resp, rl0, 0, (struct sockaddr *)&from, fl);
                 }
@@ -539,7 +596,7 @@ static void *rs_run(void *arg) {
             uint8_t body[32];
             size_t bl = (g_rs_respond == 4) ? build_close_body(body, sizeof body)
                                              : build_crypto_body(body, sizeof body);
-            size_t rl = build_authentic_v1(dcid, QP_DCID_LEN, body, bl, resp, sizeof resp);
+            size_t rl = build_authentic_v1(dcid, dcid_len, body, bl, resp, sizeof resp);
             if (rl > 0) {
                 (void)sendto(g_rs_fd, resp, rl, 0, (struct sockaddr *)&from, fl);
             }
@@ -686,7 +743,11 @@ int main(void) {
     d2k_quic_wait_ms = 150; /* тест не обязан ждать боевые 3 с тишины на каждый опыт */
 
     g_trig_len = build_plain_initial(0x11, g_trig_buf, sizeof g_trig_buf);
-    g_ctl_len = build_plain_initial(0x22, g_ctl_buf, sizeof g_ctl_buf);
+    g_ctl_len = 0;
+    CHECK(d2k_quic_hello_rename(d2k_test_v1_initial, sizeof d2k_test_v1_initial,
+                                "c0000000000.example.com", g_ctl_buf,
+                                sizeof g_ctl_buf, &g_ctl_len) == 0,
+          "не собрался валидный QUIC-профиль контроля для wire-переименования");
     CHECK(g_trig_len > 0 && g_ctl_len > 0, "не собрались тестовые снимки триггера/контроля");
     g_trig_bytes = g_trig_buf;
     g_ctl_bytes = g_ctl_buf;
@@ -696,9 +757,44 @@ int main(void) {
      * =================================================================== */
 
     d2k_quic_ask_fn real_ask = d2k_quic_ask_hook;
+    d2k_quic_ask_fn real_control = d2k_quic_ask_control_hook;
     d2k_quic_ask_hook = mock_ask;
+    d2k_quic_ask_control_hook = mock_ask;
     d2k_quic_ask_srcport_hook = mock_ask_srcport;
     d2k_quic_ask_split_hook = mock_ask_split;
+
+    /* Полный донорский Run для буквального IP: все сетевые границы здесь
+       подменены детерминированными hooks, но Initial/question builders,
+       no-SNI преобразования, Run-порядок и arm ladder настоящие. */
+    {
+        uint8_t ip_trigger[1500]; size_t ip_trigger_len = 0;
+        d2k_quic_ask_arm_fn saved_arm_hook = d2k_quic_ask_arm_hook;
+        const uint8_t *saved_trig_bytes = g_trig_bytes;
+        size_t saved_trig_len = g_trig_len;
+        CHECK(d2k_quic_probe_initial("203.0.113.7", ip_trigger,
+                                     sizeof ip_trigger, &ip_trigger_len) == 0,
+              "не собрался no-SNI вход адресного Run");
+        g_trig_bytes = ip_trigger;
+        g_trig_len = ip_trigger_len;
+        g_expect_no_sni = 1;
+        g_no_sni_failures = g_arm_calls = 0;
+        g_mock_poison_on_trigger = 0;
+        d2k_quic_ask_arm_hook = mock_arm;
+        d2k_quic_arm ip_arm;
+        d2k_vres r = d2k_quic_run("203.0.113.7", 443, "203.0.113.7",
+                                  trig_hello(), ctl_hello(), 0x2d, &ip_arm);
+        CHECK(r.verdict == D2K_V_OPAQUE,
+              "полный Run не сохранил verdict для блокируемой IP-цели");
+        CHECK(g_arm_calls > 0,
+              "полный Run пропустил исходную QUIC arm ladder для IP-цели");
+        CHECK(g_no_sni_failures == 0,
+              "полный Run добавил SNI при target IP в control/questions/arms");
+        d2k_quic_ask_arm_hook = saved_arm_hook;
+        g_trig_bytes = saved_trig_bytes;
+        g_trig_len = saved_trig_len;
+        g_expect_no_sni = 0;
+        mock_reset();
+    }
 
     /* --- НАХОДКА 2 РЕВЬЮ (круг 4): d2k_quic_ask_hook — ЧАСТЬ ПУБЛИЧНОГО
      * КОНТРАКТА (extern в d2k_quicprobe.h), не только внутренность дерева.
@@ -1193,6 +1289,7 @@ int main(void) {
     }
 
     d2k_quic_ask_hook = real_ask;
+    d2k_quic_ask_control_hook = real_control;
 
     /* ===================================================================
      * Часть 2: настоящий оракул — реальные сокеты на 127.0.0.1, реальный
@@ -1381,10 +1478,13 @@ int main(void) {
            первой редакции этого теста так и было, и core check вырос на
            минуты. */
         d2k_quic_ask_fn saved_ask = d2k_quic_ask_hook;
+        d2k_quic_ask_fn saved_control = d2k_quic_ask_control_hook;
         d2k_quic_ask_hook = mock_ask;
+        d2k_quic_ask_control_hook = mock_ask;
         d2k_vres ok = d2k_quic_classify("203.0.113.7", 443, "x.example",
                                         trig_hello(), ctl_hello(), 0);
         d2k_quic_ask_hook = saved_ask;
+        d2k_quic_ask_control_hook = saved_control;
         CHECK(ok.verdict != D2K_V_LOCAL_ADDRESS,
               "внешний адрес принят за приватный — проверка закрыла бы весь продукт");
         d2k_quic_allow_local = 1;   /* остальным проверкам нужна петля */

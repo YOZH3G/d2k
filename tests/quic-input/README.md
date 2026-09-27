@@ -32,9 +32,11 @@ version or non-AES cipher ordering instead of silently relabelling it.
 
 ## Scope still open
 
-This pins the AES-capable donor ClientHello shape. Go selects a different
-cipher order without hardware AES; that alternate profile and selection have
-not yet been ported. Cross-compilation alone does not establish donor shape
-parity on MIPS. Likewise this oracle does not cover renamed/split questions,
+This pins the AES-capable donor ClientHello shape by default. The C builder also
+supports the donor's no-AES cipher order with `-DD2K_QUIC_NON_AES_PROFILE=1`
+(the default on `__mips__`); parity was checked with Go 1.25.12 and
+`GODEBUG=cpu.aes=off`. Cross-compilation alone does not establish runtime CPU
+feature detection on every target, so a new architecture must choose the build
+mode explicitly. Likewise this oracle does not cover renamed/split questions,
 random neutral control naming, multi-datagram client capture, response verdicts
 or actual application access. Those remain separate acceptance items.

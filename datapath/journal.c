@@ -128,7 +128,7 @@ void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
 }
 
 void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
-                             const uint8_t *plan_id) {
+                             const uint8_t *plan_id, const uint8_t *trial_id) {
     d2k_jrn_entry *e = add_entry(j, at_ns, key, D2K_JRN_PLAN_APPLIED, 0, 0, NULL,
                                  NULL, 0, NULL);
     if (e && plan_id) {
@@ -136,10 +136,12 @@ void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
            которой проходит имя выше, испортила бы его молча. */
         memcpy(e->plan_id, plan_id, D2K_PLAN_ID_LEN);
     }
+    if (e && trial_id) { memcpy(e->trial_id, trial_id, D2K_TRIAL_ID_LEN); }
 }
 
 void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
-                          uint8_t kind, uint8_t code, const uint8_t *plan_id) {
+                          uint8_t kind, uint8_t code, const uint8_t *plan_id,
+                          const uint8_t *trial_id) {
     d2k_jrn_entry *e = add_entry(j, at_ns, key, kind, code, 0, NULL, NULL, 0,
                                  (kind == D2K_JRN_PLAN_UNSENT ||
                                   kind == D2K_JRN_PLAN_DAMAGED) ? d2k_refuse_text(code)
@@ -150,6 +152,7 @@ void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
            молча. */
         memcpy(e->plan_id, plan_id, D2K_PLAN_ID_LEN);
     }
+    if (e && trial_id) { memcpy(e->trial_id, trial_id, D2K_TRIAL_ID_LEN); }
 }
 
 size_t d2k_journal_count(const d2k_journal *j) {

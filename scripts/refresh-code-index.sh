@@ -2,7 +2,7 @@
 # Host-only compilation database for clangd/Serena. Does not build or run tests.
 # Requires compiledb (uv tool install compiledb) and jq.
 set -eu
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 index_tmp=$(mktemp -d "${TMPDIR:-/tmp}/d2k-code-index.XXXXXX")
 trap 'rm -f "$index_tmp/core.json" "$index_tmp/datapath.json" "$index_tmp/detect.json" "$index_tmp/merged.json"; rmdir "$index_tmp"' EXIT HUP INT TERM
 for component in core datapath detect; do

@@ -32,7 +32,10 @@ ROUTER=${D2K_ROUTER:?не задан D2K_ROUTER}
 SSH_PORT=${D2K_SSH_PORT:-222}
 QUEUE=${D2K_QUEUE:-537}
 DUR=${D2K_DUR:-60}
-PORTS=${D2K_PORTS:-443}
+# Field helper follows the service contract: observe every TCP/UDP destination
+# and let d2kd classify the protocol. Use D2K_PORTS only for an explicitly
+# narrowed diagnostic run.
+PORTS=${D2K_PORTS:-0:65535}
 MODE=${D2K_MODE:-observe}
 CONNBYTES=${D2K_CONNBYTES:-0:8}
 # Снимать ли аппаратный офлоад. Этап 0 показал, что первые пакеты КАЖДОГО
@@ -61,8 +64,9 @@ PLAN=${D2K_PLAN:-}
 MARK=${D2K_MARK:-0}
 # МЕТКА КОНТРОЛЛЕРА — ОТДЕЛЬНАЯ ОТ МЕТКИ ДАТАПАТА, и это не косметика.
 # У метки датапата одна задача: не пускать его СОБСТВЕННЫЕ сырые посылки
-# обратно в очередь (иначе петля). Правило исключения (-m mark ! --mark)
-# написано ровно под неё.
+# обратно в очередь (иначе петля). Правило исключения написано только для
+# этой метки; controller probes получают свою метку и фильтруются datapath
+# как active probes, не как новые пользовательские цели.
 #
 # Но зонд подтверждения от d2kc ходит обычным сокетом, и ему план НУЖЕН: он
 # затем и существует, чтобы проверить план на себе. Одна метка на обоих
@@ -71,7 +75,7 @@ MARK=${D2K_MARK:-0}
 # негодным. Ровно это и наблюдалось на живой линии 17.09: seqovl-1 пробивает
 # коробку (проверено планом, 3/3), а подтверждение дало «зонд не дошёл до
 # приложения» и план был выброшен.
-CTL_MARK=${D2K_CTL_MARK:-$MARK}
+CTL_MARK=${D2K_CTL_MARK:-0x2e}
 # Сужение опыта. §2.6 требует ограничивать последствия: на роутере живут
 # чужие устройства, и десинк всего 443-го порта — не эксперимент, а авария.
 SRC=${D2K_SRC:-}
@@ -81,6 +85,10 @@ DUMP_IF=${D2K_DUMP_IF:-}
 DUMP_N=${D2K_DUMP_N:-40}
 # Поднимать ли контроллер: он учится на подозрениях и строит каталог коробок.
 LEARN=${D2K_LEARN:-0}
+# Необязательный локальный seed/sink для каталога контроллера. Позволяет
+# остановить временный контроллер и запустить новый с тем же знанием, не
+# оставляя каталог на роутере и не записывая его в /opt/flash.
+CATALOG=${D2K_CATALOG:-}
 # Голос Дискорда: UDP на портах боевого профиля discord_udp, только первые
 # пакеты каждого направления (как files/S99d2k). Сужается тем же SRC/DST.
 VOICE=${D2K_VOICE:-0}
@@ -201,6 +209,13 @@ if [ "$MODE" = apply ]; then
     fi
 fi
 
+if [ -n "$CATALOG" ]; then
+    [ "$LEARN" = 1 ] || { say "D2K_CATALOG требует D2K_LEARN=1"; exit 2; }
+    [ ! -e "$CATALOG" ] || [ -f "$CATALOG" ] || {
+        say "D2K_CATALOG должен быть обычным файлом или новым путём"; exit 2;
+    }
+fi
+
 if [ "$LEARN" = 1 ]; then
     say "== доставка контроллера =="
     # Контроллер — d2kc, на C. До 11.09.2026 здесь собирался Go-бинарник и
@@ -229,6 +244,7 @@ RNARROW=""
 [ -n "$SRC" ] && RNARROW="$RNARROW -d $SRC"
 NOTSELF=""
 [ "$MARK" != 0 ] && NOTSELF="-m mark ! --mark $MARK"
+[ "$CTL_MARK" != "$MARK" ] || { say "D2K_CTL_MARK должен отличаться от D2K_MARK"; exit 2; }
 
 say "== правила, жетон $TOKEN =="
 # Порядок: сперва снять офлоад, потом отдать в очередь. Правило PPE матчит
@@ -304,7 +320,7 @@ say "== запуск службы =="
 # nohup на BusyBox нет; start-stop-daemon есть и умеет отвязывать процесс.
 $SSH "
 start-stop-daemon -S -b -m -p /tmp/d2kd.$TOKEN.pid -x /tmp/d2kd.$TOKEN -- \
-    --queue $QUEUE --mode $MODE --stats 15 --duration $DUR --mark $MARK \
+    --queue $QUEUE --mode $MODE --stats 15 --duration $DUR --mark $MARK --probe-mark $CTL_MARK \
     ${PLAN:+--plan /tmp/d2kd.$TOKEN.plan} \
     ${LEARN:+--control /tmp/d2kd.$TOKEN.sock} \
     --log /tmp/d2kd.$TOKEN.out
@@ -318,8 +334,18 @@ if [ "$LEARN" = 1 ]; then
     # ради него писать нечего. Конфигурационного файла d2kc не читает вовсе —
     # всё, что ему нужно, приходит ключами; поэтому прежний блок с D2K_CONFIG
     # здесь не нужен, а не «упущен».
+    $SSH "mkdir -p /tmp/d2k.$TOKEN.state"
+    if [ -n "$CATALOG" ] && [ -f "$CATALOG" ]; then
+        say "== восстановление временного каталога =="
+        $SSH_IN "cat > /tmp/d2k.$TOKEN.state/catalog.json" < "$CATALOG"
+        LOCAL_CATALOG_SIZE=$(wc -c < "$CATALOG" | tr -d ' ')
+        REMOTE_CATALOG_SIZE=$($SSH "wc -c < /tmp/d2k.$TOKEN.state/catalog.json" | tr -d ' \r')
+        [ "$LOCAL_CATALOG_SIZE" = "$REMOTE_CATALOG_SIZE" ] || {
+            say "каталог доставлен с ошибкой: $LOCAL_CATALOG_SIZE против $REMOTE_CATALOG_SIZE"; exit 1;
+        }
+        say "  каталог доставлен, размер совпал ($REMOTE_CATALOG_SIZE байт)"
+    fi
     $SSH "
-    mkdir -p /tmp/d2k.$TOKEN.state
     start-stop-daemon -S -b -m -p /tmp/d2k.$TOKEN.pid -x /tmp/d2k.$TOKEN -- \
         --control /tmp/d2kd.$TOKEN.sock \
         --catalog /tmp/d2k.$TOKEN.state/catalog.json \
@@ -378,6 +404,13 @@ if [ "$LEARN" = 1 ]; then
     mkdir -p "$REPO/docs/field/raw"
     $SSH "cat /tmp/d2k.$TOKEN.out 2>/dev/null" > "$REPO/docs/field/raw/control-$STAMP.log" || true
     $SSH "cat /tmp/d2k.$TOKEN.state/catalog.json 2>/dev/null" > "$REPO/docs/field/raw/catalog-$STAMP.json" || true
+    if [ -n "$CATALOG" ]; then
+        CATALOG_TMP=$(mktemp "${CATALOG}.XXXXXX")
+        $SSH "cat /tmp/d2k.$TOKEN.state/catalog.json 2>/dev/null" > "$CATALOG_TMP"
+        [ -s "$CATALOG_TMP" ] || { rm -f "$CATALOG_TMP"; say "контроллер не сохранил каталог"; exit 1; }
+        mv -f "$CATALOG_TMP" "$CATALOG"
+        say "каталог опыта сохранён локально: $CATALOG"
+    fi
     sed 's/^/  /' "$REPO/docs/field/raw/control-$STAMP.log" >&2 || true
     $SSH "rm -rf /tmp/d2k.$TOKEN /tmp/d2k.$TOKEN.* " || true
 fi

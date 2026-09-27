@@ -25,15 +25,11 @@
  * не узнала бы v2-пакет вовсе, что и есть та самая ловушка (см. test_quic.c —
  * оба вектора, RFC 9001 A.2 и RFC 9369 A.2, проверены по отдельности).
  *
- * ЧЕГО ЭТОТ МОДУЛЬ НЕ ДЕЛАЕТ. Не пересобирает ClientHello, растянутый на
- * НЕСКОЛЬКО UDP-датаграмм: обе функции смотрят строго на буфер вызывающего,
- * без памяти о предыдущих вызовах и без выделений — расшифровка нужна
- * datapath'у на каждом UDP-пакете в горячем пути (следующая задача), а не раз
- * на соединение. Кадры CRYPTO ВНУТРИ одного пакета собираются по смещениям
- * (реальные браузеры режут ClientHello на несколько кадров в одном пакете —
- * см. quic.c), а вот кадр, растянутый на несколько пакетов, для одного вызова
- * попросту не виден: имя либо есть целиком в этом пакете, либо не найдено.
- * Второе — не ошибка модуля, а честный «в этом пакете имени нет».
+ * Статические d2k_quic_sni/client_hello по-прежнему смотрят строго на один
+ * буфер вызывающего. Для живого UDP-потока есть отдельный ограниченный
+ * d2k_quic_assembly: он хранит Initial-контекст и карту CRYPTO, связывает
+ * датаграммы по DCID/version и не смешивает потоки. При переполнении границы
+ * он честно остаётся незавершённым — имя не выдумывается.
  */
 #ifndef D2K_QUIC_H
 #define D2K_QUIC_H
@@ -42,6 +38,25 @@
 #include <stdint.h>
 
 #include "d2k_crypto.h" /* D2K_WARN_UNUSED и примитивы, на которых стоит расшифровка */
+#include "d2k_quicwire.h"
+
+/* Верхняя граница состояния CRYPTO для одного живого QUIC-потока. Это не
+ * попытка угадать размер ClientHello: при превышении границы сборка честно
+ * остаётся незавершённой и датапат пропускает трафик. Размер фиксирован, чтобы
+ * на горячем пути не было malloc/realloc. */
+#define D2K_QUIC_ASSEMBLY_MAX 2048
+
+typedef struct {
+    uint8_t active;
+    uint32_t version;
+    uint8_t dcid[D2K_QW_CID_MAX];
+    size_t dcid_len;
+    d2k_qw_keys keys;
+    uint64_t largest_pn;
+    uint8_t have_pn;
+    uint8_t stream[D2K_QUIC_ASSEMBLY_MAX];
+    uint8_t seen[(D2K_QUIC_ASSEMBLY_MAX + 7) / 8];
+} d2k_quic_assembly;
 
 /* Узнаёт QUIC Initial ПО ЗАЩИЩЁННЫМ байтам — ключи не выводятся, крипто не
  * трогается вовсе. Работает потому, что защита заголовка (RFC 9001 §5.4.1)
@@ -106,5 +121,14 @@ int d2k_quic_sni(const uint8_t *p, size_t n, char *out, size_t cap);
 D2K_WARN_UNUSED
 int d2k_quic_client_hello(const uint8_t *p, size_t n,
                           uint8_t *out, size_t cap, size_t *out_len);
+
+/* Stateful counterpart for a real UDP flow. Feed Initial datagrams in any
+ * order; return 0 while the contiguous CRYPTO prefix has no SNI, 1 when the
+ * ClientHello contains a complete SNI, and -1 for a packet that cannot belong
+ * to this context. The context is owned by the caller and has no allocation. */
+void d2k_quic_assembly_init(d2k_quic_assembly *a);
+D2K_WARN_UNUSED
+int d2k_quic_assembly_feed(d2k_quic_assembly *a, const uint8_t *p, size_t n,
+                           char *out, size_t cap);
 
 #endif

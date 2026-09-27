@@ -52,6 +52,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 #include "d2k_compose.h"
 #include "d2k_compose_internal.h"
@@ -364,9 +365,14 @@ typedef struct {
        по датаграммам: имя не читается ни нами, ни коробкой, а приём разноса
        от имени не зависит. Выдумывать имя запрещено (D2K_SPEC). */
     int         by_addr;
+    uint8_t     addr_probe_src_ip[4];
+    uint16_t    addr_probe_src_port_be;
+    uint8_t     addr_probe_trial_id[D2K_TRIAL_ID_LEN];
+    int         addr_probe_identity_valid;
     d2k_flowkey voice_flow;
     int         voice_flow_bound;
     int         voice_answered;
+    int         voice_proven;
     int         voice_silent;
     int64_t     voice_watch_ms;
 
@@ -451,8 +457,8 @@ typedef struct {
     uint8_t    prop_plan_id[D2K_PLAN_ID_LEN];
     /* Номер следующего плеча ЗАПАСНОГО ПЕРЕБОРА (третий источник кандидатов,
        после готовых планов и синтеза). */
-    size_t     fb_next;
     int        search_owned;
+    size_t     fb_next;
     /* Хэши уже испытанных текстов планов — чтобы перебор не предлагал то, что
        синтез уже дал. Одинаковый текст это один и тот же план, сколько бы
        источников его ни назвало. */
@@ -480,6 +486,8 @@ typedef struct {
     uint8_t    asked_shape;
     int        reasked;
     int        trial_installed;
+    uint8_t    trial_shape;
+    uint64_t   trial_shape_seq;
     /* Сколько раз ЭТОТ кандидат переиспытывался из-за того, что плана на
        потоке зонда не оказалось (см. ветку неудачи в T_VERIFY). */
     int        ver_bare_retries;
@@ -542,6 +550,23 @@ typedef struct {
     int        c_fd;
     int        c_ok;
 } task;
+
+static int fresh_trial_id(uint8_t out[D2K_TRIAL_ID_LEN]) {
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) { return -1; }
+    size_t n = 0;
+    while (n < D2K_TRIAL_ID_LEN) {
+        ssize_t r = read(fd, out + n, D2K_TRIAL_ID_LEN - n);
+        if (r > 0) { n += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) { continue; }
+        close(fd); return -1;
+    }
+    close(fd);
+    uint8_t any = 0;
+    for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any |= out[i]; }
+    if (!any) { out[D2K_TRIAL_ID_LEN - 1] = 1; }
+    return 0;
+}
 
 typedef struct {
     uint8_t  low_ip[4], high_ip[4];
@@ -607,6 +632,8 @@ struct d2k_sched {
      * прежде, и со следующего обращения мерится уже своим. */
     uint8_t      quic_shape[2048];
     size_t       quic_shape_len;
+    char         quic_shape_name[256];
+    uint64_t     quic_shape_seq;
     /* ПОСЛЕДНЯЯ СНЯТАЯ ФОРМА TCP — С ИМЕНЕМ, ЧЬЯ ОНА.
      *
      * Снимок приходит РАНЬШЕ подозрения: датапат сперва видит приветствие, а
@@ -660,6 +687,46 @@ struct d2k_sched {
     int          wake[2];     /* самопайп: рабочий поток будит цикл */
     pthread_mutex_t mu;       /* охраняет res/res_ready/th_live задач */
 };
+
+static int addr_probe_remove(d2k_sched *s, task *t, char *err, size_t errcap) {
+    if (!t->addr_probe_identity_valid) { return 0; }
+    uint8_t dst[4];
+    if (inet_pton(AF_INET, t->ip, dst) != 1) { return -1; }
+    int rc = d2k_link_del_addr_probe(s->link_fd, t->addr_probe_src_ip,
+                                     t->addr_probe_src_port_be, dst,
+                                     htons(t->port ? t->port : 443), 17,
+                                     t->addr_probe_trial_id, err, errcap);
+    t->addr_probe_identity_valid = 0;
+    return rc;
+}
+
+static uint8_t question_shape(const task *t);
+
+/* Снимает только текущий принадлежащий задаче trial перед сменой входа.
+   Поздний snapshot во время VERIFY нельзя оставлять поверх уже установленного
+   кандидата: иначе следующий поиск стартует рядом с ним, а широкая DEL_NAME
+   может задеть подтверждённое знание той же цели. */
+static void remove_trial_exact(d2k_sched *s, task *t) {
+    if (!t->trial_installed) { return; }
+    char err[160];
+    if (t->by_addr) {
+        (void)addr_probe_remove(s, t, err, sizeof err);
+    } else if (t->probe_sport_be != 0 && t->trial_shape != 0) {
+        (void)d2k_link_del_name_probe(s->link_fd, t->name, t->transport,
+                                      t->trial_shape, t->probe_sport_be,
+                                      err, sizeof err);
+    } else if (t->prop_sport_be != 0) {
+        (void)d2k_link_del_name_probe(s->link_fd, t->name, t->transport,
+                                      question_shape(t), t->prop_sport_be,
+                                      err, sizeof err);
+    } else {
+        (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
+    }
+    if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
+    t->probe_sport_be = 0;
+    t->prop_sport_be = 0;
+    t->trial_installed = 0;
+}
 
 /* --------------------------------------------------------------------
  * Мелочи.
@@ -880,11 +947,25 @@ static int fill_hellos(d2k_sched *s, task *t) {
            PROFILE, а не CLIENT. Контроль пересобирается из того же входа
            с другим именем (core/quichello.c). */
         if (t->trig_len == 0) {
+            if (t->by_addr) {
+                /* Точный донорский режим для буквального IP: crypto/tls
+                   создаёт новый ClientHello без SNI. Чужой снимок/его имя
+                   сюда переносить нельзя, а IP нельзя кодировать как SNI. */
+                if (d2k_quic_probe_initial(t->name, t->trig,
+                                           sizeof t->trig, &t->trig_len) != 0) {
+                    return -1;
+                }
+            } else {
             /* Снимка ЭТОЙ цели нет. Берём последний снятый у кого угодно и
                переписываем в нём имя: форма — свойство клиента, а не цели
                (см. quic_shape в структуре планировщика). Признак «форма
                измерена» НЕ ставится: измерена она не здесь. */
-            if (s->quic_shape_len > 0) {
+            if (s->quic_shape_len > 0 &&
+                strcmp(s->quic_shape_name, t->name) == 0) {
+                memcpy(t->trig, s->quic_shape, s->quic_shape_len);
+                t->trig_len = s->quic_shape_len;
+                t->trig_snapped = 1;
+            } else if (s->quic_shape_len > 0) {
                 if (d2k_quic_hello_rename(s->quic_shape, s->quic_shape_len, t->name,
                                           t->trig, sizeof t->trig, &t->trig_len) != 0) {
                     t->trig_len = 0;
@@ -896,10 +977,15 @@ static int fill_hellos(d2k_sched *s, task *t) {
                 say(s, "по %s начинаю замер собственным QUIC Initial (PROFILE, не снимок клиента)",
                     t->name);
             }
+            }
         }
         if (t->ctrl_len == 0 && strcmp(t->name, SCHED_DECOY) != 0) {
-            if (d2k_quic_hello_rename(t->trig, t->trig_len, SCHED_DECOY,
-                                      t->ctrl, sizeof t->ctrl, &t->ctrl_len) != 0) {
+            int control_rc = t->by_addr
+                ? d2k_quic_probe_initial(SCHED_DECOY, t->ctrl,
+                                         sizeof t->ctrl, &t->ctrl_len)
+                : d2k_quic_hello_rename(t->trig, t->trig_len, SCHED_DECOY,
+                                        t->ctrl, sizeof t->ctrl, &t->ctrl_len);
+            if (control_rc != 0) {
                 /* Контроль — законно пустой: дерево вопросов честно скажет
                    «базовая живость не проверена», а не выдаст молчание за
                    ответ. Так бывает на приветствии, не поместившемся в одну
@@ -1218,6 +1304,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
                следующий холодный старт объявил бы слабым уже доказанное
                (§2.4). Ноль — «не измерено» — не пишется никогда. */
             if (input == D2K_INPUT_CLIENT || bd->input == 0) { bd->input = input; }
+            c->revision++;
             return 0;
         }
     }
@@ -1240,6 +1327,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
     bd->verified_by = verified_by;
     bd->input = input;
     b->n_binds++;
+    c->revision++;
     return 0;
 }
 
@@ -1479,6 +1567,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         }
         t->props_asked = 1;
         t->trial_installed = 1;
+        t->trial_shape = question_shape(t);
         t->probes++;
         s->probes_used++;
         t->prop_applied = 0;
@@ -1518,7 +1607,13 @@ static void prop_finish(d2k_sched *s, task *t) {
         /* Иначе на боевом датапате остался бы стоять план, про который это же
            измерение только что сказало «не работает» (см. d2k_props_ask). */
         char err[160];
-        (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
+        if (t->prop_sport_be != 0) {
+            (void)d2k_link_del_name_probe(s->link_fd, t->name, t->transport,
+                                          question_shape(t), t->prop_sport_be,
+                                          err, sizeof err);
+        } else {
+            (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
+        }
         t->trial_installed = 0;
     }
     t->prop_q = -1;
@@ -1532,13 +1627,15 @@ static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
         char err[160];
         int rc;
         if (t->by_addr) {
-            uint8_t ip4[4];
-            if (inet_pton(AF_INET, t->ip, ip4) != 1) {
-                snprintf(err, sizeof err, "неверный адрес цели: %s", t->ip);
-                rc = -1;
-            } else {
-                rc = d2k_link_del_addr(s->link_fd, ip4, err, sizeof err);
-            }
+            rc = addr_probe_remove(s, t, err, sizeof err);
+        } else if (t->prop_sport_be != 0) {
+            rc = d2k_link_del_name_probe(s->link_fd, t->name, t->transport,
+                                         question_shape(t), t->prop_sport_be,
+                                         err, sizeof err);
+        } else if (t->probe_sport_be != 0 && t->trial_shape != 0) {
+            rc = d2k_link_del_name_probe(s->link_fd, t->name, t->transport,
+                                         t->trial_shape, t->probe_sport_be,
+                                         err, sizeof err);
         } else {
             rc = d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
         }
@@ -1579,21 +1676,12 @@ static void task_done(task *t) {
     t->state = T_FREE;
 }
 
-/* Ставит следующего кандидата. 0 — поставлен, -1 — кандидаты кончились. */
 /* ДОЛИВАЕТ ОЧЕРЕДЬ ИЗ ЗАПАСНОГО ПЕРЕБОРА — третий источник кандидатов после
-   готовых планов коробки и синтеза из вектора (0007 п.3, 0008 п.7).
-
-   Донор после синтеза идёт по списку poisons() до успеха или конца бюджета; у
-   нас этого пути не было вовсе — синтез не помог, задача уходила в отдых.
-
-   Повторы исключаются сравнением ТЕКСТА плана с уже испытанными: одинаковый
-   текст — это один и тот же план, сколько бы источников его ни предложило.
-   Бюджет остаётся общим: сюда попадают только те попытки, что уцелели после
-   готовых планов и синтеза.
-
+   готовых планов коробки и синтеза по измеренному вектору (0007/0008).
+   Это часть перенесённого поиска, не внешний пул заранее назначенных целей.
    Возвращает число долитых планов. */
 static size_t refill_from_fallback(const d2k_sched *s, task *t) {
-    if (t->search_owned) { return 0; }
+    if (t->search_owned || t->transport == 17) { return 0; }
     size_t cap = sizeof t->plans / sizeof t->plans[0];
     size_t added = 0;
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
@@ -1603,7 +1691,7 @@ static size_t refill_from_fallback(const d2k_sched *s, task *t) {
                               text, sizeof text) != 0) {
             t->fb_next++;
             if (t->fb_next > D2K_FALLBACK_MAX) { break; }
-            continue;   /* плечо не выразимо — пробел реализации, идём дальше */
+            continue;
         }
         t->fb_next++;
         uint32_t h = fnv1a(text);
@@ -1616,7 +1704,7 @@ static size_t refill_from_fallback(const d2k_sched *s, task *t) {
             t->tried[t->n_tried++] = h;
         }
         snprintf(t->plans[added], sizeof t->plans[added], "%s", text);
-        t->plan_boxes[added][0] = '\0';   /* перебор не принадлежит модели коробки */
+        t->plan_boxes[added][0] = '\0';
         added++;
     }
     if (added) {
@@ -1627,6 +1715,7 @@ static size_t refill_from_fallback(const d2k_sched *s, task *t) {
     return added;
 }
 
+/* Ставит следующего кандидата. 0 — поставлен, -1 — кандидаты кончились. */
 /* ЛОКАЛЬНЫЙ ОТКАЗ ОТПРАВКИ — единый разбор для ВСЕХ путей испытания.
  *
  * Раньше он жил только в T_VERIFY_WAIT, и путь «зонд не дошёл до приложения»
@@ -1773,6 +1862,9 @@ static int install_next(d2k_sched *s, task *t) {
            плана. Не в рабочем: управляющий сокет принадлежит главному циклу,
            и писать в него из потока зонда значило бы гонку на канале. */
         if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
+        if (t->by_addr && t->addr_probe_identity_valid) {
+            (void)addr_probe_remove(s, t, err, sizeof err);
+        }
         t->probe_sport_be = 0;
         {
             int pfd = -1;
@@ -1796,17 +1888,61 @@ static int install_next(d2k_sched *s, task *t) {
                 return -2;
             }
         }
-        if (d2k_link_set_name_probe(s->link_fd, t->name, t->transport, hex,
-                                    probe_shape(t), t->probe_sport_be,
-                                    err, sizeof err) == 0) {
+        if (t->by_addr) {
+            struct sockaddr_in peer;
+            memset(&peer, 0, sizeof peer);
+            peer.sin_family = AF_INET;
+            peer.sin_port = htons(t->port ? t->port : 443);
+            if (inet_pton(AF_INET, t->ip, &peer.sin_addr) != 1 ||
+                connect(t->probe_fd, (struct sockaddr *)&peer, sizeof peer) != 0) {
+                say(s, "по %s адресный QUIC-сокет не смог выбрать маршрут: %s",
+                    t->name, strerror(errno));
+                close(t->probe_fd); t->probe_fd = -1;
+                return -2;
+            }
+            struct sockaddr_in local;
+            socklen_t local_len = sizeof local;
+            memset(&local, 0, sizeof local);
+            if (getsockname(t->probe_fd, (struct sockaddr *)&local, &local_len) != 0 ||
+                local.sin_family != AF_INET || local.sin_addr.s_addr == 0 ||
+                local.sin_port == 0 || fresh_trial_id(t->addr_probe_trial_id) != 0) {
+                say(s, "по %s не удалось закрепить адрес/порт/поколение QUIC-пробы",
+                    t->name);
+                close(t->probe_fd); t->probe_fd = -1;
+                return -2;
+            }
+            memcpy(t->addr_probe_src_ip, &local.sin_addr.s_addr, 4);
+            t->addr_probe_src_port_be = local.sin_port;
+            t->probe_sport_be = local.sin_port;
+        }
+        int set_rc;
+        if (t->by_addr) {
+            uint8_t dst[4];
+            if (inet_pton(AF_INET, t->ip, dst) != 1) {
+                set_rc = -1;
+                snprintf(err, sizeof err, "неверный IPv4-адрес цели");
+            } else {
+                set_rc = d2k_link_set_addr_probe(s->link_fd,
+                    t->addr_probe_src_ip, t->addr_probe_src_port_be,
+                    dst, htons(t->port ? t->port : 443), 17,
+                    t->addr_probe_trial_id, D2K_ADDR_PROBE_LEASE_MAX_MS,
+                    hex, err, sizeof err);
+            }
+        } else {
+            set_rc = d2k_link_set_name_probe(s->link_fd, t->name, t->transport, hex,
+                                             probe_shape(t), t->probe_sport_be,
+                                             err, sizeof err);
+        }
+        if (set_rc == 0) {
             t->trial_installed = 1;
+            t->trial_shape = (uint8_t)(t->by_addr ? 0 : probe_shape(t));
+            t->trial_shape_seq = s->quic_shape_seq;
+            if (t->by_addr) { t->addr_probe_identity_valid = 1; }
             return 0;
         }
         if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
     }
-        /* Очередь исчерпана. Раньше здесь был отказ — задача уходила в
-           отдых. Теперь пробуем ТРЕТИЙ источник: запасной перебор донора.
-           Ничего не долилось — значит список кончился, и отказ честен. */
+        /* Запасной перебор — последний этап оригинального инструмента. */
         if (refill_from_fallback(s, t) == 0) { return -1; }
     }
 }
@@ -2257,6 +2393,10 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
 void d2k_sched_free(d2k_sched *s) {
     if (!s) { return; }
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        char err[160];
+        if (s->tasks[i].addr_probe_identity_valid) {
+            (void)addr_probe_remove(s, &s->tasks[i], err, sizeof err);
+        }
         join_worker(&s->tasks[i]);
         /* Сокеты обращений закрываем сами: поток к этому моменту уже вернулся,
            а дескриптор принадлежит задаче, а не ему. */
@@ -2513,16 +2653,38 @@ static int start_search(d2k_sched *s, task *t) {
 
 /* ИМЯ КОРОБКИ, которой идёт подтверждённое зондом знание. Пассивное
    UDP-наблюдение сюда не попадает: оно не подтверждает обход. */
-static void box_id_for(const task *t, const char *text, char *box_id, size_t cap) {
+static void box_id_for(const d2k_sched *s, const task *t, const char *text,
+                       char *box_id, size_t cap) {
     if (t->box_id[0]) {
         /* Коробка узнана по отпечатку — успех идёт ей, а не новой записи:
            иначе каталог наполнялся бы клонами одной и той же коробки. */
         snprintf(box_id, cap, "%s", t->box_id);
+    } else if (t->fp.n_sig != 0 && s->cat) {
+        /* A stale plan does not invalidate a measured box fingerprint. If the
+           catalog has exactly one compatible model, let a newly measured and
+           verified replacement enrich that box. With multiple compatible
+           models, preserve ambiguity and do not guess an owner. */
+        const d2k_cat_box *match = NULL;
+        size_t matches = 0;
+        for (size_t i = 0; i < s->cat->n_boxes; i++) {
+            const d2k_cat_box *b = &s->cat->boxes[i];
+            if (d2k_fp_same(&b->fp, &t->fp)) {
+                match = b;
+                matches++;
+            }
+        }
+        if (matches == 1) {
+            snprintf(box_id, cap, "%s", match->id);
+        } else {
+            goto new_box;
+        }
     } else if (t->fp.n_sig == 0) {
         /* Примет нет вовсе — узнавать нечем. Знание пишется под отдельную
            запись, и это честнее, чем выдать её за узнанную коробку. */
         snprintf(box_id, cap, "box-без-приметы");
     } else {
+new_box:
+        ;
         /* Новая коробка, и её имя выводится ИЗ ОТПЕЧАТКА, а не из счётчика и
            не из транспорта: та же коробка, встреченная завтра на другой цели,
            обязана получить то же имя. */
@@ -2617,6 +2779,7 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
         return;
     }
     t->trial_installed = 1;
+    t->trial_shape = D2K_LINK_SHAPE_VOICE;
     t->probes += r.probes;
     s->probes_used += r.probes;
     t->state = T_VOICE_TRIAL;
@@ -2626,61 +2789,19 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
         (unsigned)r.client_port);
 }
 
-/* ЦЕЛЬ ПО АДРЕСУ ДЛЯ QUIC: приём разноса Initial-датаграмм.
- *
- * Доступного имени у такой цели сейчас нет; это не означает, что имя
- * невозможно извлечь из полного приветствия. Выдумывать его запрещено
- * (D2K_SPEC), поэтому цель адресная.
- *
- * Сейчас здесь единственный кандидат — выдержка перед первой посылкой.
- * Измерение цели/готовые решения коробки не подключены: это пробел пути,
- * а не доказательство, что подбирать нечего или delay подходит всем.
- *
- * Наблюдаем следующий поток САМОГО клиента: наш зонд ходит своим
- * приветствием, и его судьба о судьбе клиента не говорит. Нынешнее событие
- * UDP EXCHANGE не содержит протокольного доказательства — это ограниченный
- * опыт, а не подтверждённый поиск/обход (см. MVP_CHECKLIST). */
+/* QUIC-цель без доступного SNI. Не выдумываем имя: start_search проходит
+ * общий путь каталога/коробки и donor Run, а адресный кандидат затем
+ * устанавливается только на зарезервированный verifier flow. Само событие
+ * UDP EXCHANGE по-прежнему лишь наблюдение; оно не подтверждает протокол и
+ * не создаёт постоянную addr-привязку. */
 static void quic_addr_start(d2k_sched *s, task *t) {
-    if (d2k_quic_delay_plan(t->plans[0], sizeof t->plans[0]) != 0) {
-        say(s, "по %s план разноса датаграмм не собрался", t->name);
-        task_reset(t);
-        return;
-    }
-    t->n_plans = 1;
-    t->next_plan = 1;
-    t->n_known = 0;
+    /* Адресная цель — не повод подставить универсальный delay. Начинаем тот
+       же переносимый QUIC Run, что и для имени: сначала знания коробки,
+       затем контроль/VN, arm search и вопросы. */
     t->by_addr = 1;
-    static char wire[sizeof t->plans[0]];
-    char cat_id[40], err[160];
-    plan_ident(t->plans[0], cat_id, sizeof cat_id, t->ver_plan_id);
-    snprintf(wire, sizeof wire, "%s", t->plans[0]);
-    if (stamp_plan_id(wire, t->ver_plan_id) != 0) {
-        memset(t->ver_plan_id, 0, sizeof t->ver_plan_id);
-    }
-    static char hex[2 * D2K_PLAN_TLV_MAX + 1];
-    uint8_t ip4[4];
-    unsigned a, b, c, d;
-    if (sscanf(t->name, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 ||
-        a > 255 || b > 255 || c > 255 || d > 255) {
-        say(s, "по %s адрес не разбирается — ставить план некуда", t->name);
-        task_reset(t);
-        return;
-    }
-    ip4[0] = (uint8_t)a; ip4[1] = (uint8_t)b; ip4[2] = (uint8_t)c; ip4[3] = (uint8_t)d;
-    if (d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0 ||
-        d2k_link_set_addr(s->link_fd, ip4, hex, err, sizeof err) != 0) {
-        say(s, "по %s приём по адресу не поставился: %s", t->name, err);
-        task_reset(t);
-        return;
-    }
-    t->trial_installed = 1;
-    t->probes++;
-    s->probes_used++;
-    t->state = T_VOICE_TRIAL;
-    say(s, "по %s (QUIC) имя из приветствия не читается — цель беру ПО АДРЕСУ: %s, "
-           "приём разноса Initial-датаграмм. Испытываю на самом трафике: зонд ходит "
-           "своим приветствием, которое коробка читает, и о судьбе клиента не говорит",
-        t->name, cat_id);
+    say(s, "по %s (QUIC) SNI не читается — запускаю донорский поиск по адресу, "
+           "без выдуманного имени", t->name);
+    (void)start_search(s, t);
 }
 
 static void voice_observe(d2k_sched *s, task *t) {
@@ -2697,6 +2818,44 @@ static void voice_observe(d2k_sched *s, task *t) {
            "в каталог не записываю, кандидат остаётся временным",
         t->name, t->by_addr ? "QUIC по адресу" : "голос");
     t->voice_answered = 0;
+}
+
+/* Настоящий Discord IP Discovery response — единственное UDP-доказательство
+ * для голосового кандидата. В отличие от общего EXCHANGE это уже проверка
+ * wire-протокола, поэтому кандидат можно перевести из временного опыта в
+ * постоянную привязку и коробку. */
+static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
+    if (t->n_plans == 0) { task_fail(s, t, now_ms); return; }
+    const char *text = t->plans[0];
+    char plan_id[40], box_id[40], wire[sizeof t->plans[0]];
+    uint8_t wire_id[D2K_PLAN_ID_LEN];
+    char hex[2 * D2K_PLAN_TLV_MAX + 1], err[160];
+    plan_ident(text, plan_id, sizeof plan_id, wire_id);
+    box_id_for(s, t, text, box_id, sizeof box_id);
+    snprintf(wire, sizeof wire, "%s", text);
+    err[0] = '\0';
+    if (stamp_plan_id(wire, wire_id) != 0 ||
+        d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0 ||
+        d2k_link_set_name(s->link_fd, t->name, 17, hex, D2K_LINK_SHAPE_VOICE,
+                          err, sizeof err) != 0) {
+        say(s, "по %s (голос) ответ протокола валиден, но постоянный Plan не поставился: %s",
+            t->name, err[0] ? err : "ошибка записи");
+        task_fail(s, t, now_ms);
+        return;
+    }
+    (void)bind_confirmed(s->cat, box_id, plan_id, text, "voice",
+                         t->name, "name", 17, D2K_LINK_SHAPE_VOICE,
+                         D2K_VERBY_CLIENT, D2K_INPUT_PROFILE,
+                         wall_s(s, now_ms), &t->fp);
+    snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
+    t->trial_installed = 0;
+    t->voice_answered = 0;
+    t->voice_proven = 0;
+    t->state = T_WATCHING;
+    s->confirms++;
+    s->sync_pending = 1;
+    say(s, "по %s (голос) ПОДТВЕРЖДЕНО ответом Discord IP Discovery: %s",
+        t->name, plan_id);
 }
 
 static void voice_fail(d2k_sched *s, task *t, int64_t now_ms) {
@@ -2817,7 +2976,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     t->started_ms = 0;
     if (by_addr) {
         quic_addr_start(s, t);
-        return t->state == T_VOICE_TRIAL;
+        return t->state != T_FREE && t->state != T_RESTING;
     }
     if (is_voice_class(t->name, t->transport)) {
         /* Голос измеряется отдельным C-инструментом по живой conntrack-цели. */
@@ -2890,6 +3049,8 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
     if (ev->transport == 17 && ev->shape_len <= sizeof s->quic_shape) {
         memcpy(s->quic_shape, ev->shape, ev->shape_len);
         s->quic_shape_len = ev->shape_len;
+        memcpy(s->quic_shape_name, name, strlen(name) + 1);
+        s->quic_shape_seq++;
     }
     /* Форма TCP сохраняется ВМЕСТЕ С ИМЕНЕМ и тоже ДО поиска задач: подозрение
        приходит следом, и без этой ячейки снимок терялся бы при обычном
@@ -2993,7 +3154,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         t->state = T_PLANNING;
         return;
     }
-    box_id_for(t, text, box_id, sizeof box_id);
+    box_id_for(s, t, text, box_id, sizeof box_id);
     /* Контекст: проверку вёл СОБСТВЕННЫЙ зонд и СВОЕЙ формой приветствия
        (SCHED_PROBE_SHAPE). Записывается вместе с успехом, а не выводится
        потом: через день по файлу будет не восстановить, чем именно он
@@ -3017,9 +3178,25 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                                         : (uint8_t)D2K_INPUT_PROFILE;
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
-                         t->name, "name", t->transport, rec_shape,
+                         t->name, t->by_addr ? "addr" : "name", t->transport, rec_shape,
                          D2K_VERBY_PROBE, rec_input,
                          wall_s(s, now_ms), &t->fp);
+    if (t->by_addr) {
+        uint8_t ip4[4];
+        char err[160], permanent_wire[sizeof t->plans[0]];
+        char permanent_hex[2 * D2K_PLAN_TLV_MAX + 1];
+        err[0] = '\0';
+        snprintf(permanent_wire, sizeof permanent_wire, "%s", text);
+        if (stamp_plan_id(permanent_wire, wire_id) != 0 ||
+            d2k_plan_text_to_hex(permanent_wire, permanent_hex,
+                                 sizeof permanent_hex, err, sizeof err) != 0 ||
+            inet_pton(AF_INET, t->ip, ip4) != 1 ||
+            d2k_link_set_addr(s->link_fd, ip4, permanent_hex, err, sizeof err) != 0) {
+            if (!err[0]) { snprintf(err, sizeof err, "неверный IPv4 или отсутствует REC_ID"); }
+            say(s, "по %s адресный план подтверждён, но не удалось продвинуть его в постоянную таблицу: %s",
+                t->name, err);
+        }
+    }
     /* Запоминаем владельца подтверждённого плана. */
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
     s->confirms++;
@@ -3059,6 +3236,12 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     /* Пробным план быть перестал: он подтверждён и обязан остаться стоять.
        Снимать его при истечении задачи больше не за что (см. task_fail). */
     t->trial_installed = 0;
+    if (t->by_addr && t->addr_probe_identity_valid) {
+        char err[160];
+        if (addr_probe_remove(s, t, err, sizeof err) != 0) {
+            say(s, "по %s истёкший адресный probe оставлен до lease: %s", t->name, err);
+        }
+    }
     t->state = T_WATCHING;
     /* Подтверждение — это новое знание, и датапат обязан узнать о нём сразу,
        а не после следующего запуска (та же причина, по которой Sync на
@@ -3093,6 +3276,8 @@ static int plan_id_is_ours(const task *t, const d2k_ev *ev) {
 /* Применение НАШЕГО кандидата к НАШЕЙ цели? Полный ключ сверим после зонда. */
 static int applied_of_candidate(const task *t, const d2k_ev *ev) {
     if (ev->transport != t->transport || !plan_id_is_ours(t, ev)) { return 0; }
+    if (t->by_addr && memcmp(ev->trial_id, t->addr_probe_trial_id,
+                             D2K_TRIAL_ID_LEN) != 0) { return 0; }
     char ip[16];
     ip_text(ev->low_ip, ip, sizeof ip);
     if (ev->low_port == t->port && strcmp(ip, t->ip) == 0) {
@@ -3351,6 +3536,7 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
         task *t = &s->tasks[i];
         if (t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
             t->voice_answered = 1;
+            if (ev->code == D2K_UDP_PROOF_VOICE_DISCOVERY) { t->voice_proven = 1; }
             return;
         }
     }
@@ -3441,6 +3627,21 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         if (ev->code == D2K_CMD_SET_NAME_PROBE) {
             for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
                 if (s->tasks[i].state == T_TRIAL_SETTLE) { s->tasks[i].trial_acked = 1; }
+            }
+        } else if (ev->code == D2K_CMD_SET_ADDR_PROBE &&
+                   ((ev->num >> 8) & 0xffu) == 1u &&
+                   (ev->trial_id[0] || ev->trial_id[1] || ev->trial_id[2] ||
+                    ev->trial_id[3] || ev->trial_id[4] || ev->trial_id[5] ||
+                    ev->trial_id[6] || ev->trial_id[7] || ev->trial_id[8] ||
+                    ev->trial_id[9] || ev->trial_id[10] || ev->trial_id[11] ||
+                    ev->trial_id[12] || ev->trial_id[13] || ev->trial_id[14] ||
+                    ev->trial_id[15])) {
+            for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+                task *t = &s->tasks[i];
+                if (t->state == T_TRIAL_SETTLE && t->by_addr &&
+                    memcmp(ev->trial_id, t->addr_probe_trial_id, D2K_TRIAL_ID_LEN) == 0) {
+                    t->trial_acked = 1;
+                }
             }
         }
         return 0;
@@ -3548,7 +3749,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
 
         if (t->state == T_VOICE_WATCH) {
             if (t->voice_answered) {
-                voice_observe(s, t);
+                if (t->voice_proven) { voice_confirm(s, t, now_ms); }
+                else { voice_observe(s, t); }
                 moved++;
                 continue;
             }
@@ -3579,6 +3781,17 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
+            /* QUIC snapshots can arrive while the original Run is in flight.
+               Keep that Run's copied input immutable, then discard its result
+               and repeat once with the exact target-owned client Initial. */
+            if (t->transport == 17 && !t->reasked && !t->trig_snapped &&
+                s->quic_shape_len > 0 &&
+                strcmp(s->quic_shape_name, t->name) == 0 &&
+                s->quic_shape_len <= sizeof t->trig) {
+                remeasure_snapped(s, t, s->quic_shape, s->quic_shape_len);
+                moved++;
+                continue;
+            }
             /* Вопросы о свойствах нужны ТОЛЬКО там, где чем брать — неизвестно.
                Измеритель, вернувший плечо, на этот вопрос уже ответил своими
                зондами; спрашивать то же самое ещё раз через датапат значит
@@ -3790,6 +4003,21 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; } /* зонд в сети; срок задачи считается выше */
             join_worker(t);
+            /* Если настоящий QUIC snapshot пришёл уже после установки этого
+               trial, его результат относится к профилю, а не к байтам клиента.
+               Кандидат обязан быть снят exact-командой ДО повторного поиска;
+               иначе успешный VERIFY запишет ложное знание под чужой формой. */
+            if (t->transport == 17 && !t->reasked && !t->trig_snapped &&
+                t->trial_installed && s->quic_shape_seq > t->trial_shape_seq &&
+                s->quic_shape_len > 0 &&
+                strcmp(s->quic_shape_name, t->name) == 0 &&
+                s->quic_shape_len <= sizeof t->trig) {
+                ver_close(t);
+                remove_trial_exact(s, t);
+                remeasure_snapped(s, t, s->quic_shape, s->quic_shape_len);
+                moved++;
+                continue;
+            }
             /* КЛЮЧ ЗОНДА ИЗВЕСТЕН ТОЛЬКО ТЕПЕРЬ: местный порт назначает ядро
                при обращении. Собираем его сразу, до любых решений, потому что
                по нему разбираются НАКОПЛЕННЫЕ ранние отказы: до возврата
@@ -3996,11 +4224,20 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     /* Exhausted known plans: remove the trial before any
                        baseline measurement. Research happens at most once. */
                     char err[160];
-                    (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
+                    if (t->by_addr) { (void)addr_probe_remove(s, t, err, sizeof err); }
+                    else { (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err); }
                     t->trial_installed = 0;
                     t->researched = 1;
                     t->box_id[0] = '\0';
                     t->state = T_ASKING;
+                    if (t->transport == 17 && !t->reasked && !t->trig_snapped &&
+                        s->quic_shape_len > 0 &&
+                        strcmp(s->quic_shape_name, t->name) == 0 &&
+                        s->quic_shape_len <= sizeof t->trig) {
+                        remeasure_snapped(s, t, s->quic_shape, s->quic_shape_len);
+                        moved++;
+                        continue;
+                    }
                     /* ПРИВЕТСТВИЯ ПОДБИРАЮТСЯ ЗАНОВО, А НЕ БЕРУТСЯ КАКИЕ ЕСТЬ.
                      *
                      * Сюда задача приходит двумя дорогами. Прежняя — через

@@ -22,10 +22,11 @@
  * (key/iv/hp). Метки извлечения СЕКРЕТА УРОВНЯ ("client in"/"server in") у
  * обеих одни и те же — RFC 9369 §3.3.2 меняет только защиту.
  *
- * ШИФРНАБОР ОДИН: TLS_AES_128_GCM_SHA256. Это не «пока»: именно его
- * предлагает наш клиент TLS 1.3 (core/tls13.c), и сервер, не согласившийся на
- * него, — честный отказ измерения, а не свойство коробки. ChaCha20 и AES-256
- * в дереве отсутствуют, и заводить их ради неизмеренной нужды нельзя.
+ * Initial-ЗАЩИТА ОДНА: AES-128-GCM. Это не зависит от списка TLS cipher
+ * suites внутри ClientHello: ChaCha20/AES-256 там относятся к будущему TLS
+ * handshake, а не к QUIC Initial packet protection. Измерительный профиль
+ * ClientHello поддерживает оба donor-порядка suites; wire-слой всё равно
+ * использует RFC 9001 AES-128-GCM.
  */
 #ifndef D2K_QUICWIRE_H
 #define D2K_QUICWIRE_H
@@ -133,6 +134,15 @@ size_t d2k_qw_long_hdr(uint8_t *out, size_t cap, uint32_t version, uint8_t type,
                        const uint8_t *scid, size_t scid_len,
                        size_t pn_len, size_t payload_len);
 
+/* То же для Initial с уже выданным сервером Retry-token. Token лежит между
+ * полем длины SCID и полем Length; старый d2k_qw_long_hdr оставлен обёрткой
+ * с пустым token, чтобы не менять все существующие вызовы. */
+size_t d2k_qw_long_hdr_token(uint8_t *out, size_t cap, uint32_t version,
+                             uint8_t type, const uint8_t *dcid, size_t dcid_len,
+                             const uint8_t *scid, size_t scid_len,
+                             const uint8_t *token, size_t token_len,
+                             size_t pn_len, size_t payload_len);
+
 /* --- номера пакетов (RFC 9000 §17.1, A.2/A.3) --------------------------- */
 
 /* Сколько байт нужно, чтобы закодировать pn при подтверждённом largest_acked
@@ -188,5 +198,15 @@ int d2k_qw_open(const d2k_qw_keys *k, const d2k_qw_hdr *h,
  * 0 — метка сошлась, -1 — нет. */
 int d2k_qw_retry_verify(uint32_t version, const uint8_t *odcid, size_t odcid_len,
                         const uint8_t *retry, size_t retry_len);
+
+/* Собирает Retry с integrity tag RFC 9001 §5.8.
+ * Пакет содержит DCID клиента, SCID сервера и непрозрачный token; ODCID
+ * используется только при вычислении метки и в сам пакет не попадает.
+ * Возвращает длину пакета либо 0 при переполнении/некорректном вводе. */
+size_t d2k_qw_retry_build(uint8_t *out, size_t cap, uint32_t version,
+                          const uint8_t *odcid, size_t odcid_len,
+                          const uint8_t *dcid, size_t dcid_len,
+                          const uint8_t *scid, size_t scid_len,
+                          const uint8_t *token, size_t token_len);
 
 #endif /* D2K_QUICWIRE_H */

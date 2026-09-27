@@ -194,6 +194,22 @@ int main(int argc, char **argv) {
               "вторая пара не собралась");
         CHECK(memcmp(head, head2, head_len < h2 ? head_len : h2) != 0,
               "две пары вышли одинаковыми — DCID не свежий");
+
+        /* ПАКЕТЫ НЕ ОБЯЗАНЫ ПРИЙТИ В ПОРЯДКЕ. Сначала хвост, затем голова:
+           состояние должно помнить расшифрованный CRYPTO по смещениям и
+           выдать имя только после заполнения префикса от нуля. Статический
+           d2k_quic_sni намеренно остаётся однодатаграммным; этот контекст —
+           отдельный API для датапата. */
+        d2k_quic_assembly as;
+        d2k_quic_assembly_init(&as);
+        char assembled[256] = {0};
+        CHECK(d2k_quic_assembly_feed(&as, tail, tail_len,
+                                     assembled, sizeof assembled) == 0,
+              "хвост QUIC ошибочно объявлен готовым без головы");
+        CHECK(d2k_quic_assembly_feed(&as, head, head_len,
+                                     assembled, sizeof assembled) == 1 &&
+              strcmp(assembled, "www.microsoft.com") == 0,
+              "ClientHello между датаграммами не собрался");
     }
 
     /* --- ВОПРОС: ПОГАШЕННЫЙ ФИКСИРОВАННЫЙ БИТ --------------------------
@@ -481,6 +497,15 @@ int main(int argc, char **argv) {
               "измерительный Initial повторяет случайность другого опыта");
         CHECK(d2k_quic_probe_initial("measure.example", first, 1199, &fl) != 0 && fl == 0,
               "измерительный Initial обрезан до слишком малого буфера");
+        CHECK(d2k_quic_probe_initial("192.0.2.1", first, sizeof first, &fl) == 0 && fl == 1200,
+              "адресная QUIC-цель донора не собрала измерительный Initial");
+        CHECK(d2k_quic_client_hello(first, fl, hello, sizeof hello, &hl) == 0 && hl > 0 &&
+              d2k_quic_sni(first, fl, name, sizeof name) != 0,
+              "IP-цель должна повторять донорский Initial без SNI, а не подставлять IP как имя");
+        CHECK(d2k_quic_hello_ask(first, fl, D2K_QASK_PLAIN, "192.0.2.1",
+                                 second, sizeof second, &sl) == 0 &&
+              d2k_quic_sni(second, sl, name, sizeof name) != 0,
+              "вопрос QUIC для IP-цели не сохранил отсутствие SNI");
         CHECK(d2k_quic_probe_initial("", first, sizeof first, &fl) != 0,
               "безымянной цели выдуман именованный измерительный вход");
     }
@@ -510,6 +535,11 @@ int main(int argc, char **argv) {
               "два Initial совпали байт в байт — случайности в них нет");
         CHECK(d2k_qc_first_initial("decoy.example", ini, 100, &il) != 0,
               "Initial «собрался» в буфер на 100 байт");
+        il = 0;
+        CHECK(d2k_qc_first_initial("192.0.2.1", ini, sizeof ini, &il) == 0 &&
+              d2k_quic_is_initial(ini, il) &&
+              d2k_quic_sni(ini, il, name, sizeof name) != 0,
+              "QUIC verifier для IP-цели должен послать Initial без SNI");
     }
 
     if (fails) {

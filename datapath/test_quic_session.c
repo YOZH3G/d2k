@@ -15,8 +15,11 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <arpa/inet.h>
 #include "d2k_session.h"
+#include "d2k_journal.h"
 #include "d2k_quic.h"
+#include "d2k_quichello.h"
 #include "d2k_nat.h"
 
 static int fails;
@@ -38,6 +41,16 @@ static size_t count_plan_refused(const d2k_session *s) {
         if (e && e->kind == D2K_JRN_PLAN_REFUSED) {
             c++;
         }
+    }
+    return c;
+}
+
+static size_t count_journal_kind(const d2k_session *s, int kind) {
+    const d2k_journal *j = d2k_session_journal(s);
+    size_t n = d2k_journal_count(j), c = 0;
+    for (size_t i = 0; i < n; i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e && e->kind == kind) { c++; }
     }
     return c;
 }
@@ -324,6 +337,57 @@ static void test_direction_by_hook(void) {
         d2k_session_free(s);
     }
 
+    /* Активные зонды контроллера идут через NFQUEUE, чтобы проверить точный
+       trial Plan. Но они не являются пользовательским трафиком: их SNI и
+       молчание нельзя возвращать scheduler как новые цели/блокировки, а их
+       ClientHello не должен перебить snapshot настоящего клиента. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        CHECK(s != NULL, "сессия для controller probe не создалась");
+        d2k_plan *candidate = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &candidate,
+                            err, sizeof err) == 0,
+              "QUIC candidate для controller probe не загрузился");
+        CHECK(d2k_plantab_set_name_probe(d2k_session_plans(s),
+                  (const uint8_t *)"example.com", 11, 1, candidate,
+                  D2K_PLAN_SHAPE_QUIC, htons(50001)) == 0,
+              "exact-flow QUIC candidate не установился");
+        uint8_t pkt[1300], buf[4096];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 50001, 443, v1_initial, sizeof v1_initial);
+        d2k_session_packet_probe(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.applied && r.n_out > 0,
+              "controller probe не получил exact-flow trial Plan");
+        for (size_t i = 0; i <= r.n_out; i++) {
+            d2k_session_sent(s, 1100 + i, &r.key, r.execution_id);
+        }
+        CHECK(count_journal_kind(s, D2K_JRN_PLAN_DONE) == 1,
+              "точное исполнение trial Plan на controller probe не дошло до DONE/APPLIED");
+        CHECK(count_journal_kind(s, D2K_JRN_HELLO_SNI) == 0,
+              "SNI собственного QUIC-зонда ушёл как пользовательский HELLO");
+        CHECK(count_journal_kind(s, D2K_JRN_SUSPECT) == 0,
+              "собственный QUIC-зонд породил пользовательское SUSPECT");
+        CHECK(count_journal_kind(s, D2K_JRN_EXCHANGE) == 0,
+              "ответ на собственный QUIC-зонд ушёл как пользовательский EXCHANGE");
+        CHECK(count_plan_refused(s) == 0,
+              "отсутствие пользовательских событий не должно журналировать отказ плана");
+        CHECK(d2k_session_hellos(s) == 1,
+              "controller probe обязан разбираться для точного применения trial Plan");
+        CHECK(d2k_session_want_shape(s, (const uint8_t *)"example.com", 11, 17) == 0,
+              "controller probe ошибочно выдан за клиентский QUIC snapshot");
+        n = build_udp_pkt(pkt, 50002, 443, v1_initial, sizeof v1_initial);
+        d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+        CHECK(d2k_session_want_shape(s, (const uint8_t *)"example.com", 11, 17) == 1,
+              "реальный клиентский QUIC snapshot не удовлетворил ARM_SHAPE после probe");
+        size_t shape_len = 0;
+        const uint8_t *shape = d2k_session_shape(s, 17, &shape_len);
+        CHECK(shape && shape_len == sizeof v1_initial &&
+              memcmp(shape, v1_initial, sizeof v1_initial) == 0,
+              "после controller probe вернута не исходная форма клиента");
+        d2k_session_free(s);
+    }
+
     /* Сервер -> клиент: очередь на INPUT. Разбирать как клиентский пакет
        нельзя ни при каком содержимом. */
     {
@@ -355,6 +419,158 @@ static void test_direction_by_hook(void) {
     }
 }
 
+/* QUIC is identified by its Initial form, not by a hard-coded destination
+ * port.  A real netfilter hook is the direction proof for a non-443 service,
+ * so split hold must accept an outgoing Initial to (for example) 8443 and
+ * reject the corresponding incoming packet. */
+static void test_quic_non443_client_hold(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    uint8_t pkt[1300];
+    d2k_key key;
+    size_t n = build_udp_pkt(pkt, 58101, 8443, v1_initial, sizeof v1_initial);
+    CHECK(s != NULL, "non-443 hold session allocation");
+    if (!s) return;
+    d2k_session_set_hook(s, D2K_HOOK_OUTPUT);
+    CHECK(d2k_session_udp_hold_begin(s, pkt, n, 1000, &key) == 1,
+          "outgoing QUIC Initial on non-443 was rejected by port gate");
+    d2k_session_udp_hold_end(s, &key);
+    d2k_session_set_hook(s, D2K_HOOK_INPUT);
+    CHECK(d2k_session_udp_hold_begin(s, pkt, n, 1100, NULL) == 0,
+          "incoming non-443 QUIC was treated as client hold");
+    d2k_session_free(s);
+
+    /* The same hook evidence must survive the normal packet path, not only
+       the pre-classification hold gate: an all-port firewall must be able to
+       apply a compatible QUIC plan on 8443. */
+    s = d2k_session_new(64, 32);
+    d2k_plan *plan = NULL;
+    char err[160];
+    CHECK(s != NULL, "non-443 packet session allocation");
+    if (!s) return;
+    CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &plan, err, sizeof err) == 0,
+          "non-443 QUIC plan load");
+    d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11,
+                         1, plan);
+    uint8_t buf[4096];
+    d2k_result res;
+    d2k_session_set_hook(s, D2K_HOOK_OUTPUT);
+    d2k_session_packet(s, pkt, n, 1200, buf, sizeof buf, &res);
+    CHECK(res.applied == 1, "non-443 hook did not reach normal QUIC plan path");
+    CHECK(d2k_session_hellos(s) == 1, "non-443 QUIC name was not classified");
+    d2k_session_free(s);
+}
+
+/* Реальный ClientHello может быть разнесён по двум Initial и прийти хвостом
+ * раньше головы. Датапат обязан держать состояние на 5-tuple, иначе такой
+ * поток навсегда остаётся без имени и не доходит до общего поиска. */
+static void test_quic_cross_datagram_assembly(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    d2k_plan *p = NULL;
+    char plan_err[160];
+    uint8_t head[2048], tail[2048], pkt[2200], buf[4096];
+    d2k_result r;
+    size_t head_len = 0, tail_len = 0;
+    CHECK(s != NULL &&
+          d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, plan_err, sizeof plan_err) == 0 &&
+          d2k_plantab_set_name(d2k_session_plans(s),
+                               (const uint8_t *)"www.microsoft.com",
+                               sizeof "www.microsoft.com" - 1, 1, p) == 0 &&
+          d2k_quic_hello_split(v1_initial, sizeof v1_initial,
+                                "www.microsoft.com",
+                                head, sizeof head, &head_len,
+                                tail, sizeof tail, &tail_len) == 0,
+          "не собрался fixture QUIC с двумя датаграммами");
+    if (!s || head_len == 0 || tail_len == 0) {
+        d2k_session_free(s);
+        return;
+    }
+    size_t n = build_udp_pkt(pkt, 58100, 443, tail, tail_len);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(d2k_session_hellos(s) == 0,
+          "один хвост QUIC ошибочно дал имя до головы");
+    CHECK(!r.applied && r.n_out == 0,
+          "неполный QUIC Initial получил общий план до сборки имени");
+    n = build_udp_pkt(pkt, 58100, 443, head, head_len);
+    d2k_session_packet(s, pkt, n, 1100, buf, sizeof buf, &r);
+    CHECK(d2k_session_hellos(s) == 1,
+          "ClientHello между датаграммами не дошёл до session");
+    CHECK(r.applied && r.n_out > 0,
+          "после сборки имени план не применился к распознанной QUIC-цели");
+    d2k_session_free(s);
+}
+
+/* Ownership handoff for a split QUIC input: both original datagrams are held
+ * while the name is incomplete, and the caller must replay the first original
+ * after assembly.  Session must not apply the plan to the second (tail) piece. */
+static void test_quic_split_hold_handshake(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    d2k_plan *p = NULL;
+    char e[160];
+    uint8_t head[2048], tail[2048], pkt[2200], buf[4096];
+    d2k_result r;
+    size_t hn = 0, tn = 0;
+    CHECK(s && d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, e, sizeof e) == 0 &&
+          d2k_plantab_set_name(d2k_session_plans(s),
+                               (const uint8_t *)"www.microsoft.com", 17, 1, p) == 0 &&
+          d2k_quic_hello_split(v1_initial, sizeof v1_initial, "www.microsoft.com",
+                               head, sizeof head, &hn, tail, sizeof tail, &tn) == 0,
+          "split hold fixture не собрался");
+    if (!s || !hn || !tn) { d2k_session_free(s); return; }
+
+    d2k_key key;
+    size_t n = build_udp_pkt(pkt, 58200, 443, tail, tn);
+    CHECK(d2k_session_udp_hold_begin(s, pkt, n, 1000, &key) == 1,
+          "split QUIC hold не начал транзакцию");
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(r.udp_hold_wait && !r.applied && d2k_session_hellos(s) == 0,
+          "хвост split QUIC применил план до сборки имени");
+
+    n = build_udp_pkt(pkt, 58200, 443, head, hn);
+    d2k_session_packet(s, pkt, n, 1100, buf, sizeof buf, &r);
+    CHECK(r.udp_hold_ready && !r.applied && d2k_session_hellos(s) == 0,
+          "голова split QUIC не запросила replay исходных датаграмм");
+
+    d2k_session_udp_hold_end(s, &key);
+    n = build_udp_pkt(pkt, 58200, 443, tail, tn);
+    d2k_session_packet(s, pkt, n, 1200, buf, sizeof buf, &r);
+    CHECK(r.applied && d2k_session_hellos(s) == 1,
+          "replay первого оригинала не прошёл обычный plan path");
+    CHECK(d2k_session_udp_hold_begin(s, pkt, n, 1300, NULL) == 0,
+          "после Plan done поток снова ошибочно вошёл в UDP hold");
+    d2k_session_free(s);
+}
+
+/* После QUIC Retry клиент начинает новый Initial с новым DCID. Старый
+ * stateful-контекст не должен отбрасывать такой пакет как «чужой» и оставлять
+ * поток без имени навсегда. */
+static void test_quic_retry_resets_assembly(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    uint8_t head[2048], tail[2048], retry[2048], pkt[2200], buf[4096];
+    d2k_result r;
+    size_t head_len = 0, tail_len = 0, retry_len = 0;
+    CHECK(s != NULL &&
+          d2k_quic_hello_split(v1_initial, sizeof v1_initial,
+                                "www.microsoft.com",
+                                head, sizeof head, &head_len,
+                                tail, sizeof tail, &tail_len) == 0 &&
+          d2k_quic_probe_initial("www.microsoft.com", retry, sizeof retry,
+                                 &retry_len) == 0,
+          "не собрался Retry fixture с новым DCID");
+    if (!s || !tail_len || !retry_len) {
+        d2k_session_free(s);
+        return;
+    }
+    size_t n = build_udp_pkt(pkt, 58110, 443, tail, tail_len);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(d2k_session_hellos(s) == 0,
+          "хвост до Retry ошибочно дал имя");
+    n = build_udp_pkt(pkt, 58110, 443, retry, retry_len);
+    d2k_session_packet(s, pkt, n, 1100, buf, sizeof buf, &r);
+    CHECK(d2k_session_hellos(s) == 1 && d2k_session_with_sni(s) == 1,
+          "новый Initial после Retry не сбросил старый QUIC assembly context");
+    d2k_session_free(s);
+}
+
 /* --- ГОЛОС ДИСКОРДА: первый пакет потока — IP Discovery -------------------
  *
  * Ровно 74 байта: тип 0x0001, длина 70, SSRC, 64 нулевых байта адреса, порт
@@ -368,6 +584,24 @@ static size_t build_ip_discovery(uint8_t *p, uint32_t ssrc) {
     p[4] = (uint8_t)(ssrc >> 24); p[5] = (uint8_t)(ssrc >> 16);
     p[6] = (uint8_t)(ssrc >> 8);  p[7] = (uint8_t)ssrc;
     return 74;
+}
+
+/* Настоящий ответ IP Discovery: та же сигнатура, но адрес и порт уже
+ * заполнены. Нулевой адрес — это только запрос и не может быть доказательством
+ * работы голосового потока. */
+static size_t build_ip_discovery_response(uint8_t *p, uint32_t ssrc) {
+    size_t n = build_ip_discovery(p, ssrc);
+    memcpy(p + 8, "203.0.113.7", 11);
+    p[72] = 0xC3; p[73] = 0x50; /* 50000 */
+    return n;
+}
+
+static size_t build_stun_binding(uint8_t *p, uint16_t type, const uint8_t txid[12]) {
+    memset(p, 0, 20);
+    p[0] = (uint8_t)(type >> 8); p[1] = (uint8_t)type;
+    p[4] = 0x21; p[5] = 0x12; p[6] = 0xa4; p[7] = 0x42;
+    memcpy(p + 8, txid, 12);
+    return 20;
 }
 
 /* Тот же поток со стороны сервера: концы и порты меняются местами. */
@@ -546,6 +780,87 @@ static void test_nameless_exchange(void) {
 }
 
 static void test_discord_voice(void) {
+    /* STUN Binding — тот же voice-контекст, но отдельная строгая сигнатура и
+       отдельное подтверждение ответа по transaction ID. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        d2k_plan *p = NULL;
+        char err[160];
+        uint8_t stun[32], txid[12] = {0,1,2,3,4,5,6,7,8,9,10,11};
+        uint8_t pkt[256], buf[4096];
+        d2k_result r;
+        CHECK(d2k_plan_load(plan_voice_declared, sizeof plan_voice_declared, &p,
+                            err, sizeof err) == 0 &&
+              d2k_plantab_set_name_shaped(d2k_session_plans(s),
+                                          (const uint8_t *)D2K_VOICE_CLASS,
+                                          strlen(D2K_VOICE_CLASS), 1, p,
+                                          D2K_PLAN_SHAPE_VOICE) == 0,
+              "STUN voice plan не загрузился");
+        size_t sn = build_stun_binding(stun, 0x0001, txid);
+        size_t n = build_udp_pkt(pkt, 64041, 3478, stun, sn);
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.applied && d2k_session_hellos(s) == 1,
+              "STUN Binding Request не пошёл в voice Plan");
+        CHECK(count_kind_name(s, D2K_JRN_HELLO_SNI, D2K_VOICE_CLASS) == 1,
+              "STUN не назван классом voice");
+        d2k_session_free(s);
+    }
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t req[32], resp[32], txid[12] = {11,10,9,8,7,6,5,4,3,2,1,0};
+        uint8_t pkt[256], buf[4096];
+        d2k_result r;
+        size_t rn = build_stun_binding(req, 0x0001, txid);
+        size_t n = build_udp_pkt(pkt, 64042, 3478, req, rn);
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        size_t sn = build_stun_binding(resp, 0x0101, txid);
+        uint8_t wrong[12];
+        memcpy(wrong, txid, sizeof wrong);
+        wrong[0] ^= 0xff;
+        uint8_t wrong_resp[32];
+        size_t wn = build_stun_binding(wrong_resp, 0x0101, wrong);
+        n = build_udp_rev_pkt(pkt, 64042, wrong_resp, wn);
+        wr16(pkt + 20, 3478);
+        d2k_session_set_hook(s, D2K_HOOK_FORWARD);
+        d2k_session_packet(s, pkt, n, 1100, buf, sizeof buf, &r);
+        int wrong_stun_code = 0;
+        const d2k_journal *wj = d2k_session_journal(s);
+        for (size_t i = 0; i < d2k_journal_count(wj); i++) {
+            const d2k_jrn_entry *e = d2k_journal_at(wj, i);
+            if (e && e->kind == D2K_JRN_EXCHANGE && e->code == D2K_UDP_PROOF_STUN) {
+                wrong_stun_code = 1;
+            }
+        }
+        CHECK(!wrong_stun_code,
+              "STUN response с чужим transaction ID ошибочно дал protocol proof");
+        n = build_udp_rev_pkt(pkt, 64042, resp, sn);
+        wr16(pkt + 20, 3478);
+        d2k_session_packet(s, pkt, n, 1200, buf, sizeof buf, &r);
+        const d2k_journal *j = d2k_session_journal(s);
+        size_t exchanges = count_kind_name(s, D2K_JRN_EXCHANGE, NULL);
+        int stun_code = 0;
+        for (size_t i = 0; i < d2k_journal_count(j); i++) {
+            const d2k_jrn_entry *e = d2k_journal_at(j, i);
+            if (e && e->kind == D2K_JRN_EXCHANGE && e->code == D2K_UDP_PROOF_STUN) {
+                stun_code = 1;
+            }
+        }
+        CHECK(exchanges == 2 && stun_code, "STUN response не дал transaction-bound proof");
+        d2k_session_free(s);
+    }
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t bad[20] = {0}, pkt[256], buf[4096];
+        d2k_result r;
+        bad[4] = 0x21; bad[5] = 0x12; bad[6] = 0xa4; bad[7] = 0x42;
+        size_t n = build_udp_pkt(pkt, 64043, 3478, bad, sizeof bad);
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(d2k_session_hellos(s) == 0, "неполный STUN ошибочно признан voice");
+        d2k_session_free(s);
+    }
     /* План, объявленный голосом, датапат принимает и голосу отдаёт. */
     {
         d2k_session *s = d2k_session_new(64, 32);
@@ -640,6 +955,31 @@ static void test_discord_voice(void) {
         d2k_session_packet(s, pkt, n, 3000, buf, sizeof buf, &r);
         CHECK(count_kind_name(s, D2K_JRN_EXCHANGE, NULL) == 1,
               "обмен по одному потоку объявлен дважды");
+        d2k_session_free(s);
+    }
+    /* Только корректный ответ IP Discovery, с тем же SSRC, является
+       протокольным доказательством. Пустой/чужой ответ остаётся обычным
+       наблюдением и не получает этот код. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t pkt[256], buf[4096], disc[74], reply[74];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 64039, 50004, disc, build_ip_discovery(disc, 0xAABBCCDD));
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        build_ip_discovery_response(reply, 0xAABBCCDD);
+        n = build_udp_pkt(pkt, 64039, 50004, reply, sizeof reply);
+        swap_udp_ends(pkt);
+        d2k_session_set_hook(s, D2K_HOOK_FORWARD);
+        d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+        const d2k_journal *j = d2k_session_journal(s);
+        int proof = 0;
+        for (size_t i = 0; i < d2k_journal_count(j); i++) {
+            const d2k_jrn_entry *e = d2k_journal_at(j, i);
+            if (e && e->kind == D2K_JRN_EXCHANGE &&
+                e->code == D2K_UDP_PROOF_VOICE_DISCOVERY) { proof = 1; }
+        }
+        CHECK(proof, "валидный IP Discovery response не дал протокольного доказательства");
         d2k_session_free(s);
     }
 }
@@ -765,6 +1105,10 @@ static void test_fragments(void) {
 int main(void) {
     test_fragments();
     test_direction_by_hook();
+    test_quic_non443_client_hold();
+    test_quic_cross_datagram_assembly();
+    test_quic_split_hold_handshake();
+    test_quic_retry_resets_assembly();
     test_discord_voice();
     test_nameless_initial();
     test_nameless_silence();
@@ -1050,14 +1394,10 @@ int main(void) {
         d2k_session_free(s);
     }
 
-    /* --- ни один порт не 443: направление неизвестно, план не применяется -
-       Третья ветка того же признака (ревью задачи 4, круг 3): порт источника
-       и порт назначения оба НЕ 443. По правилам files/S99d2k такая
-       датаграмма в очередь вообще не попала бы (обе цепочки заточены под
-       443), но handle_udp вызывается и напрямую (эта программа), и обязан
-       вести себя безопасно на входе, которого честная эксплуатация не
-       производит: "не понял — не тронь" распространяется и на направление,
-       не только на содержимое. */
+    /* --- неизвестный hook и нестандартный порт: направление неизвестно,
+       план не применяется. Это сохраняет безопасный fallback для старых
+       вызывающих, которые не передают NFQUEUE hook; боевой all-port firewall
+       передаёт hook и проходит отдельную проверку выше. */
     {
         d2k_session *s = d2k_session_new(64, 32);
         d2k_plan *p = NULL;
@@ -1322,6 +1662,27 @@ int main(void) {
             CHECK(d2k_session_sweep(s4, 30 * s_ns) == 0,
                   "ответивший по QUIC сервер объявлен молчащим");
             d2k_session_free(s4);
+        }
+
+        /* 4b. Один ответ на первый Initial не отменяет подозрение, если
+           следующий PTO клиента снова остаётся без ответа: это модель
+           «первый пакет пропустили, повторы режутся», которую использует
+           transit QUIC fixture. Ответ после повтора, напротив, снимает
+           подозрение через last_{rev,fwd}_after_hello_ns. */
+        {
+            d2k_session *s4b = d2k_session_new(64, 64);
+            size_t n = build_udp_pkt(pkt, 50411, 443, v1_initial, sizeof v1_initial);
+            d2k_session_packet(s4b, pkt, n, 2 * s_ns, buf, sizeof buf, &r);
+            n = build_udp_rev_pkt(pkt, 50411, any, sizeof any);
+            d2k_session_packet(s4b, pkt, n, 2 * s_ns + 100000000ull,
+                               buf, sizeof buf, &r);
+            n = build_udp_pkt(pkt, 50411, 443, v1_initial, sizeof v1_initial);
+            d2k_session_packet(s4b, pkt, n, 3 * s_ns, buf, sizeof buf, &r);
+            CHECK(d2k_session_sweep(s4b, 4 * s_ns + 100000000ull) == 1,
+                  "ответ на первый Initial навсегда скрыл молчание после PTO");
+            CHECK(d2k_session_suspects(s4b) == 1,
+                  "потерянный ответ после повторного QUIC Initial не дал SUSPECT");
+            d2k_session_free(s4b);
         }
 
         /* 5. Обе стороны на порту 443 — направление неизвестно, и ни

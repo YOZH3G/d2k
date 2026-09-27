@@ -5,6 +5,7 @@
  * транспортам сразу.
  */
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -104,6 +105,14 @@ static int name_matches(const char *pat, size_t plen, const char *host) {
    иначе разбор честно отвечает «сказать нечего». */
 static int cert_name_ok(const uint8_t *der, size_t len, const char *host) {
     static const uint8_t oid[] = { 0x06, 0x03, 0x55, 0x1D, 0x11 };
+    if (!host || !host[0]) { return -1; }
+    uint8_t host_ip[16];
+    size_t host_ip_len = 0;
+    if (inet_pton(AF_INET, host, host_ip) == 1) {
+        host_ip_len = 4;
+    } else if (inet_pton(AF_INET6, host, host_ip) == 1) {
+        host_ip_len = 16;
+    }
     for (size_t i = 0; i + sizeof oid <= len; i++) {
         if (memcmp(der + i, oid, sizeof oid) != 0) { continue; }
         size_t q = i + sizeof oid;
@@ -121,7 +130,7 @@ static int cert_name_ok(const uint8_t *der, size_t len, const char *host) {
         if (slen == 0 || 1 + shdr + slen > gnlen) { continue; }
         const uint8_t *e = gn + 1 + shdr;
         size_t left = slen;
-        int saw_dns = 0;
+        int saw_dns = 0, saw_ip = 0;
         while (left >= 2) {
             uint8_t tag = e[0];
             size_t ehdr = 0;
@@ -129,12 +138,17 @@ static int cert_name_ok(const uint8_t *der, size_t len, const char *host) {
             if (1 + ehdr + elen > left) { break; }
             if (tag == 0x82) {                            /* dNSName */
                 saw_dns = 1;
-                if (name_matches((const char *)(e + 1 + ehdr), elen, host)) { return 1; }
+                if (!host_ip_len &&
+                    name_matches((const char *)(e + 1 + ehdr), elen, host)) { return 1; }
+            } else if (tag == 0x87) {                     /* iPAddress */
+                saw_ip = 1;
+                if (host_ip_len == elen &&
+                    memcmp(e + 1 + ehdr, host_ip, host_ip_len) == 0) { return 1; }
             }
             e += 1 + ehdr + elen;
             left -= 1 + ehdr + elen;
         }
-        return saw_dns ? 0 : -1;
+        return (saw_dns || saw_ip) ? 0 : -1;
     }
     return -1;
 }

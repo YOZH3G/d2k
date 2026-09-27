@@ -184,7 +184,7 @@ func TestD2KProbeHelloParity(t *testing.T) {
 	if bin == "" {
 		t.Fatal("D2K_QUIC_INPUT_BIN is required")
 	}
-	for _, name := range []string{"profile.example", "a.example", "longer-target-name.example.com"} {
+	for _, name := range []string{"profile.example", "a.example", "longer-target-name.example.com", "192.0.2.1"} {
 		t.Run(name, func(t *testing.T) {
 			want, err := ClientHello(name, []byte{1, 2, 3, 4, 5, 6, 7, 8})
 			if err != nil {

@@ -318,15 +318,21 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         }
         out->code = (uint16_t)((uint16_t)rest[0] << 8 | rest[1]);
         out->num = (uint32_t)rest[2] << 8 | rest[3]; /* (ok<<8)|reason, см. d2k_link.h */
+        if (rlen >= 4 + D2K_TRIAL_ID_LEN) {
+            memcpy(out->trial_id, rest + 4, D2K_TRIAL_ID_LEN);
+        }
         break;
     case D2K_EV_APPLIED:
         /* Новый код подтверждения исполнения требует полный ID. Старый
            PREPARED (0x0003) — отдельное событие, не доказательство. */
-        if (rlen < D2K_PLAN_ID_LEN) {
-            say(err, errcap, "исполнение без полного идентификатора плана");
+        if (rlen < D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN) {
+            say(err, errcap, "исполнение без полного Plan ID/trial ID");
             return -1;
         }
         memcpy(out->plan_id, rest, D2K_PLAN_ID_LEN);
+        if (rlen >= D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN) {
+            memcpy(out->trial_id, rest + D2K_PLAN_ID_LEN, D2K_TRIAL_ID_LEN);
+        }
         break;
     case D2K_EV_PROTO:
         /* ВЕРСИЯ ПРОВОДА. Короче двух байт — версия не объявлена, и это не
@@ -356,9 +362,12 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         if (rlen >= 1) {
             out->code = rest[0];
         }
-        if (rlen >= 1 + D2K_PLAN_ID_LEN) {
-            memcpy(out->plan_id, rest + 1, D2K_PLAN_ID_LEN);
+        if (rlen < 1 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN) {
+            say(err, errcap, "отказ без полного Plan ID/trial ID");
+            return -1;
         }
+        memcpy(out->plan_id, rest + 1, D2K_PLAN_ID_LEN);
+        memcpy(out->trial_id, rest + 1 + D2K_PLAN_ID_LEN, D2K_TRIAL_ID_LEN);
         break;
     default:
         /* Вид события, которого этот модуль пока не разбирает глубже, —
@@ -547,6 +556,74 @@ int d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
     return 0;
 }
 
+static int addr_probe_flow_bytes(uint8_t *p, const uint8_t src_ip4[4], uint16_t src_port_be,
+                                 const uint8_t dst_ip4[4], uint16_t dst_port_be,
+                                 uint8_t transport) {
+    if (!src_ip4 || !dst_ip4 || !src_port_be || !dst_port_be || transport != 17) { return -1; }
+    memcpy(p, src_ip4, 4);
+    memcpy(p + 4, &src_port_be, 2);
+    memcpy(p + 6, dst_ip4, 4);
+    memcpy(p + 10, &dst_port_be, 2);
+    p[12] = transport;
+    return 0;
+}
+
+int d2k_link_set_addr_probe(int fd, const uint8_t src_ip4[4], uint16_t src_port_be,
+                            const uint8_t dst_ip4[4], uint16_t dst_port_be,
+                            uint8_t transport, const uint8_t trial_id[D2K_TRIAL_ID_LEN],
+                            uint32_t lease_ms, const char *plan_hex,
+                            char *err, size_t errcap) {
+    if (fd < 0 || !trial_id || !lease_ms || lease_ms > D2K_ADDR_PROBE_LEASE_MAX_MS || !plan_hex ||
+        addr_probe_flow_bytes(g_scratch + HDR, src_ip4, src_port_be,
+                              dst_ip4, dst_port_be, transport) != 0) {
+        say(err, errcap, "аргументы SET_ADDR_PROBE негодны");
+        return -1;
+    }
+    uint8_t any = 0;
+    for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any |= trial_id[i]; }
+    if (!any) { say(err, errcap, "trial_id не может быть нулевым"); return -1; }
+    size_t o = HDR + 13;
+    memcpy(g_scratch + o, trial_id, D2K_TRIAL_ID_LEN); o += D2K_TRIAL_ID_LEN;
+    g_scratch[o++] = (uint8_t)(lease_ms >> 24);
+    g_scratch[o++] = (uint8_t)(lease_ms >> 16);
+    g_scratch[o++] = (uint8_t)(lease_ms >> 8);
+    g_scratch[o++] = (uint8_t)lease_ms;
+    size_t hexlen = strlen(plan_hex);
+    if (hexlen & 1u) { say(err, errcap, "план SET_ADDR_PROBE не hex"); return -1; }
+    long decoded = hex_decode(plan_hex, g_scratch + o, sizeof g_scratch - o);
+    if (decoded < 0) { say(err, errcap, "план SET_ADDR_PROBE не hex"); return -1; }
+    o += (size_t)decoded;
+    size_t body_len = o - HDR;
+    if (body_len > (size_t)D2K_CTL_FRAME_MAX - 2) { say(err, errcap, "SET_ADDR_PROBE длиннее кадра"); return -1; }
+    uint32_t plen = (uint32_t)(2 + body_len);
+    g_scratch[0] = (uint8_t)(plen >> 24); g_scratch[1] = (uint8_t)(plen >> 16);
+    g_scratch[2] = (uint8_t)(plen >> 8); g_scratch[3] = (uint8_t)plen;
+    g_scratch[4] = (uint8_t)(D2K_CMD_SET_ADDR_PROBE >> 8); g_scratch[5] = (uint8_t)D2K_CMD_SET_ADDR_PROBE;
+    if (write_all(fd, g_scratch, o) != 0) { say(err, errcap, "SET_ADDR_PROBE: %s", strerror(errno)); return -1; }
+    return 0;
+}
+
+int d2k_link_del_addr_probe(int fd, const uint8_t src_ip4[4], uint16_t src_port_be,
+                            const uint8_t dst_ip4[4], uint16_t dst_port_be,
+                            uint8_t transport, const uint8_t trial_id[D2K_TRIAL_ID_LEN],
+                            char *err, size_t errcap) {
+    if (fd < 0 || !trial_id || addr_probe_flow_bytes(g_scratch + HDR, src_ip4,
+        src_port_be, dst_ip4, dst_port_be, transport) != 0) {
+        say(err, errcap, "аргументы DEL_ADDR_PROBE негодны"); return -1;
+    }
+    uint8_t any = 0;
+    for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any |= trial_id[i]; }
+    if (!any) { say(err, errcap, "trial_id не может быть нулевым"); return -1; }
+    size_t o = HDR + 13;
+    memcpy(g_scratch + o, trial_id, D2K_TRIAL_ID_LEN); o += D2K_TRIAL_ID_LEN;
+    uint32_t plen = (uint32_t)(2 + o - HDR);
+    g_scratch[0] = (uint8_t)(plen >> 24); g_scratch[1] = (uint8_t)(plen >> 16);
+    g_scratch[2] = (uint8_t)(plen >> 8); g_scratch[3] = (uint8_t)plen;
+    g_scratch[4] = (uint8_t)(D2K_CMD_DEL_ADDR_PROBE >> 8); g_scratch[5] = (uint8_t)D2K_CMD_DEL_ADDR_PROBE;
+    if (write_all(fd, g_scratch, o) != 0) { say(err, errcap, "DEL_ADDR_PROBE: %s", strerror(errno)); return -1; }
+    return 0;
+}
+
 int d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
                        char *err, size_t errcap) {
     /* Своё тело, а не send_name_only: за именем едет ТРАНСПОРТ. Снимок
@@ -585,6 +662,36 @@ int d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
 
 int d2k_link_del_name(int fd, const char *name, char *err, size_t errcap) {
     return send_name_only(fd, D2K_CMD_DEL_NAME, "DEL_NAME", name, err, errcap);
+}
+
+int d2k_link_del_name_probe(int fd, const char *name, uint8_t transport,
+                            uint8_t shape, uint16_t sport_be,
+                            char *err, size_t errcap) {
+    (void)transport; /* transport is represented by the wire shape */
+    if (fd < 0 || !name || sport_be == 0) {
+        say(err, errcap, "сокет, имя или порт пробного плана не задан");
+        return -1;
+    }
+    size_t nl = strlen(name);
+    if (nl == 0 || nl > 255) {
+        say(err, errcap, "недопустимая длина имени пробного плана");
+        return -1;
+    }
+    size_t o = HDR;
+    g_scratch[o++] = (uint8_t)nl;
+    memcpy(g_scratch + o, name, nl); o += nl;
+    g_scratch[o++] = shape;
+    memcpy(g_scratch + o, &sport_be, 2); o += 2;
+    uint32_t plen = (uint32_t)(2 + (o - HDR));
+    g_scratch[0] = (uint8_t)(plen >> 24); g_scratch[1] = (uint8_t)(plen >> 16);
+    g_scratch[2] = (uint8_t)(plen >> 8);  g_scratch[3] = (uint8_t)plen;
+    g_scratch[4] = (uint8_t)(D2K_CMD_DEL_NAME_PROBE >> 8);
+    g_scratch[5] = (uint8_t)D2K_CMD_DEL_NAME_PROBE;
+    if (write_all(fd, g_scratch, o) != 0) {
+        say(err, errcap, "DEL_NAME_PROBE не отправилась: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 int d2k_link_del_addr(int fd, const uint8_t ip4[4], char *err, size_t errcap) {

@@ -76,7 +76,16 @@ CHAIN_IN=D2K_IN
 # Значения по умолчанию; конфигурация их перекрывает.
 QUEUE_NUM=2000
 MARK=0x2d
-PORTS=443
+# Controller probes must traverse NFQUEUE for exact trial Plans, while raw
+# packets emitted by d2kd bypass it using MARK. Keep a distinct observable
+# mark so d2kd can parse verifier traffic without rediscovering its own probes.
+PROBE_MARK=0x2e
+# Наблюдаем весь TCP/UDP трафик, а не только привычный HTTPS-порт. Протокол
+# определяется разбором первых пакетов в d2kd; ограничение портом 443 теряло
+# QUIC/DoT/нестандартные TLS и адресные потоки до того, как ядро могло выбрать
+# собственный путь. connbytes ниже ограничивает только начальное окно каждого
+# потока, а не охват портов.
+PORTS=0:65535
 CONNBYTES=0:8
 # ГОЛОС ДИСКОРДА — порты боевого профиля discord_udp z2k (и эталона bol-van
 # 50-discord-media для медиадиапазона 50000–50099). Узнаётся голос по первому
@@ -119,11 +128,10 @@ fw_up() {
     iptables -t mangle -N "$CHAIN_OUT" 2>/dev/null || return 1
     iptables -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
 
-    # Собственные пакеты исключаются по метке. §5.5: без этого система учится
-    # на своём же эхе. Без -p — правило покрывает ЛЮБОЙ транспорт по метке, TCP
-    # и UDP одинаково: зонды QUIC (задача 4) метятся тем же MARK, что и зонды
-    # TCP, и им нужен тот же выход до NFQUEUE, иначе собственные зонды службы
-    # вернутся в её же очередь.
+    # Собственные сырые посылки датапата исключаются по MARK. Активные зонды
+    # контроллера помечаются отдельным PROBE_MARK: им нужно попасть в очередь,
+    # чтобы точный trial Plan достался verifier; d2kd разбирает их, но не
+    # порождает из них новое обнаружение.
     iptables -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN || return 1
 
     # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
@@ -285,9 +293,11 @@ start() {
 
     dpmode=observe
     [ "$MODE" = "apply" ] && dpmode=apply
+    [ "$PROBE_MARK" != "$MARK" ] || die "PROBE_MARK должен отличаться от MARK"
 
     start-stop-daemon -S -b -m -p "$DP_PID" -x "$DPBIN" -- \
         --queue "$QUEUE_NUM" --mode "$dpmode" --mark "$MARK" \
+        --probe-mark "$PROBE_MARK" \
         --flows "$FLOWS" --control "$SOCK" --stats "${STATS_SEC:-60}" \
         --log "$LOG/d2kd.log" || die "датапат не запустился"
 
@@ -316,7 +326,7 @@ start() {
     # потоки потомка не наследует, и вывод уходил бы в никуда — проверено на
     # роутере, файл оставался нулевым при исправно работающем движке.
     start-stop-daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
-        --control "$SOCK" --catalog "$DIR/state/catalog.json" --mark "$MARK" \
+        --control "$SOCK" --catalog "$DIR/state/catalog.json" --mark "$PROBE_MARK" \
         --log "$LOG/d2kc.log" || say "контроллер не запустился — датапат наблюдает без подбора"
 
     # ЖУРНАЛ НЕ РАСТЁТ БЕЗ КОНЦА, и это про износ флешки, а не про место.

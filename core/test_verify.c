@@ -45,6 +45,7 @@
 
 #include "d2k_crypto.h" /* то же расписание ключей, что у клиента, с другой стороны */
 #include "d2k_meas.h"   /* d2k_mark_hook — им проверяется «обращение непомеченное» */
+#include "d2k_tls13core.h"
 #include "d2k_verify.h"
 
 static int fails;
@@ -673,6 +674,23 @@ int main(void) {
             stand_stop(&s);
         }
         stand_cert_name = NULL;
+    }
+
+    /* RFC 5280 iPAddress SAN is an OCTET STRING inside GeneralNames, not a
+       dNSName containing the textual IP. QUIC address targets have no SNI,
+       so verification must bind the certificate to the literal IP. */
+    {
+        static const uint8_t ip_cert[] = {
+            0x00, 0x00, 0x00, 0x14, /* context, certificate_list length */
+            0x00, 0x00, 0x0f,       /* certificate length */
+            0x06, 0x03, 0x55, 0x1d, 0x11, /* subjectAltName OID */
+            0x04, 0x08, 0x30, 0x06, 0x87, 0x04, 127, 0, 0, 1,
+            0x00, 0x00              /* certificate extensions */
+        };
+        CHECK(d2k_t13_cert_name_ok(ip_cert, sizeof ip_cert, "127.0.0.1") == 1,
+              "QUIC/IP verification must accept a matching iPAddress SAN");
+        CHECK(d2k_t13_cert_name_ok(ip_cert, sizeof ip_cert, "127.0.0.2") == 0,
+              "QUIC/IP verification must reject a different iPAddress SAN");
     }
 
     /* --- ДОБИВКА ДО ДЛИНЫ ПРИВЕТСТВИЯ КЛИЕНТА ---------------------------

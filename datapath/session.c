@@ -248,6 +248,9 @@ static uint16_t rd16(const uint8_t *p) {
    отсутствующего — он выглядит полным. */
 static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
                    const char *why) {
+    d2k_flow *fl = k ? d2k_track_find(k->proto == 17 ? s->uflows : s->flows, k)
+                     : NULL;
+    if (fl && fl->controller_probe) { return; }
     d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_PLAN_REFUSED, 0, 0, NULL, NULL, 0, why);
 }
 
@@ -259,13 +262,14 @@ static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
    двух однажды забыла бы взвести счёт, и «план доисполнен» по этому
    транспорту перестало бы появляться молча. */
 static void plan_handed_off(d2k_session *s, d2k_result *out, d2k_flow *fl, const d2k_key *k,
-                            const d2k_plan *use) {
+                            const d2k_plan *use, const uint8_t *trial_id) {
     out->applied = 1;
     out->key = *k;
     const uint8_t *id = d2k_plan_id(use);
     if (id) {
         memcpy(out->plan_id, id, D2K_PLAN_ID_LEN);
     }
+    if (trial_id) { memcpy(out->trial_id, trial_id, D2K_TRIAL_ID_LEN); }
     /* n_out не может превысить вместимость out[] (16): выше стоит явная
        проверка, отвергающая план целиком. */
     /* One completion for each raw send AND one for the original's NF verdict. */
@@ -278,6 +282,7 @@ static void plan_handed_off(d2k_session *s, d2k_result *out, d2k_flow *fl, const
     if (++s->next_execution == 0) { ++s->next_execution; }
     out->execution_id = fl->execution_id = s->next_execution;
     memcpy(fl->execution_plan_id, out->plan_id, D2K_PLAN_ID_LEN);
+    memcpy(fl->execution_trial_id, out->trial_id, D2K_TRIAL_ID_LEN);
 }
 
 /* Таблица, в которой живёт поток этого ключа. Транспорт лежит в самом ключе,
@@ -293,7 +298,7 @@ static d2k_table *table_of(d2k_session *s, const d2k_key *k) {
    вообще. Отсюда ничего не пишется на диск. */
 static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
                     d2k_flow *fl, uint8_t code, const d2k_jrn_detail *det) {
-    if (fl->suspected) {
+    if (fl->controller_probe || fl->suspected) {
         return;
     }
     fl->suspected = 1;
@@ -313,7 +318,7 @@ static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
 static void on_flow_expire(void *ctx, const d2k_flow *f) {
     d2k_session *s = ctx;
     d2k_capture_forget(&s->capture, &f->key);
-    if (!f->saw_hello || f->rev_after_hello > 0 || f->suspected) {
+    if (f->controller_probe || !f->saw_hello || f->rev_after_hello > 0 || f->suspected) {
         return;
     }
     /* Та же оговорка, что у sweep_one: без правила на обратное направление
@@ -348,6 +353,44 @@ static int is_discord_ip_discovery(const uint8_t *d, size_t n) {
         if (d[i] != 0) { return 0; }
     }
     return 1;
+}
+
+static int is_discord_ip_discovery_response(const uint8_t *d, size_t n,
+                                            const uint8_t ssrc[4]) {
+    if (n != 74 || d[0] != 0 || d[1] != 1 || d[2] != 0 || d[3] != 70 ||
+        memcmp(d + 4, ssrc, 4) != 0) { return 0; }
+    int nonzero = 0;
+    for (size_t i = 8; i < 72; i++) {
+        unsigned char c = d[i];
+        if (c == 0) { continue; }
+        nonzero = 1;
+        if (!((c >= '0' && c <= '9') || c == '.' || c == ':')) { return 0; }
+    }
+    return nonzero && (d[72] != 0 || d[73] != 0);
+}
+
+/* RFC 5389 Binding только: magic cookie и объявленная длина обязательны.
+ * Один magic cookie без границ недостаточен — произвольный UDP с такими
+ * байтами не должен становиться voice/STUN-доказательством. */
+static int is_stun_binding(const uint8_t *d, size_t n, uint16_t type) {
+    if (!d || n < 20 || (d[0] & 0xc0) != 0 ||
+        ((size_t)d[2] << 8 | d[3]) % 4 != 0 ||
+        20u + (((size_t)d[2] << 8) | d[3]) > n ||
+        d[4] != 0x21 || d[5] != 0x12 || d[6] != 0xa4 || d[7] != 0x42 ||
+        ((uint16_t)d[0] << 8 | d[1]) != type) {
+        return 0;
+    }
+    return 1;
+}
+
+static int is_stun_request(const uint8_t *d, size_t n) {
+    return is_stun_binding(d, n, 0x0001);
+}
+
+static int is_stun_response_for(const uint8_t *d, size_t n,
+                                const uint8_t txid[12]) {
+    return txid && is_stun_binding(d, n, 0x0101) &&
+           memcmp(d + 8, txid, 12) == 0;
 }
 
 /* --- QUIC/UDP: та же склейка, что и для TCP выше, для другого транспорта --
@@ -508,7 +551,8 @@ static int flow_tracked(d2k_flow *fl, const d2k_conn *c, uint8_t proto,
 
 static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
                        size_t ihl, uint64_t now_ns,
-                       uint8_t *buf, size_t bufcap, d2k_result *out) {
+                       uint8_t *buf, size_t bufcap, d2k_result *out,
+                       int controller_probe) {
     /* Минимум для UDP — 8 байт заголовка, а не унаследованные от TCP 20: у
        UDP нет ни номеров последовательности, ни опций, и датаграмма с пустой
        нагрузкой (total == ihl + 8) уже целиком помещается. Раньше эта
@@ -547,6 +591,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         out->skipped = "таблица потоков полна";
         return;
     }
+    if (controller_probe) { fl->controller_probe = 1; }
 
     /* Направление — из ПОРТА, а не из содержимого (ревью задачи 4, круг 3).
      *
@@ -568,35 +613,17 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
      * открыта раньше, просто причина, написанная как факт, была написана
      * раньше, чем её проверили стендом.
      *
-     * Улика — в самом пакете, а не в его содержимом: правила, которые вообще
-     * кладут датаграмму в очередь (files/S99d2k), сами различают стороны
-     * портом — исходящее (клиент -> сервер) по --dports 443, входящее
-     * (сервер -> клиент) по --sports 443. Значит:
-     *   порт назначения 443, порт источника НЕ 443  -> клиентская сторона;
-     *   порт источника 443, порт назначения НЕ 443  -> серверная сторона;
-     *   оба 443 или ни одного                        -> направление
-     *                                                    неизвестно.
-     * Серверную и неизвестную стороны нельзя разбирать как клиентский
-     * Initial ни при каком результате раскрытия — доказательство по
-     * содержимому вопроса «откуда» не покрывает вовсе, и гадать здесь так
-     * же нельзя, как гадать «имени нет» по -1 у d2k_quic_sni (см.
-     * комментарий у вызова ниже).
-     *
-     * ГРАНИЦА ПРИЁМА: он верен ровно настолько, насколько правила экрана
-     * привязаны к фиксированному порту 443 — а весь периметр задачи 4
-     * сегодня именно на этом и стоит (files/S99d2k). Когда датапат научится
-     * обслуживать произвольные порты, порт перестанет быть уликой
-     * направления, и общий ответ там другой — номер крючка netfilter из
-     * NFQA_PACKET_HDR (поле hook в nfqnl_msg_packet_hdr ядра): очередь на
-     * POSTROUTING значит исходящее, на INPUT или FORWARD — входящее. nfq.c
-     * сегодня это поле не разбирает вовсе, и вводить его в этой задаче не
-     * нужно — но тот, кто в будущем возьмётся за не-443-порты, обязан
-     * заменить порт на крючок здесь, а не унаследовать привязку к 443 по
-     * инерции молча. */
+     * Улика — в самом пакете, а не в его содержимом. Основной firewall теперь
+     * наблюдает весь TCP/UDP диапазон, поэтому для произвольного сервисного
+     * порта направление берётся из hook NFQUEUE: OUTPUT/POSTROUTING — клиент,
+     * INPUT/PREROUTING — сервер, а неоднозначный FORWARD уточняется по уже
+     * известному направлению потока. Вызовы без hook сохраняют старый
+     * безопасный fallback по портам 443. Серверную и неизвестную сторону
+     * нельзя объявлять клиентским Initial только по успешной расшифровке:
+     * публичный DCID не доказывает направление. */
     /* НАПРАВЛЕНИЕ: СНАЧАЛА КРЮЧОК, ПОТОМ ПОРТ.
-       Крючок — прямая улика и работает на ЛЮБОМ порту (см. d2k_session_set_hook
-       и абзац выше про границу приёма по 443). Порт остаётся запасным ответом
-       ровно для тех вызывающих, кто крючка не знает. */
+       Крючок — прямая улика и работает на ЛЮБОМ порту. Порт остаётся запасным
+       ответом ровно для тех вызывающих, кто крючка не знает. */
     int dst_is_443 = (rd16(u + 2) == 443);
     int src_is_443 = (rd16(u + 0) == 443);
     int from_client = -1;   /* -1 — не установлено */
@@ -641,14 +668,39 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
            полным молчанием. Это не проверка протокола или успеха обхода. */
         if (fl->saw_hello || fl->saw_initial) {
             fl->rev_after_hello++;
+            fl->last_rev_after_hello_ns = now_ns;
+            if (fl->stun_txid_valid) {
+            }
+            if (!fl->controller_probe && fl->voice_ssrc_valid &&
+                is_discord_ip_discovery_response(pkt + payload_off, payload_len,
+                                                 fl->voice_ssrc) &&
+                !fl->voice_proof_told) {
+                fl->voice_proof_told = 1;
+                fl->exchange_told = 1;
+                s->exchanges++;
+                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_EXCHANGE,
+                                D2K_UDP_PROOF_VOICE_DISCOVERY,
+                                (uint32_t)payload_len, NULL, NULL, 0, NULL);
+            }
+            if (!fl->controller_probe && fl->stun_txid_valid &&
+                is_stun_response_for(pkt + payload_off, payload_len,
+                                     fl->stun_txid) && !fl->stun_proof_told) {
+                fl->stun_proof_told = 1;
+                fl->exchange_told = 1;
+                s->exchanges++;
+                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_EXCHANGE,
+                                D2K_UDP_PROOF_STUN,
+                                (uint32_t)payload_len, NULL, NULL, 0, NULL);
+            }
             /* UDP EXCHANGE — только первая обратная датаграмма, один раз на
                поток. UDP допускает пустую нагрузку. Здесь не проверяются
                ни транзакция STUN, ни QUIC Initial, ни IP Discovery: событие
                не вправе подтверждать протокол/обход/работу приложения. */
-            if (!fl->exchange_told) {
+            if (!fl->controller_probe && !fl->exchange_told) {
                 fl->exchange_told = 1;
                 s->exchanges++;
-                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_EXCHANGE, 0,
+                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_EXCHANGE,
+                                D2K_UDP_PROOF_NONE,
                                 (uint32_t)payload_len, NULL, NULL, 0, NULL);
             }
         }
@@ -676,6 +728,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
            приветствием уходит первой же строкой, и счёт, поставленный после,
            не двинулся бы никогда. */
         fl->fwd_after_hello++;
+        fl->last_fwd_after_hello_ns = now_ns;
     }
 
     /* ПОВРЕЖДЕНИЕ — ДО РАННЕГО ВЫХОДА по уже разобранному приветствию.
@@ -713,15 +766,26 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        различаются только имя и форма: у QUIC имя из Initial, у голоса —
        ярлык класса (D2K_VOICE_CLASS в d2k_plans.h про то, почему не домен и
        не адрес). */
-    int voice = is_discord_ip_discovery(pkt + payload_off, payload_len);
+    int discord_voice = is_discord_ip_discovery(pkt + payload_off, payload_len);
+    int stun_voice = is_stun_request(pkt + payload_off, payload_len);
+    int voice = discord_voice || stun_voice;
+    if (discord_voice && !fl->voice_ssrc_valid) {
+        memcpy(fl->voice_ssrc, pkt + payload_off + 4, sizeof fl->voice_ssrc);
+        fl->voice_ssrc_valid = 1;
+    }
+    if (stun_voice && !fl->stun_txid_valid) {
+        memcpy(fl->stun_txid, pkt + payload_off + 8, sizeof fl->stun_txid);
+        fl->stun_txid_valid = 1;
+    }
     if (!voice && !d2k_quic_is_initial(pkt + payload_off, payload_len)) {
         out->skipped = "не QUIC Initial и не голос Дискорда";
         return;
     }
 
-    /* d2k_quic_sni осознанно не различает «не расшифровалось этими ключами»
-       и «расшифровалось, но server_name нет» (см. d2k_quic.h) — оба случая
-       возвращают -1. Различать их здесь тоже нельзя: объявить второе как
+    /* Stateful assembly осознанно не различает «не расшифровалось этими
+       ключами» и «расшифровалось, но server_name нет» — оба случая
+       дают отсутствие готового имени (0 или -1). Различать их здесь тоже
+       нельзя: объявить второе как
        факт значило бы дописать модулю определённость, которой у него нет, а
        расшифровка могла не сойтись из-за ловушки Retry выше. Направление
        здесь ни при чём — оно доказано портом до этого места, а не
@@ -733,13 +797,12 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
      *
      * Поле 19.09.2026: настоящий клиент (curl/ngtcp2) разбрасывает ClientHello
      * по множеству мелких кадров CRYPTO в разнобой, поперёк ДВУХ
-     * Initial-датаграмм; разбор собирает CRYPTO лишь внутри одной датаграммы.
-     * Ограничение восемью кадрами уже снято, сборки между датаграммами пока
-     * нет. Здесь стоял выход — и к такому потоку не применялся НИКАКОЙ план,
-     * даже поставленный ПО АДРЕСУ или общий (--plan): за прогон «узнано
-     * приветствий 0» при 91 ушедшей датаграмме.
+     * Initial-датаграмм; d2k_quic_assembly теперь собирает их по DCID и
+     * смещениям CRYPTO. Пока непрерывный ClientHello не готов, здесь всё ещё
+     * должен быть честный выход — имя и план нельзя вывести из половины.
      *
-     * Имя при этом не выдумывается и приветствием пакет не объявляется:
+     * Имя при этом не выдумывается и неполный пакет не объявляется
+       приветствием:
      * счётчики, журнал и снимок остаются нетронутыми (§2.4 — «не измерено» не
      * превращается в факт). Но план, который про имя не спрашивает, обязан
      * достаться: у плана по адресу имени нет по построению, у общего — тем
@@ -748,12 +811,33 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     int named = 1;
     if (voice) {
         snprintf(name, sizeof name, "%s", D2K_VOICE_CLASS);
-    } else if (d2k_quic_sni(pkt + payload_off, payload_len, name, sizeof name) != 0) {
-        named = 0;
-        name[0] = '\0';
+    } else {
+        int assembled = d2k_quic_assembly_feed(&fl->quic_assembly,
+                                                pkt + payload_off,
+                                                payload_len, name, sizeof name);
+        if (assembled != 1) {
+            named = 0;
+            name[0] = '\0';
+        }
     }
     size_t name_len = strlen(name);
     uint8_t seen_shape = voice ? D2K_PLAN_SHAPE_VOICE : D2K_PLAN_SHAPE_QUIC;
+
+    /* Внешний UDP hold уже сохранил эту датаграмму.  Пока ClientHello не
+       собран, только накапливаем состояние; когда имя появилось, сообщаем
+       владельцу hold, чтобы он взял ПЕРВУЮ исходную датаграмму и повторил её
+       через обычный plan path. Нельзя применять воздействие к текущему
+       хвосту: это поменяло бы порядок и оставило голову без стратегии. */
+    if (fl->udp_hold_active) {
+        if (!named) {
+            out->udp_hold_wait = 1;
+            out->skipped = "QUIC ClientHello ещё не собран — датаграмма удерживается";
+        } else {
+            out->udp_hold_ready = 1;
+            out->skipped = "QUIC ClientHello собран — требуется replay исходных датаграмм";
+        }
+        return;
+    }
 
     /* Направление уже доказано портом выше, ДО попытки разбора содержимого;
        успешный разбор здесь доказывает отдельный, независимый факт — что
@@ -788,8 +872,10 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
            4: имя есть имя для контроллера независимо от транспорта. */
         s->hellos++;
         s->with_sni++;
-        d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI, 0, 0, NULL,
-                        (const uint8_t *)name, name_len, NULL);
+        if (!fl->controller_probe) {
+            d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI, 0, 0, NULL,
+                            (const uint8_t *)name, name_len, NULL);
+        }
     }
 
     /* СНИМОК ПРИВЕТСТВИЯ QUIC — ровно то же, что делает ветка TCP, и по той
@@ -800,7 +886,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
 
        Слот свой (см. slot_of): TLS-приветствие и Initial — разные байты
        разной формы, и отдавать одно вместо другого нельзя. */
-    if (named && !voice) {
+    if (named && !voice && !fl->controller_probe) {
         size_t k = slot_of(17);
         if (payload_len <= sizeof s->last_hello[k]) {
             memcpy(s->last_hello[k], pkt + payload_off, payload_len);
@@ -841,10 +927,21 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        что назвал контроллер, и переворачивать по дороге нечего. */
     uint16_t sport_be;
     memcpy(&sport_be, u + 0, 2);
-    const d2k_plan *use = d2k_plantab_find_sport(s->plans,
+    d2k_addr_probe_flow probe_flow;
+    memset(&probe_flow, 0, sizeof probe_flow);
+    memcpy(probe_flow.src_ip4, pkt + 12, 4);
+    memcpy(&probe_flow.src_port_be, u + 0, 2);
+    memcpy(probe_flow.dst_ip4, pkt + 16, 4);
+    memcpy(&probe_flow.dst_port_be, u + 2, 2);
+    probe_flow.transport = 17;
+    uint8_t trial_id[D2K_TRIAL_ID_LEN] = {0};
+    const d2k_plan *use = voice ? NULL : d2k_plantab_find_addr_probe(
+        s->plans, &probe_flow, now_ns, trial_id);
+    if (!use) { memset(trial_id, 0, sizeof trial_id); }
+    if (!use) { use = d2k_plantab_find_sport(s->plans,
                                                  named ? (const uint8_t *)name : NULL,
                                                  name_len, dst_be, now_ns,
-                                                 seen_shape, sport_be);
+                                                 seen_shape, sport_be); }
     if (!use) {
         use = s->plan;
     }
@@ -1071,17 +1168,23 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     /* Ключ потока и идентификатор плана — ВЫЗЫВАЮЩЕМУ, до отправки. Без них
        отправляющий видит только байты, и отказ sendto оставался голым
        счётчиком (d2k_session.h, поля applied/key/plan_id). */
-    plan_handed_off(s, out, fl, &key, use);
+    plan_handed_off(s, out, fl, &key, use,
+                    trial_id[0] || trial_id[1] || trial_id[2] || trial_id[3] ||
+                    trial_id[4] || trial_id[5] || trial_id[6] || trial_id[7] ||
+                    trial_id[8] || trial_id[9] || trial_id[10] || trial_id[11] ||
+                    trial_id[12] || trial_id[13] || trial_id[14] || trial_id[15]
+                    ? trial_id : NULL);
     /* Не просто «план применился», а КАКОЙ: без идентификатора контроллер не
        отличит применение своего кандидата от применения предыдущего, чьё
        событие пришло позже (d2k_ctl.h объявляет APPLIED «ключ + id плана»). */
-    d2k_journal_add_applied(s->jrn, now_ns, &key, d2k_plan_id(use));
+    d2k_journal_add_applied(s->jrn, now_ns, &key, d2k_plan_id(use), out->trial_id);
     d2k_actions_free(&acts);
 }
 
 static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap,
-                       d2k_result *out, int observe_only) {
+                       d2k_result *out, int observe_only,
+                       int controller_probe) {
     if (!out) {
         return 0;
     }
@@ -1115,7 +1218,10 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
            handle_udp, СВОИМ порогом (8 байт UDP, а не унаследованным TCP-20:
            см. ревью задачи 4 — короткая, но честная UDP-датаграмма получала
            TCP-объяснение «заголовок не помещается» ровно из-за этого). */
-        if (!observe_only) { handle_udp(s, pkt, len, ihl, now_ns, buf, bufcap, out); }
+        if (!observe_only) {
+            handle_udp(s, pkt, len, ihl, now_ns, buf, bufcap, out,
+                       controller_probe);
+        }
         return 0;
     }
     if (pkt[9] != 6) {
@@ -1261,6 +1367,11 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         fl->syn_seq = rd32(t + 4);
         fl->saw_syn = 1;
     }
+    if (syn && !ack) {
+        fl->controller_probe = controller_probe ? 1 : 0;
+    } else if (controller_probe) {
+        fl->controller_probe = 1;
+    }
     if (syn && ack) {
         /* RTT берём с самого потока: от SYN до SYN-ACK. Ориентир из измерения,
            а не из константы — на медленной линии константа объявила бы
@@ -1276,7 +1387,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        наступает позже первого — сообщить только о первом значит навсегда
        оставить контроллер на уровне 2. */
     const uint8_t appdata_bit = (uint8_t)(1u << (23 - 20));
-    if (fl->saw_hello && fl->rev_payload_after_hello > 0 &&
+    if (!fl->controller_probe && fl->saw_hello && fl->rev_payload_after_hello > 0 &&
         (!fl->exchange_told ||
          (!fl->appdata_told && (fl->rev_types & appdata_bit)))) {
         if (fl->rev_types & appdata_bit) {
@@ -1407,12 +1518,12 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             }
             fl->hello_seq = in_seq;
             s->hellos++;
-            if (tls.have_sni) {
+            if (tls.have_sni && !fl->controller_probe) {
                 s->with_sni++;
                 d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI, 0, 0,
                                 NULL, pkt + payload_off + tls.sni_off,
                                 tls.sni_len, NULL);
-            } else if (tls.have_record_end) {
+            } else if (tls.have_record_end && !fl->controller_probe) {
                 /* Имени нет — и это нормальное состояние модели (§5.3), а не
                    ошибка разбора. */
                 d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_NONAME, 0, 0,
@@ -1443,12 +1554,14 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             if (complete.is_client_hello && complete.have_record_end &&
                 complete.have_hello_middle && !complete.exts_truncated) {
                 s->captured_hellos++;
-                memcpy(s->last_hello[0], hello, hello_len);
-                s->last_hello_len[0] = hello_len;
-                s->last_name_len[0] = 0;
-                if (complete.have_sni && complete.sni_len <= sizeof s->last_name[0]) {
-                    memcpy(s->last_name[0], hello + complete.sni_off, complete.sni_len);
-                    s->last_name_len[0] = complete.sni_len;
+                if (!fl->controller_probe) {
+                    memcpy(s->last_hello[0], hello, hello_len);
+                    s->last_hello_len[0] = hello_len;
+                    s->last_name_len[0] = 0;
+                    if (complete.have_sni && complete.sni_len <= sizeof s->last_name[0]) {
+                        memcpy(s->last_name[0], hello + complete.sni_off, complete.sni_len);
+                        s->last_name_len[0] = complete.sni_len;
+                    }
                 }
                 if (!fl->saw_hello) {
                     fl->saw_hello = 1;
@@ -1456,18 +1569,18 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                     fl->hello_seq = hello_seq;
                     s->hellos++;
                 }
-                if (!fl->had_sni && complete.have_sni) {
+                if (!fl->controller_probe && !fl->had_sni && complete.have_sni) {
                     fl->had_sni = 1;
                     s->with_sni++;
                     d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI,
                                     0, 0, NULL, hello + complete.sni_off,
                                     complete.sni_len, NULL);
-                } else if (!complete.have_sni &&
+                } else if (!fl->controller_probe && !complete.have_sni &&
                            !(tls.is_client_hello && tls.have_record_end)) {
                     d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_NONAME,
                                     0, 0, NULL, NULL, 0, NULL);
                 }
-                if (s->shape_armed[0] &&
+                if (!fl->controller_probe && s->shape_armed[0] &&
                     (s->shape_name_len[0] == 0 ||
                      name_same(s->last_name[0], s->last_name_len[0],
                                s->shape_name[0], s->shape_name_len[0]))) {
@@ -1719,11 +1832,11 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     /* Ключ потока и идентификатор плана — ВЫЗЫВАЮЩЕМУ, до отправки. Без них
        отправляющий видит только байты, и отказ sendto оставался голым
        счётчиком (d2k_session.h, поля applied/key/plan_id). */
-    plan_handed_off(s, out, fl, &key, use);
+    plan_handed_off(s, out, fl, &key, use, NULL);
     /* Не просто «план применился», а КАКОЙ: без идентификатора контроллер не
        отличит применение своего кандидата от применения предыдущего, чьё
        событие пришло позже (d2k_ctl.h объявляет APPLIED «ключ + id плана»). */
-    d2k_journal_add_applied(s->jrn, now_ns, &key, d2k_plan_id(use));
+    d2k_journal_add_applied(s->jrn, now_ns, &key, d2k_plan_id(use), NULL);
 
     d2k_actions_free(&acts);
     return 0;
@@ -1731,12 +1844,18 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
 
 int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap, d2k_result *out) {
-    return session_packet(s, pkt, len, now_ns, buf, bufcap, out, 0);
+    return session_packet(s, pkt, len, now_ns, buf, bufcap, out, 0, 0);
+}
+
+int d2k_session_packet_probe(d2k_session *s, const uint8_t *pkt, size_t len,
+                             uint64_t now_ns, uint8_t *buf, size_t bufcap,
+                             d2k_result *out) {
+    return session_packet(s, pkt, len, now_ns, buf, bufcap, out, 0, 1);
 }
 
 void d2k_session_observe_tcp(d2k_session *s, const uint8_t *p, size_t n, uint64_t now) {
     d2k_result out;
-    (void)session_packet(s, p, n, now, NULL, 0, &out, 1);
+    (void)session_packet(s, p, n, now, NULL, 0, &out, 1, 0);
 }
 
 uint64_t d2k_session_plan_revision(const d2k_session *s) {
@@ -1755,6 +1874,48 @@ int d2k_session_stream_anchor(d2k_session *s, const uint8_t *p, size_t n,
 
 void d2k_session_set_hook(d2k_session *s, uint8_t hook) {
     if (s) { s->hook = hook; }
+}
+
+int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
+                               uint64_t now_ns, d2k_key *key_out) {
+    if (!s || !p || n < 28 || (p[0] >> 4) != 4 || p[9] != 17) { return 0; }
+    size_t ihl = (size_t)(p[0] & 15) * 4;
+    if (ihl < 20 || ihl + 8 > n || (rd16(p + 6) & 0x1fff) != 0) { return 0; }
+    const uint8_t *u = p + ihl;
+    size_t total = rd16(p + 2);
+    if (total < ihl + 8 || total > n) {
+        return 0;
+    }
+    /* Only a client-side QUIC Initial needs split replay.  Voice/STUN and
+       ordinary UDP remain observation-only here.  With a real OUTPUT or
+       POSTROUTING hook the direction is already proven and the service may
+       use any destination port; callers that do not provide a hook retain the
+       old 443 fallback so tests/lab tools cannot silently reinterpret an
+       unknown direction. */
+    int hook_client = (s->hook == D2K_HOOK_OUTPUT ||
+                       s->hook == D2K_HOOK_POSTROUTING);
+    int hook_server = (s->hook == D2K_HOOK_INPUT ||
+                       s->hook == D2K_HOOK_PREROUTING ||
+                       s->hook == D2K_HOOK_FORWARD);
+    if (hook_server || (!hook_client &&
+                        (rd16(u + 2) != 443 || rd16(u) == 443)) ||
+        !d2k_quic_is_initial(p + ihl + 8, total - ihl - 8)) {
+        return 0;
+    }
+    d2k_key key;
+    (void)d2k_key_make(&key, 17, p + 12, p + 16, u, u + 2);
+    d2k_flow *fl = d2k_track_get(s->uflows, &key, now_ns);
+    if (!fl) { return 0; }
+    if (fl->plan_done || fl->damaged || fl->saw_hello) { return 0; }
+    fl->udp_hold_active = 1;
+    if (key_out) { *key_out = key; }
+    return 1;
+}
+
+void d2k_session_udp_hold_end(d2k_session *s, const d2k_key *key) {
+    if (!s || !key) { return; }
+    d2k_flow *fl = d2k_track_find(s->uflows, key);
+    if (fl) { fl->udp_hold_active = 0; }
 }
 
 void d2k_session_note_unassembled(d2k_session *s, const uint8_t *p, size_t n,
@@ -2021,7 +2182,11 @@ static void sweep_udp_one(void *ctx, d2k_flow *f) {
     if ((!f->saw_hello && !f->saw_initial) || f->silence_told || f->suspected) {
         return;
     }
-    if (f->rev_after_hello > 0) {
+    /* Один ответ не закрывает наблюдение навсегда: цензор может пропустить
+       первый Initial, а затем съесть повтор PTO. Считаем поток отвечающим,
+       только если после последней клиентской повторной посылки уже был ответ. */
+    if (f->rev_after_hello > 0 &&
+        f->last_rev_after_hello_ns >= f->last_fwd_after_hello_ns) {
         return;
     }
     if (!c->s->rev_seen[slot_of(17)]) {
@@ -2099,7 +2264,8 @@ void d2k_session_sent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     if (fl->sends_left == 0 && !fl->sends_failed) {
         s->done++;
         d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_DONE,
-                             D2K_REFUSE_NONE, fl->execution_plan_id);
+                             D2K_REFUSE_NONE, fl->execution_plan_id,
+                             fl->execution_trial_id);
     }
 }
 
@@ -2156,7 +2322,8 @@ int d2k_session_exec_failed(d2k_session *s, uint64_t at_ns, const d2k_key *k,
             fl->damaged_told = 1;
             d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_DAMAGED,
                                  D2K_REFUSE_DAMAGED,
-                                 plan_id ? plan_id : fl->execution_plan_id);
+                                 plan_id ? plan_id : fl->execution_plan_id,
+                                 fl->execution_trial_id);
         }
         return 0;
     }
@@ -2188,7 +2355,8 @@ void d2k_session_unsent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     d2k_flow *fl = d2k_track_find(table_of(s, k), k);
     if (fl && execution != 0 && fl->execution_id == execution) {
         d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_UNSENT, code,
-                             plan_id ? plan_id : fl->execution_plan_id);
+                             plan_id ? plan_id : fl->execution_plan_id,
+                             fl->execution_trial_id);
         fl->sends_left = 0;
         fl->sends_failed = 1;
     }

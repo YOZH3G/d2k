@@ -44,6 +44,7 @@ NAME=${D2K_LAB_TRANSIT_NAME:-tranzit.example}
 TARGET=${D2K_LAB_TRANSIT_TARGET:-local}
 QUEUE=2101
 MARK=0x2d
+PROBE_MARK=0x2e
 CLNS=cl
 CL_IP=10.99.0.2
 RT_IP=10.99.0.1
@@ -243,12 +244,12 @@ iptables -t mangle -I FORWARD -j D2K_IN
 iptables -t mangle -I OUTPUT -j D2K_OUT
 iptables -t mangle -I INPUT -j D2K_IN
 
-./datapath/d2kd --mode apply --control /tmp/d2kst/sock --queue 2000 --mark 45 \
+./datapath/d2kd --mode apply --control /tmp/d2kst/sock --queue 2000 --mark 45 --probe-mark "$PROBE_MARK" \
     --journal 400 --duration 300 --stats 30 > /tmp/d2kd.log 2>&1 &
 DPID=$!
 i=0; while [ ! -S /tmp/d2kst/sock ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
 [ -S /tmp/d2kst/sock ] || fail "датапат не открыл управляющий сокет"
-./core/d2kc --control /tmp/d2kst/sock --catalog /tmp/d2kst/catalog.json > /tmp/d2kc.log 2>&1 &
+./core/d2kc --control /tmp/d2kst/sock --catalog /tmp/d2kst/catalog.json --mark "$PROBE_MARK" > /tmp/d2kc.log 2>&1 &
 CPID=$!
 sleep 1
 
@@ -364,7 +365,11 @@ if [ "$OK" -ge "$NEED" ]; then
     # СКОЛЬКО РАЗ ПЛАН НЕ ПРИМЕНИЛСЯ ИЗ-ЗА CONNTRACK — вслух даже на зелёном
     # прогоне. Критерий «два из трёх» пройден и при одном потерянном клиенте,
     # и без этой строки потеря выглядит как полный успех (найдено 17.09).
-    MISSED=$(grep -c "не ведётся conntrack" /tmp/d2kd.log 2>/dev/null || echo 0)
+    # grep -c возвращает код 1 без совпадений; не добавлять второй «0» через
+    # `|| echo 0`, иначе BusyBox test получает многострочное число и портит
+    # уже успешный transit-прогон сообщением Illegal number.
+    MISSED=$(grep -c "не ведётся conntrack" /tmp/d2kd.log 2>/dev/null || true)
+    MISSED=${MISSED:-0}
     [ "$MISSED" -gt 0 ] && echo "ВНИМАНИЕ: планов не применено из-за conntrack: $MISSED"
     keep_logs
     echo "ОБХОД ДОШЁЛ ДО КЛИЕНТА ЗА NAT: $OK из $TRIES"

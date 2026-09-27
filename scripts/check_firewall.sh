@@ -67,14 +67,14 @@ fw_installed || fail "полный набор правил не распозна
 RULES=$(iptables -t mangle -S)
 echo "$RULES"
 
-echo "$RULES" | grep -qE -- '-A D2K_OUT -p udp .*--dports 443.*--queue-bypass' \
-    || fail "нет исходящего UDP-правила с --queue-bypass"
-echo "$RULES" | grep -qE -- '-A D2K_IN -p udp .*--sports 443.*--queue-bypass' \
-    || fail "нет входящего UDP-правила (ответ) с --queue-bypass"
-echo "$RULES" | grep -qE -- '-A D2K_OUT -p tcp .*--dports 443.*--queue-bypass' \
-    || fail "нет исходящего TCP-правила с --queue-bypass (регресс задачи 3)"
-echo "$RULES" | grep -qE -- '-A D2K_IN -p tcp .*--sports 443.*--queue-bypass' \
-    || fail "нет входящего TCP-правила (ответ) с --queue-bypass (регресс задачи 3)"
+echo "$RULES" | grep -qE -- '-A D2K_OUT -p udp .*--dports 0:65535.*--queue-bypass' \
+    || fail "нет исходящего UDP-правила полного диапазона с --queue-bypass"
+echo "$RULES" | grep -qE -- '-A D2K_IN -p udp .*--sports 0:65535.*--queue-bypass' \
+    || fail "нет входящего UDP-правила полного диапазона (ответ) с --queue-bypass"
+echo "$RULES" | grep -qE -- '-A D2K_OUT -p tcp .*--dports 0:65535.*--queue-bypass' \
+    || fail "нет исходящего TCP-правила полного диапазона с --queue-bypass (регресс задачи 3)"
+echo "$RULES" | grep -qE -- '-A D2K_IN -p tcp .*--sports 0:65535.*--queue-bypass' \
+    || fail "нет входящего TCP-правила полного диапазона с --queue-bypass (регресс задачи 3)"
 
 MARK_LINE=$(echo "$RULES" | grep -E -- '-A D2K_OUT -m mark .* -j RETURN' || true)
 [ -n "$MARK_LINE" ] || fail "нет правила RETURN по метке в исходящей цепочке"
@@ -83,7 +83,7 @@ echo "$MARK_LINE" | grep -q -- '-p ' && fail "правило RETURN по мет�
 echo "== fw_up повторно (идемпотентность) =="
 fw_up
 COUNT_OUT=$(iptables -t mangle -S D2K_OUT | wc -l)
-[ "$COUNT_OUT" -eq 4 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 4)"
+[ "$COUNT_OUT" -eq 5 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 5 включая -N)"
 
 echo "== пустые цепочки с сохранёнными переходами — НЕ работающий firewall =="
 iptables -t mangle -F D2K_OUT

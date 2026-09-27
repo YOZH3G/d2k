@@ -69,6 +69,11 @@ const char *d2k_suspect_text(uint8_t code);
  * запрещает применять к нему что-либо ещё. */
 #define D2K_REFUSE_DAMAGED   4
 
+/* D2K_JRN_EXCHANGE code values for protocol-level UDP proofs. */
+#define D2K_UDP_PROOF_NONE            0
+#define D2K_UDP_PROOF_VOICE_DISCOVERY 1
+#define D2K_UDP_PROOF_STUN            2
+
 const char *d2k_refuse_text(uint8_t code);
 
 enum {
@@ -170,6 +175,7 @@ typedef struct {
      * d2k_journal_add ниже). Идентификатор двоичный, такая чистка испортила
      * бы его молча, и «план применился» приписалось бы не тому плану. */
     uint8_t  plan_id[D2K_PLAN_ID_LEN];
+    uint8_t  trial_id[D2K_TRIAL_ID_LEN];
     char     name[D2K_JRN_NAME_MAX + 1];
     /* Строковый литерал причины. Владения нет и не нужно: причины приходят
      * литералами из датапата и живут столько же, сколько программа. */
@@ -211,7 +217,7 @@ void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
  * ровно у одного вида записи, а добавленный всем аргумент пришлось бы
  * писать нулём в двух десятках вызовов, где он ничего не значит. */
 void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
-                             const uint8_t *plan_id);
+                             const uint8_t *plan_id, const uint8_t *trial_id);
 
 /* Запись о судьбе посылок: kind — D2K_JRN_PLAN_DONE либо D2K_JRN_PLAN_UNSENT,
  * code — D2K_REFUSE_* (значим только у UNSENT), plan_id — тот же
@@ -221,7 +227,8 @@ void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
  * «план применён», и превратить её в общую функцию с видом записи значило бы
  * получить два вызова, отличающиеся одним числом, там, где смысл разный. */
 void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
-                          uint8_t kind, uint8_t code, const uint8_t *plan_id);
+                          uint8_t kind, uint8_t code, const uint8_t *plan_id,
+                          const uint8_t *trial_id);
 
 /* Записи от старой к новой. i от 0 до d2k_journal_count()-1. */
 size_t               d2k_journal_count(const d2k_journal *j);

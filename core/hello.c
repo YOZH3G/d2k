@@ -117,6 +117,7 @@ typedef struct {
                         перечисленных в нём версий есть 0x0304 */
 
     int    have_sni;
+    size_t sni_ext_off;      /* начало расширения server_name */
     size_t sni_ext_len_off;  /* длина расширения server_name (2 байта) */
     size_t sni_list_len_off; /* длина ServerNameList (2 байта) */
     size_t sni_name_len_off; /* длина самого имени (2 байта) */
@@ -237,6 +238,7 @@ static void parse_hello(const uint8_t *b, size_t n, hello_layout *L) {
                         if (nt == SNI_HOST_NAME && nlen > 0) {
                             /* Пустое имя — не имя, как в tls.c. */
                             L->have_sni = 1;
+                            L->sni_ext_off = p;
                             L->sni_ext_len_off = p + 2;
                             L->sni_list_len_off = list_len_off;
                             L->sni_name_len_off = name_len_off;
@@ -474,6 +476,47 @@ int d2k_hello_rename(const uint8_t *ch, size_t n, const char *sni,
     }
     memcpy(out, spliced + 5, slen - 5);
     *out_len = slen - 5;
+    return 0;
+}
+
+int d2k_hello_without_sni(const uint8_t *ch, size_t n,
+                          uint8_t *out, size_t cap, size_t *out_len) {
+    if (!ch || !out || !out_len || n > 0xFFFF || n + 5 > TEMPLATE_MAX) {
+        return -1;
+    }
+    *out_len = 0;
+    uint8_t rec[TEMPLATE_MAX], stripped[TEMPLATE_MAX];
+    rec[0] = TLS_HANDSHAKE;
+    rec[1] = 0x03; rec[2] = 0x01;
+    wr16(rec + 3, (uint16_t)n);
+    memcpy(rec + 5, ch, n);
+
+    hello_layout L;
+    parse_hello(rec, n + 5, &L);
+    if (!L.parsed || !L.complete || L.exts_truncated || !L.have_exts ||
+        !L.have_sni) {
+        return -1;
+    }
+    size_t ext_len = (size_t)rd16(rec + L.sni_ext_len_off) + 4;
+    if (L.sni_ext_off + ext_len > n + 5 || ext_len > rd16(rec + L.exts_len_off) ||
+        ext_len > rd24(rec + L.hs_len_off) || ext_len > rd16(rec + L.rec_len_off)) {
+        return -1;
+    }
+    size_t new_len = n + 5 - ext_len;
+    if (new_len < 5 || new_len - 5 > cap) {
+        return -1;
+    }
+    memcpy(stripped, rec, L.sni_ext_off);
+    memcpy(stripped + L.sni_ext_off, rec + L.sni_ext_off + ext_len,
+           n + 5 - (L.sni_ext_off + ext_len));
+    wr16(stripped + L.exts_len_off,
+         (uint16_t)(rd16(rec + L.exts_len_off) - ext_len));
+    wr24(stripped + L.hs_len_off,
+         rd24(rec + L.hs_len_off) - (uint32_t)ext_len);
+    wr16(stripped + L.rec_len_off,
+         (uint16_t)(rd16(rec + L.rec_len_off) - ext_len));
+    memcpy(out, stripped + 5, new_len - 5);
+    *out_len = new_len - 5;
     return 0;
 }
 

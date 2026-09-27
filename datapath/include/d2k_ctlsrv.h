@@ -29,6 +29,7 @@
  * (internal/control/control.go) — оба обязаны совпадать, и это ловится
  * мостовым тестом (internal/control/bridge_test.go), а не сверкой на глаз. */
 #define D2K_KEY_WIRE_LEN 13
+#define D2K_ADDR_PROBE_FLOW_WIRE_LEN 13
 
 /* Контекст обслуживания команд. */
 typedef struct {

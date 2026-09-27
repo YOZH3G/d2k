@@ -62,6 +62,7 @@ NAME=${D2K_LAB_QUIC_NAME:-www.google.com}
 BOX=${D2K_LAB_QUIC_BOX:-first}
 QUEUE=2101
 MARK=0x2d
+PROBE_MARK=0x2e
 
 echo "== подготовка =="
 apt-get update -qq >/dev/null 2>&1
@@ -115,12 +116,12 @@ iptables -t mangle -A D2KD -p udp --dport 443 \
 iptables -t mangle -A INPUT -p udp --sport 443 \
     -m connbytes --connbytes 0:8 --connbytes-dir reply --connbytes-mode packets \
     -j NFQUEUE --queue-num 2102 --queue-bypass
-/tmp/d2kd --mode apply --control "$SOCK" --queue 2102 --mark 45 \
+/tmp/d2kd --mode apply --control "$SOCK" --queue 2102 --mark 45 --probe-mark "$PROBE_MARK" \
     --journal 400 --duration 300 > /tmp/d2kd.log 2>&1 &
 DPID=$!
 i=0; while [ ! -S "$SOCK" ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
 [ -S "$SOCK" ] || fail "датапат не открыл управляющий сокет"
-./core/d2kc --control "$SOCK" --catalog "$CAT" > /tmp/d2kc.log 2>&1 &
+./core/d2kc --control "$SOCK" --catalog "$CAT" --mark "$PROBE_MARK" > /tmp/d2kc.log 2>&1 &
 CPID=$!
 sleep 1
 for n in 1 2 3; do timeout 20 /tmp/quicping "$IP" "$NAME" >/dev/null 2>&1 || true; sleep 3; done

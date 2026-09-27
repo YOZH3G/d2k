@@ -457,8 +457,14 @@ static int plan_id_from_setname(uint16_t kind, const uint8_t *body, size_t len,
                                 uint8_t out[D2K_PLAN_ID_LEN]) {
     if (len < 1) { return -1; }
     if (kind != D2K_CMD_SET_NAME && kind != D2K_CMD_SET_NAME_PROBE) { return -1; }
-    size_t off = (size_t)2 + body[0] + 12 + 4;   /* +1 байт формы приветствия */
+    /* body = name_len(1) + name + shape(1) + [probe port(2)] +
+       plan header(12) + REC_ID header(4) + plan id.  The previous helper
+       started from 2 and then added shape once more, shifting the ID by one
+       byte; APPLIED was then treated as a foreign plan and every negative
+       question paid the full wait budget. */
+    size_t off = (size_t)1 + body[0] + 1;
     if (kind == D2K_CMD_SET_NAME_PROBE) { off += 2; } /* reserved probe port */
+    off += 12 + 4;
     if (off + D2K_PLAN_ID_LEN > len) { return -1; }
     memcpy(out, body + off, D2K_PLAN_ID_LEN);
     return 0;
@@ -556,8 +562,12 @@ static void send_exchange(int fd, const uint8_t *ip_a, uint16_t port_a,
 static void send_applied(int fd, const uint8_t *ip_a, uint16_t port_a,
                          const uint8_t *ip_b, uint16_t port_b,
                          uint8_t transport, const uint8_t plan_id[D2K_PLAN_ID_LEN]) {
+    /* Wire v3 appends the address-trial generation to APPLIED. These TCP
+       measurements are name probes, so their generation is the all-zero ID. */
+    uint8_t rest[D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN] = {0};
+    memcpy(rest, plan_id, D2K_PLAN_ID_LEN);
     send_event_frame(fd, D2K_EV_APPLIED, ip_a, port_a, ip_b, port_b, transport,
-                     plan_id, D2K_PLAN_ID_LEN);
+                     rest, sizeof rest);
 }
 
 static const uint8_t LOOPBACK4[4] = { 127, 0, 0, 1 };
@@ -1291,10 +1301,15 @@ int main(void) {
         peerstand ps;
         uint16_t target_port = peerstand_start(&ps);
 
-        int outcomes[] = { -1 }; /* своего обмена не будет никогда */
+        /* Первый собственный опыт молчит, чтобы рядом стоящее чужое событие
+           было единственным ответом этого раунда. Остальные четыре вопроса
+           тоже получают команды: отвечают без применения, иначе стенд
+           оборвётся после первого и оставит опрос ждать ACK до пяти секунд
+           на каждый оставшийся вопрос. */
+        int outcomes[] = { -1, 3, 3, 3, 3 };
         fakeend_args fa; memset(&fa, 0, sizeof fa);
         fa.fd = sv[1]; fa.ps = &ps; fa.target_port = target_port;
-        fa.outcomes = outcomes; fa.n = 1; fa.foreign_before_round = 0; /* чужое (с appdata) шлём */
+        fa.outcomes = outcomes; fa.n = 5; fa.foreign_before_round = 0; /* чужое (с appdata) шлём */
         pthread_t th;
         CHECK(pthread_create(&th, NULL, fakeend_run, &fa) == 0, "c1: поддельный конец связи не запустился");
 

@@ -8,6 +8,7 @@
  * QUIC в проекте был бы вторым экземпляром уже существующего (§2.5).
  */
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "d2k_hello.h"
 #include "d2k_quic.h"
@@ -16,6 +17,31 @@
 #include "d2k_tls13core.h"
 #include "d2k_crypto.h"
 #include "profiles/quic_probe.h"
+
+/* Go crypto/tls changes only the cipher-suite order when AES hardware is not
+ * available: the non-AES profile starts with TLS_CHACHA20_POLY1305_SHA256.
+ * QUIC Initial packet protection itself remains AES-128-GCM; this switch is
+ * solely about reproducing the donor ClientHello shape on such targets. */
+#ifndef D2K_QUIC_NON_AES_PROFILE
+# if defined(__mips__)
+#  define D2K_QUIC_NON_AES_PROFILE 1
+# else
+#  define D2K_QUIC_NON_AES_PROFILE 0
+# endif
+#endif
+
+static void select_probe_profile(uint8_t *profile, size_t len) {
+    memcpy(profile, d2k_quic_probe_profile, len);
+#if D2K_QUIC_NON_AES_PROFILE
+    /* ClientHello: cipher_suites vector starts at 39, length is six bytes;
+       donor's non-AES order is 1303, 1301, 1302. */
+    if (len >= 47 && profile[39] == 0 && profile[40] == 6) {
+        profile[41] = 0x13; profile[42] = 0x03;
+        profile[43] = 0x13; profile[44] = 0x01;
+        profile[45] = 0x13; profile[46] = 0x02;
+    }
+#endif
+}
 
 typedef char probe_profile_fields_fit[
     D2K_QUIC_PROFILE_RANDOM_OFF + 32 <= sizeof d2k_quic_probe_profile &&
@@ -108,7 +134,26 @@ static int prepare(const uint8_t *in, size_t n, const char *sni, int want_v2,
     if (d2k_quic_client_hello(in, n, ch, sizeof ch, &ch_len) != 0) {
         return -1;
     }
-    if (d2k_hello_rename(ch, ch_len, sni, ch2, D2K_QW_MAX_DGRAM, ch2_len) != 0) {
+    struct in_addr ip_target;
+    int is_ip_target = inet_pton(AF_INET, sni, &ip_target) == 1;
+    int rename_rc;
+    if (is_ip_target) {
+        size_t sni_off = 0, sni_len = 0;
+        if (d2k_hello_sni(ch, ch_len, &sni_off, &sni_len) == 0) {
+            rename_rc = d2k_hello_without_sni(ch, ch_len, ch2,
+                                              D2K_QW_MAX_DGRAM, ch2_len);
+        } else if (ch_len <= D2K_QW_MAX_DGRAM) {
+            memcpy(ch2, ch, ch_len);
+            *ch2_len = ch_len;
+            rename_rc = 0;
+        } else {
+            rename_rc = -1;
+        }
+    } else {
+        rename_rc = d2k_hello_rename(ch, ch_len, sni, ch2,
+                                     D2K_QW_MAX_DGRAM, ch2_len);
+    }
+    if (rename_rc != 0) {
         return -1;
     }
 
@@ -191,7 +236,7 @@ int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
     if (cap < INITIAL_MIN) { return -1; }
     uint8_t profile[sizeof d2k_quic_probe_profile], ch[D2K_QW_MAX_DGRAM];
     uint8_t dcid[8], scid[8], priv[32], sec[32];
-    memcpy(profile, d2k_quic_probe_profile, sizeof profile);
+    select_probe_profile(profile, sizeof profile);
     if (d2k_t13_random(dcid, sizeof dcid) != 0 ||
         d2k_t13_random(scid, sizeof scid) != 0 ||
         d2k_t13_random(profile + D2K_QUIC_PROFILE_RANDOM_OFF, 32) != 0 ||
@@ -201,7 +246,12 @@ int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
     if (rc != 0) { return -1; }
     memcpy(profile + D2K_QUIC_PROFILE_SCID_OFF, scid, sizeof scid);
     size_t ch_len = 0;
-    if (d2k_hello_rename(profile, sizeof profile, sni, ch, sizeof ch, &ch_len) != 0) {
+    struct in_addr ip_target;
+    int is_ip_target = inet_pton(AF_INET, sni, &ip_target) == 1;
+    int hello_rc = is_ip_target
+        ? d2k_hello_without_sni(profile, sizeof profile, ch, sizeof ch, &ch_len)
+        : d2k_hello_rename(profile, sizeof profile, sni, ch, sizeof ch, &ch_len);
+    if (hello_rc != 0) {
         return -1;
     }
     d2k_qw_keys k;

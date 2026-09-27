@@ -158,17 +158,21 @@ int main(void) {
         d2k_key k = mk(7);
         uint8_t id[D2K_PLAN_ID_LEN];
         for (size_t i = 0; i < sizeof id; i++) { id[i] = (uint8_t)(0xA0 + i); }
-        d2k_journal_add_applied(j, 42, &k, id);
+        uint8_t trial[D2K_TRIAL_ID_LEN];
+        memset(trial, 0xA5, sizeof trial);
+        d2k_journal_add_applied(j, 42, &k, id, trial);
         const d2k_jrn_entry *e = d2k_journal_at(j, 0);
         CHECK(e != NULL, "запись применения не легла в журнал");
         if (e) {
             CHECK(e->kind == D2K_JRN_PLAN_APPLIED, "вид записи не «план применён»");
             CHECK(memcmp(e->plan_id, id, sizeof id) == 0,
                   "идентификатор плана в журнале не тот, что положили");
+            CHECK(memcmp(e->trial_id, trial, sizeof trial) == 0,
+                  "trial ID в журнале не тот, что положили");
         }
         /* Плана без записи REC_ID разбор не запрещает: поле обязано остаться
            нулевым, а не мусором — это и означает «плану нечем представиться». */
-        d2k_journal_add_applied(j, 43, &k, NULL);
+        d2k_journal_add_applied(j, 43, &k, NULL, NULL);
         const d2k_jrn_entry *e2 = d2k_journal_at(j, 1);
         CHECK(e2 != NULL, "вторая запись применения не легла в журнал");
         if (e2) {
@@ -187,13 +191,13 @@ int main(void) {
         d2k_journal_add(NULL, 1, NULL, 0, 0, 0, NULL, NULL, 0, NULL);
         /* Хранить негде — записывать некуда, но и падать не на чем: у журнала
            нулевой глубины (и у отсутствующего) ячейки нет вовсе. */
-        d2k_journal_add_applied(NULL, 1, NULL, NULL);
+        d2k_journal_add_applied(NULL, 1, NULL, NULL, NULL);
         {
             d2k_journal *off = d2k_journal_new(0);
             d2k_key k0 = mk(9);
             uint8_t id0[D2K_PLAN_ID_LEN];
             memset(id0, 0x5A, sizeof id0);
-            d2k_journal_add_applied(off, 1, &k0, id0);
+            d2k_journal_add_applied(off, 1, &k0, id0, NULL);
             CHECK(d2k_journal_count(off) == 0, "в выключенный журнал легло применение");
             d2k_journal_free(off);
         }

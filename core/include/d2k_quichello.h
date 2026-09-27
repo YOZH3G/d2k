@@ -48,8 +48,10 @@
 
 /* Собственный измерительный Initial оригинала quicprobe.buildInitial.
  * Встроенный ClientHello — нормализованный выход donor crypto/tls Go 1.25.12
- * (AES-capable профиль). Случайные поля генерируются заново. Это PROFILE,
- * не снимок клиента; отдельный зонд подтверждения остаётся в quicconn.c. */
+ * (AES-capable профиль по умолчанию; для MIPS/`D2K_QUIC_NON_AES_PROFILE` порядок
+ * cipher suites совпадает с donor Go без AES). Случайные поля генерируются
+ * заново. Это PROFILE, не снимок клиента; отдельный зонд подтверждения остаётся
+ * в quicconn.c. */
 int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
                            size_t *out_len);
 

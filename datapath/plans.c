@@ -30,6 +30,14 @@ typedef struct {
     d2k_plan *plan;
 } entry;
 
+typedef struct {
+    uint8_t used;
+    d2k_addr_probe_flow flow;
+    uint8_t trial_id[D2K_TRIAL_ID_LEN];
+    uint64_t expires_ns;
+    d2k_plan *plan;
+} probe_entry;
+
 /* ИНВАРИАНТ УПЛОТНЕНИЯ, общий для всего файла: занятые записи всегда лежат
  * ПОДРЯД в v[0..used), свободные — в v[used..cap). Читают его find_name,
  * find_addr и oldest; держат — drop и take_free_or_evict, единственные, кто
@@ -63,6 +71,8 @@ struct d2k_plantab {
     entry *v;
     size_t cap;
     size_t used;
+    probe_entry *probes;
+    size_t probe_used;
 };
 
 d2k_plantab *d2k_plantab_new(size_t cap) {
@@ -74,7 +84,10 @@ d2k_plantab *d2k_plantab_new(size_t cap) {
         return NULL;
     }
     t->v = calloc(cap, sizeof *t->v);
-    if (!t->v) {
+    t->probes = calloc(cap, sizeof *t->probes);
+    if (!t->v || !t->probes) {
+        free(t->probes);
+        free(t->v);
         free(t);
         return NULL;
     }
@@ -93,7 +106,9 @@ void d2k_plantab_free(d2k_plantab *t) {
        нельзя позволить поиску на пакетном пути. */
     for (size_t i = 0; i < t->cap; i++) {
         d2k_plan_free(t->v[i].plan);
+        d2k_plan_free(t->probes[i].plan);
     }
+    free(t->probes);
     free(t->v);
     free(t);
 }
@@ -384,8 +399,147 @@ int d2k_plantab_del_name(d2k_plantab *t, const uint8_t *name, size_t len) {
     return n > 0;
 }
 
+int d2k_plantab_del_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
+                               uint8_t shape, uint16_t sport_be) {
+    if (!t || !name || len == 0 || sport_be == 0) { return 0; }
+    int n = 0;
+    for (size_t i = 0; i < t->used;) {
+        entry *e = &t->v[i];
+        if (e->kind == KEY_NAME && e->only_sport == sport_be &&
+            e->shape == shape && name_eq(e->name, e->name_len, name, len)) {
+            (void)drop(t, e);
+            n++;
+            continue; /* drop() compacted the last entry into slot i */
+        }
+        i++;
+    }
+    return n > 0;
+}
+
 int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be) {
     return t ? drop(t, find_addr(t, addr_be)) : 0;
+}
+
+static int trial_id_valid(const uint8_t id[D2K_TRIAL_ID_LEN]) {
+    if (!id) { return 0; }
+    uint8_t any = 0;
+    for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any |= id[i]; }
+    return any != 0;
+}
+
+static int probe_flow_valid(const d2k_addr_probe_flow *f) {
+    if (!f || f->transport != 17 || f->src_port_be == 0 || f->dst_port_be == 0) {
+        return 0;
+    }
+    uint8_t src = 0, dst = 0;
+    for (size_t i = 0; i < sizeof f->src_ip4; i++) {
+        src |= f->src_ip4[i];
+        dst |= f->dst_ip4[i];
+    }
+    return src != 0 && dst != 0;
+}
+
+static int probe_flow_equal(const d2k_addr_probe_flow *a,
+                            const d2k_addr_probe_flow *b) {
+    return a->transport == b->transport &&
+           a->src_port_be == b->src_port_be && a->dst_port_be == b->dst_port_be &&
+           memcmp(a->src_ip4, b->src_ip4, sizeof a->src_ip4) == 0 &&
+           memcmp(a->dst_ip4, b->dst_ip4, sizeof a->dst_ip4) == 0;
+}
+
+static void probe_drop(d2k_plantab *t, probe_entry *e) {
+    if (!t || !e || !e->used) { return; }
+    d2k_plan_free(e->plan);
+    memset(e, 0, sizeof *e);
+    t->probe_used--;
+    t->revision++;
+}
+
+int d2k_plantab_set_addr_probe(d2k_plantab *t,
+                               const d2k_addr_probe_flow *flow,
+                               const uint8_t trial_id[D2K_TRIAL_ID_LEN],
+                               uint64_t now_ns, uint64_t expires_ns,
+                               d2k_plan *p) {
+    if (!t || !probe_flow_valid(flow) || !trial_id_valid(trial_id) || !p ||
+        expires_ns <= now_ns) {
+        d2k_plan_free(p);
+        return -2;
+    }
+    probe_entry *free_slot = NULL;
+    for (size_t i = 0; i < t->cap; i++) {
+        probe_entry *e = &t->probes[i];
+        if (!e->used) {
+            if (!free_slot) { free_slot = e; }
+            continue;
+        }
+        if (e->expires_ns <= now_ns) {
+            probe_drop(t, e);
+            if (!free_slot) { free_slot = e; }
+            continue;
+        }
+        if (!probe_flow_equal(&e->flow, flow)) { continue; }
+        if (memcmp(e->trial_id, trial_id, D2K_TRIAL_ID_LEN) != 0) {
+            d2k_plan_free(p);
+            return -3;
+        }
+        d2k_plan_free(e->plan);
+        e->plan = p;
+        e->expires_ns = expires_ns;
+        t->revision++;
+        return 0;
+    }
+    if (!free_slot) {
+        d2k_plan_free(p);
+        return -1;
+    }
+    free_slot->used = 1;
+    free_slot->flow = *flow;
+    memcpy(free_slot->trial_id, trial_id, D2K_TRIAL_ID_LEN);
+    free_slot->expires_ns = expires_ns;
+    free_slot->plan = p;
+    t->probe_used++;
+    t->revision++;
+    return 0;
+}
+
+int d2k_plantab_del_addr_probe(d2k_plantab *t,
+                               const d2k_addr_probe_flow *flow,
+                               const uint8_t trial_id[D2K_TRIAL_ID_LEN]) {
+    if (!t || !probe_flow_valid(flow) || !trial_id_valid(trial_id)) { return 0; }
+    for (size_t i = 0; i < t->cap; i++) {
+        probe_entry *e = &t->probes[i];
+        if (e->used && probe_flow_equal(&e->flow, flow) &&
+            memcmp(e->trial_id, trial_id, D2K_TRIAL_ID_LEN) == 0) {
+            probe_drop(t, e);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+const d2k_plan *d2k_plantab_find_addr_probe(
+    d2k_plantab *t, const d2k_addr_probe_flow *flow, uint64_t now_ns,
+    uint8_t trial_id_out[D2K_TRIAL_ID_LEN]) {
+    if (!t || !probe_flow_valid(flow)) { return NULL; }
+    for (size_t i = 0; i < t->cap; i++) {
+        probe_entry *e = &t->probes[i];
+        if (!e->used) { continue; }
+        if (e->expires_ns <= now_ns) {
+            probe_drop(t, e);
+            continue;
+        }
+        if (probe_flow_equal(&e->flow, flow)) {
+            if (trial_id_out) {
+                memcpy(trial_id_out, e->trial_id, D2K_TRIAL_ID_LEN);
+            }
+            return e->plan;
+        }
+    }
+    return NULL;
+}
+
+size_t d2k_plantab_probe_count(const d2k_plantab *t) {
+    return t ? t->probe_used : 0;
 }
 
 /* Подходит ли запись наблюдаемой форме приветствия — ТРИ НАЗВАННЫХ ИСХОДА,

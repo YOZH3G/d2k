@@ -39,6 +39,15 @@ d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
     original_wire wire={.port=port,.wait_ms=wait_ms,.mark=mark};
     if(d2k_quic_sni(trigger.bytes,trigger.len,wire.target_sni,sizeof wire.target_sni)!=0) {
         wire.target_sni[0]='\0';
+        /* У буквальной IP-цели donor ClientHello не содержит SNI, но askArms
+           всё равно строит каждый Initial для host. pool[0] — именно
+           закреплённый исходный IP (не rotated spare и не SNI контроля). */
+        if(ctx && ctx->pool && ctx->n_pool > 0) {
+            struct in_addr target_ip;
+            if(inet_pton(AF_INET,ctx->pool[0],&target_ip)==1) {
+                snprintf(wire.target_sni,sizeof wire.target_sni,"%s",ctx->pool[0]);
+            }
+        }
     }
     if(control.bytes && control.len) {
         if(d2k_quic_sni(control.bytes,control.len,wire.control_sni,sizeof wire.control_sni)!=0) {

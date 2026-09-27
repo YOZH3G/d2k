@@ -104,16 +104,28 @@ static void frame(uint8_t *o, uint16_t type, const uint8_t *body, size_t len) {
  * что read() одним вызовом на весь кадр — не подгонка под этот тест, а свойство
  * формата. Возвращает 1, если прочитан целый и это действительно ACK. */
 static int read_ack(int fd, uint16_t *cmd, int *ok, uint8_t *reason) {
-    uint8_t buf[6 + D2K_KEY_WIRE_LEN + 2 + 1 + 1];
-    ssize_t n = read(fd, buf, sizeof buf);
-    if (n != (ssize_t)sizeof buf) {
+    uint8_t hdr[6], body[128];
+    size_t got = 0;
+    while (got < sizeof hdr) {
+        ssize_t n = read(fd, hdr + got, sizeof hdr - got);
+        if (n > 0) { got += (size_t)n; continue; }
         return 0;
     }
-    uint16_t type = (uint16_t)((buf[4] << 8) | buf[5]);
+    uint32_t frame_len = (uint32_t)hdr[0] << 24 | (uint32_t)hdr[1] << 16 |
+                         (uint32_t)hdr[2] << 8 | hdr[3];
+    if (frame_len < 2 || frame_len - 2 > sizeof body) { return 0; }
+    size_t body_len = frame_len - 2;
+    got = 0;
+    while (got < body_len) {
+        ssize_t n = read(fd, body + got, body_len - got);
+        if (n > 0) { got += (size_t)n; continue; }
+        return 0;
+    }
+    uint16_t type = (uint16_t)((hdr[4] << 8) | hdr[5]);
     if (type != D2K_EV_ACK) {
         return 0;
     }
-    const uint8_t *body = buf + 6;
+    if (body_len < D2K_KEY_WIRE_LEN + 4) { return 0; }
     *cmd = (uint16_t)((body[D2K_KEY_WIRE_LEN] << 8) | body[D2K_KEY_WIRE_LEN + 1]);
     *ok = body[D2K_KEY_WIRE_LEN + 2];
     *reason = body[D2K_KEY_WIRE_LEN + 3];
@@ -550,10 +562,134 @@ int main(void) {
             CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "годная команда не разобралась");
             d2k_ctl_flush(c);
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            ok = 0;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на годную команду не пришёл");
             CHECK(cmd == D2K_CMD_SET_NAME, "ack не на ту команду");
             CHECK(ok == 1, "годная команда отвергнута");
             CHECK(reason == D2K_ACK_OK, "у успеха причина не D2K_ACK_OK");
+        }
+
+        /* Точная очистка пробного имени не должна удалять подтверждённую
+           запись той же цели. */
+        {
+            const char *nm = "ok.example";
+            uint8_t body[96], f[112];
+            size_t nl = strlen(nm), o = 0;
+            body[o++] = (uint8_t)nl; memcpy(body + o, nm, nl); o += nl;
+            body[o++] = D2K_PLAN_SHAPE_QUIC;
+            body[o++] = 0x9c; body[o++] = 0x40; /* port 40000 */
+            memcpy(body + o, tiny, sizeof tiny); o += sizeof tiny;
+            frame(f, D2K_CMD_SET_NAME_PROBE, body, o);
+            CHECK(write(cli, f, 6 + o) == (ssize_t)(6 + o), "SET_NAME_PROBE для удаления не отправилась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "SET_NAME_PROBE для удаления не разобралась");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
+                  "SET_NAME_PROBE для удаления не принялась");
+            o = 0; body[o++] = (uint8_t)nl; memcpy(body + o, nm, nl); o += nl;
+            body[o++] = D2K_PLAN_SHAPE_QUIC; body[o++] = 0x9c; body[o++] = 0x40;
+            frame(f, D2K_CMD_DEL_NAME_PROBE, body, o);
+            CHECK(write(cli, f, 6 + o) == (ssize_t)(6 + o), "DEL_NAME_PROBE не отправилась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "DEL_NAME_PROBE не разобралась");
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
+                  "DEL_NAME_PROBE не получила ACK");
+            d2k_plantab *tab = d2k_session_plans(sess);
+            CHECK(d2k_plantab_find(tab, (const uint8_t *)nm, nl, 0, cx.now_ns,
+                                   D2K_PLAN_SHAPE_QUIC) != NULL,
+                  "DEL_NAME_PROBE задела подтверждённый SET_NAME");
+        }
+
+        /* Адресная проба передаёт полный 5-tuple и поколение отдельно от
+           Plan ID. DELETE старого поколения не должен снимать активную. */
+        {
+            uint8_t body[128], f[160], trial[D2K_TRIAL_ID_LEN];
+            memset(trial, 0, sizeof trial);
+            for (size_t i = 0; i < sizeof trial; i++) { trial[i] = (uint8_t)(i + 1); }
+            const uint8_t flow_wire[13] = {
+                192, 0, 2, 10, 0x9c, 0x40,
+                203, 0, 113, 7, 0x01, 0xbb, 17
+            };
+            /* Invalid transport and zero generation must reject before the
+               temporary table changes. The ACK echoes the address-trial ID. */
+            memcpy(body, flow_wire, sizeof flow_wire);
+            body[12] = 6;
+            memcpy(body + 13, trial, sizeof trial);
+            body[29] = 0; body[30] = 0; body[31] = 0xea; body[32] = 0x60;
+            memcpy(body + 33, tiny, sizeof tiny);
+            frame(f, 0x0089u, body, 33 + sizeof tiny);
+            CHECK(write(cli, f, 6 + 33 + sizeof tiny) == (ssize_t)(6 + 33 + sizeof tiny),
+                  "SET_ADDR_PROBE с неверным transport не отправилась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
+                  "SET_ADDR_PROBE с неверным transport не разобралась");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 1; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && cmd == 0x0089u &&
+                  ok == 0 && reason == D2K_ACK_BAD_ARGS,
+                  "неверный transport адресной пробы не получил BAD_ARGS");
+
+            memcpy(body, flow_wire, sizeof flow_wire);
+            memset(body + 13, 0, D2K_TRIAL_ID_LEN);
+            body[29] = 0; body[30] = 0; body[31] = 0xea; body[32] = 0x60;
+            memcpy(body + 33, tiny, sizeof tiny);
+            frame(f, 0x0089u, body, 33 + sizeof tiny);
+            CHECK(write(cli, f, 6 + 33 + sizeof tiny) == (ssize_t)(6 + 33 + sizeof tiny),
+                  "SET_ADDR_PROBE с нулевым trial ID не отправилась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
+                  "SET_ADDR_PROBE с нулевым trial ID не разобралась");
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 0 &&
+                  reason == D2K_ACK_BAD_ARGS,
+                  "нулевой trial ID адресной пробы не получил BAD_ARGS");
+
+            memcpy(body, flow_wire, sizeof flow_wire);
+            memcpy(body + 13, trial, sizeof trial);
+            body[29] = 0; body[30] = 0; body[31] = 0xea; body[32] = 0x60;
+            memcpy(body + 33, tiny, sizeof tiny);
+            size_t blen = 33 + sizeof tiny;
+            frame(f, 0x0089u, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen),
+                  "адресная проба не отправилась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
+                  "SET_ADDR_PROBE не разобралась");
+            d2k_ctl_flush(c);
+            ok = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && cmd == 0x0089u && ok == 1,
+                  "валидная SET_ADDR_PROBE не подтвердилась");
+            d2k_addr_probe_flow flow = {
+                .src_ip4 = {192, 0, 2, 10}, .src_port_be = 0x409c,
+                .dst_ip4 = {203, 0, 113, 7}, .dst_port_be = 0xbb01,
+                .transport = 17
+            };
+            uint8_t seen[D2K_TRIAL_ID_LEN] = {0};
+            d2k_plantab *tab = d2k_session_plans(sess);
+            CHECK(d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, seen) != NULL &&
+                  memcmp(seen, trial, sizeof seen) == 0,
+                  "разобранный SET_ADDR_PROBE потерял flow/generation");
+
+            memcpy(body, flow_wire, sizeof flow_wire);
+            memcpy(body + 13, trial, sizeof trial);
+            body[13] ^= 0xff;
+            frame(f, 0x008au, body, 29);
+            CHECK(write(cli, f, 35) == 35, "stale DEL_ADDR_PROBE не отправилась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
+                  "stale DEL_ADDR_PROBE не разобралась");
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
+                  "stale delete не получил идемпотентный ACK");
+            CHECK(d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, NULL) != NULL,
+                  "stale delete снял probe другого поколения");
+
+            memcpy(body, flow_wire, sizeof flow_wire);
+            memcpy(body + 13, trial, sizeof trial);
+            frame(f, 0x008au, body, 29);
+            CHECK(write(cli, f, 35) == 35, "точный DEL_ADDR_PROBE не отправилась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
+                  "точный DEL_ADDR_PROBE не разобралась");
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1 &&
+                  d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, NULL) == NULL,
+                  "точный delete не удалил только свой probe");
         }
 
         /* Байты плана не разбираются: ack ok=0, причина D2K_ACK_BAD_PLAN —
@@ -861,11 +997,14 @@ int main(void) {
                 continue;
             }
             found = 1;
-            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 16),
-                  "тело APPLIED не «ключ + 16 байт идентификатора»");
-            if (n == (ssize_t)(D2K_KEY_WIRE_LEN + 16)) {
+            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN),
+                  "тело APPLIED не содержит Plan ID и trial ID фиксированной ширины");
+            if (n == (ssize_t)(D2K_KEY_WIRE_LEN + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN)) {
                 CHECK(memcmp(ev + D2K_KEY_WIRE_LEN, want_id, sizeof want_id) == 0,
                       "идентификатор на проводе не тот, что приехал записью REC_ID");
+                CHECK(memcmp(ev + D2K_KEY_WIRE_LEN + D2K_PLAN_ID_LEN,
+                             (uint8_t[D2K_TRIAL_ID_LEN]){0}, D2K_TRIAL_ID_LEN) == 0,
+                      "обычный план неожиданно получил trial ID");
             }
         }
         CHECK(found, "события применения не пришло вовсе");
@@ -971,8 +1110,8 @@ int main(void) {
             if (type != D2K_EV_REFUSED) {
                 continue;
             }
-            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 1) || n == (ssize_t)(D2K_KEY_WIRE_LEN + 17),
-                  "тело REFUSED не «ключ + код причины»");
+            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 1 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN),
+                  "тело REFUSED не содержит код, Plan ID и trial ID");
             if (n < (ssize_t)(D2K_KEY_WIRE_LEN + 1)) {
                 continue;
             }
@@ -984,8 +1123,8 @@ int main(void) {
                 seen_damaged = 1;
                 /* Идентичность обязана доехать: без неё повреждение нельзя
                    приписать ни попытке, ни плану. */
-                CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 17),
-                      "повреждение приехало без идентификатора плана");
+                CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 1 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN),
+                      "повреждение приехало без Plan ID/trial ID");
                 int nonzero = 0;
                 for (int b = 0; b < 16; b++) {
                     if (ev[D2K_KEY_WIRE_LEN + 1 + b]) { nonzero = 1; }

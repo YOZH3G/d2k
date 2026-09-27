@@ -50,7 +50,7 @@ if [ "$D2K_LINUX" != 0 ]; then
     }
     build_c "${D2K_ZIG:-zig}" cc -target aarch64-linux-musl
 else
-    build_c ${CC:-cc}
+    build_c "${CC:-cc}"
 fi
 cd "$D2K_TMP"
 if [ "$D2K_LINUX" != 0 ]; then

@@ -955,13 +955,32 @@ fail:
 #endif
 }
 
+/* Donor probe.go:neutralName — a fresh random z<10 hex>.example.com for
+   every control repetition. The fixed-size name lets the captured SNI be
+   replaced without changing the client's otherwise measured TLS profile. */
+static int qp_neutral_control_sni(char out[24]) {
+    static const char hex[] = "0123456789abcdef";
+    uint8_t random[5];
+    if (!out || d2k_t13_random(random, sizeof random) != 0) {
+        return -1;
+    }
+    out[0] = 'z';
+    for (size_t i = 0; i < sizeof random; i++) {
+        out[1 + i * 2] = hex[random[i] >> 4];
+        out[2 + i * 2] = hex[random[i] & 0x0f];
+    }
+    memcpy(out + 11, ".example.com", sizeof ".example.com");
+    return 0;
+}
+
 static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                               const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
                               int prefix_copies, int src_port, const char *split_sni,
                               d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                               int repeats, uint32_t *rtt_ms_out, int *refused_out,
                               int *sent_out, uint8_t *ttl_in_out, qp_verify_fn verify,
-                              const d2k_ipfrag_plan *fragment, const char *fresh_sni) {
+                              const d2k_ipfrag_plan *fragment, const char *fresh_sni,
+                              int neutral_control) {
     d2k_tally t;
     memset(&t, 0, sizeof t);
     t.marked = 1;
@@ -1055,6 +1074,22 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                 sent[i].len = clen;
             } else {
                 sent[i] = (d2k_hello){NULL,0};
+            }
+        } else if (neutral_control) {
+            char neutral_sni[24];
+            /* Donor probe.go builds a fresh Initial for every neutral control
+               repetition.  Re-encrypting the captured packet here used the
+               generic snapshot builder, which recomputed PNLen=1 for PN=0;
+               donor buildInitial uses PNLen=4 and the loopback oracle rejects
+               the former as a malformed measurement. */
+            if (qp_neutral_control_sni(neutral_sni) == 0 &&
+                d2k_quic_probe_initial(neutral_sni, copies[i], COPY_CAP, &clen) == 0) {
+                sent[i].bytes = copies[i];
+                sent[i].len = clen;
+            } else {
+                /* A failed rebuild is a local unsent attempt, never a replay
+                   of the stale/fixed control name. */
+                sent[i] = (d2k_hello){NULL, 0};
             }
         } else if (split_sni) {
             /* ПАРА ДАТАГРАММ СОБИРАЕТСЯ НА КАЖДУЮ ПОПЫТКУ ЦЕЛИКОМ, а не
@@ -1238,7 +1273,7 @@ static d2k_tally quic_fragment(const char *addr,uint16_t port,int shape,d2k_hell
         return t;
     }
     return quic_ask_ex(addr,port,NULL,0,0,1,0,NULL,msg,wait_ms,mark,repeats,
-        NULL,NULL,sent_out,NULL,qp_verify_aead,&p,NULL);
+        NULL,NULL,sent_out,NULL,qp_verify_aead,&p,NULL,0);
 }
 d2k_quic_fragment_fn d2k_quic_fragment_hook=quic_fragment;
 
@@ -1271,7 +1306,7 @@ static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
     d2k_hello no_snapshot={NULL,0};
     return quic_ask_ex(q->addr,port,prefix,prefix_len,ttl,copies,0,NULL,
         no_snapshot,wait_ms,mark,D2K_QUIC_REPEATS,NULL,NULL,sent_out,NULL,
-        qp_verify_aead,fragment,sni);
+        qp_verify_aead,fragment,sni,0);
 }
 d2k_quic_ask_arm_fn d2k_quic_ask_arm_hook=quic_ask_arm;
 
@@ -1281,7 +1316,7 @@ static d2k_tally quic_ask(const char *addr, uint16_t port,
                            int repeats, uint32_t *rtt_ms_out, int *refused_out, int *sent_out,
                            uint8_t *ttl_in_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, 0, 1, 0, NULL, msg, wait_ms, mark,
-                        repeats, rtt_ms_out, refused_out, sent_out, ttl_in_out, qp_verify_aead, NULL,NULL);
+                        repeats, rtt_ms_out, refused_out, sent_out, ttl_in_out, qp_verify_aead, NULL,NULL,0);
 }
 
 /* Живость через согласование версии — та же дисциплина ПОВТОРОВ, метки и
@@ -1306,7 +1341,7 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
     msg.bytes = (tlen > 0) ? trig_buf : NULL;
     msg.len = tlen;
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, NULL, msg, wait_ms, mark,
-                        D2K_QUIC_REPEATS, NULL, NULL, sent_out, NULL, qp_verify_vn, NULL,NULL);
+                        D2K_QUIC_REPEATS, NULL, NULL, sent_out, NULL, qp_verify_vn, NULL,NULL,0);
 }
 
 /* Задача 6: как quic_ask (умолчание d2k_quic_ask_hook), но с TTL приманки —
@@ -1318,7 +1353,7 @@ static d2k_tally quic_ask_ttl(const char *addr, uint16_t port, const uint8_t *pr
                                int prefix_ttl, d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, prefix_ttl, 1, 0, NULL, msg, wait_ms,
-                        mark, repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL);
+                        mark, repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL,0);
 }
 d2k_quic_ask_ttl_fn d2k_quic_ask_ttl_hook = quic_ask_ttl;
 
@@ -1336,7 +1371,7 @@ static d2k_tally quic_ask_copies(const char *addr, uint16_t port,
                                   int copies, d2k_hello msg, uint32_t wait_ms,
                                   uint32_t mark, int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, 0, copies, 0, NULL, msg, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL,0);
 }
 d2k_quic_ask_copies_fn d2k_quic_ask_copies_hook = quic_ask_copies;
 
@@ -1347,7 +1382,7 @@ static d2k_tally quic_ask_srcport(const char *addr, uint16_t port, int src_port,
                                    d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                    int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, src_port, NULL, msg, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL,0);
 }
 d2k_quic_ask_srcport_fn d2k_quic_ask_srcport_hook = quic_ask_srcport;
 
@@ -1358,7 +1393,7 @@ static d2k_tally quic_ask_split(const char *addr, uint16_t port, d2k_hello snap,
                                  const char *sni, uint32_t wait_ms, uint32_t mark,
                                  int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, sni, snap, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL,NULL,0);
 }
 d2k_quic_ask_split_fn d2k_quic_ask_split_hook = quic_ask_split;
 
@@ -1370,6 +1405,17 @@ d2k_quic_ask_split_fn d2k_quic_ask_split_hook = quic_ask_split;
 int d2k_quic_allow_local;
 
 d2k_quic_ask_fn d2k_quic_ask_hook = quic_ask;
+
+static d2k_tally quic_ask_control(const char *addr, uint16_t port,
+                                  const uint8_t *prefix, size_t prefix_len,
+                                  d2k_hello msg, uint32_t wait_ms, uint32_t mark,
+                                  int repeats, uint32_t *rtt_ms_out, int *refused_out,
+                                  int *sent_out, uint8_t *ttl_in_out) {
+    return quic_ask_ex(addr, port, prefix, prefix_len, 0, 1, 0, NULL, msg,
+                       wait_ms, mark, repeats, rtt_ms_out, refused_out, sent_out,
+                       ttl_in_out, qp_verify_aead, NULL, NULL, 1);
+}
+d2k_quic_ask_fn d2k_quic_ask_control_hook = quic_ask_control;
 
 /* ---------------------------------------------------------------------
  * Дерево вопросов.
@@ -1755,7 +1801,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
         uint8_t ttl_in = 0;
         int refused = 0;
         int base_sent = 0;
-        d2k_tally base_ctl = d2k_quic_ask_hook(pool[0], port, NULL, 0, control, d2k_quic_wait_ms,
+        d2k_tally base_ctl = d2k_quic_ask_control_hook(pool[0], port, NULL, 0, control, d2k_quic_wait_ms,
                                                 mark, D2K_QUIC_REPEATS, &rtt_ms, &refused, &base_sent, &ttl_in);
         r.probes += base_sent; /* сколько реально ушло на провод, не pass+fail (находка 4 ревью, круг 5) */
         if (!base_ctl.marked) {
@@ -1914,7 +1960,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                 } else {
                     nap_us(D2K_QUIC_GAP_US); /* §7: пауза между вопросами по той же тройке */
                     int same_sent = 0;
-                    d2k_tally same = d2k_quic_ask_hook(pool[0], port, NULL, 0, control, dyn_wait, mark,
+                    d2k_tally same = d2k_quic_ask_control_hook(pool[0], port, NULL, 0, control, dyn_wait, mark,
                                                         D2K_QUIC_REPEATS, NULL, NULL, &same_sent, NULL);
                     r.probes += same_sent; /* сколько реально ушло на провод (находка 4 ревью, круг 5) */
                     if (!same.marked) {

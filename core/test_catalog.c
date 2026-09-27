@@ -589,10 +589,16 @@ int main(void) {
         CHECK(d2k_catalog_load("testdata/catalog-real.json", &c, err, sizeof err) == 0, "загрузка");
         CHECK(c.n_boxes > 0 && c.boxes[0].n_binds > 0, "нечего помечать");
         c.boxes[0].binds[0].transport = 17;
+        snprintf(c.boxes[0].binds[0].kind, sizeof c.boxes[0].binds[0].kind, "addr");
+        snprintf(c.boxes[0].binds[0].target, sizeof c.boxes[0].binds[0].target,
+                 "203.0.113.7");
         CHECK(d2k_catalog_save(&c, "/tmp/d2k-cat-tr.json", err, sizeof err) == 0, "запись");
         d2k_catalog_free(&c);
         CHECK(d2k_catalog_load("/tmp/d2k-cat-tr.json", &c, err, sizeof err) == 0, "перечитывание");
         CHECK(c.boxes[0].binds[0].transport == 17, "транспорт потерялся при круговом обходе");
+        CHECK(strcmp(c.boxes[0].binds[0].kind, "addr") == 0 &&
+              strcmp(c.boxes[0].binds[0].target, "203.0.113.7") == 0,
+              "kind=addr/IPv4 target потерялись при круговом обходе");
         d2k_catalog_free(&c);
     }
     /* --- битый ввод отвергается, а не разбирается наполовину --------------- */

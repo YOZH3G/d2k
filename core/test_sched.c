@@ -79,10 +79,15 @@ static int tcp_owns_search;
 static int tcp_found_arm;
 static size_t tcp_last_wire;
 static d2k_verdict quic_answer = D2K_V_OPAQUE;
-static char tcp_last_ip[64], quic_last_sni[256];
+static char tcp_last_ip[64], quic_last_sni[256], quic_last_ip[64];
+static uint8_t quic_seen_triggers[2][2048];
+static size_t quic_seen_trigger_lens[2];
+static char quic_seen_ips[2][64], quic_seen_snis[2][256];
+static char quic_seen_targets[2][256], quic_seen_controls[2][256];
 static pthread_mutex_t snapshot_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t snapshot_cv = PTHREAD_COND_INITIALIZER;
 static int snapshot_enabled, snapshot_entered, snapshot_release, snapshot_ok;
+static int ver_snapshot_enabled, ver_snapshot_entered, ver_snapshot_release;
 
 static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
     d2k_voice_res r;
@@ -176,9 +181,11 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
    движется сама, без пользователя. */
 static int ver_calls;
 static int ver_fail_first;
+static int ver_app_after_tcp_search;
 static uint8_t ver_last_transport;
 static d2k_ver_level ver_answer = D2K_VER_APPLICATION;
 static uint16_t ver_answer_port;
+static uint8_t ver_local_ip4[4] = {192, 168, 1, 67};
 
 /* Подменённый подбор плеча QUIC: настоящий ходит в сеть десятками опытов, а
    тест обязан утверждать поведение планировщика, не выходя наружу. */
@@ -252,12 +259,21 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
     /* Сокета нет вовсе: ver_close планировщика на отрицательном дескрипторе
        ничего не закрывает, и чужой дескриптор тест не теряет. */
     r.fd = -1;
-    r.level = (ver_calls <= ver_fail_first) ? D2K_VER_HANDSHAKE : ver_answer;
+    r.level = (ver_calls <= ver_fail_first ||
+               (ver_app_after_tcp_search && tcp_calls == 0))
+                  ? D2K_VER_HANDSHAKE : ver_answer;
     r.status = (r.level == D2K_VER_APPLICATION) ? 200 : 0;
     /* Тот же местный конец, что в ключах событий этого теста (ev_hello). */
-    r.local_ip4[0] = 192; r.local_ip4[1] = 168; r.local_ip4[2] = 1; r.local_ip4[3] = 67;
+    memcpy(r.local_ip4, ver_local_ip4, sizeof r.local_ip4);
     r.local_port = ver_answer_port;
     snprintf(r.reason, sizeof r.reason, "подменённый зонд");
+    if (ver_snapshot_enabled) {
+        pthread_mutex_lock(&snapshot_mu);
+        ver_snapshot_entered = 1;
+        pthread_cond_broadcast(&snapshot_cv);
+        while (!ver_snapshot_release) { pthread_cond_wait(&snapshot_cv, &snapshot_mu); }
+        pthread_mutex_unlock(&snapshot_mu);
+    }
     return r;
 }
 
@@ -267,9 +283,14 @@ static char quic_last_ctl[256];
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
                           d2k_hello trigger, d2k_hello control, uint32_t mark,
                           d2k_quic_arm *arm) {
-    (void)ip; (void)port; (void)mark;
-    quic_calls++;
+    (void)port; (void)mark;
+    int call_index = quic_calls++;
+    if (call_index < 2 && trigger.bytes && trigger.len <= sizeof quic_seen_triggers[0]) {
+        memcpy(quic_seen_triggers[call_index], trigger.bytes, trigger.len);
+        quic_seen_trigger_lens[call_index] = trigger.len;
+    }
     snprintf(quic_last_sni, sizeof quic_last_sni, "%s", sni ? sni : "");
+    snprintf(quic_last_ip, sizeof quic_last_ip, "%s", ip ? ip : "");
     /* Чем именно позвали мерить — разбираем ТЕМ ЖЕ разбором, что и коробка.
        Без этого «вопросник вызван» ничего не значит: ему могли подсунуть
        TLS-приветствие, и стенд не заметил бы. */
@@ -277,11 +298,35 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
     quic_last_ctl[0] = '\0';
     if (trigger.bytes && trigger.len &&
         d2k_quic_sni(trigger.bytes, trigger.len, quic_last_trig, sizeof quic_last_trig) != 0) {
-        snprintf(quic_last_trig, sizeof quic_last_trig, "<не QUIC>");
+        uint8_t ch[2048]; size_t ch_len = 0;
+        snprintf(quic_last_trig, sizeof quic_last_trig, "%s",
+                 d2k_quic_client_hello(trigger.bytes, trigger.len, ch, sizeof ch, &ch_len) == 0
+                    ? "<без SNI>" : "<не QUIC>");
     }
     if (control.bytes && control.len &&
         d2k_quic_sni(control.bytes, control.len, quic_last_ctl, sizeof quic_last_ctl) != 0) {
-        snprintf(quic_last_ctl, sizeof quic_last_ctl, "<не QUIC>");
+        uint8_t ch[2048]; size_t ch_len = 0;
+        snprintf(quic_last_ctl, sizeof quic_last_ctl, "%s",
+                 d2k_quic_client_hello(control.bytes, control.len, ch, sizeof ch, &ch_len) == 0
+                    ? "<без SNI>" : "<не QUIC>");
+    }
+    if (call_index < 2) {
+        snprintf(quic_seen_ips[call_index], sizeof quic_seen_ips[call_index], "%s", ip ? ip : "");
+        snprintf(quic_seen_snis[call_index], sizeof quic_seen_snis[call_index], "%s", sni ? sni : "");
+        snprintf(quic_seen_targets[call_index], sizeof quic_seen_targets[call_index], "%s", quic_last_trig);
+        snprintf(quic_seen_controls[call_index], sizeof quic_seen_controls[call_index], "%s", quic_last_ctl);
+    }
+    if (snapshot_enabled) {
+        uint8_t before[2048];
+        size_t before_len = trigger.len <= sizeof before ? trigger.len : sizeof before;
+        if (trigger.bytes && before_len) { memcpy(before, trigger.bytes, before_len); }
+        pthread_mutex_lock(&snapshot_mu);
+        snapshot_entered = 1;
+        pthread_cond_broadcast(&snapshot_cv);
+        while (!snapshot_release) { pthread_cond_wait(&snapshot_cv, &snapshot_mu); }
+        snapshot_ok = trigger.bytes && trigger.len == before_len &&
+                      memcmp(before, trigger.bytes, before_len) == 0;
+        pthread_mutex_unlock(&snapshot_mu);
     }
     d2k_vres r;
     memset(&r, 0, sizeof r);
@@ -420,6 +465,50 @@ static size_t sent_command_count(uint16_t kind, const uint8_t *body, size_t len)
         off += 4 + n;
     }
     return count;
+}
+
+static int last_addr_probe_endpoint(uint8_t src[4], uint16_t *sport_be,
+                                    uint8_t trial[D2K_TRIAL_ID_LEN]) {
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3];
+        if (n < 2 || n > sent_len - off - 4) { break; }
+        uint16_t type = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
+        if (type == D2K_CMD_SET_ADDR_PROBE && n >= 2 + 13 + D2K_TRIAL_ID_LEN + 4) {
+            memcpy(src, p + 6, 4);
+            memcpy(sport_be, p + 10, 2);
+            memcpy(trial, p + 6 + 13, D2K_TRIAL_ID_LEN);
+            return 1;
+        }
+        off += 4 + n;
+    }
+    return 0;
+}
+
+/* Снимок всех адресных проб, ушедших по управляющему сокету. Нужен для
+ * lifecycle-регрессий: один и тот же Plan ID не различает параллельные
+ * задачи, а trial ID и точный destination должны различать их. */
+static size_t collect_addr_probes(uint8_t dst[][4], uint8_t trial[][D2K_TRIAL_ID_LEN],
+                                  uint16_t *src_port_be, size_t cap) {
+    size_t found = 0;
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3];
+        if (n < 2 || n > sent_len - off - 4) { break; }
+        uint16_t type = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
+        if (type == D2K_CMD_SET_ADDR_PROBE && n >= 2 + 13 + D2K_TRIAL_ID_LEN + 4 &&
+            found < cap) {
+            const uint8_t *body = p + 6;
+            memcpy(dst[found], body + 6, 4);
+            if (src_port_be) { memcpy(&src_port_be[found], body + 4, 2); }
+            memcpy(trial[found], body + 13, D2K_TRIAL_ID_LEN);
+            found++;
+        }
+        off += 4 + n;
+    }
+    return found;
 }
 
 /* Идентификатор ПОСЛЕДНЕГО отправленного плана — прямо с провода.
@@ -886,6 +975,7 @@ int main(void) {
               "complete cache ignored or fragment used as a complete input");
         d2k_sched_free(s); d2k_catalog_free(&empty);
     }
+
     tcp_answer = D2K_V_OPAQUE;
 
     /* --- подозрение по TCP идёт в дерево вердиктов --------------------- */
@@ -919,7 +1009,7 @@ int main(void) {
             d2k_sched_event(s, &sh);
         }
         settle(s);
-        CHECK(quic_calls == 1, "вопросник QUIC не вызван");
+        CHECK(quic_calls >= 1, "вопросник QUIC не вызван");
         CHECK(tcp_calls == 0, "по UDP-подозрению позвано дерево вердиктов TCP");
         CHECK(strcmp(quic_last_sni, "instagram.com") == 0,
               "вопроснику QUIC досталось не имя цели");
@@ -968,6 +1058,109 @@ int main(void) {
               "контроль по QUIC не собран из входа с именем приманки");
         d2k_sched_free(s);
         d2k_catalog_free(&cW);
+    }
+
+    /* SHAPE, пришедший ПОКА ИДЁТ QUIC Run, относится к тому же имени и
+       обязан запустить ровно один повтор после завершения текущего вопроса.
+       Нельзя менять вход активного опыта; повтор обязан получить реальные
+       байты события, а не пересобранный профиль с тем же SNI. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_calls = quic_calls = 0;
+        memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
+        snapshot_enabled = 1;
+        snapshot_entered = snapshot_release = snapshot_ok = 0;
+        quic_answer = D2K_V_CLEAR;
+        d2k_ev h = ev_hello(17, 40005, "late.quic.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40005);
+        d2k_sched_event(s, &su);
+        pthread_mutex_lock(&snapshot_mu);
+        struct timespec snapshot_deadline;
+        clock_gettime(CLOCK_REALTIME, &snapshot_deadline);
+        snapshot_deadline.tv_sec += 2;
+        int snapshot_wait_rc = 0;
+        while (!snapshot_entered && snapshot_wait_rc == 0) {
+            snapshot_wait_rc = pthread_cond_timedwait(&snapshot_cv, &snapshot_mu,
+                                                       &snapshot_deadline);
+        }
+        int quic_entered = snapshot_entered;
+        pthread_mutex_unlock(&snapshot_mu);
+        CHECK(quic_entered, "QUIC worker не достиг контрольного барьера");
+        d2k_ev sh;
+        CHECK(quic_shape(&sh, "late.quic.example") == 0,
+              "поздний QUIC снимок не собрался");
+        d2k_sched_event(s, &sh);
+        pthread_mutex_lock(&snapshot_mu);
+        snapshot_release = 1;
+        pthread_cond_broadcast(&snapshot_cv);
+        pthread_mutex_unlock(&snapshot_mu);
+        settle(s);
+        CHECK(snapshot_ok, "поздний SHAPE изменил байты уже идущего QUIC-опыта");
+        CHECK(quic_calls == 2,
+              "снимок QUIC во время ASKING не вызвал ровно один повтор измерения");
+        CHECK(quic_seen_trigger_lens[1] == sh.shape_len &&
+              memcmp(quic_seen_triggers[1], sh.shape, sh.shape_len) == 0,
+              "повтор QUIC-измерения не получил точные байты позднего снимка");
+        d2k_sched_free(s);
+        d2k_catalog_free(&empty);
+        snapshot_enabled = 0;
+        quic_answer = D2K_V_OPAQUE;
+    }
+
+    /* Свежий QUIC snapshot во время VERIFY отменяет только поставленный
+       кандидат. Без этого барьера scheduler успевал записать профильный
+       trial как будто это байты клиента. */
+    {
+        d2k_catalog cV;
+        memset(&cV, 0, sizeof cV);
+        d2k_sched *s = d2k_sched_new(&cV, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        quic_calls = ver_calls = 0;
+        memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
+        quic_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_answer_port = 40006;
+        ver_snapshot_enabled = 1;
+        ver_snapshot_entered = ver_snapshot_release = 0;
+        d2k_ev h = ev_hello(17, 40006, "verify.snapshot.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40006);
+        d2k_sched_event(s, &su);
+        spin(s, 20);
+        pthread_mutex_lock(&snapshot_mu);
+        struct timespec verify_deadline;
+        clock_gettime(CLOCK_REALTIME, &verify_deadline);
+        verify_deadline.tv_sec += 2;
+        int verify_wait_rc = 0;
+        while (!ver_snapshot_entered && verify_wait_rc == 0) {
+            verify_wait_rc = pthread_cond_timedwait(&snapshot_cv, &snapshot_mu,
+                                                     &verify_deadline);
+        }
+        pthread_mutex_unlock(&snapshot_mu);
+        CHECK(ver_snapshot_entered, "QUIC VERIFY не достиг контрольного барьера");
+        d2k_ev sh;
+        CHECK(quic_shape(&sh, "verify.snapshot.example") == 0,
+              "VERIFY snapshot не собрался");
+        d2k_sched_event(s, &sh);
+        pthread_mutex_lock(&snapshot_mu);
+        ver_snapshot_release = 1;
+        pthread_cond_broadcast(&snapshot_cv);
+        pthread_mutex_unlock(&snapshot_mu);
+        settle(s);
+        CHECK(quic_calls == 2,
+              "snapshot во время VERIFY не вызвал ровно один повтор QUIC-поиска");
+        CHECK(quic_seen_trigger_lens[1] == sh.shape_len &&
+              memcmp(quic_seen_triggers[1], sh.shape, sh.shape_len) == 0,
+              "повтор после VERIFY не получил точные байты snapshot клиента");
+        ver_snapshot_enabled = 0;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cV);
+        quic_answer = D2K_V_OPAQUE;
     }
 
     /* --- СНИМОК СОСЕДА ЗАКРЫВАЕТ ХОЛОДНЫЙ СТАРТ QUIC ---------------------
@@ -1051,7 +1244,7 @@ int main(void) {
                 snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "quic");
                 b->plans[0].text = strdup(
                     "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
-                    "proto udp quic\npayload 1 hex aabb\n"
+                    "proto udp quic\npayload 1 aabb\n"
                     "fake payload=1 poison=0 repeats=1 gap_us=0 place=before\n"
                     "order forward\n");
                 CHECK(b->plans[0].text != NULL, "текст плана не создался");
@@ -1068,7 +1261,12 @@ int main(void) {
                 d2k_sched_event(s, &h);
                 d2k_ev su = ev_suspect(17, 40203);
                 d2k_sched_event(s, &su);
-                settle(s);
+                spin_until_installed(s);
+                {
+                    d2k_ev ap = ev_applied(17, 40203);
+                    d2k_sched_event(s, &ap);
+                    spin(s, 80);
+                }
                 CHECK(said("готовых планов узнанной коробки"),
                       "готовый план узнанной коробки не испытан без снимка");
                 CHECK(quic_calls == 0,
@@ -1115,7 +1313,7 @@ int main(void) {
                 snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "quic");
                 b->plans[0].text = strdup(
                     "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
-                    "proto udp quic\npayload 1 hex aabb\n"
+                    "proto udp quic\npayload 1 aabb\n"
                     "fake payload=1 poison=0 repeats=1 gap_us=0 place=before\n"
                     "order forward\n");
                 CHECK(b->plans[0].text != NULL, "текст плана не создался");
@@ -1124,6 +1322,8 @@ int main(void) {
                 d2k_sched *s = d2k_sched_new(&cR, sv[0], 0x2d);
                 saidbuf[0] = '\0';
                 d2k_sched_set_say(s, collect_say, NULL);
+                quic_calls = 0;
+                memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
                 /* Зонд доходит только до рукопожатия — готовый план не
                    засчитывается, и планы кончаются. */
                 ver_answer = D2K_VER_HANDSHAKE;
@@ -1142,11 +1342,15 @@ int main(void) {
                 {
                     d2k_ev sh;
                     CHECK(quic_shape(&sh, "остыл.снимок.позже") == 0, "снимок QUIC не собрался");
+                    memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
                     d2k_sched_event(s, &sh);
+                    settle(s);
+                    CHECK(quic_calls == 1,
+                          "после позднего снимка QUIC не выполнено ровно одно измерение");
+                    CHECK(quic_seen_trigger_lens[0] == sh.shape_len &&
+                          memcmp(quic_seen_triggers[0], sh.shape, sh.shape_len) == 0,
+                          "переход от готовых планов не измерял точный поздний QUIC Initial");
                 }
-                settle(s);
-                CHECK(quic_calls == 1,
-                      "после провала готовых планов замер не пошёл вовсе");
                 CHECK(strcmp(quic_last_ctl, "disk.rzd.ru") == 0,
                       "замер пошёл БЕЗ контрольного имени — вопрос коробке не задан, "
                       "а кандидаты будут потрачены впустую");
@@ -1693,6 +1897,92 @@ int main(void) {
               "промах готового плана записан как новая привязка");
         d2k_sched_free(s);
         d2k_catalog_free(&c6);
+    }
+
+    /* A recognized box whose old plan has gone stale may learn a replacement,
+       but the new plan belongs to that same measured box.  The passive
+       fingerprint is unchanged; plan identity must not be mixed into box
+       identity after a successful re-search. */
+    {
+        d2k_catalog cD;
+        memset(&cD, 0, sizeof cD);
+        cD.boxes = calloc(1, sizeof *cD.boxes);
+        CHECK(cD.boxes != NULL, "не удалось создать коробку для деградации");
+        if (cD.boxes) {
+            cD.n_boxes = 1;
+            d2k_cat_box *b = &cD.boxes[0];
+            snprintf(b->id, sizeof b->id, "box-stable-fingerprint");
+            b->fp.method = D2K_FP_METHOD;
+            b->fp.n_sig = 1;
+            snprintf(b->fp.sig[0].kind, sizeof b->fp.sig[0].kind, "rst");
+            b->fp.sig[0].ttl = 127;
+            b->fp.sig[0].tos = 0x88;
+            b->fp.sig[0].ipid = 54321;
+            b->plans = calloc(1, sizeof *b->plans);
+            CHECK(b->plans != NULL, "не удалось создать устаревший план");
+            if (b->plans) {
+                b->n_plans = 1;
+                snprintf(b->plans[0].id, sizeof b->plans[0].id, "plan-stale");
+                snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "tls");
+                b->plans[0].enabled = 1;
+                b->plans[0].successes = 3;
+                b->plans[0].text = strdup(
+                    "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                    "proto tcp tls\nsplit payload_start +1\norder forward\n");
+            }
+            d2k_sched *s = d2k_sched_new(&cD, sv[0], 0x2d);
+            CHECK(s != NULL, "планировщик деградации не создан");
+            if (s) {
+                saidbuf[0] = '\0';
+                d2k_sched_set_say(s, collect_say, NULL);
+                tcp_answer = D2K_V_PREFIX;
+                tcp_calls = vol_calls = 0;
+                ver_answer = D2K_VER_APPLICATION;
+                /* Every pre-measurement plan fails; the first plan produced
+                   after the C search starts is independently verifiable. */
+                ver_fail_first = 0;
+                ver_app_after_tcp_search = 1;
+                ver_calls = 0;
+                ver_answer_port = 40053;
+                forget_sent();
+                d2k_ev h = ev_hello(6, 40053, "деградировавшая.цель");
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, 40053);
+                d2k_sched_event(s, &su);
+                /* As with the existing known-box path, wait until the first
+                   (catalog) plan is installed and acknowledge its application
+                   before expecting the verifier's miss to advance the task. */
+                spin_until_installed(s);
+                d2k_ev old_ap = ev_applied(6, 40053);
+                d2k_sched_event(s, &old_ap);
+                settle(s);
+
+                CHECK(said("готовых планов узнанной коробки"),
+                      "устаревший план не был проверен первым");
+                CHECK(said("готовые планы не помогли — начинаю новый замер"),
+                      "после отказа готового плана новый замер не запущен");
+                CHECK(tcp_calls == 1, "после отказа готового плана новый поиск не выполнен ровно один раз");
+                CHECK(ver_calls >= 2, "новый измеренный кандидат не проверен после старого плана");
+
+                /* The measured replacement has its own apply proof. */
+                d2k_ev ap = ev_applied(6, 40053);
+                d2k_sched_event(s, &ap);
+                settle(s);
+                CHECK(total_bindings(&cD) == 1,
+                      "успех нового плана не создал ровно одну привязку");
+                CHECK(cD.n_boxes == 1,
+                      "новый Plan с тем же совместимым измеренным отпечатком размножил коробку");
+                CHECK(cD.n_boxes == 1 && cD.boxes[0].n_plans >= 2,
+                      "новый подтверждённый Plan не добавлен к модели уже узнанной коробки");
+                CHECK(cD.revision > 0,
+                      "изменение каталога не подняло revision для надёжного сохранения");
+                CHECK(binding_of(&cD, "деградировавшая.цель", 6) != NULL,
+                      "после деградации не сохранена новая подтверждённая привязка");
+                ver_app_after_tcp_search = 0;
+                d2k_sched_free(s);
+            }
+            d2k_catalog_free(&cD);
+        }
     }
 
     /* --- каталог едет датапату при запуске, а не лежит мёртвым грузом --- */
@@ -3046,11 +3336,9 @@ int main(void) {
      *
      * Поле 19.09.2026: настоящий клиент разбрасывает ClientHello так, что имя
      * из него не читается ни датапатом, ни коробкой. Подозрение о таком потоке
-     * приходит БЕЗ имени, и искать по имени нечего — но адрес известен, а
-     * приём разноса датаграмм (delay) от имени цели не зависит вовсе.
-     *
-     * Ответ следующего потока — только наблюдение. EXCHANGE у UDP не несёт
-     * протокольного доказательства и не вправе создать успех в каталоге. */
+     * приходит БЕЗ имени. Цель — адрес сервера; донорский Run должен получить
+     * буквальный IP и собрать собственный ClientHello без SNI. Непроверенный
+     * delay не должен устанавливаться вместо измерения. */
     {
         uint16_t saved_port = g_server_port;
         g_server_port = 443;
@@ -3063,16 +3351,24 @@ int main(void) {
             d2k_sched_set_say(s, collect_say, NULL);
             tcp_calls = vol_calls = 0;
             ver_calls = 0;
+            quic_calls = 0;
+            quic_answer = D2K_V_CLEAR;
             forget_sent();
             /* Приветствия по этому потоку НЕ было: имя не прочиталось. */
             d2k_ev su = ev_suspect(17, 40400);
             d2k_sched_event(s, &su);
             spin(s, 20);
             drain();
-            CHECK(said("цель беру ПО АДРЕСУ"),
-                  "подозрение без имени по QUIC не завело адресной цели");
+            CHECK(quic_calls == 1 && strcmp(quic_last_ip, "127.0.0.1") == 0 &&
+                  strcmp(quic_last_sni, "127.0.0.1") == 0,
+                  "безымянная QUIC-цель не прошла через полный измеритель как буквальный IP");
+            CHECK(strcmp(quic_last_trig, "<без SNI>") == 0 &&
+                  strcmp(quic_last_ctl, "<без SNI>") != 0,
+                  "адресный Run не сохранил SNI-less trigger и отдельный контроль");
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 0,
+                  "неизмеренный delay установлен вместо donor Run");
             CHECK(ver_calls == 0,
-                  "по адресной цели QUIC пошёл зонд, чья судьба о клиенте не говорит");
+                  "чистый donor verdict неожиданно запустил кандидатную верификацию");
 
             d2k_ev ap = ev_applied(17, 40401);
             d2k_sched_event(s, &ap);
@@ -3083,140 +3379,260 @@ int main(void) {
             const d2k_cat_binding *bd = binding_of(&cQ, "127.0.0.1", 17);
             CHECK(bd == NULL && cQ.n_boxes == 0,
                   "произвольный UDP-ответ создал подтверждение/коробку адресной цели");
-            CHECK(said("UDP-ответ наблюдался") && !said("ПОДТВЕРЖДЕНО"),
-                  "UDP-наблюдение потеряно либо названо подтверждением");
+            CHECK(!said("ПОДТВЕРЖДЕНО"),
+                  "произвольный UDP-ответ назван подтверждением QUIC-успеха");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cQ);
         g_server_port = saved_port;
     }
 
-    /* Одинаковый план не делает две адресные цели одной задачей. События
-       приходят от ВТОРОЙ цели раньше первой: чужой APPLIED + её же EXCHANGE
-       не должны стать наблюдением первой задачи, даже при равных plan_id.
-       Отдельный прогон добавляет чужой порт: один дефект не маскирует другой. */
-    for (int wrong_port = 0; wrong_port < 2; wrong_port++) {
-        uint16_t saved_port = g_server_port;
-        g_server_port = 443;
-        d2k_catalog cQ;
-        memset(&cQ, 0, sizeof cQ);
-        d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
-        CHECK(s != NULL, "планировщик двух адресных целей не завёлся");
-        if (s) {
-            saidbuf[0] = '\0';
-            d2k_sched_set_say(s, collect_say, NULL);
-            forget_sent();
-            d2k_ev a = ev_suspect(17, 40410);
-            d2k_sched_event(s, &a);
-            spin(s, 2);
-            uint8_t first_id[D2K_PLAN_ID_LEN] = {0};
-            CHECK(last_plan_id(first_id), "первая адресная цель не получила план");
-            d2k_ev b = ev_suspect(17, 40411);
-            b.low_ip[3] = 2;
-            d2k_sched_event(s, &b);
-            spin(s, 2);
-            uint8_t second_id[D2K_PLAN_ID_LEN] = {0};
-            CHECK(last_plan_id(second_id), "вторая адресная цель не получила план");
-            CHECK(memcmp(first_id, second_id, sizeof first_id) == 0,
-                  "стенд должен воспроизводить одинаковые планы разных целей");
-
-            d2k_ev ap = ev_applied(17, 40412);
-            d2k_ev ex = ev_exchange(17, 40412, 0);
-            /* Тот же IP, но другой сервис — не наш опыт. */
-            if (wrong_port) {
-                ap.low_port = ex.low_port = 8443;
-                d2k_sched_event(s, &ap);
-                d2k_sched_event(s, &ex);
-                spin(s, 2);
-                CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
-                      "чужой порт подтвердил адресную цель");
-                CHECK(!said("UDP-ответ наблюдался"),
-                      "чужой порт принят за наблюдение адресного опыта");
-            }
-
-            ap = ev_applied(17, 40413);
-            ex = ev_exchange(17, 40413, 0);
-            ap.low_ip[3] = ex.low_ip[3] = 2;
-            d2k_sched_event(s, &ap);
-            d2k_sched_event(s, &ex);
-            spin(s, 2);
-            CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
-                  "ответ второй IP-цели подтвердил первую по общему plan_id");
-            CHECK(said("по 127.0.0.2 (QUIC по адресу) UDP-ответ наблюдался") &&
-                  !said("по 127.0.0.1 (QUIC по адресу) UDP-ответ наблюдался"),
-                  "ответ второй IP-цели потерян или приписан первой");
-            CHECK(cQ.n_boxes == 0, "наблюдение второй IP-цели записало успех");
-
-            ap = ev_applied(17, 40414);
-            memcpy(ap.plan_id, first_id, sizeof first_id);
-            ex = ev_exchange(17, 40414, 0);
-            d2k_sched_event(s, &ap);
-            d2k_sched_event(s, &ex);
-            spin(s, 2);
-            CHECK(said("по 127.0.0.1 (QUIC по адресу) UDP-ответ наблюдался"),
-                  "собственный ответ первой IP-цели потерян");
-            CHECK(cQ.n_boxes == 0, "наблюдение первой IP-цели записало успех");
-            d2k_sched_free(s);
-        }
-        d2k_catalog_free(&cQ);
-        g_server_port = saved_port;
-    }
-
-    /* Жизненный цикл адресного кандидата: срок, молчание, ответ без доказательства.
-       Это проверки маршрутизации/очистки, не доказательство QUIC-handshake. */
-    for (int outcome = 0; outcome < 4; outcome++) {
+    /* Два безымянных QUIC-адреса остаются двумя задачами, каждая идёт через
+       donor Run со своим literal IP и без SNI. Никакой delay не выставляется
+       только из факта подозрения. */
+    {
         uint16_t saved_port = g_server_port;
         g_server_port = 443;
         d2k_catalog cQ = {0};
         d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
-        CHECK(s != NULL, "планировщик жизненного цикла адресной цели не завёлся");
+        CHECK(s != NULL, "планировщик нескольких адресных целей не завёлся");
         if (s) {
-            saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
+            quic_answer = D2K_V_CLEAR;
+            quic_calls = 0;
             forget_sent();
-            d2k_ev su = ev_suspect(17, 40420);
+            d2k_ev a = ev_suspect(17, 40410);
+            d2k_sched_event(s, &a);
+            d2k_ev b = ev_suspect(17, 40411);
+            b.low_ip[3] = 2;
+            d2k_sched_event(s, &b);
+            spin(s, 20);
+            CHECK(quic_calls == 2, "два адреса не получили два независимых QUIC Run");
+            CHECK(strcmp(quic_seen_ips[0], "127.0.0.1") == 0 &&
+                  strcmp(quic_seen_snis[0], "127.0.0.1") == 0 &&
+                  strcmp(quic_seen_targets[0], "<без SNI>") == 0,
+                  "первый адресный Run подменил цель или его SNI");
+            CHECK(strcmp(quic_seen_ips[1], "127.0.0.2") == 0 &&
+                  strcmp(quic_seen_snis[1], "127.0.0.2") == 0 &&
+                  strcmp(quic_seen_targets[1], "<без SNI>") == 0,
+                  "второй адресный Run потерял собственный target context");
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 0 &&
+                  cQ.n_boxes == 0,
+                  "подозрение или UDP EXCHANGE создали неизмеренный address Plan/успех");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cQ);
+        g_server_port = saved_port;
+    }
+
+    /* Адресный кандидат не может идти через SET_NAME_PROBE (у цели нет SNI)
+       и не может временно ставиться общим SET_ADDR (это затронет чужие
+       потоки к тому же IP). Для него нужен отдельный exact-flow probe overlay. */
+    {
+        uint16_t saved_port = g_server_port;
+        d2k_sched_ver_fn saved_ver = d2k_sched_ver_hook;
+        uint8_t saved_local_ip4[4];
+        memcpy(saved_local_ip4, ver_local_ip4, sizeof saved_local_ip4);
+        g_server_port = 443;
+        d2k_catalog cQ = {0};
+        d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик адресного кандидата не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            quic_answer = D2K_V_PREFIX;
+            ver_answer = D2K_VER_APPLICATION;
+            ver_answer_port = 40450;
+            quic_calls = 0;
+            ver_calls = 0;
+            forget_sent();
+            d2k_ev su = ev_suspect(17, 40450);
+            su.low_ip[3] = 9;
             d2k_sched_event(s, &su);
-            spin(s, 2);
-            CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 1,
-                  "адресный кандидат не установлен");
-            d2k_ev ap = ev_applied(17, 40421);
-            if (outcome) { d2k_sched_event(s, &ap); }
-            if (outcome >= 2) {
-                d2k_ev ex = ev_exchange(17, 40421, 0);
-                d2k_sched_event(s, &ex);
-                spin(s, 2);
-                CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
-                      "UDP-наблюдение превратило кандидат в подтверждённый план");
+            spin_until_installed(s);
+            CHECK(quic_calls == 1,
+                  "безымянная QUIC-цель не прошла через donor Run");
+            uint8_t src_ip4[4], trial_id[D2K_TRIAL_ID_LEN];
+            uint16_t src_port_be = 0;
+            CHECK(last_addr_probe_endpoint(src_ip4, &src_port_be, trial_id),
+                  "SET_ADDR_PROBE не несёт зарезервированный endpoint и trial ID");
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR_PROBE, NULL, 0) >= 1,
+                  "адресный кандидат не установлен отдельной SET_ADDR_PROBE-командой");
+            CHECK(sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0) == 0,
+                  "адресный кандидат ошибочно установлен как проба по имени");
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 0,
+                  "временный адресный кандидат утёк в постоянную таблицу адресов");
+            if (src_port_be != 0) {
+                memcpy(ver_local_ip4, src_ip4, 4);
+                ver_answer_port = ntohs(src_port_be);
+                d2k_ev applied = ev_applied(17, ver_answer_port);
+                applied.low_ip[0] = 127; applied.low_ip[1] = 0;
+                applied.low_ip[2] = 0; applied.low_ip[3] = 9;
+                applied.low_port = 443;
+                memcpy(applied.high_ip, src_ip4, 4);
+                applied.high_port = ntohs(src_port_be);
+                memcpy(applied.trial_id, trial_id, sizeof trial_id);
+                d2k_ev stale = applied;
+                stale.trial_id[0] ^= 0x80u;
+                d2k_sched_event(s, &stale);
+                spin(s, 20);
+                CHECK(binding_of(&cQ, "127.0.0.9", 17) == NULL &&
+                      sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 0,
+                      "stale APPLIED с тем же Plan/flow, но чужим trial ID не должен promote-ить адрес");
+                d2k_sched_event(s, &applied);
+                d2k_ev ack;
+                memset(&ack, 0, sizeof ack);
+                ack.kind = D2K_EV_ACK;
+                ack.code = D2K_CMD_SET_ADDR_PROBE;
+                ack.num = 0x100u;
+                memcpy(ack.trial_id, trial_id, sizeof trial_id);
+                d2k_sched_event(s, &ack);
+                spin(s, 20);
+                const d2k_cat_binding *bd = binding_of(&cQ, "127.0.0.9", 17);
+                CHECK(bd && strcmp(bd->kind, "addr") == 0 &&
+                      strcmp(bd->target, "127.0.0.9") == 0,
+                      "QUIC application proof + exact Plan/trial evidence не создали addr binding");
+                CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 1,
+                      "подтверждённый адресный план не продвинут в постоянную таблицу");
+                drain();
+                CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) >= 1,
+                      "успешный адресный trial не удалил только свою временную пробу");
             }
+            d2k_sched_free(s);
+        }
+        memcpy(ver_local_ip4, saved_local_ip4, sizeof saved_local_ip4);
+        d2k_catalog_free(&cQ);
+        d2k_sched_ver_hook = saved_ver;
+        g_server_port = saved_port;
+    }
+
+    /* Адресный lifecycle: параллельные задачи не смешивают destination и
+       поколения даже когда у них один и тот же измеренный Plan. */
+    {
+        uint16_t saved_port = g_server_port;
+        g_server_port = 443;
+        d2k_catalog cQ = {0};
+        d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик параллельных адресных опытов не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            quic_answer = D2K_V_PREFIX;
+            ver_answer = D2K_VER_APPLICATION;
+            ver_fail_first = 1; /* first candidate fails, next one is usable */
+            quic_calls = ver_calls = 0;
             forget_sent();
-            if (outcome == 1) {
-                /* Молчание чужого потока не завершает наш опыт. */
-                d2k_ev other = ev_suspect(17, 40422);
-                d2k_sched_event(s, &other);
-                spin(s, 2);
-                CHECK(!said("не пробил"), "чужое молчание завершило адресный опыт");
-                su = ev_suspect(17, 40421);
-                d2k_sched_event(s, &su);
-                spin(s, 2);
-                CHECK(said("не пробил"), "молчание своего адресного опыта проигнорировано");
-            } else if (outcome == 3) {
-                /* Ответ без доказательства не снимает владение опытом:
-                   молчание этого же потока всё ещё должно снять кандидат. */
-                su = ev_suspect(17, 40421);
-                d2k_sched_event(s, &su);
-                spin(s, 2);
-                CHECK(said("не пробил"), "UDP-ответ заблокировал снятие молчащего опыта");
-            } else {
-                skip_ahead(s, 10 * 60 * 1000 + 1);
+            d2k_ev a = ev_suspect(17, 40460);
+            d2k_ev b = ev_suspect(17, 40461);
+            b.low_ip[3] = 2;
+            d2k_sched_event(s, &a);
+            d2k_sched_event(s, &b);
+            for (int i = 0; i < 400 &&
+                 sent_command_count(D2K_CMD_SET_ADDR_PROBE, NULL, 0) < 2; i++) {
+                tick_once(s);
+            }
+            uint8_t ips[4][4], ids[4][D2K_TRIAL_ID_LEN];
+            uint16_t sports[4] = {0};
+            size_t n = collect_addr_probes(ips, ids, sports, 4);
+            CHECK(n >= 2, "две адресные задачи не получили независимые SET_ADDR_PROBE");
+            if (n >= 2) {
+                CHECK((ips[0][3] == 1 && ips[1][3] == 2) ||
+                      (ips[0][3] == 2 && ips[1][3] == 1),
+                      "параллельные адресные пробы потеряли destination");
+                CHECK(memcmp(ids[0], ids[1], D2K_TRIAL_ID_LEN) != 0,
+                      "параллельные адресные пробы разделяют trial generation");
+                CHECK(sports[0] != 0 && sports[1] != 0 && sports[0] != sports[1],
+                      "параллельные адресные пробы разделяют локальный verifier port");
+            }
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cQ);
+        g_server_port = saved_port;
+    }
+
+    /* Отказ/неуспех кандидата обязан снять только старое поколение и
+       поставить следующий опыт с новым UDP-портом и trial ID. */
+    {
+        uint16_t saved_port = g_server_port;
+        g_server_port = 443;
+        d2k_catalog cQ = {0};
+        d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик retry адресной пробы не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            quic_answer = D2K_V_PREFIX;
+            ver_answer = D2K_VER_HANDSHAKE;
+            ver_fail_first = 0;
+            quic_calls = ver_calls = 0;
+            forget_sent();
+            d2k_ev su = ev_suspect(17, 40470);
+            su.low_ip[3] = 7;
+            d2k_sched_event(s, &su);
+            for (int i = 0; i < 400 &&
+                 sent_command_count(D2K_CMD_SET_ADDR_PROBE, NULL, 0) < 1; i++) {
+                tick_once(s);
             }
             drain();
-            const uint8_t addr[4] = {127, 0, 0, 1};
-            CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0,
-                  "очистка адресной задачи отправляет DEL_NAME");
-            CHECK(sent_command_count(D2K_CMD_DEL_ADDR, addr, sizeof addr) == 1,
-                  "неподтверждённый адресный кандидат не снят");
-            CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
-                  "неподтверждённый адресный опыт создал привязку");
+            uint8_t first_ip[4], first_id[D2K_TRIAL_ID_LEN];
+            uint16_t first_port = 0;
+            CHECK(last_addr_probe_endpoint(first_ip, &first_port, first_id),
+                  "первое поколение адресной пробы не зафиксировано");
+            size_t before_del = sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0);
+            for (int i = 0; i < 500 &&
+                 sent_command_count(D2K_CMD_SET_ADDR_PROBE, NULL, 0) < 2; i++) {
+                tick_once(s);
+            }
+            uint8_t ips[4][4], ids[4][D2K_TRIAL_ID_LEN];
+            uint16_t sports[4] = {0};
+            size_t n = collect_addr_probes(ips, ids, sports, 4);
+            CHECK(n == 1, "после исчерпания единственного измеренного arm появился чужой retry");
+            if (n == 1) {
+                CHECK(memcmp(ids[0], first_id, D2K_TRIAL_ID_LEN) == 0,
+                      "единственный address trial изменился сам по себе");
+                CHECK(sports[0] == first_port,
+                      "единственный address trial получил неожиданный порт");
+            }
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) > before_del,
+                  "старое поколение адресной пробы не снято перед retry");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cQ);
+        g_server_port = saved_port;
+    }
+
+    /* Таймаут задачи — это не успех и не вечная lease: временный address
+       probe должен быть снят exact-командой, постоянный SET_ADDR не появляется. */
+    {
+        uint16_t saved_port = g_server_port;
+        g_server_port = 443;
+        d2k_catalog cQ = {0};
+        d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик timeout адресной пробы не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            quic_answer = D2K_V_PREFIX;
+            ver_answer = D2K_VER_APPLICATION;
+            /* Keep the verifier unsuccessful while the task itself reaches
+               its ten-minute lifetime; the first probe must still remain
+               observable before that timeout. */
+            ver_fail_first = 100000;
+            quic_calls = ver_calls = 0;
+            forget_sent();
+            d2k_ev su = ev_suspect(17, 40480);
+            su.low_ip[3] = 8;
+            d2k_sched_event(s, &su);
+            for (int i = 0; i < 400 &&
+                 sent_command_count(D2K_CMD_SET_ADDR_PROBE, NULL, 0) < 1; i++) {
+                tick_once(s);
+            }
+            drain();
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR_PROBE, NULL, 0) == 1,
+                  "timeout-тест не дошёл до единственной адресной пробы");
+            size_t del_before = sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0);
+            skip_ahead(s, 10 * 60 * 1000 + 1);
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) > del_before,
+                  "истёкшая адресная задача не сняла exact address probe");
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 0 &&
+                  cQ.n_boxes == 0,
+                  "таймаут адресной пробы создал постоянное знание");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cQ);
@@ -3629,7 +4045,7 @@ int main(void) {
             d2k_sched_event(s, &sh);
         }
         settle(s);
-        CHECK(arm_calls == 1, "плечо QUIC не подбиралось вовсе");
+        CHECK(arm_calls >= 1, "плечо QUIC не подбиралось вовсе");
         CHECK(said("плечо подобрано"), "подбор плеча не назван вслух");
 
         d2k_ev ap = ev_applied(17, 40220);
@@ -3757,6 +4173,8 @@ int main(void) {
               "ненайденное плечо выдано за пробел реализации");
         CHECK(binding_of(&cNF, "нечем.квик", 17) == NULL,
               "по ненайденному плечу появилась привязка");
+        CHECK(sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0) == 0,
+              "QUIC без найденного плеча получил резервный TCP/TLS-план");
         arm_kind = D2K_QA_BLOB;
         quic_answer = D2K_V_CLEAR;
         d2k_sched_free(s);

@@ -90,6 +90,18 @@ static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
     }
 }
 
+static void ack_trial(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason,
+                      const uint8_t trial_id[D2K_TRIAL_ID_LEN]) {
+    uint8_t body[D2K_KEY_WIRE_LEN + 4 + D2K_TRIAL_ID_LEN];
+    memset(body, 0, D2K_KEY_WIRE_LEN);
+    body[D2K_KEY_WIRE_LEN] = (uint8_t)(type >> 8);
+    body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)type;
+    body[D2K_KEY_WIRE_LEN + 2] = (uint8_t)(ok != 0);
+    body[D2K_KEY_WIRE_LEN + 3] = ok ? D2K_ACK_OK : reason;
+    memcpy(body + D2K_KEY_WIRE_LEN + 4, trial_id, D2K_TRIAL_ID_LEN);
+    d2k_ctl_event(cx->ctl, D2K_EV_ACK, body, sizeof body);
+}
+
 void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen) {
     if (!ctl) { return; }
     /* ПЕРВОЕ, ЧТО СЛЫШИТ КОНТРОЛЛЕР — ВЕРСИЯ ПРОВОДА.
@@ -178,6 +190,50 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         ack(cx, type, rc == 0, reason);
         return;
     }
+    case D2K_CMD_SET_ADDR_PROBE: {
+        const size_t fixed = D2K_ADDR_PROBE_FLOW_WIRE_LEN + D2K_TRIAL_ID_LEN + 4u;
+        if (len < fixed) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        d2k_addr_probe_flow flow;
+        memcpy(flow.src_ip4, b, 4);
+        memcpy(&flow.src_port_be, b + 4, 2);
+        memcpy(flow.dst_ip4, b + 6, 4);
+        memcpy(&flow.dst_port_be, b + 10, 2);
+        flow.transport = b[12];
+        const uint8_t *trial_id = b + D2K_ADDR_PROBE_FLOW_WIRE_LEN;
+        size_t lease_off = D2K_ADDR_PROBE_FLOW_WIRE_LEN + D2K_TRIAL_ID_LEN;
+        uint32_t lease_ms = (uint32_t)b[lease_off] << 24 |
+                            (uint32_t)b[lease_off + 1] << 16 |
+                            (uint32_t)b[lease_off + 2] << 8 | b[lease_off + 3];
+        uint8_t any_id = 0;
+        for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any_id |= trial_id[i]; }
+        if (flow.transport != 17 || !flow.src_port_be || !flow.dst_port_be ||
+            !lease_ms || lease_ms > D2K_ADDR_PROBE_LEASE_MAX_MS || !any_id ||
+            cx->now_ns > UINT64_MAX - (uint64_t)lease_ms * 1000000u) {
+            ack_trial(cx, type, 0, D2K_ACK_BAD_ARGS, trial_id);
+            return;
+        }
+        d2k_plan *p = NULL;
+        if (d2k_plan_load(b + fixed, len - fixed, &p, why, sizeof why) != 0) {
+            fprintf(stderr, "d2kd: адресный probe plan не принят: %s\n", why);
+            ack_trial(cx, type, 0, D2K_ACK_BAD_PLAN, trial_id);
+            return;
+        }
+        if (!d2k_plan_fits(p, cx->send_limits, cx->send_maxlen, why, sizeof why)) {
+            d2k_plan_free(p);
+            ack_trial(cx, type, 0, D2K_ACK_BAD_PLAN, trial_id);
+            return;
+        }
+        uint64_t expires = cx->now_ns + (uint64_t)lease_ms * 1000000u;
+        int rc = d2k_plantab_set_addr_probe(tab, &flow, trial_id,
+                                            cx->now_ns, expires, p);
+        uint8_t reason = rc == -1 ? D2K_ACK_NO_ROOM :
+                         rc == 0 ? D2K_ACK_OK : D2K_ACK_BAD_ARGS;
+        ack_trial(cx, type, rc == 0, reason, trial_id);
+        return;
+    }
     case D2K_CMD_ARM_SHAPE: {
         /* Тело: длина имени, имя, затем ТРАНСПОРТ одним байтом. Транспорт
            обязателен: снимок приветствия хранится отдельно на транспорт, и без
@@ -217,6 +273,21 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         d2k_plantab_del_name(tab, b + 1, b[0]);
         ack(cx, type, 1, D2K_ACK_OK);
         return;
+    case D2K_CMD_DEL_NAME_PROBE:
+        /* тело: длина имени, имя, форма, местный порт */
+        if (len < 4 || len < 4u + b[0]) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        uint16_t probe_port;
+        memcpy(&probe_port, b + 2u + b[0], 2);
+        if (!probe_port) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        d2k_plantab_del_name_probe(tab, b + 1, b[0], b[1u + b[0]], probe_port);
+        ack(cx, type, 1, D2K_ACK_OK);
+        return;
     case D2K_CMD_DEL_ADDR: {
         if (len < 4) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
@@ -225,6 +296,30 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         uint32_t addr;
         memcpy(&addr, b, 4);
         d2k_plantab_del_addr(tab, addr);
+        ack(cx, type, 1, D2K_ACK_OK);
+        return;
+    }
+    case D2K_CMD_DEL_ADDR_PROBE: {
+        if (len < D2K_ADDR_PROBE_FLOW_WIRE_LEN + D2K_TRIAL_ID_LEN) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        d2k_addr_probe_flow flow;
+        memcpy(flow.src_ip4, b, 4);
+        memcpy(&flow.src_port_be, b + 4, 2);
+        memcpy(flow.dst_ip4, b + 6, 4);
+        memcpy(&flow.dst_port_be, b + 10, 2);
+        flow.transport = b[12];
+        const uint8_t *trial_id = b + D2K_ADDR_PROBE_FLOW_WIRE_LEN;
+        uint8_t any_id = 0;
+        for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any_id |= trial_id[i]; }
+        if (flow.transport != 17 || !flow.src_port_be || !flow.dst_port_be || !any_id) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        /* Idempotent and generation-safe: not finding this exact owner is
+           success, but can never remove a different trial or persistent addr. */
+        (void)d2k_plantab_del_addr_probe(tab, &flow, trial_id);
         ack(cx, type, 1, D2K_ACK_OK);
         return;
     }
@@ -253,7 +348,7 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             continue;
         }
         /* Хватает и на приветствие целиком: форма приезжает сюда же. */
-        uint8_t body[D2K_KEY_WIRE_LEN + 2048 + 8];
+        uint8_t body[D2K_KEY_WIRE_LEN + 2048 + 8 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN];
         size_t n = put_key(body, &e->key);
         uint16_t type = 0;
         switch (e->kind) {
@@ -298,6 +393,8 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
                к тому же избавляет ту сторону от разбора «есть или нет». */
             memcpy(body + n, e->plan_id, D2K_PLAN_ID_LEN);
             n += D2K_PLAN_ID_LEN;
+            memcpy(body + n, e->trial_id, D2K_TRIAL_ID_LEN);
+            n += D2K_TRIAL_ID_LEN;
             break;
         case D2K_JRN_PLAN_REFUSED:
             type = D2K_EV_REFUSED;
@@ -309,6 +406,10 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
                от разбора «есть или нет» — тот же приём, что у plan_id в
                APPLIED выше. */
             body[n++] = D2K_REFUSE_NONE;
+            memset(body + n, 0, D2K_PLAN_ID_LEN);
+            n += D2K_PLAN_ID_LEN;
+            memset(body + n, 0, D2K_TRIAL_ID_LEN);
+            n += D2K_TRIAL_ID_LEN;
             break;
         case D2K_JRN_PLAN_DAMAGED:
             /* Поток испорчен недоисполнением. Тем же видом события, что отказ
@@ -323,6 +424,8 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             body[n++] = e->code;
             memcpy(body + n, e->plan_id, D2K_PLAN_ID_LEN);
             n += D2K_PLAN_ID_LEN;
+            memcpy(body + n, e->trial_id, D2K_TRIAL_ID_LEN);
+            n += D2K_TRIAL_ID_LEN;
             break;
         case D2K_JRN_PLAN_UNSENT:
             /* План применён, но НЕ ДОИСПОЛНЕН: хотя бы одна его посылка не
@@ -335,6 +438,8 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             body[n++] = e->code;
             memcpy(body + n, e->plan_id, D2K_PLAN_ID_LEN);
             n += D2K_PLAN_ID_LEN;
+            memcpy(body + n, e->trial_id, D2K_TRIAL_ID_LEN);
+            n += D2K_TRIAL_ID_LEN;
             break;
         case D2K_JRN_SHAPE: {
             /* Байты приветствия лежат не в журнале, а в ловушке сессии:

@@ -43,6 +43,7 @@ dump() {
 NAME=${D2K_LAB_QUIC_NAME:-www.google.com}
 QUEUE=2101
 MARK=0x2d
+PROBE_MARK=0x2e
 # КАКАЯ КОРОБКА. first — заводит состояние на пятёрку и разбирает ПЕРВУЮ
 # датаграмму потока (ради таких в каталоге плеч есть приманки); all — разбирает
 # КАЖДУЮ датаграмму и приманкой не обманывается вовсе. Обе настоящие, и
@@ -77,7 +78,7 @@ echo "== цензор по QUIC =="
 # 62 хопа — то же число и та же причина, что в lab-censor.sh: плечо с
 # укороченным TTL обязано умереть до сервера, но быть увиденным коробкой.
 BOXFLAG=
-[ "$BOX" = "first" ] && BOXFLAG=--first
+[ "$BOX" = "first" ] && BOXFLAG="--first --warm"
 /tmp/labdpi "$QUEUE" "$NAME" 62 --quic $BOXFLAG > /tmp/labdpi.log 2>&1 &
 DPI=$!
 sleep 1
@@ -120,12 +121,12 @@ iptables -t mangle -A INPUT -p udp --sport 443 \
     -m connbytes --connbytes 0:8 --connbytes-dir reply --connbytes-mode packets \
     -j NFQUEUE --queue-num 2102 --queue-bypass
 
-/tmp/d2kd --mode apply --control "$SOCK" --queue 2102 --mark 45 \
+/tmp/d2kd --mode apply --control "$SOCK" --queue 2102 --mark 45 --probe-mark "$PROBE_MARK" \
     --journal 400 --duration 300 > /tmp/d2kd.log 2>&1 &
 DPID=$!
 i=0; while [ ! -S "$SOCK" ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
 [ -S "$SOCK" ] || fail "датапат не открыл управляющий сокет"
-./core/d2kc --control "$SOCK" --catalog "$CAT" > /tmp/d2kc.log 2>&1 &
+./core/d2kc --control "$SOCK" --catalog "$CAT" --mark "$PROBE_MARK" > /tmp/d2kc.log 2>&1 &
 CPID=$!
 sleep 1
 
