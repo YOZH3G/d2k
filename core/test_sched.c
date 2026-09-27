@@ -761,7 +761,12 @@ static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
     d2k_sched_free(s);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    int voice_only = argc == 2 && strcmp(argv[1], "--voice-only") == 0;
+    if (argc > 1 && !voice_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only]\n");
+        return 2;
+    }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
      * the reserved socket's port. Opening another socket defeats that scope. */
     {
@@ -807,6 +812,7 @@ int main(void) {
 
     d2k_catalog cat;
     memset(&cat, 0, sizeof cat);
+    if (voice_only) { goto voice_only_run; }
 
     /* A completed domain-search provider is not a bare classifier. Its
      * failure must not launch another property questionnaire or fallback. */
@@ -3349,7 +3355,7 @@ int main(void) {
         CHECK(s != NULL, "планировщик для адресной цели не завёлся");
         if (s) {
             d2k_sched_set_say(s, collect_say, NULL);
-            tcp_calls = vol_calls = 0;
+            tcp_calls = quic_calls = vol_calls = 0;
             ver_calls = 0;
             quic_calls = 0;
             quic_answer = D2K_V_CLEAR;
@@ -3645,6 +3651,7 @@ int main(void) {
        спрашивает публичный STUN-контроль и подбирает arm по исходному списку.
        Plan ставится на voice-класс, а последующий ответ самого разговора
        остаётся только наблюдением: каталог от него не пополняется. */
+voice_only_run:
     {
         uint16_t saved_port = g_server_port;
         d2k_sched_voice_fn saved_voice_hook = d2k_sched_voice_hook;
@@ -3681,7 +3688,7 @@ int main(void) {
             CHECK(sent_has(D2K_LINK_VOICE_CLASS), "кандидат голоса не поставлен на класс");
             CHECK(sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0) == 1,
                   "voice Plan не ограничен портом измеренного потока");
-            CHECK(tcp_calls == 0 && ver_calls == 0,
+            CHECK(tcp_calls == 0 && quic_calls == 0 && ver_calls == 0,
                   "по голосу пошёл замер или зонд, которые мерить его не могут");
             CHECK(!said("жду форму приветствия"),
                   "голос принят за QUIC и ждёт снимка Initial");
@@ -3743,6 +3750,7 @@ int main(void) {
         d2k_sched_voice_hook = saved_voice_hook;
         g_server_port = saved_port;
     }
+    if (voice_only) { goto voice_only_done; }
 
     /* --- СНИМОК, ПРИШЕДШИЙ ВО ВРЕМЯ ЗАМЕРА, НЕ ПРОПАДАЕТ ---------------
        Поле 18.09.2026, discord.com: замер начат заготовкой в 1534 байта, а
@@ -4389,11 +4397,13 @@ int main(void) {
         d2k_catalog_free(&cF);
     }
 
+voice_only_done:
     close(sv[0]);
     close(sv[1]);
     d2k_catalog_free(&cat);
 
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }
-    printf("планировщик: все проверки прошли\n");
+    printf(voice_only ? "voice scheduler: all checks passed\n" :
+                        "планировщик: все проверки прошли\n");
     return 0;
 }
