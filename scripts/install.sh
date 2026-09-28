@@ -107,7 +107,11 @@ case "$PANEL_VERSION" in
     *) die "скачанный d2kpanel устарел: в нём нет управления Telegram-туннелем" ;;
 esac
 "$TMP/d2kd" --help  >/dev/null 2>&1 || die "скачанный d2kd не запускается на этой системе"
-"$TMP/d2ktg" --version >/dev/null 2>&1 || die "скачанный d2ktg не запускается на этой системе"
+TG_VERSION=$("$TMP/d2ktg" --version 2>/dev/null) || die "скачанный d2ktg не запускается на этой системе"
+case "$TG_VERSION" in
+    *features=per-install-enrollment*) ;;
+    *) die "скачанный d2ktg устарел: в нём нет автоматической регистрации установки" ;;
+esac
 # d2kc без обязательного --control печатает использование и выходит кодом 2 —
 # это и есть признак «запускается и та арка». Ноль он здесь вернуть не может.
 #
@@ -195,6 +199,17 @@ fi
 # чтение root даже при обновлении ранее установленного файла с более широкими
 # правами.
 chmod 0600 "$DIR/config" || die "не защитить права конфигурации"
+# Upgrade the old unconfigured Telegram template without changing a user's
+# enable/disable choice or custom relay. No fleet credential is installed.
+TG_INSTALL_URL=$(sed -n 's/^TG_RELAY_URL=//p' "$DIR/config" | tail -n 1)
+if [ -z "$TG_INSTALL_URL" ]; then
+    printf '\nTG_RELAY_URL=wss://213.176.74.63.nip.io/ws\n' >> "$DIR/config"
+    TG_INSTALL_URL=wss://213.176.74.63.nip.io/ws
+fi
+if [ "$TG_INSTALL_URL" = wss://213.176.74.63.nip.io/ws ] &&
+   ! grep -q '^TG_ENROLL_PORT=' "$DIR/config"; then
+    printf 'TG_ENROLL_PORT=9443\n' >> "$DIR/config"
+fi
 # Resolve and pin Instagram through the same authenticated VPS flow as z2k.
 # A resolver/VPS outage must not turn a healthy D2K installation into a failure.
 if "$DIR/d2k-instagram-dns.sh" refresh; then
@@ -217,6 +232,18 @@ if ! "$INIT" status | grep -q "датапат: работает"; then
 fi
 
 "$INIT" status
+if grep -q '^TG_ENABLED=1$' "$DIR/config"; then
+    tg_wait=0
+    while [ "$tg_wait" -lt 30 ] && [ "$(cat "$DIR/state/telegram.status" 2>/dev/null || true)" != connected ]; do
+        sleep 1
+        tg_wait=$((tg_wait + 1))
+    done
+    if [ "$(cat "$DIR/state/telegram.status" 2>/dev/null || true)" = connected ]; then
+        say "Telegram: персональная регистрация и подключение к релею подтверждены"
+    else
+        say "Telegram ещё не подключён; автоматические повторы продолжаются, состояние видно в панели"
+    fi
+fi
 PANEL_LISTEN=$(sed -n 's/^PANEL_LISTEN=//p' "$DIR/config" | tail -n 1)
 if [ -n "$PANEL_LISTEN" ]; then
     say "панель слушает: http://$PANEL_LISTEN/"

@@ -3,6 +3,7 @@
 #include "tg_tls.h"
 #include "tg_identity.h"
 #include "tg_net.h"
+#include "tg_enroll.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -29,6 +30,26 @@ static int read_response_headers(SSL *ssl, char *buf, size_t cap, int *status) {
     if(sscanf(buf,"HTTP/1.%*1[01] %3d",&code)!=1 || code<100 || code>599)return -1;
     *status=code;
     return 0;
+}
+
+int tg_enroll_identity(const char *hostname,uint16_t port,const char *ca_bundle,
+                       const tg_identity *identity) {
+    uint8_t proof[TG_ENROLL_SIZE];char request[768],response[16385];
+    SSL_CTX *ctx=NULL;SSL *ssl=NULL;int fd=-1,status=0,result=-1;
+    if(!hostname||strchr(hostname,'\r')||strchr(hostname,'\n')||!port||
+       tg_enroll_proof(identity,proof)!=0)return -1;
+    int n=snprintf(request,sizeof(request),
+        "POST /register HTTP/1.1\r\nHost: %s:%u\r\nContent-Type: application/octet-stream\r\n"
+        "Content-Length: %u\r\nConnection: close\r\n\r\n",hostname,(unsigned)port,TG_ENROLL_SIZE);
+    if(n<=0||(size_t)n>=sizeof(request))return -1;
+    fd=tg_tcp_connect_ipv4(hostname,port,10000);if(fd<0)goto done;
+    ctx=tg_tls_client_context(ca_bundle);if(!ctx)goto done;
+    ssl=tg_tls_connect_fd(ctx,fd,hostname);if(!ssl)goto done;
+    if(write_all(ssl,(const uint8_t *)request,(size_t)n)!=0||write_all(ssl,proof,sizeof(proof))!=0||
+       read_response_headers(ssl,response,sizeof(response),&status)!=0)goto done;
+    result=status==200?0:status==409?TG_REGISTER_ID_CONFLICT:-1;
+done:
+    SSL_free(ssl);SSL_CTX_free(ctx);if(fd>=0)close(fd);return result;
 }
 
 int tg_register_identity(const char *hostname, uint16_t port,

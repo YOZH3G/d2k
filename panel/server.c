@@ -288,7 +288,7 @@ static void telegram_config_flags(const d2k_panel_config *cfg,int *enabled,int *
     *enabled=0;*configured=0;
     if(!cfg||!cfg->config_path)return;
     FILE *f=fopen(cfg->config_path,"r");if(!f)return;
-    char line[2048];int have_url=0,have_secret=0;
+    char line[2048];int have_url=0,have_secret=0,have_enroll=0;
     while(fgets(line,sizeof(line),f)) {
         char *p=line;while(*p==' '||*p=='\t')p++;
         if(*p=='#'||!*p)continue;
@@ -296,11 +296,21 @@ static void telegram_config_flags(const d2k_panel_config *cfg,int *enabled,int *
         char *end=p+strlen(p);while(end>p&&(end[-1]==' '||end[-1]=='\t'||end[-1]=='\r'||end[-1]=='\n'))*--end='\0';
         while(*eq==' '||*eq=='\t')eq++;
         end=eq+strlen(eq);while(end>eq&&(end[-1]==' '||end[-1]=='\t'||end[-1]=='\r'||end[-1]=='\n'))*--end='\0';
+        if(*eq=='\''||*eq=='"') {
+            char quote=*eq;
+            if(end-eq<2||end[-1]!=quote){*configured=0;fclose(f);return;}
+            *--end='\0';eq++;
+            if(strchr(eq,quote)){*configured=0;fclose(f);return;}
+        }
         if(strcmp(p,"TG_ENABLED")==0)*enabled=strcmp(eq,"1")==0||strcmp(eq,"yes")==0;
         else if(strcmp(p,"TG_RELAY_URL")==0)have_url=*eq!='\0';
         else if(strcmp(p,"TG_RELAY_SECRET")==0)have_secret=*eq!='\0';
+        else if(strcmp(p,"TG_ENROLL_PORT")==0) {
+            char *tail;unsigned long port=strtoul(eq,&tail,10);
+            have_enroll=tail!=eq&&!*tail&&port>0&&port<=65535;
+        }
     }
-    fclose(f);*configured=have_url&&have_secret;
+    fclose(f);*configured=have_url&&(have_secret||have_enroll);
 }
 
 static void telegram_status_value(const d2k_panel_config *cfg,int enabled,int configured,int *running,char out[24]) {

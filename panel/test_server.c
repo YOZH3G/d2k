@@ -188,6 +188,14 @@ static void test_telegram_status_is_dynamic_and_never_exposes_secret(void) {
     (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
     assert(strstr(response,"\"telegram_configured\":false")!=NULL);
     assert(strstr(response,"\"telegram_status\":\"not_configured\"")!=NULL);
+    rewrite_file(config,"TG_ENABLED=1\nTG_RELAY_URL=wss://relay.example/ws\nTG_ENROLL_PORT=9443\n");
+    (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
+    assert(strstr(response,"\"telegram_configured\":true")!=NULL);
+    assert(strstr(response,"\"telegram_status\":\"connected\"")!=NULL);
+    rewrite_file(config,"TG_ENABLED=\"1\"\nTG_RELAY_URL='wss://relay.example/ws'\nTG_ENROLL_PORT=\"9443\"\n");
+    (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
+    assert(strstr(response,"\"telegram_configured\":true")!=NULL);
+    assert(strstr(response,"\"telegram_status\":\"connected\"")!=NULL);
     unlink(live);unlink(config);unlink(status);unlink(pid);
 }
 
@@ -258,7 +266,7 @@ static void test_panel_accepts_a_control_action_request(void) {
         response, sizeof response);
     assert(strstr(response,"HTTP/1.1 409 Conflict")!=NULL);
     char tg_config[]="/tmp/d2k-panel-tg-control-config.XXXXXX";
-    write_temp_file(tg_config,"TG_ENABLED=0\nTG_RELAY_URL=wss://relay.example/ws\nTG_RELAY_SECRET=private\n");
+    write_temp_file(tg_config,"TG_ENABLED=0\nTG_RELAY_URL=wss://relay.example/ws\nTG_ENROLL_PORT=9443\n");
     cfg.config_path=tg_config;
     (void)request(&cfg,
         "POST /api/control/telegram-enable HTTP/1.1\r\nHost: localhost:8090\r\n"

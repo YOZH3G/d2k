@@ -12,6 +12,7 @@ typedef struct {
     char ca_bundle[512];
     char status_path[512];
     uint16_t listen_port;
+    uint16_t enroll_port;
 } tg_config;
 
 typedef struct {

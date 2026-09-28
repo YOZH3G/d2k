@@ -297,7 +297,7 @@
     tgState.setAttribute("data-state", snapshot.telegram_status || "unknown");
     append(tgCopy, node(doc, "p", snapshot.telegram_configured
       ? "Отдельный TCP-туннель для Telegram; подбор D2K управляется независимо."
-      : "Для включения сначала задайте TG_RELAY_URL и TG_RELAY_SECRET в конфигурации роутера."));
+      : "Настройка туннеля не завершена. Повторите установку D2K для автоматической регистрации роутера."));
     var tgAction = snapshot.telegram_enabled ? "telegram-disable" : "telegram-enable";
     var tgButton = append(tgCard, node(doc, "button",
       snapshot.telegram_enabled ? "Выключить" : "Включить", "control-button " + (snapshot.telegram_enabled ? "button-danger" : "button-primary")));

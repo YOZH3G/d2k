@@ -39,7 +39,18 @@ static void test_duplicate_and_incomplete_keys_rejected(void) {
     assert(tg_config_read("/path/that/does/not/exist",&cfg)!=0);
 }
 
+static void test_per_install_enrollment_needs_no_shared_secret(void) {
+    char path[]="/tmp/d2k-tg-enroll-config-XXXXXX";int fd=mkstemp(path);assert(fd>=0);
+    FILE *f=fdopen(fd,"w");assert(f);
+    fputs("TG_ENABLED=1\nTG_RELAY_URL=wss://213.176.74.63.nip.io/ws\nTG_ENROLL_PORT=9443\n",f);
+    assert(fclose(f)==0);tg_config cfg;assert(tg_config_read(path,&cfg)==0);
+    assert(cfg.enabled&&cfg.enroll_port==9443&&!cfg.relay_secret[0]);
+    f=fopen(path,"w");assert(f);fputs("TG_ENROLL_PORT=65536\n",f);assert(fclose(f)==0);
+    assert(tg_config_read(path,&cfg)!=0);unlink(path);
+}
+
 int main(void) {
     test_config_values_and_url();test_url_rejects_unsafe_or_unsupported_inputs();
+    test_per_install_enrollment_needs_no_shared_secret();
     test_duplicate_and_incomplete_keys_rejected();puts("config tests: ok");return 0;
 }

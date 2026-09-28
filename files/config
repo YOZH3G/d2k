@@ -8,9 +8,9 @@ QUEUE_NUM=2000
 CONTROL_SOCKET=/opt/d2k/run/d2kd.sock
 DECOY_SNI=disk.rzd.ru
 MARK=0x2d
-# Telegram TCP tunnel is opt-in until a private relay credential is configured.
-TG_ENABLED=0
-# Set these two values only after receiving relay access details; never commit a secret.
-# TG_RELAY_URL=wss://relay.example/ws
-# TG_RELAY_SECRET=put-private-relay-secret-here
+# Each router creates its own private identity and registers its public key.
+TG_ENABLED=1
+TG_RELAY_URL=wss://213.176.74.63.nip.io/ws
+TG_ENROLL_PORT=9443
+# Custom relays may use TG_RELAY_SECRET instead of the enrollment endpoint.
 # TG_PORT=1443

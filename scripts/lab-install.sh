@@ -68,7 +68,8 @@ echo "== сборка того, что будет установлено =="
 make -s -C core d2kc
 make -s -C datapath d2kd
 
-mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets"
+mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets" "$REL/scripts"
+cp scripts/select-panel-ip.sh "$REL/scripts/"
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
 cp builds/d2ktg-linux-arm64 "$REL/builds/d2ktg-linux-$ARCH"
@@ -80,6 +81,10 @@ cp files/S99d2k files/config files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
 cp files/d2k-tg-firewall.sh files/d2k-tg-watchdog.sh files/d2k-instagram-dns.sh \
     files/d2k-instagram-dns-scheduler.sh files/meta-ranges.txt files/tg-roots.pem "$REL/files/"
 cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fake/"
+# The real package enables enrollment, but the isolated lab must never contact
+# the production VPS or Telegram. Point its copied template to closed local ports.
+sed -i 's|^TG_RELAY_URL=.*|TG_RELAY_URL=wss://127.0.0.1:11443/ws|; s/^TG_ENROLL_PORT=.*/TG_ENROLL_PORT=11444/' "$REL/files/config"
+sed -i 's|^PROBE_URL=.*|PROBE_URL=https://127.0.0.1:11443/|; s/^PROBE_IP=.*/PROBE_IP=127.0.0.1/' "$REL/files/d2k-tg-watchdog.sh"
 
 # Keenetic DNS lifecycle is exercised with a stateful ndmc double. curl is
 # wrapped only for the external resolver and Instagram probes; the real curl
@@ -169,11 +174,11 @@ grep -q "готово" /tmp/install1.log || fail "установка с чист
 [ "$(grep -c '^instagram.com 157.240.9.174$' "$DIR/state/instagram-ip-hosts.tsv")" = 1 ] || fail "установщик не сохранил владение Instagram-записью"
 [ "$(grep -c '^www.instagram.com 157.240.9.175$' "$DIR/state/instagram-ip-hosts.tsv" || true)" = 0 ] || fail "установщик присвоил себе заранее существующую запись"
 [ -s "$DIR/files/tg-roots.pem" ] || fail "не установлен CA bundle Telegram"
-[ "$(/opt/sbin/d2ktg --version)" = "d2k-tg-0.1" ] || fail "не запускается C-туннель Telegram"
-[ "$(grep -c '^TG_ENABLED=0$' "$DIR/config")" = 1 ] || fail "Telegram должен быть выключен по умолчанию"
-[ "$(grep -Ec '^#[[:space:]]*TG_RELAY_SECRET=' "$DIR/config")" = 1 ] || fail "секрет ретранслятора не должен задаваться по умолчанию"
+/opt/sbin/d2ktg --version | grep -q 'features=per-install-enrollment' || fail "нет автоматической регистрации C-туннеля"
+[ "$(grep -c '^TG_ENABLED=1$' "$DIR/config")" = 1 ] || fail "Telegram должен быть включён по умолчанию"
 [ "$(grep -Ec '^[[:space:]]*TG_RELAY_SECRET=' "$DIR/config" || true)" = 0 ] || fail "шаблон не должен задавать relay secret активным ключом"
-[ ! -e "$DIR/run/d2ktg.pid" ] || fail "Telegram запущен без включения пользователем"
+[ -e "$DIR/run/d2ktg.pid" ] || fail "Telegram не запущен установщиком"
+[ "$(stat -c '%a' "$DIR/state/tg.identity")" = 600 ] || fail "ключ установки доступен не только root"
 [ -x /opt/sbin/d2kpanel ] || fail "C-панель не установлена"
 [ ! -x /opt/sbin/d2k ] || fail "legacy Go-панель осталась установленной"
 [ -s "$DIR/panel/index.html" ] && [ -s "$DIR/panel/panel.css" ] && [ -s "$DIR/panel/panel.js" ] && [ -s "$DIR/panel/logo-d2k.png" ] && [ -s "$DIR/panel/mascot-d2k.png" ] || fail "не установлены статические ресурсы панели"
@@ -194,9 +199,9 @@ done
 [ "$PANEL_OK" = 1 ] || fail "C-панель не отдала /api/status"
 grep -q '"snapshot"' /tmp/d2k-panel-status.json || fail "API не вернул status snapshot"
 grep -q '"controls_enabled":true' /tmp/d2k-panel-status.json || fail "loopback-панель не включила управление сервисом"
-grep -q '"telegram_enabled":false' /tmp/d2k-panel-status.json || fail "API считает выключенный Telegram включённым"
-grep -q '"telegram_configured":false' /tmp/d2k-panel-status.json || fail "API считает Telegram настроенным без секрета и URL"
-grep -q '"telegram_status":"not_configured"' /tmp/d2k-panel-status.json || fail "API неверно показывает состояние не настроенного Telegram"
+grep -q '"telegram_enabled":true' /tmp/d2k-panel-status.json || fail "API считает включённый Telegram выключенным"
+grep -q '"telegram_configured":true' /tmp/d2k-panel-status.json || fail "API не распознал регистрацию без общего секрета"
+grep -q '"telegram_status":"connecting"' /tmp/d2k-panel-status.json || fail "закрытый локальный порт не должен давать статус connected"
 if grep -q 'TG_RELAY_SECRET\|relay_secret\|telegram.*secret' /tmp/d2k-panel-status.json; then
     fail "API раскрыл поле или значение секрета ретранслятора"
 fi
@@ -221,6 +226,8 @@ REAPPLY_FAILED=0
 for pid in $REAPPLY_PIDS; do wait "$pid" || REAPPLY_FAILED=1; done
 [ "$REAPPLY_FAILED" = 0 ] || fail "параллельное восстановление завершилось ошибкой"
 "$INIT" status | grep -q "правила: стоят" || fail "параллельное восстановление оставило firewall частичным"
+panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-disable | grep -q '"ok":true' || fail "панель не выключила Telegram"
+sed -i '/^TG_RELAY_URL=/d; /^TG_ENROLL_PORT=/d' "$DIR/config"
 if panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-enable >/tmp/d2k-telegram-enable.json; then
     fail "панель включила Telegram без URL и relay secret"
 fi
@@ -352,7 +359,7 @@ ipset list d2k_tg_dc6 >/dev/null 2>&1 && fail "после удаления ос�
 [ -e /opt/sbin/d2kc.pre-goal-lab ] && fail "после удаления остался pre-goal backup"
 [ -e /opt/sbin/d2kc.pre-sched-lab ] && fail "после удаления остался pre-sched backup"
 [ "$(rules)" = "$CLEAN_RULES" ] || fail "после удаления список правил не совпал с исходным"
-[ ! -e "$DIR" ] && fail "обычное удаление оставило каталог D2K"
+[ -e "$DIR" ] && fail "обычное удаление оставило каталог D2K"
 echo "удалено без следов, включая каталог коробок"
 
 echo

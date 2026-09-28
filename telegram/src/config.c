@@ -62,7 +62,7 @@ int tg_relay_url_parse(const char *url,tg_relay_url *out) {
 
 int tg_config_read(const char *path,tg_config *out) {
     enum { K_ENABLED=1u<<0,K_URL=1u<<1,K_SECRET=1u<<2,K_IDENTITY=1u<<3,
-           K_CA=1u<<4,K_STATUS=1u<<5,K_PORT=1u<<6,K_STATE=1u<<7 };
+           K_CA=1u<<4,K_STATUS=1u<<5,K_PORT=1u<<6,K_STATE=1u<<7,K_ENROLL=1u<<8 };
     FILE *f;char line[2048],state_dir[512]="/opt/d2k/state";unsigned seen=0;int rc=-1;
     int have_identity=0,have_status=0;
     if(!path||!out)return -1;
@@ -83,6 +83,7 @@ int tg_config_read(const char *path,tg_config *out) {
         else if(strcmp(key,"TG_CA_BUNDLE")==0){bit=K_CA;dst=out->ca_bundle;cap=sizeof(out->ca_bundle);}
         else if(strcmp(key,"TG_STATUS")==0){bit=K_STATUS;dst=out->status_path;cap=sizeof(out->status_path);}
         else if(strcmp(key,"TG_PORT")==0)bit=K_PORT;
+        else if(strcmp(key,"TG_ENROLL_PORT")==0)bit=K_ENROLL;
         else if(strcmp(key,"STATE_DIR")==0){bit=K_STATE;dst=state_dir;cap=sizeof(state_dir);}
         if(!bit)continue;
         if(seen&bit)goto done;seen|=bit;
@@ -91,9 +92,12 @@ int tg_config_read(const char *path,tg_config *out) {
             if(strcmp(value,"1")==0||strcmp(value,"yes")==0)out->enabled=1;
             else if(strcmp(value,"0")==0||strcmp(value,"no")==0)out->enabled=0;
             else goto done;
-        } else if(bit==K_PORT) {
+        } else if(bit==K_PORT||bit==K_ENROLL) {
+            if(!*value)goto done;
             for(const char *p=value;*p;p++)if(!isdigit((unsigned char)*p))goto done;
-            errno=0;unsigned long v=strtoul(value,NULL,10);if(errno||v!=1443)goto done;out->listen_port=(uint16_t)v;
+            errno=0;unsigned long v=strtoul(value,NULL,10);if(errno||v==0||v>65535)goto done;
+            if(bit==K_PORT){if(v!=1443)goto done;out->listen_port=(uint16_t)v;}
+            else out->enroll_port=(uint16_t)v;
         } else if(!*value||copy_value(dst,cap,value)!=0)goto done;
         if(bit==K_IDENTITY)have_identity=1;
         if(bit==K_STATUS)have_status=1;

@@ -71,7 +71,7 @@ static int known_key(const char *key) {
         "STATS_SEC", "HEAL_EVERY", "LOGMAX", "LOGKEEP", "PORTS",
         "CONNBYTES", "VOICE_PORTS", "VOICE_CONNBYTES", "TG_ENABLED",
         "TG_RELAY_URL", "TG_RELAY_SECRET", "TG_IDENTITY", "TG_CA_BUNDLE",
-        "TG_STATUS", "TG_PORT"
+        "TG_STATUS", "TG_PORT", "TG_ENROLL_PORT"
     };
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
         if (strcmp(key, keys[i]) == 0) { return 1; }

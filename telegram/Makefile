@@ -8,7 +8,14 @@ OPENSSL_LIBS ?= $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcr
 
 .PHONY: test test-wire test-relay test-tls test-session test-streams test-config clean arm64 d2ktg
 
-test: test-wire test-relay test-tls test-session test-streams test-config
+test: test-wire test-relay test-tls test-session test-streams test-config test-enroll
+
+test-enroll: $(BUILD_DIR)/test-enroll
+	./$(BUILD_DIR)/test-enroll
+
+$(BUILD_DIR)/test-enroll: test_enroll.c src/enroll.c src/identity.c include/tg_enroll.h
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -o $@ test_enroll.c src/enroll.c src/identity.c $(OPENSSL_LIBS)
 
 test-wire: $(BUILD_DIR)/test-wire
 	./$(BUILD_DIR)/test-wire
@@ -30,7 +37,7 @@ test-config: $(BUILD_DIR)/test-config
 
 d2ktg: $(BUILD_DIR)/d2ktg
 
-$(BUILD_DIR)/d2ktg: src/main.c src/config.c src/tls.c src/ws.c src/ws_pump.c src/identity.c src/register.c src/net.c src/wire.c src/tunnel.c src/listener.c src/streams.c src/queue.c src/session.c
+$(BUILD_DIR)/d2ktg: src/main.c src/config.c src/tls.c src/ws.c src/ws_pump.c src/identity.c src/register.c src/enroll.c src/net.c src/wire.c src/tunnel.c src/listener.c src/streams.c src/queue.c src/session.c
 	mkdir -p $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -o $@ $^ $(OPENSSL_LIBS)
 
@@ -43,9 +50,9 @@ $(BUILD_DIR)/test-relay: test_relay.c src/ws.c src/identity.c src/net.c include/
 	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -o $@ test_relay.c src/ws.c src/identity.c src/net.c $(OPENSSL_LIBS)
 
 
-$(BUILD_DIR)/test-tls: test_tls.c ../files/tg-roots.pem src/tls.c src/ws.c src/ws_pump.c src/identity.c src/register.c src/net.c src/wire.c src/tunnel.c src/listener.c src/streams.c src/queue.c src/session.c include/tg_tls.h include/tg_ws.h include/tg_register.h include/tg_identity.h include/tg_net.h include/tg_tunnel.h include/tg_streams.h include/tg_listener.h include/tg_session.h include/tg_wire.h
+$(BUILD_DIR)/test-tls: test_tls.c ../files/tg-roots.pem src/tls.c src/ws.c src/ws_pump.c src/identity.c src/register.c src/enroll.c src/net.c src/wire.c src/tunnel.c src/listener.c src/streams.c src/queue.c src/session.c include/tg_tls.h include/tg_ws.h include/tg_register.h include/tg_identity.h include/tg_net.h include/tg_tunnel.h include/tg_streams.h include/tg_listener.h include/tg_session.h include/tg_wire.h
 	mkdir -p $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -pthread -o $@ test_tls.c src/tls.c src/ws.c src/ws_pump.c src/identity.c src/register.c src/net.c src/wire.c src/tunnel.c src/listener.c src/streams.c src/queue.c src/session.c $(OPENSSL_LIBS)
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -pthread -o $@ test_tls.c src/tls.c src/ws.c src/ws_pump.c src/identity.c src/register.c src/enroll.c src/net.c src/wire.c src/tunnel.c src/listener.c src/streams.c src/queue.c src/session.c $(OPENSSL_LIBS)
 
 $(BUILD_DIR)/test-session: test_session.c src/session.c src/wire.c src/identity.c include/tg_session.h include/tg_wire.h include/tg_identity.h
 	mkdir -p $(BUILD_DIR)

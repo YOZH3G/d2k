@@ -6,6 +6,7 @@
 #include "tg_identity.h"
 #include "tg_net.h"
 #include "tg_register.h"
+#include "tg_enroll.h"
 #include "tg_session.h"
 #include "tg_tunnel.h"
 #include "tg_tls.h"
@@ -24,7 +25,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TG_BUILD "d2k-tg-0.1"
+#define TG_BUILD "d2k-tg-0.2"
 #define TG_DEFAULT_WINDOW (2u*1024u*1024u)
 
 static volatile sig_atomic_t stop_requested;
@@ -75,16 +76,19 @@ static void close_ws(SSL **ssl,int *fd) {
     if(*ssl){SSL_free(*ssl);*ssl=NULL;}if(*fd>=0){close(*fd);*fd=-1;}
 }
 
+static int register_identity(const tg_config *cfg,const tg_relay_url *url,tg_identity *identity) {
+    if(!cfg->relay_secret[0])return tg_enroll_identity(url->host,cfg->enroll_port,cfg->ca_bundle,identity);
+    return tg_register_identity(url->host,url->port,url->host,cfg->ca_bundle,cfg->relay_secret,identity);
+}
+
 static int ensure_registered(const tg_config *cfg,const tg_relay_url *url,tg_identity *identity) {
-    int rc=tg_register_identity(url->host,url->port,url->host,cfg->ca_bundle,
-                                cfg->relay_secret,identity);
+    int rc=register_identity(cfg,url,identity);
     if(rc!=TG_REGISTER_ID_CONFLICT)return rc;
     log_msg("relay reports an identity conflict; rotating the local installation identity");
     tg_identity_cleanup(identity);
     if(unlink(cfg->identity_path)!=0&&errno!=ENOENT)return -1;
     if(tg_identity_load_or_mint(cfg->identity_path,identity)!=0)return -1;
-    return tg_register_identity(url->host,url->port,url->host,cfg->ca_bundle,
-                                cfg->relay_secret,identity);
+    return register_identity(cfg,url,identity);
 }
 
 static void interruptible_wait(uint32_t delay_ms) {
@@ -100,7 +104,7 @@ static double random_unit(void) {
 static int run_daemon(const char *config_path) {
     tg_config cfg;tg_relay_url url;tg_identity identity={0};SSL_CTX *ctx=NULL;int listener=-1,rc=1;
     if(tg_config_read(config_path,&cfg)!=0){log_msg("cannot read configuration");return 1;}
-    if(!cfg.enabled||!cfg.relay_url[0]||!cfg.relay_secret[0]){
+    if(!cfg.enabled||!cfg.relay_url[0]||(!cfg.relay_secret[0]&&!cfg.enroll_port)){
         (void)write_status(cfg.status_path,"not_configured\n");tg_config_clean(&cfg);return 0;
     }
     if(tg_relay_url_parse(cfg.relay_url,&url)!=0){log_msg("TG_RELAY_URL must be a valid wss://host[:port]/ws URL");(void)write_status(cfg.status_path,"error\n");goto done;}
@@ -160,7 +164,7 @@ done:
 static int check_config(const char *path) {
     tg_config cfg;tg_relay_url url;
     int ok=tg_config_read(path,&cfg)==0;
-    if(ok)ok=cfg.relay_secret[0]&&cfg.relay_url[0]&&access(cfg.ca_bundle,R_OK)==0&&
+    if(ok)ok=(cfg.relay_secret[0]||cfg.enroll_port)&&cfg.relay_url[0]&&access(cfg.ca_bundle,R_OK)==0&&
         tg_relay_url_parse(cfg.relay_url,&url)==0;
     tg_config_clean(&cfg);return ok?0:1;
 }
@@ -173,7 +177,7 @@ static int redirect_log(const char *path) {
 
 int main(int argc,char **argv) {
     const char *config="/opt/d2k/config",*log_path=NULL;
-    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD);return 0;}
+    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=per-install-enrollment");return 0;}
     if(argc==2&&strcmp(argv[1],"--help")==0){puts("d2ktg [--config FILE]");return 0;}
     if(argc==3&&strcmp(argv[1],"--check-config")==0)return check_config(argv[2]);
     for(int i=1;i<argc;i++) {

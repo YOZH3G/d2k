@@ -512,7 +512,7 @@ telegram_start() {
     [ "${TG_ENABLED:-0}" = 1 ] || { write_telegram_status stopped; return 0; }
     [ -x "$TGBIN" ] || { say "Telegram включён, но нет $TGBIN"; write_telegram_status error; return 1; }
     "$TGBIN" --check-config "$CONF" >/dev/null 2>&1 || {
-        say "Telegram включён, но TG_RELAY_URL/TG_RELAY_SECRET не настроены корректно"
+        say "Telegram включён, но адрес релея или способ регистрации не настроены корректно"
         write_telegram_status not_configured
         return 1
     }
