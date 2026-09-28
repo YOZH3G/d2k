@@ -72,7 +72,7 @@ cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
 make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
-cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js "$REL/internal/web/assets/"
+cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/logo-d2k.png internal/web/assets/mascot-d2k.png "$REL/internal/web/assets/"
 cp files/S99d2k files/config files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
 cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fake/"
 
@@ -93,7 +93,7 @@ grep -q "готово" /tmp/install1.log || fail "установка с чист
 [ -x /opt/sbin/d2kc ] || fail "d2kc не установлен"
 [ -x /opt/sbin/d2kpanel ] || fail "C-панель не установлена"
 [ ! -x /opt/sbin/d2k ] || fail "legacy Go-панель осталась установленной"
-[ -s "$DIR/panel/index.html" ] && [ -s "$DIR/panel/panel.css" ] && [ -s "$DIR/panel/panel.js" ] || fail "не установлены статические ресурсы панели"
+[ -s "$DIR/panel/index.html" ] && [ -s "$DIR/panel/panel.css" ] && [ -s "$DIR/panel/panel.js" ] && [ -s "$DIR/panel/logo-d2k.png" ] && [ -s "$DIR/panel/mascot-d2k.png" ] || fail "не установлены статические ресурсы панели"
 [ -x "$INIT" ]        || fail "init-скрипт не установлен"
 [ -f "$DIR/run/d2k-panel.pid" ] || fail "C-панель не получила pid-файл"
 PANEL_PID=$(cat "$DIR/run/d2k-panel.pid")
@@ -110,7 +110,19 @@ while [ "$i" -lt 30 ]; do
 done
 [ "$PANEL_OK" = 1 ] || fail "C-панель не отдала /api/status"
 grep -q '"snapshot"' /tmp/d2k-panel-status.json || fail "API не вернул status snapshot"
+grep -q '"controls_enabled":true' /tmp/d2k-panel-status.json || fail "loopback-панель не включила управление сервисом"
 curl -fsS http://127.0.0.1:8090/ | grep -q 'id="app"' || fail "C-панель не отдала главную страницу"
+curl -fsS http://127.0.0.1:8090/assets/logo-d2k.png -o /tmp/d2k-logo.png || fail "C-панель не отдала знак D2K"
+curl -fsS http://127.0.0.1:8090/assets/mascot-d2k.png -o /tmp/d2k-mascot.png || fail "C-панель не отдала маскота D2K"
+curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/stop | grep -q '"ok":true' || fail "локальная панель не остановила движок"
+[ -d "/proc/$PANEL_PID" ] || fail "остановка движка погасила панель управления"
+curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-stopped.json || fail "панель недоступна после остановки движка"
+grep -q '"engine_running":false' /tmp/d2k-panel-stopped.json || fail "после остановки API продолжает считать движок работающим"
+grep -q '"controller_running":false' /tmp/d2k-panel-stopped.json || fail "после остановки API продолжает считать контроллер работающим"
+grep -q '"linked":false' /tmp/d2k-panel-stopped.json || fail "API сохранил linked=true после остановки движка"
+curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/start | grep -q '"ok":true' || fail "локальная панель не запустила движок"
+"$INIT" status | grep -q "датапат: работает" || fail "движок не восстановился из панели"
+curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/reapply | grep -q '"ok":true' || fail "локальная панель не восстановила правила"
 echo "установлено и работает"
 
 echo "== 2. переход версии =="

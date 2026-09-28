@@ -51,6 +51,7 @@
 #include "d2k_quic.h"
 #include "test_quic_vector.h"
 #include "d2k_tls13.h"
+#include "d2k_meas.h"
 
 /* Что планировщик говорил о себе. Нужен не для красоты: узнавание коробки
    снаружи иначе НЕ отличить от совпадения имени — имя коробки выводится из
@@ -3690,7 +3691,7 @@ voice_only_run:
                 0x01, 0x01, 0x00, 0x0a, 0x00, 0x01, 0x00, 0x01,
                 0x06, 0x00, 0x00, 0x00, 0x00, 0x00
             };
-            tcp_calls = vol_calls = 0;
+            tcp_calls = quic_calls = vol_calls = 0;
             ver_calls = voice_calls = 0;
             forget_sent();
             d2k_ev h = ev_hello(17, 40200, D2K_LINK_VOICE_CLASS);
@@ -3735,11 +3736,44 @@ voice_only_run:
                   "UDP-наблюдение голоса потеряно либо названо подтверждением");
             forget_sent();
             skip_ahead(s, 10 * 60 * 1000 + 1);
-            CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 1,
+            CHECK(sent_command_count(D2K_CMD_DEL_NAME_PROBE, NULL, 0) == 1,
                   "UDP-ответ оставил неподтверждённый голосовой кандидат навсегда");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cV);
+
+        d2k_catalog cS;
+        memset(&cS, 0, sizeof cS);
+        saidbuf[0] = '\0';
+        s = d2k_sched_new(&cS, sv[0], 0x2d);
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            forget_sent();
+            /* Оба порта выше эфемерной границы: server_of выбирает меньший,
+               то есть адрес сервера 127.0.0.1, а не клиента 192.168.1.67. */
+            d2k_ev h = ev_hello(17, 52005, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 52005);
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            drain();
+            d2k_ev ap = ev_applied(17, 52005);
+            d2k_sched_event(s, &ap);
+            d2k_ev ex = ev_exchange(17, 52005, 0);
+            ex.code = D2K_UDP_PROOF_STUN;
+            d2k_sched_event(s, &ex);
+            spin(s, 20);
+            const d2k_cat_binding *bd = binding_of(&cS, "127.0.0.1", 17);
+            CHECK(bd != NULL && strcmp(bd->kind, "addr") == 0 &&
+                  strcmp(bd->target, "127.0.0.1") == 0 &&
+                  bd->verified_by == D2K_VERBY_STUN,
+                  "валидный STUN proof не создал адресную STUN-привязку");
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 1 &&
+                  sent_command_count(D2K_CMD_SET_NAME, NULL, 0) == 0,
+                  "STUN proof записал общий voice class вместо IP цели");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cS);
 
         /* Тот же путь, но поток разговора с приёмом МОЛЧИТ. */
         d2k_catalog cW;

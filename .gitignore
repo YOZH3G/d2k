@@ -6,7 +6,12 @@ docs/field/raw/
 spike/nfqview-c/nfqview-c-linux-*
 spike/bench/results/
 spike/nfqview-raw/nfqview-raw-linux-*
-builds/
+# Публикуемые arm64 runtime-артефакты, которые скачивает scripts/install.sh.
+# Остальные сборки и временные файлы каталога остаются локальными.
+builds/*
+!builds/d2kd-linux-arm64
+!builds/d2kc-linux-arm64
+!builds/d2kpanel-linux-arm64
 
 # Планы реализации — локальные, как и в z2k: публикуется спека, а не план.
 docs/superpowers/

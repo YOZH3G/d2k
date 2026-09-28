@@ -219,6 +219,51 @@ static d2k_ev ev_with_seen(uint8_t seen_types) {
 }
 
 int main(void) {
+    /* Controller status must turn false when the datapath peer vanishes;
+       checking a live PID alone is not enough to prove this link is alive. */
+    {
+        int sv[2] = {-1, -1};
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+              "socketpair (проверка живости связи) не создался");
+        if (sv[0] >= 0 && sv[1] >= 0) {
+            CHECK(d2k_link_peer_closed(sv[0]) == 0,
+                  "открытый управляющий сокет ошибочно признан закрытым");
+            close(sv[1]);
+            CHECK(d2k_link_peer_closed(sv[0]) == 1,
+                  "закрытый управляющий peer не распознан");
+            CHECK(d2k_link_peer_closed(-1) == -1,
+                  "ошибочный fd не вернул ошибку живости связи");
+            close(sv[0]);
+        }
+    }
+    /* On peer close POLLIN and POLLHUP can coexist. The controller's normal
+       256-event fairness cap must not discard a final finite batch. */
+    {
+        int sv[2] = {-1, -1};
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+              "socketpair (финальная очередь событий) не создался");
+        if (sv[0] >= 0 && sv[1] >= 0) {
+            const uint8_t hello[] = {0};
+            for (int i = 0; i < 300; i++) {
+                send_synthetic(sv[1], D2K_EV_HELLO, hello, sizeof hello);
+            }
+            close(sv[1]);
+            CHECK(d2k_link_peer_closed(sv[0]) == 1,
+                  "закрытие peer не видно при ещё читаемой очереди");
+            int received = 0;
+            for (;;) {
+                int drained = 0;
+                for (; drained < 256; drained++) {
+                    d2k_ev ev; char err[128];
+                    if (d2k_link_next(sv[0], &ev, 0, err, sizeof err) != 0) { break; }
+                    received++;
+                }
+                if (drained < 256 || d2k_link_peer_closed(sv[0]) != 1) { break; }
+            }
+            CHECK(received == 300, "закрытие потеряло конечную очередь из 300 событий");
+            close(sv[0]);
+        }
+    }
     /* A real closed AF_UNIX peer must return an error even when the
        application has the default SIGPIPE disposition (e.g. d2kask). */
     {

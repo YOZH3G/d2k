@@ -4,6 +4,7 @@
 #include "server.h"
 
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -11,6 +12,8 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -171,6 +174,36 @@ static int json_top_nonempty_string(const char *json, const char *key) {
            value[0] == '"' && value[len - 1] == '"';
 }
 
+static int pid_path_running(const char *path, time_t *started_at) {
+    if (started_at) { *started_at = 0; }
+    if (!path || !path[0]) { return 1; }
+    FILE *f = fopen(path, "r");
+    if (!f) { return 0; }
+    struct stat st;
+    int have_stat = fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode);
+    char line[32];
+    int ok = fgets(line, sizeof line, f) != NULL;
+    fclose(f);
+    if (!ok || !have_stat) { return 0; }
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(line, &end, 10);
+    if (errno || value <= 1 || value > 4194304L || !end) { return 0; }
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') { end++; }
+    if (*end) { return 0; }
+    int running = kill((pid_t)value, 0) == 0 || errno == EPERM;
+    if (running && started_at) { *started_at = st.st_mtime; }
+    return running;
+}
+
+static int engine_pid_running(const d2k_panel_config *cfg, time_t *started_at) {
+    return pid_path_running(cfg ? cfg->engine_pid_path : NULL, started_at);
+}
+
+static int controller_pid_running(const d2k_panel_config *cfg) {
+    return pid_path_running(cfg ? cfg->controller_pid_path : NULL, NULL);
+}
+
 static int write_all(int fd, const void *buf, size_t len) {
     const char *p = buf;
     while (len > 0) {
@@ -198,6 +231,151 @@ static int response(int fd, int code, const char *reason, const char *type,
     if (n < 0 || (size_t)n >= sizeof hdr) { return -1; }
     if (write_all(fd, hdr, (size_t)n) != 0) { return -1; }
     return len == 0 ? 0 : write_all(fd, body, len);
+}
+
+static int header_value(const char *req, const char *wanted,
+                        const char **value, size_t *value_len) {
+    const char *line = strstr(req, "\r\n");
+    if (!line) { return 0; }
+    line += 2;
+    while (*line && !(line[0] == '\r' && line[1] == '\n')) {
+        const char *end = strstr(line, "\r\n");
+        if (!end) { return 0; }
+        const char *colon = memchr(line, ':', (size_t)(end - line));
+        if (colon && (size_t)(colon - line) == strlen(wanted) &&
+            strncasecmp(line, wanted, strlen(wanted)) == 0) {
+            const char *start = colon + 1;
+            while (start < end && (*start == ' ' || *start == '\t')) { start++; }
+            const char *finish = end;
+            while (finish > start && (finish[-1] == ' ' || finish[-1] == '\t')) { finish--; }
+            *value = start;
+            *value_len = (size_t)(finish - start);
+            return 1;
+        }
+        line = end + 2;
+    }
+    return 0;
+}
+
+static int loopback_authority(const char *host, size_t len) {
+    const char *port = NULL;
+    size_t name_len = len;
+    if (len >= 5 && host[0] == '[') {
+        const char *close = memchr(host, ']', len);
+        if (!close || (size_t)(close - host) != 4 || memcmp(host, "[::1]", 5) != 0) { return 0; }
+        name_len = 5;
+        if (len > name_len) {
+            if (host[name_len] != ':') { return 0; }
+            port = host + name_len + 1;
+        }
+    } else {
+        size_t localhost_len = 9, ipv4_len = 9;
+        if (len >= localhost_len && memcmp(host, "localhost", localhost_len) == 0) {
+            name_len = localhost_len;
+        } else if (len >= ipv4_len && memcmp(host, "127.0.0.1", ipv4_len) == 0) {
+            name_len = ipv4_len;
+        } else { return 0; }
+        if (len > name_len) {
+            if (host[name_len] != ':') { return 0; }
+            port = host + name_len + 1;
+        }
+    }
+    if (!port) { return len == name_len; }
+    if (!*port) { return 0; }
+    unsigned long value = 0;
+    for (const char *p = port; p < host + len; p++) {
+        if (!isdigit((unsigned char)*p)) { return 0; }
+        value = value * 10 + (unsigned)(*p - '0');
+        if (value > 65535) { return 0; }
+    }
+    return value > 0;
+}
+
+static int same_loopback_origin(const char *req) {
+    const char *host = NULL, *origin = NULL;
+    size_t host_len = 0, origin_len = 0;
+    if (!header_value(req, "Host", &host, &host_len) ||
+        !header_value(req, "Origin", &origin, &origin_len) ||
+        origin_len < 7 || memcmp(origin, "http://", 7) != 0) { return 0; }
+    const char *authority = origin + 7;
+    size_t authority_len = origin_len - 7;
+    return loopback_authority(host, host_len) && host_len == authority_len &&
+           memcmp(host, authority, host_len) == 0;
+}
+
+static int run_service_action(const d2k_panel_config *cfg, const char *action) {
+    if (!cfg || !cfg->service_path || !cfg->service_path[0]) { return -1; }
+    pid_t pid = fork();
+    if (pid < 0) { return -1; }
+    if (pid == 0) {
+        execl(cfg->service_path, cfg->service_path, action, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) { continue; }
+        return -1;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
+static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
+                       const char *path) {
+    static const struct { const char *path; const char *command; const char *label; } actions[] = {
+        { "/api/control/start", "engine-start", "Запуск движка" },
+        { "/api/control/stop", "engine-stop", "Остановка движка" },
+        { "/api/control/restart", "engine-restart", "Перезапуск движка" },
+        { "/api/control/reapply", "reapply", "Восстановление правил" },
+    };
+    const char *command = NULL, *label = NULL;
+    for (size_t i = 0; i < sizeof actions / sizeof actions[0]; i++) {
+        if (strcmp(path, actions[i].path) == 0) {
+            command = actions[i].command;
+            label = actions[i].label;
+            break;
+        }
+    }
+    if (!command) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Неизвестная операция\"}";
+        return response(fd, 404, "Not Found", "application/json; charset=utf-8",
+                        body, sizeof body - 1);
+    }
+    if (!cfg || !cfg->control_enabled || !same_loopback_origin(req)) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Управление разрешено только с локальной панели\"}";
+        return response(fd, 403, "Forbidden", "application/json; charset=utf-8",
+                        body, sizeof body - 1);
+    }
+    if ((strcmp(command, "engine-start") == 0 ||
+         strcmp(command, "engine-restart") == 0) &&
+        cfg->mode && strcmp(cfg->mode, "off") == 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"В config задан MODE=off; сначала измените режим движка\"}";
+        return response(fd, 409, "Conflict", "application/json; charset=utf-8",
+                        body, sizeof body - 1);
+    }
+    const char *transfer = NULL;
+    size_t transfer_len = 0;
+    if (header_value(req, "Transfer-Encoding", &transfer, &transfer_len)) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Тело запроса запрещено\"}";
+        return response(fd, 400, "Bad Request", "application/json; charset=utf-8",
+                        body, sizeof body - 1);
+    }
+    const char *length = NULL;
+    size_t length_len = 0;
+    if (header_value(req, "Content-Length", &length, &length_len) &&
+        !(length_len == 1 && length[0] == '0')) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Тело запроса запрещено\"}";
+        return response(fd, 400, "Bad Request", "application/json; charset=utf-8",
+                        body, sizeof body - 1);
+    }
+    if (run_service_action(cfg, command) != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Команда службы завершилась ошибкой\"}";
+        return response(fd, 500, "Service Error", "application/json; charset=utf-8",
+                        body, sizeof body - 1);
+    }
+    char body[256];
+    int n = snprintf(body, sizeof body, "{\"ok\":true,\"action\":\"%s\",\"message\":\"Готово\"}", label);
+    if (n < 0 || (size_t)n >= sizeof body) { return -1; }
+    return response(fd, 200, "OK", "application/json; charset=utf-8", body, (size_t)n);
 }
 
 static int read_request(int fd, char *buf, size_t cap, size_t *used) {
@@ -293,6 +471,23 @@ static void buf_json_string(panel_buf *b, const char *s) {
     buf_puts(b, "\"");
 }
 
+static void buf_live_knowledge(panel_buf *b, const char *json, size_t len,
+                               int effective_linked) {
+    const char *value = NULL;
+    size_t value_len = 0;
+    if (!json_top_value(json, "linked", &value, &value_len) ||
+        value < json || (size_t)(value - json) > len ||
+        value_len > len - (size_t)(value - json)) {
+        buf_add(b, json, len);
+        return;
+    }
+    size_t offset = (size_t)(value - json);
+    buf_add(b, json, offset);
+    buf_puts(b, effective_linked ? "true" : "false");
+    size_t suffix_offset = offset + value_len;
+    buf_add(b, json + suffix_offset, len - suffix_offset);
+}
+
 static void append_stage(panel_buf *b, const char *key, const char *title,
                          int built, const char *detail, int comma) {
     if (comma) { buf_puts(b, ","); }
@@ -304,7 +499,8 @@ static void append_stage(panel_buf *b, const char *key, const char *title,
 }
 
 static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
-                            int linked, int have_catalog) {
+                            int linked, int have_catalog, int live_fresh,
+                            int engine_running, int controller_running) {
     time_t now = time(NULL);
     struct tm tmv;
     char now_iso[32], started_iso[32];
@@ -331,6 +527,11 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     buf_printf(b, ",\"config_exists\":%s,\"mode\":", cfg && cfg->config_exists ? "true" : "false");
     buf_json_string(b, mode);
     buf_puts(b, ",\"panel_listen\":"); buf_json_string(b, panel_listen);
+    buf_printf(b, ",\"controls_enabled\":%s", cfg && cfg->control_enabled ? "true" : "false");
+    buf_printf(b, ",\"catalog_available\":%s", have_catalog ? "true" : "false");
+    buf_printf(b, ",\"live_fresh\":%s", live_fresh ? "true" : "false");
+    buf_printf(b, ",\"engine_running\":%s", engine_running ? "true" : "false");
+    buf_printf(b, ",\"controller_running\":%s", controller_running ? "true" : "false");
     buf_puts(b, ",\"state_dir\":"); buf_json_string(b, state_dir);
     buf_puts(b, ",\"state_dir_note\":"); buf_json_string(b, state_note);
     buf_printf(b, ",\"queue_num\":%d,\"unknown_keys\":[", queue);
@@ -378,11 +579,23 @@ static int api_status(int fd, const d2k_panel_config *cfg) {
         if (!body) { free(live); return -1; }
         panel_buf b = { .p = body, .len = 0, .cap = cap, .failed = 0 };
         buf_puts(&b, "{\"snapshot\":");
-        int linked = json_top_true(live, "linked");
+        time_t now = time(NULL);
+        struct stat live_stat;
+        time_t engine_started_at = 0;
+        int engine_running = engine_pid_running(cfg, &engine_started_at);
+        int controller_running = controller_pid_running(cfg);
+        int live_fresh = cfg->live_path && stat(cfg->live_path, &live_stat) == 0 &&
+            S_ISREG(live_stat.st_mode) &&
+            (!engine_started_at || live_stat.st_mtime >= engine_started_at) &&
+            (live_stat.st_mtime > now ? live_stat.st_mtime - now <= 5 :
+                                         now - live_stat.st_mtime <= 15);
+        int linked = json_top_true(live, "linked") && live_fresh &&
+                     engine_running && controller_running;
         int have_catalog = json_top_nonempty_string(live, "catalog_at");
-        append_snapshot(&b, cfg, linked, have_catalog);
+        append_snapshot(&b, cfg, linked, have_catalog, live_fresh,
+                        engine_running, controller_running);
         buf_puts(&b, ",\"knowledge\":");
-        buf_add(&b, live, live_len);
+        buf_live_knowledge(&b, live, live_len, linked);
         buf_puts(&b, "}");
         if (b.failed) { free(body); free(live); return -1; }
         int rc = response(fd, 200, "OK", "application/json; charset=utf-8",
@@ -400,7 +613,8 @@ static int api_status(int fd, const d2k_panel_config *cfg) {
     if (!body) { return -1; }
     panel_buf b = { .p = body, .len = 0, .cap = cap, .failed = 0 };
     buf_puts(&b, "{\"snapshot\":");
-    append_snapshot(&b, cfg, 0, 0);
+    append_snapshot(&b, cfg, 0, 0, 0, engine_pid_running(cfg, NULL),
+                    controller_pid_running(cfg));
     buf_puts(&b, ",\"knowledge\":");
     buf_puts(&b, unavailable_knowledge);
     buf_puts(&b, "}");
@@ -460,11 +674,18 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
         (strcmp(version, "HTTP/1.1") != 0 && strcmp(version, "HTTP/1.0") != 0)) {
         return response(fd, 400, "Bad Request", "text/plain; charset=utf-8", "bad request\n", 12);
     }
+    char *query = strchr(path, '?');
+    if (query) { *query = '\0'; }
+    if (strncmp(path, "/api/control/", sizeof "/api/control/" - 1) == 0) {
+        if (strcmp(method, "POST") != 0) {
+            return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8",
+                            "method not allowed\n", 19);
+        }
+        return api_control(fd, cfg, req, path);
+    }
     if (strcmp(method, "GET") != 0) {
         return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8", "method not allowed\n", 19);
     }
-    char *query = strchr(path, '?');
-    if (query) { *query = '\0'; }
     if (strcmp(path, "/api/status") == 0) { return api_status(fd, cfg); }
     if (strcmp(path, "/") == 0) {
         return static_file(fd, cfg, "index.html", "text/html; charset=utf-8");
@@ -474,6 +695,15 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     }
     if (strcmp(path, "/assets/panel.js") == 0) {
         return static_file(fd, cfg, "panel.js", "application/javascript; charset=utf-8");
+    }
+    if (strcmp(path, "/assets/mascot.svg") == 0) {
+        return static_file(fd, cfg, "mascot.svg", "image/svg+xml; charset=utf-8");
+    }
+    if (strcmp(path, "/assets/logo-d2k.png") == 0) {
+        return static_file(fd, cfg, "logo-d2k.png", "image/png");
+    }
+    if (strcmp(path, "/assets/mascot-d2k.png") == 0) {
+        return static_file(fd, cfg, "mascot-d2k.png", "image/png");
     }
     (void)used;
     return response(fd, 404, "Not Found", "text/plain; charset=utf-8", "not found\n", 10);

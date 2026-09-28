@@ -184,6 +184,32 @@ void d2k_link_close(int fd) {
     }
 }
 
+int d2k_link_peer_closed(int fd) {
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int pr;
+    do {
+        pr = poll(&pfd, 1, 0);
+    } while (pr < 0 && errno == EINTR);
+    if (pr < 0) {
+        return -1;
+    }
+    if (pr == 0) {
+        return 0;
+    }
+    if (pfd.revents & POLLNVAL) {
+        errno = EBADF;
+        return -1;
+    }
+    return (pfd.revents & (POLLHUP | POLLERR)) ? 1 : 0;
+}
+
 int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
     if (!out) {
         say(err, errcap, "нет места для события");

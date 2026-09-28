@@ -4,14 +4,42 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">
-<title>d2k — состояние</title>
+<meta name="theme-color" content="#f3f5f2">
+<title>D2K — сетевой радар</title>
 <link rel="stylesheet" href="/assets/panel.css">
 <script src="/assets/panel.js" defer></script>
 </head>
 <body>
-<main class="wrap" id="app" aria-live="polite" aria-busy="true">
-  <h1>d2k</h1>
-  <p>Загружаю состояние измерителя…</p>
-</main>
+<div class="frame">
+  <aside class="rail">
+    <a class="brand" href="#overview" aria-label="D2K — на главную">
+      <img class="brand-mark" src="/assets/logo-d2k.png" alt="Знак D2K" width="48" height="48">
+      <span class="brand-name">D2K<span>Интернет под присмотром</span></span>
+    </a>
+    <p class="rail-caption">Сетевой радар</p>
+    <nav class="nav" aria-label="Разделы панели">
+      <a class="nav-link active" href="#overview"><span class="nav-glyph glyph-overview" aria-hidden="true"></span>Обзор</a>
+      <a class="nav-link" href="#searches"><span class="nav-glyph glyph-search" aria-hidden="true"></span>Подбор</a>
+      <a class="nav-link" href="#boxes"><span class="nav-glyph glyph-boxes" aria-hidden="true"></span>Результаты</a>
+      <a class="nav-link" href="#diagnostics"><span class="nav-glyph glyph-system" aria-hidden="true"></span>Диагностика</a>
+      <a class="nav-link" href="#controls"><span class="nav-glyph glyph-control" aria-hidden="true"></span>Управление</a>
+    </nav>
+    <div class="rail-bottom">
+      <span class="rail-dot" aria-hidden="true"></span>
+      <span><b id="rail-state">Подключаемся</b><small id="rail-updated">к локальному движку</small></span>
+    </div>
+    <span class="rail-version">D2K / Keenetic</span>
+  </aside>
+
+  <div class="workspace">
+    <header class="topbar">
+      <span class="crumb">Локальная панель <i>/</i> <b>Состояние сети</b></span>
+      <span class="live-indicator" id="live-indicator"><i></i><span>Получение данных</span></span>
+    </header>
+    <main id="app" class="content" aria-live="polite" aria-busy="true">
+      <div class="loading"><span class="loader" aria-hidden="true"></span><p>Подключаюсь к D2K…</p></div>
+    </main>
+  </div>
+</div>
 </body>
 </html>

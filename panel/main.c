@@ -50,7 +50,8 @@ static void say(const char *fmt, ...) {
 
 static void usage(FILE *f) {
     fputs("d2kpanel --version | serve [--config FILE] [--live FILE] [--assets DIR] "
-          "[--listen HOST:PORT] [--state-dir DIR] [--mode MODE] [--queue N] [--log FILE]\n",
+          "[--listen HOST:PORT] [--state-dir DIR] [--mode MODE] [--queue N] "
+          "[--service FILE] [--engine-pid FILE] [--controller-pid FILE] [--log FILE]\n",
           f);
 }
 
@@ -191,6 +192,11 @@ static int listen_socket(const char *addr) {
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         listener = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (listener < 0) { continue; }
+        if (fcntl(listener, F_SETFD, FD_CLOEXEC) != 0) {
+            close(listener);
+            listener = -1;
+            continue;
+        }
         int yes = 1;
         (void)setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
         if (bind(listener, ai->ai_addr, ai->ai_addrlen) == 0 && listen(listener, 16) == 0) { break; }
@@ -222,7 +228,8 @@ static void set_state_note(const char *dir, char *out, size_t cap) {
 
 static int serve(const char *listen_addr, const char *live_path, const char *asset_dir,
                  const char *config_path, const char *mode, const char *state_dir,
-                 int queue, const char *log_path) {
+                 int queue, const char *service_path, const char *engine_pid_path,
+                 const char *controller_pid_path, const char *log_path) {
     if (log_path && log_path[0]) {
         int logfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (logfd < 0) { say("не открыть журнал %s: %s", log_path, strerror(errno)); return 1; }
@@ -277,12 +284,16 @@ static int serve(const char *listen_addr, const char *live_path, const char *ass
         .config_path = config_path,
         .state_dir = config_state,
         .state_dir_note = state_note,
+        .service_path = service_path,
+        .engine_pid_path = engine_pid_path,
+        .controller_pid_path = controller_pid_path,
         .unknown_keys = unknown_ptrs,
         .unknown_key_count = n_unknown,
         .started_epoch = (long long)time(NULL),
         .queue_num = queue,
         .config_exists = config_exists,
         .dirty = D2K_PANEL_DIRTY,
+        .control_enabled = is_loopback_addr(listen_addr),
     };
     printf("d2kpanel %s\nhttp://%s/\n", D2K_PANEL_VERSION, listen_addr);
     fflush(stdout);
@@ -296,6 +307,7 @@ static int serve(const char *listen_addr, const char *live_path, const char *ass
             continue;
         }
         struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
+        (void)fcntl(client, F_SETFD, FD_CLOEXEC);
         (void)setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
         (void)setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
         (void)d2k_panel_handle_fd(client, &cfg);
@@ -326,6 +338,9 @@ int main(int argc, char **argv) {
     char state_dir[512] = "/opt/d2k/state";
     int queue = 2000;
     const char *log_path = NULL;
+    const char *service_path = "/opt/etc/init.d/S99d2k";
+    const char *engine_pid_path = "/opt/d2k/run/d2kd.pid";
+    const char *controller_pid_path = "/opt/d2k/run/d2k.pid";
     int cli_listen = 0, cli_mode = 0, cli_state = 0, cli_queue = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) { config_path = argv[++i]; }
@@ -348,7 +363,10 @@ int main(int argc, char **argv) {
             if (!end || *end || v < 0 || v > 65535) { return 2; }
             queue = (int)v;
             cli_queue = 1;
-        } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) { log_path = argv[++i]; }
+        } else if (strcmp(argv[i], "--service") == 0 && i + 1 < argc) { service_path = argv[++i]; }
+        else if (strcmp(argv[i], "--engine-pid") == 0 && i + 1 < argc) { engine_pid_path = argv[++i]; }
+        else if (strcmp(argv[i], "--controller-pid") == 0 && i + 1 < argc) { controller_pid_path = argv[++i]; }
+        else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) { log_path = argv[++i]; }
         else { usage(stderr); return 2; }
     }
     if (!valid_mode(mode)) { say("недопустимый MODE: %s", mode); return 2; }
@@ -369,5 +387,6 @@ int main(int argc, char **argv) {
         if (n < 0 || (size_t)n >= sizeof live_path) { return 2; }
     }
     return serve(listen_addr, live_path, asset_dir, config_path, mode,
-                 state_dir, queue, log_path);
+                 state_dir, queue, service_path, engine_pid_path,
+                 controller_pid_path, log_path);
 }

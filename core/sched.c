@@ -381,6 +381,7 @@ typedef struct {
     int         voice_flow_bound;
     int         voice_answered;
     int         voice_proven;
+    uint8_t     voice_proof_code;
     int         voice_silent;
     int64_t     voice_watch_ms;
 
@@ -2809,6 +2810,7 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
     }
     t->trial_installed = 1;
     t->trial_shape = D2K_LINK_SHAPE_VOICE;
+    t->probe_sport_be = htons(r.client_port);
     t->probes += r.probes;
     s->probes_used += r.probes;
     t->state = T_VOICE_TRIAL;
@@ -2863,28 +2865,51 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     box_id_for(s, t, text, box_id, sizeof box_id);
     snprintf(wire, sizeof wire, "%s", text);
     err[0] = '\0';
-    if (stamp_plan_id(wire, wire_id) != 0 ||
-        d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0 ||
-        d2k_link_set_name(s->link_fd, t->name, 17, hex, D2K_LINK_SHAPE_VOICE,
-                          err, sizeof err) != 0) {
-        say(s, "по %s (голос) ответ протокола валиден, но постоянный Plan не поставился: %s",
-            t->name, err[0] ? err : "ошибка записи");
+    int is_stun = t->voice_proof_code == D2K_UDP_PROOF_STUN;
+    int install_rc = -1;
+    if (stamp_plan_id(wire, wire_id) == 0 &&
+        d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) == 0) {
+        if (is_stun) {
+            uint8_t ip4[4];
+            if (inet_pton(AF_INET, t->ip, ip4) == 1) {
+                install_rc = d2k_link_set_addr(s->link_fd, ip4, hex, err, sizeof err);
+            } else {
+                snprintf(err, sizeof err, "адрес STUN-цели не является IPv4");
+            }
+        } else {
+            install_rc = d2k_link_set_name(s->link_fd, t->name, 17, hex,
+                                           D2K_LINK_SHAPE_VOICE, err, sizeof err);
+        }
+    }
+    if (install_rc != 0) {
+        say(s, "по %s (%s) ответ протокола валиден, но постоянный Plan не поставился: %s",
+            t->name, is_stun ? "STUN" : "голос",
+            err[0] ? err : "ошибка записи");
         task_fail(s, t, now_ms);
         return;
     }
-    (void)bind_confirmed(s->cat, box_id, plan_id, text, "voice",
-                         t->name, "name", 17, D2K_LINK_SHAPE_VOICE,
-                         D2K_VERBY_CLIENT, D2K_INPUT_PROFILE,
+    if (is_stun) {
+        (void)d2k_link_del_name_probe(s->link_fd, t->name, 17,
+                                      D2K_LINK_SHAPE_VOICE,
+                                      t->probe_sport_be, err, sizeof err);
+    }
+    (void)bind_confirmed(s->cat, box_id, plan_id, text,
+                         is_stun ? "stun" : "voice",
+                         is_stun ? t->ip : t->name,
+                         is_stun ? "addr" : "name", 17, D2K_LINK_SHAPE_VOICE,
+                         is_stun ? D2K_VERBY_STUN : D2K_VERBY_CLIENT,
+                         D2K_INPUT_PROFILE,
                          wall_s(s, now_ms), &t->fp);
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
     t->trial_installed = 0;
     t->voice_answered = 0;
     t->voice_proven = 0;
+    t->voice_proof_code = 0;
     t->state = T_WATCHING;
     s->confirms++;
     s->sync_pending = 1;
-    say(s, "по %s (голос) ПОДТВЕРЖДЕНО ответом Discord IP Discovery: %s",
-        t->name, plan_id);
+    say(s, "по %s (%s) ПОДТВЕРЖДЕНО протокольным ответом: %s",
+        t->name, is_stun ? "STUN" : "голос", plan_id);
 }
 
 static void voice_fail(d2k_sched *s, task *t, int64_t now_ms) {
@@ -3565,7 +3590,11 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
         task *t = &s->tasks[i];
         if (t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
             t->voice_answered = 1;
-            if (ev->code == D2K_UDP_PROOF_VOICE_DISCOVERY) { t->voice_proven = 1; }
+            if (ev->code == D2K_UDP_PROOF_VOICE_DISCOVERY ||
+                ev->code == D2K_UDP_PROOF_STUN) {
+                t->voice_proven = 1;
+                t->voice_proof_code = ev->code;
+            }
             return;
         }
     }

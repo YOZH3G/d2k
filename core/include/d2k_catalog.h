@@ -216,6 +216,7 @@ typedef struct {
  * отсутствие в записи. */
 #define D2K_VERBY_PROBE  1
 #define D2K_VERBY_CLIENT 2
+#define D2K_VERBY_STUN   3
 
 /* Совместима ли ЗАПИСАННАЯ форма приветствия (stored) с той, в которой
  * проверка идёт СЕЙЧАС (got). 1 — не противоречат, 0 — противоречат.

@@ -253,6 +253,7 @@ int main(int argc, char **argv) {
 
     int64_t last_tick = now_ms(), last_save = last_tick;
     uint64_t dirty = cat.revision; /* catalog contents changed since last save */
+    int link_lost = 0;
 
     while (!stop_asked) {
         struct pollfd pfd[2];
@@ -278,39 +279,61 @@ int main(int argc, char **argv) {
                датапат за секунду присылает сотни наблюдений, и круг poll на
                каждое был бы чистой тратой. Нулевой потолок — «только то, что
                уже в буфере». */
-            for (int i = 0; i < 256; i++) {
-                d2k_ev ev;
-                if (d2k_link_next(fd, &ev, 0, err, sizeof err) != 0) { break; }
-                seen_events++;
-                switch (ev.kind) {
-                case D2K_EV_HELLO:    seen_hello++; break;
-                case D2K_EV_SUSPECT:  seen_suspect++; break;
-                case D2K_EV_EXCHANGE: seen_exchange++; break;
-                case D2K_EV_APPLIED:  seen_applied++; break;
-                case D2K_EV_REFUSED:  seen_refused++; break;
-                case D2K_EV_PROTO:
-                    /* ВЕРСИЯ ПРОВОДА. Чужая — работать нельзя: смешанная пара
-                       не падает и не ругается, она молча не даёт
-                       подтверждений, и всё измерение уходит в никуда. Лучше
-                       громкий отказ сейчас, чем полдня пустых замеров. */
-                    proto_seen = 1;
-                    /* Предел отправки едет тем же событием и нужен сборке
-                       планов: тело фальшивки обязано помещаться в канал. */
-                    d2k_sched_set_send_cap(s, ev.send_maxlen);
-                    if (ev.num != (uint32_t)D2K_CTL_PROTO_VERSION) {
-                        fprintf(stderr,
-                            "d2kc: датапат говорит на версии протокола %u, наша %u — "
-                            "работать с такой парой нельзя: подтверждений она не даст, "
-                            "а измерения будут пустыми. Обновите d2kd, d2kc и d2kask "
-                            "вместе, из одного дерева.\n",
-                            (unsigned)ev.num, (unsigned)D2K_CTL_PROTO_VERSION);
-                        proto_bad = 1;
+            for (;;) {
+                int drained = 0;
+                for (; drained < 256; drained++) {
+                    d2k_ev ev;
+                    if (d2k_link_next(fd, &ev, 0, err, sizeof err) != 0) { break; }
+                    seen_events++;
+                    switch (ev.kind) {
+                    case D2K_EV_HELLO:    seen_hello++; break;
+                    case D2K_EV_SUSPECT:  seen_suspect++; break;
+                    case D2K_EV_EXCHANGE: seen_exchange++; break;
+                    case D2K_EV_APPLIED:  seen_applied++; break;
+                    case D2K_EV_REFUSED:  seen_refused++; break;
+                    case D2K_EV_PROTO:
+                        /* ВЕРСИЯ ПРОВОДА. Чужая — работать нельзя: смешанная пара
+                           не падает и не ругается, она молча не даёт
+                           подтверждений, и всё измерение уходит в никуда. Лучше
+                           громкий отказ сейчас, чем полдня пустых замеров. */
+                        proto_seen = 1;
+                        /* Предел отправки едет тем же событием и нужен сборке
+                           планов: тело фальшивки обязано помещаться в канал. */
+                        d2k_sched_set_send_cap(s, ev.send_maxlen);
+                        if (ev.num != (uint32_t)D2K_CTL_PROTO_VERSION) {
+                            fprintf(stderr,
+                                "d2kc: датапат говорит на версии протокола %u, наша %u — "
+                                "работать с такой парой нельзя: подтверждений она не даст, "
+                                "а измерения будут пустыми. Обновите d2kd, d2kc и d2kask "
+                                "вместе, из одного дерева.\n",
+                                (unsigned)ev.num, (unsigned)D2K_CTL_PROTO_VERSION);
+                            proto_bad = 1;
+                        }
+                        break;
+                    default: break;
                     }
-                    break;
-                default: break;
+                    d2k_sched_event(s, &ev);
                 }
-                d2k_sched_event(s, &ev);
+                /* В обычном потоке ограничиваем круг 256 событиями, чтобы
+                   таймеры и планировщик не голодали. После закрытия peer
+                   очередь конечна: дочитываем её до EOF, иначе последняя
+                   пачка наблюдений теряется перед сохранением каталога. */
+                if (drained < 256 || d2k_link_peer_closed(fd) != 1) { break; }
             }
+        }
+        /* PID живого контроллера ещё не означает, что он связан с датапатом:
+           закрытый AF_UNIX peer даёт POLLHUP один раз. Не выходя здесь,
+           контроллер продолжал бы публиковать live.json с linked=true. */
+        int peer_closed = d2k_link_peer_closed(fd);
+        if (peer_closed != 0) {
+            if (peer_closed < 0) {
+                fprintf(stderr, "d2kc: проверка связи с датапатом: %s\n",
+                        strerror(errno));
+            } else {
+                fprintf(stderr, "d2kc: связь с датапатом оборвалась\n");
+            }
+            link_lost = 1;
+            break;
         }
         if (proto_bad) { break; }
 
@@ -382,5 +405,5 @@ int main(int argc, char **argv) {
     }
     d2k_link_close(fd);
     d2k_catalog_free(&cat);
-    return 0;
+    return link_lost ? 1 : 0;
 }

@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
+#include <utime.h>
 #include <unistd.h>
 
 typedef struct {
@@ -105,7 +107,24 @@ static void test_api_exposes_live_knowledge(void) {
     assert(strstr(response, "\"version\":\"test-version\"") != NULL);
     assert(strstr(response, "\"unknown_keys\":[\"FUTURE_OPTION\"]") != NULL);
     assert(strstr(response, "\"linked\":true") != NULL);
+    assert(strstr(response, "\"live_fresh\":true") != NULL);
     assert(strstr(response, "Content-Security-Policy:") != NULL);
+    cfg.engine_pid_path = "/tmp/d2k-panel-no-such-engine.pid";
+    cfg.controller_pid_path = "/tmp/d2k-panel-no-such-controller.pid";
+    (void)request(&cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                  response, sizeof response);
+    assert(strstr(response, "\"engine_running\":false") != NULL);
+    assert(strstr(response, "\"controller_running\":false") != NULL);
+    assert(strstr(response, "\"linked\":false") != NULL);
+    assert(strstr(response, "\"linked\":true") == NULL);
+    cfg.engine_pid_path = NULL;
+    struct utimbuf old = { .actime = time(NULL) - 60, .modtime = time(NULL) - 60 };
+    assert(utime(live, &old) == 0);
+    (void)request(&cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                  response, sizeof response);
+    assert(strstr(response, "\"live_fresh\":false") != NULL);
+    assert(strstr(response, "\"linked\":false") != NULL);
+    assert(strstr(response, "\"linked\":true") == NULL);
     unlink(live);
 }
 
@@ -143,6 +162,107 @@ static void test_unsupported_method_is_rejected(void) {
     (void)request(&cfg, "POST /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
                   response, sizeof response);
     assert(strstr(response, "HTTP/1.1 405 Method Not Allowed") != NULL);
+}
+
+static void test_panel_accepts_a_control_action_request(void) {
+    char service[] = "/tmp/d2k-panel-service.XXXXXX";
+    char marker[] = "/tmp/d2k-panel-action.XXXXXX";
+    int marker_fd = mkstemp(marker);
+    assert(marker_fd >= 0);
+    close(marker_fd);
+    int service_fd = mkstemp(service);
+    assert(service_fd >= 0);
+    char script[PATH_MAX];
+    int n = snprintf(script, sizeof script,
+        "#!/bin/sh\nprintf '%%s' \"$1\" > '%s'\nexit 0\n", marker);
+    assert(n > 0 && (size_t)n < sizeof script);
+    write_all(service_fd, script);
+    close(service_fd);
+    assert(chmod(service, 0700) == 0);
+    d2k_panel_config cfg = {
+        .live_path = "/absent", .asset_dir = "panel/assets",
+        .service_path = service, .control_enabled = 1,
+    };
+    char response[4096];
+    (void)request(&cfg,
+        "POST /api/control/stop HTTP/1.1\r\n"
+        "Host: localhost:8090\r\n"
+        "Origin: http://localhost:8090\r\n"
+        "Content-Length: 0\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    char action[64] = "";
+    FILE *f = fopen(marker, "r");
+    assert(f != NULL);
+    assert(fgets(action, sizeof action, f) != NULL);
+    fclose(f);
+    assert(strcmp(action, "engine-stop") == 0);
+    static const struct { const char *path; const char *command; } routes[] = {
+        { "start", "engine-start" }, { "restart", "engine-restart" },
+        { "reapply", "reapply" },
+    };
+    for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) {
+        char req[512];
+        n = snprintf(req, sizeof req,
+            "POST /api/control/%s HTTP/1.1\r\nHost: localhost:8090\r\n"
+            "Origin: http://localhost:8090\r\nContent-Length: 0\r\n\r\n",
+            routes[i].path);
+        assert(n > 0 && (size_t)n < sizeof req);
+        (void)request(&cfg, req, response, sizeof response);
+        assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+        f = fopen(marker, "r");
+        assert(f != NULL);
+        strcpy(action, "");
+        assert(fgets(action, sizeof action, f) != NULL);
+        fclose(f);
+        assert(strcmp(action, routes[i].command) == 0);
+    }
+    (void)request(&cfg,
+        "POST /api/control/start HTTP/1.1\r\n"
+        "Host: localhost:8090\r\n"
+        "Origin: http://attacker.example\r\n"
+        "Content-Length: 0\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 403 Forbidden") != NULL);
+    f = fopen(marker, "r");
+    assert(f != NULL);
+    strcpy(action, "");
+    assert(fgets(action, sizeof action, f) != NULL);
+    fclose(f);
+    assert(strcmp(action, "reapply") == 0);
+    cfg.mode = "off";
+    (void)request(&cfg,
+        "POST /api/control/start HTTP/1.1\r\nHost: localhost:8090\r\n"
+        "Origin: http://localhost:8090\r\nContent-Length: 0\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 409 Conflict") != NULL);
+    (void)request(&cfg,
+        "POST /api/control/restart HTTP/1.1\r\nHost: localhost:8090\r\n"
+        "Origin: http://localhost:8090\r\nContent-Length: 0\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 409 Conflict") != NULL);
+    f = fopen(marker, "r");
+    assert(f != NULL);
+    strcpy(action, "");
+    assert(fgets(action, sizeof action, f) != NULL);
+    fclose(f);
+    assert(strcmp(action, "reapply") == 0);
+    cfg.mode = NULL;
+    cfg.control_enabled = 0;
+    (void)request(&cfg,
+        "POST /api/control/start HTTP/1.1\r\nHost: localhost:8090\r\n"
+        "Origin: http://localhost:8090\r\nContent-Length: 0\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 403 Forbidden") != NULL);
+    (void)request(&cfg,
+        "POST /api/control/anything HTTP/1.1\r\n"
+        "Host: localhost:8090\r\n"
+        "Origin: http://localhost:8090\r\n"
+        "Content-Length: 0\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 404 Not Found") != NULL);
+    unlink(marker);
+    unlink(service);
 }
 
 static void test_unknown_and_traversal_paths_are_not_served(void) {
@@ -215,6 +335,22 @@ static void test_panel_javascript_is_served_same_origin(void) {
     assert(strstr(response, "Content-Type: application/javascript; charset=utf-8") != NULL);
 }
 
+static void test_generated_brand_assets_are_served_as_png(void) {
+    d2k_panel_config cfg = {
+        .live_path = "/absent",
+        .asset_dir = "../internal/web/assets",
+    };
+    char response[8192];
+    (void)request(&cfg, "GET /assets/logo-d2k.png HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                  response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "Content-Type: image/png") != NULL);
+    (void)request(&cfg, "GET /assets/mascot-d2k.png HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                  response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "Content-Type: image/png") != NULL);
+}
+
 static void test_disconnected_client_cannot_sigpipe_server(void) {
     pid_t child = fork();
     assert(child >= 0);
@@ -242,11 +378,13 @@ int main(void) {
     test_api_exposes_live_knowledge();
     test_invalid_live_json_is_not_reported_as_empty_knowledge();
     test_unsupported_method_is_rejected();
+    test_panel_accepts_a_control_action_request();
     test_unknown_and_traversal_paths_are_not_served();
     test_oversized_request_header_gets_431();
     test_asset_symlink_cannot_escape_asset_directory();
     test_root_serves_static_offline_panel_shell();
     test_panel_javascript_is_served_same_origin();
+    test_generated_brand_assets_are_served_as_png();
     test_disconnected_client_cannot_sigpipe_server();
     puts("C panel HTTP contract: all checks passed");
     return 0;

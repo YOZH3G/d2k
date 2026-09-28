@@ -39,7 +39,8 @@ fi
 
 NAME=d2k
 DIR=/opt/d2k
-# Контроллер и панель — независимые процессы на C. Панель read-only.
+# Контроллер и панель — независимые процессы на C. Управление панелью
+# ограничено локальной loopback-привязкой и командами из фиксированного списка.
 BIN=/opt/sbin/d2kc
 PANELBIN=/opt/sbin/d2kpanel
 PANEL_ASSETS=$DIR/panel
@@ -280,16 +281,25 @@ fastnat_restore() {
     rm -f "$FASTNAT_SAVED"
 }
 
-start() {
-    [ "$MODE" = "off" ] && { say "MODE=off — не запускаюсь"; return 0; }
+start_engine() {
+    [ "$MODE" = "off" ] && { say "MODE=off — запуск запрещён"; return 1; }
     [ -x "$DPBIN" ] || die "нет $DPBIN"
     [ -x "$BIN" ] || die "нет $BIN"
 
     mkdir -p "$RUN" "$LOG" "$DIR/state" || die "не создать $RUN"
 
     if running "$DP_PID"; then
-        say "уже запущен"
-        return 0
+        if running "$CT_PID" && fw_installed && \
+            { [ ! -x "$HEAL" ] || running "$HL_PID"; }; then
+            say "движок уже запущен полностью"
+            return 0
+        fi
+        say "обнаружен частичный запуск — восстанавливаю весь движок"
+        engine_stop
+    else
+        # Контроллер может пережить упавший datapath и продолжать писать
+        # ложное live-состояние. Перед чистым запуском убираем весь остаток.
+        engine_stop
     fi
 
     # Файл сокета переживает SIGKILL и мешает следующему запуску.
@@ -317,11 +327,11 @@ start() {
         sleep 0.1 2>/dev/null || sleep 1
     done
     if [ -z "$bound" ] || [ "$bound" = "0" ]; then
-        stop
+        engine_stop
         die "очередь $QUEUE_NUM не привязалась — правила не ставлю"
     fi
 
-    fw_up || { stop; die "не поставить правила"; }
+    fw_up || { engine_stop; die "не поставить правила"; }
 
     # После правил, но до контроллера: к моменту первого приветствия таблица
     # соединений уже обязана вестись.
@@ -333,7 +343,11 @@ start() {
     start-stop-daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
         --control "$SOCK" --catalog "$DIR/state/catalog.json" --mark "$PROBE_MARK" \
         --measure-mark "$MEASURE_MARK" \
-        --log "$LOG/d2kc.log" || say "контроллер не запустился — датапат наблюдает без подбора"
+        --log "$LOG/d2kc.log" || { engine_stop; die "контроллер не запустился"; }
+    if ! running "$CT_PID"; then
+        engine_stop
+        die "контроллер завершился сразу после запуска"
+    fi
 
     # ЖУРНАЛ НЕ РАСТЁТ БЕЗ КОНЦА, и это про износ флешки, а не про место.
     #
@@ -372,39 +386,58 @@ start() {
             || say "сторож правил не запустился — правила придётся возвращать вручную"
     fi
 
-    # Панель — отдельным процессом, и её отсутствие НЕ отменяет обход: она
-    # показывает происходящее, а не делает его. Поэтому неудача здесь — say,
-    # а не die.
+    say "движок запущен: очередь $QUEUE_NUM, режим $MODE"
+}
+
+start_panel() {
+    # Панель — отдельный процесс и не принадлежит жизненному циклу datapath:
+    # команды engine-stop/engine-start оставляют её доступной для управления.
     if [ -x "$PANELBIN" ]; then
         start-stop-daemon -S -b -m -p "$PN_PID" -x "$PANELBIN" -- serve \
             --config "$CONF" --live "$STATE_DIR/live.json" --assets "$PANEL_ASSETS" \
             --listen "$PANEL_LISTEN" --state-dir "$STATE_DIR" --mode "$MODE" \
-            --queue "$QUEUE_NUM" --log "$LOG/panel.log" \
+            --queue "$QUEUE_NUM" --service /opt/etc/init.d/S99d2k \
+            --engine-pid "$DP_PID" --controller-pid "$CT_PID" \
+            --log "$LOG/panel.log" \
             || say "панель не запустилась — обход это не затрагивает"
     fi
+}
 
-    say "запущен: очередь $QUEUE_NUM, режим $MODE"
+start() {
+    start_engine || return $?
+    start_panel
+}
+
+stop_pidfile() {
+    p=$1
+    if running "$p"; then
+        start-stop-daemon -K -q -p "$p" 2>/dev/null
+        i=0
+        while running "$p" && [ $i -lt 30 ]; do
+            i=$((i + 1))
+            sleep 0.1 2>/dev/null || sleep 1
+        done
+        running "$p" && start-stop-daemon -K -q -s KILL -p "$p" 2>/dev/null
+    fi
+    rm -f "$p"
+}
+
+engine_stop() {
+    # Сторож гасится ДО снятия правил: иначе он может заметить снятые правила
+    # и успеть восстановить их, пока служба останавливается.
+    stop_pidfile "$HL_PID"
+    fw_down
+    fastnat_restore
+    stop_pidfile "$CT_PID"
+    stop_pidfile "$DP_PID"
+    rm -f "$SOCK"
+    say "движок остановлен"
 }
 
 stop() {
-    fw_down
-    fastnat_restore
-    # Сторож гасится ПЕРВЫМ: иначе он увидит снятые правила и начнёт их
-    # возвращать ровно в тот момент, когда служба их убирает.
-    for p in "$HL_PID" "$PN_PID" "$CT_PID" "$DP_PID"; do
-        if running "$p"; then
-            start-stop-daemon -K -q -p "$p" 2>/dev/null
-            i=0
-            while running "$p" && [ $i -lt 30 ]; do
-                i=$((i + 1))
-                sleep 0.1 2>/dev/null || sleep 1
-            done
-            running "$p" && start-stop-daemon -K -q -s KILL -p "$p" 2>/dev/null
-        fi
-        rm -f "$p"
-    done
-    rm -f "$SOCK"
-    say "остановлен"
+    engine_stop
+    stop_pidfile "$PN_PID"
+    say "служба остановлена"
 }
 
 status() {
@@ -442,7 +475,14 @@ case "$1" in
     start)   start ;;
     stop)    stop ;;
     restart) stop; start ;;
+    engine-start) start_engine ;;
+    engine-stop) engine_stop ;;
+    engine-restart)
+        [ "$MODE" != "off" ] || die "MODE=off — перезапуск невозможен"
+        engine_stop
+        start_engine
+        ;;
     status)  status ;;
     reapply) reapply ;;
-    *) echo "использование: $0 {start|stop|restart|status|reapply}" >&2; exit 2 ;;
+    *) echo "использование: $0 {start|stop|restart|engine-start|engine-stop|engine-restart|status|reapply}" >&2; exit 2 ;;
 esac

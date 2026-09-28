@@ -14,12 +14,16 @@ typedef struct {
     const char *config_path;
     const char *state_dir;
     const char *state_dir_note;
+    const char *service_path;
+    const char *engine_pid_path;
+    const char *controller_pid_path;
     const char *const *unknown_keys;
     size_t unknown_key_count;
     long long started_epoch;
     int queue_num;
     int config_exists;
     int dirty;
+    int control_enabled;
 } d2k_panel_config;
 
 /* Serve one bounded HTTP/1.1 request on an already accepted socket. */
