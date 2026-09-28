@@ -50,7 +50,26 @@ dump() {
     echo "--- журналы ---"; tail -n 15 "$DIR"/log/*.log 2>/dev/null || true
 }
 sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
-rules() { iptables -t mangle -S 2>/dev/null | sort; }
+rules() {
+    iptables -t mangle -S 2>/dev/null | sort
+    ip6tables -t mangle -S 2>/dev/null | sort
+}
+nfq6_direct() {
+    # Explicit lab-only matches prove native queue delivery even when the
+    # container's conntrack accounting is disabled. Never installed on a router.
+    for proto in tcp udp; do
+        ip6tables -t mangle -I OUTPUT -d ::1 -p "$proto" \
+            -j NFQUEUE --queue-num 2000 --queue-bypass
+    done
+    /tmp/d2k-ipv6-direct || fail "IPv6 TCP/UDP не проходит очередь"
+    ip6tables -t mangle -nvx -L OUTPUT | awk '
+        $3 == "NFQUEUE" && $1 > 0 { seen++ } END { exit seen == 2 ? 0 : 1 }' \
+        || fail "прямой IPv6 тест не прошёл оба NFQUEUE правила"
+    for proto in tcp udp; do
+        ip6tables -t mangle -D OUTPUT -d ::1 -p "$proto" \
+            -j NFQUEUE --queue-num 2000 --queue-bypass
+    done
+}
 
 echo "== подготовка контейнера =="
 apt-get update -qq >/dev/null 2>&1
@@ -68,6 +87,7 @@ echo "== сборка того, что будет установлено =="
 # Кросс-сборка проверяется отдельно, гейтом; здесь проверяется установка.
 make -s -C core d2kc
 make -s -C datapath d2kd
+cc -Wall -Wextra -Werror -o /tmp/d2k-ipv6-direct tests/ipv6-direct.c
 
 mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets" "$REL/scripts"
 cp scripts/select-panel-ip.sh scripts/architecture.sh scripts/check-cpu.sh "$REL/scripts/"
@@ -175,6 +195,8 @@ grep -q "готово" /tmp/install1.log || fail "установка с чист
 "$INIT" status | grep -q "датапат: работает" || fail "после установки датапат не работает"
 "$INIT" status | grep -q "правила: стоят"    || fail "после установки правил нет"
 "$INIT" status | grep -q "очередь .*привязана" || fail "очередь не привязана"
+ip6tables -t mangle -C POSTROUTING -j D2K_OUT || fail "установщик не включил IPv6"
+nfq6_direct
 [ -x /opt/sbin/d2kd ] || fail "d2kd не установлен"
 [ -x /opt/sbin/d2kc ] || fail "d2kc не установлен"
 [ -x /opt/sbin/d2ktg ] || fail "C-туннель Telegram не установлен"
@@ -332,6 +354,7 @@ echo "== 4. остановка =="
 "$INIT" stop >/dev/null
 "$INIT" status | grep -q "датапат: не работает" || fail "после остановки датапат всё ещё работает"
 [ -d "/proc/$PID_OK" ] && fail "процесс службы пережил остановку"
+nfq6_direct
 
 echo "== 5. возврат в прежний режим =="
 # Экран обязан выглядеть ровно так, как до установки: не «похоже», а

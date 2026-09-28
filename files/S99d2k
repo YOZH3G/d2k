@@ -137,17 +137,18 @@ running() {
 # идёт через POSTROUTING и FORWARD, собственные зонды — через OUTPUT и INPUT:
 # зонд идёт С САМОГО роутера, и транзитные цепочки его не видят.
 
-fw_up_unlocked() {
-    iptables -t mangle -N "$CHAIN_OUT" 2>/dev/null || return 1
-    iptables -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
+fw_family_up() (
+    fw_tool=$1
+    "$fw_tool" -t mangle -N "$CHAIN_OUT" 2>/dev/null || return 1
+    "$fw_tool" -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
 
     # Собственные сырые посылки датапата и измерительные запросы контроллера
     # исключаются. Активные verifier-зонды
     # контроллера помечаются отдельным PROBE_MARK: им нужно попасть в очередь,
     # чтобы точный trial Plan достался verifier; d2kd разбирает их, но не
     # порождает из них новое обнаружение.
-    iptables -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN || return 1
-    iptables -t mangle -A "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN || return 1
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN || return 1
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN || return 1
 
     # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
     # останавливать его (§10). Это касается и UDP-правил ниже в той же мере,
@@ -156,12 +157,12 @@ fw_up_unlocked() {
     # connbytes-dir выбирает счётчик ORIGINAL, но не проверяет направление
     # текущего пакета. При диапазоне 0:8 встречный счётчик равен нулю и тоже
     # совпадает. Явный ctdir не даёт широким PORTS захватить чужую сторону.
-    iptables -t mangle -A "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL \
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL \
         -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
-    iptables -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY \
+    "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY \
         -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
@@ -172,12 +173,12 @@ fw_up_unlocked() {
     # симметрии: D2K_HELLO_WINDOW в session.c ограничивает разбор QUIC
     # ровно тем же числом первых датаграмм потока, так что очередь ничего не
     # выигрывает, продолжая получать пакеты сверх этого окна.
-    iptables -t mangle -A "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL \
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL \
         -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
-    iptables -t mangle -A "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY \
+    "$fw_tool" -t mangle -A "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY \
         -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
@@ -186,12 +187,12 @@ fw_up_unlocked() {
     # Голос: первые пакеты туда (IP Discovery и повторы — по ним датапат
     # узнаёт голос и приговаривает «молчат») и первые оттуда (ответ сервера —
     # единственное подтверждение приёма голоса: зонда у голоса нет).
-    iptables -t mangle -A "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL \
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL \
         -m multiport --dports "$VOICE_PORTS" \
         -m connbytes --connbytes "$VOICE_CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
-    iptables -t mangle -A "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY \
+    "$fw_tool" -t mangle -A "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY \
         -m multiport --sports "$VOICE_PORTS" \
         -m connbytes --connbytes "$VOICE_CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
@@ -219,31 +220,32 @@ fw_up_unlocked() {
     # идущий следом тем же кортежем, попадает в неё же — на проводе они
     # неотличимы. Только UDP: для TCP то же правило не нужно, а проверять
     # непроверенное на живой линии нельзя.
-    iptables -t nat -A POSTROUTING -p udp -m mark --mark "$MARK" \
+    [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -A POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE || say "не поставить MASQUERADE для своих посылок — QUIC за роутером не пойдёт"
-    iptables -t mangle -I POSTROUTING -j "$CHAIN_OUT" || return 1
-    iptables -t mangle -I FORWARD     -j "$CHAIN_IN"  || return 1
-    iptables -t mangle -I INPUT       -j "$CHAIN_IN"  || return 1
+    "$fw_tool" -t mangle -I POSTROUTING -j "$CHAIN_OUT" || return 1
+    "$fw_tool" -t mangle -I FORWARD     -j "$CHAIN_IN"  || return 1
+    "$fw_tool" -t mangle -I INPUT       -j "$CHAIN_IN"  || return 1
     return 0
-}
+)
 
-fw_down_unlocked() {
+fw_family_down() (
+    fw_tool=$1
     # Своё правило в nat снимается по тем же признакам, по которым ставилось.
-    while iptables -t nat -D POSTROUTING -p udp -m mark --mark "$MARK" \
+    while [ "$fw_tool" = iptables ] && "$fw_tool" -t nat -D POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE 2>/dev/null; do :; done
     for hook in POSTROUTING FORWARD OUTPUT INPUT; do
         for ch in "$CHAIN_OUT" "$CHAIN_IN"; do
-            while iptables -t mangle -D "$hook" -j "$ch" 2>/dev/null; do :; done
+            while "$fw_tool" -t mangle -D "$hook" -j "$ch" 2>/dev/null; do :; done
         done
     done
     for ch in "$CHAIN_OUT" "$CHAIN_IN"; do
-        if iptables -t mangle -n -L "$ch" >/dev/null 2>&1; then
-            iptables -t mangle -F "$ch" 2>/dev/null
-            iptables -t mangle -X "$ch" 2>/dev/null
+        if "$fw_tool" -t mangle -n -L "$ch" >/dev/null 2>&1; then
+            "$fw_tool" -t mangle -F "$ch" 2>/dev/null
+            "$fw_tool" -t mangle -X "$ch" 2>/dev/null
         fi
     done
     return 0
-}
+)
 
 # Все изменения собственных цепочек сериализуются: периодический сторож,
 # NDM-хук, UI и ручная команда могут заметить сброс почти одновременно.
@@ -272,6 +274,19 @@ fw_lock_release() {
     rmdir "$FW_LOCK" 2>/dev/null
 }
 
+fw_up_unlocked() {
+    fw_family_up iptables && fw_family_up ip6tables
+}
+
+fw_down_unlocked() {
+    fw_family_down iptables
+    fw_family_down ip6tables
+}
+
+fw_installed() {
+    fw_family_installed iptables && fw_family_installed ip6tables
+}
+
 fw_up() {
     fw_lock_acquire || return 1
     fw_down_unlocked
@@ -293,31 +308,32 @@ fw_down() {
     return "$rc"
 }
 
-fw_installed() {
+fw_family_installed() (
+    fw_tool=$1
     # A jump into an empty chain does not send a single packet to d2kd.
     # Check the complete contract, including reply traffic and bypass. -C
     # is supported by the target's iptables 1.4.21 (verified 12.09).
-    iptables -t mangle -C POSTROUTING -j "$CHAIN_OUT" 2>/dev/null || return 1
-    iptables -t mangle -C FORWARD -j "$CHAIN_IN" 2>/dev/null || return 1
-    iptables -t mangle -C INPUT -j "$CHAIN_IN" 2>/dev/null || return 1
-    iptables -t mangle -C "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN 2>/dev/null || return 1
-    iptables -t mangle -C "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C POSTROUTING -j "$CHAIN_OUT" 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C FORWARD -j "$CHAIN_IN" 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C INPUT -j "$CHAIN_IN" 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN 2>/dev/null || return 1
     for proto in tcp udp; do
-        iptables -t mangle -C "$CHAIN_OUT" -p "$proto" -m conntrack --ctdir ORIGINAL \
+        "$fw_tool" -t mangle -C "$CHAIN_OUT" -p "$proto" -m conntrack --ctdir ORIGINAL \
             -m multiport --dports "$PORTS" \
             -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
             --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
             --queue-bypass 2>/dev/null || return 1
-        iptables -t mangle -C "$CHAIN_IN" -p "$proto" -m conntrack --ctdir REPLY \
+        "$fw_tool" -t mangle -C "$CHAIN_IN" -p "$proto" -m conntrack --ctdir REPLY \
             -m multiport --sports "$PORTS" \
             -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
             --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
             --queue-bypass 2>/dev/null || return 1
     done
-    iptables -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" \
+    [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE 2>/dev/null || return 1
     return 0
-}
+)
 
 # --- запуск --------------------------------------------------------------
 

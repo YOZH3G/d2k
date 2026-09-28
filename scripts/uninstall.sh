@@ -46,16 +46,18 @@ fi
 # Цепочка снимается даже если init-скрипта уже нет: он мог быть удалён руками,
 # а правила остаться.
 # Старое имя D2K тоже снимается: установка прошлой версии могла оставить его.
+for fw_tool in iptables ip6tables; do
 for hook in POSTROUTING FORWARD OUTPUT INPUT; do
     for ch in D2K_OUT D2K_IN D2K; do
-        while iptables -t mangle -D "$hook" -j "$ch" 2>/dev/null; do :; done
+        while "$fw_tool" -t mangle -D "$hook" -j "$ch" 2>/dev/null; do :; done
     done
 done
 for ch in D2K_OUT D2K_IN D2K; do
-    if iptables -t mangle -n -L "$ch" >/dev/null 2>&1; then
-        iptables -t mangle -F "$ch" 2>/dev/null || true
-        iptables -t mangle -X "$ch" 2>/dev/null || true
+    if "$fw_tool" -t mangle -n -L "$ch" >/dev/null 2>&1; then
+        "$fw_tool" -t mangle -F "$ch" 2>/dev/null || true
+        "$fw_tool" -t mangle -X "$ch" 2>/dev/null || true
     fi
+done
 done
 say "правила сняты"
 
@@ -80,5 +82,5 @@ else
     say "удалено всё, включая каталог коробок"
 fi
 
-left=$(iptables -t mangle -S 2>/dev/null | grep -c -- "-j D2K" || true)
+left=$({ iptables -t mangle -S 2>/dev/null || true; ip6tables -t mangle -S 2>/dev/null || true; } | grep -c -- "-j D2K" || true)
 say "готово. Ссылок на цепочки d2k осталось: $left"

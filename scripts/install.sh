@@ -34,7 +34,7 @@ trap cleanup EXIT INT TERM
 # получить «не запускается» без объяснения.
 
 # --- что нужно от системы ------------------------------------------------
-for t in curl ip iptables start-stop-daemon; do
+for t in curl ip iptables ip6tables start-stop-daemon; do
     command -v "$t" >/dev/null 2>&1 || die "нет $t — поставьте пакет и повторите"
 done
 for t in ipset openssl; do

@@ -61,9 +61,22 @@ set -e
 
 fail() { echo "ПРОВАЛ: $*" >&2; exit 1; }
 
+# A foreign rule must survive all D2K install/heal/remove operations.
+ip6tables -t mangle -A INPUT -p ipv6-icmp -j ACCEPT
 echo "== fw_up =="
 fw_up
 fw_installed || fail "полный набор правил не распознан"
+for proto in tcp udp; do
+    ip6tables -t mangle -C D2K_OUT -p "$proto" -m conntrack --ctdir ORIGINAL \
+        -m multiport --dports "$PORTS" \
+        -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
+        --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass \
+        || fail "нет IPv6 $proto перехвата"
+done
+ip6tables -t mangle -C D2K_OUT -m mark --mark "$MARK" -j RETURN || fail "нет IPv6 raw bypass"
+ip6tables -t mangle -C D2K_OUT -m mark --mark "$MEASURE_MARK" -j RETURN || fail "нет IPv6 measurement bypass"
+ip6tables -t mangle -S | grep 'NFQUEUE' | grep -vE -- '-p (tcp|udp) ' && fail "IPv6 очередь захватывает не TCP/UDP"
+if ip6tables -t nat -S | grep -q MASQUERADE; then fail "IPv4 MASQUERADE скопирован в IPv6"; fi
 RULES=$(iptables -t mangle -S)
 echo "$RULES"
 
@@ -152,11 +165,39 @@ if fw_installed; then fail "пустые цепочки объявлены ра�
 fw_up
 fw_installed || fail "после восстановления правила не распознаны"
 
+echo "== восстановление только IPv6 после сброса =="
+ip6tables -t mangle -F D2K_IN
+if fw_installed; then fail "потеря IPv6 ответов не обнаружена"; fi
+fw_up
+fw_installed || fail "IPv6 не восстановлен"
+COUNT6=$(ip6tables -t mangle -S D2K_OUT | wc -l)
+[ "$COUNT6" -eq 6 ] || fail "IPv6 дубли после восстановления"
+
 echo "== fw_down =="
 fw_down
 if fw_installed; then fail "после fw_down правила объявлены установленными"; fi
 LEFT=$(iptables -t mangle -S | grep -ic d2k || true)
 [ "$LEFT" -eq 0 ] || fail "fw_down оставил $LEFT правил(о) с упоминанием D2K"
+LEFT6=$(ip6tables -t mangle -S | grep -ic d2k || true)
+[ "$LEFT6" -eq 0 ] || fail "fw_down оставил IPv6 правила"
+ip6tables -t mangle -C INPUT -p ipv6-icmp -j ACCEPT || fail "чужое IPv6 правило удалено"
+
+echo "== частичный отказ IPv6 откатывает обе семьи =="
+# Fail a real IPv6 insertion after chain creation, without replacing IPv4.
+ip6tables() {
+    case "$*" in
+        *"-A D2K_IN -p udp"*) return 1 ;;
+    esac
+    command ip6tables "$@"
+}
+if fw_up; then fail "ошибка IPv6 скрыта успешным IPv4"; fi
+for tool in iptables ip6tables; do
+    if "$tool" -t mangle -S | grep -q D2K; then fail "частичная установка $tool не откачена"; fi
+done
+unset -f ip6tables
+fw_up
+fw_installed || fail "запуск после частичного отказа не восстановлен"
+fw_down
 
 echo "ВСЁ ЗЕЛЕНО: правила files/S99d2k проверены настоящим iptables"
 DRIVER
