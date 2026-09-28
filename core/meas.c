@@ -181,7 +181,25 @@ int d2k_meas_once(const char *ip, uint16_t port, d2k_hello h,
     if (marked_out) { *marked_out = (mark == 0); }
     if (wait_ms == 0 || wait_ms > WAIT_CEIL_MS) { wait_ms = WAIT_CEIL_MS; }
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_storage a;
+    memset(&a, 0, sizeof a);
+    struct sockaddr_in *v4 = (struct sockaddr_in *)&a;
+    struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&a;
+    socklen_t alen;
+    int family;
+    if (strchr(ip, '%')) { return D2K_MEAS_ERR; }
+    if (inet_pton(AF_INET, ip, &v4->sin_addr) == 1) {
+        family = AF_INET;
+        v4->sin_family = AF_INET;
+        v4->sin_port = htons(port);
+        alen = sizeof *v4;
+    } else if (inet_pton(AF_INET6, ip, &v6->sin6_addr) == 1) {
+        family = AF_INET6;
+        v6->sin6_family = AF_INET6;
+        v6->sin6_port = htons(port);
+        alen = sizeof *v6;
+    } else { return D2K_MEAS_ERR; }
+    int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) { return D2K_MEAS_ERR; }
 
     if (mark != 0) {
@@ -207,12 +225,7 @@ int d2k_meas_once(const char *ip, uint16_t port, d2k_hello h,
     struct timeval ctv = { (time_t)d2k_send_timeout_s, 0 };
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof ctv);
 
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) { close(fd); return D2K_MEAS_ERR; }
-    if (connect_bounded(fd, (struct sockaddr *)&a, sizeof a, CONNECT_TIMEOUT_MS) != 0) {
+    if (connect_bounded(fd, (struct sockaddr *)&a, alen, CONNECT_TIMEOUT_MS) != 0) {
         close(fd);
         return D2K_MEAS_ERR;
     }

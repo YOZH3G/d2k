@@ -249,14 +249,26 @@ static void *stand_run(void *arg) {
     }
 }
 
-static uint16_t stand_start(struct stand *s, int mode) {
-    s->fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in a;
+static uint16_t stand_start_family(struct stand *s, int mode, int family) {
+    s->fd = socket(family, SOCK_STREAM, 0);
+    struct sockaddr_storage a;
     memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(0x7f000001);
-    a.sin_port = 0;
-    bind(s->fd, (struct sockaddr *)&a, sizeof a);
+    socklen_t alen;
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&a;
+        v6->sin6_family = AF_INET6;
+        v6->sin6_addr = in6addr_loopback;
+        alen = sizeof *v6;
+    } else {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&a;
+        v4->sin_family = AF_INET;
+        v4->sin_addr.s_addr = htonl(0x7f000001);
+        alen = sizeof *v4;
+    }
+    if (s->fd < 0 || bind(s->fd, (struct sockaddr *)&a, alen) != 0) {
+        if (s->fd >= 0) close(s->fd);
+        return 0;
+    }
     socklen_t l = sizeof a;
     getsockname(s->fd, (struct sockaddr *)&a, &l);
     listen(s->fd, 8);
@@ -265,7 +277,9 @@ static uint16_t stand_start(struct stand *s, int mode) {
        вызывающий выставит их ДО stand_start (см. тест короткой записи и
        тесты на частичный сбой транспорта/подтверждение clear) — здесь
        было бы поздно и затёрло бы уже установленное значение. */
-    s->port = ntohs(a.sin_port);
+    s->port = family == AF_INET6
+        ? ntohs(((struct sockaddr_in6 *)&a)->sin6_port)
+        : ntohs(((struct sockaddr_in *)&a)->sin_port);
 
     /* ПОТОК ЖИВЁТ ДОЛЬШЕ, ЧЕМ БЛОК ВЫЗЫВАЮЩЕГО, и это не мелочь.
        struct stand у всех тестов лежит на стеке внутри блока `{ ... }`;
@@ -294,6 +308,10 @@ static uint16_t stand_start(struct stand *s, int mode) {
     pthread_create(&t, NULL, stand_run, own);
     pthread_detach(t);
     return s->port;
+}
+
+static uint16_t stand_start(struct stand *s, int mode) {
+    return stand_start_family(s, mode, AF_INET);
 }
 
 #endif /* D2K_TEST_STAND_H */

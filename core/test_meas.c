@@ -47,6 +47,28 @@ int main(void) {
     memcpy(hello, d2k_test_sig, sizeof d2k_test_sig);
     d2k_hello h = { hello, sizeof hello };
 
+    {
+        struct stand s = {0};
+        uint16_t p = stand_start_family(&s, 0, AF_INET6);
+        CHECK(p != 0, "IPv6 loopback fixture must start");
+        d2k_tally t = d2k_meas("::1", p, h, NULL, 0, 0, 700, 0,
+                              d2k_accept_serverhello, 3);
+        CHECK(t.pass == 3 && t.err == 0, "native IPv6 measurement receives answers");
+    }
+    {
+        struct stand s = {0};
+        uint16_t p = stand_start_family(&s, 1, AF_INET6);
+        CHECK(p != 0, "IPv6 blocking fixture must start");
+        d2k_tally t = d2k_meas("::1", p, h, NULL, 0, 0, 700, 0,
+                              d2k_accept_serverhello, 1);
+        CHECK(t.pass == 0 && t.fail == 1 && t.err == 0,
+              "IPv6 silence after send is measured, not a socket error");
+        size_t cut = 1;
+        t = d2k_meas("::1", p, h, &cut, 1, 5000, 700, 0,
+                     d2k_accept_serverhello, 1);
+        CHECK(t.pass == 1 && t.err == 0, "IPv6 measurement preserves split experiment");
+    }
+
     /* --- чистая мишень: все три повтора проходят -------------------------- */
     {
         struct stand s;
