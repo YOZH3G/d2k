@@ -294,6 +294,10 @@ int  d2k_link_set_name_probe(int fd, const char *name, uint8_t transport,
  * НЕМЕДЛЕННО, если она уже поймана (см. d2k_ctlsrv_command в ctlsrv.c), и это
  * событие придёт РАНЬШЕ ack на саму команду ARM_SHAPE — забирать его должен
  * вызывающий через d2k_link_next, а не эта функция впустую. */
+int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
+                             const char *plan_text, uint8_t shape,
+                             uint16_t sport_be, uint8_t family,
+                             char *err, size_t errcap);
 int  d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
                         char *err, size_t errcap);
 
@@ -310,6 +314,11 @@ int  d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
  * Отличие от D2K_CMD_CLEAR: CLEAR сносит ВСЮ таблицу, включая планы чужих
  * целей, которые никто не просил трогать. */
 int  d2k_link_del_name(int fd, const char *name, char *err, size_t errcap);
+int d2k_link_del_name_family(int fd, const char *name, uint8_t family,
+                             char *err, size_t errcap);
+int d2k_link_del_name_probe_family(int fd, const char *name, uint8_t transport,
+                                   uint8_t shape, uint16_t sport_be, uint8_t family,
+                                   char *err, size_t errcap);
 int  d2k_link_del_name_probe(int fd, const char *name, uint8_t transport,
                              uint8_t shape, uint16_t sport_be,
                              char *err, size_t errcap);

@@ -462,7 +462,7 @@ static int plan_id_from_setname(uint16_t kind, const uint8_t *body, size_t len,
        started from 2 and then added shape once more, shifting the ID by one
        byte; APPLIED was then treated as a foreign plan and every negative
        question paid the full wait budget. */
-    size_t off = (size_t)1 + body[0] + 1;
+    size_t off = (size_t)1 + body[0] + 2;
     if (kind == D2K_CMD_SET_NAME_PROBE) { off += 2; } /* reserved probe port */
     off += 12 + 4;
     if (off + D2K_PLAN_ID_LEN > len) { return -1; }

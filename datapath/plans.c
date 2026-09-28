@@ -8,6 +8,7 @@ enum { KEY_FREE = 0, KEY_NAME = 1, KEY_ADDR = 2 };
 
 typedef struct {
     uint8_t  kind;
+    uint8_t  family;
     uint8_t  name_len;
     uint8_t  name[D2K_TARGET_NAME_MAX];
     uint32_t addr_be;
@@ -135,9 +136,16 @@ uint64_t d2k_plantab_revision(const d2k_plantab *t) { return t ? t->revision : 0
 
 int d2k_plantab_stream_candidate(const d2k_plantab *t, const uint8_t *name,
                                 size_t len, uint32_t addr_be, uint16_t sport_be) {
-    if (!t) { return 0; }
+    return d2k_plantab_stream_candidate_family(t, name, len, addr_be, sport_be, 4);
+}
+
+int d2k_plantab_stream_candidate_family(const d2k_plantab *t, const uint8_t *name,
+    size_t len, uint32_t addr_be, uint16_t sport_be, uint8_t family) {
+    if (!t || (family != 4 && family != 6)) { return 0; }
     for (size_t i = 0; i < t->used; i++) {
         const entry *e = &t->v[i];
+        if ((e->kind == KEY_NAME && e->family != family) ||
+            (e->kind == KEY_ADDR && family != 4)) { continue; }
         if (!d2k_plan_stream_input(e->plan) ||
             (e->only_sport && e->only_sport != sport_be)) { continue; }
         if (e->kind == KEY_ADDR && e->addr_be == addr_be) { return 1; }
@@ -152,9 +160,9 @@ int d2k_plantab_stream_candidate(const d2k_plantab *t, const uint8_t *name,
    не попадают намеренно: они существуют только для одного местного порта, и
    для всех прочих вопросов их как будто нет. Пропусти это — и пробный план
    утёк бы к пользователю через ветку «имя знаем, формы такой нет». */
-static entry *find_name(d2k_plantab *t, const uint8_t *name, size_t len) {
+static entry *find_name(d2k_plantab *t, const uint8_t *name, size_t len, uint8_t family) {
     for (size_t i = 0; i < t->used; i++) {
-        if (t->v[i].kind == KEY_NAME && t->v[i].only_sport == 0 &&
+        if (t->v[i].kind == KEY_NAME && t->v[i].family == family && t->v[i].only_sport == 0 &&
             name_eq(t->v[i].name, t->v[i].name_len, name, len)) {
             return &t->v[i];
         }
@@ -175,9 +183,9 @@ static entry *find_name(d2k_plantab *t, const uint8_t *name, size_t len) {
  * клиент за роутером не проходил ни по одному транспорту — при том, что
  * собственный зонд на обоих отвечал 200. */
 static entry *find_name_shape_port(d2k_plantab *t, const uint8_t *name, size_t len,
-                                   uint8_t shape, uint16_t sport_be) {
+                                   uint8_t shape, uint16_t sport_be, uint8_t family) {
     for (size_t i = 0; i < t->used; i++) {
-        if (t->v[i].kind == KEY_NAME && t->v[i].shape == shape &&
+        if (t->v[i].kind == KEY_NAME && t->v[i].family == family && t->v[i].shape == shape &&
             t->v[i].only_sport == sport_be &&
             name_eq(t->v[i].name, t->v[i].name_len, name, len)) {
             return &t->v[i];
@@ -191,10 +199,10 @@ static entry *find_name_shape_port(d2k_plantab *t, const uint8_t *name, size_t l
    ослабляет постоянные записи: только запись, закреплённая за ненулевым
    локальным портом, может быть найдена этим путём. */
 static entry *find_name_port(d2k_plantab *t, const uint8_t *name, size_t len,
-                             uint16_t sport_be) {
+                             uint16_t sport_be, uint8_t family) {
     if (!sport_be) { return NULL; }
     for (size_t i = 0; i < t->used; i++) {
-        if (t->v[i].kind == KEY_NAME && t->v[i].only_sport == sport_be &&
+        if (t->v[i].kind == KEY_NAME && t->v[i].family == family && t->v[i].only_sport == sport_be &&
             name_eq(t->v[i].name, t->v[i].name_len, name, len)) {
             return &t->v[i];
         }
@@ -203,8 +211,8 @@ static entry *find_name_port(d2k_plantab *t, const uint8_t *name, size_t len,
 }
 
 static entry *find_name_shape(d2k_plantab *t, const uint8_t *name, size_t len,
-                              uint8_t shape) {
-    return find_name_shape_port(t, name, len, shape, 0);
+                              uint8_t shape, uint8_t family) {
+    return find_name_shape_port(t, name, len, shape, 0, family);
 }
 
 static entry *find_addr(d2k_plantab *t, uint32_t addr_be) {
@@ -291,7 +299,13 @@ int d2k_plantab_set_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
 int d2k_plantab_set_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
                                uint64_t now_ns, d2k_plan *p, uint8_t shape,
                                uint16_t sport_be) {
-    if (!t || !name || len == 0 || len > D2K_TARGET_NAME_MAX) {
+    return d2k_plantab_set_name_family(t, name, len, now_ns, p, shape, sport_be, 4);
+}
+
+int d2k_plantab_set_name_family(d2k_plantab *t, const uint8_t *name, size_t len,
+    uint64_t now_ns, d2k_plan *p, uint8_t shape, uint16_t sport_be, uint8_t family) {
+    if (!t || !name || len == 0 || len > D2K_TARGET_NAME_MAX ||
+        (family != 4 && family != 6)) {
         d2k_plan_free(p);
         return -2;
     }
@@ -307,7 +321,7 @@ int d2k_plantab_set_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
        записи — ровно прежнее поведение «форму не понижаем». */
     entry *e = NULL;
     if (shape == D2K_PLAN_SHAPE_GRANDFATHER && sport_be == 0) {
-        e = find_name(t, name, len);
+        e = find_name(t, name, len, family);
         if (e && e->only_sport == 0 && e->shape != D2K_PLAN_SHAPE_GRANDFATHER) {
             e->last_used_ns = now_ns;
             d2k_plan_free(e->plan);
@@ -316,7 +330,7 @@ int d2k_plantab_set_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
         }
     }
     if (!e || e->shape != shape || e->only_sport != sport_be) {
-        e = find_name_shape_port(t, name, len, shape, sport_be);
+        e = find_name_shape_port(t, name, len, shape, sport_be, family);
     }
     if (!e) {
         e = take_free_or_evict(t);
@@ -326,6 +340,7 @@ int d2k_plantab_set_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
         }
         t->used++;
         e->kind = KEY_NAME;
+        e->family = family;
         e->name_len = (uint8_t)len;
         memcpy(e->name, name, len);
         e->shape = shape;
@@ -396,6 +411,10 @@ static int drop(d2k_plantab *t, entry *e) {
 }
 
 int d2k_plantab_del_name(d2k_plantab *t, const uint8_t *name, size_t len) {
+    return d2k_plantab_del_name_family(t, name, len, 4);
+}
+
+int d2k_plantab_del_name_family(d2k_plantab *t, const uint8_t *name, size_t len, uint8_t family) {
     if (!t || !name || len == 0) {
         return 0;
     }
@@ -406,7 +425,7 @@ int d2k_plantab_del_name(d2k_plantab *t, const uint8_t *name, size_t len) {
        обход там, где его выключили. */
     int n = 0;
     for (;;) {
-        entry *e = find_name(t, name, len);
+        entry *e = find_name(t, name, len, family);
         if (!e || drop(t, e) == 0) {
             break;
         }
@@ -417,11 +436,16 @@ int d2k_plantab_del_name(d2k_plantab *t, const uint8_t *name, size_t len) {
 
 int d2k_plantab_del_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
                                uint8_t shape, uint16_t sport_be) {
+    return d2k_plantab_del_name_probe_family(t, name, len, shape, sport_be, 4);
+}
+
+int d2k_plantab_del_name_probe_family(d2k_plantab *t, const uint8_t *name, size_t len,
+    uint8_t shape, uint16_t sport_be, uint8_t family) {
     if (!t || !name || len == 0 || sport_be == 0) { return 0; }
     int n = 0;
     for (size_t i = 0; i < t->used;) {
         entry *e = &t->v[i];
-        if (e->kind == KEY_NAME && e->only_sport == sport_be &&
+        if (e->kind == KEY_NAME && e->family == family && e->only_sport == sport_be &&
             e->shape == shape && name_eq(e->name, e->name_len, name, len)) {
             (void)drop(t, e);
             n++;
@@ -605,7 +629,13 @@ const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
 const d2k_plan *d2k_plantab_find_sport(d2k_plantab *t, const uint8_t *name,
                                        size_t len, uint32_t addr_be, uint64_t now_ns,
                                        uint8_t seen_shape, uint16_t sport_be) {
-    if (!t) {
+    return d2k_plantab_find_family(t, name, len, addr_be, now_ns, seen_shape, sport_be, 4);
+}
+
+const d2k_plan *d2k_plantab_find_family(d2k_plantab *t, const uint8_t *name,
+    size_t len, uint32_t addr_be, uint64_t now_ns, uint8_t seen_shape,
+    uint16_t sport_be, uint8_t family) {
+    if (!t || (family != 4 && family != 6)) {
         return NULL;
     }
     /* Первый QUIC Initial может ещё не нести собранное имя: его CRYPTO
@@ -619,7 +649,7 @@ const d2k_plan *d2k_plantab_find_sport(d2k_plantab *t, const uint8_t *name,
         entry *probe = NULL;
         for (size_t i = 0; i < t->used; i++) {
             entry *e = &t->v[i];
-            if (e->kind != KEY_NAME || e->only_sport != sport_be ||
+            if (e->kind != KEY_NAME || e->family != family || e->only_sport != sport_be ||
                 !shape_fits(e->shape, seen_shape)) {
                 continue;
             }
@@ -642,15 +672,15 @@ const d2k_plan *d2k_plantab_find_sport(d2k_plantab *t, const uint8_t *name,
            остальных потоков её как будто нет вовсе. */
         entry *e = NULL;
         if (sport_be != 0) {
-            e = find_name_shape_port(t, name, len, seen_shape, sport_be);
+            e = find_name_shape_port(t, name, len, seen_shape, sport_be, family);
             if (!e && seen_shape == D2K_PLAN_SHAPE_ANY) {
                 /* Probe-specific SET_NAME carries the verifier's known shape;
                    a segmented ClientHello may not reveal it in its first
                    packet. Exact name+ephemeral-port identity is sufficient. */
-                e = find_name_port(t, name, len, sport_be);
+                e = find_name_port(t, name, len, sport_be, family);
             }
             if (!e) {
-                e = find_name_shape_port(t, name, len, D2K_PLAN_SHAPE_GRANDFATHER, sport_be);
+                e = find_name_shape_port(t, name, len, D2K_PLAN_SHAPE_GRANDFATHER, sport_be, family);
             }
             if (e) {
                 e->last_used_ns = now_ns;
@@ -665,16 +695,16 @@ const d2k_plan *d2k_plantab_find_sport(d2k_plantab *t, const uint8_t *name,
             }
         }
         /* Сперва запись СВОЕЙ формы: у имени их может быть несколько. */
-        e = find_name_shape(t, name, len, seen_shape);
+        e = find_name_shape(t, name, len, seen_shape, family);
         if (!e) {
             /* Дедушкино право — отдельная запись, и она подходит любой
                форме (см. shape_fits). Ищем её только когда своей нет. */
-            e = find_name_shape(t, name, len, D2K_PLAN_SHAPE_GRANDFATHER);
+            e = find_name_shape(t, name, len, D2K_PLAN_SHAPE_GRANDFATHER, family);
         }
         if (!e) {
             /* Имя знаем, а формы такой у него нет — это отдельный факт, см.
                счётчик ниже. */
-            e = find_name(t, name, len);
+            e = find_name(t, name, len, family);
         }
         if (e) {
             /* Обращение продлевает жизнь записи — см. d2k_plans.h про то,
@@ -698,7 +728,7 @@ const d2k_plan *d2k_plantab_find_sport(d2k_plantab *t, const uint8_t *name,
     }
     /* Только теперь по адресу: обратный порядок дал бы плану соседа по CDN
        перебить план, подтверждённый для этого имени. */
-    entry *e = find_addr(t, addr_be);
+    entry *e = family == 4 ? find_addr(t, addr_be) : NULL;
     if (e) {
         e->last_used_ns = now_ns;
         if (shape_fits(e->shape, seen_shape)) {

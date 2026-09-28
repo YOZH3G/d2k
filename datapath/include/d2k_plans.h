@@ -82,6 +82,17 @@
 
 typedef struct d2k_plantab d2k_plantab;
 
+/* Explicit family APIs. Legacy entry points are IPv4-only wrappers. */
+int d2k_plantab_set_name_family(d2k_plantab *, const uint8_t *, size_t,
+    uint64_t, d2k_plan *, uint8_t shape, uint16_t sport_be, uint8_t family);
+int d2k_plantab_del_name_family(d2k_plantab *, const uint8_t *, size_t, uint8_t family);
+int d2k_plantab_del_name_probe_family(d2k_plantab *, const uint8_t *, size_t,
+    uint8_t shape, uint16_t sport_be, uint8_t family);
+const d2k_plan *d2k_plantab_find_family(d2k_plantab *, const uint8_t *, size_t,
+    uint32_t addr_be, uint64_t, uint8_t shape, uint16_t sport_be, uint8_t family);
+int d2k_plantab_stream_candidate_family(const d2k_plantab *, const uint8_t *,
+    size_t, uint32_t addr_be, uint16_t sport_be, uint8_t family);
+
 /* Полный поток собственного адресного QUIC-зонда. Все порты в сетевом
  * порядке; адреса — четыре байта как в d2k_key. Не смешивать его с ключом
  * постоянной адресной привязки, у которой намеренно только destination IP. */

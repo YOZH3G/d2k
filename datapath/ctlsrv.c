@@ -140,21 +140,21 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
     case D2K_CMD_SET_NAME:
     case D2K_CMD_SET_NAME_PROBE:
     case D2K_CMD_SET_ADDR: {
-        /* SET_NAME: [длина имени][имя][ФОРМА][план]. Форма байтом перед
-           планом, а не после: длина плана в теле не объявлена, план это «всё,
-           что осталось», и поле после него было бы съедено как его часть.
-           Формат сменился 12.09.2026 вместе с кодом APPLIED — d2kd и d2kc
-           обновляются согласованно (d2k_ctl.h, d2k_link.h). */
-        /* У пробной команды после формы идёт ещё местный порт (u16). */
+        /* v4: [длина имени][имя][форма][family][пробный порт?][план].
+           План занимает остаток тела; адресное семейство обязательно. */
         size_t hdr;
         if (type == D2K_CMD_SET_ADDR) {
             hdr = 4u;
         } else if (type == D2K_CMD_SET_NAME_PROBE) {
-            hdr = len ? 4u + b[0] : 4u;
+            hdr = len ? 5u + b[0] : 5u;
         } else {
-            hdr = len ? 2u + b[0] : 2u;
+            hdr = len ? 3u + b[0] : 3u;
         }
         if (len < hdr) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        if (type != D2K_CMD_SET_ADDR && b[2u + b[0]] != 4 && b[2u + b[0]] != 6) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
@@ -174,10 +174,10 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         if (type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) {
             uint16_t sport_be = 0;
             if (type == D2K_CMD_SET_NAME_PROBE) {
-                memcpy(&sport_be, b + 2u + b[0], 2);
+                memcpy(&sport_be, b + 3u + b[0], 2);
             }
-            rc = d2k_plantab_set_name_probe(tab, b + 1, b[0], cx->now_ns, p,
-                                            b[1u + b[0]], sport_be);
+            rc = d2k_plantab_set_name_family(tab, b + 1, b[0], cx->now_ns, p,
+                                            b[1u + b[0]], sport_be, b[2u + b[0]]);
         } else {
             uint32_t addr;
             memcpy(&addr, b, 4);
@@ -277,26 +277,29 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         return;
     }
     case D2K_CMD_DEL_NAME:
-        if (len < 1 || len < 1u + b[0]) {
+        if (len < 2 || len != 2u + b[0] ||
+            (b[1u + b[0]] != 4 && b[1u + b[0]] != 6)) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
-        d2k_plantab_del_name(tab, b + 1, b[0]);
+        d2k_plantab_del_name_family(tab, b + 1, b[0], b[1u + b[0]]);
         ack(cx, type, 1, D2K_ACK_OK);
         return;
     case D2K_CMD_DEL_NAME_PROBE:
-        /* тело: длина имени, имя, форма, местный порт */
-        if (len < 4 || len < 4u + b[0]) {
+        /* тело: длина имени, имя, форма, family, местный порт */
+        if (len < 5 || len != 5u + b[0] ||
+            (b[2u + b[0]] != 4 && b[2u + b[0]] != 6)) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
         uint16_t probe_port;
-        memcpy(&probe_port, b + 2u + b[0], 2);
+        memcpy(&probe_port, b + 3u + b[0], 2);
         if (!probe_port) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
-        d2k_plantab_del_name_probe(tab, b + 1, b[0], b[1u + b[0]], probe_port);
+        d2k_plantab_del_name_probe_family(tab, b + 1, b[0], b[1u + b[0]],
+                                          probe_port, b[2u + b[0]]);
         ack(cx, type, 1, D2K_ACK_OK);
         return;
     case D2K_CMD_DEL_ADDR: {

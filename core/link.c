@@ -422,12 +422,23 @@ int d2k_link_set_name(int fd, const char *name, uint8_t transport,
     return d2k_link_set_name_probe(fd, name, transport, plan_text, shape, 0, err, errcap);
 }
 
-/* Ноль в sport_be означает «всем» и шлёт обычный SET_NAME — старый формат
-   тела, старое поведение. Ненулевой порт превращает команду в пробную
+/* Ноль в sport_be означает постоянный SET_NAME. Ненулевой порт делает команду пробной
    (D2K_CMD_SET_NAME_PROBE): такой план достанется ровно одному потоку. */
 int d2k_link_set_name_probe(int fd, const char *name, uint8_t transport,
                             const char *plan_text, uint8_t shape,
                             uint16_t sport_be, char *err, size_t errcap) {
+    return d2k_link_set_name_family(fd, name, transport, plan_text, shape,
+                                    sport_be, 4, err, errcap);
+}
+
+int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
+                             const char *plan_text, uint8_t shape,
+                             uint16_t sport_be, uint8_t family,
+                             char *err, size_t errcap) {
+    if (family != 4 && family != 6) {
+        say(err, errcap, "семейство адресов должно быть 4 или 6");
+        return -1;
+    }
     if (fd < 0) {
         say(err, errcap, "сокет не открыт");
         return -1;
@@ -457,7 +468,7 @@ int d2k_link_set_name_probe(int fd, const char *name, uint8_t transport,
         return -1;
     }
     size_t extra = sport_be ? 2u : 0u;                  /* местный порт, если пробный */
-    size_t plan_cap = sizeof g_scratch - HDR - 2 - nl - extra;
+    size_t plan_cap = sizeof g_scratch - HDR - 3 - nl - extra;
     if (hexlen / 2 > plan_cap) {
         say(err, errcap, "план длиннее предела кадра");
         return -1;
@@ -471,6 +482,7 @@ int d2k_link_set_name_probe(int fd, const char *name, uint8_t transport,
        Длина плана в теле не объявлена: план это «всё, что осталось». Поле
        после него было бы съедено как часть плана. */
     g_scratch[o++] = shape;
+    g_scratch[o++] = family;
     if (sport_be) {
         memcpy(g_scratch + o, &sport_be, 2);
         o += 2;
@@ -506,13 +518,10 @@ int d2k_link_set_name_probe(int fd, const char *name, uint8_t transport,
     return 0;
 }
 
-/* Общее тело ARM_SHAPE и DEL_NAME: на проводе они отличаются ТОЛЬКО кодом
-   команды (d2k_ctl.h — у обеих тело "длина имени u8, имя"), и держать две
-   копии одного кадра значило бы заводить второе место, где можно разойтись
-   с протоколом. */
+/* Family-scoped name removal. ARM_SHAPE has its own snapshot contract. */
 static int send_name_only(int fd, uint16_t cmd, const char *what,
-                          const char *name, char *err, size_t errcap) {
-    if (fd < 0) {
+                          const char *name, uint8_t family, char *err, size_t errcap) {
+    if (fd < 0 || (family != 4 && family != 6)) {
         say(err, errcap, "сокет не открыт");
         return -1;
     }
@@ -529,7 +538,7 @@ static int send_name_only(int fd, uint16_t cmd, const char *what,
     g_scratch[o++] = (uint8_t)nl;
     memcpy(g_scratch + o, name, nl);
     o += nl;
-
+    g_scratch[o++] = family;
     size_t body_len = o - HDR;
     uint32_t plen = (uint32_t)(2 + body_len);
     g_scratch[0] = (uint8_t)(plen >> 24);
@@ -700,14 +709,25 @@ int d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
 }
 
 int d2k_link_del_name(int fd, const char *name, char *err, size_t errcap) {
-    return send_name_only(fd, D2K_CMD_DEL_NAME, "DEL_NAME", name, err, errcap);
+    return d2k_link_del_name_family(fd, name, 4, err, errcap);
+}
+
+int d2k_link_del_name_family(int fd, const char *name, uint8_t family,
+                             char *err, size_t errcap) {
+    return send_name_only(fd, D2K_CMD_DEL_NAME, "DEL_NAME", name, family, err, errcap);
 }
 
 int d2k_link_del_name_probe(int fd, const char *name, uint8_t transport,
                             uint8_t shape, uint16_t sport_be,
                             char *err, size_t errcap) {
+    return d2k_link_del_name_probe_family(fd, name, transport, shape, sport_be, 4, err, errcap);
+}
+
+int d2k_link_del_name_probe_family(int fd, const char *name, uint8_t transport,
+                                   uint8_t shape, uint16_t sport_be, uint8_t family,
+                                   char *err, size_t errcap) {
     (void)transport; /* transport is represented by the wire shape */
-    if (fd < 0 || !name || sport_be == 0) {
+    if (fd < 0 || !name || sport_be == 0 || (family != 4 && family != 6)) {
         say(err, errcap, "сокет, имя или порт пробного плана не задан");
         return -1;
     }
@@ -720,6 +740,7 @@ int d2k_link_del_name_probe(int fd, const char *name, uint8_t transport,
     g_scratch[o++] = (uint8_t)nl;
     memcpy(g_scratch + o, name, nl); o += nl;
     g_scratch[o++] = shape;
+    g_scratch[o++] = family;
     memcpy(g_scratch + o, &sport_be, 2); o += 2;
     uint32_t plen = (uint32_t)(2 + (o - HDR));
     g_scratch[0] = (uint8_t)(plen >> 24); g_scratch[1] = (uint8_t)(plen >> 16);

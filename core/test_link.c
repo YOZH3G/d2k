@@ -786,6 +786,34 @@ int main(void) {
             close(sv[1]);
         }
     }
+    /* Name plans carry an explicit family, including IPv4 compatibility calls. */
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "name family socketpair");
+        char err[200]; uint8_t wire[64];
+        CHECK(d2k_link_set_name_family(sv[0], "x", 6, "aabb", 1, 0, 6,
+                                      err, sizeof err) == 0, "IPv6 name command");
+        CHECK(read(sv[1], wire, sizeof wire) == 12, "IPv6 name command length");
+        CHECK(wire[6] == 1 && wire[7] == 'x' && wire[8] == 1 &&
+              wire[9] == 6 && wire[10] == 0xaa && wire[11] == 0xbb,
+              "IPv6 name command exact bytes");
+        CHECK(d2k_link_set_name_family(sv[0], "x", 6, "", 1, 0, 0,
+                                      err, sizeof err) == -1, "ambiguous family rejected");
+        CHECK(d2k_link_set_name(sv[0], "x", 6, "", 1, err, sizeof err) == 0,
+              "IPv4 compatibility command");
+        CHECK(read(sv[1], wire, sizeof wire) == 10 && wire[9] == 4,
+              "legacy API explicitly encodes IPv4");
+        CHECK(d2k_link_del_name_family(sv[0], "x", 6, err, sizeof err) == 0,
+              "IPv6 delete name");
+        CHECK(read(sv[1], wire, sizeof wire) == 9 && wire[8] == 6,
+              "IPv6 delete is family scoped");
+        CHECK(d2k_link_del_name_probe_family(sv[0], "x", 17, 3, htons(40000), 6,
+                                             err, sizeof err) == 0, "IPv6 probe delete");
+        CHECK(read(sv[1], wire, sizeof wire) == 12 && wire[8] == 3 &&
+              wire[9] == 6 && wire[10] == 0x9c && wire[11] == 0x40,
+              "IPv6 probe delete wire");
+        close(sv[0]); close(sv[1]);
+    }
     /* Address-trial command encoding is byte-level protocol, not a struct ABI. */
     {
         int sv[2];

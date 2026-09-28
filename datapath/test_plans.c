@@ -46,6 +46,34 @@ static uint32_t addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 
 int main(void) {
     {
+        d2k_plantab *t = d2k_plantab_new(8);
+        const uint8_t name[] = "dual.example";
+        d2k_plan *v4 = mkplan(), *v6 = mkplan(), *trial = mkplan();
+        CHECK(d2k_plantab_set_name_family(t, name, 12, 1, v4, D2K_PLAN_SHAPE_MODERN, 0, 4) == 0,
+              "IPv4 family plan setup");
+        CHECK(d2k_plantab_set_name_family(t, name, 12, 1, v6, D2K_PLAN_SHAPE_MODERN, 0, 6) == 0,
+              "IPv6 family plan setup");
+        CHECK(d2k_plantab_count(t) == 2, "one family overwrote another");
+        CHECK(d2k_plantab_find_family(t, name, 12, 0, 2, D2K_PLAN_SHAPE_MODERN, 0, 4) == v4,
+              "IPv4 received IPv6 plan");
+        CHECK(d2k_plantab_find_family(t, name, 12, 0, 2, D2K_PLAN_SHAPE_MODERN, 0, 6) == v6,
+              "IPv6 received IPv4 plan");
+        CHECK(d2k_plantab_set_name_family(t, name, 12, 3, trial, D2K_PLAN_SHAPE_MODERN, 123, 6) == 0,
+              "IPv6 trial setup");
+        CHECK(d2k_plantab_find_family(t, NULL, 0, 0, 4, D2K_PLAN_SHAPE_MODERN, 123, 4) == NULL,
+              "nameless IPv4 received IPv6 trial");
+        CHECK(d2k_plantab_find_family(t, NULL, 0, 0, 4, D2K_PLAN_SHAPE_MODERN, 123, 6) == trial,
+              "nameless IPv6 lost exact trial");
+        CHECK(d2k_plantab_del_name_probe_family(t, name, 12, D2K_PLAN_SHAPE_MODERN, 123, 4) == 0,
+              "IPv4 cleanup deleted IPv6 trial");
+        CHECK(d2k_plantab_del_name_probe_family(t, name, 12, D2K_PLAN_SHAPE_MODERN, 123, 6) == 1,
+              "IPv6 trial cleanup");
+        CHECK(d2k_plantab_del_name_family(t, name, 12, 4) == 1, "IPv4 plan cleanup");
+        CHECK(d2k_plantab_find_family(t, name, 12, 0, 5, D2K_PLAN_SHAPE_MODERN, 0, 6) == v6,
+              "IPv4 cleanup deleted persistent IPv6");
+        d2k_plantab_free(t);
+    }
+    {
         d2k_plantab *t = d2k_plantab_new(4);
         d2k_addr_probe_flow f = {.family=6, .transport=17,
             .src_port_be=0x3412, .dst_port_be=0xbb01,

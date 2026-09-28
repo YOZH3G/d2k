@@ -145,8 +145,9 @@ static size_t set_name_body_shaped(uint8_t *body, const char *name,
     body[0] = (uint8_t)nl;
     memcpy(body + 1, name, nl);
     body[1 + nl] = shape;
-    memcpy(body + 2 + nl, plan, planlen);
-    return 2 + nl + planlen;
+    body[2 + nl] = 4;
+    memcpy(body + 3 + nl, plan, planlen);
+    return 3 + nl + planlen;
 }
 
 static size_t set_name_body(uint8_t *body, const char *name,
@@ -577,6 +578,7 @@ int main(void) {
             size_t nl = strlen(nm), o = 0;
             body[o++] = (uint8_t)nl; memcpy(body + o, nm, nl); o += nl;
             body[o++] = D2K_PLAN_SHAPE_QUIC;
+            body[o++] = 4;
             body[o++] = 0x9c; body[o++] = 0x40; /* port 40000 */
             memcpy(body + o, tiny, sizeof tiny); o += sizeof tiny;
             frame(f, D2K_CMD_SET_NAME_PROBE, body, o);
@@ -587,7 +589,8 @@ int main(void) {
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
                   "SET_NAME_PROBE для удаления не принялась");
             o = 0; body[o++] = (uint8_t)nl; memcpy(body + o, nm, nl); o += nl;
-            body[o++] = D2K_PLAN_SHAPE_QUIC; body[o++] = 0x9c; body[o++] = 0x40;
+            body[o++] = D2K_PLAN_SHAPE_QUIC; body[o++] = 4;
+            body[o++] = 0x9c; body[o++] = 0x40;
             frame(f, D2K_CMD_DEL_NAME_PROBE, body, o);
             CHECK(write(cli, f, 6 + o) == (ssize_t)(6 + o), "DEL_NAME_PROBE не отправилась");
             CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "DEL_NAME_PROBE не разобралась");
@@ -598,6 +601,40 @@ int main(void) {
             CHECK(d2k_plantab_find(tab, (const uint8_t *)nm, nl, 0, cx.now_ns,
                                    D2K_PLAN_SHAPE_QUIC) != NULL,
                   "DEL_NAME_PROBE задела подтверждённый SET_NAME");
+        }
+
+        /* Same name in two families: commands cannot replace/delete the other. */
+        {
+            const char *nm = "dual.example";
+            size_t nl = strlen(nm);
+            uint8_t body[96], f[112];
+            d2k_plantab *tab = d2k_session_plans(sess);
+            for (uint8_t family = 4; family <= 6; family += 2) {
+                size_t blen = set_name_body(body, nm, tiny, sizeof tiny);
+                body[2 + nl] = family;
+                frame(f, D2K_CMD_SET_NAME, body, blen);
+                CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "dual SET write");
+                CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "dual SET parse");
+                d2k_ctl_flush(c);
+                uint16_t cmd; int ok; uint8_t reason;
+                CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok, "dual SET ack");
+            }
+            CHECK(d2k_plantab_find_family(tab, (const uint8_t *)nm, nl, 0,
+                    cx.now_ns, D2K_PLAN_SHAPE_QUIC, 0, 4) != NULL, "IPv4 plan retained");
+            CHECK(d2k_plantab_find_family(tab, (const uint8_t *)nm, nl, 0,
+                    cx.now_ns, D2K_PLAN_SHAPE_QUIC, 0, 6) != NULL, "IPv6 plan installed");
+            body[0] = (uint8_t)nl; memcpy(body + 1, nm, nl); body[1 + nl] = 6;
+            frame(f, D2K_CMD_DEL_NAME, body, nl + 2);
+            CHECK(write(cli, f, nl + 8) == (ssize_t)(nl + 8), "dual DEL write");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "dual DEL parse");
+            d2k_ctl_flush(c);
+            uint16_t cmd; int ok; uint8_t reason;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok, "dual DEL ack");
+            CHECK(d2k_plantab_find_family(tab, (const uint8_t *)nm, nl, 0,
+                    cx.now_ns, D2K_PLAN_SHAPE_QUIC, 0, 4) != NULL, "IPv6 delete preserves IPv4");
+            CHECK(d2k_plantab_find_family(tab, (const uint8_t *)nm, nl, 0,
+                    cx.now_ns, D2K_PLAN_SHAPE_QUIC, 0, 6) == NULL, "IPv6 delete scoped");
+            d2k_plantab_del_name(tab, (const uint8_t *)nm, nl);
         }
 
         /* Адресная проба передаёт полный 5-tuple и поколение отдельно от
@@ -716,8 +753,9 @@ int main(void) {
             uint8_t body[32], f[48];
             body[0] = 0;
             body[1] = D2K_PLAN_SHAPE_GRANDFATHER;
-            memcpy(body + 2, tiny, sizeof tiny);
-            size_t blen = 2 + sizeof tiny;
+            body[2] = 4;
+            memcpy(body + 3, tiny, sizeof tiny);
+            size_t blen = 3 + sizeof tiny;
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "команда с пустым именем не отправилась");
             CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "команда с пустым именем не разобралась");
