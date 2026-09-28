@@ -138,7 +138,7 @@ struct d2k_session {
      *
      * Признак по транспорту, а не один на всё: правила на TCP и на UDP —
      * разные строки, и наличие одной ничего не говорит о другой. */
-    int      rev_seen[2];
+    int      rev_seen[4];
     int      udp_reverse_hook;
 
     int      shape_armed[4];
@@ -331,7 +331,7 @@ static void on_flow_expire(void *ctx, const d2k_flow *f) {
        сервер невидим, и молчащим выглядит каждый поток. Улика тут сессионная
        (см. rev_seen): к моменту забвения поток мог не получить ни одного
        пакета оттуда именно потому, что его и не ждали. */
-    if (!s->rev_seen[slot_of(f->key.proto)] &&
+    if (!s->rev_seen[shape_slot(f->key.proto, f->key.family)] &&
         !(f->key.proto == 17 && s->udp_reverse_hook)) {
         return;
     }
@@ -676,7 +676,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
            ни при каких обстоятельствах (лаборатория lab-quic.sh 13.09.2026:
            приветствий 4, подозрений 0). */
         fl->rev_pkts++;
-        s->rev_seen[slot_of(17)] = 1;
+        s->rev_seen[shape_slot(17, fl->key.family)] = 1;
         /* saw_initial — тот же поток, только имя не прочиталось (d2k_track.h).
            Ответ по нему тоже наблюдаем: иначе обратный трафик выглядел бы
            полным молчанием. Это не проверка протокола или успеха обхода. */
@@ -1364,7 +1364,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         }
         fl->rev_pkts++;
         fl->rev_bytes += total;
-        s->rev_seen[slot_of(6)] = 1;
+        s->rev_seen[shape_slot(6, fl->key.family)] = 1;
         if (fl->saw_hello) {
             fl->rev_after_hello++;
             size_t rpay_off = ihl + doff;
@@ -2264,7 +2264,7 @@ static void sweep_udp_one(void *ctx, d2k_flow *f) {
         f->last_rev_after_hello_ns >= f->last_fwd_after_hello_ns) {
         return;
     }
-    if (!c->s->rev_seen[slot_of(17)] && !c->s->udp_reverse_hook) {
+    if (!c->s->rev_seen[shape_slot(17, f->key.family)] && !c->s->udp_reverse_hook) {
         return;
     }
     if (f->fwd_after_hello == 0) {

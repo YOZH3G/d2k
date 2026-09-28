@@ -1162,6 +1162,28 @@ static int frag_nat6(const char *path, uint8_t proto, const uint8_t *src,
 
 int main(void) {
     {
+        /* An IPv4 server reply cannot prove the IPv6 reply hook exists. */
+        d2k_session *s = d2k_session_new(32, 32);
+        uint8_t old[1400], pkt[1420] = {0}, out[8192], reply[] = {1, 2, 3};
+        d2k_result r;
+        size_t n = build_udp_rev_pkt(old, 50010, reply, sizeof reply);
+        d2k_session_packet(s, old, n, 1000000000ull, out, sizeof out, &r);
+        n = build_udp_pkt(old, 50011, 443, v1_initial, sizeof v1_initial);
+        pkt[0] = 0x60; pkt[4] = (uint8_t)((n - 20) >> 8); pkt[5] = (uint8_t)(n - 20);
+        pkt[6] = 17; pkt[7] = 64;
+        pkt[8] = pkt[24] = 0x20; pkt[9] = pkt[25] = 1;
+        pkt[23] = 1; pkt[39] = 2;
+        memcpy(pkt + 40, old + 20, n - 20);
+        d2k_session_packet(s, pkt, n + 20, 2000000000ull, out, sizeof out, &r);
+        d2k_session_packet(s, pkt, n + 20, 3000000000ull, out, sizeof out, &r);
+        CHECK(d2k_session_sweep(s, 30000000000ull) == 0,
+              "IPv4 reply visibility must not manufacture IPv6 silence evidence");
+        d2k_session_expire(s, 300000000000ull, 50000000000ull);
+        CHECK(d2k_session_suspects(s) == 0,
+              "expiry must not mix reply visibility across families");
+        d2k_session_free(s);
+    }
+    {
         d2k_session *s6 = d2k_session_new(32, 32);
         uint8_t old[1400], pkt[1420] = {0}, output[8192];
         size_t n4 = build_udp_pkt(old, 50011, 443, v1_initial, sizeof v1_initial);
