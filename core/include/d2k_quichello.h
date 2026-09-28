@@ -55,6 +55,13 @@
 int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
                            size_t *out_len);
 
+/* Prepare a QUIC measurement input from the latest captured client shape.
+ * If that snapshot cannot be safely renamed for this target, fall back to the
+ * same fresh PROFILE used when no snapshot is available. */
+int d2k_quic_prepare_target(const uint8_t *sample, size_t sample_len,
+                            const char *sni, uint8_t *out, size_t cap,
+                            size_t *out_len, int *used_sample);
+
 /* ЧЕМ СПРОСИТЬ КОРОБКУ — способ пересборки снятого Initial.
  *
  * Оригинал («Поиск по домену», internal/quicprobe/questions.go) задаёт восемь

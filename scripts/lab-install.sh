@@ -77,8 +77,49 @@ make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
 cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/logo-d2k.png internal/web/assets/mascot-d2k.png "$REL/internal/web/assets/"
 cp files/S99d2k files/config files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
-cp files/d2k-tg-firewall.sh files/d2k-tg-watchdog.sh files/tg-roots.pem "$REL/files/"
+cp files/d2k-tg-firewall.sh files/d2k-tg-watchdog.sh files/d2k-instagram-dns.sh \
+    files/d2k-instagram-dns-scheduler.sh files/meta-ranges.txt files/tg-roots.pem "$REL/files/"
 cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fake/"
+
+# Keenetic DNS lifecycle is exercised with a stateful ndmc double. curl is
+# wrapped only for the external resolver and Instagram probes; the real curl
+# still checks the local D2K panel below.
+mkdir -p /tmp/d2k-test-bin
+cat > /tmp/d2k-test-bin/ndmc <<'NDMC'
+#!/bin/sh
+case "$*" in
+    *"show running-config"*) cat /tmp/d2k-ndmc-state ;;
+    *"system configuration save"*) : ;;
+    *"-c ip host "*)
+        set -- $*
+        printf 'ip host %s %s\n' "$4" "$5" >> /tmp/d2k-ndmc-state
+        ;;
+    *"-c no ip host "*)
+        set -- $*
+        host=$5; ip=$6
+        awk -v h="$host" -v ip="$ip" '!( $1=="ip" && $2=="host" && $3==h && $4==ip )' /tmp/d2k-ndmc-state > /tmp/d2k-ndmc-state.new
+        mv /tmp/d2k-ndmc-state.new /tmp/d2k-ndmc-state
+        ;;
+    *) echo "unexpected ndmc: $*" >&2; exit 2 ;;
+esac
+NDMC
+cat > /tmp/d2k-test-bin/curl <<'CURL'
+#!/bin/sh
+case "$*" in
+    *https://213.176.74.63.nip.io/resolve*)
+        printf '%s' '{"results":{"instagram.com":["157.240.9.174"],"www.instagram.com":["157.240.9.175"]}}'
+        exit 0
+        ;;
+    *https://instagram.com/*|*https://www.instagram.com/*)
+        printf '200'
+        exit 0
+        ;;
+esac
+exec /usr/bin/curl "$@"
+CURL
+chmod +x /tmp/d2k-test-bin/ndmc /tmp/d2k-test-bin/curl
+printf 'ip host www.instagram.com 157.240.9.175\nip host instagram.com 203.0.113.10\nip host unrelated.example 192.0.2.7\n' > /tmp/d2k-ndmc-state
+export D2K_STUB_PATH=/tmp/d2k-test-bin
 
 # СНИМОК ЧИСТОЙ СИСТЕМЫ. По нему проверяются и остановка, и удаление: обе
 # обязаны вернуть экран ровно в то состояние, в каком его застали.
@@ -100,6 +141,11 @@ grep -q "готово" /tmp/install1.log || fail "установка с чист
 [ -x /opt/sbin/d2ktg ] || fail "C-туннель Telegram не установлен"
 [ -x "$DIR/d2k-tg-firewall.sh" ] || fail "не установлен firewall Telegram"
 [ -x "$DIR/d2k-tg-watchdog.sh" ] || fail "не установлен сторож Telegram"
+[ -x "$DIR/d2k-instagram-dns.sh" ] || fail "не установлен Instagram DNS manager"
+[ -s "$DIR/files/meta-ranges.txt" ] || fail "не установлены диапазоны Meta для проверки VPS-ответа"
+[ "$(grep -c '^ip host instagram.com 157.240.9.174$' /tmp/d2k-ndmc-state)" = 1 ] || fail "установщик не применил VPS Instagram-резолв"
+[ "$(grep -c '^instagram.com 157.240.9.174$' "$DIR/state/instagram-ip-hosts.tsv")" = 1 ] || fail "установщик не сохранил владение Instagram-записью"
+[ "$(grep -c '^www.instagram.com 157.240.9.175$' "$DIR/state/instagram-ip-hosts.tsv" || true)" = 0 ] || fail "установщик присвоил себе заранее существующую запись"
 [ -s "$DIR/files/tg-roots.pem" ] || fail "не установлен CA bundle Telegram"
 [ "$(/opt/sbin/d2ktg --version)" = "d2k-tg-0.1" ] || fail "не запускается C-туннель Telegram"
 [ "$(grep -c '^TG_ENABLED=0$' "$DIR/config")" = 1 ] || fail "Telegram должен быть выключен по умолчанию"
@@ -268,17 +314,18 @@ sh scripts/uninstall.sh >/dev/null
 [ -e "$DIR/panel" ] && fail "после удаления остались ресурсы панели"
 [ -e "$DIR/d2k-tg-firewall.sh" ] && fail "после удаления остался firewall Telegram"
 [ -e "$DIR/d2k-tg-watchdog.sh" ] && fail "после удаления остался сторож Telegram"
+[ -e "$DIR/d2k-instagram-dns.sh" ] && fail "после удаления остался Instagram DNS manager"
+[ -e "$DIR/files/meta-ranges.txt" ] && fail "после удаления остались диапазоны Meta"
+[ "$(grep -c '^ip host instagram.com 157.240.9.174$' /tmp/d2k-ndmc-state || true)" = 0 ] || fail "деинсталлятор оставил D2K Instagram запись"
+[ "$(grep -c '^ip host www.instagram.com 157.240.9.175$' /tmp/d2k-ndmc-state)" = 1 ] || fail "деинсталлятор удалил существовавшую до D2K запись"
+[ "$(grep -c '^ip host instagram.com 203.0.113.10$' /tmp/d2k-ndmc-state)" = 1 ] || fail "деинсталлятор удалил пользовательскую запись"
 [ -e "$DIR/files/tg-roots.pem" ] && fail "после удаления остался CA bundle Telegram"
 ipset list d2k_tg_dc >/dev/null 2>&1 && fail "после удаления остался IPv4 Telegram ipset"
 ipset list d2k_tg_dc6 >/dev/null 2>&1 && fail "после удаления остался IPv6 Telegram ipset"
 [ -e "$INIT" ]        && fail "после удаления остался init-скрипт"
 [ "$(rules)" = "$CLEAN_RULES" ] || fail "после удаления список правил не совпал с исходным"
-# Каталог изученных коробок по умолчанию сохраняется — это заявленное
-# поведение, и проверяется оно так же, как всё остальное.
-[ -d "$DIR/state" ] || fail "каталог коробок удалён, хотя обещано сохранить"
-D2K_KEEP_STATE=0 sh scripts/uninstall.sh >/dev/null
-[ -e "$DIR" ] && fail "явное удаление каталога оставило $DIR"
-echo "удалено без следов; каталог коробок удаляется только по явному запросу"
+[ ! -e "$DIR" ] && fail "обычное удаление оставило каталог D2K"
+echo "удалено без следов, включая каталог коробок"
 
 echo
 echo "УСТАНОВКА ПРОВЕРЕНА: шесть проверок этапа G пройдены на чистой системе"

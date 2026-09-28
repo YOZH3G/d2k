@@ -113,6 +113,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
           find scripts spike -name '*.sh' -print0 | xargs -0 -r shellcheck -s sh
+          shellcheck -s sh files/d2k-instagram-dns.sh
+      - name: Instagram resolver DNS lifecycle
+        run: sh scripts/test-instagram-dns.sh
+      - name: Installer/uninstaller lifecycle in disposable container
+        run: sh scripts/lab-install.sh
 
   datapath:
     name: Датапат на C — сборка под целевые арки

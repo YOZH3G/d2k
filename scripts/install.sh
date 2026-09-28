@@ -81,6 +81,9 @@ fetch "files/d2k-fw-heal.sh"    "$TMP/d2k-fw-heal.sh"
 fetch "files/001-d2k.sh"        "$TMP/001-d2k.sh"
 fetch "files/d2k-tg-firewall.sh" "$TMP/d2k-tg-firewall.sh"
 fetch "files/d2k-tg-watchdog.sh" "$TMP/d2k-tg-watchdog.sh"
+fetch "files/d2k-instagram-dns.sh" "$TMP/d2k-instagram-dns.sh"
+fetch "files/d2k-instagram-dns-scheduler.sh" "$TMP/d2k-instagram-dns-scheduler.sh"
+fetch "files/meta-ranges.txt" "$TMP/meta-ranges.txt"
 fetch "files/tg-roots.pem" "$TMP/tg-roots.pem"
 fetch "files/fake/stun.bin" "$TMP/stun.bin"
 fetch "files/fake/quic_initial_dbankcloud_ru.bin" "$TMP/quic_initial_dbankcloud_ru.bin"
@@ -93,7 +96,8 @@ fetch "internal/web/assets/mascot-d2k.png" "$TMP/panel/mascot-d2k.png"
 
 chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kd" "$TMP/d2ktg" \
          "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/001-d2k.sh" \
-         "$TMP/d2k-tg-firewall.sh" "$TMP/d2k-tg-watchdog.sh"
+         "$TMP/d2k-tg-firewall.sh" "$TMP/d2k-tg-watchdog.sh" \
+         "$TMP/d2k-instagram-dns.sh" "$TMP/d2k-instagram-dns-scheduler.sh"
 
 # Проверка ДО замены: запускается ли то, что скачалось, и та ли это арка.
 PANEL_VERSION=$("$TMP/d2kpanel" --version 2>/dev/null) || die "скачанный d2kpanel не запускается на этой системе"
@@ -151,6 +155,9 @@ install_data_atomic "$TMP/panel/mascot-d2k.png" "$DIR/panel/mascot-d2k.png"
 install_atomic "$TMP/d2k-fw-heal.sh" "$DIR/d2k-fw-heal.sh"
 install_atomic "$TMP/d2k-tg-firewall.sh" "$DIR/d2k-tg-firewall.sh"
 install_atomic "$TMP/d2k-tg-watchdog.sh" "$DIR/d2k-tg-watchdog.sh"
+install_atomic "$TMP/d2k-instagram-dns.sh" "$DIR/d2k-instagram-dns.sh"
+install_atomic "$TMP/d2k-instagram-dns-scheduler.sh" "$DIR/d2k-instagram-dns-scheduler.sh"
+install_data_atomic "$TMP/meta-ranges.txt" "$DIR/files/meta-ranges.txt"
 install_data_atomic "$TMP/tg-roots.pem" "$DIR/files/tg-roots.pem"
 install_atomic "$TMP/stun.bin" "$DIR/files/fake/stun.bin"
 install_atomic "$TMP/quic_initial_dbankcloud_ru.bin" "$DIR/files/fake/quic_initial_dbankcloud_ru.bin"
@@ -174,6 +181,13 @@ fi
 # чтение root даже при обновлении ранее установленного файла с более широкими
 # правами.
 chmod 0600 "$DIR/config" || die "не защитить права конфигурации"
+# Resolve and pin Instagram through the same authenticated VPS flow as z2k.
+# A resolver/VPS outage must not turn a healthy D2K installation into a failure.
+if "$DIR/d2k-instagram-dns.sh" refresh; then
+    say "Instagram DNS проверен через VPS"
+else
+    say "VPS Instagram DNS сейчас недоступен; действующие записи не затронуты, повтор назначен ежедневно с 04:00"
+fi
 # Убираем только legacy Go-панельный бинарник прежней установки; новый C
 # runtime уже проверен выше и установлен отдельно как d2kpanel.
 rm -f "$SBIN/d2k"
@@ -189,5 +203,11 @@ if ! "$INIT" status | grep -q "датапат: работает"; then
 fi
 
 "$INIT" status
-say "готово. Панель: http://127.0.0.1:8090/ (адрес меняется в $DIR/config)"
+PANEL_LISTEN=$(sed -n 's/^PANEL_LISTEN=//p' "$DIR/config" | tail -n 1)
+if [ -n "$PANEL_LISTEN" ]; then
+    say "панель слушает: http://$PANEL_LISTEN/"
+else
+    say "панель отключена (PANEL_LISTEN пуст в $DIR/config)"
+fi
+say "готово"
 say "режим по умолчанию — активный обход (MODE=apply). Для наблюдения задайте MODE=observe."

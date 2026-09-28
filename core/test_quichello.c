@@ -508,6 +508,18 @@ int main(int argc, char **argv) {
               "вопрос QUIC для IP-цели не сохранил отсутствие SNI");
         CHECK(d2k_quic_probe_initial("", first, sizeof first, &fl) != 0,
               "безымянной цели выдуман именованный измерительный вход");
+
+        {
+            const uint8_t unusable_sample[] = {0x01, 0x02, 0x03};
+            int used_sample = 1;
+            CHECK(d2k_quic_prepare_target(unusable_sample, sizeof unusable_sample,
+                                          "vk.ru", first, sizeof first, &fl,
+                                          &used_sample) == 0 && used_sample == 0,
+                  "неподходящий последний QUIC-снимок не переключился на безопасный PROFILE");
+            CHECK(d2k_quic_sni(first, fl, name, sizeof name) == 0 &&
+                  strcmp(name, "vk.ru") == 0,
+                  "резервный измерительный Initial не содержит имя цели");
+        }
     }
 
     /* ПЕРВЫЙ INITIAL СВОИМ СТЕКОМ — БАЙТЫ, А НЕ СОЕДИНЕНИЕ.

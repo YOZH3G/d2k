@@ -112,6 +112,8 @@ TG_STATUS=$STATE_DIR/telegram.status
 TG_FIREWALL=$DIR/d2k-tg-firewall.sh
 TG_WATCHDOG=$DIR/d2k-tg-watchdog.sh
 TG_WD_PID=$RUN/d2k-tg-watchdog.pid
+DNS_SCHEDULER=$DIR/d2k-instagram-dns-scheduler.sh
+DNS_SCHED_PID=$RUN/d2k-instagram-dns-scheduler.pid
 TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
 unset TG_RELAY_SECRET TG_RELAY_URL TG_IDENTITY TG_CA_BUNDLE
 FW_LOCK=${FW_LOCK:-/tmp/d2k-fw-operation.lock}
@@ -478,6 +480,10 @@ start() {
     start_engine || return $?
     telegram_start || say "Telegram tunnel не поднят; D2K продолжает работу независимо"
     start_panel
+    if [ -x "$DNS_SCHEDULER" ] && ! running "$DNS_SCHED_PID"; then
+        start-stop-daemon -S -b -m -p "$DNS_SCHED_PID" -x "$DNS_SCHEDULER" -- run \
+            || say "планировщик Instagram DNS не запустился — повторы вручную"
+    fi
 }
 
 stop_pidfile() {
@@ -599,6 +605,7 @@ engine_stop() {
 }
 
 stop() {
+    stop_pidfile "$DNS_SCHED_PID"
     telegram_stop
     engine_stop
     stop_pidfile "$PN_PID"
@@ -617,6 +624,8 @@ status() {
                       || echo "  сторож правил: не работает"
     running "$TG_PID" && echo "  Telegram tunnel: работает (pid $(cat $TG_PID))" \
                        || echo "  Telegram tunnel: не работает (enabled=${TG_ENABLED:-0})"
+    running "$DNS_SCHED_PID" && echo "  Instagram DNS: суточное обновление запланировано (pid $(cat $DNS_SCHED_PID))" \
+                              || echo "  Instagram DNS: планировщик не работает"
     fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
     bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
         /proc/net/netfilter/nfnetlink_queue 2>/dev/null)

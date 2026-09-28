@@ -276,7 +276,8 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
     /* Тот же местный конец, что в ключах событий этого теста (ev_hello). */
     memcpy(r.local_ip4, ver_local_ip4, sizeof r.local_ip4);
     r.local_port = ver_answer_port;
-    snprintf(r.reason, sizeof r.reason, "подменённый зонд");
+    snprintf(r.reason, sizeof r.reason, "%s",
+             r.level == D2K_VER_CHALLENGE ? "Cloudflare challenge, HTTP 403" : "подменённый зонд");
     if (ver_snapshot_enabled) {
         pthread_mutex_lock(&snapshot_mu);
         ver_snapshot_entered = 1;
@@ -379,7 +380,7 @@ static d2k_ev ev_suspect(uint8_t transport, uint16_t cport) {
     d2k_ev e = ev_hello(transport, cport, "");
     e.kind = D2K_EV_SUSPECT;
     e.name[0] = '\0';
-    e.code = 1;      /* подделанный сброс */
+    e.code = D2K_SUSPECT_RST_CUT; /* снятый защитой аномальный сброс */
     e.ttl = 127;     /* примета коробки: она на фиксированном расстоянии */
     e.ref_ttl = 53;  /* сервер — на своём, разность приметой не является */
     e.tos = 0x88;
@@ -776,8 +777,10 @@ static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
 int main(int argc, char **argv) {
     d2k_sched_mark_fn saved_mark = d2k_sched_mark_hook;
     int voice_only = argc == 2 && strcmp(argv[1], "--voice-only") == 0;
-    if (argc > 1 && !voice_only) {
-        fprintf(stderr, "usage: test_sched [--voice-only]\n");
+    int rst_only = argc == 2 && strcmp(argv[1], "--rst-only") == 0;
+    int admission_only = argc == 2 && strcmp(argv[1], "--admission-only") == 0;
+    if (argc > 1 && !voice_only && !rst_only && !admission_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only]\n");
         return 2;
     }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
@@ -821,12 +824,13 @@ int main(int argc, char **argv) {
     drain_fd = sv[1];
     {
         int fl = fcntl(drain_fd, F_GETFL, 0);
-        if (fl >= 0) { (void)fcntl(drain_fd, F_SETFL, fl | O_NONBLOCK); }
+    if (fl >= 0) { (void)fcntl(drain_fd, F_SETFL, fl | O_NONBLOCK); }
     }
 
     d2k_catalog cat;
     memset(&cat, 0, sizeof cat);
     if (voice_only) { goto voice_only_run; }
+    if (admission_only) { goto admission_only_run; }
 
     /* A completed domain-search provider is not a bare classifier. Its
      * failure must not launch another property questionnaire or fallback. */
@@ -1002,6 +1006,240 @@ int main(int argc, char **argv) {
     }
 
     tcp_answer = D2K_V_OPAQUE;
+
+    /* Обычный входящий RST — наблюдение, а не достаточный диагноз.
+       Одиночный RST не должен запускать дорогой поиск; второй RST по тому же
+       имени, но по другому TCP-потоку в пределах 30 секунд — должен. */
+    {
+        d2k_catalog c_rst = {0};
+        d2k_sched *s = d2k_sched_new(&c_rst, sv[0], 0x2d);
+        tcp_calls = quic_calls = 0;
+        saidbuf[0] = '\0';
+        CHECK(s != NULL, "планировщик для порога RST не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            d2k_ev h1 = ev_hello(6, 41001, "single-reset.example");
+            d2k_sched_event(s, &h1);
+            d2k_ev r1 = ev_suspect(6, 41001);
+            r1.code = D2K_SUSPECT_RST;
+            CHECK(d2k_sched_event(s, &r1) == 0,
+                  "один обычный RST запустил поиск вместо ожидания подтверждения");
+            CHECK(d2k_sched_active(s) == 0,
+                  "ожидающий подтверждения RST засчитан как активный поиск");
+            settle(s);
+            CHECK(tcp_calls == 0 && quic_calls == 0,
+                  "одиночный RST дошёл до сетевого оракула");
+
+            d2k_ev h2 = ev_hello(6, 41002, "single-reset.example");
+            d2k_sched_event(s, &h2);
+            d2k_ev r2 = ev_suspect(6, 41002);
+            r2.code = D2K_SUSPECT_RST;
+            CHECK(d2k_sched_event(s, &r2) == 1,
+                  "второй RST на независимом потоке не запустил поиск");
+            CHECK(said("второй обычный RST на независимом потоке"),
+                  "второй поток не распознан как подтверждение; журнал: ");
+            settle(s);
+            CHECK(tcp_calls == 1 && quic_calls == 0,
+                  "подтверждённый RST не запустил ровно один TCP-поиск");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c_rst);
+    }
+
+    /* Повтор того же flow key не является независимым подтверждением. По
+       окончании окна старый одиночный RST забывается: новый тоже ждёт второго. */
+    {
+        d2k_catalog c_rst = {0};
+        d2k_sched *s = d2k_sched_new(&c_rst, sv[0], 0x2d);
+        tcp_calls = 0;
+        CHECK(s != NULL, "планировщик для границ RST не завёлся");
+        if (s) {
+            d2k_ev h = ev_hello(6, 41003, "reset-window.example");
+            d2k_sched_event(s, &h);
+            d2k_ev r = ev_suspect(6, 41003);
+            r.code = D2K_SUSPECT_RST;
+            CHECK(d2k_sched_event(s, &r) == 0, "первый RST окна не отложен");
+            tick_once(s); /* привязать окно к модельным часам планировщика */
+            CHECK(d2k_sched_event(s, &r) == 0,
+                  "повтор RST того же потока ошибочно подтвердил блокировку");
+            skip_ahead(s, 30001);
+            d2k_ev h2 = ev_hello(6, 41004, "reset-window.example");
+            d2k_sched_event(s, &h2);
+            d2k_ev r2 = ev_suspect(6, 41004);
+            r2.code = D2K_SUSPECT_RST;
+            CHECK(d2k_sched_event(s, &r2) == 0,
+                  "RST за пределами окна подтвердил старое подозрение");
+            settle(s);
+            CHECK(tcp_calls == 0, "неподтверждённое/просроченное RST запустило поиск");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c_rst);
+    }
+
+    /* Более сильные сигналы не должны ждать второго потока: повтор ClientHello,
+       молчание и снятый защитой аномальный RST запускают поиск сразу. */
+    {
+        static const uint16_t strong_codes[] = {
+            D2K_SUSPECT_REPEAT, D2K_SUSPECT_SILENT, D2K_SUSPECT_RST_CUT
+        };
+        for (size_t i = 0; i < sizeof strong_codes / sizeof strong_codes[0]; i++) {
+            d2k_catalog c_strong = {0};
+            d2k_sched *s = d2k_sched_new(&c_strong, sv[0], 0x2d);
+            tcp_calls = quic_calls = 0;
+            CHECK(s != NULL, "планировщик сильного подозрения не завёлся");
+            if (s) {
+                uint16_t port = (uint16_t)(41010 + i);
+                d2k_ev h = ev_hello(6, port, "strong-signal.example");
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port);
+                su.code = strong_codes[i];
+                CHECK(d2k_sched_event(s, &su) == 1,
+                      "сильный сигнал ошибочно ждал второго потока");
+                settle(s);
+                CHECK(tcp_calls == 1,
+                      "сильный сигнал не вызвал ровно один TCP-поиск");
+                d2k_sched_free(s);
+            }
+            d2k_catalog_free(&c_strong);
+        }
+    }
+
+    /* Сильный сигнал по соседнему потоку немедленно подтверждает уже ожидающий
+       RST, не требуя второго обычного сброса. */
+    {
+        d2k_catalog c_promote = {0};
+        d2k_sched *s = d2k_sched_new(&c_promote, sv[0], 0x2d);
+        tcp_calls = 0;
+        CHECK(s != NULL, "планировщик для усиления RST не завёлся");
+        if (s) {
+            d2k_ev h1 = ev_hello(6, 41020, "promote-reset.example");
+            d2k_sched_event(s, &h1);
+            d2k_ev r1 = ev_suspect(6, 41020);
+            r1.code = D2K_SUSPECT_RST;
+            CHECK(d2k_sched_event(s, &r1) == 0,
+                  "обычный RST не перешёл в ожидание подтверждения");
+            d2k_ev h2 = ev_hello(6, 41021, "promote-reset.example");
+            d2k_sched_event(s, &h2);
+            d2k_ev repeat = ev_suspect(6, 41021);
+            repeat.code = D2K_SUSPECT_REPEAT;
+            CHECK(d2k_sched_event(s, &repeat) == 1,
+                  "повтор ClientHello не повысил ожидающее подозрение");
+            settle(s);
+            CHECK(tcp_calls == 1,
+                  "усиленное подозрение не запустило ровно один поиск");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c_promote);
+    }
+
+    if (rst_only) {
+        if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }
+        printf("RST trigger criterion: all checks passed\n");
+        return 0;
+    }
+
+admission_only_run:
+    /* Bound network work during a burst of distinct targets. Two measurements
+       may run at once; the third stays queued, and starts only after the
+       minimum spacing. The stub blocks until cancellation, so this verifies
+       the bound without touching any external host. */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_calls = 0;
+        tcp_block_until_stop = 1;
+        tcp_saw_stop = 0;
+        CHECK(s != NULL, "планировщик ограничения нагрузки не завёлся");
+        if (s) {
+            for (uint16_t i = 0; i < 3; i++) {
+                char name[48];
+                uint16_t port = (uint16_t)(41030 + i);
+                snprintf(name, sizeof name, "burst-%u.example", (unsigned)i);
+                d2k_ev h = ev_hello(6, port, name);
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port);
+                d2k_sched_event(s, &su);
+            }
+            settle(s);
+            CHECK(tcp_calls == 2,
+                  "всплеск запустил больше двух сетевых замеров одновременно");
+            CHECK(d2k_sched_active(s) == 3,
+                  "третий сигнал потерян, а не сохранён в ограниченной очереди");
+            tcp_block_until_stop = 0;
+            d2k_sched_free(s);
+        }
+        tcp_block_until_stop = 0;
+        d2k_catalog_free(&c);
+    }
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_calls = 0;
+        tcp_block_until_stop = 0;
+        tcp_answer = D2K_V_CLEAR;
+        if (s) {
+            for (uint16_t i = 0; i < 3; i++) {
+                char name[48];
+                uint16_t port = (uint16_t)(41040 + i);
+                snprintf(name, sizeof name, "paced-%u.example", (unsigned)i);
+                d2k_ev h = ev_hello(6, port, name);
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port);
+                d2k_sched_event(s, &su);
+            }
+            spin(s, 120); /* 600 ms: let both workers finish before the 1 s gate */
+            CHECK(tcp_calls == 2,
+                  "третье измерение обошло межстартовую паузу");
+            skip_ahead(s, 1000);
+            settle(s);
+            CHECK(tcp_calls == 3,
+                  "ограниченная очередь не продолжилась после паузы");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+    }
+    if (admission_only) {
+        close(sv[0]); close(sv[1]);
+        if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }
+        printf("measurement admission: all checks passed\n");
+        return 0;
+    }
+
+    /* --- подозрение по TCP идёт в дерево вердиктов --------------------- */
+    {
+        static const struct {
+            const char *name;
+            int excluded;
+        } cases[] = {
+            { "telegram.org", 1 },
+            { "core.telegram.org", 1 },
+            { "WEB.TELEGRAM.ORG", 1 },
+            { "nottelegram.org", 0 },
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            d2k_catalog empty = {0};
+            d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+            uint16_t port = (uint16_t)(40600 + i);
+            tcp_calls = quic_calls = 0;
+            d2k_ev h = ev_hello(6, port, cases[i].name);
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, port);
+            int rc = d2k_sched_event(s, &su);
+            if (cases[i].excluded) {
+                CHECK(rc == 0, "telegram.org попал в очередь замеров");
+                settle(s);
+                CHECK(tcp_calls == 0 && quic_calls == 0,
+                      "telegram.org запустил сетевое измерение");
+            } else {
+                CHECK(rc == 1, "похожий, но посторонний домен исключён ошибочно");
+                settle(s);
+                CHECK(tcp_calls == 1, "посторонний домен перестал измеряться");
+            }
+            d2k_sched_free(s);
+            d2k_catalog_free(&empty);
+        }
+    }
 
     /* --- подозрение по TCP идёт в дерево вердиктов --------------------- */
     {
@@ -1241,12 +1479,9 @@ int main(int argc, char **argv) {
         d2k_catalog_free(&cQ);
     }
 
-    /* --- ГОТОВЫЙ ПЛАН УЗНАННОЙ КОРОБКИ СНИМКА НЕ ЖДЁТ -------------------
-     *
-     * Чтобы ИСПЫТАТЬ подтверждённый план, мерить нечего: зонд QUIC ведёт своё
-     * рукопожатие сам, а отпечаток коробки приехал вместе с подозрением.
-     * Прежде эта ветка стояла после требования снимка, и цель с готовым
-     * планом уходила ждать второго обращения наравне с незнакомой. */
+    /* --- КОРОБКА НЕ ОБХОДИТ ПРЯМОЙ ЗАМЕР -------------------------------
+     * Даже если коробка известна, стратегия не испытывается до подтверждения
+     * блокировки именно у этой цели. */
     {
         tcp_calls = quic_calls = 0;
         d2k_catalog cK;
@@ -1263,10 +1498,10 @@ int main(int argc, char **argv) {
             b->fp.sig[0].ttl = 127;
             b->fp.sig[0].tos = 0x88;
             b->fp.sig[0].ipid = 54321;
-            b->plans = calloc(1, sizeof *b->plans);
+            b->plans = calloc(2, sizeof *b->plans);
             CHECK(b->plans != NULL, "не удалось создать план модели");
             if (b->plans) {
-                b->n_plans = 1;
+                b->n_plans = 2;
                 b->plans[0].enabled = 1;
                 b->plans[0].successes = 4;
                 snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "quic");
@@ -1276,14 +1511,100 @@ int main(int argc, char **argv) {
                     "fake payload=1 poison=0 repeats=1 gap_us=0 place=before\n"
                     "order forward\n");
                 CHECK(b->plans[0].text != NULL, "текст плана не создался");
+                snprintf(b->plans[1].id, sizeof b->plans[1].id,
+                         "plan-tls-still-valid");
+                b->plans[1].enabled = 1;
+                b->plans[1].successes = 2;
+                snprintf(b->plans[1].proto, sizeof b->plans[1].proto, "tls");
+                b->plans[1].text = strdup(
+                    "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                    "proto tcp tls\nsplit payload_start +1\norder forward\n");
+                CHECK(b->plans[1].text != NULL, "TLS-план коробки не создался");
+            }
+            b->binds = calloc(2, sizeof *b->binds);
+            CHECK(b->binds != NULL, "не удалось создать старые привязки коробки");
+            if (b->binds) {
+                b->n_binds = 2;
+                snprintf(b->binds[0].kind, sizeof b->binds[0].kind, "name");
+                snprintf(b->binds[0].target, sizeof b->binds[0].target,
+                         "новый.хост.цдн");
+                snprintf(b->binds[0].plan_id, sizeof b->binds[0].plan_id,
+                         "plan-quic-stale");
+                b->binds[0].enabled = 1;
+                b->binds[0].level = 3;
+                b->binds[0].transport = 17;
+                b->binds[0].shape = D2K_SHAPE_LEGACY;
+                snprintf(b->binds[1].kind, sizeof b->binds[1].kind, "name");
+                snprintf(b->binds[1].target, sizeof b->binds[1].target,
+                         "новый.хост.цдн");
+                snprintf(b->binds[1].plan_id, sizeof b->binds[1].plan_id,
+                         "plan-tls-still-valid");
+                b->binds[1].enabled = 1;
+                b->binds[1].level = 3;
+                b->binds[1].transport = 6;
+                b->binds[1].shape = D2K_SHAPE_MODERN;
             }
             if (b->plans && b->plans[0].text) {
+                /* An existing box plan is not evidence that this target is
+                   blocked. A clear direct QUIC measurement must stop before
+                   installing the catalog plan. */
+                {
+                    d2k_sched *s = d2k_sched_new(&cK, sv[0], 0x2d);
+                    saidbuf[0] = '\0';
+                    d2k_sched_set_say(s, collect_say, NULL);
+                    quic_answer = D2K_V_CLEAR;
+                    quic_calls = ver_calls = 0;
+                    d2k_ev h = ev_hello(17, 40202, "новый.хост.цдн");
+                    d2k_sched_event(s, &h);
+                    d2k_ev su = ev_suspect(17, 40202);
+                    d2k_sched_event(s, &su);
+                    settle(s);
+                    CHECK(quic_calls == 1,
+                          "известная коробка обошла прямое QUIC-измерение");
+                    CHECK(ver_calls == 0,
+                          "при прямом QUIC-проходе проверялся готовый обход");
+                    CHECK(!said("готовых планов узнанной коробки"),
+                          "готовый обход запускался без подтверждения блокировки");
+                    CHECK(b->n_binds == 1 && b->binds[0].transport == 6,
+                          "прямой проход не удалил старую QUIC-привязку или задел TLS");
+                    CHECK(cK.revision > 0,
+                          "снятие устаревшей привязки не отметило каталог для сохранения");
+                    d2k_sched_free(s);
+                }
+
+                /* A flaky 2/3 direct measurement is uncertainty, not a
+                   license to probe Ozon-like targets with a known bypass. */
+                {
+                    d2k_sched *s = d2k_sched_new(&cK, sv[0], 0x2d);
+                    saidbuf[0] = '\0';
+                    d2k_sched_set_say(s, collect_say, NULL);
+                    quic_answer = D2K_V_FLAKY;
+                    quic_calls = ver_calls = 0;
+                    d2k_ev h = ev_hello(17, 40206, "сомнительная.цель");
+                    d2k_sched_event(s, &h);
+                    d2k_ev su = ev_suspect(17, 40206);
+                    d2k_sched_event(s, &su);
+                    settle(s);
+                    CHECK(quic_calls == 1,
+                          "неоднозначная коробка не прошла прямой QUIC-замер");
+                    CHECK(ver_calls == 0,
+                          "при неоднозначном QUIC-замере применялся обход");
+                    CHECK(!said("готовых планов узнанной коробки"),
+                          "готовый обход применён без подтверждения блокировки");
+                    d2k_sched_free(s);
+                    quic_answer = D2K_V_OPAQUE;
+                }
+
+                /* With a positive direct-block verdict, reuse stays first:
+                   measure first, then try the box plan before synthesis. */
                 d2k_sched *s = d2k_sched_new(&cK, sv[0], 0x2d);
                 saidbuf[0] = '\0';
                 d2k_sched_set_say(s, collect_say, NULL);
+                quic_answer = D2K_V_OPAQUE;
                 ver_answer = D2K_VER_APPLICATION;
                 ver_fail_first = 0;
                 ver_calls = 0;
+                quic_calls = 0;
                 ver_answer_port = 40203;
                 d2k_ev h = ev_hello(17, 40203, "новый.хост.цдн");
                 d2k_sched_event(s, &h);
@@ -1296,9 +1617,9 @@ int main(int argc, char **argv) {
                     spin(s, 80);
                 }
                 CHECK(said("готовых планов узнанной коробки"),
-                      "готовый план узнанной коробки не испытан без снимка");
-                CHECK(quic_calls == 0,
-                      "цель с готовым планом пошла мерить, хотя мерить было незачем");
+                      "после прямого подтверждения блокировки не проверен план коробки");
+                CHECK(quic_calls == 1,
+                      "прямой QUIC-замер не выполнен до готового плана");
                 CHECK(ver_calls >= 1, "готовый план не дошёл до зонда");
                 d2k_sched_free(s);
             }
@@ -1352,33 +1673,27 @@ int main(int argc, char **argv) {
                 d2k_sched_set_say(s, collect_say, NULL);
                 quic_calls = 0;
                 memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
-                /* Зонд доходит только до рукопожатия — готовый план не
-                   засчитывается, и планы кончаются. */
+                /* Положительный прямой вердикт допускает повторное применение. */
                 ver_answer = D2K_VER_HANDSHAKE;
                 ver_fail_first = 0;
                 ver_calls = 0;
                 ver_answer_port = 40205;
                 d2k_ev h = ev_hello(17, 40205, "остыл.снимок.позже");
                 d2k_sched_event(s, &h);
+                d2k_ev sh;
+                CHECK(quic_shape(&sh, "остыл.снимок.позже") == 0,
+                      "снимок QUIC не собрался");
+                d2k_sched_event(s, &sh);
                 d2k_ev su = ev_suspect(17, 40205);
                 d2k_sched_event(s, &su);
-                /* Крутим ровно до установки первого готового плана: задача уже
-                   вошла в испытание БЕЗ приветствий, но планы ещё не кончились
-                   — ровно то состояние, в котором на линии приехал снимок. */
                 spin_until_installed(s);
-                CHECK(said("готовых планов узнанной коробки"), "готовый план не пошёл в дело без снимка");
-                {
-                    d2k_ev sh;
-                    CHECK(quic_shape(&sh, "остыл.снимок.позже") == 0, "снимок QUIC не собрался");
-                    memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
-                    d2k_sched_event(s, &sh);
-                    settle(s);
-                    CHECK(quic_calls == 1,
-                          "после позднего снимка QUIC не выполнено ровно одно измерение");
-                    CHECK(quic_seen_trigger_lens[0] == sh.shape_len &&
-                          memcmp(quic_seen_triggers[0], sh.shape, sh.shape_len) == 0,
-                          "переход от готовых планов не измерял точный поздний QUIC Initial");
-                }
+                CHECK(said("готовых планов узнанной коробки"),
+                      "готовый план не был проверен после прямого подтверждения блокировки");
+                CHECK(quic_calls == 1,
+                      "перед планом узнанной коробки не выполнен ровно один прямой QUIC-замер");
+                CHECK(quic_seen_trigger_lens[0] == sh.shape_len &&
+                      memcmp(quic_seen_triggers[0], sh.shape, sh.shape_len) == 0,
+                      "прямое QUIC-измерение не использовало снимок клиента");
                 CHECK(strcmp(quic_last_ctl, "disk.rzd.ru") == 0,
                       "замер пошёл БЕЗ контрольного имени — вопрос коробке не задан, "
                       "а кандидаты будут потрачены впустую");
@@ -1889,8 +2204,8 @@ int main(int argc, char **argv) {
         d2k_ev su2 = ev_suspect(6, 40051);
         d2k_sched_event(s, &su2);
         settle(s);
-        CHECK(tcp_calls == 0 && vol_calls == 0,
-              "узнанная коробка запустила новый замер ДО проверки готового плана");
+        CHECK(tcp_calls == 1 && vol_calls == 1,
+              "узнанная коробка не была проверена прямым замером до готового плана");
         d2k_ev x2 = ev_applied(6, 40051);
         d2k_sched_event(s, &x2);
         spin(s, 40);
@@ -1918,7 +2233,7 @@ int main(int argc, char **argv) {
         d2k_sched_event(s, &su3);
         settle(s);
         CHECK(tcp_calls == 1 && vol_calls == 1,
-              "после промаха готового плана исследование не запущено ровно один раз");
+              "после промаха готового плана повторно запущено прямое измерение");
         CHECK(binding_of(&c6, "вторая.цель", 6) != NULL,
               "промах третьей цели повредил подтверждённую вторую");
         CHECK(binding_of(&c6, "третья.цель", 6) == NULL,
@@ -1966,9 +2281,9 @@ int main(int argc, char **argv) {
                 tcp_answer = D2K_V_PREFIX;
                 tcp_calls = vol_calls = 0;
                 ver_answer = D2K_VER_APPLICATION;
-                /* Every pre-measurement plan fails; the first plan produced
-                   after the C search starts is independently verifiable. */
-                ver_fail_first = 0;
+                /* The first (catalog) plan fails; the already-measured
+                   replacement candidate is independently verifiable. */
+                ver_fail_first = 1;
                 ver_app_after_tcp_search = 1;
                 ver_calls = 0;
                 ver_answer_port = 40053;
@@ -1987,15 +2302,15 @@ int main(int argc, char **argv) {
 
                 CHECK(said("готовых планов узнанной коробки"),
                       "устаревший план не был проверен первым");
-                CHECK(said("готовые планы не помогли — начинаю новый замер"),
-                      "после отказа готового плана новый замер не запущен");
-                CHECK(tcp_calls == 1, "после отказа готового плана новый поиск не выполнен ровно один раз");
-                CHECK(ver_calls >= 2, "новый измеренный кандидат не проверен после старого плана");
+                CHECK(tcp_calls == 1, "после отказа готового плана прямое измерение повторилось");
+                CHECK(ver_calls >= 1, "готовый план не был проверен");
 
                 /* The measured replacement has its own apply proof. */
                 d2k_ev ap = ev_applied(6, 40053);
                 d2k_sched_event(s, &ap);
                 settle(s);
+                CHECK(ver_calls >= 2,
+                      "новый измеренный кандидат не проверен после отказа старого плана");
                 CHECK(total_bindings(&cD) == 1,
                       "успех нового плана не создал ровно одну привязку");
                 CHECK(cD.n_boxes == 1,
@@ -2712,6 +3027,153 @@ int main(int argc, char **argv) {
         tcp_answer = D2K_V_OPAQUE;
     }
 
+    /* A direct CLEAR is not a catalog fact, but it is a short-lived scheduler
+       backoff: the same target must not be actively remeasured on every fresh
+       suspicion while it is already known to pass. It becomes eligible again
+       after the backoff expires. */
+    {
+        d2k_catalog c;
+        memset(&c, 0, sizeof c);
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_answer = D2K_V_CLEAR;
+        tcp_calls = 0;
+        CHECK(s != NULL, "планировщик CLEAR-backoff не завёлся");
+        if (s) {
+            d2k_ev h = ev_hello(6, 40201, "clear-backoff.example");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 40201);
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(tcp_calls == 1, "первый CLEAR не выполнил прямой замер");
+
+            /* First clean result must suppress the same repeated signal for
+               longer than the old two-minute task rest. */
+            skip_ahead(s, 3 * 60 * 1000);
+            d2k_ev h2 = ev_hello(6, 40202, "clear-backoff.example");
+            d2k_sched_event(s, &h2);
+            d2k_ev su2 = ev_suspect(6, 40202);
+            d2k_sched_event(s, &su2);
+            settle(s);
+            CHECK(tcp_calls == 1,
+                  "повторный CLEAR по той же цели начал замер внутри cooldown");
+
+            /* The cooldown expires; a new observation can measure again. */
+            skip_ahead(s, 8 * 60 * 1000);
+            d2k_ev h3 = ev_hello(6, 40203, "clear-backoff.example");
+            d2k_sched_event(s, &h3);
+            d2k_ev su3 = ev_suspect(6, 40203);
+            d2k_sched_event(s, &su3);
+            settle(s);
+            CHECK(tcp_calls == 2, "первый CLEAR-backoff не истёк через 10 минут");
+
+            skip_ahead(s, 3 * 60 * 1000);
+            d2k_ev h4 = ev_hello(6, 40204, "clear-backoff.example");
+            d2k_sched_event(s, &h4);
+            d2k_ev su4 = ev_suspect(6, 40204);
+            d2k_sched_event(s, &su4);
+            settle(s);
+            CHECK(tcp_calls == 2,
+                  "повторный CLEAR не увеличил cooldown: частота не снижается");
+
+            skip_ahead(s, 28 * 60 * 1000);
+            d2k_ev h5 = ev_hello(6, 40205, "clear-backoff.example");
+            d2k_sched_event(s, &h5);
+            d2k_ev su5 = ev_suspect(6, 40205);
+            d2k_sched_event(s, &su5);
+            settle(s);
+            CHECK(tcp_calls == 3,
+                  "увеличенный CLEAR-backoff не истёк после 30 минут");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* A genuinely different datapath signal may bypass a prior CLEAR; the
+       cooldown is target-local and must not suppress unrelated sites. */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_answer = D2K_V_CLEAR;
+        tcp_calls = 0;
+        CHECK(s != NULL, "планировщик проверки усиленного сигнала не завёлся");
+        if (s) {
+            d2k_ev h = ev_hello(6, 40231, "changed-signal.example");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 40231);
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(tcp_calls == 1, "первый direct CLEAR не измерен");
+
+            skip_ahead(s, 3 * 60 * 1000);
+            d2k_ev h2 = ev_hello(6, 40232, "changed-signal.example");
+            d2k_sched_event(s, &h2);
+            d2k_ev stronger = ev_suspect(6, 40232);
+            stronger.code = D2K_SUSPECT_SILENT;
+            d2k_sched_event(s, &stronger);
+            settle(s);
+            CHECK(tcp_calls == 2,
+                  "новый тип сигнала был подавлен старым CLEAR-backoff");
+
+            d2k_ev h3 = ev_hello(6, 40233, "unrelated-site.example");
+            d2k_sched_event(s, &h3);
+            d2k_ev su3 = ev_suspect(6, 40233);
+            d2k_sched_event(s, &su3);
+            settle(s);
+            CHECK(tcp_calls == 3,
+                  "cooldown одной цели остановил измерение другого сайта");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* An anti-bot challenge gets a longer target-local cooldown than an
+       ordinary CLEAR, and must not be treated as a failed strategy to retry. */
+    {
+        d2k_catalog c;
+        memset(&c, 0, sizeof c);
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_CHALLENGE;
+        ver_fail_first = 0;
+        ver_answer_port = 40210;
+        ver_calls = 0;
+        forget_sent();
+        CHECK(s != NULL, "планировщик challenge-backoff не завёлся");
+        if (s) {
+            d2k_ev h = ev_hello(6, 40210, "challenge-backoff.example");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 40210);
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(ver_calls == 1, "первый challenge не был получен");
+
+            skip_ahead(s, 3 * 60 * 1000);
+            d2k_ev h2 = ev_hello(6, 40211, "challenge-backoff.example");
+            d2k_sched_event(s, &h2);
+            d2k_ev su2 = ev_suspect(6, 40211);
+            su2.code = D2K_SUSPECT_SILENT;
+            d2k_sched_event(s, &su2);
+            settle(s);
+            CHECK(ver_calls == 1,
+                  "антибот-челлендж вызвал повторный активный зонд внутри cooldown");
+
+            skip_ahead(s, 58 * 60 * 1000);
+            d2k_ev h3 = ev_hello(6, 40212, "challenge-backoff.example");
+            d2k_sched_event(s, &h3);
+            d2k_ev su3 = ev_suspect(6, 40212);
+            d2k_sched_event(s, &su3);
+            settle(s);
+            CHECK(ver_calls == 2,
+                  "challenge-backoff не истёк: цель навсегда исключена из перепроверки");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
+    }
+
     /* Two compatible models are alternatives, not "first match wins". */
     {
         d2k_catalog c;
@@ -2761,8 +3223,8 @@ int main(int argc, char **argv) {
                 d2k_ev su = ev_suspect(6, 40101);
                 d2k_sched_event(s, &su);
                 settle(s);
-                CHECK(tcp_calls == 0 && vol_calls == 0,
-                      "первая похожая модель не помогла — вторая пропущена ради исследования");
+                CHECK(tcp_calls == 1 && vol_calls == 1,
+                      "модели не проверялись после прямого подтверждения блокировки");
                 d2k_ev ap = ev_applied(6, 40101);
                 d2k_sched_event(s, &ap);
                 spin(s, 40);
@@ -2775,7 +3237,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Missing diagnostic control is not permission to abandon synthesis. */
+    /* An inconclusive direct measurement is not evidence to apply a bypass. */
     {
         d2k_catalog c;
         memset(&c, 0, sizeof c);
@@ -2783,17 +3245,52 @@ int main(int argc, char **argv) {
         saidbuf[0] = '\0';
         d2k_sched_set_say(s, collect_say, NULL);
         tcp_answer = D2K_V_INCONCLUSIVE;
-        ver_answer = D2K_VER_HANDSHAKE; /* кандидатов собрали, но не подтвердили */
+        ver_answer = D2K_VER_HANDSHAKE;
         d2k_ev h = ev_hello(6, 40100, "без.контроля");
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(6, 40100);
         d2k_sched_event(s, &su);
         settle(s);
-        CHECK(said("поставил план 1 из"), "нет диагноза — генерация ошибочно запрещена");
+        CHECK(!said("поставил план 1 из"),
+              "без положительного диагноза план ошибочно применён");
+        CHECK(said("не подтвердил блокировку"),
+              "неопределённый замер не остановил подбор");
         CHECK(c.n_boxes == 0, "непроверенная гипотеза попала в каталог");
         d2k_sched_free(s);
         d2k_catalog_free(&c);
         tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* Явный ответ Cloudflare challenge — не успех и не повод перебрать
+       остальные кандидаты: все они упрётся в ту же проверку ботов. */
+    {
+        d2k_catalog c;
+        memset(&c, 0, sizeof c);
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_CHALLENGE;
+        ver_fail_first = 0;
+        ver_answer_port = 40105;
+        ver_calls = 0;
+        forget_sent();
+
+        d2k_ev h = ev_hello(6, 40105, "challenge.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40105);
+        d2k_sched_event(s, &su);
+        settle(s);
+
+        CHECK(ver_calls == 1, "challenge привёл к перебору следующих кандидатов");
+        CHECK(said("Cloudflare challenge"), "challenge не объяснён в журнале");
+        CHECK(said("перебор остановлен"), "поиск не остановлен на challenge");
+        CHECK(binding_of(&c, "challenge.example", 6) == NULL,
+              "challenge записан в каталог как подтверждённый обход");
+        d2k_sched_free(s);
+        d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
     }
 
     /* --- редкую цель планировщик испытывает САМ (задача 3) -------------- */

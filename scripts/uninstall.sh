@@ -5,17 +5,27 @@
 # Чужого не трогает даже там, где похоже — правило соседа, снятое «на всякий
 # случай», ломает соседа молча.
 #
-# Каталог изученных коробок по умолчанию СОХРАНЯЕТСЯ: он оплачен настоящими
-# измерениями на этой линии, и выбрасывать его вместе с программой — потеря,
-# которую нечем восполнить. Удалить его можно явно.
+# Полное удаление, включая конфигурацию и каталог коробок, — поведение по
+# умолчанию. Чтобы оставить изученное состояние, задайте D2K_KEEP_STATE=1.
 set -eu
 
 DIR=/opt/d2k
 SBIN=/opt/sbin
 INIT=/opt/etc/init.d/S99d2k
-KEEP=${D2K_KEEP_STATE:-1}
+KEEP=${D2K_KEEP_STATE:-0}
 
 say() { echo "d2k: $*"; }
+
+# Remove only exact DNS pairs recorded by this installation. If NDM cannot
+# confirm cleanup, stop before deleting the helper/manifest so the owner can
+# retry rather than leaving unexplained static routes behind.
+if [ -x "$DIR/d2k-instagram-dns.sh" ]; then
+    say "снимаю свои Instagram DNS-записи"
+    "$DIR/d2k-instagram-dns.sh" remove || {
+        say "не удалось снять D2K Instagram DNS; удаление остановлено, повторите позже"
+        exit 1
+    }
+fi
 
 if [ -x "$INIT" ]; then
     say "останавливаю"
@@ -53,12 +63,14 @@ say "правила сняты"
 # нет, на каждое изменение netfilter — мусор в журнале на ровном месте.
 rm -f /opt/etc/ndm/netfilter.d/001-d2k.sh
 rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2ktg"
-rm -f "$DIR/d2k-tg-firewall.sh" "$DIR/d2k-tg-watchdog.sh" "$DIR/files/tg-roots.pem"
+rm -f "$DIR/d2k-tg-firewall.sh" "$DIR/d2k-tg-watchdog.sh" "$DIR/d2k-instagram-dns.sh" \
+    "$DIR/d2k-instagram-dns-scheduler.sh" \
+    "$DIR/files/meta-ranges.txt" "$DIR/files/tg-roots.pem"
 rm -rf "$DIR/run" "$DIR/log" "$DIR/panel"
 
 if [ "$KEEP" = "1" ]; then
-    say "каталог изученных коробок оставлен в $DIR/state"
-    say "чтобы удалить и его: D2K_KEEP_STATE=0 sh $0"
+    say "сохраняю конфигурацию и каталог изученных коробок в $DIR"
+    say "чтобы удалить всё: D2K_KEEP_STATE=0 sh $0"
     rm -f "$DIR/config.new"
 else
     rm -rf "$DIR"

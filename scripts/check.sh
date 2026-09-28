@@ -65,6 +65,8 @@ D2K_REQUIRE_LAB=1 $GO test -race -count=1 ./...
 
 echo "== скрипты =="
 find scripts spike -name '*.sh' -print0 | xargs -0 shellcheck -s sh
+sh scripts/test-instagram-dns.sh
+sh scripts/test-instagram-dns-scheduler.sh
 
 # files/S99d2k — самый рискованный скрипт задачи (ставит правила firewall на
 # живом роутере), а глоб *.sh его не ловит: init-скрипты Keenetic по
@@ -73,6 +75,8 @@ find scripts spike -name '*.sh' -print0 | xargs -0 shellcheck -s sh
 # указан явно, а не через более широкий глоб по files/, потому что там сейчас
 # ровно один файл и обобщать шаблон под гипотетические будущие не по чему.
 shellcheck -s sh files/S99d2k
+shellcheck -s sh files/d2k-instagram-dns.sh
+shellcheck -s sh files/d2k-instagram-dns-scheduler.sh
 
 # Синтаксис files/S99d2k проверен строкой выше; ПОВЕДЕНИЕ его правил firewall
 # (что для UDP есть обе стороны, что на них --queue-bypass, что RETURN по

@@ -127,6 +127,14 @@ render(root, {
     ], searches: [], targets: 1, confirms: 1,
   },
 }, document);
+const engineControls = root.walk().filter((node) => {
+  const action = node.attributes && node.attributes['data-control'];
+  return action && action !== 'telegram-enable' && action !== 'telegram-disable';
+});
+assert.equal(engineControls.every((button) => button.disabled === false), true,
+  'same-origin panel controls must render enabled when the API says control is available');
+assert.match(root.textContent, /только с того же адреса панели/,
+  'the panel must explain that controls are restricted to its same origin');
 assert.equal(root.walk().find((node) => node.id === 'box-filter').value, 'box-a',
   'box filter text must survive periodic refreshes');
 assert.equal(root.walk().find((node) => node.tagName === 'details' && node.attributes['data-ui-key'] === 'plan:box-a:0').open, true,

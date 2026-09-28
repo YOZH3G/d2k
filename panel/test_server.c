@@ -269,6 +269,19 @@ static void test_panel_accepts_a_control_action_request(void) {
     assert(strcmp(action,"telegram-enable")==0);
     assert(strstr(response,"private")==NULL);unlink(tg_config);
     (void)request(&cfg,
+        "POST /api/control/stop HTTP/1.1\r\n"
+        "Host: 192.168.1.1:8090\r\n"
+        "Origin: http://192.168.1.1:8090\r\n"
+        "Content-Length: 0\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    f = fopen(marker, "r");
+    assert(f != NULL);
+    strcpy(action, "");
+    assert(fgets(action, sizeof action, f) != NULL);
+    fclose(f);
+    assert(strcmp(action, "engine-stop") == 0);
+    (void)request(&cfg,
         "POST /api/control/start HTTP/1.1\r\n"
         "Host: localhost:8090\r\n"
         "Origin: http://attacker.example\r\n"
@@ -280,7 +293,7 @@ static void test_panel_accepts_a_control_action_request(void) {
     strcpy(action, "");
     assert(fgets(action, sizeof action, f) != NULL);
     fclose(f);
-    assert(strcmp(action, "telegram-enable") == 0);
+    assert(strcmp(action, "engine-stop") == 0);
     cfg.mode = "off";
     (void)request(&cfg,
         "POST /api/control/start HTTP/1.1\r\nHost: localhost:8090\r\n"
@@ -297,7 +310,7 @@ static void test_panel_accepts_a_control_action_request(void) {
     strcpy(action, "");
     assert(fgets(action, sizeof action, f) != NULL);
     fclose(f);
-    assert(strcmp(action, "telegram-enable") == 0);
+    assert(strcmp(action, "engine-stop") == 0);
     cfg.mode = NULL;
     cfg.control_enabled = 0;
     (void)request(&cfg,

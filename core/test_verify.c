@@ -72,21 +72,23 @@ static const struct {
     const char *text;
     int status;
     size_t split;
+    int cloudflare_challenge;
 } replies[] = {
-    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 200, 0},
-    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 200, 10},
-    {"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\n\r\n", 200, 0},
-    {"HTTP/1.1 103 Early Hints\r\n\r\n", 0, 0},
-    {"HTTP/1.1 200", 0, 0},
-    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n", 0, 0},
-    {"HTTP/1.1 2000 OK\r\n\r\n", 0, 0},
-    {"HTTP/1.1 200x OK\r\n\r\n", 0, 0},
-    {"HTTP/1.12 200 OK\r\n\r\n", 0, 0},
-    {"HTTP/1.1 999 Invalid\r\n\r\n", 0, 0},
-    {"HTTP/1.0 403 Forbidden\r\n\r\n", 403, 0},
-    {"HTTP/1.1 101 Switching Protocols\r\n\r\n", 0, 0},
-    {"HTTP/1.1 204 No Content\r\n\r\n", 204, 10},
-    {"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n", 204, 0},
+    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 200, 0, 0},
+    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 200, 10, 0},
+    {"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\n\r\n", 200, 0, 0},
+    {"HTTP/1.1 103 Early Hints\r\n\r\n", 0, 0, 0},
+    {"HTTP/1.1 200", 0, 0, 0},
+    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n", 0, 0, 0},
+    {"HTTP/1.1 2000 OK\r\n\r\n", 0, 0, 0},
+    {"HTTP/1.1 200x OK\r\n\r\n", 0, 0, 0},
+    {"HTTP/1.12 200 OK\r\n\r\n", 0, 0, 0},
+    {"HTTP/1.1 999 Invalid\r\n\r\n", 0, 0, 0},
+    {"HTTP/1.0 403 Forbidden\r\n\r\n", 403, 0, 0},
+    {"HTTP/1.1 403 Forbidden\r\nCF-Mitigated:  challenge \t\r\n\r\n", 403, 0, 1},
+    {"HTTP/1.1 101 Switching Protocols\r\n\r\n", 0, 0, 0},
+    {"HTTP/1.1 204 No Content\r\n\r\n", 204, 10, 0},
+    {"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n", 204, 0, 0},
 };
 
 struct stand {
@@ -749,8 +751,13 @@ int main(void) {
                     i, replies[i].status, r.status, (int)r.level, r.reason);
         }
         CHECK(r.status == replies[i].status, "неверный статус HTTP на граничном ответе");
-        CHECK((r.level == D2K_VER_APPLICATION) == (replies[i].status != 0),
-              "фрагмент или промежуточный ответ засчитан как окончательный HTTP");
+        if (replies[i].cloudflare_challenge) {
+            CHECK(strstr(r.reason, "Cloudflare challenge") != NULL,
+                  "challenge Cloudflare принят за обычный HTTP-ответ");
+        } else {
+            CHECK((r.level == D2K_VER_APPLICATION) == (replies[i].status != 0),
+                  "фрагмент или промежуточный ответ засчитан как окончательный HTTP");
+        }
         d2k_verify_close(&r);
         stand_stop(&s);
     }

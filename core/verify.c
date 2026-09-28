@@ -65,6 +65,44 @@ static const uint8_t *find_eol(const uint8_t *b, size_t n) {
     return NULL;
 }
 
+static int ascii_equal_ci(const uint8_t *p, size_t n, const char *s) {
+    size_t sn = strlen(s);
+    if (n != sn) { return 0; }
+    for (size_t i = 0; i < n; i++) {
+        uint8_t a = p[i], b = (uint8_t)s[i];
+        if (a >= 'A' && a <= 'Z') { a = (uint8_t)(a + ('a' - 'A')); }
+        if (b >= 'A' && b <= 'Z') { b = (uint8_t)(b + ('a' - 'A')); }
+        if (a != b) { return 0; }
+    }
+    return 1;
+}
+
+/* `cf-mitigated: challenge` is Cloudflare's explicit anti-bot signal. A
+ * generic 403 is deliberately NOT special: many origins use it for normal
+ * authorization failures, and status alone says nothing about DPI bypass.
+ */
+static int has_cf_challenge(const uint8_t *buf, size_t hdr_len) {
+    const uint8_t *line_end = find_eol(buf, hdr_len + 2);
+    if (!line_end) { return 0; }
+    size_t pos = (size_t)(line_end - buf) + 2;
+    while (pos < hdr_len) {
+        const uint8_t *line = buf + pos;
+        const uint8_t *eol = find_eol(line, hdr_len - pos + 2);
+        if (!eol) { break; }
+        size_t line_len = (size_t)(eol - line);
+        const uint8_t *colon = memchr(line, ':', line_len);
+        if (colon && ascii_equal_ci(line, (size_t)(colon - line), "cf-mitigated")) {
+            const uint8_t *value = colon + 1;
+            const uint8_t *end = line + line_len;
+            while (value < end && (*value == ' ' || *value == '\t')) { value++; }
+            while (end > value && (end[-1] == ' ' || end[-1] == '\t')) { end--; }
+            if (ascii_equal_ci(value, (size_t)(end - value), "challenge")) { return 1; }
+        }
+        pos += line_len + 2;
+    }
+    return 0;
+}
+
 /* Код окончательного ответа HTTP, либо 0 — «полных заголовков нет».
  *
  * НОЛЬ В ТЕЛЕ БОЛЬШЕ НИЧЕГО НЕ РЕШАЕТ. Здесь стояло `if (memchr(...0...)) break;`
@@ -99,9 +137,11 @@ static long read12(void *sess, uint8_t *buf, size_t cap, int wait_ms,
     return d2k_tls12_read((d2k_tls12 *)sess, buf, cap, wait_ms, err, errcap);
 }
 
-static int read_status_rd(read_fn rd, void *sess, int wait_ms, char *err, size_t errcap) {
+static int read_status_rd(read_fn rd, void *sess, int wait_ms, char *err, size_t errcap,
+                          int *cf_challenge) {
     uint8_t buf[8193];
     size_t used = 0;
+    if (cf_challenge) { *cf_challenge = 0; }
     int64_t until = verify_now_ms() + (wait_ms > 0 ? wait_ms : 8000);
     for (;;) {
         const uint8_t *end = find_hdr_end(buf, used);
@@ -125,7 +165,10 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms, char *err, size_t
                 if ((buf[p] < 32 && buf[p] != '\t') || buf[p] == 127) { return 0; }
             }
             int code = (buf[9] - '0') * 100 + (buf[10] - '0') * 10 + buf[11] - '0';
-            if (code >= 200) { return code; }
+            if (code >= 200) {
+                if (cf_challenge) { *cf_challenge = has_cf_challenge(buf, hdr_len); }
+                return code;
+            }
             if (code == 101) { return 0; } /* upgrade не запрашивали */
             /* Промежуточный ответ (1xx) — отбрасываем его вместе с
                заголовками и ждём окончательного. */
@@ -151,8 +194,9 @@ d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
 /* use_fd — УЖЕ ЗАНЯТЫЙ сокет (d2k_props_bind), чей местный порт вызывающий
    назвал датапату заранее, чтобы пробный план достался только этому потоку.
    Меньше нуля — создать свой, тогда это в точности d2k_verify_probe. */
-static int read_status(d2k_tls *t, int wait_ms, char *err, size_t errcap) {
-    return read_status_rd(read13, t, wait_ms, err, errcap);
+static int read_status(d2k_tls *t, int wait_ms, char *err, size_t errcap,
+                       int *cf_challenge) {
+    return read_status_rd(read13, t, wait_ms, err, errcap, cf_challenge);
 }
 
 d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port, const char *sni,
@@ -207,11 +251,17 @@ d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port, co
     } else if (d2k_tls_write(t, (const uint8_t *)req, (size_t)n, err, sizeof err) != 0) {
         snprintf(r.reason, sizeof r.reason, "запрос не ушёл: %.150s", err);
     } else {
-        int code = read_status(t, deadline_ms, err, sizeof err);
+        int cf_challenge = 0;
+        int code = read_status(t, deadline_ms, err, sizeof err, &cf_challenge);
         if (code) {
-            r.level = D2K_VER_APPLICATION;
+            r.level = cf_challenge ? D2K_VER_CHALLENGE : D2K_VER_APPLICATION;
             r.status = code;
-            snprintf(r.reason, sizeof r.reason, "HTTP-заголовки получены, статус %d", code);
+            if (cf_challenge) {
+                snprintf(r.reason, sizeof r.reason,
+                         "Cloudflare challenge получен, HTTP %d; обход не подтверждён", code);
+            } else {
+                snprintf(r.reason, sizeof r.reason, "HTTP-заголовки получены, статус %d", code);
+            }
         } else {
             snprintf(r.reason, sizeof r.reason,
                      "нет полных заголовков окончательного HTTP-ответа: %.100s", err);
@@ -281,12 +331,18 @@ d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
     } else if (d2k_tls12_write(t, (const uint8_t *)req, (size_t)n, err, sizeof err) != 0) {
         snprintf(r.reason, sizeof r.reason, "запрос не ушёл: %.150s", err);
     } else {
-        int code = read_status_rd(read12, t, deadline_ms, err, sizeof err);
+        int cf_challenge = 0;
+        int code = read_status_rd(read12, t, deadline_ms, err, sizeof err, &cf_challenge);
         if (code) {
-            r.level = D2K_VER_APPLICATION;
+            r.level = cf_challenge ? D2K_VER_CHALLENGE : D2K_VER_APPLICATION;
             r.status = code;
-            snprintf(r.reason, sizeof r.reason,
-                     "HTTP-заголовки получены по TLS 1.2, статус %d", code);
+            if (cf_challenge) {
+                snprintf(r.reason, sizeof r.reason,
+                         "Cloudflare challenge получен по TLS 1.2, HTTP %d; обход не подтверждён", code);
+            } else {
+                snprintf(r.reason, sizeof r.reason,
+                         "HTTP-заголовки получены по TLS 1.2, статус %d", code);
+            }
         } else {
             snprintf(r.reason, sizeof r.reason,
                      "нет полных заголовков окончательного HTTP-ответа: %.100s", err);

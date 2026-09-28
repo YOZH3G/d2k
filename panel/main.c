@@ -299,7 +299,9 @@ static int serve(const char *listen_addr, const char *live_path, const char *ass
         .queue_num = queue,
         .config_exists = config_exists,
         .dirty = D2K_PANEL_DIRTY,
-        .control_enabled = is_loopback_addr(listen_addr),
+        /* The operator explicitly selected this panel bind address. Allow
+         * same-origin controls there; server.c rejects cross-origin actions. */
+        .control_enabled = 1,
     };
     printf("d2kpanel %s\nhttp://%s/\n", D2K_PANEL_VERSION, listen_addr);
     fflush(stdout);

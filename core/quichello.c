@@ -265,6 +265,25 @@ int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
                     body, b, 0, 4, INITIAL_MIN, 0, out, cap, out_len);
 }
 
+int d2k_quic_prepare_target(const uint8_t *sample, size_t sample_len,
+                            const char *sni, uint8_t *out, size_t cap,
+                            size_t *out_len, int *used_sample) {
+    if (!sni || !sni[0] || !out || !out_len) { return -1; }
+    *out_len = 0;
+    if (used_sample) { *used_sample = 0; }
+    if (sample && sample_len > 0 &&
+        d2k_quic_hello_rename(sample, sample_len, sni, out, cap, out_len) == 0) {
+        if (used_sample) { *used_sample = 1; }
+        return 0;
+    }
+    /* A snapshot from another site is only an optimization. Some live client
+       shapes cannot be safely rewritten; do not leave the target waiting when
+       the ordinary fresh PROFILE path is available and already used at cold
+       start. The classifier still has to prove a block before composing plans. */
+    *out_len = 0;
+    return d2k_quic_probe_initial(sni, out, cap, out_len);
+}
+
 int d2k_quic_hello_rename(const uint8_t *in, size_t n, const char *sni,
                           uint8_t *out, size_t cap, size_t *out_len) {
     return d2k_quic_hello_ask(in, n, D2K_QASK_PLAIN, sni, out, cap, out_len);

@@ -4,7 +4,6 @@
 #include "server.h"
 
 #include <errno.h>
-#include <ctype.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -257,41 +256,7 @@ static int header_value(const char *req, const char *wanted,
     return 0;
 }
 
-static int loopback_authority(const char *host, size_t len) {
-    const char *port = NULL;
-    size_t name_len = len;
-    if (len >= 5 && host[0] == '[') {
-        const char *close = memchr(host, ']', len);
-        if (!close || (size_t)(close - host) != 4 || memcmp(host, "[::1]", 5) != 0) { return 0; }
-        name_len = 5;
-        if (len > name_len) {
-            if (host[name_len] != ':') { return 0; }
-            port = host + name_len + 1;
-        }
-    } else {
-        size_t localhost_len = 9, ipv4_len = 9;
-        if (len >= localhost_len && memcmp(host, "localhost", localhost_len) == 0) {
-            name_len = localhost_len;
-        } else if (len >= ipv4_len && memcmp(host, "127.0.0.1", ipv4_len) == 0) {
-            name_len = ipv4_len;
-        } else { return 0; }
-        if (len > name_len) {
-            if (host[name_len] != ':') { return 0; }
-            port = host + name_len + 1;
-        }
-    }
-    if (!port) { return len == name_len; }
-    if (!*port) { return 0; }
-    unsigned long value = 0;
-    for (const char *p = port; p < host + len; p++) {
-        if (!isdigit((unsigned char)*p)) { return 0; }
-        value = value * 10 + (unsigned)(*p - '0');
-        if (value > 65535) { return 0; }
-    }
-    return value > 0;
-}
-
-static int same_loopback_origin(const char *req) {
+static int same_origin(const char *req) {
     const char *host = NULL, *origin = NULL;
     size_t host_len = 0, origin_len = 0;
     if (!header_value(req, "Host", &host, &host_len) ||
@@ -299,7 +264,7 @@ static int same_loopback_origin(const char *req) {
         origin_len < 7 || memcmp(origin, "http://", 7) != 0) { return 0; }
     const char *authority = origin + 7;
     size_t authority_len = origin_len - 7;
-    return loopback_authority(host, host_len) && host_len == authority_len &&
+    return host_len == authority_len &&
            memcmp(host, authority, host_len) == 0;
 }
 
@@ -376,8 +341,8 @@ static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
         return response(fd, 404, "Not Found", "application/json; charset=utf-8",
                         body, sizeof body - 1);
     }
-    if (!cfg || !cfg->control_enabled || !same_loopback_origin(req)) {
-        static const char body[] = "{\"ok\":false,\"message\":\"Управление разрешено только с локальной панели\"}";
+    if (!cfg || !cfg->control_enabled || !same_origin(req)) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Управление разрешено только с этой панели\"}";
         return response(fd, 403, "Forbidden", "application/json; charset=utf-8",
                         body, sizeof body - 1);
     }

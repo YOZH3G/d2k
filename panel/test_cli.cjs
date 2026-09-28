@@ -37,7 +37,7 @@ async function main() {
   const stateDir = path.join(temp, 'state');
   const configPath = path.join(temp, 'config');
   fs.writeFileSync(configPath,
-    `MODE=apply\nPANEL_LISTEN=127.0.0.1:${port}\nSTATE_DIR=${stateDir}\nQUEUE_NUM=4321\nFUTURE_OPTION=preserve-me\n`);
+    `MODE=apply\nPANEL_LISTEN=0.0.0.0:${port}\nSTATE_DIR=${stateDir}\nQUEUE_NUM=4321\nFUTURE_OPTION=preserve-me\n`);
   const child = spawn(exe, [
     'serve', '--config', configPath,
     '--live', '/tmp/d2k-panel-no-live-file',
@@ -63,6 +63,8 @@ async function main() {
     assert.equal(payload.knowledge.linked, false,
       'missing live knowledge is unavailable, not an empty healthy catalog');
     assert.equal(payload.snapshot.mode, 'apply');
+    assert.equal(payload.snapshot.controls_enabled, true,
+      'controls should remain active for a panel intentionally bound to a router interface');
     assert.equal(payload.snapshot.queue_num, 4321);
     assert.equal(payload.snapshot.config_exists, true);
     assert.equal(payload.snapshot.state_dir, stateDir);

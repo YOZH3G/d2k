@@ -50,6 +50,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -76,6 +77,10 @@
 /* Одновременных поисков. Больше — и рабочих потоков станет больше, чем у
    роутера есть смысла держать: каждый занят сетевым ожиданием, не счётом. */
 #define SCHED_MAX_TASKS 64
+#define SCHED_COOLDOWN_SLOTS 128
+#define SCHED_MAX_ACTIVE_MEASUREMENTS 2
+#define SCHED_MAX_QUEUED_MEASUREMENTS 16
+#define SCHED_START_GAP_MS 1000
 
 /* Жизнь задачи. Дольше — и задача занимает место, давно перестав быть про
    актуальное состояние линии. */
@@ -83,6 +88,16 @@
 
 /* Отдых цели после неудачи: не долбить одну и ту же цель подряд. */
 #define SCHED_REST_MS (2 * 60 * 1000)
+/* Отрицательное наблюдение — оперативная защита от повторного сканирования,
+   а НЕ знание каталога. Повторные CLEAR увеличивают паузу до одного часа. */
+#define SCHED_CLEAR_BACKOFF_1_MS (10LL * 60 * 1000)
+#define SCHED_CLEAR_BACKOFF_2_MS (30LL * 60 * 1000)
+#define SCHED_CLEAR_BACKOFF_MAX_MS (60LL * 60 * 1000)
+#define SCHED_CHALLENGE_BACKOFF_MS (60LL * 60 * 1000)
+/* Явный порог планировщика, согласованный с владельцем: обычный TCP RST —
+   низкоуверенное подозрение, второй должен прийти по независимому flow key,
+   пока первое ещё отражает текущую линию. Это не порог дерева оригинала. */
+#define SCHED_RST_CONFIRM_MS (30 * 1000)
 /* Сколько ждать решения по потоку разговора с применённым приёмом голоса.
    Приговор «молчит» датапат выносит через две секунды после приветствия
    (silence_deadline); пятнадцать — с запасом на медленную очередь событий, и
@@ -313,6 +328,8 @@ d2k_sched_voice_fn d2k_sched_voice_hook = voice_default;
 
 typedef enum {
     T_FREE = 0,
+    T_RST_PENDING,  /* одиночный обычный TCP RST, ждём независимое подтверждение */
+    T_QUEUED,       /* подозрение сохранено, ждёт безопасного слота измерения */
     T_ASKING,        /* сетевой оракул работает в потоке */
     /* Снимок приветствия заказан, поиск ЖДЁТ его. Состояние заведено ради
        QUIC и существует только для него: у TLS есть профиль холодного старта
@@ -364,6 +381,8 @@ typedef struct {
 
     int64_t    started_ms;
     int64_t    rest_until_ms;
+    int64_t    rst_confirm_until_ms;
+    d2k_flowkey rst_pending_flow;
     int        probes;
 
     /* ГОЛОС/АДРЕСНЫЙ UDP: поток, к которому применился приём, и наблюдения.
@@ -487,7 +506,9 @@ typedef struct {
        не из синтеза по вердикту: различать их нужно на записи успеха (план
        узнанной коробки не заводит новую) и в логе. */
     size_t     n_known;
-    int        researched;     /* expensive measurement is a fallback, not recognition */
+    int        researched;     /* whether this target has had a direct measurement */
+    int        cached_measure_valid; /* preserve measured candidates after box-plan reuse */
+    uint8_t    trigger_code;   /* signal that admitted this measurement; cooldown key */
     /* Форма приветствия, КОТОРЫМ шёл замер, и было ли уже повторение из-за
        её расхождения со снимком. Нужны затем, что снимок настоящего клиента
        приходит уже ПОСЛЕ старта поиска: первый поиск идёт профилем холодного
@@ -585,6 +606,22 @@ typedef struct {
     int      used;
 } seen_name;
 
+/* Negative observations never enter the strategy catalog. This bounded,
+   process-local cache only debounces active measurements for an exact
+   hostname+transport; normal CLEAR backoff may be bypassed by a different
+   signal, while an explicit challenge or exhausted search remains quiet for
+   the full backoff regardless of signal changes. */
+typedef struct {
+    char       name[256];
+    uint8_t    transport;
+    uint8_t    signal_code;
+    uint8_t    negative_streak;
+    int64_t    until_ms;
+    int        challenge;
+    int        exhausted;
+    int        used;
+} target_cooldown;
+
 struct d2k_sched {
     d2k_catalog *cat;
     int          link_fd;
@@ -599,6 +636,10 @@ struct d2k_sched {
     task         tasks[SCHED_MAX_TASKS];
     seen_name    seen[SCHED_SEEN];
     size_t       seen_next;   /* кольцо: старое вытесняется, а не отказывает */
+    target_cooldown cooldowns[SCHED_COOLDOWN_SLOTS];
+    size_t       cooldown_next;
+    int64_t      last_measure_start_ms;
+    int          measure_start_seen;
 
     /* Проход по каталогу, разложенный на порции (см. d2k_sched_sync_step):
        где остановились и просили ли начать заново. */
@@ -915,6 +956,69 @@ static const char *recall(const d2k_sched *s, const d2k_ev *ev) {
     return NULL;
 }
 
+static target_cooldown *cooldown_find(d2k_sched *s, const char *name,
+                                     uint8_t transport) {
+    if (!s || !name || !name[0]) { return NULL; }
+    for (size_t i = 0; i < SCHED_COOLDOWN_SLOTS; i++) {
+        target_cooldown *c = &s->cooldowns[i];
+        if (c->used && c->transport == transport && strcmp(c->name, name) == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
+                           uint8_t signal_code, int64_t *remaining_ms) {
+    target_cooldown *c = cooldown_find(s, name, transport);
+    if (!c) { return 0; }
+    if (s->now_ms >= c->until_ms) { return 0; }
+    /* A changed symptom after a direct CLEAR is fresh evidence. Do not let a
+       stale negative suppress it. A bot challenge is different: stay quiet
+       for this exact origin even if the datapath reports another symptom. */
+    if (!c->challenge && !c->exhausted && c->signal_code != signal_code) { return 0; }
+    if (remaining_ms) { *remaining_ms = c->until_ms - s->now_ms; }
+    return 1;
+}
+
+static void cooldown_clear(d2k_sched *s, const char *name, uint8_t transport) {
+    target_cooldown *c = cooldown_find(s, name, transport);
+    if (c) { memset(c, 0, sizeof *c); }
+}
+
+static int64_t clear_backoff_ms(unsigned streak) {
+    if (streak <= 1) { return SCHED_CLEAR_BACKOFF_1_MS; }
+    if (streak == 2) { return SCHED_CLEAR_BACKOFF_2_MS; }
+    return SCHED_CLEAR_BACKOFF_MAX_MS;
+}
+
+/* kind: 0 = direct CLEAR, 1 = anti-bot challenge, 2 = exhausted/incomplete search. */
+static void cooldown_record(d2k_sched *s, const task *t, int kind) {
+    if (!s || !t || !t->name[0]) { return; }
+    target_cooldown *c = cooldown_find(s, t->name, t->transport);
+    if (!c) {
+        c = &s->cooldowns[s->cooldown_next];
+        s->cooldown_next = (s->cooldown_next + 1) % SCHED_COOLDOWN_SLOTS;
+        memset(c, 0, sizeof *c);
+        snprintf(c->name, sizeof c->name, "%s", t->name);
+        c->transport = t->transport;
+        c->used = 1;
+    }
+    if (kind == 1) {
+        c->challenge = 1;
+        c->exhausted = 0;
+        c->until_ms = s->now_ms + SCHED_CHALLENGE_BACKOFF_MS;
+        c->signal_code = t->trigger_code;
+        return;
+    }
+    if (c->challenge && s->now_ms < c->until_ms) { return; }
+    if (c->negative_streak < UINT8_MAX) { c->negative_streak++; }
+    c->challenge = 0;
+    c->exhausted = kind == 2;
+    c->signal_code = t->trigger_code;
+    c->until_ms = s->now_ms + clear_backoff_ms(c->negative_streak);
+}
+
 static task *task_of(d2k_sched *s, const char *name, uint8_t transport) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         if (s->tasks[i].state != T_FREE && s->tasks[i].transport == transport &&
@@ -976,10 +1080,15 @@ static int fill_hellos(d2k_sched *s, task *t) {
                 t->trig_len = s->quic_shape_len;
                 t->trig_snapped = 1;
             } else if (s->quic_shape_len > 0) {
-                if (d2k_quic_hello_rename(s->quic_shape, s->quic_shape_len, t->name,
-                                          t->trig, sizeof t->trig, &t->trig_len) != 0) {
-                    t->trig_len = 0;
+                int used_sample = 0;
+                if (d2k_quic_prepare_target(s->quic_shape, s->quic_shape_len,
+                                            t->name, t->trig, sizeof t->trig,
+                                            &t->trig_len, &used_sample) != 0) {
                     return -1;
+                }
+                if (!used_sample) {
+                    say(s, "по %s последний QUIC-снимок нельзя безопасно переименовать; использую измерительный PROFILE",
+                        t->name);
                 }
             } else {
                 if (d2k_quic_probe_initial(t->name, t->trig, sizeof t->trig,
@@ -2037,6 +2146,93 @@ static size_t known_plans(d2k_sched *s, task *t) {
     return took;
 }
 
+/* A suspicion is only a trigger to measure. Reuse or synthesis is allowed
+   only when the direct measurement positively identifies content blocking. */
+static int verdict_proves_block(d2k_verdict verdict) {
+    return verdict == D2K_V_PREFIX || verdict == D2K_V_WHOLE ||
+           verdict == D2K_V_OPAQUE;
+}
+
+static const d2k_cat_plan *plan_by_id(const d2k_cat_box *b, const char *id);
+
+/* A direct CLEAR supersedes a stale learned bypass for this exact name and
+   transport. DEL_NAME is name-wide in the datapath, so replay any surviving
+   protocol/shape bindings for that name immediately after the delete. Plans
+   stay on their box: only the no-longer-justified target binding is removed. */
+static void forget_clear_target_bindings(d2k_sched *s, task *t) {
+    if (!s || !s->cat || !t || t->by_addr) { return; }
+    size_t removed = 0;
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t j = 0; j < b->n_binds; j++) {
+            d2k_cat_binding *bd = &b->binds[j];
+            uint8_t tr = bd->transport ? bd->transport : 6;
+            if (strcmp(bd->kind, "name") == 0 &&
+                strcmp(bd->target, t->name) == 0 && tr == t->transport &&
+                d2k_cat_shape_fits(bd->shape, t->asked_shape)) {
+                removed++;
+            }
+        }
+    }
+    if (removed == 0) { return; }
+
+    char err[200];
+    if (d2k_link_del_name(s->link_fd, t->name, err, sizeof err) != 0) {
+        say(s, "по %s проходит напрямую, но старую привязку не удалось снять: %s",
+            t->name, err);
+        return;
+    }
+
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t j = 0; j < b->n_binds;) {
+            d2k_cat_binding *bd = &b->binds[j];
+            uint8_t tr = bd->transport ? bd->transport : 6;
+            if (strcmp(bd->kind, "name") == 0 &&
+                strcmp(bd->target, t->name) == 0 && tr == t->transport &&
+                d2k_cat_shape_fits(bd->shape, t->asked_shape)) {
+                memmove(bd, bd + 1, (b->n_binds - j - 1) * sizeof *bd);
+                b->n_binds--;
+                b->updated = (int64_t)time(NULL);
+                continue;
+            }
+            j++;
+        }
+    }
+    s->cat->revision++;
+
+    /* Restore any other still-confirmed protocol or ClientHello shape for
+       this name; the datapath delete itself intentionally has broader scope. */
+    char hex[2 * D2K_PLAN_TLV_MAX + 1];
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        const d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t j = 0; j < b->n_binds; j++) {
+            const d2k_cat_binding *bd = &b->binds[j];
+            if (strcmp(bd->target, t->name) != 0 || strcmp(bd->kind, "name") != 0 ||
+                !bd->enabled || (bd->level > 0 && bd->level < 3) ||
+                (bd->transport == 17 && bd->verified_by == D2K_VERBY_CLIENT)) {
+                continue;
+            }
+            const d2k_cat_plan *p = plan_by_id(b, bd->plan_id);
+            if (!p || !p->text ||
+                d2k_plan_text_to_hex(p->text, hex, sizeof hex, err, sizeof err) != 0) {
+                say(s, "по %s оставшаяся привязка %s не восстановлена после снятия: план не найден",
+                    t->name, bd->plan_id);
+                continue;
+            }
+            uint8_t tr = bd->transport ? bd->transport : 6;
+            uint8_t shape = bd->shape ? bd->shape : D2K_LINK_SHAPE_GRANDFATHER;
+            if (d2k_link_set_name(s->link_fd, bd->target, tr, hex, shape,
+                                  err, sizeof err) != 0) {
+                say(s, "по %s оставшаяся привязка %s не восстановлена: %s",
+                    t->name, bd->plan_id, err);
+            }
+        }
+    }
+    say(s, "по %s проходит напрямую — снял устаревших привязок: %zu",
+        t->name, removed);
+}
+
 /* Вектор свойств словами. Нужен наружу: иначе «кандидатов 3» ничего не
    говорит о том, ЧЕМ коробка себя выдала, а это и есть результат опроса.
    Тройственность сохраняется буквально — «не измерено» не превращается в
@@ -2309,6 +2505,8 @@ static void signal_human(const d2k_cat_signal *sig, char *out, size_t cap) {
    «ищем новое», и сливать их в одно нельзя. */
 static const char *task_phase(const task *t) {
     switch (t->state) {
+    case T_QUEUED:        return "ожидает безопасного слота замера";
+    case T_RST_PENDING:   return "ждём независимое подтверждение RST";
     case T_SHAPE_WAIT:    return "ждём форму приветствия";
     case T_ASKING:        return "распознаём поведение";
     case T_PROPS_CONTACT:
@@ -2402,7 +2600,8 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         fputs("\"candidate\": ", f);
         json_str(f, t->next_plan > 0 ? "план поставлен" : "");
         fputs(", \"source\": ", f);
-        json_str(f, t->n_known > 0 && t->next_plan <= t->n_known
+        json_str(f, t->state == T_RST_PENDING ? "поиск ещё не запущен" :
+                    t->n_known > 0 && t->next_plan <= t->n_known
                         ? "готовый план узнанной коробки" : "выведен из замера");
         fputc('}', f);
     }
@@ -2446,7 +2645,7 @@ size_t d2k_sched_active(const d2k_sched *s) {
     size_t n = 0;
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task_state st = s->tasks[i].state;
-        if (st == T_SHAPE_WAIT || st == T_ASKING || st == T_PLANNING ||
+        if (st == T_QUEUED || st == T_SHAPE_WAIT || st == T_ASKING || st == T_PLANNING ||
             st == T_VERIFY || st == T_VERIFY_WAIT || st == T_WATCHING) { n++; }
     }
     return n;
@@ -2621,36 +2820,15 @@ int d2k_sched_sync_step(d2k_sched *s) {
     return 1;
 }
 
-/* Заводит поиск на подготовленной задаче: приветствия, готовые планы
-   узнанной коробки, иначе замер. Отдельно от on_suspect потому, что тот же
+/* Заводит поиск на подготовленной задаче: прямой замер, затем готовые планы
+   узнанной коробки и/или синтез. Отдельно от on_suspect потому, что тот же
    запуск нужен ПОЗЖЕ — когда задача ждала форму приветствия и дождалась
    (on_shape ниже). Возвращает 1, если задача занята делом. */
 static int start_search(d2k_sched *s, task *t) {
     if (fill_hellos(s, t) != 0) {
         if (t->transport == 17 && t->shape_armed) {
-            /* ГОТОВЫЙ ПЛАН УЗНАННОЙ КОРОБКИ СНИМКА НЕ ТРЕБУЕТ.
-             *
-             * Приветствие нужно для ЗАМЕРА — им задают вопросы коробке. Чтобы
-             * ИСПЫТАТЬ уже подтверждённый план, мерить нечего: зонд QUIC ведёт
-             * своё рукопожатие сам (d2k_verify_probe_quic), а отпечаток
-             * коробки пришёл вместе с подозрением и снимка не ждёт.
-             *
-             * Раньше эта ветка стояла ПОСЛЕ требования снимка и до неё не
-             * доходило: цель с готовым планом уходила ждать второго
-             * обращения наравне с незнакомой. Ровно так терялись рилсы —
-             * `plan-3d61ea1d` был подтверждён на четырёх целях той же
-             * коробки, а новому `scontent-*` не доставался никогда. */
-            t->n_known = known_plans(s, t);
-            t->n_plans = t->n_known;
-            if (t->n_known > 0) {
-                t->state = T_PLANNING;
-                say(s, "по %s (QUIC) снимка нет, но коробка узнана — "
-                       "испытываю %zu готовых планов, не дожидаясь формы",
-                    t->name, t->n_known);
-                return 1;
-            }
-            /* Единственный случай, когда отсутствие приветствия — не отказ:
-               снимок заказан и приедет событием (см. T_SHAPE_WAIT). */
+            /* Не применяем готовый план по одному подозрению. Если нельзя
+               собрать собственный QUIC Initial, ждём запрошенный снимок. */
             t->state = T_SHAPE_WAIT;
             say(s, "по %s (QUIC) жду форму приветствия: собрать QUIC-вход не удалось, "
                    "мерить до снимка нечем", t->name);
@@ -2658,14 +2836,6 @@ static int start_search(d2k_sched *s, task *t) {
         }
         task_reset(t);
         return 0;
-    }
-    t->n_known = known_plans(s, t);
-    t->n_plans = t->n_known;
-    if (t->n_known > 0) {
-        t->state = T_PLANNING;
-        say(s, "по %s проверяю %zu готовых планов узнанной коробки / совместимых моделей ДО нового замера",
-            t->name, t->n_known);
-        return 1;
     }
     t->researched = 1;
     t->state = T_ASKING;
@@ -2835,6 +3005,82 @@ static void quic_addr_start(d2k_sched *s, task *t) {
     (void)start_search(s, t);
 }
 
+static size_t measurements_in_flight(const d2k_sched *s) {
+    size_t n = 0;
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        switch (s->tasks[i].state) {
+        case T_ASKING:
+        case T_PROPS_CONTACT:
+        case T_PROPS_WAIT:
+        case T_PLANNING:
+        case T_TRIAL_SETTLE:
+        case T_VERIFY:
+        case T_VERIFY_WAIT:
+        case T_VOICE_MEASURE:
+            n++;
+            break;
+        default:
+            break;
+        }
+    }
+    return n;
+}
+
+static size_t queued_measurements(const d2k_sched *s) {
+    size_t n = 0;
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        if (s->tasks[i].state == T_QUEUED) { n++; }
+    }
+    return n;
+}
+
+static int launch_task(d2k_sched *s, task *t) {
+    if (t->by_addr) {
+        quic_addr_start(s, t);
+        return t->state != T_FREE && t->state != T_RESTING;
+    }
+    if (is_voice_class(t->name, t->transport)) {
+        voice_start(s, t);
+        return t->state == T_VOICE_MEASURE || t->state == T_VOICE_TRIAL;
+    }
+    if (!t->shape_armed) {
+        char err[128];
+        if (d2k_link_arm_shape(s->link_fd, t->name, t->transport,
+                               err, sizeof err) == 0) {
+            t->shape_armed = 1;
+        }
+    }
+    return start_search(s, t);
+}
+
+static int launch_or_queue(d2k_sched *s, task *t) {
+    size_t active = measurements_in_flight(s);
+    /* Before the first scheduler tick, model time is intentionally unknown.
+       Do not stamp a start at zero and later compare it with the first real
+       monotonic tick (or a test's model clock); the concurrency cap still
+       bounds the initial burst. */
+    int start_gap = s->clock_seen && s->measure_start_seen && active == 0 &&
+                    s->now_ms - s->last_measure_start_ms < SCHED_START_GAP_MS;
+    if (active >= SCHED_MAX_ACTIVE_MEASUREMENTS || start_gap) {
+        if (queued_measurements(s) >= SCHED_MAX_QUEUED_MEASUREMENTS) {
+            say(s, "по %s измерение не поставлено: ограниченная очередь заполнена; "
+                   "следующий поток снова сможет поднять подозрение", t->name);
+            task_reset(t);
+            return 0;
+        }
+        t->state = T_QUEUED;
+        t->started_ms = s->now_ms;
+        say(s, "по %s подозрение сохранено в ограниченной очереди замеров "
+               "(%zu из %d); новые измерения ограничены до %d одновременно",
+            t->name, queued_measurements(s), SCHED_MAX_QUEUED_MEASUREMENTS,
+            SCHED_MAX_ACTIVE_MEASUREMENTS);
+        return 0;
+    }
+    s->last_measure_start_ms = s->now_ms;
+    s->measure_start_seen = 1;
+    return launch_task(s, t);
+}
+
 static void voice_observe(d2k_sched *s, task *t) {
     /* handle_udp сообщает EXCHANGE на ЛЮБУЮ обратную датаграмму, включая
        пустую. APPLIED связывает её с исполненным планом, но не проверяет
@@ -2923,6 +3169,22 @@ static int is_voice_class(const char *name, uint8_t transport) {
     return transport == 17 && strcmp(name, D2K_LINK_VOICE_CLASS) == 0;
 }
 
+/* Telegram control/site traffic is routed through the separately managed VPS
+   tunnel. It must not become a D2K measurement target. Match the DNS label
+   boundary, so unrelated names such as nottelegram.org remain eligible. */
+static int is_telegram_tunnel_domain(const char *name) {
+    static const char domain[] = "telegram.org";
+    size_t name_len = strlen(name);
+    const size_t domain_len = sizeof domain - 1;
+    if (name_len == domain_len) {
+        return strcasecmp(name, domain) == 0;
+    }
+    if (name_len <= domain_len || name[name_len - domain_len - 1] != '.') {
+        return 0;
+    }
+    return strcasecmp(name + name_len - domain_len, domain) == 0;
+}
+
 static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     /* Имя копируется СРАЗУ, а не держится указателем в кольцо имён: и потому
        что кольцо переживает вытеснение (следующее приветствие может занять
@@ -2955,12 +3217,67 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
            вытесненным из кольца) законно бывает. */
         return 0;
     }
+    if (is_telegram_tunnel_domain(name)) {
+        say(s, "по %s замер не запускаю: домен обслуживается Telegram VPS-туннелем",
+            name);
+        return 0;
+    }
+    int64_t cooldown_left_ms = 0;
+    if (cooldown_blocks(s, name, ev->transport, ev->code, &cooldown_left_ms)) {
+        target_cooldown *cool = cooldown_find(s, name, ev->transport);
+        const char *reason = cool && cool->challenge ? "антибот-ответа" :
+                             cool && cool->exhausted ? "исчерпания прошлого поиска" :
+                             "повторного CLEAR";
+        say(s, "по %s замер отложен после %s ещё примерно %lld мин",
+            name, reason,
+            (long long)((cooldown_left_ms + 59999) / 60000));
+        return 0;
+    }
     task *t = task_of(s, name, ev->transport);
+    int ordinary_tcp_rst = ev->transport == 6 && ev->code == D2K_SUSPECT_RST;
+    d2k_cat_fp carried_fp;
+    int have_carried_fp = 0;
+    memset(&carried_fp, 0, sizeof carried_fp);
     if (t && t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
         /* Поток разговора, к которому применился приём, остался без ответа —
            решает тик (записи и снятию нужны часы). */
         t->voice_silent = 1;
         return 0;
+    }
+    if (t && t->state == T_RST_PENDING) {
+        int within_window = t->rst_confirm_until_ms == 0 ||
+                            s->now_ms < t->rst_confirm_until_ms;
+        if (within_window && ordinary_tcp_rst &&
+            ev_matches_flow(ev, &t->rst_pending_flow)) {
+            /* Дубликат события по тому же TCP 5-tuple не независимое
+               подтверждение: datapath мог повторно сообщить о том же сбросе. */
+            return 0;
+        }
+        if (!within_window) {
+            say(s, "по %s одиночный RST не подтвердился за 30 с — забываю подозрение",
+                t->name);
+            task_done(t);
+            t = NULL;
+        } else {
+            /* Сохраняем первое наблюдение в отпечатке: модель коробки должна
+               учитывать оба независимых потока, а не только подтверждающий. */
+            carried_fp = t->fp;
+            d2k_cat_signal sig = signal_of(ev);
+            fp_add(&carried_fp, &sig);
+            have_carried_fp = 1;
+            if (ordinary_tcp_rst) {
+                say(s, "по %s второй обычный RST на независимом потоке за 30 с — подтверждаю подозрение",
+                    t->name);
+                ordinary_tcp_rst = 0; /* это подтверждение, теперь запускаем поиск */
+            } else {
+                char human[200];
+                signal_human(&sig, human, sizeof human);
+                say(s, "по %s пришёл дополнительный сигнал (%s) — подтверждаю подозрение",
+                    t->name, human);
+            }
+            task_done(t);
+            t = NULL;
+        }
     }
     if (t) {
         /* Поиск уже идёт — но примета всё равно наша: отпечаток растёт по мере
@@ -3004,8 +3321,12 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     task_reset(t);
     snprintf(t->name, sizeof t->name, "%s", name);
     t->transport = ev->transport;
-    t->fp.method = D2K_FP_METHOD;
-    {
+    t->by_addr = by_addr;
+    t->trigger_code = ev->code;
+    if (have_carried_fp) {
+        t->fp = carried_fp;
+    } else {
+        t->fp.method = D2K_FP_METHOD;
         d2k_cat_signal sig = signal_of(ev);
         fp_add(&t->fp, &sig);
     }
@@ -3028,24 +3349,24 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         }
     }
     t->started_ms = 0;
-    if (by_addr) {
-        quic_addr_start(s, t);
-        return t->state != T_FREE && t->state != T_RESTING;
+    if (ordinary_tcp_rst) {
+        t->state = T_RST_PENDING;
+        t->rst_pending_flow.transport = ev->transport;
+        memcpy(t->rst_pending_flow.a_ip, ev->low_ip, sizeof ev->low_ip);
+        memcpy(t->rst_pending_flow.b_ip, ev->high_ip, sizeof ev->high_ip);
+        t->rst_pending_flow.a_port = ev->low_port;
+        t->rst_pending_flow.b_port = ev->high_port;
+        t->rst_confirm_until_ms = s->clock_seen
+                                      ? s->now_ms + SCHED_RST_CONFIRM_MS
+                                      : 0;
+        say(s, "по %s одиночный обычный RST — жду второй независимый поток до 30 с; поиск пока не запускаю",
+            t->name);
+        return 0;
     }
-    if (is_voice_class(t->name, t->transport)) {
-        /* Голос измеряется отдельным C-инструментом по живой conntrack-цели. */
-        voice_start(s, t);
-        return t->state == T_VOICE_MEASURE || t->state == T_VOICE_TRIAL;
-    }
-    /* Снимок заказывается ДО подбора приветствий, а не после: для QUIC он не
-       «уточнение», а единственный источник байт, и порядок здесь несущий. */
-    if (!t->shape_armed) {
-        char err[128];
-        if (d2k_link_arm_shape(s->link_fd, t->name, t->transport, err, sizeof err) == 0) {
-            t->shape_armed = 1;
-        }
-    }
-    return start_search(s, t);
+    /* Голос, QUIC по адресу и TLS идут через одну общую очередь: иначе
+       ограничение только одного транспорта оставило бы остальные источником
+       неограниченных параллельных сетевых измерений. */
+    return launch_or_queue(s, t);
 }
 
 /* ПЕРЕМЕР ПОДТВЕРЖДЁННОЙ ЦЕЛИ СНЯТЫМИ БАЙТАМИ.
@@ -3069,7 +3390,7 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     t->next_plan = 0;
     say(s, "по %s привязка добыта заготовкой, а снимок клиента есть — "
            "перемеряю снимком: %zu байт", t->name, len);
-    (void)start_search(s, t);
+    (void)launch_or_queue(s, t);
 }
 
 static void on_shape(d2k_sched *s, const d2k_ev *ev) {
@@ -3153,7 +3474,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
             if (t->state == T_SHAPE_WAIT) {
                 /* Ждали ровно этого. Контроль соберётся из этих же байт, и
                    поиск пойдёт дальше как обычно. */
-                (void)start_search(s, t);
+                (void)launch_or_queue(s, t);
             }
         }
     }
@@ -3738,6 +4059,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         s->clock_seen = 1;
         s->mono_base_ms = now_ms;
         s->wall_base_s = (int64_t)time(NULL);
+        /* Events may beat the first timer tick. Their local zero timestamp
+           is provisional; rebase admission pacing when the clock becomes
+           meaningful so uptime/model-clock differences cannot release the
+           initial queue immediately. */
+        if (s->measure_start_seen) { s->last_measure_start_ms = now_ms; }
     }
     s->now_ms = now_ms;
 
@@ -3754,6 +4080,47 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         task *t = &s->tasks[i];
         if (t->state == T_FREE) { continue; }
 
+        if (t->state == T_QUEUED) {
+            if (t->started_ms == 0) { t->started_ms = now_ms; }
+            if (now_ms - t->started_ms > SCHED_TASK_LIFE_MS) {
+                say(s, "по %s подозрение устарело в очереди — сетевой замер не запускал",
+                    t->name);
+                task_done(t);
+                moved++;
+                continue;
+            }
+            size_t active = measurements_in_flight(s);
+            /* Once work has actually waited in the queue, pace its release
+               even if a long-running measurement still occupies one slot.
+               A fresh event may immediately fill a genuinely free second
+               slot (launch_or_queue), but queued backlog must not drain in
+               a burst as workers finish. */
+            int start_gap = s->measure_start_seen &&
+                            now_ms - s->last_measure_start_ms < SCHED_START_GAP_MS;
+            if (active < SCHED_MAX_ACTIVE_MEASUREMENTS && !start_gap) {
+                s->last_measure_start_ms = now_ms;
+                s->measure_start_seen = 1;
+                (void)launch_task(s, t);
+                moved++;
+            }
+            continue;
+        }
+
+        if (t->state == T_RST_PENDING) {
+            /* Первое событие может прийти до первого тика планировщика. В
+               таком случае начинаем 30-секундное окно от его первых часов,
+               а не от нуля/времени запуска ОС. */
+            if (t->rst_confirm_until_ms == 0) {
+                t->started_ms = now_ms;
+                t->rst_confirm_until_ms = now_ms + SCHED_RST_CONFIRM_MS;
+            } else if (now_ms >= t->rst_confirm_until_ms) {
+                say(s, "по %s одиночный RST не подтвердился за 30 с — забываю подозрение",
+                    t->name);
+                task_done(t);
+                moved++;
+            }
+            continue;
+        }
         if (t->state == T_RESTING) {
             if (now_ms >= t->rest_until_ms) { task_done(t); moved++; }
             continue;
@@ -3787,6 +4154,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     say(s, "по %s голосовой замер не уложился в %d мин — "
                            "результат не применяется",
                         t->name, SCHED_TASK_LIFE_MS / 60000);
+                }
+                if (t->probes > 0) {
+                    cooldown_record(s, t, 2);
+                    say(s, "по %s после долгого незавершённого поиска новый замер временно отложен",
+                        t->name);
                 }
                 task_fail(s, t, now_ms);
             }
@@ -3850,30 +4222,6 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++;
                 continue;
             }
-            /* Вопросы о свойствах нужны ТОЛЬКО там, где чем брать — неизвестно.
-               Измеритель, вернувший плечо, на этот вопрос уже ответил своими
-               зондами; спрашивать то же самое ещё раз через датапат значит
-               потратить минуты на повторение готового ответа. */
-            if (r.verdict == D2K_V_OPAQUE && t->transport == 6 && !r.have_arm && !r.owns_search) {
-                /* «Решает содержимое» — единственный вердикт, на который
-                   вопросы о свойствах вообще осмысленны: разрез такую коробку
-                   не берёт, берёт её отравление буфера пересборки, а чем
-                   именно — это и есть вопросы (d2k_compose.h). На остальных
-                   вердиктах спрашивать нечего: там ответ уже дан разрезом или
-                   его отсутствием. Только TCP: все пять вопросов —
-                   про TCP-сегменты, которых у QUIC нет. */
-                say(s, "по %s вердикт: %s (%s) — спрашиваю коробку о свойствах",
-                    t->name, verdict_name(r.verdict), r.reason);
-                memset(&t->props, 0, sizeof t->props);
-                t->prop_q = -1;
-                t->props_asked = 0;
-                t->res = r;
-                if (prop_send_next(s, t, now_ms) == 0) {
-                    moved++;
-                    continue;
-                }
-                prop_finish(s, t);
-            }
             /* СНИМОК ПРИШЁЛ ПОСЛЕ СТАРТА — ЗАМЕР СДЕЛАН НЕ ТЕМ ПРИВЕТСТВИЕМ.
                Первый поиск по цели идёт профилем холодного старта, а форму
                настоящего клиента датапат присылает отдельным событием, и
@@ -3927,6 +4275,66 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     moved++;
                     continue;
                 }
+            }
+            if (!verdict_proves_block(r.verdict)) {
+                say(s, "по %s прямой замер не подтвердил блокировку (%s: %s) — "
+                       "подбор и применение обхода не запускаю",
+                    t->name, verdict_name(r.verdict), r.reason);
+                if (r.verdict == D2K_V_CLEAR) {
+                    forget_clear_target_bindings(s, t);
+                    cooldown_record(s, t, 0);
+                    target_cooldown *cool = cooldown_find(s, t->name, t->transport);
+                    int64_t delay_ms = cool
+                                           ? clear_backoff_ms(cool->negative_streak)
+                                           : SCHED_CLEAR_BACKOFF_1_MS;
+                    say(s, "по %s напрямую проходит — повторный поиск отложен на %lld мин; "
+                           "это временный ограничитель, а не запись в каталоге",
+                        t->name, (long long)((delay_ms + 59999) / 60000));
+                }
+                task_fail(s, t, now_ms);
+                moved++;
+                continue;
+            }
+            cooldown_clear(s, t->name, t->transport);
+            {
+                size_t known = known_plans(s, t);
+                if (known > 0) {
+                    t->res = r;
+                    t->cached_measure_valid = 1;
+                    t->n_known = known;
+                    t->n_plans = known;
+                    t->next_plan = 0;
+                    t->state = T_PLANNING;
+                    say(s, "по %s прямой замер подтвердил блокировку (%s) — "
+                           "сначала проверяю %zu готовых планов узнанной коробки",
+                        t->name, verdict_name(r.verdict), known);
+                    moved++;
+                    continue;
+                }
+            }
+            /* Вопросы о свойствах нужны ТОЛЬКО там, где чем брать — неизвестно.
+               Измеритель, вернувший плечо, на этот вопрос уже ответил своими
+               зондами; спрашивать то же самое ещё раз через датапат значит
+               потратить минуты на повторение готового ответа. */
+            if (r.verdict == D2K_V_OPAQUE && t->transport == 6 && !r.have_arm && !r.owns_search) {
+                /* «Решает содержимое» — единственный вердикт, на который
+                   вопросы о свойствах вообще осмысленны: разрез такую коробку
+                   не берёт, берёт её отравление буфера пересборки, а чем
+                   именно — это и есть вопросы (d2k_compose.h). На остальных
+                   вердиктах спрашивать нечего: там ответ уже дан разрезом или
+                   его отсутствием. Только TCP: все пять вопросов —
+                   про TCP-сегменты, которых у QUIC нет. */
+                say(s, "по %s вердикт: %s (%s) — спрашиваю коробку о свойствах",
+                    t->name, verdict_name(r.verdict), r.reason);
+                memset(&t->props, 0, sizeof t->props);
+                t->prop_q = -1;
+                t->props_asked = 0;
+                t->res = r;
+                if (prop_send_next(s, t, now_ms) == 0) {
+                    moved++;
+                    continue;
+                }
+                prop_finish(s, t);
             }
             verdict_to_plans(s, t, &r);
             /* ДЛИТЕЛЬНОСТЬ И ЦЕНА — В ТОЙ ЖЕ СТРОКЕ, ЧТО И ВЕРДИКТ.
@@ -4087,6 +4495,23 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             t->ver_flow.b_port = t->port;
             t->ver_flow.transport = t->transport;
             claim_early_refusal(t);
+            if (t->ver.level == D2K_VER_CHALLENGE) {
+                /* Anti-bot challenge means the HTTP edge answered, but the
+                   requested content was not established. It is neither a
+                   successful bypass nor evidence against this candidate:
+                   stop this search instead of burning every arm against the
+                   same challenge, and remove only the temporary trial. */
+                say(s, "по %s зонд получил %s — это не подтверждение обхода и не диагноз блокировки; "
+                       "перебор остановлен",
+                    t->name, t->ver.reason);
+                cooldown_record(s, t, 1);
+                say(s, "по %s антибот-ответ: активный замер этой цели поставлен на паузу на %lld мин",
+                    t->name, (long long)(SCHED_CHALLENGE_BACKOFF_MS / 60000));
+                ver_close(t);
+                task_fail(s, t, now_ms);
+                moved++;
+                continue;
+            }
             if (t->ver.unsupported) {
                 /* НЕ ПРО КАНДИДАТА, А ПРО ТРАНСПОРТ. Следующий кандидат
                    получит тот же ответ, и перебор потратил бы весь бюджет
@@ -4278,6 +4703,24 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 continue;
             }
             if (inst != 0) {
+                if (t->n_known > 0 && t->cached_measure_valid) {
+                    d2k_vres measured = t->res;
+                    t->cached_measure_valid = 0;
+                    remove_trial_exact(s, t);
+                    verdict_to_plans(s, t, &measured);
+                    if (t->n_plans == 0) {
+                        say(s, "по %s готовые планы не помогли; прямое измерение "
+                               "не дало новых кандидатов", t->name);
+                        task_fail(s, t, now_ms);
+                        moved++;
+                        continue;
+                    }
+                    t->state = T_PLANNING;
+                    say(s, "по %s готовые планы не помогли — проверяю кандидаты "
+                           "из уже выполненного прямого замера", t->name);
+                    moved++;
+                    continue;
+                }
                 if (!t->researched) {
                     /* Exhausted known plans: remove the trial before any
                        baseline measurement. Research happens at most once. */
@@ -4332,6 +4775,15 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        "Это не «перебор кончился»: планы выводятся из замера, и если "
                        "измерить было нечем, их и нет",
                     t->name, t->probes);
+                cooldown_record(s, t, 2);
+                {
+                    target_cooldown *cool = cooldown_find(s, t->name, t->transport);
+                    int64_t delay_ms = cool
+                                           ? clear_backoff_ms(cool->negative_streak)
+                                           : SCHED_CLEAR_BACKOFF_1_MS;
+                    say(s, "по %s после исчерпания кандидатов новый поиск отложен на %lld мин",
+                        t->name, (long long)((delay_ms + 59999) / 60000));
+                }
                 task_fail(s, t, now_ms);
                 moved++;
                 continue;
