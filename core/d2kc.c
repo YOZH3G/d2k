@@ -193,6 +193,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Do not send catalog commands or start measurements before the peer
+       proves it uses this key layout. Old greetings have shorter keys and
+       cannot be safely interpreted as version-4 traffic. */
+    d2k_ev greeting;
+    if (d2k_link_next(fd, &greeting, 2000, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: нет корректного приветствия датапата: %s\n", err);
+        d2k_link_close(fd);
+        d2k_catalog_free(&cat);
+        return 1;
+    }
+    if (greeting.kind != D2K_EV_PROTO || greeting.num != D2K_CTL_PROTO_VERSION) {
+        fprintf(stderr, "d2kc: несовместимое приветствие датапата, нужна версия %u\n",
+                (unsigned)D2K_CTL_PROTO_VERSION);
+        d2k_link_close(fd);
+        d2k_catalog_free(&cat);
+        return 1;
+    }
+
     d2k_sched *s = d2k_sched_new(&cat, fd, mark);
     if (!s) {
         fprintf(stderr, "d2kc: планировщик не завёлся\n");
@@ -201,6 +219,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     d2k_sched_set_measure_mark(s, have_measure_mark ? measure_mark : mark);
+    d2k_sched_set_send_cap(s, greeting.send_maxlen);
 
     d2k_sched_set_say(s, sched_say, NULL);
 
@@ -234,7 +253,7 @@ int main(int argc, char **argv) {
     unsigned long seen_exchange = 0, seen_applied = 0, seen_refused = 0;
     /* Версия провода: объявлена ли вообще и совпала ли. Оба «нет» означают
        «мы не знаем, с кем говорили», и оба обязаны быть слышны. */
-    int proto_seen = 0, proto_bad = 0;
+    int proto_seen = 1, proto_bad = 0;
     int64_t last_report = now_ms();
 
     /* Путь вида для панели: рядом с каталогом, если не задан явно. Панель
