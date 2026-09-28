@@ -9,10 +9,10 @@ spike/nfqview-raw/nfqview-raw-linux-*
 # Публикуемые arm64 runtime-артефакты, которые скачивает scripts/install.sh.
 # Остальные сборки и временные файлы каталога остаются локальными.
 builds/*
-!builds/d2kd-linux-arm64
-!builds/d2kc-linux-arm64
-!builds/d2kpanel-linux-arm64
-!builds/d2ktg-linux-arm64
+!builds/d2kd-linux-*
+!builds/d2kc-linux-*
+!builds/d2kpanel-linux-*
+!builds/d2ktg-linux-*
 /build/
 /telegram/build/
 /panel/d2kpanel

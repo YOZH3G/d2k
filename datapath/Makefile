@@ -355,11 +355,16 @@ d2kd: $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) $(HDR)
 # scripts/install.sh, и расхождение здесь означало бы «скачанного файла нет»
 # на живом роутере. Одно имя на всё, а не два похожих.
 BUILDDIR ?= ../builds
-d2kd-linux-arm64:
+TARGET ?= aarch64-linux-musl
+TARGET_FLAGS ?=
+ARCH ?= arm64
+.PHONY: release
+d2kd-linux-arm64: release
+release:
 	@mkdir -p $(BUILDDIR)
-	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
-		-o $(BUILDDIR)/d2kd-linux-arm64 $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC)
-	@ls -l $(BUILDDIR)/d2kd-linux-arm64
+	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -static -Wl,-S \
+		-o $(BUILDDIR)/d2kd-linux-$(ARCH) $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC)
+	@ls -l $(BUILDDIR)/d2kd-linux-$(ARCH)
 
 # planlab тоже в зависимостях, и это не украшение: он собирается отдельной
 # целью, поэтому однажды check остался зелёным при несобирающейся

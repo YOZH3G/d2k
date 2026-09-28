@@ -7,6 +7,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef NDEBUG
+#error "Session regressions require active assertions (compile with -UNDEBUG)"
+#endif
+
 typedef struct {
     uint8_t replies[2][256]; size_t reply_len[2]; size_t reply_count; size_t next_reply;
     uint8_t sent[2][256]; size_t sent_len[2]; size_t send_count;
@@ -80,10 +84,15 @@ static void test_v1_auth_vector_and_reconnect_policy(void) {
     assert(auth.type==TG_MUX_AUTHID && auth.payload_len==88);
     uint8_t pub[32]; assert(tg_identity_public_key(&id,pub)==0);
     assert(tg_identity_verify(pub,auth.payload,24,auth.payload+24)==0);
-    assert(tg_reconnect_delay_ms(1,0,0,0.0)==2100);
+    /* x87 retains extended precision until the integer cast; 0.7 * 3000
+     * may truncate to 2099, just as the upper bound below can be 12999. */
+    uint32_t low_jitter = tg_reconnect_delay_ms(1,0,0,0.0);
+    assert(low_jitter >= 2099 && low_jitter <= 2100);
     assert(tg_reconnect_delay_ms(3,0,0,1.0)>=12999 && tg_reconnect_delay_ms(3,0,0,1.0)<=13000);
-    assert(tg_reconnect_delay_ms(10,99,0,0.5)==5000);
-    assert(tg_reconnect_delay_ms(10,0,1,0.5)==1000);
+    uint32_t retry_jitter = tg_reconnect_delay_ms(10,99,0,0.5);
+    uint32_t healthy_jitter = tg_reconnect_delay_ms(10,0,1,0.5);
+    assert(retry_jitter >= 4999 && retry_jitter <= 5000);
+    assert(healthy_jitter >= 999 && healthy_jitter <= 1000);
     assert(!tg_reconnect_needs_reregister(2) && tg_reconnect_needs_reregister(3));
     assert(tg_session_ping_due(0,10000) && !tg_session_ping_due(1,10000));
     assert(tg_session_read_expired(0,30000) && !tg_session_read_expired(1,30000));

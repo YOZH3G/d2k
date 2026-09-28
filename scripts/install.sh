@@ -32,11 +32,6 @@ trap cleanup EXIT INT TERM
 #
 # Отказ на неподдерживаемой арке ЯВНЫЙ. Поставить бинарник не той арки значит
 # получить «не запускается» без объяснения.
-case "$(uname -m)" in
-    aarch64|arm64) ARCH=arm64 ;;
-    *) die "C runtime пока собирается и проверяется только для ARM64, а здесь $(uname -m)" ;;
-esac
-say "архитектура: $(uname -m) -> $ARCH"
 
 # --- что нужно от системы ------------------------------------------------
 for t in curl ip iptables start-stop-daemon; do
@@ -73,6 +68,19 @@ fetch() {
     [ -s "$2" ] || die "$1 оказался пустым"
 }
 
+fetch "scripts/architecture.sh" "$TMP/architecture.sh"
+fetch "scripts/check-cpu.sh" "$TMP/check-cpu.sh"
+SYS_ARCH=$(uname -m)
+ENTWARE_ARCH=
+if command -v opkg >/dev/null 2>&1; then
+    ENTWARE_ARCH=$(opkg print-architecture 2>/dev/null | awk '
+        $1 == "arch" && $2 != "all" && $2 != "noarch" {
+            if ($3 + 0 >= priority) { priority = $3 + 0; arch = $2 }
+        } END { print arch }')
+fi
+ARCH=$(sh "$TMP/architecture.sh" "$SYS_ARCH" "$ENTWARE_ARCH") || die "неподдерживаемая архитектура"
+sh "$TMP/check-cpu.sh" "$ARCH" || die "CPU не соответствует требованиям сборки"
+say "архитектура: $SYS_ARCH / ${ENTWARE_ARCH:-без Entware ABI} -> $ARCH"
 say "загрузка"
 fetch "scripts/select-panel-ip.sh" "$TMP/select-panel-ip.sh"
 fetch "builds/d2kpanel-linux-$ARCH" "$TMP/d2kpanel"

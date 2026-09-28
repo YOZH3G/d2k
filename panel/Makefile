@@ -13,12 +13,18 @@ all: d2kpanel
 d2kpanel: main.c server.h server.c
 	$(CC) $(CFLAGS) -o $@ main.c server.c
 
-d2kpanel-linux-arm64: main.c server.h server.c
-	mkdir -p ../builds
-	$(ZIG) cc -target aarch64-linux-musl -static -Os -std=c11 -Wall -Wextra -Werror \
+TARGET ?= aarch64-linux-musl
+TARGET_FLAGS ?=
+ARCH ?= arm64
+BUILDDIR ?= ../builds
+.PHONY: release
+d2kpanel-linux-arm64: release
+release: main.c server.h server.c
+	mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) -static -Wl,-S -Os -std=c11 -Wall -Wextra -Werror \
 		-D_POSIX_C_SOURCE=200809L -DD2K_PANEL_VERSION='"$(VERSION)"' \
 		-DD2K_PANEL_COMMIT='"$(COMMIT)"' -DD2K_PANEL_BUILT='"$(BUILT)"' \
-		-DD2K_PANEL_DIRTY=$(DIRTY) -o ../builds/d2kpanel-linux-arm64 main.c server.c
+		-DD2K_PANEL_DIRTY=$(DIRTY) -o $(BUILDDIR)/d2kpanel-linux-$(ARCH) main.c server.c
 
 test_server: test_server.c server.h server.c
 	$(CC) $(CFLAGS) -pthread -o $@ test_server.c server.c

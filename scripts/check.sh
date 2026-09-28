@@ -68,6 +68,7 @@ find scripts spike -name '*.sh' -print0 | xargs -0 shellcheck -s sh
 sh scripts/test-instagram-dns.sh
 sh scripts/test-instagram-dns-scheduler.sh
 sh scripts/test-readme-commands.sh
+sh scripts/test-architecture.sh
 
 # files/S99d2k — самый рискованный скрипт задачи (ставит правила firewall на
 # живом роутере), а глоб *.sh его не ловит: init-скрипты Keenetic по

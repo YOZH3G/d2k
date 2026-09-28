@@ -29,7 +29,8 @@ fi
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-tar -C "$ROOT" -cf - --exclude='.git' --exclude='*.o' --exclude='state' . | tar -C "$WORK" -xf -
+tar -C "$ROOT" -cf - --exclude='.git' --exclude='*.o' --exclude='state' \
+    --exclude='./build' --exclude='./.impeccable' --exclude='./spike' . | tar -C "$WORK" -xf -
 
 cat > "$WORK/install-lab.sh" <<'DRIVER'
 #!/bin/sh
@@ -69,7 +70,7 @@ make -s -C core d2kc
 make -s -C datapath d2kd
 
 mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets" "$REL/scripts"
-cp scripts/select-panel-ip.sh "$REL/scripts/"
+cp scripts/select-panel-ip.sh scripts/architecture.sh scripts/check-cpu.sh "$REL/scripts/"
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
 cp builds/d2ktg-linux-arm64 "$REL/builds/d2ktg-linux-$ARCH"

@@ -4,7 +4,7 @@ D2K наблюдает трафик на Keenetic, измеряет подозр
 
 ## Установка / обновление — одна команда
 
-Выполняйте **в SSH-терминале Entware на роутере от root**, не на компьютере и не в командной строке KeeneticOS. Нужен Keenetic **ARM64 (`aarch64`)** с подготовленным Entware — см. [подготовку ниже](#перед-первой-установкой).
+Выполняйте **в SSH-терминале Entware на роутере от root**, не на компьютере и не в командной строке KeeneticOS. Архитектуру установщик определяет автоматически по Entware и `uname` — см. [совместимость](#архитектуры) и [подготовку](#перед-первой-установкой).
 
 ```sh
 (f=$(mktemp) && curl -fsSL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/necronicle/d2k/feat/telegram-tunnel/scripts/install.sh -o "$f" && D2K_REF=feat/telegram-tunnel sh "$f"; r=$?; rm -f "$f"; exit "$r")
@@ -22,8 +22,8 @@ D2K наблюдает трафик на Keenetic, измеряет подозр
 
 ## Перед первой установкой
 
-1. Установите Entware и включите компонент Keenetic **«Модули ядра подсистемы Netfilter»**. [Официальная инструкция Entware](https://support.keenetic.com/hero-5g/kn-4110/en/20980-installing-the-entware-repository-on-a-usb-drive.html) приведена для ARM64-модели; на сайте выберите свою модель. MIPS/MIPSEL текущая сборка D2K не поддерживает.
-2. Подключитесь к **Entware по SSH**, используя его адрес, порт и пароль root. Проверьте `uname -m`: должно быть `aarch64`/`arm64`.
+1. Установите Entware и включите компонент Keenetic **«Модули ядра подсистемы Netfilter»**. [Официальная инструкция Entware](https://support.keenetic.com/hero-5g/kn-4110/en/20980-installing-the-entware-repository-on-a-usb-drive.html) приведена для ARM64-модели; на сайте выберите свою модель.
+2. Подключитесь к **Entware по SSH**, используя его адрес, порт и пароль root. Архитектуру можно посмотреть командами `uname -m` и `opkg print-architecture`.
 3. Один раз подготовьте зависимости:
 
    ```sh
@@ -65,6 +65,26 @@ tail -n 30 /opt/d2k/log/instagram-dns.log
 
 Чтобы удалить программу, но оставить конфигурацию и изученное состояние, добавьте `D2K_KEEP_STATE=1` перед командой `sh "$f"` в строке удаления. Обычная команда выше удаляет всё состояние D2K.
 
+## Архитектуры
+
+Для каждой цели собирается полный статический C-комплект: движок, контроллер, панель и Telegram. Отдельная установка OpenSSL-библиотек для этих бинарников не нужна; `openssl-util` и CA-сертификаты нужны установочным скриптам.
+
+| Цель | Требования |
+| --- | --- |
+| ARM64 | AArch64 |
+| ARM32 | ARMv7 и новее, little-endian, EABI, VFPv3 |
+| MIPS / MIPSEL | MIPS32, big-/little-endian соответственно, soft-float |
+| MIPS64EL | MIPS64, little-endian, N64 ABI, **нужен FPU** |
+| x86 / x86-64 | i686 / x86-64 |
+| PPC64 | 64-битный PowerPC, big-endian |
+| RISC-V64 | RV64GC |
+
+Для MIPS64EL установщик дополнительно проверяет наличие FPU и отказывается менять установку, если подтвердить его не удалось. Нативный MIPS64EL без FPU пока не поддерживается.
+
+Проверки пакетов: запуск всех 36 бинарников под QEMU, отсутствие динамических зависимостей, криптография, QUIC-пакеты, разбор планов, OpenSSL и Telegram-сессии. MIPS32-сессии дополнительно проверены на эмулируемом CPU без FPU. Изолированный ARM64-тест проходит установку, обновление, безопасный отказ, остановку/запуск и полное удаление.
+
+Это тестовые пакеты, **не подтверждение совместимости со всеми моделями**. Реальная установка ранее проверялась на ARM64; остальные устройства требуют полевых тестов. Эмуляция проверяет запуск и переносимость, но не драйверы Netfilter, NDM и производительность конкретного роутера. На всех моделях нужны Entware, NFQUEUE, connbytes и ipset. Lexra, ARMv5/ARMv6 и 32-битный PPC не поддерживаются; MIPS64 с 32-битным Entware получает пакет MIPSEL/MIPS согласно ABI Entware. Неизвестная архитектура вызывает явный отказ до остановки старой службы.
+
 ## Для разработчиков
 
 D2K переносит сам «Поиск по домену» z2k на C, а не заменяет его другим алгоритмом. Полные требования: [D2K_SPEC.md](D2K_SPEC.md); история и ограничения: [D2K_HANDOFF.md](D2K_HANDOFF.md). Принятый владельцем MVP не означает завершение всех пунктов полного ТЗ, включая STUN и безымянный IP-трафик.
@@ -77,13 +97,16 @@ make -C relay-enroll test
 sh scripts/lab-install.sh  # изолированная установка/удаление; нужен Docker
 ```
 
-На роутере работают C-процессы `d2kd`, `d2kc`, `d2kpanel` и `d2ktg`. Серверный Telegram relay — существующий внешний сервис z2k; его Go-runtime не устанавливается на роутер. Пересборка ARM64:
+На роутере работают C-процессы `d2kd`, `d2kc`, `d2kpanel` и `d2ktg`. Серверный Telegram relay — существующий внешний сервис z2k; его Go-runtime не устанавливается на роутер. Для сборки нужны make, Perl, git и Zig **0.16.0**; для MIPS64EL используется **0.14.1**, поскольку 0.16.0 не линкует полный runtime этой цели. OpenSSL закреплён по commit.
 
 ```sh
-make -C datapath d2kd-linux-arm64
-make -C core d2kc-linux-arm64
-make -C panel d2kpanel-linux-arm64 VERSION=0.1.0-mvp
-sh scripts/build-openssl-tg.sh
+ZIG_MIPS64EL=/path/to/zig-0.14.1 sh scripts/build-router.sh
+# Или только нужные пакеты:
+ARCHES="arm64 mipsel" sh scripts/build-router.sh
+# Сборка существующих регрессий под те же CPU/ABI:
+ZIG_MIPS64EL=/path/to/zig-0.14.1 sh scripts/build-router-tests.sh
+# На Linux с qemu-user и binutils:
+sh scripts/check-router-builds.sh
 ```
 
 Донор: [z2k](https://github.com/necronicle/z2k). Лицензия: MIT.

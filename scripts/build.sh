@@ -7,8 +7,8 @@
 # бы того же, чего стоило там — бинарника, который никто ни разу не проверил.
 # GOMIPS=softfloat обязателен: на MIPS-роутерах нет сопроцессора.
 #
-# Целевые C-runtime собираются статически через Zig/musl под реально
-# проверенную архитектуру ARM64. Нельзя выдавать Go CLI за продуктовую панель.
+# Целевые C-runtime собираются отдельно scripts/build-router.sh.
+# Нельзя выдавать Go CLI за продуктовую панель.
 set -eu
 
 GO=${GO:-go}
@@ -65,15 +65,7 @@ done
 
 # --- ядро и датапат на C -------------------------------------------------
 #
-# Без них установка НЕПОЛНАЯ: scripts/install.sh качает три бинарника, и
-# отсутствие любого означает «не скачать» на живом роутере. Раньше этот
-# скрипт собирал только обвязку на Go, builds/ содержал одну панель из трёх
-# файлов, и «готовой команды установки нет» стояло в README именно поэтому.
-#
-# Арка одна — arm64: только под неё есть проверенный тулчейн (zig cc,
-# статическая musl) и только на ней прогонялась установка (scripts/
-# lab-install.sh). Дописывать сюда арки, которых никто не собирал и не
-# ставил, значит обещать то, чего нет; отказ ниже честнее.
+# Полный комплект: датапат, контроллер, панель и Telegram, все на C.
 if [ "${D2K_GO_ONLY:-0}" = "1" ]; then
     echo "D2K_GO_ONLY=1 — C-часть не собиралась, установка такой сборкой НЕ пройдёт"
 else
@@ -84,13 +76,8 @@ else
     fi
     HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
     ROOT=$(CDPATH='' cd -- "$HERE/.." && pwd)
-    make -C "$ROOT/datapath" d2kd-linux-arm64 >/dev/null
-    make -C "$ROOT/core"     d2kc-linux-arm64 >/dev/null
-    make -C "$ROOT/panel" d2kpanel-linux-arm64 \
-        VERSION="$version" COMMIT="$commit" BUILT="$date" DIRTY="$dirty" >/dev/null
-    for f in d2kd-linux-arm64 d2kc-linux-arm64 d2kpanel-linux-arm64; do
-        printf '  %-22s %8s байт\n' "$f" "$(wc -c < "$OUT/$f" | tr -d ' ')"
-    done
+    ARCHES="${D2K_ARCHES:-arm64 arm mipsel mips mips64el amd64 x86 ppc64 riscv64}" \
+        OUT="$OUT" VERSION="$version" sh "$ROOT/scripts/build-router.sh"
 fi
 
 echo "готово: $OUT"
