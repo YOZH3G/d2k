@@ -829,6 +829,38 @@ int main(int argc, char **argv) {
 
     d2k_catalog cat;
     memset(&cat, 0, sizeof cat);
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        /* No tick: only admission and name recall, never network work. */
+        d2k_ev h4 = ev_hello(6, 41001, "dual.example");
+        h4.family = 4;
+        d2k_sched_event(s, &h4);
+        d2k_ev h6 = h4;
+        h6.family = 6;
+        CHECK(inet_pton(AF_INET6, "2001:db8::1", h6.low_ip) == 1, "IPv6 low fixture");
+        CHECK(inet_pton(AF_INET6, "2001:db8::2", h6.high_ip) == 1, "IPv6 high fixture");
+        d2k_sched_event(s, &h6);
+        d2k_ev r4 = h4, r6 = h6;
+        r4.kind = r6.kind = D2K_EV_SUSPECT;
+        r4.code = r6.code = D2K_SUSPECT_RST;
+        r4.name[0] = r6.name[0] = 0;
+        d2k_sched_event(s, &r4);
+        d2k_sched_event(s, &r6);
+        CHECK(d2k_sched_active(s) == 0, "IPv4/IPv6 RSTs cannot confirm each other");
+        /* Same IPv6 /32 but distinct endpoints: must not recall dual.example. */
+        d2k_ev other = r6;
+        other.low_ip[15] = 3;
+        d2k_sched_event(s, &other);
+        CHECK(d2k_sched_active(s) == 0, "IPv6 name recall compares all 128 bits");
+        h6.high_port++;
+        d2k_sched_event(s, &h6);
+        r6.high_port++;
+        d2k_sched_event(s, &r6);
+        CHECK(d2k_sched_active(s) == 1, "independent IPv6 RST confirms IPv6 suspicion");
+        d2k_sched_free(s);
+        d2k_catalog_free(&empty);
+    }
     if (voice_only) { goto voice_only_run; }
     if (admission_only) { goto admission_only_run; }
 
@@ -1139,6 +1171,88 @@ int main(int argc, char **argv) {
     }
 
 admission_only_run:
+    {
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        confirm_once(&c, sv[0], "family-sync.example", 40170);
+        CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 1, "sync family fixture confirmed");
+        if (c.n_boxes == 1 && c.boxes[0].n_binds == 1) {
+            d2k_cat_box *b = &c.boxes[0];
+            d2k_cat_binding *grown = realloc(b->binds, 3 * sizeof *grown);
+            CHECK(grown != NULL, "allocate native family bindings");
+            if (grown) {
+                b->binds = grown; b->n_binds = 3;
+                b->binds[1] = b->binds[2] = b->binds[0];
+                b->binds[0].family = 4;
+                b->binds[1].family = b->binds[2].family = 6;
+                snprintf(b->binds[2].kind, sizeof b->binds[2].kind, "addr");
+                snprintf(b->binds[2].target, sizeof b->binds[2].target, "2001:db8::abcd");
+                d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+                drain(); forget_sent();
+                (void)d2k_sched_sync(s); sync_out(s);
+                unsigned name4 = 0, name6 = 0, addr6 = 0;
+                uint8_t want_addr[16];
+                CHECK(inet_pton(AF_INET6, "2001:db8::abcd", want_addr) == 1, "sync address fixture");
+                for (size_t off = 0; off + 6 <= sent_len;) {
+                    const uint8_t *p = sentbuf + off;
+                    uint32_t n = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                                 ((uint32_t)p[2] << 8) | p[3];
+                    if (n < 2 || n > sent_len - off - 4) break;
+                    unsigned kind = ((unsigned)p[4] << 8) | p[5];
+                    const uint8_t *body = p + 6;
+                    if (kind == D2K_CMD_SET_NAME && n > 2 + 1 + strlen("family-sync.example") + 2 &&
+                        body[0] == strlen("family-sync.example") &&
+                        !memcmp(body + 1, "family-sync.example", body[0])) {
+                        name4 += body[2 + body[0]] == 4;
+                        name6 += body[2 + body[0]] == 6;
+                    }
+                    if (kind == D2K_CMD_SET_ADDR && n > 19 && body[0] == 6 &&
+                        !memcmp(body + 1, want_addr, 16)) addr6++;
+                    off += 4 + n;
+                }
+                CHECK(name4 == 1 && name6 == 1, "sync restores each name family exactly once");
+                CHECK(addr6 == 1, "sync restores full native IPv6 address binding");
+                tcp_answer = D2K_V_CLEAR;
+                d2k_ev h = ev_hello(6, 41019, "family-sync.example");
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, 41019);
+                d2k_sched_event(s, &su);
+                settle(s);
+                CHECK(b->n_binds == 2, "IPv4 CLEAR removes only IPv4 binding");
+                if (b->n_binds == 2) {
+                    CHECK(b->binds[0].family == 6 && b->binds[1].family == 6,
+                          "IPv4 CLEAR retains IPv6 knowledge");
+                }
+                d2k_sched_free(s);
+            }
+        }
+        d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+    }
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_calls = 0; tcp_answer = D2K_V_CLEAR;
+        d2k_ev h = ev_hello(6, 41020, "family-clear.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 41020);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(tcp_calls == 1, "IPv4 CLEAR fixture measured once");
+        skip_ahead(s, 3 * 60 * 1000);
+        d2k_sched_event(s, &su);
+        CHECK(d2k_sched_active(s) == 0, "IPv4 CLEAR suppresses IPv4 repeat");
+        h.family = su.family = 6;
+        CHECK(inet_pton(AF_INET6, "2001:db8::1", h.low_ip) == 1, "CLEAR low fixture");
+        CHECK(inet_pton(AF_INET6, "2001:db8::2", h.high_ip) == 1, "CLEAR high fixture");
+        memcpy(su.low_ip, h.low_ip, 16); memcpy(su.high_ip, h.high_ip, 16);
+        d2k_sched_event(s, &h);
+        d2k_sched_event(s, &su);
+        CHECK(d2k_sched_active(s) == 1, "IPv4 CLEAR must not suppress IPv6 search");
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+    }
     /* Bound network work during a burst of distinct targets. Two measurements
        may run at once; the third stays queued, and starts only after the
        minimum spacing. The stub blocks until cancellation, so this verifies

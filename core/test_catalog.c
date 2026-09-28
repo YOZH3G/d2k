@@ -527,7 +527,41 @@ static void check_free_is_safe(void) {
     }
 }
 
+static void check_binding_family_persistence(void) {
+    const char *path = "/tmp/d2k-cat-family.json";
+    const char *out = "/tmp/d2k-cat-family-out.json";
+    char err[200];
+    /* Old bindings must become explicitly IPv4; a new IPv6 binding for
+       the same name must retain its own identity through save/reload. */
+    write_tmp(path, "{\"boxes\":[{\"bindings\":["
+        "{\"target\":\"example.com\",\"transport\":6},"
+        "{\"target\":\"example.com\",\"transport\":6,\"family\":6}]}]}");
+    d2k_catalog c;
+    CHECK(d2k_catalog_load(path, &c, err, sizeof err) == 0, "load family fixture");
+    CHECK(d2k_catalog_save(&c, out, err, sizeof err) == 0, "save family fixture");
+    d2k_catalog_free(&c);
+    FILE *f = fopen(out, "r");
+    CHECK(f != NULL, "open saved family fixture");
+    if (f) {
+        char buf[4096]; size_t n = fread(buf, 1, sizeof buf - 1, f);
+        buf[n] = 0; fclose(f);
+        CHECK(strstr(buf, "\"family\": 4") != NULL, "legacy binding saved as IPv4");
+        CHECK(strstr(buf, "\"family\": 6") != NULL, "IPv6 binding preserved");
+    }
+    CHECK(d2k_catalog_load(out, &c, err, sizeof err) == 0, "reload family fixture");
+    CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 2, "both bindings survive");
+    if (c.n_boxes == 1 && c.boxes[0].n_binds == 2) {
+        CHECK(c.boxes[0].binds[0].family == 4, "legacy binding reloads as IPv4");
+        CHECK(c.boxes[0].binds[1].family == 6, "IPv6 binding reloads as IPv6");
+    }
+    d2k_catalog_free(&c);
+    write_tmp(path, "{\"boxes\":[{\"bindings\":[{\"family\":5}]}]}");
+    CHECK(d2k_catalog_load(path, &c, err, sizeof err) != 0, "reject invalid binding family");
+    d2k_catalog_free(&c);
+}
+
 int main(void) {
+    check_binding_family_persistence();
     check_time_roundtrip();
     check_transport_default_zero_on_old_file();
     check_shape_default_zero_on_old_file();

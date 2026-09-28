@@ -840,6 +840,14 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
         return jparse_bool_i(j, &out->enabled, "binding.enabled", err, errcap);
     if (strcmp(key, "transport") == 0)
         return jparse_u8(j, &out->transport, "binding.transport", err, errcap);
+    if (strcmp(key, "family") == 0) {
+        if (jparse_u8(j, &out->family, "binding.family", err, errcap) != 0) return -1;
+        if (out->family != 4 && out->family != 6) {
+            if (err && errcap) snprintf(err, errcap, "binding.family must be 4 or 6");
+            return -1;
+        }
+        return 0;
+    }
     if (strcmp(key, "shape") == 0)
         return jparse_u8(j, &out->shape, "binding.shape", err, errcap);
     if (strcmp(key, "verified_by") == 0)
@@ -850,6 +858,7 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
 }
 static int parse_binding(jctx *j, d2k_cat_binding *out, int depth, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
+    out->family = 4;
     return parse_object(j, handle_binding_key, out, depth, err, errcap);
 }
 static int elem_binding(jctx *j, void *o, int depth, char *err, size_t errcap) {
@@ -1151,6 +1160,7 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
        для НЕЁ omitempty-поведение Go смысла не имеет: этого поля в её
        структуре нет вообще, ей нечего сравнивать с нулём. */
     wr_indent(f, depth + 1); fprintf(f, "\"transport\": %u,\n", (unsigned)bd->transport);
+    wr_indent(f, depth + 1); fprintf(f, "\"family\": %u,\n", (unsigned)(bd->family ? bd->family : 4));
     /* shape/verified_by — контекст, в котором проверка состоялась; тем же
        порядком и по тем же правилам, что transport (Go их тоже не знает и
        молча пропустит). Ноль выводится наравне с остальным: «не измерено» —

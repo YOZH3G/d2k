@@ -376,7 +376,8 @@ typedef struct {
     task_state state;
     char       name[256];
     uint8_t    transport;
-    char       ip[16];
+    uint8_t    family;
+    char       ip[INET6_ADDRSTRLEN];
     uint16_t   port;
 
     int64_t    started_ms;
@@ -599,9 +600,10 @@ static int fresh_trial_id(uint8_t out[D2K_TRIAL_ID_LEN]) {
 }
 
 typedef struct {
-    uint8_t  low_ip[4], high_ip[4];
+    uint8_t  low_ip[16], high_ip[16];
     uint16_t low_port, high_port;
     uint8_t  transport;
+    uint8_t  family;
     char     name[256];
     int      used;
 } seen_name;
@@ -614,6 +616,7 @@ typedef struct {
 typedef struct {
     char       name[256];
     uint8_t    transport;
+    uint8_t    family;
     uint8_t    signal_code;
     uint8_t    negative_streak;
     int64_t    until_ms;
@@ -914,19 +917,20 @@ static void server_of(const d2k_ev *ev, char *ip, size_t ipcap, uint16_t *port) 
         server_is_low = ev->low_port <= ev->high_port;
     }
     if (server_is_low) {
-        ip_text(ev->low_ip, ip, ipcap);
+        (void)inet_ntop(ev->family == 6 ? AF_INET6 : AF_INET, ev->low_ip, ip, (socklen_t)ipcap);
         *port = ev->low_port;
     } else {
-        ip_text(ev->high_ip, ip, ipcap);
+        (void)inet_ntop(ev->family == 6 ? AF_INET6 : AF_INET, ev->high_ip, ip, (socklen_t)ipcap);
         *port = ev->high_port;
     }
 }
 
 static int same_flow(const seen_name *s, const d2k_ev *ev) {
     return s->used && s->transport == ev->transport &&
+           s->family == (ev->family ? ev->family : 4) &&
            s->low_port == ev->low_port && s->high_port == ev->high_port &&
-           memcmp(s->low_ip, ev->low_ip, 4) == 0 &&
-           memcmp(s->high_ip, ev->high_ip, 4) == 0;
+           memcmp(s->low_ip, ev->low_ip, s->family == 6 ? 16 : 4) == 0 &&
+           memcmp(s->high_ip, ev->high_ip, s->family == 6 ? 16 : 4) == 0;
 }
 
 static void remember(d2k_sched *s, const d2k_ev *ev) {
@@ -940,8 +944,9 @@ static void remember(d2k_sched *s, const d2k_ev *ev) {
     seen_name *slot = &s->seen[s->seen_next];
     s->seen_next = (s->seen_next + 1) % SCHED_SEEN;
     memset(slot, 0, sizeof *slot);
-    memcpy(slot->low_ip, ev->low_ip, 4);
-    memcpy(slot->high_ip, ev->high_ip, 4);
+    slot->family = ev->family ? ev->family : 4;
+    memcpy(slot->low_ip, ev->low_ip, slot->family == 6 ? 16 : 4);
+    memcpy(slot->high_ip, ev->high_ip, slot->family == 6 ? 16 : 4);
     slot->low_port = ev->low_port;
     slot->high_port = ev->high_port;
     slot->transport = ev->transport;
@@ -957,11 +962,12 @@ static const char *recall(const d2k_sched *s, const d2k_ev *ev) {
 }
 
 static target_cooldown *cooldown_find(d2k_sched *s, const char *name,
-                                     uint8_t transport) {
+                                     uint8_t transport, uint8_t family) {
     if (!s || !name || !name[0]) { return NULL; }
     for (size_t i = 0; i < SCHED_COOLDOWN_SLOTS; i++) {
         target_cooldown *c = &s->cooldowns[i];
-        if (c->used && c->transport == transport && strcmp(c->name, name) == 0) {
+        if (c->used && c->transport == transport &&
+            c->family == (family ? family : 4) && strcmp(c->name, name) == 0) {
             return c;
         }
     }
@@ -969,8 +975,8 @@ static target_cooldown *cooldown_find(d2k_sched *s, const char *name,
 }
 
 static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
-                           uint8_t signal_code, int64_t *remaining_ms) {
-    target_cooldown *c = cooldown_find(s, name, transport);
+                           uint8_t family, uint8_t signal_code, int64_t *remaining_ms) {
+    target_cooldown *c = cooldown_find(s, name, transport, family);
     if (!c) { return 0; }
     if (s->now_ms >= c->until_ms) { return 0; }
     /* A changed symptom after a direct CLEAR is fresh evidence. Do not let a
@@ -981,8 +987,8 @@ static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
     return 1;
 }
 
-static void cooldown_clear(d2k_sched *s, const char *name, uint8_t transport) {
-    target_cooldown *c = cooldown_find(s, name, transport);
+static void cooldown_clear(d2k_sched *s, const char *name, uint8_t transport, uint8_t family) {
+    target_cooldown *c = cooldown_find(s, name, transport, family);
     if (c) { memset(c, 0, sizeof *c); }
 }
 
@@ -995,13 +1001,14 @@ static int64_t clear_backoff_ms(unsigned streak) {
 /* kind: 0 = direct CLEAR, 1 = anti-bot challenge, 2 = exhausted/incomplete search. */
 static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     if (!s || !t || !t->name[0]) { return; }
-    target_cooldown *c = cooldown_find(s, t->name, t->transport);
+    target_cooldown *c = cooldown_find(s, t->name, t->transport, t->family);
     if (!c) {
         c = &s->cooldowns[s->cooldown_next];
         s->cooldown_next = (s->cooldown_next + 1) % SCHED_COOLDOWN_SLOTS;
         memset(c, 0, sizeof *c);
         snprintf(c->name, sizeof c->name, "%s", t->name);
         c->transport = t->transport;
+        c->family = t->family;
         c->used = 1;
     }
     if (kind == 1) {
@@ -1019,9 +1026,10 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     c->until_ms = s->now_ms + clear_backoff_ms(c->negative_streak);
 }
 
-static task *task_of(d2k_sched *s, const char *name, uint8_t transport) {
+static task *task_of(d2k_sched *s, const char *name, uint8_t transport, uint8_t family) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         if (s->tasks[i].state != T_FREE && s->tasks[i].transport == transport &&
+            s->tasks[i].family == (family ? family : 4) &&
             strcmp(s->tasks[i].name, name) == 0) {
             return &s->tasks[i];
         }
@@ -2169,6 +2177,7 @@ static void forget_clear_target_bindings(d2k_sched *s, task *t) {
             uint8_t tr = bd->transport ? bd->transport : 6;
             if (strcmp(bd->kind, "name") == 0 &&
                 strcmp(bd->target, t->name) == 0 && tr == t->transport &&
+                (bd->family ? bd->family : 4) == t->family &&
                 d2k_cat_shape_fits(bd->shape, t->asked_shape)) {
                 removed++;
             }
@@ -2177,7 +2186,7 @@ static void forget_clear_target_bindings(d2k_sched *s, task *t) {
     if (removed == 0) { return; }
 
     char err[200];
-    if (d2k_link_del_name(s->link_fd, t->name, err, sizeof err) != 0) {
+    if (d2k_link_del_name_family(s->link_fd, t->name, t->family, err, sizeof err) != 0) {
         say(s, "по %s проходит напрямую, но старую привязку не удалось снять: %s",
             t->name, err);
         return;
@@ -2190,6 +2199,7 @@ static void forget_clear_target_bindings(d2k_sched *s, task *t) {
             uint8_t tr = bd->transport ? bd->transport : 6;
             if (strcmp(bd->kind, "name") == 0 &&
                 strcmp(bd->target, t->name) == 0 && tr == t->transport &&
+                (bd->family ? bd->family : 4) == t->family &&
                 d2k_cat_shape_fits(bd->shape, t->asked_shape)) {
                 memmove(bd, bd + 1, (b->n_binds - j - 1) * sizeof *bd);
                 b->n_binds--;
@@ -2209,6 +2219,7 @@ static void forget_clear_target_bindings(d2k_sched *s, task *t) {
         for (size_t j = 0; j < b->n_binds; j++) {
             const d2k_cat_binding *bd = &b->binds[j];
             if (strcmp(bd->target, t->name) != 0 || strcmp(bd->kind, "name") != 0 ||
+                (bd->family ? bd->family : 4) != t->family ||
                 !bd->enabled || (bd->level > 0 && bd->level < 3) ||
                 (bd->transport == 17 && bd->verified_by == D2K_VERBY_CLIENT)) {
                 continue;
@@ -2222,8 +2233,8 @@ static void forget_clear_target_bindings(d2k_sched *s, task *t) {
             }
             uint8_t tr = bd->transport ? bd->transport : 6;
             uint8_t shape = bd->shape ? bd->shape : D2K_LINK_SHAPE_GRANDFATHER;
-            if (d2k_link_set_name(s->link_fd, bd->target, tr, hex, shape,
-                                  err, sizeof err) != 0) {
+            if (d2k_link_set_name_family(s->link_fd, bd->target, tr, hex, shape,
+                                         0, t->family, err, sizeof err) != 0) {
                 say(s, "по %s оставшаяся привязка %s не восстановлена: %s",
                     t->name, bd->plan_id, err);
             }
@@ -2753,18 +2764,20 @@ int d2k_sched_sync_step(d2k_sched *s) {
             continue;
         }
         int rc;
+        uint8_t family = bd->family ? bd->family : 4;
+        if (family != 4 && family != 6) {
+            s->sync_skipped++;
+            continue;
+        }
         if (strcmp(bd->kind, "addr") == 0) {
-            uint8_t ip4[4];
-            unsigned a, bb, c, d;
-            if (sscanf(bd->target, "%u.%u.%u.%u", &a, &bb, &c, &d) != 4 ||
-                a > 255 || bb > 255 || c > 255 || d > 255) {
+            uint8_t addr[16] = {0};
+            if (strchr(bd->target, '%') ||
+                inet_pton(family == 6 ? AF_INET6 : AF_INET, bd->target, addr) != 1) {
                 say(s, "каталог: привязка по адресу \"%s\" не разбирается", bd->target);
                 s->sync_skipped++;
                 continue;
             }
-            ip4[0] = (uint8_t)a; ip4[1] = (uint8_t)bb;
-            ip4[2] = (uint8_t)c; ip4[3] = (uint8_t)d;
-            rc = d2k_link_set_addr(s->link_fd, ip4, hex, err, sizeof err);
+            rc = d2k_link_set_addr_family(s->link_fd, addr, family, hex, err, sizeof err);
         } else {
             /* transport привязки проверяется, но на провод не едет: у SET_NAME
                сегодня нет места под него (d2k_link.h). Ноль — старый файл,
@@ -2791,8 +2804,8 @@ int d2k_sched_sync_step(d2k_sched *s) {
                перестал бы применяться у человека (0009, U5-R3). */
             uint8_t wire_shape = bd->shape ? (uint8_t)bd->shape
                                            : (uint8_t)D2K_LINK_SHAPE_GRANDFATHER;
-            rc = d2k_link_set_name(s->link_fd, bd->target, tr, hex,
-                                   wire_shape, err, sizeof err);
+            rc = d2k_link_set_name_family(s->link_fd, bd->target, tr, hex,
+                                          wire_shape, 0, family, err, sizeof err);
         }
         if (rc != 0) {
             say(s, "каталог: план для %s не отправился: %s", bd->target, err);
@@ -3223,8 +3236,8 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         return 0;
     }
     int64_t cooldown_left_ms = 0;
-    if (cooldown_blocks(s, name, ev->transport, ev->code, &cooldown_left_ms)) {
-        target_cooldown *cool = cooldown_find(s, name, ev->transport);
+    if (cooldown_blocks(s, name, ev->transport, ev->family, ev->code, &cooldown_left_ms)) {
+        target_cooldown *cool = cooldown_find(s, name, ev->transport, ev->family);
         const char *reason = cool && cool->challenge ? "антибот-ответа" :
                              cool && cool->exhausted ? "исчерпания прошлого поиска" :
                              "повторного CLEAR";
@@ -3233,7 +3246,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
             (long long)((cooldown_left_ms + 59999) / 60000));
         return 0;
     }
-    task *t = task_of(s, name, ev->transport);
+    task *t = task_of(s, name, ev->transport, ev->family);
     int ordinary_tcp_rst = ev->transport == 6 && ev->code == D2K_SUSPECT_RST;
     d2k_cat_fp carried_fp;
     int have_carried_fp = 0;
@@ -3321,6 +3334,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     task_reset(t);
     snprintf(t->name, sizeof t->name, "%s", name);
     t->transport = ev->transport;
+    t->family = ev->family ? ev->family : 4;
     t->by_addr = by_addr;
     t->trigger_code = ev->code;
     if (have_carried_fp) {
@@ -3352,6 +3366,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     if (ordinary_tcp_rst) {
         t->state = T_RST_PENDING;
         t->rst_pending_flow.transport = ev->transport;
+        t->rst_pending_flow.family = t->family;
         memcpy(t->rst_pending_flow.a_ip, ev->low_ip, sizeof t->rst_pending_flow.a_ip);
         memcpy(t->rst_pending_flow.b_ip, ev->high_ip, sizeof t->rst_pending_flow.b_ip);
         t->rst_pending_flow.a_port = ev->low_port;
@@ -3808,7 +3823,7 @@ static void on_refused_foreign(d2k_sched *s, const d2k_ev *ev) {
 
     uint8_t present = 0;
     for (size_t i = 0; i < D2K_PLAN_ID_LEN; i++) { present |= ev->plan_id[i]; }
-    task *t = task_of(s, name, ev->transport);
+    task *t = task_of(s, name, ev->transport, ev->family);
     if (t && present) {
         /* По этой цели идёт поиск. Запоминаем ИМЕННО ТОТ план, который не
            поместился: к моменту решения кандидат может смениться. Отказ без
@@ -3969,7 +3984,7 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
     }
     const char *name = recall(s, ev);
     if (!name) { return; }
-    task *t = task_of(s, name, ev->transport);
+    task *t = task_of(s, name, ev->transport, ev->family);
     /* Только ПОДТВЕРЖДЁННАЯ задача. Завести привязку это наблюдение не может
        (задача 4): на нём кандидат, доведший дело лишь до ответа коробки,
        записывался бы в каталог рабочим — так и набрались 4796 «успехов» по
@@ -4283,7 +4298,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 if (r.verdict == D2K_V_CLEAR) {
                     forget_clear_target_bindings(s, t);
                     cooldown_record(s, t, 0);
-                    target_cooldown *cool = cooldown_find(s, t->name, t->transport);
+                    target_cooldown *cool = cooldown_find(s, t->name, t->transport, t->family);
                     int64_t delay_ms = cool
                                            ? clear_backoff_ms(cool->negative_streak)
                                            : SCHED_CLEAR_BACKOFF_1_MS;
@@ -4295,7 +4310,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++;
                 continue;
             }
-            cooldown_clear(s, t->name, t->transport);
+            cooldown_clear(s, t->name, t->transport, t->family);
             {
                 size_t known = known_plans(s, t);
                 if (known > 0) {
@@ -4777,7 +4792,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     t->name, t->probes);
                 cooldown_record(s, t, 2);
                 {
-                    target_cooldown *cool = cooldown_find(s, t->name, t->transport);
+                    target_cooldown *cool = cooldown_find(s, t->name, t->transport, t->family);
                     int64_t delay_ms = cool
                                            ? clear_backoff_ms(cool->negative_streak)
                                            : SCHED_CLEAR_BACKOFF_1_MS;

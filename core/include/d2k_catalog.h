@@ -176,6 +176,7 @@ typedef struct {
     int      successes;
     int      enabled;
     uint8_t  transport;    /* 6 TCP, 17 UDP, 0 — не записано (старый файл) */
+    uint8_t  family;       /* 4 or 6; legacy in-memory zero means IPv4, never wildcard */
     uint8_t  shape;        /* d2k_shape: 1 MODERN, 2 LEGACY, 0 — не измерено */
     uint8_t  verified_by;  /* D2K_VERBY_*, 0 — не измерено */
     /* ЧЕМ ГОВОРИЛ ЗАМЕР, ИЗ КОТОРОГО ВЫВЕДЕН ЭТОТ ПЛАН. D2K_INPUT_* ниже,
