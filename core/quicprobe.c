@@ -119,6 +119,7 @@
  * определение IP_TTL от этого переключателя не зависит — макрос там просто
  * не распознаётся и ни на что не влияет. */
 #define _DARWIN_C_SOURCE
+#define _DEFAULT_SOURCE 1
 #ifdef __APPLE__
 #define __APPLE_USE_RFC_3542
 #endif
@@ -142,6 +143,7 @@
 #include "d2k_quichello.h"
 #include "d2k_quicwire.h"
 #include "d2k_quicprobe.h"
+#include "d2k_ip6frag_send.h"
 #include "d2k_quic_arms.h"
 #include "d2k_ipfrag.h"
 #include "d2k_tls13core.h"
@@ -974,6 +976,8 @@ static int qp_send_fragmented(const char *addr,uint16_t port,d2k_hello msg,
 #else
     if(!addr || !msg.bytes || !msg.len || msg.len>D2K_QW_MAX_DGRAM)return -1;
     int rx=-1,raw=-1;
+    d2k_ip6frag_sender sender6;
+    d2k_ip6frag_sender_init(&sender6);
     uint8_t target[16];
     int family=qp_addr_parse(addr,target);
     if(!family)return -1;
@@ -995,25 +999,24 @@ static int qp_send_fragmented(const char *addr,uint16_t port,d2k_hello msg,
     if(connect(rx,(struct sockaddr *)&dst,dst_len)!=0)goto fail;
     socklen_t local_len=sizeof local;
     if(getsockname(rx,(struct sockaddr *)&local,&local_len)!=0)goto fail;
-    raw=socket(family,SOCK_RAW,IPPROTO_RAW);
-    if(raw<0)goto fail;
-    int one=1;
-    if(setsockopt(raw,family==AF_INET6?IPPROTO_IPV6:IPPROTO_IP,
-        family==AF_INET6?IPV6_HDRINCL:IP_HDRINCL,&one,sizeof one)!=0)goto fail;
+    if(family==AF_INET) {
+        raw=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
+        if(raw<0)goto fail;
+        int one=1;
+        if(setsockopt(raw,IPPROTO_IP,IP_HDRINCL,&one,sizeof one)!=0)goto fail;
     /* Proven donor/platform limitation: local conntrack can reorder pos8
        and discard overlaps BEFORE the probe reaches the wire. Preserve the
        donor's requested fragments, not that accidental kernel rewrite.
        No fallback: unavailable NODEFRAG is unsent/local error (SPEC §7). */
-    if(family==AF_INET) {
 #ifdef IP_NODEFRAG
     if(setsockopt(raw,IPPROTO_IP,IP_NODEFRAG,&one,sizeof one)!=0)goto fail;
 #else
     goto fail;
 #endif
-    }
     /* Unlike the donor's EPERM fallback, D2K refuses to send an unisolated
        raw probe through its own candidate. SPEC §7, tested explicitly. */
     if(mark && d2k_mark_hook(raw,mark)!=0){*marked=0;goto fail;}
+    }
     uint8_t wire[3*(D2K_QW_MAX_DGRAM+48)];d2k_ipfrag_span spans[3];
     uint32_t id=fragment_id();
     size_t n;
@@ -1031,11 +1034,17 @@ static int qp_send_fragmented(const char *addr,uint16_t port,d2k_hello msg,
     }
     if(!n)goto fail;
     for(size_t i=0;i<n;i++) {
-        if(sendto(raw,wire+spans[i].off,spans[i].len,0,(struct sockaddr *)&dst,dst_len)!=(ssize_t)spans[i].len)goto fail;
+        ssize_t sent = family==AF_INET6
+            ? d2k_ip6frag_send(&sender6,wire+spans[i].off,spans[i].len,mark)
+            : sendto(raw,wire+spans[i].off,spans[i].len,0,(struct sockaddr *)&dst,dst_len);
+        if(sent!=(ssize_t)spans[i].len)goto fail;
     }
-    close(raw);return rx;
+    if(raw>=0)close(raw);
+    d2k_ip6frag_sender_close(&sender6);
+    return rx;
 fail:
     if(raw>=0)close(raw);
+    d2k_ip6frag_sender_close(&sender6);
     close(rx);return -1;
 #endif
 }

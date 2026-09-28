@@ -48,6 +48,7 @@ TESTS   = test_addr test_hold test_udp_hold test_udp_release test_capture test_p
 all: planlab ctlprobe
 
 HDR += include/d2k_packet.h
+HDR += $(CORE_DIR)/include/d2k_ip6frag_send.h
 
 # Implicitly compiled objects also depend on shared structure layouts.
 $(SRC:.c=.o): $(HDR) include/d2k_addr.h

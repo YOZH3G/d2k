@@ -58,6 +58,7 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 # ctlprobe — чтобы дать событие обмена, по которому судит сам d2k_props_ask.
 # test_link тоже без TESTHDR-стенда: его "стенд" — настоящий ctlprobe
 # (datapath/ctlprobe.c), отдельным процессом, а не петля-мишень в потоке.
+HDR += include/d2k_ip6frag_send.h
 TESTHDR = test_stand.h
 
 # test_d2kask — ЧЁРНЫЙ ЯЩИК (см. её шапку): не общий стенд test_stand.h сам
@@ -710,6 +711,10 @@ TESTS += test_quicconn6
 check: test-quicconn6
 test-quicconn6: test_quicconn6
 	./test_quicconn6
+
+# Requires an isolated Linux veth/marked-route fixture; not part of host check.
+test_ip6frag_send_live: test_ip6frag_send_live.c ipfrag.c include/d2k_ip6frag_send.h include/d2k_ipfrag.h
+	$(CC) $(CFLAGS) -o $@ test_ip6frag_send_live.c ipfrag.c $(TEST_LDFLAGS)
 
 # d2kc — процесс контроллера на C: цикл событий поверх планировщика.
 DETECT_OBJ = ../detect/bridge.o ../detect/classify.o ../detect/poison.o \

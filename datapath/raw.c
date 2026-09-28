@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 
 #include "d2k_raw.h"
+#include "d2k_ip6frag_send.h"
 
 /* Сколько маршрутов помним. Шестнадцать — не «разумное число», а следствие
  * того, что здесь кэшируется: предел ОДНОГО направления, и направлений у
@@ -40,6 +41,7 @@ struct d2k_raw {
     int      fd;
     int      fd6;
     int      fragment_fd;
+    d2k_ip6frag_sender fragments6;
     uint32_t limits;
     size_t   maxlen;
     uint64_t sent;
@@ -194,6 +196,7 @@ d2k_raw *d2k_raw_open(uint32_t mark, const char *ifname, char *err, size_t errca
     r->limits = D2K_RAW_CANT_IPID | D2K_RAW_CANT_IPSUM;
     r->fragment_fd = -1;
     r->fd6 = -1;
+    d2k_ip6frag_sender_init(&r->fragments6);
     /* Один раз при старте — см. шапку в d2k_raw.h про цену этого выбора. */
     r->maxlen = pick_maxlen(ifname);
     r->mark = mark;
@@ -255,6 +258,7 @@ void d2k_raw_close(d2k_raw *r) {
         close(r->fd);
     }
     if (r->fragment_fd >= 0) close(r->fragment_fd);
+    d2k_ip6frag_sender_close(&r->fragments6);
     if (r->fd6 >= 0) close(r->fd6);
     free(r);
 }
@@ -311,6 +315,11 @@ int d2k_raw_prepare(d2k_raw *r, const uint8_t *pkt, size_t len,
     if ((pkt[0] >> 4) == 6) {
         if (len < 40 || len != 40u + ((size_t)pkt[4] << 8) + pkt[5]) {
             say(err, errcap, "invalid IPv6 packet length"); errno=EINVAL; return -1;
+        }
+        if (pkt[6] == 44) {
+            int rc = d2k_ip6frag_prepare(&r->fragments6, pkt, len, r->mark);
+            if (rc) say(err, errcap, "IPv6 fragment route: %s", strerror(errno));
+            return rc;
         }
         if (r->fd6 >= 0) { return 0; }
         int fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW), one = 1;
@@ -379,6 +388,14 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
         return -1;
     }
     if(d2k_raw_prepare(r,pkt,len,err,errcap)<0) {r->errors++;return -1;}
+    if (family == 6 && pkt[6] == 44) {
+        if (d2k_ip6frag_send(&r->fragments6, pkt, len, r->mark) < 0) {
+            r->errors++;
+            say(err, errcap, "IPv6 fragment send: %s", strerror(errno));
+            return -1;
+        }
+        r->sent++; return 0;
+    }
     int fd = family == 6 ? r->fd6 :
         ((pkt[6]&0x3f) || pkt[7]) ? r->fragment_fd : r->fd;
 

@@ -33,7 +33,7 @@ int main(void) {
     assert(getsockname(receive, (struct sockaddr *)&local, &sl) == 0);
     d2k_conn c = {.family=6, .ttl=48, .src_port=htons(54322), .dst_port=local.sin6_port};
     c.src_ip6[15] = c.dst_ip6[15] = 1;
-    const uint8_t body[] = "native IPv6 raw packet";
+    const uint8_t body[64] = "native IPv6 raw packet";
     d2k_emit e = {.bytes=body, .len=sizeof body};
     uint8_t packet[256], got[256]; char err[256];
     size_t len = d2k_wire_build_udp(&c, &e, packet, sizeof packet);
@@ -63,19 +63,20 @@ int main(void) {
     struct sockaddr_ll link = {.sll_family=AF_PACKET, .sll_protocol=htons(ETH_P_ALL)};
     link.sll_ifindex = (int)if_nametoindex("lo");
     assert(bind(capture, (struct sockaddr *)&link, sizeof link) == 0);
-    for (int reverse = 0; reverse <= 1; reverse++) {
-        d2k_ipfrag_plan plan = {.pos1=8, .reverse=(uint8_t)reverse};
+    for (int shape = 1; shape <= 4; shape++) {
+        d2k_ipfrag_plan plan;
+        assert(d2k_ipfrag_shape(shape, &plan) == 0);
         d2k_ipfrag_span spans[3];
         size_t count = d2k_udpfrag6_build_ex(c.src_ip6, c.dst_ip6,
             ntohs(c.src_port), ntohs(c.dst_port), body, sizeof body, &plan,
-            0x12345000u + (unsigned)reverse, 48, 0, 0, packet, sizeof packet, spans);
-        assert(count == 2);
+            0x12345000u + (unsigned)shape, 48, 0, 0, packet, sizeof packet, spans);
+        assert(count == (shape <= 2 ? 2u : 3u));
         for (size_t i = 0; i < count; i++) {
             assert(d2k_raw_prepare(raw, packet + spans[i].off, spans[i].len, err, sizeof err) == 0);
             assert(d2k_raw_send(raw, packet + spans[i].off, spans[i].len, err, sizeof err) == 0);
         }
         int seen = 0;
-        for (int attempt = 0; attempt < 32 && seen < 2; attempt++) {
+        for (int attempt = 0; attempt < 32 && (size_t)seen < count; attempt++) {
             struct pollfd ready = {.fd=capture, .events=POLLIN};
             if (poll(&ready, 1, 100) <= 0) break;
             uint8_t frame[2048];
@@ -89,10 +90,12 @@ int main(void) {
             assert(!memcmp(frame, packet + spans[seen].off, (size_t)bytes));
             seen++;
         }
-        assert(seen == 2); /* UDP success alone does not prove wire fragmentation. */
-        assert(poll(&wait, 1, 1000) == 1);
-        assert(recv(receive, got, sizeof got, 0) == sizeof body);
-        assert(!memcmp(got, body, sizeof body));
+        assert((size_t)seen == count); /* UDP success alone does not prove wire fragmentation. */
+        if (shape <= 2) {
+            assert(poll(&wait, 1, 1000) == 1);
+            assert(recv(receive, got, sizeof got, 0) == sizeof body);
+            assert(!memcmp(got, body, sizeof body));
+        }
     }
     close(capture);
     d2k_raw_close(raw); close(receive);
