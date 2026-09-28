@@ -300,6 +300,8 @@ int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
                              char *err, size_t errcap);
 int  d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
                         char *err, size_t errcap);
+int d2k_link_arm_shape_family(int fd, const char *name, uint8_t transport,
+                              uint8_t family, char *err, size_t errcap);
 
 /* Снимает план с имени цели: команда D2K_CMD_DEL_NAME. Тело на проводе такое
  * же, как у ARM_SHAPE (длина имени u8, имя — d2k_ctl.h), поэтому и код тот
@@ -337,6 +339,13 @@ int  d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
 /* Временная адресная проба для одного UDP 5-tuple. Адреса/порты передаются
  * байтами сетевого порядка; trial_id — случайный ненулевой токен поколения,
  * lease_ms ограничен датапатом 120 секунд. */
+int d2k_link_set_addr_probe_family(int fd, const uint8_t *src, uint16_t src_port_be,
+    const uint8_t *dst, uint16_t dst_port_be, uint8_t transport, uint8_t family,
+    const uint8_t trial_id[D2K_TRIAL_ID_LEN], uint32_t lease_ms,
+    const char *plan_hex, char *err, size_t errcap);
+int d2k_link_del_addr_probe_family(int fd, const uint8_t *src, uint16_t src_port_be,
+    const uint8_t *dst, uint16_t dst_port_be, uint8_t transport, uint8_t family,
+    const uint8_t trial_id[D2K_TRIAL_ID_LEN], char *err, size_t errcap);
 int  d2k_link_set_addr_probe(int fd, const uint8_t src_ip4[4], uint16_t src_port_be,
                              const uint8_t dst_ip4[4], uint16_t dst_port_be,
                              uint8_t transport, const uint8_t trial_id[D2K_TRIAL_ID_LEN],

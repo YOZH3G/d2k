@@ -812,6 +812,10 @@ int main(void) {
         CHECK(read(sv[1], wire, sizeof wire) == 12 && wire[8] == 3 &&
               wire[9] == 6 && wire[10] == 0x9c && wire[11] == 0x40,
               "IPv6 probe delete wire");
+        CHECK(d2k_link_arm_shape_family(sv[0], "x", 17, 6, err, sizeof err) == 0,
+              "IPv6 snapshot request");
+        CHECK(read(sv[1], wire, sizeof wire) == 10 && wire[8] == 17 && wire[9] == 6,
+              "snapshot wire carries transport and family");
         close(sv[0]); close(sv[1]);
     }
     /* Address-trial command encoding is byte-level protocol, not a struct ABI. */
@@ -829,21 +833,29 @@ int main(void) {
                   "SET_ADDR_PROBE wire-команда не собралась");
             uint8_t frame[128];
             ssize_t n = read(sv[1], frame, sizeof frame);
-            CHECK(n == 6 + 13 + D2K_TRIAL_ID_LEN + 4 + 1,
+            CHECK(n == 6 + 38 + D2K_TRIAL_ID_LEN + 4 + 1,
                   "SET_ADDR_PROBE имеет неверную длину кадра");
-            if (n >= 6 + 13 + D2K_TRIAL_ID_LEN + 4 + 1) {
+            if (n >= 6 + 38 + D2K_TRIAL_ID_LEN + 4 + 1) {
                 CHECK(frame[4] == 0 && frame[5] == D2K_CMD_SET_ADDR_PROBE,
                       "SET_ADDR_PROBE имеет неверный command type");
-                CHECK(memcmp(frame + 6, src, 4) == 0 &&
-                      memcmp(frame + 10, (uint8_t[]){0x9c, 0x40}, 2) == 0 &&
-                      memcmp(frame + 12, dst, 4) == 0 &&
-                      memcmp(frame + 16, (uint8_t[]){0x01, 0xbb, 17}, 3) == 0,
+                CHECK(frame[6] == 4 && memcmp(frame + 7, src, 4) == 0 &&
+                      memcmp(frame + 39, (uint8_t[]){0x9c, 0x40}, 2) == 0 &&
+                      memcmp(frame + 23, dst, 4) == 0 &&
+                      memcmp(frame + 41, (uint8_t[]){0x01, 0xbb, 17}, 3) == 0,
                       "SET_ADDR_PROBE потерял exact flow tuple");
-                CHECK(memcmp(frame + 19, trial, sizeof trial) == 0 &&
-                      memcmp(frame + 35, (uint8_t[]){0, 1, 0xd4, 0xc0}, 4) == 0 &&
-                      frame[39] == 0,
+                CHECK(memcmp(frame + 44, trial, sizeof trial) == 0 &&
+                      memcmp(frame + 60, (uint8_t[]){0, 1, 0xd4, 0xc0}, 4) == 0 &&
+                      frame[64] == 0,
                       "SET_ADDR_PROBE потерял generation, lease или TLV");
             }
+            const uint8_t src6[16] = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,1};
+            const uint8_t dst6[16] = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,2};
+            CHECK(d2k_link_set_addr_probe_family(sv[0], src6, htons(40000), dst6,
+                  htons(443), 17, 6, trial, 120000, "00", err, sizeof err) == 0,
+                  "IPv6 exact tuple command");
+            n = read(sv[1], frame, sizeof frame);
+            CHECK(n == 65 && frame[6] == 6 && memcmp(frame + 7, src6, 16) == 0 &&
+                  memcmp(frame + 23, dst6, 16) == 0, "IPv6 tuple full addresses");
             close(sv[0]); close(sv[1]);
         }
     }

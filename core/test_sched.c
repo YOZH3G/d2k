@@ -488,10 +488,10 @@ static int last_addr_probe_endpoint(uint8_t src[4], uint16_t *sport_be,
                      ((uint32_t)p[2] << 8) | p[3];
         if (n < 2 || n > sent_len - off - 4) { break; }
         uint16_t type = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
-        if (type == D2K_CMD_SET_ADDR_PROBE && n >= 2 + 13 + D2K_TRIAL_ID_LEN + 4) {
-            memcpy(src, p + 6, 4);
-            memcpy(sport_be, p + 10, 2);
-            memcpy(trial, p + 6 + 13, D2K_TRIAL_ID_LEN);
+        if (type == D2K_CMD_SET_ADDR_PROBE && n >= 2 + 38 + D2K_TRIAL_ID_LEN + 4) {
+            memcpy(src, p + 7, 4);
+            memcpy(sport_be, p + 39, 2);
+            memcpy(trial, p + 6 + 38, D2K_TRIAL_ID_LEN);
             return 1;
         }
         off += 4 + n;
@@ -511,12 +511,12 @@ static size_t collect_addr_probes(uint8_t dst[][4], uint8_t trial[][D2K_TRIAL_ID
                      ((uint32_t)p[2] << 8) | p[3];
         if (n < 2 || n > sent_len - off - 4) { break; }
         uint16_t type = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
-        if (type == D2K_CMD_SET_ADDR_PROBE && n >= 2 + 13 + D2K_TRIAL_ID_LEN + 4 &&
+        if (type == D2K_CMD_SET_ADDR_PROBE && n >= 2 + 38 + D2K_TRIAL_ID_LEN + 4 &&
             found < cap) {
             const uint8_t *body = p + 6;
-            memcpy(dst[found], body + 6, 4);
-            if (src_port_be) { memcpy(&src_port_be[found], body + 4, 2); }
-            memcpy(trial[found], body + 13, D2K_TRIAL_ID_LEN);
+            memcpy(dst[found], body + 17, 4);
+            if (src_port_be) { memcpy(&src_port_be[found], body + 33, 2); }
+            memcpy(trial[found], body + 38, D2K_TRIAL_ID_LEN);
             found++;
         }
         off += 4 + n;

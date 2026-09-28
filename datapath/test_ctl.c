@@ -639,23 +639,33 @@ int main(void) {
 
         /* Адресная проба передаёт полный 5-tuple и поколение отдельно от
            Plan ID. DELETE старого поколения не должен снимать активную. */
-        {
+        for (uint8_t family = 4; family <= 6; family += 2) {
             uint8_t body[128], f[160], trial[D2K_TRIAL_ID_LEN];
             memset(trial, 0, sizeof trial);
             for (size_t i = 0; i < sizeof trial; i++) { trial[i] = (uint8_t)(i + 1); }
-            const uint8_t flow_wire[13] = {
-                192, 0, 2, 10, 0x9c, 0x40,
-                203, 0, 113, 7, 0x01, 0xbb, 17
+            uint8_t flow_wire[38] = {
+                [0]=4, [1]=192, [3]=2, [4]=10,
+                [17]=203, [19]=113, [20]=7,
+                [33]=0x9c, [34]=0x40, [35]=0x01, [36]=0xbb, [37]=17
             };
+            if (family == 6) {
+                flow_wire[0] = 6;
+                memset(flow_wire + 1, 0, 32);
+                flow_wire[1] = flow_wire[17] = 0x20;
+                flow_wire[2] = flow_wire[18] = 1;
+                flow_wire[3] = flow_wire[19] = 0xdb;
+                flow_wire[4] = flow_wire[20] = 8;
+                flow_wire[16] = 1; flow_wire[32] = 2;
+            }
             /* Invalid transport and zero generation must reject before the
                temporary table changes. The ACK echoes the address-trial ID. */
             memcpy(body, flow_wire, sizeof flow_wire);
-            body[12] = 6;
-            memcpy(body + 13, trial, sizeof trial);
-            body[29] = 0; body[30] = 0; body[31] = 0xea; body[32] = 0x60;
-            memcpy(body + 33, tiny, sizeof tiny);
-            frame(f, 0x0089u, body, 33 + sizeof tiny);
-            CHECK(write(cli, f, 6 + 33 + sizeof tiny) == (ssize_t)(6 + 33 + sizeof tiny),
+            body[37] = 6;
+            memcpy(body + 38, trial, sizeof trial);
+            body[54] = 0; body[55] = 0; body[56] = 0xea; body[57] = 0x60;
+            memcpy(body + 58, tiny, sizeof tiny);
+            frame(f, 0x0089u, body, 58 + sizeof tiny);
+            CHECK(write(cli, f, 6 + 58 + sizeof tiny) == (ssize_t)(6 + 58 + sizeof tiny),
                   "SET_ADDR_PROBE с неверным transport не отправилась");
             CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
                   "SET_ADDR_PROBE с неверным transport не разобралась");
@@ -666,11 +676,11 @@ int main(void) {
                   "неверный transport адресной пробы не получил BAD_ARGS");
 
             memcpy(body, flow_wire, sizeof flow_wire);
-            memset(body + 13, 0, D2K_TRIAL_ID_LEN);
-            body[29] = 0; body[30] = 0; body[31] = 0xea; body[32] = 0x60;
-            memcpy(body + 33, tiny, sizeof tiny);
-            frame(f, 0x0089u, body, 33 + sizeof tiny);
-            CHECK(write(cli, f, 6 + 33 + sizeof tiny) == (ssize_t)(6 + 33 + sizeof tiny),
+            memset(body + 38, 0, D2K_TRIAL_ID_LEN);
+            body[54] = 0; body[55] = 0; body[56] = 0xea; body[57] = 0x60;
+            memcpy(body + 58, tiny, sizeof tiny);
+            frame(f, 0x0089u, body, 58 + sizeof tiny);
+            CHECK(write(cli, f, 6 + 58 + sizeof tiny) == (ssize_t)(6 + 58 + sizeof tiny),
                   "SET_ADDR_PROBE с нулевым trial ID не отправилась");
             CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
                   "SET_ADDR_PROBE с нулевым trial ID не разобралась");
@@ -680,10 +690,10 @@ int main(void) {
                   "нулевой trial ID адресной пробы не получил BAD_ARGS");
 
             memcpy(body, flow_wire, sizeof flow_wire);
-            memcpy(body + 13, trial, sizeof trial);
-            body[29] = 0; body[30] = 0; body[31] = 0xea; body[32] = 0x60;
-            memcpy(body + 33, tiny, sizeof tiny);
-            size_t blen = 33 + sizeof tiny;
+            memcpy(body + 38, trial, sizeof trial);
+            body[54] = 0; body[55] = 0; body[56] = 0xea; body[57] = 0x60;
+            memcpy(body + 58, tiny, sizeof tiny);
+            size_t blen = 58 + sizeof tiny;
             frame(f, 0x0089u, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen),
                   "адресная проба не отправилась");
@@ -698,6 +708,13 @@ int main(void) {
                 .dst_ip4 = {203, 0, 113, 7}, .dst_port_be = 0xbb01,
                 .transport = 17
             };
+            flow.family = family;
+            memcpy(&flow.src_port_be, flow_wire + 33, 2);
+            memcpy(&flow.dst_port_be, flow_wire + 35, 2);
+            if (family == 6) {
+                memcpy(flow.src_ip6, flow_wire + 1, 16);
+                memcpy(flow.dst_ip6, flow_wire + 17, 16);
+            }
             uint8_t seen[D2K_TRIAL_ID_LEN] = {0};
             d2k_plantab *tab = d2k_session_plans(sess);
             CHECK(d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, seen) != NULL &&
@@ -705,10 +722,10 @@ int main(void) {
                   "разобранный SET_ADDR_PROBE потерял flow/generation");
 
             memcpy(body, flow_wire, sizeof flow_wire);
-            memcpy(body + 13, trial, sizeof trial);
-            body[13] ^= 0xff;
-            frame(f, 0x008au, body, 29);
-            CHECK(write(cli, f, 35) == 35, "stale DEL_ADDR_PROBE не отправилась");
+            memcpy(body + 38, trial, sizeof trial);
+            body[38] ^= 0xff;
+            frame(f, 0x008au, body, 54);
+            CHECK(write(cli, f, 60) == 60, "stale DEL_ADDR_PROBE не отправилась");
             CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
                   "stale DEL_ADDR_PROBE не разобралась");
             d2k_ctl_flush(c);
@@ -718,9 +735,9 @@ int main(void) {
                   "stale delete снял probe другого поколения");
 
             memcpy(body, flow_wire, sizeof flow_wire);
-            memcpy(body + 13, trial, sizeof trial);
-            frame(f, 0x008au, body, 29);
-            CHECK(write(cli, f, 35) == 35, "точный DEL_ADDR_PROBE не отправилась");
+            memcpy(body + 38, trial, sizeof trial);
+            frame(f, 0x008au, body, 54);
+            CHECK(write(cli, f, 60) == 60, "точный DEL_ADDR_PROBE не отправилась");
             CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
                   "точный DEL_ADDR_PROBE не разобралась");
             d2k_ctl_flush(c);

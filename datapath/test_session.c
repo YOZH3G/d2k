@@ -1210,6 +1210,12 @@ int main(void) {
             CHECK(d2k_session_want_shape(g, name, sizeof name - 1, 6) == 1,
                   "full hello not available to later search");
             CHECK(d2k_session_shape(g, 17, &got_len) == NULL, "TCP polluted QUIC snapshot");
+            CHECK(d2k_session_want_shape_family(g, name, sizeof name - 1, 6, 6) == 0,
+                  "IPv6 request reused IPv4 snapshot");
+            CHECK(d2k_session_shape_family(g, 6, 6, &got_len) == NULL,
+                  "IPv6 snapshot contains IPv4 hello");
+            CHECK(d2k_session_shape_family(g, 6, 4, &got_len) != NULL,
+                  "IPv6 request destroyed IPv4 snapshot");
             pn = build_pkt(part, 47000, 0x18, whole, whole_len);
             d2k_session_packet(g, part, pn, 3, buf, sizeof buf, &r);
             d2k_payload_stats ps;

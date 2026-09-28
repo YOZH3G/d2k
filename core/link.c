@@ -606,13 +606,16 @@ int d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
 
 static int addr_probe_flow_bytes(uint8_t *p, const uint8_t src_ip4[4], uint16_t src_port_be,
                                  const uint8_t dst_ip4[4], uint16_t dst_port_be,
-                                 uint8_t transport) {
-    if (!src_ip4 || !dst_ip4 || !src_port_be || !dst_port_be || transport != 17) { return -1; }
-    memcpy(p, src_ip4, 4);
-    memcpy(p + 4, &src_port_be, 2);
-    memcpy(p + 6, dst_ip4, 4);
-    memcpy(p + 10, &dst_port_be, 2);
-    p[12] = transport;
+                                 uint8_t transport, uint8_t family) {
+    if (!src_ip4 || !dst_ip4 || !src_port_be || !dst_port_be || transport != 17 ||
+        (family != 4 && family != 6)) { return -1; }
+    memset(p, 0, 38);
+    p[0] = family;
+    memcpy(p + 1, src_ip4, family == 6 ? 16 : 4);
+    memcpy(p + 17, dst_ip4, family == 6 ? 16 : 4);
+    memcpy(p + 33, &src_port_be, 2);
+    memcpy(p + 35, &dst_port_be, 2);
+    p[37] = transport;
     return 0;
 }
 
@@ -621,16 +624,24 @@ int d2k_link_set_addr_probe(int fd, const uint8_t src_ip4[4], uint16_t src_port_
                             uint8_t transport, const uint8_t trial_id[D2K_TRIAL_ID_LEN],
                             uint32_t lease_ms, const char *plan_hex,
                             char *err, size_t errcap) {
+    return d2k_link_set_addr_probe_family(fd, src_ip4, src_port_be, dst_ip4,
+        dst_port_be, transport, 4, trial_id, lease_ms, plan_hex, err, errcap);
+}
+
+int d2k_link_set_addr_probe_family(int fd, const uint8_t *src_ip4, uint16_t src_port_be,
+    const uint8_t *dst_ip4, uint16_t dst_port_be, uint8_t transport, uint8_t family,
+    const uint8_t trial_id[D2K_TRIAL_ID_LEN], uint32_t lease_ms,
+    const char *plan_hex, char *err, size_t errcap) {
     if (fd < 0 || !trial_id || !lease_ms || lease_ms > D2K_ADDR_PROBE_LEASE_MAX_MS || !plan_hex ||
         addr_probe_flow_bytes(g_scratch + HDR, src_ip4, src_port_be,
-                              dst_ip4, dst_port_be, transport) != 0) {
+                              dst_ip4, dst_port_be, transport, family) != 0) {
         say(err, errcap, "аргументы SET_ADDR_PROBE негодны");
         return -1;
     }
     uint8_t any = 0;
     for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any |= trial_id[i]; }
     if (!any) { say(err, errcap, "trial_id не может быть нулевым"); return -1; }
-    size_t o = HDR + 13;
+    size_t o = HDR + 38;
     memcpy(g_scratch + o, trial_id, D2K_TRIAL_ID_LEN); o += D2K_TRIAL_ID_LEN;
     g_scratch[o++] = (uint8_t)(lease_ms >> 24);
     g_scratch[o++] = (uint8_t)(lease_ms >> 16);
@@ -655,14 +666,21 @@ int d2k_link_del_addr_probe(int fd, const uint8_t src_ip4[4], uint16_t src_port_
                             const uint8_t dst_ip4[4], uint16_t dst_port_be,
                             uint8_t transport, const uint8_t trial_id[D2K_TRIAL_ID_LEN],
                             char *err, size_t errcap) {
+    return d2k_link_del_addr_probe_family(fd, src_ip4, src_port_be, dst_ip4,
+        dst_port_be, transport, 4, trial_id, err, errcap);
+}
+
+int d2k_link_del_addr_probe_family(int fd, const uint8_t *src_ip4, uint16_t src_port_be,
+    const uint8_t *dst_ip4, uint16_t dst_port_be, uint8_t transport, uint8_t family,
+    const uint8_t trial_id[D2K_TRIAL_ID_LEN], char *err, size_t errcap) {
     if (fd < 0 || !trial_id || addr_probe_flow_bytes(g_scratch + HDR, src_ip4,
-        src_port_be, dst_ip4, dst_port_be, transport) != 0) {
+        src_port_be, dst_ip4, dst_port_be, transport, family) != 0) {
         say(err, errcap, "аргументы DEL_ADDR_PROBE негодны"); return -1;
     }
     uint8_t any = 0;
     for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any |= trial_id[i]; }
     if (!any) { say(err, errcap, "trial_id не может быть нулевым"); return -1; }
-    size_t o = HDR + 13;
+    size_t o = HDR + 38;
     memcpy(g_scratch + o, trial_id, D2K_TRIAL_ID_LEN); o += D2K_TRIAL_ID_LEN;
     uint32_t plen = (uint32_t)(2 + o - HDR);
     g_scratch[0] = (uint8_t)(plen >> 24); g_scratch[1] = (uint8_t)(plen >> 16);
@@ -674,10 +692,15 @@ int d2k_link_del_addr_probe(int fd, const uint8_t src_ip4[4], uint16_t src_port_
 
 int d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
                        char *err, size_t errcap) {
+    return d2k_link_arm_shape_family(fd, name, transport, 4, err, errcap);
+}
+
+int d2k_link_arm_shape_family(int fd, const char *name, uint8_t transport,
+                              uint8_t family, char *err, size_t errcap) {
     /* Своё тело, а не send_name_only: за именем едет ТРАНСПОРТ. Снимок
        приветствия датапат хранит отдельно на транспорт, и без этого байта он
        отдал бы QUIC-задаче байты TLS (d2k_session_want_shape). */
-    if (fd < 0) {
+    if (fd < 0 || (family != 4 && family != 6) || (transport != 6 && transport != 17)) {
         say(err, errcap, "сокет не открыт");
         return -1;
     }
@@ -692,6 +715,7 @@ int d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
     memcpy(g_scratch + o, name, nl);
     o += nl;
     g_scratch[o++] = transport;
+    g_scratch[o++] = family;
 
     size_t body_len = o - HDR;
     uint32_t plen = (uint32_t)(2 + body_len);

@@ -111,11 +111,12 @@ struct d2k_session {
        UDP — разные байты, разной формы, и контроллеру они нужны РАЗНЫЕ.
        Общий слот отдавал QUIC-задаче то, что снято с TCP, и наоборот; задача
        QUIC шла мерить, держа в руках TLS-приветствие, и первый же разбор его
-       отвергал. Индекс 0 — TCP, 1 — UDP (см. slot_of). */
-    uint8_t  last_hello[2][2048];
-    size_t   last_hello_len[2];
-    uint8_t  last_name[2][256];
-    size_t   last_name_len[2];
+       отвергал. Индексы 0/1 — IPv4 TCP/UDP; 2/3 — IPv6 TCP/UDP.
+       Семейства не делят снимок: опыт сохраняет контекст исходного потока. */
+    uint8_t  last_hello[4][2048];
+    size_t   last_hello_len[4];
+    uint8_t  last_name[4][256];
+    size_t   last_name_len[4];
 
     /* ВИДНА ЛИ ВООБЩЕ ОБРАТНАЯ СТОРОНА — по транспорту (индексы те же, что у
      * last_hello: 0 TCP, 1 UDP, см. slot_of).
@@ -139,17 +140,20 @@ struct d2k_session {
     int      rev_seen[2];
     int      udp_reverse_hook;
 
-    int      shape_armed[2];
-    uint8_t  shape_name[2][256];
-    size_t   shape_name_len[2];
-    uint8_t  shape[2][2048];
-    size_t   shape_len[2];
+    int      shape_armed[4];
+    uint8_t  shape_name[4][256];
+    size_t   shape_name_len[4];
+    uint8_t  shape[4][2048];
+    size_t   shape_len[4];
 };
 
 /* Номер слота снимка по транспорту. Всё, кроме UDP, живёт в слоте TCP: других
    транспортов у нас нет, а заводить третий слот под несуществующее значило бы
    завести неизмеренную сущность. */
 static size_t slot_of(uint8_t transport) { return transport == 17 ? 1u : 0u; }
+static size_t shape_slot(uint8_t transport, uint8_t family) {
+    return slot_of(transport) + (family == 6 ? 2u : 0u);
+}
 
 static uint16_t next_fragment_id(d2k_session *s) {
     if (!s->fragment_seeded) {
@@ -891,7 +895,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        Слот свой (см. slot_of): TLS-приветствие и Initial — разные байты
        разной формы, и отдавать одно вместо другого нельзя. */
     if (named && !voice && !fl->controller_probe) {
-        size_t k = slot_of(17);
+        size_t k = shape_slot(17, key.family);
         if (payload_len <= sizeof s->last_hello[k]) {
             memcpy(s->last_hello[k], pkt + payload_off, payload_len);
             s->last_hello_len[k] = payload_len;
@@ -1568,14 +1572,15 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             d2k_tls_parse(hello, hello_len, &complete);
             if (complete.is_client_hello && complete.have_record_end &&
                 complete.have_hello_middle && !complete.exts_truncated) {
+                size_t k = shape_slot(6, key.family);
                 s->captured_hellos++;
                 if (!fl->controller_probe) {
-                    memcpy(s->last_hello[0], hello, hello_len);
-                    s->last_hello_len[0] = hello_len;
-                    s->last_name_len[0] = 0;
-                    if (complete.have_sni && complete.sni_len <= sizeof s->last_name[0]) {
-                        memcpy(s->last_name[0], hello + complete.sni_off, complete.sni_len);
-                        s->last_name_len[0] = complete.sni_len;
+                    memcpy(s->last_hello[k], hello, hello_len);
+                    s->last_hello_len[k] = hello_len;
+                    s->last_name_len[k] = 0;
+                    if (complete.have_sni && complete.sni_len <= sizeof s->last_name[k]) {
+                        memcpy(s->last_name[k], hello + complete.sni_off, complete.sni_len);
+                        s->last_name_len[k] = complete.sni_len;
                     }
                 }
                 if (!fl->saw_hello) {
@@ -1595,13 +1600,13 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                     d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_NONAME,
                                     0, 0, NULL, NULL, 0, NULL);
                 }
-                if (!fl->controller_probe && s->shape_armed[0] &&
-                    (s->shape_name_len[0] == 0 ||
-                     name_same(s->last_name[0], s->last_name_len[0],
-                               s->shape_name[0], s->shape_name_len[0]))) {
-                    memcpy(s->shape[0], hello, hello_len);
-                    s->shape_len[0] = hello_len;
-                    s->shape_armed[0] = 0;
+                if (!fl->controller_probe && s->shape_armed[k] &&
+                    (s->shape_name_len[k] == 0 ||
+                     name_same(s->last_name[k], s->last_name_len[k],
+                               s->shape_name[k], s->shape_name_len[k]))) {
+                    memcpy(s->shape[k], hello, hello_len);
+                    s->shape_len[k] = hello_len;
+                    s->shape_armed[k] = 0;
                     d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
                                     (uint32_t)hello_len, NULL, NULL, 0, NULL);
                 }
@@ -2066,10 +2071,16 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
 
 int d2k_session_want_shape(d2k_session *s, const uint8_t *name, size_t len,
                            uint8_t transport) {
-    if (!s) {
+    return d2k_session_want_shape_family(s, name, len, transport, 4);
+}
+
+int d2k_session_want_shape_family(d2k_session *s, const uint8_t *name, size_t len,
+                                  uint8_t transport, uint8_t family) {
+    if (!s || (family != 4 && family != 6) || (transport != 6 && transport != 17) ||
+        (!name && len)) {
         return 0;
     }
-    size_t k = slot_of(transport);
+    size_t k = shape_slot(transport, family);
     if (len > sizeof s->shape_name[k]) {
         len = sizeof s->shape_name[k];
     }
@@ -2093,10 +2104,16 @@ int d2k_session_want_shape(d2k_session *s, const uint8_t *name, size_t len,
 }
 
 const uint8_t *d2k_session_shape(const d2k_session *s, uint8_t transport, size_t *len) {
-    if (!s) {
+    return d2k_session_shape_family(s, transport, 4, len);
+}
+
+const uint8_t *d2k_session_shape_family(const d2k_session *s, uint8_t transport,
+                                        uint8_t family, size_t *len) {
+    if (len) { *len = 0; }
+    if (!s || (family != 4 && family != 6) || (transport != 6 && transport != 17)) {
         return NULL;
     }
-    size_t k = slot_of(transport);
+    size_t k = shape_slot(transport, family);
     if (s->shape_len[k] == 0) {
         return NULL;
     }

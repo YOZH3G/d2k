@@ -362,6 +362,10 @@ void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out);
  * клиент не ходит. */
 int d2k_session_want_shape(d2k_session *s, const uint8_t *name, size_t len,
                            uint8_t transport);
+int d2k_session_want_shape_family(d2k_session *s, const uint8_t *name, size_t len,
+                                  uint8_t transport, uint8_t family);
+const uint8_t *d2k_session_shape_family(const d2k_session *s, uint8_t transport,
+                                        uint8_t family, size_t *len);
 
 /* Приветствие, готовое к выдаче. NULL — не готово. */
 const uint8_t *d2k_session_shape(const d2k_session *s, uint8_t transport, size_t *len);

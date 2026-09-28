@@ -136,14 +136,14 @@
  * Испытание кандидата — это единственное место, где план не должен достаться
  * никому, кроме зонда (см. d2k_plans.h про цену обратного). */
 #define D2K_CMD_SET_NAME_PROBE 0x0088
-#define D2K_CMD_SET_ADDR_PROBE 0x0089 /* flow(13), trial-id(16), lease-ms(u32), Plan */
-#define D2K_CMD_DEL_ADDR_PROBE 0x008A /* flow(13), trial-id(16); stale delete is no-op */
+#define D2K_CMD_SET_ADDR_PROBE 0x0089 /* family+src/dst+ports+proto(38), trial-id(16), lease-ms(u32), Plan */
+#define D2K_CMD_DEL_ADDR_PROBE 0x008A /* flow(38), trial-id(16); stale delete is no-op */
 #define D2K_CMD_SET_ADDR 0x0082  /* адрес u32 BE, план TLV */
 #define D2K_CMD_DEL_NAME 0x0083  /* длина имени u8, имя, family u8 */
 #define D2K_CMD_DEL_ADDR 0x0084  /* адрес u32 BE */
 #define D2K_CMD_CLEAR    0x0085  /* убрать все планы */
 #define D2K_CMD_STATS    0x0086  /* прислать счётчики */
-/* Поймать форму следующего приветствия к цели: длина имени u8, имя.
+/* Поймать форму следующего приветствия: длина имени u8, имя, transport u8, family u8.
  * Взводится один раз и срабатывает один раз. */
 #define D2K_CMD_ARM_SHAPE 0x0087
 #define D2K_CMD_DEL_NAME_PROBE 0x008B /* длина имени u8, имя, форма u8, family u8, порт u16 BE */

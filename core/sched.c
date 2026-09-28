@@ -3352,8 +3352,8 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     if (ordinary_tcp_rst) {
         t->state = T_RST_PENDING;
         t->rst_pending_flow.transport = ev->transport;
-        memcpy(t->rst_pending_flow.a_ip, ev->low_ip, sizeof ev->low_ip);
-        memcpy(t->rst_pending_flow.b_ip, ev->high_ip, sizeof ev->high_ip);
+        memcpy(t->rst_pending_flow.a_ip, ev->low_ip, sizeof t->rst_pending_flow.a_ip);
+        memcpy(t->rst_pending_flow.b_ip, ev->high_ip, sizeof t->rst_pending_flow.b_ip);
         t->rst_pending_flow.a_port = ev->low_port;
         t->rst_pending_flow.b_port = ev->high_port;
         t->rst_confirm_until_ms = s->clock_seen

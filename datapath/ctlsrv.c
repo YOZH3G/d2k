@@ -131,6 +131,26 @@ void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen) {
     d2k_ctl_event(ctl, D2K_EV_PROTO, body, sizeof body);
 }
 
+static int read_probe_flow(const uint8_t *b, d2k_addr_probe_flow *flow) {
+    if (b[0] != 4 && b[0] != 6) { return -1; }
+    memset(flow, 0, sizeof *flow);
+    flow->family = b[0];
+    if (b[0] == 6) {
+        memcpy(flow->src_ip6, b + 1, 16);
+        memcpy(flow->dst_ip6, b + 17, 16);
+    } else {
+        for (size_t i = 4; i < 16; i++) {
+            if (b[1 + i] || b[17 + i]) { return -1; }
+        }
+        memcpy(flow->src_ip4, b + 1, 4);
+        memcpy(flow->dst_ip4, b + 17, 4);
+    }
+    memcpy(&flow->src_port_be, b + 33, 2);
+    memcpy(&flow->dst_port_be, b + 35, 2);
+    flow->transport = b[37];
+    return 0;
+}
+
 void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len) {
     d2k_ctlsrv *cx = vctx;
     char why[200];
@@ -207,11 +227,10 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             return;
         }
         d2k_addr_probe_flow flow = {0};
-        memcpy(flow.src_ip4, b, 4);
-        memcpy(&flow.src_port_be, b + 4, 2);
-        memcpy(flow.dst_ip4, b + 6, 4);
-        memcpy(&flow.dst_port_be, b + 10, 2);
-        flow.transport = b[12];
+        if (read_probe_flow(b, &flow) != 0) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
         const uint8_t *trial_id = b + D2K_ADDR_PROBE_FLOW_WIRE_LEN;
         size_t lease_off = D2K_ADDR_PROBE_FLOW_WIRE_LEN + D2K_TRIAL_ID_LEN;
         uint32_t lease_ms = (uint32_t)b[lease_off] << 24 |
@@ -245,25 +264,30 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         return;
     }
     case D2K_CMD_ARM_SHAPE: {
-        /* Тело: длина имени, имя, затем ТРАНСПОРТ одним байтом. Транспорт
+        /* Тело: длина имени, имя, ТРАНСПОРТ и семейство по байту. Транспорт
            обязателен: снимок приветствия хранится отдельно на транспорт, и без
            него датапат отдал бы QUIC-задаче байты TLS. Старое тело (без
            последнего байта) отвергается — смешанная пара ловится сверкой
            версии провода, а не молча. */
-        if (len < 2 || len < 2u + b[0]) {
+        if (len < 3 || len != 3u + b[0]) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
         uint8_t want_tr = b[1u + b[0]];
-        if (d2k_session_want_shape(cx->sess, b + 1, b[0], want_tr)) {
+        uint8_t want_family = b[2u + b[0]];
+        if ((want_tr != 6 && want_tr != 17) || (want_family != 4 && want_family != 6)) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        if (d2k_session_want_shape_family(cx->sess, b + 1, b[0], want_tr, want_family)) {
             /* Готово прямо сейчас — отдаём, не дожидаясь следующего
                приветствия. */
             size_t slen = 0;
-            const uint8_t *sh = d2k_session_shape(cx->sess, want_tr, &slen);
+            const uint8_t *sh = d2k_session_shape_family(cx->sess, want_tr, want_family, &slen);
             if (sh && slen > 0 && cx->ctl) {
                 uint8_t body[D2K_KEY_WIRE_LEN + 2048];
                 memset(body, 0, D2K_KEY_WIRE_LEN);
-                body[0] = 4;
+                body[0] = want_family;
                 /* Транспорт кладётся в ключ, а не рядом: место под него на
                    проводе уже есть, и контроллер разбирает его общим путём. */
                 body[D2K_KEY_WIRE_LEN - 1] = want_tr;
@@ -314,16 +338,15 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         return;
     }
     case D2K_CMD_DEL_ADDR_PROBE: {
-        if (len < D2K_ADDR_PROBE_FLOW_WIRE_LEN + D2K_TRIAL_ID_LEN) {
+        if (len != D2K_ADDR_PROBE_FLOW_WIRE_LEN + D2K_TRIAL_ID_LEN) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
         d2k_addr_probe_flow flow = {0};
-        memcpy(flow.src_ip4, b, 4);
-        memcpy(&flow.src_port_be, b + 4, 2);
-        memcpy(flow.dst_ip4, b + 6, 4);
-        memcpy(&flow.dst_port_be, b + 10, 2);
-        flow.transport = b[12];
+        if (read_probe_flow(b, &flow) != 0) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
         const uint8_t *trial_id = b + D2K_ADDR_PROBE_FLOW_WIRE_LEN;
         uint8_t any_id = 0;
         for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any_id |= trial_id[i]; }
@@ -461,7 +484,8 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             size_t slen = 0;
             /* Транспорт берётся из ключа записи журнала: ловушка взводится на
                транспорт, и снимок лежит в его слоте. */
-            const uint8_t *sh = d2k_session_shape(s, e->key.proto, &slen);
+            const uint8_t *sh = d2k_session_shape_family(s, e->key.proto,
+                                                         e->key.family == 6 ? 6 : 4, &slen);
             if (!sh || slen == 0 || n + slen > sizeof body) {
                 continue;
             }

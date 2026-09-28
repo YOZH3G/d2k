@@ -22,7 +22,7 @@
  * IPv4 occupies the first four address bytes with zero tails. Fields are
  * encoded explicitly, never by copying the native d2k_key structure. */
 #define D2K_KEY_WIRE_LEN 38
-#define D2K_ADDR_PROBE_FLOW_WIRE_LEN 13
+#define D2K_ADDR_PROBE_FLOW_WIRE_LEN 38
 
 /* Контекст обслуживания команд. */
 typedef struct {
