@@ -29,5 +29,8 @@ size_t d2k_ip4_text(uint32_t ip_net, char *out, size_t cap);
  * участвует: петля (127/8), RFC 1918 (10/8, 172.16/12, 192.168/16),
  * link-local (169.254/16), CGNAT (100.64/10) и нулевой адрес. */
 int d2k_ip4_private(uint32_t ip_net);
+/* IPv6 non-public targets: unspecified, loopback, ULA, link-local, multicast.
+ * IPv4-mapped addresses use the same IPv4 policy. */
+int d2k_ip6_private(const uint8_t ip[16]);
 
 #endif /* D2K_NET4_H */

@@ -541,7 +541,7 @@ static void *rs_run(void *arg) {
     (void)arg;
     for (;;) {
         uint8_t buf[2048];
-        struct sockaddr_in from;
+        struct sockaddr_storage from;
         socklen_t fl = sizeof from;
         ssize_t n = recvfrom(g_rs_fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
         if (n < 0) {
@@ -604,22 +604,32 @@ static void *rs_run(void *arg) {
     }
 }
 
-static uint16_t rs_start(void) {
-    g_rs_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in a;
+static uint16_t rs_start_family(int family) {
+    g_rs_fd = socket(family, SOCK_DGRAM, 0);
+    struct sockaddr_storage a;
     memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(0x7f000001); /* 127.0.0.1 — единственный переносимо-бинд-абельный адрес */
-    a.sin_port = 0;
-    bind(g_rs_fd, (struct sockaddr *)&a, sizeof a);
+    socklen_t alen;
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&a;
+        v6->sin6_family = AF_INET6; v6->sin6_addr = in6addr_loopback;
+        alen = sizeof *v6;
+    } else {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&a;
+        v4->sin_family = AF_INET; v4->sin_addr.s_addr = htonl(0x7f000001);
+        alen = sizeof *v4;
+    }
+    if (bind(g_rs_fd, (struct sockaddr *)&a, alen) != 0) return 0;
     socklen_t al = sizeof a;
     getsockname(g_rs_fd, (struct sockaddr *)&a, &al);
-    uint16_t port = ntohs(a.sin_port);
+    uint16_t port = family == AF_INET6 ? ntohs(((struct sockaddr_in6 *)&a)->sin6_port)
+                                     : ntohs(((struct sockaddr_in *)&a)->sin_port);
     pthread_t t;
     pthread_create(&t, NULL, rs_run, NULL);
     pthread_detach(t);
     return port;
 }
+
+static uint16_t rs_start(void) { return rs_start_family(AF_INET); }
 
 /* Стенд для "путь жив только через согласование версии": молчит на ЛЮБОЙ
  * настоящий Initial (control/trigger), но честно отвечает на зонд
@@ -732,7 +742,7 @@ static int mark_fail_from_nth(int fd, uint32_t mark) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     /* Цель стенда живёт на петле по построению — см. d2k_quic_allow_local.
        Без этого весь вопросник отвечает «имя разрешается в приватный адрес»,
        и проверять становится нечего. */
@@ -751,6 +761,33 @@ int main(void) {
     CHECK(g_trig_len > 0 && g_ctl_len > 0, "не собрались тестовые снимки триггера/контроля");
     g_trig_bytes = g_trig_buf;
     g_ctl_bytes = g_ctl_buf;
+
+    {
+        char pool[4][D2K_QUIC_ADDR_LEN];
+        g_extra_n = 2;
+        snprintf(g_extra_pool[0], D2K_QUIC_ADDR_LEN, "192.0.2.1");
+        snprintf(g_extra_pool[1], D2K_QUIC_ADDR_LEN, "2001:db8::2");
+        size_t n = d2k_quic_build_pool("2001:db8:1234:5678::1", "x.example", pool, 4);
+        CHECK(n == 2 && strcmp(pool[0], "2001:db8:1234:5678::1") == 0 &&
+              strcmp(pool[1], "2001:db8::2") == 0,
+              "IPv6 pool preserves target and excludes IPv4 answers");
+        n = d2k_quic_build_pool("192.0.2.2", "x.example", pool, 4);
+        CHECK(n == 2 && strcmp(pool[1], "192.0.2.1") == 0,
+              "IPv4 pool excludes IPv6 answers");
+        g_extra_n = 0;
+        g_rs_respond = 1;
+        uint16_t port = rs_start_family(AF_INET6);
+        CHECK(port != 0, "IPv6 QUIC measurement fixture starts");
+        d2k_vres r = d2k_quic_classify("::1", port, "x.example", trig_hello(), ctl_hello(), 0);
+        CHECK(r.verdict == D2K_V_CLEAR, "native IPv6 QUIC measurement accepts authenticated response");
+        CHECK(r.qprops.server_ttl_in > 0, "IPv6 reply hop limit is measured");
+        d2k_quic_allow_local = 0;
+        r = d2k_quic_classify("::1", port, "x.example", trig_hello(), ctl_hello(), 0);
+        CHECK(r.verdict == D2K_V_LOCAL_ADDRESS, "IPv6 loopback is not an ISP measurement");
+        d2k_quic_allow_local = 1;
+        close(g_rs_fd);
+    }
+    if (argc == 2 && strcmp(argv[1], "--ipv6") == 0) return fails ? 1 : 0;
 
     /* ===================================================================
      * Часть 1: дисциплина дерева (подмена d2k_quic_ask_hook).

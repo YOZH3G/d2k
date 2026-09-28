@@ -49,3 +49,16 @@ int d2k_ip4_private(uint32_t ip_net) {
            (v & 0xffc00000u) == 0x64400000u ||      /* 100.64/10, RFC 6598 */
            v == 0;
 }
+
+int d2k_ip6_private(const uint8_t ip[16]) {
+    static const uint8_t zero[16] = {0};
+    if (!ip) return 1;
+    if (memcmp(ip, zero, 15) == 0 && ip[15] <= 1) return 1;
+    if ((ip[0] & 0xfe) == 0xfc ||
+        (ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80) || ip[0] == 0xff) return 1;
+    if (memcmp(ip, zero, 10) == 0 && ip[10] == 0xff && ip[11] == 0xff) {
+        uint32_t v4; memcpy(&v4, ip + 12, 4);
+        return d2k_ip4_private(v4);
+    }
+    return 0;
+}

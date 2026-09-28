@@ -119,6 +119,9 @@
  * определение IP_TTL от этого переключателя не зависит — макрос там просто
  * не распознаётся и ни на что не влияет. */
 #define _DARWIN_C_SOURCE
+#ifdef __APPLE__
+#define __APPLE_USE_RFC_3542
+#endif
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
@@ -151,27 +154,44 @@
 /* Настоящий прямой DNS-запрос, IPv4 (см. шапку заголовка про то, почему это
  * не "DNS-подлог"). Возвращает 0 при любом сбое резолва — вызывающий не
  * считает это отказом всего вопросника, только пустым пулом. */
-static size_t resolve_real(const char *sni, char out[][D2K_QUIC_ADDR_LEN], size_t cap) {
+static int qp_addr_parse(const char *text, uint8_t bytes[16]) {
+    memset(bytes, 0, 16);
+    if (!text || strchr(text, '%')) return 0;
+    if (inet_pton(AF_INET, text, bytes) == 1) return AF_INET;
+    if (inet_pton(AF_INET6, text, bytes) == 1) return AF_INET6;
+    return 0;
+}
+
+static size_t resolve_family(const char *sni, int family,
+                              char out[][D2K_QUIC_ADDR_LEN], size_t cap) {
     if (!sni || cap == 0) {
         return 0;
     }
     struct addrinfo hints, *res, *it;
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET; /* d2k сегодня весь IPv4, см. d2k_quicprobe.h */
+    hints.ai_family = family;
     hints.ai_socktype = SOCK_DGRAM;
     if (getaddrinfo(sni, NULL, &hints, &res) != 0) {
         return 0;
     }
     size_t n = 0;
     for (it = res; it != NULL && n < cap; it = it->ai_next) {
-        struct sockaddr_in *a = (struct sockaddr_in *)(void *)it->ai_addr;
-        if (!inet_ntop(AF_INET, &a->sin_addr, out[n], D2K_QUIC_ADDR_LEN)) {
+        const void *addr;
+        if (it->ai_family == AF_INET6) {
+            addr = &((struct sockaddr_in6 *)(void *)it->ai_addr)->sin6_addr;
+        } else if (it->ai_family == AF_INET) {
+            addr = &((struct sockaddr_in *)(void *)it->ai_addr)->sin_addr;
+        } else { continue; }
+        if (!inet_ntop(it->ai_family, addr, out[n], D2K_QUIC_ADDR_LEN)) {
             continue;
         }
         n++;
     }
     freeaddrinfo(res);
     return n;
+}
+static size_t resolve_real(const char *sni, char out[][D2K_QUIC_ADDR_LEN], size_t cap) {
+    return resolve_family(sni, AF_INET, out, cap);
 }
 d2k_quic_resolve_fn d2k_quic_resolve_hook = resolve_real;
 
@@ -222,7 +242,9 @@ uint32_t d2k_quic_budget_s =
  * расходиться может НАБОР полей, которые нужны разным вызывающим, но не
  * сама логика "первый гарантированный + дедуп резолвера". */
 size_t d2k_quic_build_pool(const char *ip, const char *sni, char pool[][D2K_QUIC_ADDR_LEN], size_t cap) {
-    if (cap == 0) {
+    uint8_t target[16];
+    int family = qp_addr_parse(ip, target);
+    if (cap == 0 || !pool || !family || strlen(ip) >= D2K_QUIC_ADDR_LEN) {
         return 0;
     }
     memset(pool, 0, cap * D2K_QUIC_ADDR_LEN); /* хвосты слотов детерминированы (нули), а не читаются как есть */
@@ -231,7 +253,9 @@ size_t d2k_quic_build_pool(const char *ip, const char *sni, char pool[][D2K_QUIC
 
     char extra[D2K_QUIC_MAX_ADDRS][D2K_QUIC_ADDR_LEN];
     memset(extra, 0, sizeof extra);
-    size_t n_extra = d2k_quic_resolve_hook(sni, extra, D2K_QUIC_MAX_ADDRS);
+    size_t n_extra = d2k_quic_resolve_hook == resolve_real
+        ? resolve_family(sni, family, extra, D2K_QUIC_MAX_ADDRS)
+        : d2k_quic_resolve_hook(sni, extra, D2K_QUIC_MAX_ADDRS);
     if (n_extra > D2K_QUIC_MAX_ADDRS) {
         /* Хук обязан был вернуть не больше cap (D2K_QUIC_MAX_ADDRS), но
            буферу всё равно, кто ошибся: без этого зажима цикл ниже читал бы
@@ -240,9 +264,14 @@ size_t d2k_quic_build_pool(const char *ip, const char *sni, char pool[][D2K_QUIC
         n_extra = D2K_QUIC_MAX_ADDRS;
     }
     for (size_t i = 0; i < n_extra && n_pool < cap; i++) {
+        uint8_t candidate[16];
+        if (!memchr(extra[i], 0, D2K_QUIC_ADDR_LEN) ||
+            qp_addr_parse(extra[i], candidate) != family) continue;
         int dup = 0;
         for (size_t j = 0; j < n_pool; j++) {
-            if (strcmp(pool[j], extra[i]) == 0) {
+            uint8_t existing[16];
+            (void)qp_addr_parse(pool[j], existing);
+            if (memcmp(existing, candidate, 16) == 0) {
                 dup = 1;
                 break;
             }
@@ -679,7 +708,10 @@ static int qp_send_one(const char *addr, uint16_t port,
     if (!addr || !msg.bytes || msg.len == 0) {
         return -1;
     }
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    uint8_t dst[16];
+    int family = qp_addr_parse(addr, dst);
+    if (!family) return -1;
+    int fd = socket(family, SOCK_DGRAM, 0);
     if (fd < 0) {
         return -1;
     }
@@ -697,28 +729,39 @@ static int qp_send_one(const char *addr, uint16_t port,
        попытка не отправляется вовсе (-1, «наша сторона»), и вопрос честно
        остаётся незаданным, а не «не помог». */
     if (src_port > 0 && src_port < 65536) {
-        struct sockaddr_in src;
+        struct sockaddr_storage src;
         memset(&src, 0, sizeof src);
-        src.sin_family = AF_INET;
-        src.sin_addr.s_addr = htonl(INADDR_ANY);
-        src.sin_port = htons((uint16_t)src_port);
-        if (bind(fd, (struct sockaddr *)&src, sizeof src) != 0) {
+        socklen_t slen;
+        if (family == AF_INET6) {
+            struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&src;
+            v6->sin6_family = AF_INET6; v6->sin6_port = htons((uint16_t)src_port);
+            slen = sizeof *v6;
+        } else {
+            struct sockaddr_in *v4 = (struct sockaddr_in *)&src;
+            v4->sin_family = AF_INET; v4->sin_port = htons((uint16_t)src_port);
+            slen = sizeof *v4;
+        }
+        if (bind(fd, (struct sockaddr *)&src, slen) != 0) {
             close(fd);
             return -1;
         }
     }
-    struct sockaddr_in a;
+    struct sockaddr_storage a;
     memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons(port);
-    if (inet_pton(AF_INET, addr, &a.sin_addr) != 1) {
-        close(fd);
-        return -1;
+    socklen_t alen;
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&a;
+        v6->sin6_family = AF_INET6; v6->sin6_port = htons(port);
+        memcpy(&v6->sin6_addr, dst, 16); alen = sizeof *v6;
+    } else {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&a;
+        v4->sin_family = AF_INET; v4->sin_port = htons(port);
+        memcpy(&v4->sin_addr, dst, 4); alen = sizeof *v4;
     }
     /* "Подключенный" UDP-сокет — не ради семантики соединения (её у UDP
        нет), а чтобы ICMP-отказ (порт/хост недоступен) дошёл до нас через
        POLLERR/код ошибки, а не неотличимой тишиной. */
-    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+    if (connect(fd, (struct sockaddr *)&a, alen) != 0) {
         close(fd);
         return -1;
     }
@@ -729,18 +772,26 @@ static int qp_send_one(const char *addr, uint16_t port,
        заводим. */
     {
         int on = 1;
-        (void)setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &on, sizeof on);
+        if (family == AF_INET) (void)setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &on, sizeof on);
     }
 #endif
+    if (family == AF_INET6) {
+        int on = 1;
+        (void)setsockopt(fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on, sizeof on);
+    }
+    int hop_level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+    int hop_option = family == AF_INET6 ? IPV6_UNICAST_HOPS : IP_TTL;
     if (prefix && prefix_len > 0) {
         int orig_ttl = -1;
         if (prefix_ttl > 0) {
             socklen_t ttl_len = sizeof orig_ttl;
-            if (getsockopt(fd, IPPROTO_IP, IP_TTL, &orig_ttl, &ttl_len) != 0) {
-                orig_ttl = -1; /* не узнали исходный — восстанавливать будет нечем, см. ниже */
+            if (getsockopt(fd, hop_level, hop_option, &orig_ttl, &ttl_len) != 0) {
+                close(fd); return -1;
             }
             int want = prefix_ttl;
-            (void)setsockopt(fd, IPPROTO_IP, IP_TTL, &want, sizeof want);
+            if (setsockopt(fd, hop_level, hop_option, &want, sizeof want) != 0) {
+                close(fd); return -1;
+            }
         }
         /* КОПИЙ СТОЛЬКО, СКОЛЬКО ПРОСИЛИ, И КАЖДАЯ — СВОЯ ДАТАГРАММА.
            Донор кладёт N отдельных датаграмм перед Initial
@@ -759,7 +810,9 @@ static int qp_send_one(const char *addr, uint16_t port,
             /* Восстановить ДО отправки trigger — иначе он тоже уйдёт с
                укороченным TTL и рискует не дойти до настоящего сервера
                (см. doc-комментарий d2k_quic_ask_ttl_fn). */
-            (void)setsockopt(fd, IPPROTO_IP, IP_TTL, &orig_ttl, sizeof orig_ttl);
+            if (setsockopt(fd, hop_level, hop_option, &orig_ttl, sizeof orig_ttl) != 0) {
+                close(fd); return -1;
+            }
         }
         /* Original exchange writes prefix datagrams and Initial back-to-back.
            An inserted settle delay changes the measured hypothesis. */
@@ -849,7 +902,7 @@ static ssize_t qp_recv_ttl(int fd, uint8_t *buf, size_t cap, uint8_t *ttl) {
     msg.msg_controllen = sizeof ctl.space;
     ssize_t n = recvmsg(fd, &msg, 0);
     if (n <= 0) { return n; }
-#ifdef IP_RECVTTL
+#if defined(IP_RECVTTL) || defined(IPV6_HOPLIMIT)
     /* ПОДАВЛЕНИЕ ТОЧЕЧНОЕ И НЕ НАШЕ. CMSG_NXTHDR у musl сам сравнивает
        знаковое с беззнаковым внутри макроса; под -Werror это ломает
        кросс-сборку на строке, где нашего кода нет вовсе. Переписывать обход
@@ -860,10 +913,16 @@ static ssize_t qp_recv_ttl(int fd, uint8_t *buf, size_t cap, uint8_t *ttl) {
 #pragma GCC diagnostic ignored "-Wsign-compare"
 #endif
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
-        if (c->cmsg_level != IPPROTO_IP) { continue; }
+        int is_hop = c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_HOPLIMIT;
         /* Linux отдаёт IP_TTL, BSD и macOS — IP_RECVTTL под тем же номером,
            что и опция. Принимаем оба: имя различается, смысл один. */
-        if (c->cmsg_type != IP_TTL && c->cmsg_type != IP_RECVTTL) { continue; }
+        int is_ttl = 0;
+#ifdef IP_RECVTTL
+        is_ttl = c->cmsg_level == IPPROTO_IP &&
+                 (c->cmsg_type == IP_TTL || c->cmsg_type == IP_RECVTTL);
+#endif
+        if (!is_hop && !is_ttl) continue;
+        if (c->cmsg_len < CMSG_LEN(0)) continue;
         size_t len = (size_t)c->cmsg_len - (size_t)CMSG_LEN(0);
         if (len >= sizeof(int)) {
             int v = 0;
@@ -1735,12 +1794,12 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
        выведенное из НЕПРИГОДНОГО ввода, а не из сети. */
     int ip_ok = 0;
     if (ip && strlen(ip) < D2K_QUIC_ADDR_LEN) {
-        struct in_addr ip_probe;
-        ip_ok = (inet_pton(AF_INET, ip, &ip_probe) == 1);
+        uint8_t ip_probe[16];
+        ip_ok = qp_addr_parse(ip, ip_probe) != 0;
     }
     if (!ip_ok || !sni || !trigger.bytes || trigger.len == 0) {
         r.verdict = D2K_V_FLAKY;
-        reason_set(&r, "вход структурно непригоден: адрес не разбирается как IPv4, имя или снимок "
+        reason_set(&r, "вход структурно непригоден: адрес не разбирается как IP, имя или снимок "
                        "триггера отсутствуют — измерения не было");
         return r; /* r.marked=0 по построению — ни один опыт не задавался; единственный ранний
                      выход, как и у эталона (verdict.c) — это отказ ДО измерения, не его исход */
@@ -1759,6 +1818,13 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
      * 10.171.171.171, тогда как 8.8.8.8 отдаёт 188.186.154.79. Без этой
      * проверки инструмент объявил бы «режут адрес» и был бы неправ полностью. */
     if (!d2k_quic_allow_local) {
+        uint8_t ip6[16];
+        if (inet_pton(AF_INET6, ip, ip6) == 1 && d2k_ip6_private(ip6)) {
+            r.verdict = D2K_V_LOCAL_ADDRESS;
+            reason_set(&r, "адрес %s локальный или не является публичной целью — "
+                           "измерения блокировки провайдера не было", ip);
+            return r;
+        }
         struct in_addr a;
         if (inet_pton(AF_INET, ip, &a) == 1) {
             /* Список диапазонов — ОДИН на проект (d2k_net4.h): тот же вопрос
