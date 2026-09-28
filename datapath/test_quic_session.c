@@ -1151,6 +1151,15 @@ static void test_fragments(void) {
     d2k_nat_hook=saved;
 }
 
+static int frag_nat6(const char *path, uint8_t proto, const uint8_t *src,
+    uint16_t sport, const uint8_t *dst, uint16_t dport, uint8_t family,
+    uint8_t *outside, uint16_t *out_port) {
+    (void)path; (void)dst; (void)dport;
+    CHECK(proto == 17 && family == 6, "fragment native NAT context");
+    memcpy(outside, src, 16); outside[15] = 7; *out_port = sport;
+    return 0;
+}
+
 int main(void) {
     {
         d2k_session *s6 = d2k_session_new(32, 32);
@@ -1178,6 +1187,25 @@ int main(void) {
         CHECK(d2k_session_want_shape(s6, (const uint8_t *)"example.com", 11, 17) == 0,
               "IPv6 QUIC snapshot leaked to IPv4");
         d2k_session_free(s6);
+        d2k_nat_family_fn saved6 = d2k_nat_family_hook;
+        d2k_nat_family_hook = frag_nat6;
+        for (int shape = 1; shape <= 4; shape++) {
+            uint8_t tlv[] = {'D','2','K','P',0,1,0,7,0,0,0,2,
+                            0,2,0,2,17,2,1,12,0,1,0};
+            tlv[22] = (uint8_t)shape;
+            s6 = d2k_session_new(32, 32); p6 = NULL;
+            CHECK(d2k_plan_load(tlv, sizeof tlv, &p6, err6, sizeof err6) == 0,
+                  "native fragment plan load");
+            d2k_session_set_plan(s6, p6);
+            d2k_session_packet(s6, pkt, n4 + 20, 2, output, sizeof output, &r6);
+            CHECK(r6.applied && r6.n_out == (shape <= 2 ? 2u : 3u),
+                  "native fragment plan must emit every fragment");
+            CHECK(output[0] == 0x60 && output[6] == 44 && output[40] == 17,
+                  "native fragment plan emitted wrong headers");
+            CHECK(output[23] == 7, "native fragments need confirmed full NAT address");
+            d2k_session_free(s6);
+        }
+        d2k_nat_family_hook = saved6;
     }
     test_fragments();
     test_direction_by_hook();

@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 
 #include "d2k_nat.h"
+d2k_nat_family_fn d2k_nat_family_hook = d2k_nat_outside_family;
 
 /* "192.168.1.117" -> адрес в сетевом порядке. 0 — не разобралось. */
 static int parse_ip4(const char *s, uint32_t *out) {

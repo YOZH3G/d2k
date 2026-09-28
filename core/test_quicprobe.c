@@ -781,13 +781,27 @@ int main(int argc, char **argv) {
         d2k_vres r = d2k_quic_classify("::1", port, "x.example", trig_hello(), ctl_hello(), 0);
         CHECK(r.verdict == D2K_V_CLEAR, "native IPv6 QUIC measurement accepts authenticated response");
         CHECK(r.qprops.server_ttl_in > 0, "IPv6 reply hop limit is measured");
+        if (argc == 2 && strcmp(argv[1], "--ipv6-fragments") == 0) {
+            for (int shape = 1; shape <= 2; shape++) {
+                int sent = 0;
+                d2k_quic_arm_question q = {.addr="::1", .frag=shape};
+                d2k_tally t = d2k_quic_ask_arm_hook(&q, "z0123456789.example.com",
+                                                   port, 500, 0xd200, &sent);
+                if (sent != D2K_QUIC_REPEATS || t.pass != D2K_QUIC_REPEATS || t.err != 0)
+                    fprintf(stderr, "IPv6 fragment shape=%d sent=%d pass=%d fail=%d err=%d\n",
+                            shape, sent, t.pass, t.fail, t.err);
+                CHECK(sent == D2K_QUIC_REPEATS && t.pass == D2K_QUIC_REPEATS && t.err == 0,
+                      "native IPv6 fragmented QUIC probe receives authenticated answer");
+            }
+        }
         d2k_quic_allow_local = 0;
         r = d2k_quic_classify("::1", port, "x.example", trig_hello(), ctl_hello(), 0);
         CHECK(r.verdict == D2K_V_LOCAL_ADDRESS, "IPv6 loopback is not an ISP measurement");
         d2k_quic_allow_local = 1;
         close(g_rs_fd);
     }
-    if (argc == 2 && strcmp(argv[1], "--ipv6") == 0) return fails ? 1 : 0;
+    if (argc == 2 && (strcmp(argv[1], "--ipv6") == 0 ||
+                      strcmp(argv[1], "--ipv6-fragments") == 0)) return fails ? 1 : 0;
 
     /* ===================================================================
      * Часть 1: дисциплина дерева (подмена d2k_quic_ask_hook).

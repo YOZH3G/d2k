@@ -32,7 +32,7 @@
 struct d2k_session {
     /* Event-loop owned; random initial value, nonzero counter per datagram.
        Never derive this from the client's frequently-zero DF packet ID. */
-    uint16_t fragment_id;
+    uint32_t fragment_id;
     int fragment_seeded;
     /* Крючок netfilter для ТЕКУЩЕГО пакета — см. d2k_session_set_hook.
        D2K_HOOK_UNKNOWN значит «не сказали», и тогда направление выводится
@@ -156,7 +156,7 @@ static size_t shape_slot(uint8_t transport, uint8_t family) {
     return slot_of(transport) + (family == 6 ? 2u : 0u);
 }
 
-static uint16_t next_fragment_id(d2k_session *s) {
+static uint32_t next_fragment_id(d2k_session *s) {
     if (!s->fragment_seeded) {
         FILE *f=fopen("/dev/urandom","rb");
         if (!f) return 0;
@@ -165,7 +165,7 @@ static uint16_t next_fragment_id(d2k_session *s) {
         if (n!=sizeof s->fragment_id) return 0;
         s->fragment_seeded=1;
     }
-    if (++s->fragment_id==0) ++s->fragment_id;
+    if ((uint16_t)++s->fragment_id==0) ++s->fragment_id;
     return s->fragment_id;
 }
 
@@ -521,7 +521,7 @@ static int flow_tracked(d2k_flow *fl, const d2k_conn *c, uint8_t proto,
         for (int attempt = 0; attempt < 3; attempt++) {
             if (c->family == 6) {
                 uint8_t ext6[16];
-                rc = d2k_nat_outside_family(D2K_NAT_PROC, proto, c->src_ip6, c->src_port,
+                rc = d2k_nat_family_hook(D2K_NAT_PROC, proto, c->src_ip6, c->src_port,
                     c->dst_ip6, c->dst_port, 6, ext6, &eport);
             } else {
                 rc = d2k_nat_hook(D2K_NAT_PROC, proto, c->src_ip, c->src_port,
@@ -1070,20 +1070,18 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     c.ip_id = ip->ip_id;
     d2k_conn fragment_conn=c;
     for (size_t i=0;i<acts.n;i++) if (acts.v[i].ipfrag) {
-        if (c.family == 6) {
-            out->skipped = "IPv6 fragment emission not implemented";
-            refuse(s, now_ns, &key, out->skipped);
-            d2k_actions_free(&acts);
-            return;
-        }
         /* NODEFRAG sends bypass reassembly/normal UDP conntrack. Translate
            ONLY fragments here, using the existing client's confirmed tuple.
            Whole fakes retain the original tuple and ordinary kernel NAT.
            No first-packet exemption: unknown mapping cannot be invented. */
         uint32_t ext=0;uint16_t port=0;
-        int found=d2k_nat_hook(D2K_NAT_PROC,17,c.src_ip,c.src_port,
-                              c.dst_ip,c.dst_port,&ext,&port);
-        if(found!=0 || !ext || !port) {
+        uint8_t ext6[16] = {0};
+        int found = c.family == 6
+            ? d2k_nat_family_hook(D2K_NAT_PROC,17,c.src_ip6,c.src_port,
+                                  c.dst_ip6,c.dst_port,6,ext6,&port)
+            : d2k_nat_hook(D2K_NAT_PROC,17,c.src_ip,c.src_port,
+                           c.dst_ip,c.dst_port,&ext,&port);
+        if(found!=0 || (c.family != 6 && !ext) || !port) {
             /* Первый QUIC Initial ещё не подтверждён conntrack, пока его
                NFQUEUE-ID удерживается на разбор/исполнение. NODEFRAG нельзя
                NAT-ить по догадке, поэтому этот пакет проходит нетронутым, но
@@ -1100,7 +1098,11 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
             out->skipped="нет подтверждённого NAT-контекста для IP-фрагментов";
             refuse(s,now_ns,&key,out->skipped);d2k_actions_free(&acts);return;
         }
-        if(found==0){fragment_conn.src_ip=ext;fragment_conn.src_port=port;}
+        if(found==0){
+            if(c.family==6)memcpy(fragment_conn.src_ip6,ext6,16);
+            else fragment_conn.src_ip=ext;
+            fragment_conn.src_port=port;
+        }
         break;
     }
     /* c.ack и c.window остаются нулями: полей TCP у UDP нет, а
@@ -1135,13 +1137,19 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
             d2k_ipfrag_plan fp;
             /* Copying/fragmenting IPv4 options needs its own measured path.
                Reject unsupported context instead of silently losing options. */
-            if (ihl==20 && e->kind==D2K_EMIT_PAYLOAD && !e->pre_len &&
+            if (((c.family==6 && ihl==40) || (c.family!=6 && ihl==20)) &&
+                e->kind==D2K_EMIT_PAYLOAD && !e->pre_len &&
                 !e->seq_shift && !e->poison && !e->wire_profile &&
                 d2k_ipfrag_shape(e->ipfrag,&fp)==0) {
-                uint16_t id=next_fragment_id(s);
-                count=d2k_udpfrag_build_ex((const uint8_t *)&fragment_conn.src_ip,
+                uint32_t id=next_fragment_id(s);
+                if (c.family==6) {
+                    count=d2k_udpfrag6_build_ex(fragment_conn.src_ip6,fragment_conn.dst_ip6,
+                        rd16((const uint8_t *)&fragment_conn.src_port),
+                        rd16((const uint8_t *)&fragment_conn.dst_port),e->bytes,e->len,&fp,id,
+                        c.ttl,c.traffic_class,c.flow_label,buf+used,bufcap-used,spans);
+                } else count=d2k_udpfrag_build_ex((const uint8_t *)&fragment_conn.src_ip,
                     (const uint8_t *)&fragment_conn.dst_ip,rd16((const uint8_t *)&fragment_conn.src_port),
-                    rd16((const uint8_t *)&fragment_conn.dst_port),e->bytes,e->len,&fp,id,
+                    rd16((const uint8_t *)&fragment_conn.dst_port),e->bytes,e->len,&fp,(uint16_t)id,
                     c.ttl,pkt[1],buf+used,bufcap-used,spans);
                 if(count)made=spans[count-1].off+spans[count-1].len;
             }

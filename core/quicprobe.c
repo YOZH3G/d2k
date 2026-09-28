@@ -943,19 +943,19 @@ static ssize_t qp_recv_ttl(int fd, uint8_t *buf, size_t cap, uint8_t *ttl) {
 /* Original nextIPID: random start, shared monotonic counter, never zero.
    Ports are not in the kernel's reassembly key, so they cannot serve as IDs. */
 #ifdef __linux__
-static uint16_t fragment_id(void) {
+static uint32_t fragment_id(void) {
     static pthread_mutex_t mu=PTHREAD_MUTEX_INITIALIZER;
-    static uint16_t current;
+    static uint32_t current;
     static int seeded;
-    uint16_t id=0;
+    uint32_t id=0;
     pthread_mutex_lock(&mu);
     if(!seeded) {
-        uint8_t b[2];
+        uint8_t b[4];
         if(d2k_t13_random(b,sizeof b)!=0)goto done;
-        current=(uint16_t)((unsigned)b[0]*256+b[1]);seeded=1;
+        current=(uint32_t)b[0]<<24 | (uint32_t)b[1]<<16 | (uint32_t)b[2]<<8 | b[3];seeded=1;
     }
-    current=(uint16_t)(current+1);
-    if(!current)current=1;
+    current++;
+    if(!(uint16_t)current)current++;
     id=current;
 done:
     pthread_mutex_unlock(&mu);return id;
@@ -974,38 +974,64 @@ static int qp_send_fragmented(const char *addr,uint16_t port,d2k_hello msg,
 #else
     if(!addr || !msg.bytes || !msg.len || msg.len>D2K_QW_MAX_DGRAM)return -1;
     int rx=-1,raw=-1;
-    rx=socket(AF_INET,SOCK_DGRAM,0);
+    uint8_t target[16];
+    int family=qp_addr_parse(addr,target);
+    if(!family)return -1;
+    rx=socket(family,SOCK_DGRAM,0);
     if(rx<0)return -1;
     if(mark && d2k_mark_hook(rx,mark)!=0){*marked=0;goto fail;}
-    struct sockaddr_in dst,local;
-    memset(&dst,0,sizeof dst);dst.sin_family=AF_INET;dst.sin_port=htons(port);
-    if(inet_pton(AF_INET,addr,&dst.sin_addr)!=1 || connect(rx,(struct sockaddr *)&dst,sizeof dst)!=0)goto fail;
+    struct sockaddr_storage dst,local;
+    memset(&dst,0,sizeof dst);
+    socklen_t dst_len;
+    if(family==AF_INET6) {
+        struct sockaddr_in6 *v6=(struct sockaddr_in6 *)&dst;
+        v6->sin6_family=AF_INET6;v6->sin6_port=htons(port);
+        memcpy(&v6->sin6_addr,target,16);dst_len=sizeof *v6;
+    } else {
+        struct sockaddr_in *v4=(struct sockaddr_in *)&dst;
+        v4->sin_family=AF_INET;v4->sin_port=htons(port);
+        memcpy(&v4->sin_addr,target,4);dst_len=sizeof *v4;
+    }
+    if(connect(rx,(struct sockaddr *)&dst,dst_len)!=0)goto fail;
     socklen_t local_len=sizeof local;
     if(getsockname(rx,(struct sockaddr *)&local,&local_len)!=0)goto fail;
-    raw=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
+    raw=socket(family,SOCK_RAW,IPPROTO_RAW);
     if(raw<0)goto fail;
     int one=1;
-    if(setsockopt(raw,IPPROTO_IP,IP_HDRINCL,&one,sizeof one)!=0)goto fail;
+    if(setsockopt(raw,family==AF_INET6?IPPROTO_IPV6:IPPROTO_IP,
+        family==AF_INET6?IPV6_HDRINCL:IP_HDRINCL,&one,sizeof one)!=0)goto fail;
     /* Proven donor/platform limitation: local conntrack can reorder pos8
        and discard overlaps BEFORE the probe reaches the wire. Preserve the
        donor's requested fragments, not that accidental kernel rewrite.
        No fallback: unavailable NODEFRAG is unsent/local error (SPEC §7). */
+    if(family==AF_INET) {
 #ifdef IP_NODEFRAG
     if(setsockopt(raw,IPPROTO_IP,IP_NODEFRAG,&one,sizeof one)!=0)goto fail;
 #else
     goto fail;
 #endif
+    }
     /* Unlike the donor's EPERM fallback, D2K refuses to send an unisolated
        raw probe through its own candidate. SPEC §7, tested explicitly. */
     if(mark && d2k_mark_hook(raw,mark)!=0){*marked=0;goto fail;}
-    uint8_t wire[3*(D2K_QW_MAX_DGRAM+28)];d2k_ipfrag_span spans[3];
-    uint16_t id=fragment_id();
-    size_t n=d2k_udpfrag_build((const uint8_t *)&local.sin_addr.s_addr,
-        (const uint8_t *)&dst.sin_addr.s_addr,ntohs(local.sin_port),port,
-        msg.bytes,msg.len,plan,id,wire,sizeof wire,spans);
+    uint8_t wire[3*(D2K_QW_MAX_DGRAM+48)];d2k_ipfrag_span spans[3];
+    uint32_t id=fragment_id();
+    size_t n;
+    if(family==AF_INET6) {
+        struct sockaddr_in6 *v6=(struct sockaddr_in6 *)&local;
+        n=d2k_udpfrag6_build_ex((const uint8_t *)&v6->sin6_addr,target,
+            ntohs(v6->sin6_port),port,msg.bytes,msg.len,plan,id,64,0,0,
+            wire,sizeof wire,spans);
+        ((struct sockaddr_in6 *)&dst)->sin6_port=0;
+    } else {
+        struct sockaddr_in *v4=(struct sockaddr_in *)&local;
+        n=d2k_udpfrag_build((const uint8_t *)&v4->sin_addr,target,
+            ntohs(v4->sin_port),port,msg.bytes,msg.len,plan,(uint16_t)id,
+            wire,sizeof wire,spans);
+    }
     if(!n)goto fail;
     for(size_t i=0;i<n;i++) {
-        if(sendto(raw,wire+spans[i].off,spans[i].len,0,(struct sockaddr *)&dst,sizeof dst)!=(ssize_t)spans[i].len)goto fail;
+        if(sendto(raw,wire+spans[i].off,spans[i].len,0,(struct sockaddr *)&dst,dst_len)!=(ssize_t)spans[i].len)goto fail;
     }
     close(raw);return rx;
 fail:

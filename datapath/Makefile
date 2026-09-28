@@ -63,7 +63,7 @@ test-addr: test_addr
 .PHONY: test-raw6-linux
 test-raw6-linux: test_raw6.c raw.c wire_udp.c $(HDR)
 	$(CC) $(CFLAGS) -Dsetsockopt=d2k_test_setsockopt -c raw.c -o raw6_test.o
-	$(CC) $(CFLAGS) -o test_raw6 test_raw6.c raw6_test.o wire_udp.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o test_raw6 test_raw6.c raw6_test.o wire_udp.c ../core/ipfrag.c $(LDFLAGS)
 	./test_raw6
 
 check: test-addr

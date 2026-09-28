@@ -89,5 +89,9 @@ typedef int (*d2k_nat_fn)(const char *path, uint8_t proto,
                           uint32_t dst_ip, uint16_t dst_port,
                           uint32_t *out_src, uint16_t *out_sport);
 extern d2k_nat_fn d2k_nat_hook;
+typedef int (*d2k_nat_family_fn)(const char *path, uint8_t proto,
+    const uint8_t *src, uint16_t sport, const uint8_t *dst, uint16_t dport,
+    uint8_t family, uint8_t *out_src, uint16_t *out_sport);
+extern d2k_nat_family_fn d2k_nat_family_hook;
 
 #endif /* D2K_NAT_H */

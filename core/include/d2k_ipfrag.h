@@ -29,4 +29,10 @@ size_t d2k_udpfrag_build_ex(const uint8_t src[4], const uint8_t dst[4],
     uint16_t sport, uint16_t dport, const uint8_t *payload, size_t len,
     const d2k_ipfrag_plan *plan, uint16_t id, uint8_t ttl, uint8_t tos,
     uint8_t *out, size_t cap, d2k_ipfrag_span spans[3]);
+/* Native IPv6 Fragment headers, with the same measured cuts/order. Overlap
+ * shapes remain experiments: building them does not imply peer acceptance. */
+size_t d2k_udpfrag6_build_ex(const uint8_t src[16], const uint8_t dst[16],
+    uint16_t sport, uint16_t dport, const uint8_t *payload, size_t len,
+    const d2k_ipfrag_plan *plan, uint32_t id, uint8_t hop, uint8_t traffic_class,
+    uint32_t flow_label, uint8_t *out, size_t cap, d2k_ipfrag_span spans[3]);
 #endif

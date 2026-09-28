@@ -87,3 +87,43 @@ size_t d2k_udpfrag_build(const uint8_t src[4],const uint8_t dst[4],
     const d2k_ipfrag_plan *p,uint16_t id,uint8_t *out,size_t cap,d2k_ipfrag_span spans[3]) {
     return d2k_udpfrag_build_ex(src,dst,sport,dport,payload,len,p,id,64,0,out,cap,spans);
 }
+
+size_t d2k_udpfrag6_build_ex(const uint8_t src[16], const uint8_t dst[16],
+    uint16_t sport, uint16_t dport, const uint8_t *payload, size_t len,
+    const d2k_ipfrag_plan *p, uint32_t id, uint8_t hop, uint8_t tc,
+    uint32_t flow, uint8_t *out, size_t cap, d2k_ipfrag_span spans[3]) {
+    if (!src || !dst || (!payload && len) || !out || !spans || !id || !hop ||
+        flow > 0xfffff || len > 65507) return 0;
+    d2k_ipfrag_span cuts[3];
+    size_t n = d2k_ipfrag_cuts(len + 8, p, cuts), needed = 0;
+    if (!n) return 0;
+    for (size_t i = 0; i < n; i++) needed += 48 + cuts[i].len;
+    if (needed > cap) return 0;
+    uint8_t udp[8] = {0}, pseudo[40] = {0};
+    wr16(udp, sport); wr16(udp + 2, dport); wr16(udp + 4, (uint16_t)(len + 8));
+    memcpy(pseudo, src, 16); memcpy(pseudo + 16, dst, 16);
+    wr16(pseudo + 34, (uint16_t)(len + 8)); pseudo[39] = 17;
+    uint16_t cs = fold(sum16(payload, len, sum16(udp, 8, sum16(pseudo, 40, 0))));
+    wr16(udp + 6, cs ? cs : 0xffff);
+    size_t used = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t ci = p->reverse ? n - 1 - i : i;
+        d2k_ipfrag_span c = cuts[ci];
+        uint8_t *f = out + used;
+        memset(f, 0, 48);
+        f[0] = (uint8_t)(0x60 | (tc >> 4));
+        f[1] = (uint8_t)((tc << 4) | (flow >> 16));
+        wr16(f + 2, (uint16_t)flow);
+        wr16(f + 4, (uint16_t)(8 + c.len)); f[6] = 44; f[7] = hop;
+        memcpy(f + 8, src, 16); memcpy(f + 24, dst, 16);
+        f[40] = 17;
+        wr16(f + 42, (uint16_t)(c.off | (ci + 1 < n ? 1 : 0)));
+        wr16(f + 44, (uint16_t)(id >> 16)); wr16(f + 46, (uint16_t)id);
+        for (size_t j = 0; j < c.len; j++) {
+            size_t logical = c.off + j;
+            f[48 + j] = logical < 8 ? udp[logical] : payload[logical - 8];
+        }
+        spans[i] = (d2k_ipfrag_span){used, 48 + c.len}; used += 48 + c.len;
+    }
+    return n;
+}

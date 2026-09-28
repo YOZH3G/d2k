@@ -45,6 +45,41 @@ int main(void) {
         CHECK(out[0]==0xab); /* no partial output on insufficient capacity */
     }
     d2k_ipfrag_plan p={.pos1=30};d2k_ipfrag_span cuts[3];
+    {
+        uint8_t s6[16] = {0x20,1}, d6[16] = {0x20,1};
+        s6[15] = 1; d6[15] = 2;
+        for (int shape = 1; shape <= 4; shape++) {
+            d2k_ipfrag_plan plan;
+            d2k_ipfrag_span spans[3], logical[3];
+            CHECK(d2k_ipfrag_shape(shape, &plan) == 0);
+            size_t count = d2k_ipfrag_cuts(1208, &plan, logical);
+            size_t n = d2k_udpfrag6_build_ex(s6, d6, 51234, 443, payload, sizeof payload,
+                &plan, 0x12345678, 57, 0xa5, 0xabcde, out, sizeof out, spans);
+            CHECK(n == count);
+            uint8_t restored[1208] = {0};
+            for (size_t i = 0; i < n; i++) {
+                const uint8_t *f = out + spans[i].off;
+                size_t ci = plan.reverse ? n - 1 - i : i;
+                CHECK(f[0] == 0x6a && f[1] == 0x5a && f[2] == 0xbc && f[3] == 0xde);
+                CHECK(f[6] == 44 && f[7] == 57 && f[40] == 17 && f[41] == 0);
+                CHECK(rd16(f + 4) + 40 == spans[i].len);
+                CHECK((rd16(f + 42) & 0xfff8) == logical[ci].off);
+                CHECK((rd16(f + 42) & 1) == (ci + 1 < n));
+                CHECK(rd16(f + 44) == 0x1234 && rd16(f + 46) == 0x5678);
+                CHECK(!memcmp(f + 8, s6, 16) && !memcmp(f + 24, d6, 16));
+                memcpy(restored + logical[ci].off, f + 48, spans[i].len - 48);
+            }
+            uint8_t pseudo[1248] = {0};
+            memcpy(pseudo, s6, 16); memcpy(pseudo + 16, d6, 16);
+            pseudo[34] = 4; pseudo[35] = 184; pseudo[39] = 17;
+            memcpy(pseudo + 40, restored, sizeof restored);
+            CHECK(sum(pseudo, sizeof pseudo) == 65535);
+            CHECK(!memcmp(restored + 8, payload, sizeof payload));
+            memset(out, 0xab, sizeof out);
+            CHECK(!d2k_udpfrag6_build_ex(s6, d6, 1, 2, payload, sizeof payload,
+                &plan, 1, 64, 0, 0, out, 48, spans) && out[0] == 0xab);
+        }
+    }
     CHECK(d2k_ipfrag_cuts(1208,&p,cuts)==2 && cuts[0].len==24);
     p.three=1;p.pos1=8;p.pos2=0;
     CHECK(d2k_ipfrag_cuts(1208,&p,cuts)==3 && cuts[1].len==24);
