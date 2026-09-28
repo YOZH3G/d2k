@@ -297,6 +297,21 @@ static void test_compose_follows_the_vector(void)
 
 int main(void)
 {
+    {
+        int n, applicable6 = 0, ipv4_only = 0;
+        const d2k_poison *poisons = d2k_poisons(&n);
+        for (int i = 0; i < n; i++) {
+            if (!d2k_poison_supports_family(&poisons[i], 4))
+                fail("IPv4 lost donor hypothesis %s", poisons[i].name);
+            int supported6 = d2k_poison_supports_family(&poisons[i], 6);
+            if (supported6 == !!poisons[i].ip_id_zero)
+                fail("IPv6 applicability wrong for %s", poisons[i].name);
+            applicable6 += supported6;
+            ipv4_only += !!poisons[i].ip_id_zero;
+        }
+        if (!ipv4_only || applicable6 + ipv4_only != n)
+            fail("family filtering did not exercise IPv4-only IPID");
+    }
     printf("перенос: инварианты без сети\n");
     test_repeats_reach_the_strategy();
     test_fooling_flags_reach_the_strategy();

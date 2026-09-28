@@ -576,7 +576,8 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
             if (d2k_detect_stopped(&opt->cancel)) {
                 break;
             }
-            if (d2k_opts_skipped(opt, cands[k].name)) {
+            if (!d2k_poison_supports_family(&cands[k], family) ||
+                d2k_opts_skipped(opt, cands[k].name)) {
                 continue;
             }
             obs = d2k_trace_add(res, cands[k].name);
@@ -614,7 +615,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         if (opt->only[0] != '\0' && strcmp(p.name, opt->only) != 0) {
             continue;
         }
-        if (d2k_opts_skipped(opt, p.name)) {
+        if (!d2k_poison_supports_family(&p, family) || d2k_opts_skipped(opt, p.name)) {
             continue;
         }
         snprintf(pname, sizeof(pname), "poison:%s", p.name);

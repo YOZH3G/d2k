@@ -311,6 +311,7 @@ int d2k_run_properties_family(const uint8_t *ip, uint8_t family, uint16_t port,
     const d2k_trigger *tr, const d2k_opts *opt, d2k_result *res, d2k_poison *hit);
 
 const d2k_poison *d2k_poisons(int *n);
+int d2k_poison_supports_family(const d2k_poison *p, uint8_t family);
 void d2k_strategy_for_poison(const d2k_poison *p, char *out, size_t cap);
 void d2k_strategy_for(int pos, char *out, size_t cap);
 void d2k_note_props_hit(d2k_dprops *pr, const d2k_poison *p);

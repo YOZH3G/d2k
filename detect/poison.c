@@ -13,6 +13,13 @@
 #include <stdio.h>
 #include <string.h>
 
+int d2k_poison_supports_family(const d2k_poison *p, uint8_t family)
+{
+    /* IPv6 has no IPv4 Identification field. Do not measure an impossible
+       wire hypothesis and record its local construction error as a block. */
+    return p && (family == 4 || (family == 6 && !p->ip_id_zero));
+}
+
 int d2k_poison_has_fake(const d2k_poison *p)
 {
     /* synData и oob фальшивки не несут вовсе, fakeBetween ставит её сам и в
