@@ -69,6 +69,9 @@ int d2k_nat_outside(const char *path, uint8_t proto,
                     uint32_t src_ip, uint16_t src_port,
                     uint32_t dst_ip, uint16_t dst_port,
                     uint32_t *out_src, uint16_t *out_sport);
+int d2k_nat_outside_family(const char *path, uint8_t proto,
+    const uint8_t *src, uint16_t sport, const uint8_t *dst, uint16_t dport,
+    uint8_t family, uint8_t *out_src, uint16_t *out_sport);
 
 /* Точка подмены справки о трансляции — для тестов.
  *

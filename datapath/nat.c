@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "d2k_nat.h"
 
@@ -66,7 +67,25 @@ int d2k_nat_outside(const char *path, uint8_t proto,
                     uint32_t src_ip, uint16_t src_port,
                     uint32_t dst_ip, uint16_t dst_port,
                     uint32_t *out_src, uint16_t *out_sport) {
-    if (!path || !out_src || !out_sport) { return -1; }
+    return d2k_nat_outside_family(path, proto, (const uint8_t *)&src_ip, src_port,
+        (const uint8_t *)&dst_ip, dst_port, 4, (uint8_t *)out_src, out_sport);
+}
+
+static int parse_address(const char *text, uint8_t family, uint8_t out[16]) {
+    memset(out, 0, 16);
+    if (family == 6) { return inet_pton(AF_INET6, text, out) == 1 ? 0 : -1; }
+    uint32_t v;
+    if (parse_ip4(text, &v) != 0) { return -1; }
+    memcpy(out, &v, 4);
+    return 0;
+}
+
+int d2k_nat_outside_family(const char *path, uint8_t proto,
+    const uint8_t *src_ip, uint16_t src_port, const uint8_t *dst_ip, uint16_t dst_port,
+    uint8_t family, uint8_t *out_src, uint16_t *out_sport) {
+    if (!path || !src_ip || !dst_ip || !out_src || !out_sport ||
+        (family != 4 && family != 6)) { return -1; }
+    size_t alen = family == 6 ? 16 : 4;
     FILE *f = fopen(path, "r");
     if (!f) {
         /* Таблицы соединений в системе НЕТ — значит нет и conntrack, а без
@@ -120,14 +139,15 @@ int d2k_nat_outside(const char *path, uint8_t proto,
         if (!v_dport) { continue; }
         char *after_dport = next;
 
-        uint32_t o_src = 0, o_dst = 0;
-        if (parse_ip4(v_src, &o_src) != 0 || parse_ip4(v_dst, &o_dst) != 0) { continue; }
+        uint8_t o_src[16], o_dst[16];
+        if (parse_address(v_src, family, o_src) != 0 ||
+            parse_address(v_dst, family, o_dst) != 0) { continue; }
         uint16_t o_sport = (uint16_t)atoi(v_sport);
         uint16_t o_dport = (uint16_t)atoi(v_dport);
-        uint16_t n_sport = (uint16_t)((o_sport >> 8) | (o_sport << 8));
-        uint16_t n_dport = (uint16_t)((o_dport >> 8) | (o_dport << 8));
+        uint16_t n_sport = htons(o_sport);
+        uint16_t n_dport = htons(o_dport);
 
-        if (o_src != src_ip || o_dst != dst_ip ||
+        if (memcmp(o_src, src_ip, alen) || memcmp(o_dst, dst_ip, alen) ||
             n_sport != src_port || n_dport != dst_port) {
             continue;
         }
@@ -140,8 +160,8 @@ int d2k_nat_outside(const char *path, uint8_t proto,
         char *r_dport = field_after(after_rdst, "dport", &next);
         if (!r_dport) { break; }
 
-        uint32_t ext = 0;
-        if (parse_ip4(r_dst, &ext) != 0) { continue; }
+        uint8_t ext[16];
+        if (parse_address(r_dst, family, ext) != 0) { continue; }
         uint16_t ext_port = (uint16_t)atoi(r_dport);
 
         /* Остаток жизни — третье число строки: «ipv4 2 tcp 6 1194 ...».
@@ -164,8 +184,8 @@ int d2k_nat_outside(const char *path, uint8_t proto,
         }
         if (ttl <= best_ttl && found == 0) { continue; }
         best_ttl = ttl;
-        *out_src = ext;
-        *out_sport = (uint16_t)((ext_port >> 8) | (ext_port << 8));
+        memcpy(out_src, ext, alen);
+        *out_sport = htons(ext_port);
         found = 0;
     }
     fclose(f);

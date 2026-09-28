@@ -37,6 +37,10 @@ typedef struct {
     uint16_t window;   /* хостовый порядок */
     uint8_t  ttl;      /* TTL исходного пакета: от него отсчитываем свой */
     uint16_t ip_id;    /* идентификатор исходного пакета */
+    uint8_t family;    /* 0/4 legacy IPv4, 6 IPv6 */
+    uint8_t src_ip6[16], dst_ip6[16];
+    uint8_t traffic_class;
+    uint32_t flow_label; /* host order, low 20 bits */
 } d2k_conn;
 
 /* Собирает пакет в out. Возвращает длину или 0, если не поместилось.

@@ -418,6 +418,37 @@ static void test_suspect_tells_planned(void) {
 }
 
 int main(void) {
+    {
+        d2k_session *v6 = d2k_session_new(32, 32);
+        uint8_t hello6[512], ip4[1024], ip6[1044] = {0}, output6[8192];
+        size_t h6 = build_hello(hello6);
+        size_t n4 = build_pkt(ip4, 47701, 0x18, hello6, h6);
+        size_t n6 = n4 + 20;
+        ip6[0] = 0x60; wr16(ip6 + 4, (uint16_t)(n4 - 20));
+        ip6[6] = 6; ip6[7] = 64;
+        ip6[8] = ip6[24] = 0x20; ip6[9] = ip6[25] = 1;
+        ip6[23] = 1; ip6[39] = 2;
+        memcpy(ip6 + 40, ip4 + 20, n4 - 20);
+        d2k_result r6;
+        d2k_session_want_shape_family(v6, NULL, 0, 6, 6);
+        d2k_session_packet(v6, ip6, n6, 1, output6, sizeof output6, &r6);
+        CHECK(r6.verdict == D2K_VERDICT_ACCEPT, "IPv6 observation dropped traffic");
+        CHECK(count_kind(v6, D2K_JRN_HELLO_SNI) == 1, "IPv6 TLS hello not observed");
+        size_t snaplen = 0;
+        const uint8_t *snap = d2k_session_shape_family(v6, 6, 6, &snaplen);
+        CHECK(snap && snaplen == h6 && !memcmp(snap, hello6, h6), "IPv6 live snapshot missing");
+        CHECK(d2k_session_shape(v6, 6, &snaplen) == NULL, "IPv6 polluted IPv4 snapshot");
+        d2k_plan *p6 = NULL; char why6[128];
+        CHECK(d2k_plan_load(plan_owns_payload, sizeof plan_owns_payload, &p6,
+                             why6, sizeof why6) == 0, "IPv6 execution fixture plan");
+        CHECK(d2k_plantab_set_addr_family(d2k_session_plans(v6), ip6 + 24, 6, 2, p6) == 0,
+              "IPv6 execution address binding");
+        wr16(ip6 + 40, 47702);
+        d2k_session_packet(v6, ip6, n6, 3, output6, sizeof output6, &r6);
+        CHECK(r6.applied && r6.n_out > 0 && (output6[0] >> 4) == 6,
+              "IPv6 plan did not produce native IPv6 packets");
+        d2k_session_free(v6);
+    }
     test_suspect_tells_planned();
     d2k_session *s = d2k_session_new(64, 32);
     CHECK(s != NULL, "сессия не создалась");

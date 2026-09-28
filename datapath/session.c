@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "d2k_plans.h"
+#include "d2k_packet.h"
 #include "d2k_quic.h" /* core/ — разбор QUIC линкуется исходниками, см. Makefile */
 #include "d2k_nat.h"
 #include "d2k_session.h"
@@ -518,8 +519,14 @@ static int flow_tracked(d2k_flow *fl, const d2k_conn *c, uint8_t proto,
          * пакет. */
         int rc = -1;
         for (int attempt = 0; attempt < 3; attempt++) {
-            rc = d2k_nat_hook(D2K_NAT_PROC, proto, c->src_ip, c->src_port,
+            if (c->family == 6) {
+                uint8_t ext6[16];
+                rc = d2k_nat_outside_family(D2K_NAT_PROC, proto, c->src_ip6, c->src_port,
+                    c->dst_ip6, c->dst_port, 6, ext6, &eport);
+            } else {
+                rc = d2k_nat_hook(D2K_NAT_PROC, proto, c->src_ip, c->src_port,
                               c->dst_ip, c->dst_port, &ext, &eport);
+            }
             if (rc >= 0) {
                 if (attempt > 0) { g_nat_retried++; }
                 break;
@@ -556,9 +563,10 @@ static int flow_tracked(d2k_flow *fl, const d2k_conn *c, uint8_t proto,
 }
 
 static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
-                       size_t ihl, uint64_t now_ns,
+                       const d2k_packet_view *ip, uint64_t now_ns,
                        uint8_t *buf, size_t bufcap, d2k_result *out,
                        int controller_probe) {
+    size_t ihl = ip->l4;
     /* Минимум для UDP — 8 байт заголовка, а не унаследованные от TCP 20: у
        UDP нет ни номеров последовательности, ни опций, и датаграмма с пустой
        нагрузкой (total == ihl + 8) уже целиком помещается. Раньше эта
@@ -572,11 +580,11 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     /* Тот же фрагмент-контроль, что в общем прологе TCP-ветки чуть ниже — не
        вынесен в общий код, чтобы правка UDP-ветки не могла задеть уже
        проверенный путь TCP ни при каких условиях. */
-    if ((rd16(pkt + 6) & 0x1fff) != 0) {
+    if ((ip->fragment & 0x1fff) != 0) {
         out->skipped = "фрагмент";
         return;
     }
-    size_t total = rd16(pkt + 2);
+    size_t total = ip->total;
     if (total > len || total < ihl + 8) {
         out->skipped = "поле длины не сходится";
         return;
@@ -587,7 +595,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     size_t payload_len = total - payload_off;
 
     d2k_key key;
-    int src_is_low = d2k_key_make(&key, 17, pkt + 12, pkt + 16, u + 0, u + 2);
+    int src_is_low = d2k_key_make_addr(&key, 17, &ip->src, &ip->dst, u, u + 2);
 
     d2k_flow *fl = d2k_track_get(s->uflows, &key, now_ns);
     if (!fl) {
@@ -917,8 +925,6 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         }
     }
 
-    uint32_t dst_be;
-    memcpy(&dst_be, pkt + 16, 4);
     /* Форма — СВОЯ, QUIC. Ноль здесь был дырой: он означает «не объявлено» и
        совместим с чем угодно, поэтому план, подтверждённый собственным зондом
        на TLS поверх TCP, выдавался Initial того же имени. Транспорт другой,
@@ -937,18 +943,21 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     memcpy(&sport_be, u + 0, 2);
     d2k_addr_probe_flow probe_flow;
     memset(&probe_flow, 0, sizeof probe_flow);
-    memcpy(probe_flow.src_ip4, pkt + 12, 4);
+    probe_flow.family = ip->family;
+    memcpy(ip->family == 6 ? probe_flow.src_ip6 : probe_flow.src_ip4,
+           ip->src.bytes, ip->family == 6 ? 16 : 4);
     memcpy(&probe_flow.src_port_be, u + 0, 2);
-    memcpy(probe_flow.dst_ip4, pkt + 16, 4);
+    memcpy(ip->family == 6 ? probe_flow.dst_ip6 : probe_flow.dst_ip4,
+           ip->dst.bytes, ip->family == 6 ? 16 : 4);
     memcpy(&probe_flow.dst_port_be, u + 2, 2);
     probe_flow.transport = 17;
     uint8_t trial_id[D2K_TRIAL_ID_LEN] = {0};
     const d2k_plan *use = voice ? NULL : d2k_plantab_find_addr_probe(
         s->plans, &probe_flow, now_ns, trial_id);
     if (!use) { memset(trial_id, 0, sizeof trial_id); }
-    if (!use) { use = d2k_plantab_find_sport(s->plans,
+    if (!use) { use = d2k_plantab_find_target(s->plans,
                                                  named ? (const uint8_t *)name : NULL,
-                                                 name_len, dst_be, now_ns,
+                                                 name_len, ip->dst.bytes, ip->family, now_ns,
                                                  seen_shape, sport_be); }
     if (!use) {
         use = s->plan;
@@ -1041,8 +1050,12 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
 
     d2k_conn c;
     memset(&c, 0, sizeof c);
-    memcpy(&c.src_ip, pkt + 12, 4);
-    memcpy(&c.dst_ip, pkt + 16, 4);
+    c.family = ip->family;
+    memcpy(ip->family == 6 ? c.src_ip6 : (uint8_t *)&c.src_ip,
+           ip->src.bytes, ip->family == 6 ? 16 : 4);
+    memcpy(ip->family == 6 ? c.dst_ip6 : (uint8_t *)&c.dst_ip,
+           ip->dst.bytes, ip->family == 6 ? 16 : 4);
+    c.traffic_class = ip->traffic_class; c.flow_label = ip->flow_label;
     memcpy(&c.src_port, u + 0, 2);
     memcpy(&c.dst_port, u + 2, 2);
     /* Транзитный поток обязан вестись conntrack — см. flow_tracked выше:
@@ -1053,10 +1066,16 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         d2k_actions_free(&acts);
         return;
     }
-    c.ttl = pkt[8];
-    c.ip_id = rd16(pkt + 4);
+    c.ttl = ip->hop_limit;
+    c.ip_id = ip->ip_id;
     d2k_conn fragment_conn=c;
     for (size_t i=0;i<acts.n;i++) if (acts.v[i].ipfrag) {
+        if (c.family == 6) {
+            out->skipped = "IPv6 fragment emission not implemented";
+            refuse(s, now_ns, &key, out->skipped);
+            d2k_actions_free(&acts);
+            return;
+        }
         /* NODEFRAG sends bypass reassembly/normal UDP conntrack. Translate
            ONLY fragments here, using the existing client's confirmed tuple.
            Whole fakes retain the original tuple and ordinary kernel NAT.
@@ -1218,11 +1237,12 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     }
 
     /* --- заголовки, с явными границами на каждом шаге ------------------- */
-    if (len < 20 || (pkt[0] >> 4) != 4) {
-        out->skipped = "не IPv4";
+    d2k_packet_view ip;
+    if (!d2k_packet_parse(pkt, len, &ip)) {
+        out->skipped = "неподдержанный или неполный IP-пакет";
         return 0;
     }
-    size_t ihl = (size_t)(pkt[0] & 0x0f) * 4;
+    size_t ihl = ip.l4;
     if (ihl < 20) {
         /* Нарушение самого IPv4: IHL короче 20 байт не бывает ни при каком
            транспорте — эта проверка делится TCP и UDP честно, а не по
@@ -1230,7 +1250,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         out->skipped = "заголовок не помещается";
         return 0;
     }
-    if (pkt[9] == 17) {
+    if (ip.protocol == 17) {
         /* UDP — своя ветка, см. handle_udp выше. Дальше в этой функции всё
            написано под TCP-заголовок и трогать эти байты как UDP нельзя.
            Проверка «хватает ли len на минимальный заголовок» — внутри
@@ -1238,12 +1258,12 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
            см. ревью задачи 4 — короткая, но честная UDP-датаграмма получала
            TCP-объяснение «заголовок не помещается» ровно из-за этого). */
         if (!observe_only) {
-            handle_udp(s, pkt, len, ihl, now_ns, buf, bufcap, out,
+            handle_udp(s, pkt, len, &ip, now_ns, buf, bufcap, out,
                        controller_probe);
         }
         return 0;
     }
-    if (pkt[9] != 6) {
+    if (ip.protocol != 6) {
         out->skipped = "не TCP";
         return 0;
     }
@@ -1254,11 +1274,11 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     /* Фрагмент без нулевого смещения не несёт заголовка TCP. Собирать
        фрагменты датапат не умеет и не должен: §5.2 говорит про ОГРАНИЧЕННУЮ
        пересборку, и её ещё нет. */
-    if ((rd16(pkt + 6) & 0x1fff) != 0) {
+    if ((ip.fragment & 0x1fff) != 0) {
         out->skipped = "фрагмент";
         return 0;
     }
-    size_t total = rd16(pkt + 2);
+    size_t total = ip.total;
     if (total > len || total < ihl + 20) {
         out->skipped = "поле длины не сходится";
         return 0;
@@ -1272,7 +1292,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     }
 
     d2k_key key;
-    int src_is_low = d2k_key_make(&key, 6, pkt + 12, pkt + 16, t + 0, t + 2);
+    int src_is_low = d2k_key_make_addr(&key, 6, &ip.src, &ip.dst, t, t + 2);
 
     uint8_t flags = t[13];
     const int fin = (flags & 0x01) != 0;
@@ -1331,7 +1351,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                то есть заведомо настоящий сервер: подделка приходит позже, в
                ответ на приветствие. */
             fl->rev_profiled = 1;
-            fl->rev_ttl = pkt[8];
+            fl->rev_ttl = ip.hop_limit;
             fl->rev_tos = pkt[1];
         }
         fl->rev_pkts++;
@@ -1426,7 +1446,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     /* Закрытие — повод отпустить ячейку сразу, не дожидаясь молчания.
        Но сперва посмотреть, не улика ли это. */
     if (rst && !fwd && (fl->guards & D2K_GUARD_RST_ALIEN) && fl->rev_profiled &&
-        pkt[8] != fl->rev_ttl) {
+        ip.hop_limit != fl->rev_ttl) {
         /* Сброс пришёл с другим TTL, чем всё, что до сих пор отвечало по этому
            соединению, — значит послан не оттуда. Снимаем.
 
@@ -1438,10 +1458,10 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         s->rst_dropped++;
         if (fl->saw_hello && rev_before == 0) {
             d2k_jrn_detail det;
-            det.ttl = pkt[8];
+            det.ttl = ip.hop_limit;
             det.ref_ttl = fl->rev_ttl;
             det.tos = pkt[1];
-            det.ipid = rd16(pkt + 4);
+            det.ipid = ip.ip_id;
             suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST_CUT, &det);
         }
         out->verdict = D2K_VERDICT_DROP;
@@ -1457,10 +1477,10 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                мог и правда закрыть соединение. */
             fl->saw_rev_rst = 1;
             d2k_jrn_detail det;
-            det.ttl = pkt[8];
+            det.ttl = ip.hop_limit;
             det.ref_ttl = fl->rev_profiled ? fl->rev_ttl : 0;
             det.tos = pkt[1];
-            det.ipid = rd16(pkt + 4);
+            det.ipid = ip.ip_id;
             suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST, &det);
         }
         d2k_capture_forget(&s->capture, &key);
@@ -1555,7 +1575,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        текущего пакета: tls ниже по-прежнему описывает именно этот пакет.
        Исполнение на составном входе требует отдельного удержания/выпуска. */
     if (fwd && !fl->hello_capture_done && fl->fwd_pkts <= D2K_CAPTURE_WINDOW &&
-        (rd16(pkt + 6) & 0x3fff) == 0) {
+        (ip.fragment & 0x3fff) == 0) {
         const uint8_t *hello;
         size_t hello_len;
         uint32_t hello_seq;
@@ -1655,8 +1675,6 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        первым; адрес — запасной ключ, за которым у CDN стоят сотни имён. */
     const d2k_plan *use = NULL;
     if (tls.is_client_hello) {
-        uint32_t dst_be;
-        memcpy(&dst_be, pkt + 16, 4);
         /* ФОРМА НАБЛЮДАЕМОГО ПРИВЕТСТВИЯ. План, подтверждённый на приветствии
            одной формы, не применяется к приветствию другой: успех
            собственного зонда на TLS 1.3 ничего не говорит про браузер с
@@ -1684,10 +1702,10 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         /* Местный порт — см. ту же оговорку в ветке UDP выше. */
         uint16_t sport_be;
         memcpy(&sport_be, t + 0, 2);
-        use = d2k_plantab_find_sport(s->plans,
+        use = d2k_plantab_find_target(s->plans,
                                      tls.have_sni ? pkt + payload_off + tls.sni_off : NULL,
                                      tls.have_sni ? tls.sni_len : 0,
-                                     dst_be, now_ns, seen_shape, sport_be);
+                                     ip.dst.bytes, ip.family, now_ns, seen_shape, sport_be);
         if (!use) {
             use = s->plan;
         }
@@ -1765,8 +1783,12 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     memset(&c, 0, sizeof c);
     /* Из пакета, а не из ключа: ключ канонизирован, и «низкая» сторона может
        оказаться сервером. Собранный по нему пакет полетел бы задом наперёд. */
-    memcpy(&c.src_ip, pkt + 12, 4);
-    memcpy(&c.dst_ip, pkt + 16, 4);
+    c.family = ip.family;
+    memcpy(ip.family == 6 ? c.src_ip6 : (uint8_t *)&c.src_ip,
+           ip.src.bytes, ip.family == 6 ? 16 : 4);
+    memcpy(ip.family == 6 ? c.dst_ip6 : (uint8_t *)&c.dst_ip,
+           ip.dst.bytes, ip.family == 6 ? 16 : 4);
+    c.traffic_class = ip.traffic_class; c.flow_label = ip.flow_label;
     memcpy(&c.src_port, t + 0, 2);
     memcpy(&c.dst_port, t + 2, 2);
     /* То же, что и на UDP-ветке: без записи conntrack наши посылки уйдут
@@ -1779,8 +1801,8 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     }
     c.ack = rd32(t + 8);
     c.window = rd16(t + 14);
-    c.ttl = pkt[8];
-    c.ip_id = rd16(pkt + 4);
+    c.ttl = ip.hop_limit;
+    c.ip_id = ip.ip_id;
 
     if (acts.n > sizeof out->out / sizeof out->out[0]) {
         /* Тот же класс отказа, что и made==0 чуть ниже (ревью задачи 4,

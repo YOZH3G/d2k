@@ -1152,6 +1152,33 @@ static void test_fragments(void) {
 }
 
 int main(void) {
+    {
+        d2k_session *s6 = d2k_session_new(32, 32);
+        uint8_t old[1400], pkt[1420] = {0}, output[8192];
+        size_t n4 = build_udp_pkt(old, 50011, 443, v1_initial, sizeof v1_initial);
+        pkt[0] = 0x60; pkt[4] = (uint8_t)((n4 - 20) >> 8); pkt[5] = (uint8_t)(n4 - 20);
+        pkt[6] = 17; pkt[7] = 64;
+        pkt[8] = pkt[24] = 0x20; pkt[9] = pkt[25] = 1;
+        pkt[23] = 1; pkt[39] = 2;
+        memcpy(pkt + 40, old + 20, n4 - 20);
+        d2k_plan *p6 = NULL; char err6[128];
+        CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p6, err6, sizeof err6) == 0,
+              "IPv6 QUIC fixture plan");
+        CHECK(d2k_plantab_set_name_family(d2k_session_plans(s6),
+                  (const uint8_t *)"example.com", 11, 1, p6, D2K_PLAN_SHAPE_QUIC, 0, 6) == 0,
+              "IPv6 QUIC name binding");
+        d2k_result r6;
+        d2k_session_packet(s6, pkt, n4 + 20, 2, output, sizeof output, &r6);
+        CHECK(r6.applied && r6.n_out > 0 && (output[0] >> 4) == 6,
+              "IPv6 QUIC plan did not emit native IPv6");
+        CHECK(r6.key.family == 6 && count_journal_kind(s6, D2K_JRN_HELLO_SNI) == 1,
+              "IPv6 QUIC hello/key lost");
+        CHECK(d2k_session_want_shape_family(s6, (const uint8_t *)"example.com", 11, 17, 6) == 1,
+              "IPv6 QUIC original snapshot missing");
+        CHECK(d2k_session_want_shape(s6, (const uint8_t *)"example.com", 11, 17) == 0,
+              "IPv6 QUIC snapshot leaked to IPv4");
+        d2k_session_free(s6);
+    }
     test_fragments();
     test_direction_by_hook();
     test_quic_non443_client_hold();

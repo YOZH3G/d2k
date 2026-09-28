@@ -69,6 +69,10 @@ size_t d2k_wire_build_udp(const d2k_conn *c, const d2k_emit *e,
     if (!c || !e || !out) {
         return 0;
     }
+    if (c->family != 0 && c->family != 4 && c->family != 6) { return 0; }
+    int ipv6 = c->family == 6;
+    size_t ip_hdr = ipv6 ? 40u : IP_HDR;
+    if (ipv6 && (e->poison & D2K_POISON_IPID_ZERO)) { return 0; }
     if (e->wire_profile || e->ipfrag) { return 0; } /* Fragment expansion belongs to session. */
 
     /* Четыре просьбы, которые для UDP нельзя честно исполнить, — отказ (0),
@@ -104,13 +108,23 @@ size_t d2k_wire_build_udp(const d2k_conn *c, const d2k_emit *e,
         return 0;
     }
 
+    if (e->len > 65535u - UDP_HDR) { return 0; }
     const size_t udp_len = UDP_HDR + e->len;
-    const size_t total = IP_HDR + udp_len;
+    const size_t total = ip_hdr + udp_len;
     if (total > cap || total > 0xffff) {
         return 0;
     }
-    memset(out, 0, IP_HDR + UDP_HDR);
+    memset(out, 0, ip_hdr + UDP_HDR);
 
+    if (ipv6) {
+        uint32_t first = 0x60000000u | ((uint32_t)c->traffic_class << 20) |
+                         (c->flow_label & 0xfffffu);
+        out[0] = (uint8_t)(first >> 24); out[1] = (uint8_t)(first >> 16);
+        out[2] = (uint8_t)(first >> 8); out[3] = (uint8_t)first;
+        wr16(out + 4, (uint16_t)udp_len);
+        out[6] = 17; out[7] = e->ttl ? e->ttl : (c->ttl ? c->ttl : 64);
+        memcpy(out + 8, c->src_ip6, 16); memcpy(out + 24, c->dst_ip6, 16);
+    } else {
     /* --- IPv4 --- (поле в поле как в wire.c; отличается только протокол) */
     out[0] = 0x45;                       /* версия 4, длина заголовка 5 слов */
     out[1] = 0;                          /* DSCP/ECN */
@@ -137,16 +151,17 @@ size_t d2k_wire_build_udp(const d2k_conn *c, const d2k_emit *e,
     memcpy(out + 12, &c->src_ip, 4);
     memcpy(out + 16, &c->dst_ip, 4);
     wr16(out + 10, fold(sum16(out, IP_HDR, 0)));
+    }
 
     /* --- UDP --- */
-    uint8_t *u = out + IP_HDR;
+    uint8_t *u = out + ip_hdr;
     memcpy(u + 0, &c->src_port, 2);
     memcpy(u + 2, &c->dst_port, 2);
     wr16(u + 4, (uint16_t)udp_len);
     wr16(u + 6, 0);                      /* сумма считается ниже */
 
     if (e->len) {
-        memcpy(out + IP_HDR + UDP_HDR, e->bytes, e->len);
+        memcpy(out + ip_hdr + UDP_HDR, e->bytes, e->len);
     }
 
     /* Сумма UDP поверх IPv4 формально не обязательна: RFC 768 разрешает
@@ -169,8 +184,9 @@ size_t d2k_wire_build_udp(const d2k_conn *c, const d2k_emit *e,
        сейчас был бы кодом впереди замера. Если когда-нибудь замер покажет
        несостоятельность TTL-фальшивок на каком-то пути, порченая сумма
        станет кандидатом — и появится вместе с этим замером, а не раньше. */
-    uint32_t acc = pseudo_sum(out + 12, out + 16, udp_len);
-    acc = sum16(out + IP_HDR, udp_len, acc);
+    uint32_t acc = ipv6 ? sum16(out + 8, 32, (uint32_t)udp_len + 17)
+                        : pseudo_sum(out + 12, out + 16, udp_len);
+    acc = sum16(out + ip_hdr, udp_len, acc);
     uint16_t ck = fold(acc);
     /* Если результат честного подсчёта — ровно ноль, писать его как есть
        нельзя: ноль в этом поле зарезервирован под «сумма не считалась», а мы

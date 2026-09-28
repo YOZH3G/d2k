@@ -78,16 +78,29 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     if (!c || !e || !out) {
         return 0;
     }
+    if (c->family != 0 && c->family != 4 && c->family != 6) { return 0; }
+    int ipv6 = c->family == 6;
+    size_t ip_hdr = ipv6 ? 40u : IP_HDR;
+    if (ipv6 && (e->poison & D2K_POISON_IPID_ZERO)) { return 0; }
     if (e->ipfrag || (e->wire_profile != 0 && e->wire_profile != D2K_WIRE_DETECT_TCP)) { return 0; }
     int measured = e->wire_profile == D2K_WIRE_DETECT_TCP;
     size_t opt_len = (e->poison & D2K_POISON_TCPTS_BACK) ? TS_OPT_LEN : 0;
+    if (e->pre_len > 65535u || e->len > 65535u - e->pre_len) { return 0; }
     const size_t body = e->pre_len + e->len;
-    size_t total = IP_HDR + TCP_HDR + opt_len + body;
+    size_t total = ip_hdr + TCP_HDR + opt_len + body;
     if (total > cap || total > 0xffff) {
         return 0;
     }
-    memset(out, 0, IP_HDR + TCP_HDR + opt_len);
+    memset(out, 0, ip_hdr + TCP_HDR + opt_len);
 
+    if (ipv6) {
+        wr32(out, 0x60000000u | ((uint32_t)c->traffic_class << 20) | (c->flow_label & 0xfffffu));
+        wr16(out + 4, (uint16_t)(total - 40));
+        out[6] = 6;
+        out[7] = e->ttl ? e->ttl : (measured ? 64 : (c->ttl ? c->ttl : 64));
+        memcpy(out + 8, c->src_ip6, 16);
+        memcpy(out + 24, c->dst_ip6, 16);
+    } else {
     /* --- IPv4 --- */
     out[0] = 0x45;                       /* версия 4, длина заголовка 5 слов */
     out[1] = 0;                          /* DSCP/ECN */
@@ -106,9 +119,10 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     memcpy(out + 12, &c->src_ip, 4);
     memcpy(out + 16, &c->dst_ip, 4);
     wr16(out + 10, fold(sum16(out, IP_HDR, 0)));
+    }
 
     /* --- TCP --- */
-    uint8_t *t = out + IP_HDR;
+    uint8_t *t = out + ip_hdr;
     memcpy(t + 0, &c->src_port, 2);
     memcpy(t + 2, &c->dst_port, 2);
     /* Сдвиг номера последовательности — отдельный приём: сегмент уезжает за
@@ -133,15 +147,16 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     }
 
     if (e->pre_len) {
-        memcpy(out + IP_HDR + TCP_HDR + opt_len, e->pre, e->pre_len);
+        memcpy(out + ip_hdr + TCP_HDR + opt_len, e->pre, e->pre_len);
     }
     if (e->len) {
-        memcpy(out + IP_HDR + TCP_HDR + opt_len + e->pre_len, e->bytes, e->len);
+        memcpy(out + ip_hdr + TCP_HDR + opt_len + e->pre_len, e->bytes, e->len);
     }
 
     size_t tcp_len = TCP_HDR + opt_len + body;
-    uint32_t acc = pseudo_sum(out + 12, out + 16, tcp_len);
-    acc = sum16(out + IP_HDR, tcp_len, acc);
+    uint32_t acc = ipv6 ? sum16(out + 8, 32, (uint32_t)tcp_len + 6)
+                        : pseudo_sum(out + 12, out + 16, tcp_len);
+    acc = sum16(out + ip_hdr, tcp_len, acc);
     uint16_t ck = fold(acc);
     if (e->poison & D2K_POISON_BADSUM) {
         /* Measured mode reproduces detect/raw.c, including its zero case;
@@ -163,6 +178,14 @@ int d2k_wire_tcp_checksum_ok(const uint8_t *pkt, size_t len) {
     if (!pkt || len < IP_HDR + TCP_HDR) {
         return 0;
     }
+    if ((pkt[0] >> 4) == 6) {
+        if (len < 60 || pkt[6] != 6) { return 0; }
+        size_t tcp_len = rd16(pkt + 4);
+        if (tcp_len < TCP_HDR || tcp_len > len - 40) { return 0; }
+        return fold(sum16(pkt + 40, tcp_len,
+                    sum16(pkt + 8, 32, (uint32_t)tcp_len + 6))) == 0;
+    }
+    if ((pkt[0] >> 4) != 4 || pkt[9] != 6) { return 0; }
     size_t ihl = (size_t)(pkt[0] & 0x0f) * 4;
     if (ihl < IP_HDR || len < ihl + TCP_HDR) {
         return 0;

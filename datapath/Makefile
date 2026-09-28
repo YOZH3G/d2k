@@ -47,10 +47,12 @@ TESTS   = test_addr test_hold test_udp_hold test_udp_release test_capture test_p
 
 all: planlab ctlprobe
 
+HDR += include/d2k_packet.h
+
 # Implicitly compiled objects also depend on shared structure layouts.
 $(SRC:.c=.o): $(HDR) include/d2k_addr.h
 
-test_addr: test_addr.c addr.c include/d2k_addr.h
+test_addr: test_addr.c addr.c include/d2k_addr.h include/d2k_packet.h
 	$(CC) $(CFLAGS) -o $@ test_addr.c addr.c $(LDFLAGS)
 
 .PHONY: test-addr

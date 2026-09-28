@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "d2k_nat.h"
 
@@ -25,9 +26,10 @@ static uint32_t ip4(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     memcpy(&r, v, 4);
     return r;
 }
-static uint16_t port_be(uint16_t p) { return (uint16_t)((p >> 8) | (p << 8)); }
+static uint16_t port_be(uint16_t p) { return htons(p); }
 
 static const char *g_lines =
+"ipv6 10 tcp 6 120 ESTABLISHED src=2001:db8::1 dst=2001:db8::2 sport=40000 dport=443 src=2001:db8::2 dst=2001:db8:1::1 sport=443 dport=40000 [ASSURED]\n"
 "ipv4     2 tcp      6 1194 ESTABLISHED src=192.168.1.117 dst=157.240.205.21 sport=50759 dport=443 packets=905 bytes=76261 src=157.240.205.21 dst=88.87.93.11 sport=443 dport=50759 packets=895 bytes=55144 [ASSURED] [RTCACHE o33/r37] mark=0 nmark=256 sc=0 ifw=37 ifl=33 mac=d6:62:df:88:c1:14 slan attrs= use=2\n"
 "ipv4     2 udp      17 143 src=88.87.93.11 dst=157.240.205.35 sport=55732 dport=443 packets=23 bytes=2566 src=157.240.205.35 dst=88.87.93.11 sport=443 dport=55732 packets=9 bytes=5901 [ASSURED] [FASTNAT] mark=0 nmark=256 sc=0 nomac swan no_if attrs= use=2\n"
 "ipv4     2 udp      17 29 src=192.168.1.90 dst=142.251.1.188 sport=49633 dport=443 packets=4 bytes=4800 src=142.251.1.188 dst=88.87.93.11 sport=443 dport=61001 packets=0 bytes=0 mark=0 nmark=256 sc=0 attrs= use=2\n"
@@ -40,6 +42,15 @@ int main(void) {
     fputs(g_lines, f);
     fclose(f);
     snprintf(path, sizeof path, "%s", "/tmp/d2k-test-nat.txt");
+    uint8_t a[16], b[16], ext6[16], expect6[16]; uint16_t p6;
+    inet_pton(AF_INET6, "2001:db8::1", a); inet_pton(AF_INET6, "2001:db8::2", b);
+    inet_pton(AF_INET6, "2001:db8:1::1", expect6);
+    CHECK(d2k_nat_outside_family(path, 6, a, htons(40000), b, htons(443), 6,
+                                 ext6, &p6) == 0, "IPv6 conntrack entry missing");
+    CHECK(!memcmp(ext6, expect6, 16) && p6 == htons(40000), "IPv6 NETMAP tuple lost");
+    a[4] ^= 1;
+    CHECK(d2k_nat_outside_family(path, 6, a, htons(40000), b, htons(443), 6,
+                                 ext6, &p6) == -1, "IPv6 conntrack ignored upper bits");
 
     uint32_t src = 0;
     uint16_t sport = 0;

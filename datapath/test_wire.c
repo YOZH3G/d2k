@@ -74,6 +74,30 @@ static void check_golden(void) {
 }
 
 int main(void) {
+    {
+        d2k_conn v6 = {.family = 6, .ttl = 57, .window = 1024,
+            .src_ip6 = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,1},
+            .dst_ip6 = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,2}};
+        const uint8_t data[] = {1,2,3};
+        d2k_emit emit = {.bytes = data, .len = sizeof data, .seq = 9};
+        uint8_t out[128];
+        size_t n6 = d2k_wire_build(&v6, &emit, out, sizeof out);
+        CHECK(n6 == 63 && out[0] == 0x60 && rd16(out + 4) == 23 &&
+              out[6] == 6 && out[7] == 57, "IPv6 TCP header");
+        CHECK(!memcmp(out + 8, v6.src_ip6, 16) && !memcmp(out + 24, v6.dst_ip6, 16),
+              "IPv6 TCP full addresses");
+        CHECK(!memcmp(out + 60, data, sizeof data) && d2k_wire_tcp_checksum_ok(out, n6),
+              "IPv6 TCP payload/checksum");
+        out[9] ^= 1;
+        CHECK(!d2k_wire_tcp_checksum_ok(out, n6), "IPv6 checksum omitted upper address bits");
+        CHECK(d2k_wire_build(&v6, &emit, out, 62) == 0, "IPv6 TCP capacity");
+        emit.poison = D2K_POISON_BADSUM;
+        n6 = d2k_wire_build(&v6, &emit, out, sizeof out);
+        CHECK(n6 == 63 && !d2k_wire_tcp_checksum_ok(out, n6), "IPv6 badsum effect");
+        emit.poison = D2K_POISON_IPID_ZERO;
+        CHECK(d2k_wire_build(&v6, &emit, out, sizeof out) == 0,
+              "IPv4-only IPID effect silently ignored for IPv6");
+    }
     d2k_conn c;
     memset(&c, 0, sizeof c);
     /* 192.168.1.67 -> 1.2.3.4, порты 40000 -> 443 */

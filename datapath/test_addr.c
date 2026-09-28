@@ -2,8 +2,35 @@
 #include <stdio.h>
 #include <string.h>
 #include "d2k_addr.h"
+#include "d2k_packet.h"
 
 int main(void) {
+    {
+        uint8_t pkt[80] = {0x60};
+        pkt[5] = 28; pkt[6] = 0; pkt[7] = 55;
+        pkt[8] = 0x20; pkt[23] = 1; pkt[24] = 0x20; pkt[39] = 2;
+        pkt[40] = 6; pkt[41] = 0; pkt[60] = 0x50;
+        d2k_packet_view v;
+        assert(d2k_packet_parse(pkt, 68, &v));
+        assert(v.family == 6 && v.protocol == 6 && v.l4 == 48 && v.total == 68);
+        assert(v.src.bytes[15] == 1 && v.dst.bytes[15] == 2 && v.hop_limit == 55);
+        pkt[42] = 5;
+        assert(!d2k_packet_parse(pkt, 68, &v)); /* do not strip meaningful options */
+        pkt[42] = 0;
+        assert(!d2k_packet_parse(pkt, 67, &v));
+        pkt[41] = 255;
+        assert(!d2k_packet_parse(pkt, 68, &v));
+        pkt[41] = 0; pkt[6] = 44;
+        assert(!d2k_packet_parse(pkt, 68, &v)); /* fragments bypass untouched */
+        pkt[6] = 43;
+        assert(!d2k_packet_parse(pkt, 68, &v)); /* routing header unsupported */
+        pkt[6] = 58;
+        assert(!d2k_packet_parse(pkt, 68, &v)); /* ICMPv6 never intercepted */
+        pkt[6] = 17; pkt[5] = 8;
+        assert(d2k_packet_parse(pkt, 48, &v) && v.l4 == 40);
+        pkt[5] = 0;
+        assert(!d2k_packet_parse(pkt, 48, &v)); /* no jumbograms */
+    }
     d2k_addr a, b;
     char text[64];
     assert(d2k_addr_parse("2001:db8::1", &a) == 0);

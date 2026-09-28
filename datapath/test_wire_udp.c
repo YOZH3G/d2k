@@ -161,6 +161,29 @@ static void check_golden_zero_checksum(void) {
 }
 
 int main(void) {
+    {
+        d2k_conn v6 = {.family = 6, .ttl = 49,
+            .src_ip6 = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,1},
+            .dst_ip6 = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,2}};
+        const uint8_t data[] = {1,2,3};
+        d2k_emit emit = {.bytes=data, .len=sizeof data};
+        uint8_t out[128], check[51] = {0};
+        size_t n6 = d2k_wire_build_udp(&v6, &emit, out, sizeof out);
+        CHECK(n6 == 51 && out[0] == 0x60 && rd16(out + 4) == 11 &&
+              out[6] == 17 && out[7] == 49, "IPv6 UDP header");
+        CHECK(!memcmp(out + 8, v6.src_ip6, 16) && !memcmp(out + 24, v6.dst_ip6, 16),
+              "IPv6 UDP full addresses");
+        memcpy(check, v6.src_ip6, 16); memcpy(check + 16, v6.dst_ip6, 16);
+        check[35] = 11; check[39] = 17;
+        memcpy(check + 40, out + 40, 11);
+        CHECK(rd16(out + 46) != 0 && ones_complement_ok(check, sizeof check),
+              "IPv6 UDP mandatory checksum");
+        CHECK(!memcmp(out + 48, data, sizeof data), "IPv6 UDP payload");
+        CHECK(d2k_wire_build_udp(&v6, &emit, out, 50) == 0, "IPv6 UDP capacity");
+        emit.poison = D2K_POISON_IPID_ZERO;
+        CHECK(d2k_wire_build_udp(&v6, &emit, out, sizeof out) == 0,
+              "IPv6 UDP silently ignored IPv4-only poison");
+    }
     d2k_conn c;
     conn_init(&c);
 
