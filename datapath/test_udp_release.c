@@ -52,7 +52,7 @@ int main(void) {
     d2k_udp_release *q = d2k_udp_release_new(2, 4);
     uint32_t ids[] = {11, 12};
     uint32_t verdicts[] = {1, 0};
-    d2k_key key = {1, 2, 3, 4, 17};
+    d2k_key key = {.low_ip=1, .high_ip=2, .low_port=3, .high_port=4, .proto=17};
     CHECK(q != NULL, "allocation");
     CHECK(d2k_udp_release_enqueue(q, 100, ids, verdicts, 2, &key, 77) == 0,
           "delayed original batch accepted");

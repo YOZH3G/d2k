@@ -30,7 +30,7 @@ COREHDR  = $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_quicwire.h $(C
 QUIC_FIXTURE_OBJ = core_quichello.o core_hello.o core_tls13core.o core_x25519.o
 
 # Переносимый датапат: собирается и проверяется на любой машине.
-SRC     = plan_parse.c plan_apply.c tls.c capture.c hold.c udp_hold.c udp_release.c wire.c wire_udp.c track.c session.c nat.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
+SRC     = addr.c plan_parse.c plan_apply.c tls.c capture.c hold.c udp_hold.c udp_release.c wire.c wire_udp.c track.c session.c nat.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
 # Системный слой: только Linux. На маке не собирается намеренно — подделывать
 # сокеты ядра ради сборки значило бы проверять подделку. Проверяется целью
 # cross, которая линкует ПОЛНУЮ службу под обе целевые арки: полная сборка
@@ -41,11 +41,23 @@ HDR     = include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h in
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_hold test_udp_hold test_udp_release test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session
+TESTS   = test_addr test_hold test_udp_hold test_udp_release test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session
 
 .PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release cross clean
 
 all: planlab ctlprobe
+
+# Implicitly compiled objects also depend on shared structure layouts.
+$(SRC:.c=.o): $(HDR) include/d2k_addr.h
+
+test_addr: test_addr.c addr.c include/d2k_addr.h
+	$(CC) $(CFLAGS) -o $@ test_addr.c addr.c $(LDFLAGS)
+
+.PHONY: test-addr
+test-addr: test_addr
+	./test_addr
+
+check: test-addr
 
 plan_parse.o: plan_parse.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<

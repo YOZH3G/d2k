@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "d2k_track.h"
+#include "d2k_addr.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -39,6 +40,32 @@ static void count_expired(void *ctx, const d2k_flow *f) {
 }
 
 int main(void) {
+    {
+        d2k_addr s = {6, {0x20,1,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,1}};
+        d2k_addr d = {6, {0x20,1,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,2}};
+        const uint8_t sp[] = {0xc0,0x01}, dp[] = {1,0xbb};
+        d2k_key a6, reverse, other;
+        CHECK(d2k_key_make_addr(&a6, 6, &s, &d, sp, dp) == 1, "IPv6 forward direction");
+        CHECK(d2k_key_make_addr(&reverse, 6, &d, &s, dp, sp) == 0, "IPv6 reverse direction");
+        d2k_table *v6 = d2k_track_new(16);
+        d2k_flow *first = d2k_track_get(v6, &a6, 1);
+        CHECK(first && d2k_track_get(v6, &reverse, 2) == first, "IPv6 reverse lookup");
+        s.bytes[3] = 0xb9;
+        CHECK(d2k_key_make_addr(&other, 6, &s, &d, sp, dp) >= 0, "IPv6 second key");
+        CHECK(d2k_track_get(v6, &other, 3) != first, "IPv6 high 96 bits lost");
+        CHECK(d2k_track_count(v6) == 2, "IPv6 flows merged");
+        s.family = 4;
+        CHECK(d2k_key_make_addr(&other, 6, &s, &d, sp, dp) == -1, "mixed families accepted");
+        d.family = 4;
+        d2k_key legacy;
+        int old_dir = d2k_key_make(&legacy, 6, s.bytes, d.bytes, sp, dp);
+        CHECK(d2k_key_make_addr(&other, 6, &s, &d, sp, dp) == old_dir,
+              "IPv4 wrapper changed direction");
+        CHECK(memcmp(&other, &legacy, sizeof other) == 0, "IPv4 wrapper changed key");
+        CHECK(d2k_track_get(v6, &other, 4) != first, "IPv4 and IPv6 flows merged");
+        CHECK(d2k_track_count(v6) == 3, "family separation lost");
+        d2k_track_free(v6);
+    }
     d2k_table *t = d2k_track_new(16);
     CHECK(t != NULL, "таблица не создалась");
     if (!t) {

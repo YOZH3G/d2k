@@ -56,13 +56,23 @@
  * Ширина ключа на проводе — 13 байт, именованная константа D2K_KEY_WIRE_LEN
  * (d2k_ctlsrv.h) на C-стороне и keyLen на Go-стороне (internal/control/
  * control.go) — а не буквальное число россыпью по обоим файлам. */
+#include "d2k_addr.h"
+
 typedef struct {
     uint32_t low_ip;
     uint32_t high_ip;
     uint16_t low_port;
     uint16_t high_port;
     uint8_t  proto;
+    /* Zero retains the existing IPv4 key representation during migration.
+       IPv6 keys use family=6 and all 16 bytes; legacy IP fields stay zero. */
+    uint8_t family;
+    uint8_t low_ip6[16], high_ip6[16];
 } d2k_key;
+
+int d2k_key_make_addr(d2k_key *k, uint8_t proto,
+                     const d2k_addr *src, const d2k_addr *dst,
+                     const uint8_t *sport_be, const uint8_t *dport_be);
 
 /* Строит канонический ключ из пары «источник — назначение» и транспорта.
  *

@@ -52,6 +52,27 @@ int d2k_key_make(d2k_key *k, uint8_t proto, const uint8_t *src_ip4, const uint8_
 
 enum { SLOT_FREE = 0, SLOT_USED = 1 };
 
+int d2k_key_make_addr(d2k_key *k, uint8_t proto,
+                     const d2k_addr *src, const d2k_addr *dst,
+                     const uint8_t *sport_be, const uint8_t *dport_be) {
+    if (!k || !src || !dst || !sport_be || !dport_be ||
+        src->family != dst->family) return -1;
+    if (src->family == 4)
+        return d2k_key_make(k, proto, src->bytes, dst->bytes, sport_be, dport_be);
+    if (src->family != 6) return -1;
+    int order = memcmp(src->bytes, dst->bytes, 16);
+    if (!order) order = memcmp(sport_be, dport_be, 2);
+    int low = order <= 0;
+    memset(k, 0, sizeof *k);
+    k->family = 6;
+    k->proto = proto;
+    memcpy(k->low_ip6, low ? src->bytes : dst->bytes, 16);
+    memcpy(k->high_ip6, low ? dst->bytes : src->bytes, 16);
+    memcpy(&k->low_port, low ? sport_be : dport_be, 2);
+    memcpy(&k->high_port, low ? dport_be : sport_be, 2);
+    return low;
+}
+
 struct d2k_table {
     d2k_flow *slots;
     uint8_t  *state;

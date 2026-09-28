@@ -16,7 +16,7 @@ static void release_one(void *ctx, uint32_t id, const uint8_t *p, size_t n) {
 
 int main(void) {
     d2k_udp_hold *h = d2k_udp_hold_new(); CHECK(h != NULL, "allocation");
-    d2k_key k = {1,2,3,4,17};
+    d2k_key k = {.low_ip=1, .high_ip=2, .low_port=3, .high_port=4, .proto=17};
     uint8_t a[3] = {1,2,3}, b[2] = {4,5};
     CHECK(d2k_udp_hold_feed(h, &k, 10, a, sizeof a, 100, release_one, NULL) == 1,
           "first datagram owned");
