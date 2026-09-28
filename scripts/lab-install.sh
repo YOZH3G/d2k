@@ -85,6 +85,24 @@ cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fak
 # wrapped only for the external resolver and Instagram probes; the real curl
 # still checks the local D2K panel below.
 mkdir -p /tmp/d2k-test-bin
+mkdir -p /tmp/d2k-install-bin
+LAN_TEST_IP=$(hostname -I | awk '{print $1}')
+[ -n "$LAN_TEST_IP" ] || fail "не определить IPv4 контейнера для проверки LAN-панели"
+export LAN_TEST_IP
+cat > /tmp/d2k-install-bin/ip <<'IP'
+#!/bin/sh
+case "$*" in
+    "-4 -o addr show scope global")
+        printf '9: ezcfg0 inet 198.51.100.11/32 scope global ezcfg0\n'
+        printf '33: br1 inet 10.1.30.1/24 scope global br1\n'
+        printf '34: br0 inet %s/24 scope global br0\n' "$LAN_TEST_IP"
+        printf '37: ppp0 inet 88.87.93.11/32 scope global ppp0\n'
+        ;;
+    *) echo "unexpected ip invocation: $*" >&2; exit 2 ;;
+esac
+IP
+chmod +x /tmp/d2k-install-bin/ip
+export PATH="/tmp/d2k-install-bin:$PATH"
 cat > /tmp/d2k-test-bin/ndmc <<'NDMC'
 #!/bin/sh
 case "$*" in
@@ -120,6 +138,9 @@ CURL
 chmod +x /tmp/d2k-test-bin/ndmc /tmp/d2k-test-bin/curl
 printf 'ip host www.instagram.com 157.240.9.175\nip host instagram.com 203.0.113.10\nip host unrelated.example 192.0.2.7\n' > /tmp/d2k-ndmc-state
 export D2K_STUB_PATH=/tmp/d2k-test-bin
+panel_curl() {
+    curl --connect-to "127.0.0.1:8090:$LAN_TEST_IP:8090" "$@"
+}
 
 # СНИМОК ЧИСТОЙ СИСТЕМЫ. По нему проверяются и остановка, и удаление: обе
 # обязаны вернуть экран ровно в то состояние, в каком его застали.
@@ -132,6 +153,7 @@ D2K_LOCAL="$REL" sh scripts/install.sh 2>&1 | tee /tmp/install1.log
 grep -q "готово" /tmp/install1.log || fail "установка с чистого состояния не прошла: $(tail -3 /tmp/install1.log)"
 [ "$(stat -c '%a' "$DIR/config")" = 600 ] || fail "конфигурация с relay-секретом должна быть доступна только root"
 [ "$(grep -c '^MODE=apply$' "$DIR/config")" = 1 ] || fail "чистая установка должна включать активный режим D2K"
+[ "$(grep -c "^PANEL_LISTEN=$LAN_TEST_IP:8090$" "$DIR/config")" = 1 ] || fail "чистая установка не привязала панель к LAN-адресу"
 
 "$INIT" status | grep -q "датапат: работает" || fail "после установки датапат не работает"
 "$INIT" status | grep -q "правила: стоят"    || fail "после установки правил нет"
@@ -162,7 +184,7 @@ PANEL_PID=$(cat "$DIR/run/d2k-panel.pid")
 PANEL_OK=0
 i=0
 while [ "$i" -lt 30 ]; do
-    if curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-status.json; then
+    if panel_curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-status.json; then
         PANEL_OK=1
         break
     fi
@@ -178,16 +200,16 @@ grep -q '"telegram_status":"not_configured"' /tmp/d2k-panel-status.json || fail 
 if grep -q 'TG_RELAY_SECRET\|relay_secret\|telegram.*secret' /tmp/d2k-panel-status.json; then
     fail "API раскрыл поле или значение секрета ретранслятора"
 fi
-curl -fsS http://127.0.0.1:8090/ | grep -q 'id="app"' || fail "C-панель не отдала главную страницу"
-curl -fsS http://127.0.0.1:8090/assets/logo-d2k.png -o /tmp/d2k-logo.png || fail "C-панель не отдала знак D2K"
-curl -fsS http://127.0.0.1:8090/assets/mascot-d2k.png -o /tmp/d2k-mascot.png || fail "C-панель не отдала маскота D2K"
-curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/stop | grep -q '"ok":true' || fail "локальная панель не остановила движок"
+panel_curl -fsS http://127.0.0.1:8090/ | grep -q 'id="app"' || fail "C-панель не отдала главную страницу через LAN-привязку"
+panel_curl -fsS http://127.0.0.1:8090/assets/logo-d2k.png -o /tmp/d2k-logo.png || fail "C-панель не отдала знак D2K"
+panel_curl -fsS http://127.0.0.1:8090/assets/mascot-d2k.png -o /tmp/d2k-mascot.png || fail "C-панель не отдала маскота D2K"
+panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/stop | grep -q '"ok":true' || fail "локальная панель не остановила движок"
 [ -d "/proc/$PANEL_PID" ] || fail "остановка движка погасила панель управления"
-curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-stopped.json || fail "панель недоступна после остановки движка"
+panel_curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-stopped.json || fail "панель недоступна после остановки движка"
 grep -q '"engine_running":false' /tmp/d2k-panel-stopped.json || fail "после остановки API продолжает считать движок работающим"
 grep -q '"controller_running":false' /tmp/d2k-panel-stopped.json || fail "после остановки API продолжает считать контроллер работающим"
 grep -Eq '"linked"[[:space:]]*:[[:space:]]*false' /tmp/d2k-panel-stopped.json || fail "API сохранил linked=true после остановки движка"
-curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/start | grep -q '"ok":true' || fail "локальная панель не запустила движок"
+panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/start | grep -q '"ok":true' || fail "локальная панель не запустила движок"
 "$INIT" status | grep -q "датапат: работает" || fail "движок не восстановился из панели"
 echo "== параллельное восстановление правил =="
 REAPPLY_PIDS=
@@ -199,10 +221,10 @@ REAPPLY_FAILED=0
 for pid in $REAPPLY_PIDS; do wait "$pid" || REAPPLY_FAILED=1; done
 [ "$REAPPLY_FAILED" = 0 ] || fail "параллельное восстановление завершилось ошибкой"
 "$INIT" status | grep -q "правила: стоят" || fail "параллельное восстановление оставило firewall частичным"
-if curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-enable >/tmp/d2k-telegram-enable.json; then
+if panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-enable >/tmp/d2k-telegram-enable.json; then
     fail "панель включила Telegram без URL и relay secret"
 fi
-curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-telegram-unconfigured.json || fail "панель недоступна после отказа включить Telegram"
+panel_curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-telegram-unconfigured.json || fail "панель недоступна после отказа включить Telegram"
 grep -q '"telegram_enabled":false' /tmp/d2k-panel-telegram-unconfigured.json || fail "не настроенный Telegram остался включён после отказа"
 echo "== Telegram: локальный старт, redirect, отключение =="
 # Указываем только loopback-релей без слушателя. C-клиент проверяется как
@@ -211,7 +233,7 @@ echo "== Telegram: локальный старт, redirect, отключение
 # внешний health-probe.
 printf '\nTG_RELAY_URL=wss://127.0.0.1:11443/ws\nTG_RELAY_SECRET=lab-only-not-a-real-secret\n' >> "$DIR/config"
 chmod -x "$DIR/d2k-tg-watchdog.sh"
-curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-enable | grep -q '"ok":true' || fail "панель не включила настроенный Telegram-туннель"
+panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-enable | grep -q '"ok":true' || fail "панель не включила настроенный Telegram-туннель"
 [ -f "$DIR/run/d2ktg.pid" ] || fail "d2ktg не создал pid-файл после включения"
 TG_PID_NOW=$(cat "$DIR/run/d2ktg.pid")
 [ -d "/proc/$TG_PID_NOW" ] || fail "d2ktg завершился после включения"
@@ -242,12 +264,12 @@ else
 fi
 rm -f /opt/sbin/curl
 iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "watchdog не восстановил Telegram redirect"
-curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-disable | grep -q '"ok":true' || fail "панель не отключила Telegram-туннель"
+panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-disable | grep -q '"ok":true' || fail "панель не отключила Telegram-туннель"
 [ ! -e "$DIR/run/d2ktg.pid" ] || fail "pid-файл d2ktg остался после отключения"
 ! iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "PREROUTING redirect остался после отключения"
 ! iptables -t nat -C OUTPUT -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "OUTPUT redirect остался после отключения"
 grep -q '^TG_ENABLED=0$' "$DIR/config" || fail "disable не сохранил TG_ENABLED=0"
-curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/reapply | grep -q '"ok":true' || fail "локальная панель не восстановила правила"
+panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/reapply | grep -q '"ok":true' || fail "локальная панель не восстановила правила"
 echo "установлено и работает"
 
 echo "== 2. переход версии =="

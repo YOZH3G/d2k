@@ -39,7 +39,7 @@ esac
 say "архитектура: $(uname -m) -> $ARCH"
 
 # --- что нужно от системы ------------------------------------------------
-for t in curl iptables start-stop-daemon; do
+for t in curl ip iptables start-stop-daemon; do
     command -v "$t" >/dev/null 2>&1 || die "нет $t — поставьте пакет и повторите"
 done
 [ -e /proc/net/netfilter/nfnetlink_queue ] || \
@@ -71,6 +71,7 @@ fetch() {
 }
 
 say "загрузка"
+fetch "scripts/select-panel-ip.sh" "$TMP/select-panel-ip.sh"
 fetch "builds/d2kpanel-linux-$ARCH" "$TMP/d2kpanel"
 fetch "builds/d2kc-linux-$ARCH" "$TMP/d2kc"
 fetch "builds/d2kd-linux-$ARCH" "$TMP/d2kd"
@@ -176,6 +177,19 @@ if [ ! -f "$DIR/config" ]; then
     say "создана конфигурация $DIR/config"
 else
     say "конфигурация уже есть — не трогаю"
+fi
+# Fresh installs default to loopback in the template. Bind to the primary
+# private router address instead, so every LAN device can open the panel
+# directly while no public/WAN address is ever selected.
+PANEL_LISTEN_CURRENT=$(sed -n 's/^PANEL_LISTEN=//p' "$DIR/config" | tail -n 1)
+if [ "$PANEL_LISTEN_CURRENT" = "127.0.0.1:8090" ]; then
+    PANEL_LAN_IP=$(ip -4 -o addr show scope global 2>/dev/null | sh "$TMP/select-panel-ip.sh") || \
+        die "не удалось определить LAN-адрес роутера для панели"
+    [ -n "$PANEL_LAN_IP" ] || die "не найден приватный LAN IPv4-адрес; панель не будет выставлена в интернет"
+    sed "s|^PANEL_LISTEN=.*|PANEL_LISTEN=$PANEL_LAN_IP:8090|" "$DIR/config" > "$TMP/config.lan" || \
+        die "не настроить LAN-адрес панели"
+    install_data_atomic "$TMP/config.lan" "$DIR/config"
+    say "панель доступна в LAN: http://$PANEL_LAN_IP:8090/"
 fi
 # В конфигурации хранится relay secret. Содержимое сохраняем, но ограничиваем
 # чтение root даже при обновлении ранее установленного файла с более широкими
