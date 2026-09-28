@@ -106,7 +106,7 @@ extern d2k_sched_vol_fn  d2k_sched_vol_hook;
  *
  * transport — 6 или 17: тип сокета задаётся при создании. 0 — занято,
  * отрицательное — локальный отказ. */
-typedef int (*d2k_sched_bind_fn)(uint8_t transport, int *out_fd, uint16_t *sport_be);
+typedef int (*d2k_sched_bind_fn)(uint8_t transport, uint8_t family, int *out_fd, uint16_t *sport_be);
 extern d2k_sched_bind_fn d2k_sched_bind_hook;
 
 /* Separate from the global measurement mark hook: scheduler tests replace

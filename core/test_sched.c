@@ -204,8 +204,9 @@ static int arm_calls;
 static int arm_fragment_shape;
 
 /* Занятие порта всегда неудачно — инъекция отказа для 0010 R1. */
-static int stub_bind_fail(uint8_t transport, int *out_fd, uint16_t *sport_be) {
+static int stub_bind_fail(uint8_t transport, uint8_t family, int *out_fd, uint16_t *sport_be) {
     (void)transport;
+    (void)family;
     if (out_fd) { *out_fd = -1; }
     if (sport_be) { *sport_be = 0; }
     return -1;
@@ -247,12 +248,26 @@ static int ver_unsupported;
    Подменённый зонд в сеть не ходит, но владение обязан взять: иначе каждый
    опыт течёт дескриптором, и тест упрётся в их предел. */
 static int ver_last_fd = -2;
+static int ver_socket_family;
 static uint8_t ver_last_shape;
 
 static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_t transport,
                                const char *sni, int deadline_ms, size_t hello_wire,
                                uint8_t client_shape) {
     ver_last_fd = use_fd;
+    uint8_t routed_local6[16] = {0};
+    ver_socket_family = 0;
+    if (use_fd >= 0) {
+        struct sockaddr_storage local;
+        socklen_t n = sizeof local;
+        if (getsockname(use_fd, (struct sockaddr *)&local, &n) == 0) {
+            ver_socket_family = local.ss_family;
+            if (local.ss_family == AF_INET6) {
+                const struct sockaddr_in6 *p = (const struct sockaddr_in6 *)&local;
+                memcpy(routed_local6, &p->sin6_addr, 16);
+            }
+        }
+    }
     if (use_fd >= 0) { close(use_fd); }
     (void)ip; (void)port; (void)sni; (void)deadline_ms;
     ver_last_shape = client_shape;
@@ -275,6 +290,15 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
     r.status = (r.level == D2K_VER_APPLICATION) ? 200 : 0;
     /* Тот же местный конец, что в ключах событий этого теста (ev_hello). */
     memcpy(r.local_ip4, ver_local_ip4, sizeof r.local_ip4);
+    r.family = ver_socket_family == AF_INET6 ? 6 : 4;
+    if (r.family == 6) {
+        CHECK(inet_pton(AF_INET6, "2001:db8::2", r.local_addr) == 1, "verifier native local fixture");
+        uint8_t nonzero = 0;
+        for (size_t i = 0; i < 16; i++) nonzero |= routed_local6[i];
+        if (nonzero) memcpy(r.local_addr, routed_local6, 16);
+    } else {
+        memcpy(r.local_addr, ver_local_ip4, 4);
+    }
     r.local_port = ver_answer_port;
     snprintf(r.reason, sizeof r.reason, "%s",
              r.level == D2K_VER_CHALLENGE ? "Cloudflare challenge, HTTP 403" : "подменённый зонд");
@@ -1171,6 +1195,269 @@ int main(int argc, char **argv) {
     }
 
 admission_only_run:
+    {
+        int lfd = socket(AF_INET6, SOCK_STREAM, 0);
+        struct sockaddr_in6 local = {0};
+        local.sin6_family = AF_INET6; local.sin6_addr = in6addr_loopback;
+        int bound = 0;
+        for (uint16_t port = 19500; port < 19600 && !bound; port++) {
+            local.sin6_port = htons(port);
+            bound = bind(lfd, (struct sockaddr *)&local, sizeof local) == 0;
+        }
+        CHECK(bound && listen(lfd, 4) == 0, "native property listener");
+        uint16_t saved_port = g_server_port;
+        g_server_port = ntohs(local.sin6_port);
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_NOT_MEASURED;
+        d2k_ev h = ev_hello(6, 41015, "native-properties.example");
+        h.family = 6;
+        CHECK(inet_pton(AF_INET6, "::1", h.low_ip) == 1, "property destination");
+        CHECK(inet_pton(AF_INET6, "2001:db8::2", h.high_ip) == 1, "property client");
+        d2k_sched_event(s, &h);
+        d2k_ev su = h; su.kind = D2K_EV_SUSPECT; su.code = D2K_SUSPECT_RST_CUT;
+        d2k_sched_event(s, &su);
+        int peer = -1; struct sockaddr_in6 remote = {0};
+        for (int i = 0; i < 500 && peer < 0; i++) {
+            tick_once(s);
+            struct pollfd p = {lfd, POLLIN, 0};
+            if (poll(&p, 1, 0) > 0) {
+                socklen_t len = sizeof remote;
+                peer = accept(lfd, (struct sockaddr *)&remote, &len);
+            }
+        }
+        CHECK(peer >= 0, "property question connects over native IPv6");
+        if (peer >= 0) {
+            for (int i = 0; i < 500 && !said("жду обмена"); i++) tick_once(s);
+            d2k_ev x = {0}; x.family = 6; x.transport = 6;
+            memcpy(x.low_ip, &local.sin6_addr, 16); memcpy(x.high_ip, &remote.sin6_addr, 16);
+            x.low_port = g_server_port; x.high_port = ntohs(remote.sin6_port);
+            x.kind = D2K_EV_EXCHANGE; x.code = 22; x.num = 1380;
+            x.seen_types = 0x0c; x.server_hello = 1;
+            d2k_sched_event(s, &x);
+            CHECK(said("жду подтверждения полного исполнения"), "native reply matches property flow");
+            x.kind = D2K_EV_APPLIED; (void)last_plan_id(x.plan_id);
+            d2k_sched_event(s, &x); spin(s, 20);
+            CHECK(said("перекрытие слева=нет"), "native property proof updates measured vector");
+            close(peer);
+        }
+        d2k_sched_free(s); d2k_catalog_free(&c); close(lfd);
+        g_server_port = saved_port; ver_answer = D2K_VER_APPLICATION;
+    }
+    for (int proof = 0; proof < 4; proof++) {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        quic_answer = D2K_V_PREFIX;
+        ver_answer = proof == 1 ? D2K_VER_APPLICATION : D2K_VER_NOT_MEASURED;
+        ver_fail_first = 0;
+        saidbuf[0] = 0; d2k_sched_set_say(s, collect_say, NULL);
+        quic_calls = 0;
+        drain(); forget_sent();
+        d2k_ev su = ev_suspect(17, 41016);
+        su.family = 6;
+        CHECK(inet_pton(AF_INET6, "::1", su.low_ip) == 1, "address trial destination");
+        CHECK(inet_pton(AF_INET6, "2001:db8::2", su.high_ip) == 1, "address trial client");
+        d2k_sched_event(s, &su); spin_until_installed(s); drain();
+        CHECK(quic_calls == 1 && !strcmp(quic_last_ip, "::1"), "unnamed native QUIC measured as IP");
+        CHECK(sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0) == 0,
+              "unnamed native QUIC never installs a name probe");
+        unsigned found = 0;
+        uint8_t trial[D2K_TRIAL_ID_LEN] = {0}, endpoint[38] = {0};
+        for (size_t off = 0; off + 6 <= sent_len;) {
+            const uint8_t *p = sentbuf + off;
+            uint32_t n = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                         ((uint32_t)p[2] << 8) | p[3];
+            if (n < 2 || n > sent_len - off - 4) break;
+            unsigned kind = ((unsigned)p[4] << 8) | p[5];
+            if (kind == D2K_CMD_SET_ADDR_PROBE && n >= 2 + 38 + sizeof trial) {
+                const uint8_t *body = p + 6;
+                uint8_t loopback[16] = {0}; loopback[15] = 1;
+                CHECK(body[0] == 6 && !memcmp(body + 1, loopback, 16) &&
+                      !memcmp(body + 17, loopback, 16) && body[37] == 17,
+                      "address trial uses native routed source and full destination");
+                CHECK(body[33] || body[34], "address trial has reserved source port");
+                CHECK((((unsigned)body[35] << 8) | body[36]) == su.low_port,
+                      "address trial preserves target port");
+                memcpy(endpoint, body, sizeof endpoint);
+                memcpy(trial, body + 38, sizeof trial); found++;
+            }
+            off += 4 + n;
+        }
+        CHECK(found == 1, "native address trial installed exactly once");
+        if (proof && found) {
+            ver_answer_port = (uint16_t)(((unsigned)endpoint[33] << 8) | endpoint[34]);
+            d2k_ev ap = ev_applied(17, ver_answer_port);
+            ap.family = 6;
+            memcpy(ap.low_ip, endpoint + 17, 16); memcpy(ap.high_ip, endpoint + 1, 16);
+            ap.low_port = su.low_port;
+            memcpy(ap.trial_id, trial, sizeof trial);
+            if (proof >= 2) {
+                ap.kind = D2K_EV_REFUSED; ap.code = D2K_REFUSE_TOO_LONG;
+                if (proof == 2) ap.high_ip[15] = 2; /* same /32, foreign full source */
+            }
+            d2k_sched_event(s, &ap);
+            d2k_ev ack = {0}; ack.kind = D2K_EV_ACK; ack.code = D2K_CMD_SET_ADDR_PROBE;
+            ack.num = 0x100u; memcpy(ack.trial_id, trial, sizeof trial);
+            d2k_sched_event(s, &ack); settle(s);
+            const d2k_cat_binding *bd = binding_of(&c, "::1", 17);
+            if (proof >= 2) {
+                CHECK(!bd && said("опыт невозможен") == (proof == 3),
+                      "early IPv6 refusal matches full source, not just first32 bits");
+            } else {
+            if (!bd) fprintf(stderr, "native address proof trace:\n%s", saidbuf);
+            CHECK(bd && bd->family == 6 && !strcmp(bd->kind, "addr"),
+                  "native address proof saved as IPv6 address binding");
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) >= 1,
+                  "native address proof promotes persistent datapath plan");
+            }
+        }
+        settle(s); d2k_sched_free(s); drain();
+        uint8_t removal[38 + D2K_TRIAL_ID_LEN];
+        memcpy(removal, endpoint, 38); memcpy(removal + 38, trial, sizeof trial);
+        CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, removal, sizeof removal) >= 1,
+              "native address trial cleanup preserves full endpoint and generation");
+        d2k_catalog_free(&c); quic_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
+    }
+    for (int proof = 0; proof < 2; proof++) {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 1;
+        ver_answer = proof ? D2K_VER_APPLICATION : D2K_VER_NOT_MEASURED;
+        ver_answer_port = 41017; ver_fail_first = 0;
+        ver_socket_family = ver_calls = 0;
+        drain(); forget_sent();
+        d2k_ev h = ev_hello(6, 41017, "native-probe.example");
+        h.family = 6;
+        CHECK(inet_pton(AF_INET6, "::1", h.low_ip) == 1, "native probe destination");
+        CHECK(inet_pton(AF_INET6, "2001:db8::2", h.high_ip) == 1, "native probe client");
+        d2k_sched_event(s, &h);
+        d2k_ev su = h; su.kind = D2K_EV_SUSPECT; su.code = D2K_SUSPECT_RST_CUT;
+        d2k_sched_event(s, &su); settle(s);
+        CHECK(ver_calls > 0, "native candidate reaches verifier");
+        CHECK(ver_socket_family == AF_INET6, "IPv6 verifier receives a reserved IPv6 socket");
+        CHECK(strcmp(tcp_last_ip, "::1") == 0, "native measurement receives full target address");
+        if (proof) {
+        d2k_ev ap = ev_applied(6, 41017);
+        memcpy(ap.low_ip, h.low_ip, 16); memcpy(ap.high_ip, h.high_ip, 16);
+        ap.family = 4;
+        d2k_sched_event(s, &ap); spin(s, 10);
+        CHECK(c.n_boxes == 0, "IPv4 APPLIED cannot prove an IPv6 trial");
+        ap.family = 6;
+        d2k_sched_event(s, &ap); spin(s, 40);
+        const d2k_cat_binding *native = binding_of(&c, "native-probe.example", 6);
+        CHECK(native && native->family == 6, "verified IPv6 trial creates IPv6 binding");
+        CHECK(d2k_sched_write_live(s, "/tmp/d2k-native-live.json", "") == 0,
+              "write native live API snapshot");
+        d2k_catalog live = {0}; char live_err[160];
+        CHECK(d2k_catalog_load("/tmp/d2k-native-live.json", &live, live_err, sizeof live_err) == 0,
+              "parse native bindings from live API");
+        const d2k_cat_binding *live_native = binding_of(&live, "native-probe.example", 6);
+        CHECK(live_native && live_native->family == 6, "live API retains transport and family of binding");
+        d2k_catalog_free(&live);
+        if (c.n_boxes == 1 && c.boxes[0].n_binds == 1) {
+            d2k_cat_box *b = &c.boxes[0];
+            d2k_cat_binding *both = realloc(b->binds, 2 * sizeof *both);
+            CHECK(both != NULL, "allocate mixed-family measured bindings");
+            if (both) {
+                b->binds = both; b->n_binds = 2;
+                both[1] = both[0];
+                both[0].family = 4; both[0].input = D2K_INPUT_PROFILE;
+                both[1].input = D2K_INPUT_CLIENT;
+                d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6; sh.family = 6;
+                CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "native-probe.example",
+                      sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "native repeat snapshot");
+                int before_calls = tcp_calls;
+                d2k_sched_event(s, &sh); settle(s);
+                CHECK(tcp_calls == before_calls, "IPv4 profile binding cannot force IPv6 remeasurement");
+            }
+        }
+        }
+        d2k_sched_free(s); drain(); d2k_catalog_free(&c);
+        unsigned installed = 0, removed = 0;
+        for (size_t off = 0; off + 6 <= sent_len;) {
+            const uint8_t *p = sentbuf + off;
+            uint32_t n = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                         ((uint32_t)p[2] << 8) | p[3];
+            if (n < 2 || n > sent_len - off - 4) break;
+            unsigned kind = ((unsigned)p[4] << 8) | p[5];
+            const uint8_t *body = p + 6;
+            if (kind == D2K_CMD_SET_NAME_PROBE || kind == D2K_CMD_DEL_NAME_PROBE) {
+                CHECK(n > 4 && (size_t)body[0] + 5 <= n - 2,
+                      "native probe frame is complete");
+                if (n > 4 && (size_t)body[0] + 5 <= n - 2) {
+                    CHECK(body[body[0] + 2] == 6, "probe install/removal uses IPv6 family");
+                    installed += kind == D2K_CMD_SET_NAME_PROBE;
+                    removed += kind == D2K_CMD_DEL_NAME_PROBE;
+                }
+            }
+            off += 4 + n;
+        }
+        CHECK(installed && (proof || removed), "unconfirmed native trial is installed and cleaned up");
+        tcp_owns_search = tcp_found_arm = 0;
+        tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+    }
+    for (int proto_case = 0; proto_case < 2; proto_case++) {
+        uint8_t transport = proto_case ? 17 : 6;
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        d2k_ev sh4 = {0}, sh6 = {0};
+        sh4.kind = sh6.kind = D2K_EV_SHAPE;
+        sh4.transport = sh6.transport = transport;
+        sh4.family = 4; sh6.family = 6;
+        if (!proto_case) {
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "shape-family.example",
+              sh4.shape, sizeof sh4.shape, &sh4.shape_len) == 0, "IPv4 legacy snapshot");
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "shape-family.example",
+              sh6.shape, sizeof sh6.shape, &sh6.shape_len) == 0, "IPv6 modern snapshot");
+        CHECK(sh4.shape_len != sh6.shape_len, "snapshot fixtures differ");
+        } else {
+            CHECK(quic_shape(&sh4, "shape-family.example") == 0, "IPv4 QUIC snapshot");
+            sh4.family = 4;
+            CHECK(d2k_quic_probe_initial("shape-family.example", sh6.shape,
+                  sizeof sh6.shape, &sh6.shape_len) == 0, "IPv6 QUIC snapshot");
+            CHECK(sh4.shape_len != sh6.shape_len ||
+                  memcmp(sh4.shape, sh6.shape, sh4.shape_len) != 0, "QUIC fixtures differ");
+        }
+        d2k_sched_event(s, &sh4); d2k_sched_event(s, &sh6);
+        tcp_answer = quic_answer = D2K_V_CLEAR;
+        quic_calls = 0;
+        memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
+        drain(); forget_sent();
+        for (int family = 4; family <= 6; family += 2) {
+            d2k_ev h = ev_hello(transport, 41018, "shape-family.example");
+            d2k_ev su = ev_suspect(transport, 41018);
+            h.family = su.family = (uint8_t)family;
+            if (family == 6) {
+                CHECK(inet_pton(AF_INET6, "2001:db8::1", h.low_ip) == 1, "snapshot low IPv6");
+                CHECK(inet_pton(AF_INET6, "2001:db8::2", h.high_ip) == 1, "snapshot high IPv6");
+                memcpy(su.low_ip, h.low_ip, 16); memcpy(su.high_ip, h.high_ip, 16);
+            }
+            tcp_last_wire = 0;
+            d2k_sched_event(s, &h); d2k_sched_event(s, &su); settle(s);
+            const d2k_ev *want = family == 4 ? &sh4 : &sh6;
+            if (!proto_case) {
+                CHECK(tcp_last_wire == want->shape_len, "search uses snapshot from its own family");
+            } else {
+                size_t idx = family == 6;
+                CHECK(quic_seen_trigger_lens[idx] == want->shape_len &&
+                      !memcmp(quic_seen_triggers[idx], want->shape, want->shape_len),
+                      "QUIC search retains exact snapshot of its family");
+            }
+            uint8_t request[64];
+            size_t nl = strlen("shape-family.example");
+            request[0] = (uint8_t)nl;
+            memcpy(request + 1, "shape-family.example", nl);
+            request[nl + 1] = transport; request[nl + 2] = (uint8_t)family;
+            drain();
+            CHECK(sent_command_count(D2K_CMD_ARM_SHAPE, request, nl + 3) == 1,
+                  "snapshot request carries the search family");
+            skip_ahead(s, 1000);
+        }
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        tcp_answer = quic_answer = D2K_V_OPAQUE;
+    }
     {
         d2k_catalog c = {0};
         tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION;

@@ -288,9 +288,9 @@ static d2k_ver_result verify_default(int use_fd, const char *ip, uint16_t port,
     return d2k_verify_probe_on(use_fd, ip, port, sni, deadline_ms, hello_wire);
 }
 
-static int bind_default(uint8_t transport, int *out_fd, uint16_t *sport_be) {
-    return (transport == 17) ? d2k_props_bind_udp(out_fd, sport_be)
-                             : d2k_props_bind(out_fd, sport_be);
+static int bind_default(uint8_t transport, uint8_t family, int *out_fd, uint16_t *sport_be) {
+    return (transport == 17) ? d2k_props_bind_udp_family(family, out_fd, sport_be)
+                             : d2k_props_bind_family(family, out_fd, sport_be);
 }
 
 static int mark_default(int fd, uint32_t mark) {
@@ -393,7 +393,7 @@ typedef struct {
        по датаграммам: имя не читается ни нами, ни коробкой, а приём разноса
        от имени не зависит. Выдумывать имя запрещено (D2K_SPEC). */
     int         by_addr;
-    uint8_t     addr_probe_src_ip[4];
+    uint8_t     addr_probe_src_ip[16];
     uint16_t    addr_probe_src_port_be;
     uint8_t     addr_probe_trial_id[D2K_TRIAL_ID_LEN];
     int         addr_probe_identity_valid;
@@ -576,7 +576,7 @@ typedef struct {
     int        arm_ready;
 
     /* Итог JOB_CONTACT. */
-    uint8_t    c_ip[4];
+    uint8_t    c_ip[16];
     uint16_t   c_port;
     int        c_fd;
     int        c_ok;
@@ -684,10 +684,10 @@ struct d2k_sched {
      * Чего он НЕ даёт: права назвать форму измеренной ДЛЯ ЭТОЙ ЦЕЛИ. Признак
      * trig_snapped остаётся нулевым, снимок этой цели заказывается как
      * прежде, и со следующего обращения мерится уже своим. */
-    uint8_t      quic_shape[2048];
-    size_t       quic_shape_len;
-    char         quic_shape_name[256];
-    uint64_t     quic_shape_seq;
+    uint8_t      quic_shape[2][2048];
+    size_t       quic_shape_len[2];
+    char         quic_shape_name[2][256];
+    uint64_t     quic_shape_seq[2];
     /* ПОСЛЕДНЯЯ СНЯТАЯ ФОРМА TCP — С ИМЕНЕМ, ЧЬЯ ОНА.
      *
      * Снимок приходит РАНЬШЕ подозрения: датапат сперва видит приветствие, а
@@ -702,9 +702,9 @@ struct d2k_sched {
      * приветствием, и между ними чужому снимку взяться почти неоткуда. Имя
      * сверяется, поэтому чужая форма не подставится молча — в худшем случае
      * снимка не окажется, и это прежнее поведение. */
-    uint8_t      tcp_shape[2048];
-    size_t       tcp_shape_len;
-    char         tcp_shape_name[256];
+    uint8_t      tcp_shape[2][2048];
+    size_t       tcp_shape_len[2];
+    char         tcp_shape_name[2][256];
 
     /* Для вида панели: сколько подтверждено и сколько зондов потрачено за
        жизнь процесса, и отметка стенных часов, от которой считается «с
@@ -744,11 +744,11 @@ struct d2k_sched {
 
 static int addr_probe_remove(d2k_sched *s, task *t, char *err, size_t errcap) {
     if (!t->addr_probe_identity_valid) { return 0; }
-    uint8_t dst[4];
-    if (inet_pton(AF_INET, t->ip, dst) != 1) { return -1; }
-    int rc = d2k_link_del_addr_probe(s->link_fd, t->addr_probe_src_ip,
+    uint8_t dst[16] = {0};
+    if (inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, dst) != 1) { return -1; }
+    int rc = d2k_link_del_addr_probe_family(s->link_fd, t->addr_probe_src_ip,
                                      t->addr_probe_src_port_be, dst,
-                                     htons(t->port ? t->port : 443), 17,
+                                     htons(t->port ? t->port : 443), 17, t->family,
                                      t->addr_probe_trial_id, err, errcap);
     t->addr_probe_identity_valid = 0;
     return rc;
@@ -766,15 +766,15 @@ static void remove_trial_exact(d2k_sched *s, task *t) {
     if (t->by_addr) {
         (void)addr_probe_remove(s, t, err, sizeof err);
     } else if (t->probe_sport_be != 0 && t->trial_shape != 0) {
-        (void)d2k_link_del_name_probe(s->link_fd, t->name, t->transport,
+        (void)d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
                                       t->trial_shape, t->probe_sport_be,
-                                      err, sizeof err);
+                                      t->family, err, sizeof err);
     } else if (t->prop_sport_be != 0) {
-        (void)d2k_link_del_name_probe(s->link_fd, t->name, t->transport,
+        (void)d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
                                       question_shape(t), t->prop_sport_be,
-                                      err, sizeof err);
+                                      t->family, err, sizeof err);
     } else {
-        (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
+        (void)d2k_link_del_name_family(s->link_fd, t->name, t->family, err, sizeof err);
     }
     if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
     t->probe_sport_be = 0;
@@ -880,9 +880,6 @@ static void fp_add(d2k_cat_fp *fp, const d2k_cat_signal *sig) {
     fp->sig[fp->n_sig++] = *sig;
 }
 
-static void ip_text(const uint8_t ip[4], char *out, size_t cap) {
-    snprintf(out, cap, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-}
 
 /* Начало эфемерного диапазона Linux (ip_local_port_range, умолчание
    32768-60999). Не «порт сервера» и не список сервисов — граница, из которой
@@ -1082,14 +1079,14 @@ static int fill_hellos(d2k_sched *s, task *t) {
                переписываем в нём имя: форма — свойство клиента, а не цели
                (см. quic_shape в структуре планировщика). Признак «форма
                измерена» НЕ ставится: измерена она не здесь. */
-            if (s->quic_shape_len > 0 &&
-                strcmp(s->quic_shape_name, t->name) == 0) {
-                memcpy(t->trig, s->quic_shape, s->quic_shape_len);
-                t->trig_len = s->quic_shape_len;
+            if (s->quic_shape_len[t->family == 6] > 0 &&
+                strcmp(s->quic_shape_name[t->family == 6], t->name) == 0) {
+                memcpy(t->trig, s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6]);
+                t->trig_len = s->quic_shape_len[t->family == 6];
                 t->trig_snapped = 1;
-            } else if (s->quic_shape_len > 0) {
+            } else if (s->quic_shape_len[t->family == 6] > 0) {
                 int used_sample = 0;
-                if (d2k_quic_prepare_target(s->quic_shape, s->quic_shape_len,
+                if (d2k_quic_prepare_target(s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6],
                                             t->name, t->trig, sizeof t->trig,
                                             &t->trig_len, &used_sample) != 0) {
                     return -1;
@@ -1122,13 +1119,13 @@ static int fill_hellos(d2k_sched *s, task *t) {
         }
         return 0;
     }
-    if (t->trig_len == 0 && s->tcp_shape_len > 0 &&
-        strcmp(s->tcp_shape_name, t->name) == 0 &&
-        s->tcp_shape_len <= sizeof t->trig) {
+    if (t->trig_len == 0 && s->tcp_shape_len[t->family == 6] > 0 &&
+        strcmp(s->tcp_shape_name[t->family == 6], t->name) == 0 &&
+        s->tcp_shape_len[t->family == 6] <= sizeof t->trig) {
         /* Снимок ЭТОЙ цели пришёл раньше подозрения. Берём его: это настоящие
            байты клиента, а профиль холодного старта — заведомо не они. */
-        memcpy(t->trig, s->tcp_shape, s->tcp_shape_len);
-        t->trig_len = s->tcp_shape_len;
+        memcpy(t->trig, s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]);
+        t->trig_len = s->tcp_shape_len[t->family == 6];
         t->trig_snapped = 1;
     }
     if (t->trig_len == 0) {
@@ -1234,12 +1231,13 @@ static void *worker_run(void *vp) {
            прошёл бы мимо очереди нетронутым) и с ОТКРЫТЫМ сокетом наружу
            (иначе FIN удалит ячейку потока раньше ответа сервера, и обмену не
            с чем будет связаться). Закрывает сокет цикл, после ожидания. */
-        uint8_t ip4[4];
+        uint8_t local_addr[16] = {0};
         uint16_t lport = 0;
         int fd = -1;
-        int rc = d2k_props_contact_on(a_use_fd, t->ip, t->port, trig, ip4, &lport, &fd);
+        int rc = d2k_props_contact_on_family(a_use_fd, t->ip, t->port, trig,
+                                             t->family, local_addr, &lport, &fd);
         pthread_mutex_lock(&s->mu);
-        memcpy(t->c_ip, ip4, 4);
+        memcpy(t->c_ip, local_addr, sizeof t->c_ip);
         t->c_port = lport;
         t->c_fd = fd;
         t->c_ok = (rc == 0);
@@ -1384,7 +1382,7 @@ static int64_t wall_s(const d2k_sched *s, int64_t now_ms) {
 static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_id,
                           const char *plan_text, const char *proto,
                           const char *target, const char *kind, uint8_t transport,
-                          uint8_t shape, uint8_t verified_by, uint8_t input,
+                          uint8_t family, uint8_t shape, uint8_t verified_by, uint8_t input,
                           int64_t at_s, const d2k_cat_fp *fp) {
     d2k_cat_box *b = box_ensure(c, box_id);
     if (!b) { return -1; }
@@ -1420,6 +1418,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
     for (size_t i = 0; i < b->n_binds; i++) {
         d2k_cat_binding *bd = &b->binds[i];
         if (bd->transport == transport && strcmp(bd->target, target) == 0 &&
+            strcmp(bd->kind, kind) == 0 && (bd->family ? bd->family : 4) == family &&
             d2k_cat_shape_fits(bd->shape, shape)) {
             bd->successes++;
             bd->confirmed = at_s;
@@ -1450,6 +1449,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
     bd->successes = 1;
     bd->enabled = 1;
     bd->transport = transport;
+    bd->family = family;
     bd->shape = shape;
     bd->verified_by = verified_by;
     bd->input = input;
@@ -1676,7 +1676,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         {
             int bfd = -1;
             uint16_t bsp = 0;
-            int bound = d2k_sched_bind_hook(t->transport, &bfd, &bsp);
+            int bound = d2k_sched_bind_hook(t->transport, t->family, &bfd, &bsp);
             if (bound != 0 || bsp == 0) {
                 continue; /* порт не занят — вопрос не задаём */
             }
@@ -1684,9 +1684,9 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
             t->prop_sport_be = bsp;
         }
         /* Форма приветствия вопроса — та же, что у снятого триггера. */
-        if (d2k_link_set_name_probe(s->link_fd, t->name, t->transport, hex,
+        if (d2k_link_set_name_family(s->link_fd, t->name, t->transport, hex,
                                     question_shape(t), t->prop_sport_be,
-                                    err, sizeof err) != 0) {
+                                    t->family, err, sizeof err) != 0) {
             close(t->prop_bound_fd);
             t->prop_bound_fd = -1;
             t->prop_sport_be = 0;
@@ -1735,11 +1735,11 @@ static void prop_finish(d2k_sched *s, task *t) {
            измерение только что сказало «не работает» (см. d2k_props_ask). */
         char err[160];
         if (t->prop_sport_be != 0) {
-            (void)d2k_link_del_name_probe(s->link_fd, t->name, t->transport,
+            (void)d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
                                           question_shape(t), t->prop_sport_be,
-                                          err, sizeof err);
+                                          t->family, err, sizeof err);
         } else {
-            (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
+            (void)d2k_link_del_name_family(s->link_fd, t->name, t->family, err, sizeof err);
         }
         t->trial_installed = 0;
     }
@@ -1756,15 +1756,15 @@ static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
         if (t->by_addr) {
             rc = addr_probe_remove(s, t, err, sizeof err);
         } else if (t->prop_sport_be != 0) {
-            rc = d2k_link_del_name_probe(s->link_fd, t->name, t->transport,
+            rc = d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
                                          question_shape(t), t->prop_sport_be,
-                                         err, sizeof err);
+                                         t->family, err, sizeof err);
         } else if (t->probe_sport_be != 0 && t->trial_shape != 0) {
-            rc = d2k_link_del_name_probe(s->link_fd, t->name, t->transport,
+            rc = d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
                                          t->trial_shape, t->probe_sport_be,
-                                         err, sizeof err);
+                                         t->family, err, sizeof err);
         } else {
-            rc = d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
+            rc = d2k_link_del_name_family(s->link_fd, t->name, t->family, err, sizeof err);
         }
         if (rc != 0) {
             say(s, "по %s не удалось снять пробный план: %s", t->name, err);
@@ -1869,8 +1869,9 @@ static size_t refill_from_fallback(const d2k_sched *s, task *t) {
 static void claim_early_refusal(task *t) {
     d2k_ev probe;
     memset(&probe, 0, sizeof probe);
-    memcpy(probe.low_ip, t->ver_flow.a_ip, 4);
-    memcpy(probe.high_ip, t->ver_flow.b_ip, 4);
+    probe.family = t->ver_flow.family;
+    memcpy(probe.low_ip, t->ver_flow.a_ip, sizeof probe.low_ip);
+    memcpy(probe.high_ip, t->ver_flow.b_ip, sizeof probe.high_ip);
     probe.low_port = t->ver_flow.a_port;
     probe.high_port = t->ver_flow.b_port;
     probe.transport = t->ver_flow.transport;
@@ -1999,7 +2000,7 @@ static int install_next(d2k_sched *s, task *t) {
             /* TCP и UDP занимаются РАЗНЫМИ вызовами: тип сокета задаётся при
                создании, и «тот же bind, только датаграммный» — другой вызов,
                а не другой аргумент. */
-            int bound = d2k_sched_bind_hook(t->transport, &pfd, &psport);
+            int bound = d2k_sched_bind_hook(t->transport, t->family, &pfd, &psport);
             if (bound == 0) {
                 t->probe_fd = pfd;
                 t->probe_sport_be = psport;
@@ -2031,54 +2032,80 @@ static int install_next(d2k_sched *s, task *t) {
             }
         }
         if (t->by_addr) {
-            struct sockaddr_in peer;
+            struct sockaddr_storage peer;
             memset(&peer, 0, sizeof peer);
-            peer.sin_family = AF_INET;
-            peer.sin_port = htons(t->port ? t->port : 443);
-            if (inet_pton(AF_INET, t->ip, &peer.sin_addr) != 1 ||
-                connect(t->probe_fd, (struct sockaddr *)&peer, sizeof peer) != 0) {
+            socklen_t peer_len;
+            int parsed;
+            if (t->family == 6) {
+                struct sockaddr_in6 *p = (struct sockaddr_in6 *)&peer;
+                p->sin6_family = AF_INET6;
+                p->sin6_port = htons(t->port ? t->port : 443);
+                peer_len = sizeof *p;
+                parsed = inet_pton(AF_INET6, t->ip, &p->sin6_addr);
+            } else {
+                struct sockaddr_in *p = (struct sockaddr_in *)&peer;
+                p->sin_family = AF_INET;
+                p->sin_port = htons(t->port ? t->port : 443);
+                peer_len = sizeof *p;
+                parsed = inet_pton(AF_INET, t->ip, &p->sin_addr);
+            }
+            if (parsed != 1 ||
+                connect(t->probe_fd, (struct sockaddr *)&peer, peer_len) != 0) {
                 say(s, "по %s адресный QUIC-сокет не смог выбрать маршрут: %s",
                     t->name, strerror(errno));
                 close(t->probe_fd); t->probe_fd = -1;
                 return -2;
             }
-            struct sockaddr_in local;
+            struct sockaddr_storage local;
             socklen_t local_len = sizeof local;
             memset(&local, 0, sizeof local);
-            if (getsockname(t->probe_fd, (struct sockaddr *)&local, &local_len) != 0 ||
-                local.sin_family != AF_INET || local.sin_addr.s_addr == 0 ||
-                local.sin_port == 0 || fresh_trial_id(t->addr_probe_trial_id) != 0) {
+            int local_ok = getsockname(t->probe_fd, (struct sockaddr *)&local, &local_len) == 0;
+            uint16_t local_port = 0;
+            memset(t->addr_probe_src_ip, 0, sizeof t->addr_probe_src_ip);
+            if (local_ok && t->family == 6 && local.ss_family == AF_INET6) {
+                const struct sockaddr_in6 *p = (const struct sockaddr_in6 *)&local;
+                local_ok = !IN6_IS_ADDR_UNSPECIFIED(&p->sin6_addr);
+                memcpy(t->addr_probe_src_ip, &p->sin6_addr, 16);
+                local_port = p->sin6_port;
+            } else if (local_ok && t->family == 4 && local.ss_family == AF_INET) {
+                const struct sockaddr_in *p = (const struct sockaddr_in *)&local;
+                local_ok = p->sin_addr.s_addr != 0;
+                memcpy(t->addr_probe_src_ip, &p->sin_addr, 4);
+                local_port = p->sin_port;
+            } else {
+                local_ok = 0;
+            }
+            if (!local_ok || !local_port || fresh_trial_id(t->addr_probe_trial_id) != 0) {
                 say(s, "по %s не удалось закрепить адрес/порт/поколение QUIC-пробы",
                     t->name);
                 close(t->probe_fd); t->probe_fd = -1;
                 return -2;
             }
-            memcpy(t->addr_probe_src_ip, &local.sin_addr.s_addr, 4);
-            t->addr_probe_src_port_be = local.sin_port;
-            t->probe_sport_be = local.sin_port;
+            t->addr_probe_src_port_be = local_port;
+            t->probe_sport_be = local_port;
         }
         int set_rc;
         if (t->by_addr) {
-            uint8_t dst[4];
-            if (inet_pton(AF_INET, t->ip, dst) != 1) {
+            uint8_t dst[16] = {0};
+            if (inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, dst) != 1) {
                 set_rc = -1;
-                snprintf(err, sizeof err, "неверный IPv4-адрес цели");
+                snprintf(err, sizeof err, "адрес цели не соответствует семейству опыта");
             } else {
-                set_rc = d2k_link_set_addr_probe(s->link_fd,
+                set_rc = d2k_link_set_addr_probe_family(s->link_fd,
                     t->addr_probe_src_ip, t->addr_probe_src_port_be,
-                    dst, htons(t->port ? t->port : 443), 17,
+                    dst, htons(t->port ? t->port : 443), 17, t->family,
                     t->addr_probe_trial_id, D2K_ADDR_PROBE_LEASE_MAX_MS,
                     hex, err, sizeof err);
             }
         } else {
-            set_rc = d2k_link_set_name_probe(s->link_fd, t->name, t->transport, hex,
+            set_rc = d2k_link_set_name_family(s->link_fd, t->name, t->transport, hex,
                                              probe_shape(t), t->probe_sport_be,
-                                             err, sizeof err);
+                                             t->family, err, sizeof err);
         }
         if (set_rc == 0) {
             t->trial_installed = 1;
             t->trial_shape = (uint8_t)(t->by_addr ? 0 : probe_shape(t));
-            t->trial_shape_seq = s->quic_shape_seq;
+            t->trial_shape_seq = s->quic_shape_seq[t->family == 6];
             if (t->by_addr) { t->addr_probe_identity_valid = 1; }
             return 0;
         }
@@ -2098,13 +2125,15 @@ static int install_next(d2k_sched *s, task *t) {
 /* Привязка этой цели в каталоге — та, что подходит по транспорту. Нужна
    там, где решение зависит не от плана, а от того, ЧЕМ он был добыт. */
 static const d2k_cat_binding *binding_for(const d2k_sched *s, const char *name,
-                                          uint8_t transport) {
+                                          uint8_t transport, uint8_t family) {
     if (!s->cat) { return NULL; }
     for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
         const d2k_cat_box *b = &s->cat->boxes[bi];
         for (size_t i = 0; i < b->n_binds; i++) {
             const d2k_cat_binding *bd = &b->binds[i];
-            if (bd->transport == transport && strcmp(bd->target, name) == 0) {
+            if ((bd->transport ? bd->transport : 6) == transport &&
+                (bd->family ? bd->family : 4) == family &&
+                strcmp(bd->kind, "name") == 0 && strcmp(bd->target, name) == 0) {
                 return bd;
             }
         }
@@ -2586,6 +2615,9 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
             const d2k_cat_binding *bd = &b->binds[j];
             fputs(j ? ", {" : "{", f);
             fputs("\"target\": ", f); json_str(f, bd->target);
+            fprintf(f, ", \"family\": %u, \"transport\": %u, \"shape\": %u",
+                    (unsigned)(bd->family ? bd->family : 4),
+                    (unsigned)(bd->transport ? bd->transport : 6), (unsigned)bd->shape);
             fputs(", \"kind\": ", f); json_str(f, bd->kind);
             fprintf(f, ", \"level\": %d, ", bd->level);
             fputs("\"level_name\": ", f); json_str(f, level_name(bd->level));
@@ -2605,6 +2637,10 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         fputs(first ? "\n    {" : ",\n    {", f);
         first = 0;
         fputs("\"target\": ", f); json_str(f, t->name);
+        fprintf(f, ", \"family\": %u, \"transport\": %u",
+                (unsigned)t->family, (unsigned)t->transport);
+        fputs(", \"ip\": ", f); json_str(f, t->ip);
+        fprintf(f, ", \"port\": %u", (unsigned)t->port);
         fputs(", \"phase\": ", f); json_str(f, task_phase(t));
         fputs(", \"since\": ", f); json_time(f, wall_s(s, t->started_ms));
         fprintf(f, ", \"attempts\": %zu, \"probes\": %d, ", t->next_plan, t->probes);
@@ -2985,8 +3021,8 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
     }
     char hex[2 * D2K_PLAN_TLV_MAX + 1];
     if (d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0 ||
-        d2k_link_set_name_probe(s->link_fd, t->name, 17, hex, D2K_LINK_SHAPE_VOICE,
-                                htons(r.client_port), err, sizeof err) != 0) {
+        d2k_link_set_name_family(s->link_fd, t->name, 17, hex, D2K_LINK_SHAPE_VOICE,
+                                htons(r.client_port), t->family, err, sizeof err) != 0) {
         say(s, "по %s (голос) измеренный Plan не поставился: %s", t->name, err);
         task_fail(s, t, now_ms);
         return;
@@ -3058,8 +3094,8 @@ static int launch_task(d2k_sched *s, task *t) {
     }
     if (!t->shape_armed) {
         char err[128];
-        if (d2k_link_arm_shape(s->link_fd, t->name, t->transport,
-                               err, sizeof err) == 0) {
+        if (d2k_link_arm_shape_family(s->link_fd, t->name, t->transport,
+                                      t->family, err, sizeof err) == 0) {
             t->shape_armed = 1;
         }
     }
@@ -3136,8 +3172,8 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                 snprintf(err, sizeof err, "адрес STUN-цели не является IPv4");
             }
         } else {
-            install_rc = d2k_link_set_name(s->link_fd, t->name, 17, hex,
-                                           D2K_LINK_SHAPE_VOICE, err, sizeof err);
+            install_rc = d2k_link_set_name_family(s->link_fd, t->name, 17, hex,
+                                           D2K_LINK_SHAPE_VOICE, 0, t->family, err, sizeof err);
         }
     }
     if (install_rc != 0) {
@@ -3148,14 +3184,14 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         return;
     }
     if (is_stun) {
-        (void)d2k_link_del_name_probe(s->link_fd, t->name, 17,
+        (void)d2k_link_del_name_probe_family(s->link_fd, t->name, 17,
                                       D2K_LINK_SHAPE_VOICE,
-                                      t->probe_sport_be, err, sizeof err);
+                                      t->probe_sport_be, t->family, err, sizeof err);
     }
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          is_stun ? "stun" : "voice",
                          is_stun ? t->ip : t->name,
-                         is_stun ? "addr" : "name", 17, D2K_LINK_SHAPE_VOICE,
+                         is_stun ? "addr" : "name", 17, t->family, D2K_LINK_SHAPE_VOICE,
                          is_stun ? D2K_VERBY_STUN : D2K_VERBY_CLIENT,
                          D2K_INPUT_PROFILE,
                          wall_s(s, now_ms), &t->fp);
@@ -3436,20 +3472,20 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
        цели он достанется с переписанным именем (см. quic_shape и
        fill_hellos). Сохраняем ДО поиска задач: снимок годится и тогда, когда
        задачи с этим именем уже нет. */
-    if (ev->transport == 17 && ev->shape_len <= sizeof s->quic_shape) {
-        memcpy(s->quic_shape, ev->shape, ev->shape_len);
-        s->quic_shape_len = ev->shape_len;
-        memcpy(s->quic_shape_name, name, strlen(name) + 1);
-        s->quic_shape_seq++;
+    if (ev->transport == 17 && ev->shape_len <= sizeof s->quic_shape[ev->family == 6]) {
+        memcpy(s->quic_shape[ev->family == 6], ev->shape, ev->shape_len);
+        s->quic_shape_len[ev->family == 6] = ev->shape_len;
+        memcpy(s->quic_shape_name[ev->family == 6], name, strlen(name) + 1);
+        s->quic_shape_seq[ev->family == 6]++;
     }
     /* Форма TCP сохраняется ВМЕСТЕ С ИМЕНЕМ и тоже ДО поиска задач: подозрение
        приходит следом, и без этой ячейки снимок терялся бы при обычном
        порядке событий (см. tcp_shape в структуре планировщика). */
-    if (ev->transport == 6 && ev->shape_len <= sizeof s->tcp_shape &&
-        strlen(name) < sizeof s->tcp_shape_name) {
-        memcpy(s->tcp_shape, ev->shape, ev->shape_len);
-        s->tcp_shape_len = ev->shape_len;
-        memcpy(s->tcp_shape_name, name, strlen(name) + 1);
+    if (ev->transport == 6 && ev->shape_len <= sizeof s->tcp_shape[ev->family == 6] &&
+        strlen(name) < sizeof s->tcp_shape_name[ev->family == 6]) {
+        memcpy(s->tcp_shape[ev->family == 6], ev->shape, ev->shape_len);
+        s->tcp_shape_len[ev->family == 6] = ev->shape_len;
+        memcpy(s->tcp_shape_name[ev->family == 6], name, strlen(name) + 1);
         say(s, "по %s (TCP) сохранён целый снимок для следующего поиска: %zu байт",
             name, ev->shape_len);
     }
@@ -3458,6 +3494,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
        байты, которыми задача пойдёт мерить. */
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
+        if (t->family != (ev->family ? ev->family : 4)) { continue; }
         /* The whole experiment, not just the worker, owns its input:
          * result conversion, Plan guards and verification must describe
          * the same bytes. New observations remain cached for NEXT search. */
@@ -3473,7 +3510,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
          * заходит. */
         if (t->state == T_WATCHING && t->transport == ev->transport &&
             strcmp(t->name, name) == 0) {
-            const d2k_cat_binding *bd = binding_for(s, t->name, t->transport);
+            const d2k_cat_binding *bd = binding_for(s, t->name, t->transport, t->family);
             if (bd && bd->input == D2K_INPUT_PROFILE) {
                 remeasure_snapped(s, t, ev->shape, ev->shape_len);
             }
@@ -3568,11 +3605,11 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                                         : (uint8_t)D2K_INPUT_PROFILE;
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
-                         t->name, t->by_addr ? "addr" : "name", t->transport, rec_shape,
+                         t->name, t->by_addr ? "addr" : "name", t->transport, t->family, rec_shape,
                          D2K_VERBY_PROBE, rec_input,
                          wall_s(s, now_ms), &t->fp);
     if (t->by_addr) {
-        uint8_t ip4[4];
+        uint8_t addr[16] = {0};
         char err[160], permanent_wire[sizeof t->plans[0]];
         char permanent_hex[2 * D2K_PLAN_TLV_MAX + 1];
         err[0] = '\0';
@@ -3580,9 +3617,9 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         if (stamp_plan_id(permanent_wire, wire_id) != 0 ||
             d2k_plan_text_to_hex(permanent_wire, permanent_hex,
                                  sizeof permanent_hex, err, sizeof err) != 0 ||
-            inet_pton(AF_INET, t->ip, ip4) != 1 ||
-            d2k_link_set_addr(s->link_fd, ip4, permanent_hex, err, sizeof err) != 0) {
-            if (!err[0]) { snprintf(err, sizeof err, "неверный IPv4 или отсутствует REC_ID"); }
+            inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, addr) != 1 ||
+            d2k_link_set_addr_family(s->link_fd, addr, t->family, permanent_hex, err, sizeof err) != 0) {
+            if (!err[0]) { snprintf(err, sizeof err, "неверный адрес цели или отсутствует REC_ID"); }
             say(s, "по %s адресный план подтверждён, но не удалось продвинуть его в постоянную таблицу: %s",
                 t->name, err);
         }
@@ -3644,9 +3681,9 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        уже прошёл, а крючок наблюдения (on_shape) ловит только снимки,
        пришедшие ПОСЛЕ подтверждения. Без этой проверки привязка легла бы
        заготовкой при настоящих байтах на руках. */
-    if (!t->trig_snapped && t->transport == 6 && s->tcp_shape_len > 0 &&
-        strcmp(s->tcp_shape_name, t->name) == 0) {
-        remeasure_snapped(s, t, s->tcp_shape, s->tcp_shape_len);
+    if (!t->trig_snapped && t->transport == 6 && s->tcp_shape_len[t->family == 6] > 0 &&
+        strcmp(s->tcp_shape_name[t->family == 6], t->name) == 0) {
+        remeasure_snapped(s, t, s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]);
     }
 }
 
@@ -3665,15 +3702,16 @@ static int plan_id_is_ours(const task *t, const d2k_ev *ev) {
 
 /* Применение НАШЕГО кандидата к НАШЕЙ цели? Полный ключ сверим после зонда. */
 static int applied_of_candidate(const task *t, const d2k_ev *ev) {
+    if ((ev->family ? ev->family : 4) != t->family) { return 0; }
     if (ev->transport != t->transport || !plan_id_is_ours(t, ev)) { return 0; }
     if (t->by_addr && memcmp(ev->trial_id, t->addr_probe_trial_id,
                              D2K_TRIAL_ID_LEN) != 0) { return 0; }
-    char ip[16];
-    ip_text(ev->low_ip, ip, sizeof ip);
+    char ip[INET6_ADDRSTRLEN];
+    (void)inet_ntop(t->family == 6 ? AF_INET6 : AF_INET, ev->low_ip, ip, sizeof ip);
     if (ev->low_port == t->port && strcmp(ip, t->ip) == 0) {
         return 1;
     }
-    ip_text(ev->high_ip, ip, sizeof ip);
+    (void)inet_ntop(t->family == 6 ? AF_INET6 : AF_INET, ev->high_ip, ip, sizeof ip);
     if (ev->high_port == t->port && strcmp(ip, t->ip) == 0) {
         return 1;
     }
@@ -3756,8 +3794,9 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
                 continue; /* saturation may lose evidence, never invent it */
             }
             d2k_flowkey *k = &t->ver_early[t->ver_seen++];
-            memcpy(k->a_ip, ev->low_ip, 4);
-            memcpy(k->b_ip, ev->high_ip, 4);
+            k->family = t->family;
+            memcpy(k->a_ip, ev->low_ip, t->family == 6 ? 16 : 4);
+            memcpy(k->b_ip, ev->high_ip, t->family == 6 ? 16 : 4);
             k->a_port = ev->low_port;
             k->b_port = ev->high_port;
             k->transport = ev->transport;
@@ -3880,8 +3919,9 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
                 return; /* переполнение теряет улику, но не выдумывает её */
             }
             d2k_flowkey *k = &t->ver_unsent_early[t->ver_unsent_seen];
-            memcpy(k->a_ip, ev->low_ip, 4);
-            memcpy(k->b_ip, ev->high_ip, 4);
+            k->family = t->family;
+            memcpy(k->a_ip, ev->low_ip, t->family == 6 ? 16 : 4);
+            memcpy(k->b_ip, ev->high_ip, t->family == 6 ? 16 : 4);
             k->a_port = ev->low_port;
             k->b_port = ev->high_port;
             k->transport = ev->transport;
@@ -4230,10 +4270,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                Keep that Run's copied input immutable, then discard its result
                and repeat once with the exact target-owned client Initial. */
             if (t->transport == 17 && !t->reasked && !t->trig_snapped &&
-                s->quic_shape_len > 0 &&
-                strcmp(s->quic_shape_name, t->name) == 0 &&
-                s->quic_shape_len <= sizeof t->trig) {
-                remeasure_snapped(s, t, s->quic_shape, s->quic_shape_len);
+                s->quic_shape_len[t->family == 6] > 0 &&
+                strcmp(s->quic_shape_name[t->family == 6], t->name) == 0 &&
+                s->quic_shape_len[t->family == 6] <= sizeof t->trig) {
+                remeasure_snapped(s, t, s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6]);
                 moved++;
                 continue;
             }
@@ -4257,21 +4297,21 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                руках. Коробка вправе смотреть на содержимое и длину, а не
                только на версию (§6), поэтому повод для повтора один: мерили
                НЕ байтами клиента, а они уже есть. */
-            if (t->transport == 6 && !t->reasked && s->tcp_shape_len > 0 &&
-                strcmp(s->tcp_shape_name, t->name) == 0 &&
-                s->tcp_shape_len <= sizeof t->trig &&
+            if (t->transport == 6 && !t->reasked && s->tcp_shape_len[t->family == 6] > 0 &&
+                strcmp(s->tcp_shape_name[t->family == 6], t->name) == 0 &&
+                s->tcp_shape_len[t->family == 6] <= sizeof t->trig &&
                 (!t->trig_snapped ||
-                 d2k_hello_shape(s->tcp_shape, s->tcp_shape_len)
+                 d2k_hello_shape(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6])
                      != (d2k_shape)t->asked_shape)) {
-                int other_form = d2k_hello_shape(s->tcp_shape, s->tcp_shape_len)
+                int other_form = d2k_hello_shape(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6])
                                      != (d2k_shape)t->asked_shape;
                 /* Снимок берём ТОЛЬКО ТЕПЕРЬ, когда замер закончен: вход
                    опыта неизменен, пока опыт идёт (см. on_shape — снимок
                    кладётся лишь задачам, которые его ЖДУТ). */
                 t->reasked = 1;
                 size_t was_len = t->trig_len;
-                memcpy(t->trig, s->tcp_shape, s->tcp_shape_len);
-                t->trig_len = s->tcp_shape_len;
+                memcpy(t->trig, s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]);
+                t->trig_len = s->tcp_shape_len[t->family == 6];
                 t->trig_snapped = 1;
                 t->ctrl_len = 0;   /* контроль соберётся из новых байт */
                 if (other_form) {
@@ -4435,9 +4475,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 if (t->state != T_PLANNING) { continue; }
             } else {
                 t->prop_fd = t->c_fd;
-                memcpy(t->prop_flow.a_ip, t->c_ip, 4);
+                t->prop_flow.family = t->family;
+                memcpy(t->prop_flow.a_ip, t->c_ip, sizeof t->prop_flow.a_ip);
                 t->prop_flow.a_port = t->c_port;
-                inet_pton(AF_INET, t->ip, t->prop_flow.b_ip);
+                inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, t->prop_flow.b_ip);
                 t->prop_flow.b_port = t->port;
                 t->prop_flow.transport = 6;
                 t->state = T_PROPS_WAIT;
@@ -4489,13 +4530,13 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                Кандидат обязан быть снят exact-командой ДО повторного поиска;
                иначе успешный VERIFY запишет ложное знание под чужой формой. */
             if (t->transport == 17 && !t->reasked && !t->trig_snapped &&
-                t->trial_installed && s->quic_shape_seq > t->trial_shape_seq &&
-                s->quic_shape_len > 0 &&
-                strcmp(s->quic_shape_name, t->name) == 0 &&
-                s->quic_shape_len <= sizeof t->trig) {
+                t->trial_installed && s->quic_shape_seq[t->family == 6] > t->trial_shape_seq &&
+                s->quic_shape_len[t->family == 6] > 0 &&
+                strcmp(s->quic_shape_name[t->family == 6], t->name) == 0 &&
+                s->quic_shape_len[t->family == 6] <= sizeof t->trig) {
                 ver_close(t);
                 remove_trial_exact(s, t);
-                remeasure_snapped(s, t, s->quic_shape, s->quic_shape_len);
+                remeasure_snapped(s, t, s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6]);
                 moved++;
                 continue;
             }
@@ -4504,9 +4545,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                по нему разбираются НАКОПЛЕННЫЕ ранние отказы: до возврата
                зонда отличить отказ своего обращения от отказа соседнего
                клиента той же цели было нечем. */
-            memcpy(t->ver_flow.a_ip, t->ver.local_ip4, 4);
+            t->ver_flow.family = t->family;
+            memcpy(t->ver_flow.a_ip, t->family == 6 ? t->ver.local_addr : t->ver.local_ip4,
+                   t->family == 6 ? 16 : 4);
             t->ver_flow.a_port = t->ver.local_port;
-            inet_pton(AF_INET, t->ip, t->ver_flow.b_ip);
+            inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, t->ver_flow.b_ip);
             t->ver_flow.b_port = t->port;
             t->ver_flow.transport = t->transport;
             claim_early_refusal(t);
@@ -4574,8 +4617,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     {
                         d2k_ev own;
                         memset(&own, 0, sizeof own);
-                        memcpy(own.low_ip, t->ver_flow.a_ip, 4);
-                        memcpy(own.high_ip, t->ver_flow.b_ip, 4);
+                        memcpy(own.low_ip, t->ver_flow.a_ip, sizeof own.low_ip);
+                        memcpy(own.high_ip, t->ver_flow.b_ip, sizeof own.high_ip);
+                        own.family = t->ver_flow.family;
                         own.low_port = t->ver_flow.a_port;
                         own.high_port = t->ver_flow.b_port;
                         own.transport = t->ver_flow.transport;
@@ -4623,8 +4667,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             } else {
                 d2k_ev own;
                 memset(&own, 0, sizeof own);
-                memcpy(own.low_ip, t->ver_flow.a_ip, 4);
-                memcpy(own.high_ip, t->ver_flow.b_ip, 4);
+                memcpy(own.low_ip, t->ver_flow.a_ip, sizeof own.low_ip);
+                memcpy(own.high_ip, t->ver_flow.b_ip, sizeof own.high_ip);
+                own.family = t->ver_flow.family;
                 own.low_port = t->ver_flow.a_port;
                 own.high_port = t->ver_flow.b_port;
                 own.transport = t->ver_flow.transport;
@@ -4741,16 +4786,16 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        baseline measurement. Research happens at most once. */
                     char err[160];
                     if (t->by_addr) { (void)addr_probe_remove(s, t, err, sizeof err); }
-                    else { (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err); }
+                    else { (void)d2k_link_del_name_family(s->link_fd, t->name, t->family, err, sizeof err); }
                     t->trial_installed = 0;
                     t->researched = 1;
                     t->box_id[0] = '\0';
                     t->state = T_ASKING;
                     if (t->transport == 17 && !t->reasked && !t->trig_snapped &&
-                        s->quic_shape_len > 0 &&
-                        strcmp(s->quic_shape_name, t->name) == 0 &&
-                        s->quic_shape_len <= sizeof t->trig) {
-                        remeasure_snapped(s, t, s->quic_shape, s->quic_shape_len);
+                        s->quic_shape_len[t->family == 6] > 0 &&
+                        strcmp(s->quic_shape_name[t->family == 6], t->name) == 0 &&
+                        s->quic_shape_len[t->family == 6] <= sizeof t->trig) {
+                        remeasure_snapped(s, t, s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6]);
                         moved++;
                         continue;
                     }

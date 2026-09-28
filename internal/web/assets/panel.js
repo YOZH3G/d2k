@@ -358,17 +358,29 @@
     rootNode.setAttribute("aria-busy", "false");
   }
 
+  function networkContext(item) {
+    var family = item.family || 4;
+    var transport = item.transport || 6;
+    return (family === 6 ? "IPv6" : family === 4 ? "IPv4" : "Семейство не определено") +
+      (transport === 6 ? " / TCP" : transport === 17 ? " / UDP" : "");
+  }
+
+  function contextKey(item) {
+    return [item.target || "", item.family || 4, item.transport || 6];
+  }
+
   function renderSearch(doc, parent, search) {
     var card = append(parent, node(doc, "article", undefined, "search-item"));
     var top = append(card, node(doc, "div", undefined, "search-top"));
     append(top, node(doc, "strong", search.target || "цель без имени", "search-target"));
     append(top, node(doc, "span", searchPhase(search.phase), "phase-tag"));
     var meta = append(card, node(doc, "div", undefined, "search-meta"));
+    append(meta, node(doc, "span", networkContext(search)));
     append(meta, node(doc, "span", "Начато " + safeDate(search.since)));
     var counts = append(card, node(doc, "div", undefined, "search-counts"));
     append(counts, node(doc, "span", "Проверено вариантов: " + (search.attempts || 0)));
     var detail = append(card, node(doc, "details", undefined, "search-detail"));
-    setAttr(detail, "data-ui-key", "search:" + (search.target || "unnamed"));
+    setAttr(detail, "data-ui-key", "search:" + JSON.stringify(contextKey(search)));
     append(detail, node(doc, "summary", "Подробности проверки"));
     append(detail, node(doc, "p", "Исходный сигнал: " + (search.source || "не указан")));
     append(detail, node(doc, "p", "Текущий этап: " + (search.phase || "не указан")));
@@ -407,7 +419,7 @@
       var row = append(targets, node(doc, "div", undefined, "target-row" + (binding.enabled ? "" : " target-disabled")));
       var target = append(row, node(doc, "div", undefined, "target-identity"));
       append(target, node(doc, "strong", binding.target || "цель не названа", "target-name"));
-      append(target, node(doc, "span", binding.kind || "сетевой поток", "target-kind"));
+      append(target, node(doc, "span", networkContext(binding), "target-kind"));
       var evidence = append(row, node(doc, "div", undefined, "evidence"));
       var meter = append(evidence, node(doc, "span", undefined, "evidence-meter"));
       meter.setAttribute("role", "img");
@@ -418,7 +430,8 @@
       var copy = append(row, node(doc, "button", "Копировать", "copy-button"));
       copy.setAttribute("type", "button");
       copy.setAttribute("data-copy", binding.target || "");
-      copy.setAttribute("data-ui-key", "copy:" + (binding.target || ""));
+      copy.setAttribute("data-ui-key", "copy:" + JSON.stringify(
+        [box.id || index, binding.kind || "name", binding.shape || 0].concat(contextKey(binding))));
       copy.setAttribute("aria-label", "Скопировать адрес " + (binding.target || ""));
       void successes;
     });

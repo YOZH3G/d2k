@@ -191,4 +191,30 @@ assert.match(unavailableCatalog.textContent, /Сохранённые резул�
   'an unavailable catalog must be distinguished from a genuinely empty one');
 assert.doesNotMatch(unavailableCatalog.textContent, /0 целей|0 коробок|0 коробки/,
   'unavailable catalog counts must not be represented as zeros');
+const dual = new Element('main');
+const dualState = {
+  snapshot: { mode: 'apply', stages: [], absent: [], taken: 'now' },
+  knowledge: { linked: true, searches: [
+    { target: 'dual.example', family: 4, transport: 6 },
+    { target: 'dual.example', family: 6, transport: 6 },
+    { target: 'dual.example', family: 6, transport: 17 },
+  ], boxes: [{ id: 'dual-box', bindings: [
+    { target: 'dual.example', kind: 'name', family: 4, transport: 6, enabled: true },
+    { target: 'dual.example', kind: 'name', family: 6, transport: 6, enabled: true },
+  ] }], targets: 2, confirms: 0, probes_used: 0 },
+};
+render(dual, dualState, document);
+assert.match(dual.textContent, /IPv4/, 'panel identifies IPv4 context');
+assert.match(dual.textContent, /IPv6/, 'panel identifies IPv6 context');
+const dualDetails = dual.walk().filter(x => x.className === 'search-detail');
+assert.equal(new Set(dualDetails.map(x => x.getAttribute('data-ui-key'))).size, 3,
+  'same domain across families/transports has independent disclosure state');
+const dualCopies = dual.walk().filter(x => x.className === 'copy-button');
+assert.equal(new Set(dualCopies.map(x => x.getAttribute('data-ui-key'))).size, 2,
+  'copy focus distinguishes IPv4 and IPv6 bindings');
+dualDetails[0].open = true;
+render(dual, dualState, document);
+const restored = dual.walk().filter(x => x.className === 'search-detail');
+assert.equal(restored[0].open, true);
+assert.equal(restored[1].open, false, 'opening IPv4 details must not open IPv6 details after refresh');
 console.log('C panel DOM renderer: all checks passed');
