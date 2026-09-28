@@ -278,7 +278,7 @@ static int dial_marked(const char *host, const char *port, int timeout_ms,
     int fd = -1, rc;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = strchr(host, ':') ? AF_INET6 : AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     rc = getaddrinfo(host, port, &hints, &ai);
     if (rc != 0 || !ai) {
@@ -490,7 +490,8 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
                          const d2k_opts *opt, d2k_result *res, d2k_poison *hit)
 {
     struct addrinfo hints, *ai = NULL;
-    uint8_t ip4[4];
+    uint8_t ip4[16] = {0};
+    uint8_t family;
     uint16_t pnum;
     const d2k_poison *list;
     int n, i, k;
@@ -499,13 +500,19 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
     int ncands;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = strchr(host, ':') ? AF_INET6 : AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, port, &hints, &ai) != 0 || !ai) {
         return 0;
     }
-    memcpy(ip4, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, 4);
-    pnum = ntohs(((struct sockaddr_in *)ai->ai_addr)->sin_port);
+    family = ai->ai_family == AF_INET6 ? 6 : 4;
+    if (family == 6) {
+        memcpy(ip4, &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr, 16);
+        pnum = ntohs(((struct sockaddr_in6 *)ai->ai_addr)->sin6_port);
+    } else {
+        memcpy(ip4, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, 4);
+        pnum = ntohs(((struct sockaddr_in *)ai->ai_addr)->sin_port);
+    }
     freeaddrinfo(ai);
     if (pnum == 0) {
         return 0;
@@ -521,7 +528,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         for (i = 0; i < opt->repeats; i++) {
             int rc;
             if (d2k_detect_stopped(&opt->cancel)) { break; }
-            rc = d2k_raw_probe_handshake(ip4, pnum, opt->timeout_ms, opt->mark,
+            rc = d2k_raw_probe_handshake_family(ip4, family, pnum, opt->timeout_ms, opt->mark,
                                          &opt->cancel, err, sizeof(err));
             res->probes++;
             if (rc < 0) {
@@ -555,7 +562,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
     /* СВОЙСТВА СПЕРВА, СТРАТЕГИЯ — ИЗ НИХ. Шесть вопросов вместо девяноста
      * попыток. Перебор ниже остаётся, но уже запасным путём. */
     if (opt->only[0] == '\0') {
-        if (d2k_run_properties(ip4, pnum, tr, opt, res, hit)) {
+        if (d2k_run_properties_family(ip4, family, pnum, tr, opt, res, hit)) {
             if (d2k_opts_acceptable(opt, hit)) {
                 snprintf(res->path, sizeof(res->path), "свойство");
                 return 1;
@@ -575,7 +582,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
             obs = d2k_trace_add(res, cands[k].name);
             obs->delay_ms = cands[k].gap_ms;
             for (i = 0; i < opt->repeats; i++) {
-                int rc = d2k_raw_probe_poison(ip4, pnum, tr, &cands[k], opt->timeout_ms,
+                int rc = d2k_raw_probe_poison_family(ip4, family, pnum, tr, &cands[k], opt->timeout_ms,
                                               opt->mark, &opt->cancel, err, sizeof(err));
                 res->probes++;
                 if (rc > 0) {
@@ -615,7 +622,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         obs->delay_ms = p.gap_ms;
         bind_decoy(&p, opt);
         for (r = 0; r < opt->repeats; r++) {
-            int rc = d2k_raw_probe_poison(ip4, pnum, tr, &p, opt->timeout_ms, opt->mark,
+            int rc = d2k_raw_probe_poison_family(ip4, family, pnum, tr, &p, opt->timeout_ms, opt->mark,
                                           &opt->cancel, err, sizeof(err));
             res->probes++;
             if (rc < 0) {
@@ -701,8 +708,31 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     }
     memcpy(host, addr, (size_t)(colon - addr));
     host[colon - addr] = '\0';
+    if (host[0] == '[') {
+        size_t n = strlen(host);
+        if (n < 3 || host[n - 1] != ']') {
+            res->verdict = D2K_DV_FLAKY;
+            snprintf(res->reason, sizeof(res->reason), "адрес IPv6 не разобран");
+            goto done;
+        }
+        memmove(host, host + 1, n - 2);
+        host[n - 2] = '\0';
+    }
+    if (strchr(host, '%')) {
+        res->verdict = D2K_DV_FLAKY;
+        snprintf(res->reason, sizeof(res->reason), "локальная область IPv6 не является целью замера");
+        goto done;
+    }
     snprintf(port, sizeof(port), "%s", colon + 1);
     {
+        struct in6_addr a6;
+        if (!opt->allow_loopback && inet_pton(AF_INET6, host, &a6) == 1 &&
+            (IN6_IS_ADDR_LOOPBACK(&a6) || IN6_IS_ADDR_UNSPECIFIED(&a6))) {
+            res->verdict = D2K_DV_FLAKY;
+            snprintf(res->reason, sizeof(res->reason),
+                     "цель указывает на localhost — мерить нечего, проверь как резолвится имя");
+            goto done;
+        }
         struct in_addr a;
         if (!opt->allow_loopback && inet_pton(AF_INET, host, &a) == 1) {
             uint32_t v = ntohl(a.s_addr);

@@ -89,7 +89,7 @@ static int handshake12(const char *host, const char *port, const char *sni,
     }
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = strchr(host, ':') ? AF_INET6 : AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, port, &hints, &ai) != 0 || !ai) {
         return 0;

@@ -46,6 +46,10 @@
 #ifndef SO_MARK
 #define SO_MARK 36
 #endif
+#if defined(D2K_RAW_UNIT_TEST) && !defined(IPV6_HDRINCL)
+/* Only packet helpers run in the non-Linux unit harness. */
+#define IPV6_HDRINCL (-1)
+#endif
 
 int d2k_raw_supported(void) { return 1; }
 
@@ -68,8 +72,9 @@ typedef struct {
 typedef struct {
     int      send_fd;
     int      recv_fd;
-    uint8_t  src[4];
-    uint8_t  dst[4];
+    uint8_t  src[16];
+    uint8_t  dst[16];
+    uint8_t  family; /* 0/4 IPv4, 6 IPv6 */
     uint16_t sport;
     uint16_t dport;
     uint32_t seq; /* наш следующий номер */
@@ -188,21 +193,26 @@ static void sweep_stale_rst_rules(void)
     FILE *f;
     char line[512];
 
-    f = popen("iptables -S OUTPUT 2>/dev/null", "r");
+    const char *tables[] = {"iptables", "ip6tables"};
+    for (size_t family = 0; family < 2; family++) {
+    char list[96];
+    snprintf(list, sizeof list, "%s -S OUTPUT 2>/dev/null", tables[family]);
+    f = popen(list, "r");
     if (!f) {
-        return;
+        continue;
     }
     while (fgets(line, sizeof(line), f)) {
         int port;
         if (d2k_parse_stale_rst_rule(line, &port)) {
             char cmd[192];
             snprintf(cmd, sizeof(cmd),
-                     "iptables -D OUTPUT -p tcp --sport %d --tcp-flags RST RST -j DROP"
-                     " >/dev/null 2>&1", port);
+                     "%s -D OUTPUT -p tcp --sport %d --tcp-flags RST RST -j DROP"
+                     " >/dev/null 2>&1", tables[family], port);
             (void)system(cmd);
         }
     }
     pclose(f);
+    }
 }
 
 /* suppressKernelRST закрывает ядру рот на время зонда.
@@ -213,13 +223,13 @@ static void sweep_stale_rst_rules(void)
  * от собственного ядра и читается как блокировка (замер 04.09: классификатор
  * вырождался в opaque с полным перебором на любом домене). Отказ здесь
  * молчаливый по замыслу, поэтому факт отказа обязан доехать до вердикта. */
-static int suppress_kernel_rst(uint16_t sport)
+static int suppress_kernel_rst(uint16_t sport, uint8_t family)
 {
     char cmd[192];
     int rc;
     snprintf(cmd, sizeof(cmd),
-             "iptables -I OUTPUT -p tcp --sport %u --tcp-flags RST RST -j DROP"
-             " >/dev/null 2>&1", (unsigned)sport);
+             "%s -I OUTPUT -p tcp --sport %u --tcp-flags RST RST -j DROP"
+             " >/dev/null 2>&1", family == 6 ? "ip6tables" : "iptables", (unsigned)sport);
     /* Old router iptables cannot be relied on to serialize our commands.
      * Protect only rule edits, not the network lifetime of the probe. */
     pthread_mutex_lock(&g_raw_state);
@@ -231,20 +241,34 @@ static int suppress_kernel_rst(uint16_t sport)
     return rc == 0;
 }
 
-static void release_kernel_rst(uint16_t sport)
+static void release_kernel_rst(uint16_t sport, uint8_t family)
 {
     char cmd[192];
     snprintf(cmd, sizeof(cmd),
-             "iptables -D OUTPUT -p tcp --sport %u --tcp-flags RST RST -j DROP"
-             " >/dev/null 2>&1", (unsigned)sport);
+             "%s -D OUTPUT -p tcp --sport %u --tcp-flags RST RST -j DROP"
+             " >/dev/null 2>&1", family == 6 ? "ip6tables" : "iptables", (unsigned)sport);
     pthread_mutex_lock(&g_raw_state);
     (void)system(cmd);
     pthread_mutex_unlock(&g_raw_state);
 }
 
 /* localAddrFor узнаёт, с какого адреса ядро пошло бы к этой цели. */
-static int local_addr_for(const uint8_t dst[4], uint16_t port, uint8_t out[4])
+static int local_addr_for(const uint8_t *dst, uint16_t port, uint8_t *out, uint8_t family)
 {
+    if (family == 6) {
+        struct sockaddr_in6 to, local;
+        memset(&to, 0, sizeof to);
+        to.sin6_family = AF_INET6; to.sin6_port = htons(port);
+        memcpy(&to.sin6_addr, dst, 16);
+        int sock = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (sock < 0) return 0;
+        socklen_t len = sizeof local;
+        int ok = connect(sock, (struct sockaddr *)&to, sizeof to) == 0 &&
+                 getsockname(sock, (struct sockaddr *)&local, &len) == 0;
+        if (ok) memcpy(out, &local.sin6_addr, 16);
+        close(sock);
+        return ok;
+    }
     int fd;
     struct sockaddr_in sa;
     struct sockaddr_in local;
@@ -411,8 +435,50 @@ static size_t build_ipv4_tcp(uint8_t *pkt, size_t cap,
     return ip_len;
 }
 
+static uint16_t tcp_checksum_family(uint8_t family, const uint8_t *src,
+                                     const uint8_t *dst, const uint8_t *tcp, size_t n)
+{
+    uint16_t base = tcp_checksum(src, dst, tcp, n);
+    if (family != 6) return base;
+    uint32_t sum = (uint16_t)~base;
+    for (size_t i = 4; i < 16; i += 2) sum += rd16(src + i) + rd16(dst + i);
+    while (sum >> 16) sum = (sum & 0xffffu) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+/* Share TCP/options/poison construction with the original IPv4 builder. */
+static size_t build_ip_tcp(uint8_t *pkt, size_t cap, uint8_t family,
+                            const uint8_t *src, const uint8_t *dst,
+                            uint16_t sport, uint16_t dport, uint32_t seq, uint32_t ack,
+                            uint8_t flags, const uint8_t *payload, size_t plen,
+                            const d2k_poison *p, const uint8_t *extra, size_t extralen)
+{
+    if (family != 6)
+        return build_ipv4_tcp(pkt, cap, src, dst, sport, dport, seq, ack, flags,
+                               payload, plen, p, extra, extralen);
+    if (cap < 60 || p->ip_id_zero) return 0;
+    size_t n = build_ipv4_tcp(pkt + 20, cap - 20, src, dst, sport, dport,
+                              seq, ack, flags, payload, plen, p, extra, extralen);
+    if (n < 40 || n - 20 > 65535) return 0;
+    memset(pkt, 0, 40);
+    pkt[0] = 0x60; wr16(pkt + 4, (uint16_t)(n - 20));
+    pkt[6] = 6; pkt[7] = p->ttl > 0 ? (uint8_t)p->ttl : 64;
+    memcpy(pkt + 8, src, 16); memcpy(pkt + 24, dst, 16);
+    uint16_t sum = tcp_checksum_family(6, src, dst, pkt + 40, n - 20);
+    if (p->badsum) { sum ^= 0xbeef; if (!sum) sum = 0x1234; }
+    wr16(pkt + 56, sum);
+    return n + 20;
+}
+
 static int raw_sendto(raw_conn *c, const uint8_t *pkt, size_t n)
 {
+    if (c->family == 6) {
+        struct sockaddr_in6 to;
+        memset(&to, 0, sizeof to);
+        to.sin6_family = AF_INET6;
+        memcpy(&to.sin6_addr, c->dst, 16);
+        return sendto(c->send_fd, pkt, n, 0, (struct sockaddr *)&to, sizeof to) == (ssize_t)n ? 0 : -1;
+    }
     struct sockaddr_in to;
     memset(&to, 0, sizeof(to));
     to.sin_family = AF_INET;
@@ -470,7 +536,7 @@ static int raw_send(raw_conn *c, const uint8_t *payload, size_t plen,
         if (take > D2K_SEG_MAX) {
             take = D2K_SEG_MAX;
         }
-        n = build_ipv4_tcp(pkt, sizeof(pkt), c->src, c->dst, c->sport, c->dport,
+        n = build_ip_tcp(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
                            seq + (uint32_t)off, c->ack, flags,
                            plen ? payload + off : NULL, take, p, NULL, 0);
         if (n == 0) {
@@ -502,7 +568,7 @@ static int raw_send_syn(raw_conn *c)
     size_t n;
 
     memset(&none, 0, sizeof(none));
-    n = build_ipv4_tcp(pkt, sizeof(pkt), c->src, c->dst, c->sport, c->dport,
+    n = build_ip_tcp(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
                        c->seq, 0, TCP_SYN, NULL, 0, &none, opts, sizeof(opts));
     if (n == 0) {
         return -1;
@@ -516,22 +582,27 @@ static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
 {
     uint8_t *buf = c->buffers->recv;
     for (;;) {
-        ssize_t n = recvfrom(c->recv_fd, buf, sizeof(c->buffers->recv), 0, NULL, NULL);
+        struct sockaddr_storage peer;
+        socklen_t peerlen = sizeof peer;
+        ssize_t n = recvfrom(c->recv_fd, buf, sizeof(c->buffers->recv), 0,
+                              (struct sockaddr *)&peer, &peerlen);
         size_t ihl, off;
         const uint8_t *t;
         size_t tlen;
         if (n < 0) {
             return -1;
         }
-        if (n < 40) {
-            continue;
-        }
-        ihl = (size_t)(buf[0] & 0x0f) * 4;
-        if ((size_t)n < ihl + 20) {
-            continue;
-        }
-        if (memcmp(buf + 12, c->dst, 4) != 0) {
-            continue;
+        if (c->family == 6) {
+            /* Linux IPv6 raw TCP receives the transport segment, without IP header. */
+            if (n < 20 || peer.ss_family != AF_INET6 ||
+                memcmp(&((struct sockaddr_in6 *)&peer)->sin6_addr, c->dst, 16) != 0)
+                continue;
+            ihl = 0;
+        } else {
+            if (n < 40) continue;
+            ihl = (size_t)(buf[0] & 0x0f) * 4;
+            if (ihl < 20 || (size_t)n < ihl + 20 || memcmp(buf + 12, c->dst, 4) != 0)
+                continue;
         }
         t = buf + ihl;
         tlen = (size_t)n - ihl;
@@ -539,7 +610,7 @@ static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
             continue;
         }
         off = (size_t)(t[12] >> 4) * 4;
-        if (off > tlen) {
+        if (off < 20 || off > tlen) {
             continue;
         }
         *flags = t[13];
@@ -583,7 +654,7 @@ static int raw_read_payload(raw_conn *c, int timeout_ms, const d2k_detect_stop *
 static void raw_close(raw_conn *c)
 {
     if (c->rule_up) {
-        release_kernel_rst(c->sport);
+        release_kernel_rst(c->sport, c->family);
         c->rule_up = 0;
     }
     if (c->send_fd >= 0) {
@@ -644,7 +715,7 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
 }
 
 /* dialRaw поднимает соединение своими руками и возвращает его установленным. */
-static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
+static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dport,
                     int timeout_ms, uint32_t mark_val, const d2k_detect_stop *cancel,
                     char *err, size_t errcap)
 {
@@ -655,10 +726,12 @@ static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
     memset(c, 0, sizeof(*c));
     c->send_fd = -1;
     c->recv_fd = -1;
-    memcpy(c->dst, dst, 4);
+    if (family != 4 && family != 6) return -1;
+    c->family = family;
+    memcpy(c->dst, dst, family == 6 ? 16 : 4);
     c->dport = dport;
 
-    if (!local_addr_for(dst, dport, c->src)) {
+    if (!local_addr_for(dst, dport, c->src, family)) {
         snprintf(err, errcap, "classify: не удалось определить свой адрес");
         return -1;
     }
@@ -667,7 +740,8 @@ static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
         snprintf(err, errcap, "classify: нет памяти для буферов сырого зонда");
         return -1;
     }
-    c->send_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    int af = family == 6 ? AF_INET6 : AF_INET;
+    c->send_fd = socket(af, SOCK_RAW, IPPROTO_RAW);
     if (c->send_fd < 0) {
         snprintf(err, errcap, "classify: сырой сокет на отправку (нужен root): %s",
                  strerror(errno));
@@ -677,19 +751,30 @@ static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
     /* МЕТКА, ОТКЛЮЧАЮЩАЯ НАШ ЖЕ ОБХОД. Замер обязан идти по СЫРОМУ пути,
      * иначе меряется не коробка провайдера, а наш десинк поверх неё. В
      * правилах NFQUEUE уже есть дверь: `-m mark ! --mark 0x40000000`. */
-    (void)setsockopt(c->send_fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
-    if (setsockopt(c->send_fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) != 0) {
+    if ((mark && setsockopt(c->send_fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0) ||
+        setsockopt(c->send_fd, family == 6 ? IPPROTO_IPV6 : IPPROTO_IP,
+                    family == 6 ? IPV6_HDRINCL : IP_HDRINCL, &one, sizeof(one)) != 0) {
         snprintf(err, errcap, "classify: IP_HDRINCL: %s", strerror(errno));
         raw_close(c);
         return -1;
     }
-    c->recv_fd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    c->recv_fd = socket(af, SOCK_RAW, IPPROTO_TCP);
     if (c->recv_fd < 0) {
         snprintf(err, errcap, "classify: сырой сокет на приём: %s", strerror(errno));
         raw_close(c);
         return -1;
     }
     tv.tv_sec = 0;
+    if (family == 6) {
+        struct sockaddr_in6 local;
+        memset(&local, 0, sizeof local);
+        local.sin6_family = AF_INET6;
+        memcpy(&local.sin6_addr, c->src, 16);
+        if (bind(c->recv_fd, (struct sockaddr *)&local, sizeof local) != 0) {
+            snprintf(err, errcap, "classify: IPv6 receive bind: %s", strerror(errno));
+            raw_close(c); return -1;
+        }
+    }
     tv.tv_usec = 300000;
     (void)setsockopt(c->recv_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -701,7 +786,11 @@ static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
     c->sport = next_source_port();
     seed_once();
     c->seq = (uint32_t)random();
-    c->rule_up = suppress_kernel_rst(c->sport);
+    c->rule_up = suppress_kernel_rst(c->sport, family);
+    if (!c->rule_up) {
+        snprintf(err, errcap, "classify: cannot suppress local TCP RST");
+        raw_close(c); return -1;
+    }
 
     if (raw_handshake(c, timeout_ms, cancel, err, errcap) != 0) {
         raw_close(c);
@@ -721,17 +810,18 @@ static int raw_send_urg(raw_conn *c, const uint8_t *payload, size_t plen)
     uint16_t sum;
 
     memset(&none, 0, sizeof(none));
-    n = build_ipv4_tcp(pkt, sizeof(pkt), c->src, c->dst, c->sport, c->dport,
+    n = build_ip_tcp(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
                        c->seq, c->ack, (uint8_t)(TCP_PSH | TCP_ACK | TCP_URG),
                        payload, plen, &none, NULL, 0);
     if (n == 0) {
         return -1;
     }
-    t = pkt + 20;
+    size_t ihl = c->family == 6 ? 40 : 20;
+    t = pkt + ihl;
     /* Указатель срочности — сразу за нашим байтом. */
     t[18] = 0x00;
     t[19] = (uint8_t)plen;
-    sum = tcp_checksum(c->src, c->dst, t, n - 20);
+    sum = tcp_checksum_family(c->family, c->src, c->dst, t, n - ihl);
     wr16(t + 16, sum);
     return raw_sendto(c, pkt, n);
 }
@@ -741,12 +831,12 @@ static int raw_send_urg(raw_conn *c, const uint8_t *payload, size_t plen)
  * 2026-08-28, googlevideo: тот фронтенд обслуживает только заблокированные
  * имена, безобидной нагрузки для него не существует, и самопроверка падала не
  * потому, что слой сломан, а потому, что отвечать было не на что. */
-int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
+int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                             int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
                             char *err, size_t errcap)
 {
     raw_conn c;
-    if (raw_dial(&c, ip4, port, timeout_ms, mark, cancel, err, errcap) != 0) {
+    if (raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap) != 0) {
         return -1;
     }
     raw_close(&c);
@@ -768,7 +858,7 @@ int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
  * (замер 2026-08-28: 48 гипотез поодиночке мимо, то же плечо в связке — 10 из
  * 10 на том же адресе). Поэтому здесь два независимых шага: отравить буфер
  * фальшивкой и отдать правду — как есть, задом наперёд или внахлёст слева. */
-int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
+int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,
                          int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
                          char *err, size_t errcap)
@@ -782,7 +872,7 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
     size_t n = tr->len;
 
     memset(&none, 0, sizeof(none));
-    if (raw_dial(&c, ip4, port, timeout_ms, mark, cancel, err, errcap) != 0) {
+    if (raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap) != 0) {
         return -1;
     }
     fake = c.buffers->fake;
@@ -1037,21 +1127,21 @@ int d2k_raw_rst_rule_failed(void) { return 0; }
 
 int d2k_parse_stale_rst_rule(const char *line, int *port);
 
-int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
+int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,
                          int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
                          char *err, size_t errcap)
 {
-    (void)ip4; (void)port; (void)tr; (void)p; (void)timeout_ms; (void)mark; (void)cancel;
+    (void)family; (void)ip4; (void)port; (void)tr; (void)p; (void)timeout_ms; (void)mark; (void)cancel;
     snprintf(err, errcap, "classify: сырой слой доступен только на Linux");
     return -1;
 }
 
-int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
+int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                             int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
                             char *err, size_t errcap)
 {
-    (void)ip4; (void)port; (void)timeout_ms; (void)mark; (void)cancel;
+    (void)family; (void)ip4; (void)port; (void)timeout_ms; (void)mark; (void)cancel;
     snprintf(err, errcap, "classify: сырой слой доступен только на Linux");
     return -1;
 }
@@ -1106,3 +1196,16 @@ int d2k_parse_stale_rst_rule(const char *line, int *port)
 }
 
 #endif /* __linux__ */
+
+int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
+    int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel, char *err, size_t errcap)
+{
+    return d2k_raw_probe_handshake_family(ip4, 4, port, timeout_ms, mark, cancel, err, errcap);
+}
+
+int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
+    const d2k_trigger *tr, const d2k_poison *p, int timeout_ms, uint32_t mark,
+    const d2k_detect_stop *cancel, char *err, size_t errcap)
+{
+    return d2k_raw_probe_poison_family(ip4, 4, port, tr, p, timeout_ms, mark, cancel, err, errcap);
+}

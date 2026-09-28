@@ -302,6 +302,13 @@ int  d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
                              char *err, size_t errcap);
 
 /* --- гипотезы (poison.c) ------------------------------------------------ */
+int d2k_raw_probe_handshake_family(const uint8_t *ip, uint8_t family, uint16_t port,
+    int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel, char *err, size_t errcap);
+int d2k_raw_probe_poison_family(const uint8_t *ip, uint8_t family, uint16_t port,
+    const d2k_trigger *tr, const d2k_poison *p, int timeout_ms, uint32_t mark,
+    const d2k_detect_stop *cancel, char *err, size_t errcap);
+int d2k_run_properties_family(const uint8_t *ip, uint8_t family, uint16_t port,
+    const d2k_trigger *tr, const d2k_opts *opt, d2k_result *res, d2k_poison *hit);
 
 const d2k_poison *d2k_poisons(int *n);
 void d2k_strategy_for_poison(const d2k_poison *p, char *out, size_t cap);

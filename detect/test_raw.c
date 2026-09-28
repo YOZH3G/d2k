@@ -14,6 +14,7 @@
 static uint16_t ports[WORKERS][PORTS_PER_WORKER];
 static uint8_t incoming[2][128];
 static size_t incoming_len[2];
+static uint8_t incoming_src[2][16];
 static int failures;
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "raw:%d: %s\n", __LINE__, #c); failures++; \
@@ -22,9 +23,16 @@ static int failures;
 ssize_t raw_test_recvfrom(int fd, void *buf, size_t len, int flags,
                          struct sockaddr *addr, socklen_t *alen)
 {
-    (void)flags; (void)addr; (void)alen;
+    (void)flags;
     if (fd < 0 || fd > 1 || incoming_len[fd] > len) { return -1; }
     memcpy(buf, incoming[fd], incoming_len[fd]);
+    if (addr && alen && *alen >= sizeof(struct sockaddr_in6)) {
+        struct sockaddr_in6 peer = {0};
+        peer.sin6_family = AF_INET6;
+        memcpy(&peer.sin6_addr, incoming_src[fd], 16);
+        memcpy(addr, &peer, sizeof peer);
+        *alen = sizeof peer;
+    }
     return (ssize_t)incoming_len[fd];
 }
 
@@ -143,6 +151,40 @@ static void test_datapath_matches_raw_headers(void)
 
 int main(void)
 {
+    {
+        uint8_t src[16] = {0x20, 1}, dst[16] = {0x20, 1};
+        src[15] = 1; dst[15] = 2;
+        uint8_t packet[256], body[] = {1, 2, 3};
+        d2k_poison p = {0};
+        size_t n = build_ip_tcp(packet, sizeof packet, 6, src, dst, 1000, 443,
+                                42, 43, TCP_ACK, body, sizeof body, &p, NULL, 0);
+        CHECK(n == 63 && packet[0] == 0x60 && packet[6] == 6);
+        CHECK(memcmp(packet + 8, src, 16) == 0 && memcmp(packet + 24, dst, 16) == 0);
+        CHECK(d2k_wire_tcp_checksum_ok(packet, n));
+        raw_conn conn = {0};
+        conn.family = 6; conn.recv_fd = 0; conn.sport = 443; conn.dport = 1000;
+        conn.buffers = malloc(sizeof *conn.buffers);
+        CHECK(conn.buffers != NULL);
+        if (!conn.buffers) return 1;
+        memcpy(conn.dst, src, 16);
+        memcpy(incoming_src[0], src, 16);
+        memcpy(incoming[0], packet + 40, n - 40); incoming_len[0] = n - 40;
+        uint8_t flags;
+        uint32_t seq, ack;
+        const uint8_t *received = NULL;
+        size_t received_len = 0;
+        CHECK(raw_recv(&conn, &flags, &seq, &ack, &received, &received_len) == 0);
+        CHECK(flags == TCP_ACK && seq == 42 && ack == 43);
+        CHECK(received_len == sizeof body && memcmp(received, body, sizeof body) == 0);
+        free(conn.buffers);
+        p.badsum = 1;
+        n = build_ip_tcp(packet, sizeof packet, 6, src, dst, 1000, 443,
+                         42, 43, TCP_ACK, body, sizeof body, &p, NULL, 0);
+        CHECK(n == 63 && !d2k_wire_tcp_checksum_ok(packet, n));
+        p.ip_id_zero = 1;
+        CHECK(build_ip_tcp(packet, sizeof packet, 6, src, dst, 1000, 443,
+                            42, 43, TCP_ACK, body, sizeof body, &p, NULL, 0) == 0);
+    }
     test_concurrent_ports_are_unique();
     test_checksum_matches_original();
     test_receive_is_owned_by_connection();

@@ -193,7 +193,7 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
      * измеритель не может и не пытается. */
     opt.cancel.ctx = (void *)(uintptr_t)stop;
 
-    snprintf(addr, sizeof(addr), "%s:%u", ip, (unsigned)port);
+    snprintf(addr, sizeof(addr), strchr(ip, ':') ? "[%s]:%u" : "%s:%u", ip, (unsigned)port);
     d2k_classify_run(addr, &tr, &opt, &res);
 
     if (res.stopped) {

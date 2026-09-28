@@ -61,6 +61,9 @@ test_raw: test_raw.c raw.c $(filter-out raw.o,$(OBJ)) ../core/hello.o $(HDR) ../
 bridge.o: bridge.c $(HDR) ../core/include/d2k_arm.h ../core/include/d2k_verdict.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+test_raw6_live: test_raw6_live.c $(OBJ) ../core/hello.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
+
 check: d2k-detect test_port test_tree test_bridge test_threads test_raw
 	./test_port
 	./test_tree

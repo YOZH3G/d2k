@@ -163,9 +163,10 @@ static void *dpi_thread(void *arg)
     }
 }
 
-static int fake_dpi_start(fake_dpi *d, dpi_mode mode, int sig_len, char *addr, size_t cap)
+static int fake_dpi_start_family(fake_dpi *d, dpi_mode mode, int sig_len,
+                                  char *addr, size_t cap, int family)
 {
-    struct sockaddr_in sa;
+    struct sockaddr_storage sa;
     socklen_t sl = sizeof(sa);
     pthread_t th;
     int one = 1;
@@ -173,16 +174,23 @@ static int fake_dpi_start(fake_dpi *d, dpi_mode mode, int sig_len, char *addr, s
     memset(d, 0, sizeof(*d));
     d->mode = mode;
     d->sig_len = sig_len;
-    d->fd = socket(AF_INET, SOCK_STREAM, 0);
+    d->fd = socket(family, SOCK_STREAM, 0);
     if (d->fd < 0) {
         return -1;
     }
     (void)setsockopt(d->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    sa.sin_port = 0;
-    if (bind(d->fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    socklen_t alen;
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&sa;
+        v6->sin6_family = AF_INET6; v6->sin6_addr = in6addr_loopback;
+        alen = sizeof *v6;
+    } else {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&sa;
+        v4->sin_family = AF_INET; v4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        alen = sizeof *v4;
+    }
+    if (bind(d->fd, (struct sockaddr *)&sa, alen) != 0) {
         return -1;
     }
     if (listen(d->fd, 16) != 0) {
@@ -191,12 +199,20 @@ static int fake_dpi_start(fake_dpi *d, dpi_mode mode, int sig_len, char *addr, s
     if (getsockname(d->fd, (struct sockaddr *)&sa, &sl) != 0) {
         return -1;
     }
-    snprintf(addr, cap, "127.0.0.1:%u", (unsigned)ntohs(sa.sin_port));
+    if (family == AF_INET6)
+        snprintf(addr, cap, "[::1]:%u", (unsigned)ntohs(((struct sockaddr_in6 *)&sa)->sin6_port));
+    else
+        snprintf(addr, cap, "127.0.0.1:%u", (unsigned)ntohs(((struct sockaddr_in *)&sa)->sin_port));
     if (pthread_create(&th, NULL, dpi_thread, d) != 0) {
         return -1;
     }
     pthread_detach(th);
     return 0;
+}
+
+static int fake_dpi_start(fake_dpi *d, dpi_mode mode, int sig_len, char *addr, size_t cap)
+{
+    return fake_dpi_start_family(d, mode, sig_len, addr, cap, AF_INET);
 }
 
 static void fake_dpi_stop(fake_dpi *d)
@@ -512,6 +528,24 @@ static void test_loopback_guard_rejects_misresolved_target(void)
 
 int main(void)
 {
+    {
+        fake_dpi d;
+        char addr[64];
+        d2k_trigger t;
+        d2k_opts opt;
+        d2k_result res;
+        trig(&t); fast_opts(&opt);
+        if (fake_dpi_start_family(&d, M_CLEAR, 0, addr, sizeof addr, AF_INET6) != 0)
+            return 1;
+        d2k_classify_run(addr, &t, &opt, &res);
+        if (res.verdict != D2K_DV_CLEAR || res.probes != 2)
+            fail("IPv6 clear target must follow the same two-probe baseline");
+        opt.allow_loopback = 0;
+        d2k_classify_run(addr, &t, &opt, &res);
+        if (res.verdict != D2K_DV_FLAKY || res.probes != 0)
+            fail("IPv6 loopback guard must reject before probing");
+        fake_dpi_stop(&d);
+    }
     printf("перенос: дерево на поддельной коробке\n");
     test_prefix_matcher_finds_boundary();
     test_prefix_boundary_deeper_signature();

@@ -129,6 +129,12 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok)
 /* runProperties задаёт шесть вопросов и заполняет вектор. Возвращает первую
  * гипотезу, которая сама по себе сработала, если такая была. */
 int d2k_run_properties(const uint8_t ip4[4], uint16_t port,
+    const d2k_trigger *tr, const d2k_opts *opt, d2k_result *res, d2k_poison *hit)
+{
+    return d2k_run_properties_family(ip4, 4, port, tr, opt, res, hit);
+}
+
+int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                        const d2k_trigger *tr, const d2k_opts *opt,
                        d2k_result *res, d2k_poison *hit)
 {
@@ -160,7 +166,7 @@ int d2k_run_properties(const uint8_t ip4[4], uint16_t port,
         obs = d2k_trace_add(res, label);
         obs->delay_ms = p.gap_ms;
         for (j = 0; j < opt->repeats; j++) {
-            int rc = d2k_raw_probe_poison(ip4, port, tr, &p, opt->timeout_ms, opt->mark,
+            int rc = d2k_raw_probe_poison_family(ip4, family, port, tr, &p, opt->timeout_ms, opt->mark,
                                           &opt->cancel, err, sizeof(err));
             res->probes++;
             if (rc > 0) {
