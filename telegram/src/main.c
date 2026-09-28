@@ -25,7 +25,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TG_BUILD "d2k-tg-0.2"
+#define TG_BUILD "d2k-tg-0.3"
 #define TG_DEFAULT_WINDOW (2u*1024u*1024u)
 
 static volatile sig_atomic_t stop_requested;
@@ -175,9 +175,33 @@ static int redirect_log(const char *path) {
     if(dup2(fd,STDERR_FILENO)<0){close(fd);return -1;}close(fd);return 0;
 }
 
+/* DNS edge health, not an application/bypass verdict. Keep the certificate
+   bound to the requested Meta name while avoiding its blocked wire SNI.
+   No HTTP requests, account data, or relay traffic are involved. */
+static int check_instagram_ip(const char *host,const char *ip,const char *ca) {
+    static const char *const hosts[]={"instagram.com","www.instagram.com",
+        "graph.instagram.com","api.instagram.com","instagram.c10r.instagram.com",
+        "static.cdninstagram.com","scontent.cdninstagram.com"};
+    int allowed=0;struct in_addr address;
+    for(size_t i=0;i<sizeof(hosts)/sizeof(hosts[0]);i++)if(strcmp(host,hosts[i])==0)allowed=1;
+    if(!allowed||inet_pton(AF_INET,ip,&address)!=1)return 2;
+    /* This DNS alias is not covered by *.instagram.com; authenticate its
+       canonical service rather than disabling certificate validation. */
+    const char *verify=strcmp(host,"instagram.c10r.instagram.com")==0?"instagram.com":host;
+    (void)signal(SIGPIPE,SIG_IGN);
+    alarm(5); /* Bound the entire operation, including slow TLS peers. */
+    SSL_CTX *ctx=tg_tls_client_context(ca);if(!ctx)return 1;
+    int fd=tg_tcp_connect_ipv4(ip,443,3000);
+    SSL *ssl=fd<0?NULL:tg_tls_connect_fd_sni(ctx,fd,verify,"example.com");
+    int rc=ssl?0:1;
+    if(ssl)puts("Meta edge reachable; certificate verified (not a bypass verdict)");
+    SSL_free(ssl);SSL_CTX_free(ctx);if(fd>=0)close(fd);alarm(0);return rc;
+}
+
 int main(int argc,char **argv) {
     const char *config="/opt/d2k/config",*log_path=NULL;
-    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=per-install-enrollment");return 0;}
+    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=per-install-enrollment,instagram-ip-probe");return 0;}
+    if(argc==5&&strcmp(argv[1],"--check-instagram-ip")==0)return check_instagram_ip(argv[2],argv[3],argv[4]);
     if(argc==2&&strcmp(argv[1],"--help")==0){puts("d2ktg [--config FILE]");return 0;}
     if(argc==3&&strcmp(argv[1],"--check-config")==0)return check_config(argv[2]);
     for(int i=1;i<argc;i++) {

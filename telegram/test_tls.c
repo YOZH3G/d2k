@@ -313,6 +313,23 @@ static void test_sni_and_certificate_validation(void) {
 
     args.listener = listen_loopback(); args.sni[0] = '\0';
     assert(pthread_create(&thread, NULL, serve_one, &args) == 0);
+    client_ctx = tg_tls_client_context(cert_path); assert(client_ctx);
+    ssl = tg_tls_connect_fd_sni(client_ctx, connect_loopback(args.listener), "relay.test", "example.com");
+    assert(ssl != NULL);
+    SSL_free(ssl); SSL_CTX_free(client_ctx);
+    pthread_join(thread, NULL); close(args.listener);
+    assert(strcmp(args.sni, "example.com") == 0);
+
+    args.listener = listen_loopback();
+    assert(pthread_create(&thread, NULL, serve_one, &args) == 0);
+    client_ctx = tg_tls_client_context(cert_path); assert(client_ctx);
+    ssl = tg_tls_connect_fd_sni(client_ctx, connect_loopback(args.listener), "wrong.test", "relay.test");
+    assert(ssl == NULL); /* A valid SNI certificate must not authenticate the wrong target. */
+    SSL_CTX_free(client_ctx);
+    pthread_join(thread, NULL); close(args.listener);
+
+    args.listener = listen_loopback(); args.sni[0] = '\0';
+    assert(pthread_create(&thread, NULL, serve_one, &args) == 0);
     client_ctx = tg_tls_client_context(cert_path);
     assert(client_ctx != NULL);
     ssl = tg_tls_connect_fd(client_ctx, connect_loopback(args.listener), "wrong.test");

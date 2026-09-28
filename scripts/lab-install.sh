@@ -53,7 +53,7 @@ rules() { iptables -t mangle -S 2>/dev/null | sort; }
 
 echo "== подготовка контейнера =="
 apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq iptables ipset >/dev/null 2>&1
+apt-get install -y -qq iptables ipset openssl ca-certificates >/dev/null 2>&1
 command -v start-stop-daemon >/dev/null || fail "нет start-stop-daemon — установщик на такой системе не работает"
 
 case "$(uname -m)" in
@@ -140,7 +140,18 @@ case "$*" in
 esac
 exec /usr/bin/curl "$@"
 CURL
-chmod +x /tmp/d2k-test-bin/ndmc /tmp/d2k-test-bin/curl
+cat > /tmp/d2k-test-bin/d2ktg <<'TGPROBE'
+#!/bin/sh
+if [ "$1" = --check-instagram-ip ]; then
+    [ "$#" = 4 ] || exit 2
+    case "$2:$3" in
+        instagram.com:157.240.9.174|www.instagram.com:157.240.9.175) exit 0 ;;
+        *) exit 1 ;;
+    esac
+fi
+exec /opt/sbin/d2ktg "$@"
+TGPROBE
+chmod +x /tmp/d2k-test-bin/ndmc /tmp/d2k-test-bin/curl /tmp/d2k-test-bin/d2ktg
 printf 'ip host www.instagram.com 157.240.9.175\nip host instagram.com 203.0.113.10\nip host unrelated.example 192.0.2.7\n' > /tmp/d2k-ndmc-state
 export D2K_STUB_PATH=/tmp/d2k-test-bin
 panel_curl() {

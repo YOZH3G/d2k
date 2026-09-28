@@ -42,6 +42,9 @@ say "архитектура: $(uname -m) -> $ARCH"
 for t in curl ip iptables start-stop-daemon; do
     command -v "$t" >/dev/null 2>&1 || die "нет $t — поставьте пакет и повторите"
 done
+for t in ipset openssl; do
+    command -v "$t" >/dev/null 2>&1 || die "нет $t — нужен для Telegram/Instagram; поставьте зависимости из README"
+done
 [ -e /proc/net/netfilter/nfnetlink_queue ] || \
     die "ядро без nfnetlink_queue — d2k работать не сможет"
 grep -qw NFQUEUE /proc/net/ip_tables_targets 2>/dev/null || \
@@ -111,6 +114,10 @@ TG_VERSION=$("$TMP/d2ktg" --version 2>/dev/null) || die "скачанный d2kt
 case "$TG_VERSION" in
     *features=per-install-enrollment*) ;;
     *) die "скачанный d2ktg устарел: в нём нет автоматической регистрации установки" ;;
+esac
+case "$TG_VERSION" in
+    *instagram-ip-probe*) ;;
+    *) die "скачанный d2ktg устарел: нет проверки доступности Instagram IP" ;;
 esac
 # d2kc без обязательного --control печатает использование и выходит кодом 2 —
 # это и есть признак «запускается и та арка». Ноль он здесь вернуть не может.
@@ -215,7 +222,7 @@ fi
 if "$DIR/d2k-instagram-dns.sh" refresh; then
     say "Instagram DNS проверен через VPS"
 else
-    say "VPS Instagram DNS сейчас недоступен; действующие записи не затронуты, повтор назначен ежедневно с 04:00"
+    say "Instagram DNS не обновлён: причина в $DIR/log/instagram-dns.log; прежние записи сохранены, повторы — с 04:00"
 fi
 # Убираем только legacy Go-панельный бинарник прежней установки; новый C
 # runtime уже проверен выше и установлен отдельно как d2kpanel.

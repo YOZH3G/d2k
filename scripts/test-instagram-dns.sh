@@ -6,6 +6,8 @@ ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 SCRIPT=$ROOT/files/d2k-instagram-dns.sh
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+export D2K_IP_CA_BUNDLE="$TMP/ca-bundle.pem"
+printf 'test CA handled by the probe double\n' > "$D2K_IP_CA_BUNDLE"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "PASS: $*"; }
@@ -27,6 +29,7 @@ case "$*" in
     *"show running-config"*) [ "${NDMC_FAIL_SHOW:-0}" = 1 ] && exit 7; cat "$NDMC_STATE" ;;
     *"system configuration save"*) [ "${NDMC_FAIL_SAVE:-0}" = 1 ] && exit 8; : ;;
     "-c ip host "*)
+        [ "${NDMC_FAIL_ADD:-0}" = 1 ] && exit 6
         printf '%s\n' "$*" >> "$NDMC_CALLS"
         printf 'ip host %s %s\n' "$(echo "$2" | awk '{print $3}')" "$(echo "$2" | awk '{print $4}')" >> "$NDMC_STATE"
         ;;
@@ -64,7 +67,15 @@ printf '%s' "$4" > "$OPENSSL_KEY"
 cat >/dev/null
 echo '(stdin)= 00ff'
 EOF
-chmod +x "$TMP/bin/ndmc" "$TMP/bin/curl" "$TMP/bin/openssl"
+cat > "$TMP/bin/d2ktg" <<'EOF'
+#!/bin/sh
+[ "$1" = --check-instagram-ip ] && [ "$#" = 4 ] || exit 2
+printf '%s\n' "$*" >> "$CURL_CALLS"
+[ "${PROBE_FAIL_ALL:-0}" = 1 ] && exit 1
+probes=$(grep -c -- '--check-instagram-ip' "$CURL_CALLS" || true)
+[ "$probes" -gt "${PROBE_FAIL_FIRST:-0}" ]
+EOF
+chmod +x "$TMP/bin/ndmc" "$TMP/bin/curl" "$TMP/bin/openssl" "$TMP/bin/d2ktg"
 
 env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$TMP/d2k" D2K_CONFIG="$TMP/d2k/config" \
     D2K_META_RANGES="$TMP/d2k/files/meta-ranges.txt" \
@@ -87,7 +98,8 @@ grep -q '^instagram.com 157.240.9.176$' "$TMP/d2k/state/instagram-ip-hosts.tsv" 
 grep -q 'X-Z2K-Auth: 00ff' "$TMP/curl-calls" || fail "VPS request omitted donor-compatible authentication header"
 grep -q 'instagram.com.*www.instagram.com.*graph.instagram.com.*api.instagram.com.*instagram.c10r.instagram.com.*static.cdninstagram.com.*scontent.cdninstagram.com' "$TMP/curl-calls" || fail "VPS request did not contain the Instagram host set"
 [ "$(cat "$TMP/openssl-key")" = test-secret ] || fail "quoted resolver secret was not parsed correctly"
-grep -q 'повтор HTTPS-пробы 1/2' "$TMP/refresh.log" || fail "transient IP probe failure was not retried"
+grep -q -- '--check-instagram-ip instagram.com 157.240.9.174' "$TMP/curl-calls" || fail "DNS health still depends on blocked application HTTPS instead of certificate-verified edge health"
+grep -q 'повтор TLS-пробы 1/2' "$TMP/refresh.log" || fail "transient IP probe failure was not retried"
 ok "refresh pins VPS-verified Instagram IPs and records only D2K-owned pairs"
 
 : > "$TMP/curl-calls"
@@ -104,6 +116,25 @@ grep -q '^ip host instagram.com 203.0.113.10$' "$TMP/ndmc-state" || fail "replac
 grep -q '^instagram.com 157.240.9.180$' "$TMP/d2k/state/instagram-ip-hosts.tsv" || fail "manifest lacks the refreshed edge"
 ! grep -q '^instagram.com 157.240.9.174$\|^instagram.com 157.240.9.176$' "$TMP/d2k/state/instagram-ip-hosts.tsv" || fail "manifest retained stale edges"
 ok "successful refresh replaces stale D2K-owned pairs without touching user DNS"
+
+cp "$TMP/ndmc-state" "$TMP/before-add-failure"
+if env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$TMP/d2k" NDMC_FAIL_ADD=1 \
+    D2K_RELAY_URL=https://resolve.example/resolve VPS_IP1=157.240.9.182 VPS_IP2=157.240.9.183 \
+    NDMC_STATE="$TMP/ndmc-state" NDMC_CALLS="$TMP/ndmc-calls" CURL_CALLS="$TMP/curl-calls" \
+    OPENSSL_KEY="$TMP/openssl-key" D2K_INSTAGRAM_LOG="$TMP/add-failure.log" sh "$SCRIPT" refresh; then
+    fail "refresh reported success although NDM rejected new pins"
+fi
+cmp -s "$TMP/before-add-failure" "$TMP/ndmc-state" || fail "old working pins removed despite failure to install replacements"
+ok "failed NDM additions preserve previous pins and report failure"
+
+if env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$TMP/d2k" PROBE_FAIL_ALL=1 \
+    D2K_IP_PROBE_ATTEMPTS=1 D2K_RELAY_URL=https://resolve.example/resolve \
+    NDMC_STATE="$TMP/ndmc-state" NDMC_CALLS="$TMP/ndmc-calls" CURL_CALLS="$TMP/curl-calls" \
+    OPENSSL_KEY="$TMP/openssl-key" D2K_INSTAGRAM_LOG="$TMP/tls-failure.log" sh "$SCRIPT" refresh; then
+    fail "refresh accepted failed certificate/reachability probes"
+fi
+cmp -s "$TMP/before-add-failure" "$TMP/ndmc-state" || fail "failed TLS controls changed DNS"
+ok "failed edge verification never replaces working DNS"
 
 env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$TMP/d2k" D2K_CONFIG="$TMP/d2k/config" \
     D2K_META_RANGES="$TMP/d2k/files/meta-ranges.txt" \

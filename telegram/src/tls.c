@@ -21,12 +21,16 @@ SSL_CTX *tg_tls_client_context(const char *ca_bundle) {
 }
 
 SSL *tg_tls_connect_fd(SSL_CTX *ctx, int fd, const char *hostname) {
+    return tg_tls_connect_fd_sni(ctx, fd, hostname, hostname);
+}
+
+SSL *tg_tls_connect_fd_sni(SSL_CTX *ctx, int fd, const char *hostname, const char *sni) {
     struct in_addr v4;
     struct in6_addr v6;
     int is_ip, ok;
     SSL *ssl;
     X509_VERIFY_PARAM *param;
-    if (!ctx || fd < 0 || !hostname || !*hostname) return NULL;
+    if (!ctx || fd < 0 || !hostname || !*hostname || !sni || !*sni) return NULL;
     is_ip = inet_pton(AF_INET, hostname, &v4) == 1 ||
             inet_pton(AF_INET6, hostname, &v6) == 1;
     ssl = SSL_new(ctx);
@@ -34,7 +38,7 @@ SSL *tg_tls_connect_fd(SSL_CTX *ctx, int fd, const char *hostname) {
     param = SSL_get0_param(ssl);
     ok = param && (is_ip ? X509_VERIFY_PARAM_set1_ip_asc(param, hostname) == 1
                          : X509_VERIFY_PARAM_set1_host(param, hostname, 0) == 1);
-    if (ok && !is_ip) ok = SSL_set_tlsext_host_name(ssl, hostname) == 1;
+    if (ok && !is_ip) ok = SSL_set_tlsext_host_name(ssl, sni) == 1;
     if (ok) ok = SSL_set_fd(ssl, fd) == 1;
     if (ok) ok = SSL_connect(ssl) == 1;
     if (ok) ok = SSL_get_verify_result(ssl) == X509_V_OK;
