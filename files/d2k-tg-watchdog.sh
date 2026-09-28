@@ -8,7 +8,9 @@ DIR=/opt/d2k
 INIT=/opt/etc/init.d/S99d2k
 STATE=$DIR/state/telegram-health.failures
 PROBE_URL=https://core.telegram.org/
-PROBE_IP=149.154.167.51
+# Telegram's HTTPS endpoint, as in z2k. A native MTProto DC does not speak
+# HTTPS and would trigger periodic restarts of a healthy tunnel.
+PROBE_IP=149.154.167.99
 
 failures=0
 while :; do
