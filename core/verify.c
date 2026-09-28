@@ -223,11 +223,14 @@ d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port, co
     d2k_hello none;
     none.bytes = NULL;
     none.len = 0;
-    if (d2k_props_contact_on(use_fd, ip, port, none, r.local_ip4, &r.local_port, &r.fd) != 0) {
+    r.family = ip && strchr(ip, ':') ? 6 : 4;
+    if (d2k_props_contact_on_family(use_fd, ip, port, none, r.family,
+                                    r.local_addr, &r.local_port, &r.fd) != 0) {
         snprintf(r.reason, sizeof r.reason, "нет TCP");
         return r;
     }
     r.level = D2K_VER_TRANSPORT;
+    if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);
     snprintf(r.reason, sizeof r.reason, "транспорт встал, рукопожатия нет");
 
     char err[160];
@@ -303,11 +306,14 @@ d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
     d2k_hello none;
     none.bytes = NULL;
     none.len = 0;
-    if (d2k_props_contact_on(use_fd, ip, port, none, r.local_ip4, &r.local_port, &r.fd) != 0) {
+    r.family = ip && strchr(ip, ':') ? 6 : 4;
+    if (d2k_props_contact_on_family(use_fd, ip, port, none, r.family,
+                                    r.local_addr, &r.local_port, &r.fd) != 0) {
         snprintf(r.reason, sizeof r.reason, "нет TCP");
         return r;
     }
     r.level = D2K_VER_TRANSPORT;
+    if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);
     snprintf(r.reason, sizeof r.reason, "транспорт встал, рукопожатия нет");
 
     char err[160];
@@ -412,7 +418,8 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
     }
     r.level = D2K_VER_HANDSHAKE;
     r.name_ok = d2k_qc_peer_name(c);
-    d2k_qc_local(c, r.local_ip4, &r.local_port);
+    d2k_qc_local_addr(c, r.local_addr, &r.family, &r.local_port);
+    if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);
     r.fd = d2k_qc_fd(c);
     snprintf(r.reason, sizeof r.reason, "рукопожатие завершено, приложение молчит");
 

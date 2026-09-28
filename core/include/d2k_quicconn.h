@@ -93,6 +93,8 @@ int d2k_qc_handshake_done(const d2k_qc *c);
 /* Местный конец соединения: по нему датапат привязывает событие к потоку.
  * Порт в машинном порядке. */
 void d2k_qc_local(const d2k_qc *c, uint8_t ip4[4], uint16_t *port);
+void d2k_qc_local_addr(const d2k_qc *c, uint8_t addr[16], uint8_t *family,
+                       uint16_t *port);
 
 /* Сокет остаётся ОТКРЫТЫМ до d2k_qc_close — по той же причине, что у
  * TCP-зонда: закрытие удаляет ячейку потока в датапате раньше, чем придёт

@@ -63,9 +63,10 @@ int checksum_plan_text(char *buf, size_t cap);
  * см. её большой комментарий в compose.c про то, почему вторая реализация
  * канонизации здесь не нужна и не заводится). */
 typedef struct {
-    uint8_t  a_ip[4], b_ip[4];
+    uint8_t  a_ip[16], b_ip[16];
     uint16_t a_port, b_port;
     uint8_t  transport;
+    uint8_t  family; /* 0 is legacy IPv4, otherwise 4 or 6 */
 } d2k_flowkey;
 
 int ev_matches_flow(const d2k_ev *ev, const d2k_flowkey *k);
@@ -104,16 +105,22 @@ int  d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
  * Сокет отдаётся ОТКРЫТЫМ и непомеченным: его дальше передают в
  * d2k_props_contact как готовый. Закрывает вызывающий. */
 int  d2k_props_bind(int *out_fd, uint16_t *sport_be);
+int  d2k_props_bind_family(uint8_t family, int *out_fd, uint16_t *sport_be);
 
 /* То же для UDP — зонду QUIC. Отдельная функция, а не флаг: тип сокета
  * задаётся при создании, и «тот же bind, только SOCK_DGRAM» — это другой
  * вызов, а не другой аргумент. */
 int  d2k_props_bind_udp(int *out_fd, uint16_t *sport_be);
+int  d2k_props_bind_udp_family(uint8_t family, int *out_fd, uint16_t *sport_be);
 
 /* Как d2k_props_contact, но на УЖЕ ЗАНЯТОМ сокете (d2k_props_bind). use_fd
  * меньше нуля означает «создать свой» — тогда это в точности
  * d2k_props_contact. */
 int  d2k_props_contact_on(int use_fd, const char *ip, uint16_t port, d2k_hello h,
                           uint8_t *local_ip4, uint16_t *local_port, int *out_fd);
+/* local_addr requires 4 bytes for family 4, 16 for family 6. No fallback. */
+int  d2k_props_contact_on_family(int use_fd, const char *ip, uint16_t port,
+                                d2k_hello h, uint8_t family, uint8_t *local_addr,
+                                uint16_t *local_port, int *out_fd);
 
 #endif /* D2K_COMPOSE_INTERNAL_H */

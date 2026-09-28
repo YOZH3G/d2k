@@ -132,7 +132,8 @@ struct d2k_qc {
     uint8_t  last_app[DGRAM_OUT];
     size_t   last_app_len;
 
-    uint8_t  local_ip4[4];
+    uint8_t  local_addr[16];
+    uint8_t  family;
     uint16_t local_port;
 };
 
@@ -644,8 +645,9 @@ static int first_flight(d2k_qc *c, const char *sni, const char *alpn, size_t pad
     uint8_t ch[2560];
     d2k_t13_ch_opts cho;
     memset(&cho, 0, sizeof cho);
-    struct in_addr ip_target;
-    cho.sni = (sni && inet_pton(AF_INET, sni, &ip_target) == 1) ? NULL : sni;
+    uint8_t ip_target[16];
+    cho.sni = (sni && (inet_pton(AF_INET, sni, ip_target) == 1 ||
+                       inet_pton(AF_INET6, sni, ip_target) == 1)) ? NULL : sni;
     cho.pub = pub;
     cho.random = rnd;
     cho.session_id_len = 0;      /* RFC 9001 §8.4: у QUIC он обязан быть пуст */
@@ -743,27 +745,47 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
         d2k_qc_close(c); return -1;
     }
 
-    c->fd = (o->use_fd > 0) ? o->use_fd : socket(AF_INET, SOCK_DGRAM, 0);
+    int af = strchr(o->ip, ':') ? AF_INET6 : AF_INET;
+    c->family = af == AF_INET6 ? 6 : 4;
+    c->fd = (o->use_fd > 0) ? o->use_fd : socket(af, SOCK_DGRAM, 0);
     if (c->fd < 0) { say(err, errcap, "сокет: %s", strerror(errno)); free(c); return -1; }
     if (o->mark) { (void)d2k_mark_hook(c->fd, o->mark); }
 
-    struct sockaddr_in to;
+    struct sockaddr_storage to;
     memset(&to, 0, sizeof to);
-    to.sin_family = AF_INET;
-    to.sin_port = htons(o->port ? o->port : 443);
-    if (inet_pton(AF_INET, o->ip, &to.sin_addr) != 1) {
+    socklen_t tolen;
+    void *dst;
+    if (af == AF_INET6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&to;
+        v6->sin6_family = AF_INET6;
+        v6->sin6_port = htons(o->port ? o->port : 443);
+        dst = &v6->sin6_addr; tolen = sizeof *v6;
+    } else {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&to;
+        v4->sin_family = AF_INET;
+        v4->sin_port = htons(o->port ? o->port : 443);
+        dst = &v4->sin_addr; tolen = sizeof *v4;
+    }
+    if (strchr(o->ip, '%') || inet_pton(af, o->ip, dst) != 1) {
         say(err, errcap, "адрес не разбирается"); d2k_qc_close(c); return -1;
     }
     /* connect на UDP не шлёт ни байта: он привязывает сокет к направлению,
        чтобы приходили ошибки ICMP и чтобы recv не принимал чужое. */
-    if (connect(c->fd, (struct sockaddr *)&to, sizeof to) != 0) {
+    if (connect(c->fd, (struct sockaddr *)&to, tolen) != 0) {
         say(err, errcap, "connect: %s", strerror(errno)); d2k_qc_close(c); return -1;
     }
-    struct sockaddr_in me;
+    struct sockaddr_storage me;
     socklen_t ml = sizeof me;
     if (getsockname(c->fd, (struct sockaddr *)&me, &ml) == 0) {
-        memcpy(c->local_ip4, &me.sin_addr.s_addr, 4);
-        c->local_port = ntohs(me.sin_port);
+        if (me.ss_family == AF_INET6) {
+            struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&me;
+            memcpy(c->local_addr, &v6->sin6_addr, 16);
+            c->local_port = ntohs(v6->sin6_port);
+        } else {
+            struct sockaddr_in *v4 = (struct sockaddr_in *)&me;
+            memcpy(c->local_addr, &v4->sin_addr, 4);
+            c->local_port = ntohs(v4->sin_port);
+        }
     }
     /* Первая датаграмма клиента обязана быть не короче 1200 байт
        (RFC 9000 §14.1): иначе сервер вправе её не обслуживать. */
@@ -985,8 +1007,19 @@ int d2k_qc_fd(const d2k_qc *c) { return c ? c->fd : -1; }
 
 void d2k_qc_local(const d2k_qc *c, uint8_t ip4[4], uint16_t *port) {
     if (!c) { return; }
-    if (ip4) { memcpy(ip4, c->local_ip4, 4); }
+    if (ip4) {
+        memset(ip4, 0, 4);
+        if (c->family == 4) memcpy(ip4, c->local_addr, 4);
+    }
     if (port) { *port = c->local_port; }
+}
+
+void d2k_qc_local_addr(const d2k_qc *c, uint8_t addr[16], uint8_t *family,
+                      uint16_t *port) {
+    if (!c) return;
+    if (addr) memcpy(addr, c->local_addr, 16);
+    if (family) *family = c->family;
+    if (port) *port = c->local_port;
 }
 
 int d2k_qc_release(d2k_qc *c) {

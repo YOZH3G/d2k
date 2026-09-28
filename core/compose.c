@@ -338,12 +338,16 @@ static void to_hex(const uint8_t *b, size_t n, char *out) {
  * проверял ЕЁ САМУ, а не копию, см. шапку заголовка). */
 int ev_matches_flow(const d2k_ev *ev, const d2k_flowkey *k) {
     if (ev->transport != k->transport) { return 0; }
-    if (memcmp(ev->low_ip, k->a_ip, 4) == 0 && ev->low_port == k->a_port &&
-        memcmp(ev->high_ip, k->b_ip, 4) == 0 && ev->high_port == k->b_port) {
+    uint8_t ef = ev->family ? ev->family : 4;
+    uint8_t kf = k->family ? k->family : 4;
+    if (ef != kf || (kf != 4 && kf != 6)) { return 0; }
+    size_t n = kf == 6 ? 16 : 4;
+    if (memcmp(ev->low_ip, k->a_ip, n) == 0 && ev->low_port == k->a_port &&
+        memcmp(ev->high_ip, k->b_ip, n) == 0 && ev->high_port == k->b_port) {
         return 1;
     }
-    if (memcmp(ev->low_ip, k->b_ip, 4) == 0 && ev->low_port == k->b_port &&
-        memcmp(ev->high_ip, k->a_ip, 4) == 0 && ev->high_port == k->a_port) {
+    if (memcmp(ev->low_ip, k->b_ip, n) == 0 && ev->low_port == k->b_port &&
+        memcmp(ev->high_ip, k->a_ip, n) == 0 && ev->high_port == k->a_port) {
         return 1;
     }
     return 0;
@@ -475,30 +479,52 @@ static int wait_for_event(int fd, uint16_t want, int code_filter,
    Читать из сокета по-прежнему не нужно (судит датапат по проводу, см. шапку
    файла): держать открытым и читать — разные вещи, и здесь нужно первое.
    Закрывает вызывающий, ПОСЛЕ ожидания обмена. */
-static int props_bind_any(int type, int *out_fd, uint16_t *sport_be) {
+static int props_bind_any(int type, uint8_t family, int *out_fd, uint16_t *sport_be) {
     if (out_fd) { *out_fd = -1; }
-    int fd = socket(AF_INET, type, 0);
+    if (family != 4 && family != 6) { return -1; }
+    int af = family == 6 ? AF_INET6 : AF_INET;
+    int fd = socket(af, type, 0);
     if (fd < 0) { return -1; }
-    struct sockaddr_in a;
+    struct sockaddr_storage a;
     memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
-    a.sin_port = 0;                 /* порт выбирает ядро — и сразу отдаёт */
-    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
-    struct sockaddr_in got;
+    socklen_t alen;
+    if (family == 6) {
+        ((struct sockaddr_in6 *)&a)->sin6_family = AF_INET6;
+        alen = sizeof(struct sockaddr_in6);
+        int one = 1;
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) != 0) {
+            close(fd); return -1;
+        }
+    } else {
+        ((struct sockaddr_in *)&a)->sin_family = AF_INET;
+        alen = sizeof(struct sockaddr_in);
+    }
+    if (bind(fd, (struct sockaddr *)&a, alen) != 0) { close(fd); return -1; }
+    struct sockaddr_storage got;
     socklen_t gl = sizeof got;
     if (getsockname(fd, (struct sockaddr *)&got, &gl) != 0) { close(fd); return -1; }
-    if (sport_be) { *sport_be = got.sin_port; }   /* сетевой порядок, как есть */
+    if (sport_be) {
+        *sport_be = family == 6 ? ((struct sockaddr_in6 *)&got)->sin6_port
+                               : ((struct sockaddr_in *)&got)->sin_port;
+    }
     if (out_fd) { *out_fd = fd; } else { close(fd); return -1; }
     return 0;
 }
 
 int d2k_props_bind(int *out_fd, uint16_t *sport_be) {
-    return props_bind_any(SOCK_STREAM, out_fd, sport_be);
+    return d2k_props_bind_family(4, out_fd, sport_be);
+}
+
+int d2k_props_bind_family(uint8_t family, int *out_fd, uint16_t *sport_be) {
+    return props_bind_any(SOCK_STREAM, family, out_fd, sport_be);
 }
 
 int d2k_props_bind_udp(int *out_fd, uint16_t *sport_be) {
-    return props_bind_any(SOCK_DGRAM, out_fd, sport_be);
+    return d2k_props_bind_udp_family(4, out_fd, sport_be);
+}
+
+int d2k_props_bind_udp_family(uint8_t family, int *out_fd, uint16_t *sport_be) {
+    return props_bind_any(SOCK_DGRAM, family, out_fd, sport_be);
 }
 
 int d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
@@ -508,8 +534,17 @@ int d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
 
 int d2k_props_contact_on(int use_fd, const char *ip, uint16_t port, d2k_hello h,
                          uint8_t *local_ip4, uint16_t *local_port, int *out_fd) {
+    return d2k_props_contact_on_family(use_fd, ip, port, h, 4, local_ip4,
+                                      local_port, out_fd);
+}
+
+int d2k_props_contact_on_family(int use_fd, const char *ip, uint16_t port,
+                               d2k_hello h, uint8_t family, uint8_t *local_addr,
+                               uint16_t *local_port, int *out_fd) {
     if (out_fd) { *out_fd = -1; }
-    if (!ip) { if (use_fd >= 0) { close(use_fd); } return -1; }
+    if (!ip || strchr(ip, '%') || (family != 4 && family != 6)) {
+        if (use_fd >= 0) { close(use_fd); } return -1;
+    }
     /* Пустое приветствие законно, и это не послабление контракта, а второй
        его законный вход: зонд подтверждения (core/verify.c) ведёт СВОЁ
        рукопожатие TLS 1.3 своим ключом и чужих байт в начало потока не
@@ -520,7 +555,8 @@ int d2k_props_contact_on(int use_fd, const char *ip, uint16_t port, d2k_hello h,
        нарушение: это не «нечего слать», это испорченный вызов. */
     if (h.len > 0 && !h.bytes) { if (use_fd >= 0) { close(use_fd); } return -1; }
 
-    int fd = use_fd >= 0 ? use_fd : socket(AF_INET, SOCK_STREAM, 0);
+    int af = family == 6 ? AF_INET6 : AF_INET;
+    int fd = use_fd >= 0 ? use_fd : socket(af, SOCK_STREAM, 0);
     if (fd < 0) { return -1; }
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -537,11 +573,20 @@ int d2k_props_contact_on(int use_fd, const char *ip, uint16_t port, d2k_hello h,
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 
-    struct sockaddr_in a;
+    struct sockaddr_storage a;
     memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) { close(fd); return -1; }
+    socklen_t alen;
+    void *dst;
+    if (family == 6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&a;
+        v6->sin6_family = AF_INET6; v6->sin6_port = htons(port);
+        dst = &v6->sin6_addr; alen = sizeof *v6;
+    } else {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&a;
+        v4->sin_family = AF_INET; v4->sin_port = htons(port);
+        dst = &v4->sin_addr; alen = sizeof *v4;
+    }
+    if (inet_pton(af, ip, dst) != 1) { close(fd); return -1; }
 
     /* Неблокирующий connect с явным потолком — тот же смысл, что
        connect_bounded в meas.c (не она сама: static там, и вариант здесь не
@@ -549,7 +594,7 @@ int d2k_props_contact_on(int use_fd, const char *ip, uint16_t port, d2k_hello h,
        съела бы умолчание ядра (минуты), а не D2K_PROPS_ASK_WAIT_MS. */
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { close(fd); return -1; }
-    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+    if (connect(fd, (struct sockaddr *)&a, alen) != 0) {
         if (errno != EINPROGRESS) { close(fd); return -1; }
         struct pollfd pfd;
         pfd.fd = fd; pfd.events = POLLOUT; pfd.revents = 0;
@@ -564,14 +609,22 @@ int d2k_props_contact_on(int use_fd, const char *ip, uint16_t port, d2k_hello h,
     }
     (void)fcntl(fd, F_SETFL, flags);
 
-    struct sockaddr_in local;
+    struct sockaddr_storage local;
     socklen_t local_len = sizeof local;
     if (getsockname(fd, (struct sockaddr *)&local, &local_len) != 0) {
         close(fd);
         return -1;
     }
-    if (local_ip4) { memcpy(local_ip4, &local.sin_addr, 4); }
-    if (local_port) { *local_port = ntohs(local.sin_port); }
+    if (local.ss_family != af) { close(fd); return -1; }
+    if (family == 6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&local;
+        if (local_addr) { memcpy(local_addr, &v6->sin6_addr, 16); }
+        if (local_port) { *local_port = ntohs(v6->sin6_port); }
+    } else {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&local;
+        if (local_addr) { memcpy(local_addr, &v4->sin_addr, 4); }
+        if (local_port) { *local_port = ntohs(v4->sin_port); }
+    }
 
     size_t sent = 0;
     while (sent < h.len) {
@@ -755,12 +808,12 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
            логика: не измерено, а не «нет» (§2.4). */
         return pr;
     }
-    uint8_t target_ip4[4];
-    if (inet_pton(AF_INET, ip, target_ip4) != 1) {
-        /* ip не разобрался как IPv4-литерал — тем же самым не разберётся и
-           props_ask_contact ниже, а без адреса цели не собрать и ключ потока
-           для wait_for_event. Не измерено, а не «нет». */
-        return pr;
+    uint8_t target_addr[16] = {0};
+    uint8_t family = 4;
+    if (strchr(ip, '%')) { return pr; }
+    if (inet_pton(AF_INET, ip, target_addr) != 1) {
+        if (inet_pton(AF_INET6, ip, target_addr) != 1) { return pr; }
+        family = 6;
     }
 
     size_t sni_off = 0, sni_len = 0;
@@ -828,12 +881,12 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
            остаётся локальным и не превращается в план для всех. */
         int qfd = -1;
         uint16_t qsport = 0;
-        if (d2k_props_bind(&qfd, &qsport) != 0 || qsport == 0) {
+        if (d2k_props_bind_family(family, &qfd, &qsport) != 0 || qsport == 0) {
             step_rc(steps, i, D2K_STEP_SEND_FAIL, "порт для вопроса не занялся");
             continue;
         }
-        if (d2k_link_set_name_probe(link_fd, name, 6, hexbuf, qshape, qsport,
-                                    err, sizeof err) != 0) {
+        if (d2k_link_set_name_family(link_fd, name, 6, hexbuf, qshape, qsport,
+                                     family, err, sizeof err) != 0) {
             close(qfd);
             step_rc(steps, i, D2K_STEP_SEND_FAIL, err);
             continue; /* план не отправился вовсе — не измерено */
@@ -868,11 +921,11 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
            props_ask_contact про то, почему СВОЙ вариант, а не d2k_meas_once:
            непомеченный зонд (иначе план мимо очереди) и местные адрес+порт
            наружу (иначе обмен чужого потока неотличим от своего). */
-        uint8_t local_ip4[4];
+        uint8_t local_addr[16] = {0};
         uint16_t local_port = 0;
         int contact_fd = -1;
-        if (d2k_props_contact_on(qfd, ip, port, trigger, local_ip4, &local_port,
-                                 &contact_fd) != 0) {
+        if (d2k_props_contact_on_family(qfd, ip, port, trigger, family, local_addr,
+                                        &local_port, &contact_fd) != 0) {
             step_rc(steps, i, D2K_STEP_CONTACT_FAIL, strerror(errno));
             continue; /* обращение не состоялось (транспорт) — не измерено */
         }
@@ -880,12 +933,13 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
             steps[i].local_port = local_port;
         }
 
-        d2k_flowkey fk;
-        memcpy(fk.a_ip, target_ip4, 4);
+        d2k_flowkey fk = {0};
+        memcpy(fk.a_ip, target_addr, sizeof fk.a_ip);
         fk.a_port = port;
-        memcpy(fk.b_ip, local_ip4, 4);
+        memcpy(fk.b_ip, local_addr, sizeof fk.b_ip);
         fk.b_port = local_port;
         fk.transport = 6;
+        fk.family = family;
 
         /* ДВА события на один обмен, а не одно. Датапат сообщает ДВАЖДЫ
            (datapath/session.c, комментарий у D2K_JRN_EXCHANGE): сперва «обмен
@@ -1018,7 +1072,7 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
        не меняет в наблюдении о коробке и потому не пишется в вектор. */
     if (asked_any && !passed_any) {
         char derr[128];
-        (void)d2k_link_del_name(link_fd, name, derr, sizeof derr);
+        (void)d2k_link_del_name_family(link_fd, name, family, derr, sizeof derr);
     }
 
     return pr;

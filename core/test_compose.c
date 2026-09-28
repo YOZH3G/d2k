@@ -685,7 +685,48 @@ static void *fakeend_run(void *arg) {
     return NULL;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    {
+        struct stand s = {0};
+        uint16_t port = stand_start_family(&s, 0, AF_INET6);
+        int fd = -1, connected = -1;
+        uint16_t reserved = 0, actual = 0;
+        uint8_t local[16] = {0};
+        CHECK(port != 0, "IPv6 contact fixture starts");
+        CHECK(d2k_props_bind_family(6, &fd, &reserved) == 0,
+              "reserve IPv6 TCP probe port");
+        d2k_hello empty = {0};
+        CHECK(d2k_props_contact_on_family(fd, "::1", port, empty, 6,
+                                         local, &actual, &connected) == 0,
+              "connect IPv6 property probe using reserved socket");
+        CHECK(actual == ntohs(reserved) && actual != 0,
+              "IPv6 contact retains reserved trial port");
+        CHECK(memcmp(local, &in6addr_loopback, 16) == 0,
+              "contact returns entire IPv6 source address");
+        if (connected >= 0) close(connected);
+        fd = -1;
+        CHECK(d2k_props_bind_udp_family(6, &fd, &reserved) == 0,
+              "reserve IPv6 UDP probe port");
+        if (fd >= 0) close(fd);
+    }
+    {
+        d2k_ev ev = {0};
+        d2k_flowkey k = {0};
+        ev.family = 6; k.family = 6;
+        ev.transport = k.transport = 6;
+        ev.low_port = k.a_port = 100;
+        ev.high_port = k.b_port = 443;
+        ev.low_ip[0] = k.a_ip[0] = 0x20;
+        ev.high_ip[0] = k.b_ip[0] = 0x20;
+        ev.low_ip[15] = k.a_ip[15] = 1;
+        ev.high_ip[15] = k.b_ip[15] = 2;
+        CHECK(ev_matches_flow(&ev, &k), "native IPv6 trial matches full flow");
+        k.a_ip[14] = 1;
+        CHECK(!ev_matches_flow(&ev, &k), "different IPv6 trial is rejected");
+        k.a_ip[14] = 0; k.family = 4;
+        CHECK(!ev_matches_flow(&ev, &k), "IPv6 event cannot prove IPv4 trial");
+    }
+    if (argc == 2 && strcmp(argv[1], "--ipv6-sockets") == 0) return fails ? 1 : 0;
     const char *decoy = "disk.rzd.ru";
     char out[8][4096];
 

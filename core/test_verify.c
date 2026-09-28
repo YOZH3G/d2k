@@ -446,10 +446,12 @@ static void *stand_run(void *arg) {
     /* Местный порт зонда, снятый С ЭТОЙ стороны провода: ровно то, что увидел
        бы датапат и по чему привязывал бы событие к потоку. Своё представление
        зонда о нём сверять было бы не с чем. */
-    struct sockaddr_in peer;
+    struct sockaddr_storage peer;
     socklen_t plen = sizeof peer;
     if (getpeername(c, (struct sockaddr *)&peer, &plen) == 0) {
-        s->peer_port = ntohs(peer.sin_port);
+        s->peer_port = peer.ss_family == AF_INET6
+            ? ntohs(((struct sockaddr_in6 *)&peer)->sin6_port)
+            : ntohs(((struct sockaddr_in *)&peer)->sin_port);
     }
     struct timeval tv = { STAND_IO_MS / 1000, (STAND_IO_MS % 1000) * 1000 };
     (void)setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -505,22 +507,34 @@ static void *stand_run(void *arg) {
     return NULL;
 }
 
-static uint16_t stand_start(struct stand *s, int role) {
+static uint16_t stand_start_family(struct stand *s, int role, int family) {
     memset(s, 0, sizeof *s);
-    s->fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in a;
+    s->fd = socket(family, SOCK_STREAM, 0);
+    struct sockaddr_storage a;
     memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(0x7f000001);
-    a.sin_port = 0;
-    if (bind(s->fd, (struct sockaddr *)&a, sizeof a) != 0) { return 0; }
+    socklen_t alen;
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&a;
+        v6->sin6_family = AF_INET6; v6->sin6_addr = in6addr_loopback;
+        alen = sizeof *v6;
+    } else {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&a;
+        v4->sin_family = AF_INET; v4->sin_addr.s_addr = htonl(0x7f000001);
+        alen = sizeof *v4;
+    }
+    if (bind(s->fd, (struct sockaddr *)&a, alen) != 0) { return 0; }
     socklen_t l = sizeof a;
     if (getsockname(s->fd, (struct sockaddr *)&a, &l) != 0) { return 0; }
     if (listen(s->fd, 4) != 0) { return 0; }
     s->role = role;
-    s->port = ntohs(a.sin_port);
+    s->port = family == AF_INET6 ? ntohs(((struct sockaddr_in6 *)&a)->sin6_port)
+                               : ntohs(((struct sockaddr_in *)&a)->sin_port);
     if (pthread_create(&s->th, NULL, stand_run, s) != 0) { return 0; }
     return s->port;
+}
+
+static uint16_t stand_start(struct stand *s, int role) {
+    return stand_start_family(s, role, AF_INET);
 }
 
 static void stand_stop(struct stand *s) {
@@ -569,6 +583,21 @@ static uint16_t closed_port(void) {
 
 int main(void) {
     d2k_mark_hook = counting_mark;
+    {
+        struct stand s;
+        uint16_t port = stand_start_family(&s, ROLE_APP, AF_INET6);
+        CHECK(port != 0, "IPv6 TLS fixture starts");
+        d2k_ver_result r = d2k_verify_probe("::1", port, "ipv6.example", 3000, 0);
+        CHECK(r.level == D2K_VER_APPLICATION && r.status == 200,
+              "IPv6 TLS verifier completes handshake and receives HTTP");
+        if (r.fd < 0) return 1;
+        CHECK(r.family == 6 && memcmp(r.local_addr, &in6addr_loopback, 16) == 0,
+              "IPv6 verifier retains full native source address");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+        CHECK(r.local_port == s.peer_port && r.local_port != 0,
+              "IPv6 verifier reports actual trial port");
+    }
 
     /* --- обращение не состоялось: про линию не сказано ничего ------------- */
     {

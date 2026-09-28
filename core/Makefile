@@ -702,6 +702,15 @@ test_verify: test_verify.c verify.o tls12.o quicconn.o quicwire.o h3.o compose.o
 test-verify: test_verify
 	./test_verify
 
+test_quicconn6: test_quicconn6.c quicconn.o quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< quicconn.o quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+
+.PHONY: test-quicconn6
+TESTS += test_quicconn6
+check: test-quicconn6
+test-quicconn6: test_quicconn6
+	./test_quicconn6
+
 # d2kc — процесс контроллера на C: цикл событий поверх планировщика.
 DETECT_OBJ = ../detect/bridge.o ../detect/classify.o ../detect/poison.o \
              ../detect/props.o ../detect/raw.o ../detect/trigger.o ../detect/response.o
