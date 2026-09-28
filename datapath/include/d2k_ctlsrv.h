@@ -18,17 +18,10 @@
 #include "d2k_raw.h"
 #include "d2k_session.h"
 
-/* Ширина ключа потока НА ПРОВОДЕ: 4 (low_ip) + 4 (high_ip) + 2 (low_port) +
- * 2 (high_port) + 1 (proto) = 13 байт полями (см. put_key в ctlsrv.c), а не
- * sizeof(d2k_key) — тот равен 16 из-за выравнивания в памяти, и наложение
- * структуры на буфер здесь запрещено ровно потому, что три байта дыры уехали
- * бы на провод непредсказуемыми (см. большой комментарий у d2k_key,
- * d2k_track.h). Общая для C-стороны константа: все места, что резервируют
- * или режут место под ключ в кадре, обязаны ссылаться на неё, а не повторять
- * число. Go-сторона держит то же число под именем keyLen
- * (internal/control/control.go) — оба обязаны совпадать, и это ловится
- * мостовым тестом (internal/control/bridge_test.go), а не сверкой на глаз. */
-#define D2K_KEY_WIRE_LEN 13
+/* Control v4: family(1), low/high address(16+16), ports(2+2), protocol(1).
+ * IPv4 occupies the first four address bytes with zero tails. Fields are
+ * encoded explicitly, never by copying the native d2k_key structure. */
+#define D2K_KEY_WIRE_LEN 38
 #define D2K_ADDR_PROBE_FLOW_WIRE_LEN 13
 
 /* Контекст обслуживания команд. */

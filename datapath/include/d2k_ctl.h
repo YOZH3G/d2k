@@ -46,7 +46,7 @@
 /* Версия 2 добавила транспорт в ARM_SHAPE. Версия 3 добавляет временную
  * адресную пробу с exact-flow key и поколением, а также trial ID в
  * APPLIED/REFUSED. Смешанная пара должна остановиться на приветствии. */
-#define D2K_CTL_PROTO_VERSION 3
+#define D2K_CTL_PROTO_VERSION 4
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */

@@ -90,7 +90,8 @@
  * test_link.c: hello + два reply — 22, потом 23 — на одном потоке). */
 typedef struct {
     uint16_t kind;          /* D2K_EV_* */
-    uint8_t  low_ip[4], high_ip[4];
+    uint8_t  family;
+    uint8_t  low_ip[16], high_ip[16];
     uint16_t low_port, high_port;
     uint8_t  transport;     /* 6 TCP, 17 UDP — см. большой комментарий выше */
     uint16_t code;          /* SUSPECT: причина; EXCHANGE: тип TLS-записи; ACK: тип команды;

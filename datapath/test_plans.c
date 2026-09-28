@@ -45,6 +45,30 @@ static uint32_t addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 }
 
 int main(void) {
+    {
+        d2k_plantab *t = d2k_plantab_new(4);
+        d2k_addr_probe_flow f = {.family=6, .transport=17,
+            .src_port_be=0x3412, .dst_port_be=0xbb01,
+            .src_ip6={0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,1},
+            .dst_ip6={0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,2}};
+        uint8_t trial[D2K_TRIAL_ID_LEN] = {1};
+        d2k_plan *p = mkplan();
+        CHECK(d2k_plantab_set_addr_probe(t, &f, trial, 1, 100, p) == 0,
+              "IPv6 exact probe rejected");
+        CHECK(d2k_plantab_find_addr_probe(t, &f, 2, NULL) == p, "IPv6 probe not found");
+        d2k_addr_probe_flow other = f;
+        other.src_ip6[2]++;
+        CHECK(d2k_plantab_find_addr_probe(t, &other, 2, NULL) == NULL,
+              "IPv6 probe matched only lower address bits");
+        CHECK(d2k_plantab_del_addr_probe(t, &other, trial) == 0,
+              "another IPv6 source deleted trial");
+        other = f; other.family = 4;
+        memcpy(other.src_ip4, f.src_ip6, 4); memcpy(other.dst_ip4, f.dst_ip6, 4);
+        CHECK(d2k_plantab_find_addr_probe(t, &other, 2, NULL) == NULL,
+              "IPv4 matched IPv6 trial");
+        CHECK(d2k_plantab_del_addr_probe(t, &f, trial) == 1, "IPv6 cleanup failed");
+        d2k_plantab_free(t);
+    }
     /* --- поиск по имени и по адресу ---------------------------------------- */
     {
         d2k_plantab *t = d2k_plantab_new(8);

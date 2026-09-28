@@ -18,11 +18,18 @@
  * (wire.c, wire_udp.c) собирает заголовки: поле в поле, явным порядком.
  * Возвращает D2K_KEY_WIRE_LEN — сколько байт записано. */
 static size_t put_key(uint8_t *out, const d2k_key *k) {
-    memcpy(out + 0, &k->low_ip, 4);
-    memcpy(out + 4, &k->high_ip, 4);
-    memcpy(out + 8, &k->low_port, 2);
-    memcpy(out + 10, &k->high_port, 2);
-    out[12] = k->proto;
+    memset(out, 0, D2K_KEY_WIRE_LEN);
+    out[0] = k->family == 6 ? 6 : 4;
+    if (out[0] == 6) {
+        memcpy(out + 1, k->low_ip6, 16);
+        memcpy(out + 17, k->high_ip6, 16);
+    } else {
+        memcpy(out + 1, &k->low_ip, 4);
+        memcpy(out + 17, &k->high_ip, 4);
+    }
+    memcpy(out + 33, &k->low_port, 2);
+    memcpy(out + 35, &k->high_port, 2);
+    out[37] = k->proto;
     return D2K_KEY_WIRE_LEN;
 }
 
@@ -76,6 +83,7 @@ static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
        про поток, но общая раскладка проще и сборке, и разбору. Ключ нулевой. */
     uint8_t body[D2K_KEY_WIRE_LEN + 4];
     memset(body, 0, sizeof body);
+    body[0] = 4;
     body[D2K_KEY_WIRE_LEN] = (uint8_t)(type >> 8);
     body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)type;
     body[D2K_KEY_WIRE_LEN + 2] = ok ? 1 : 0;
@@ -94,6 +102,7 @@ static void ack_trial(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason,
                       const uint8_t trial_id[D2K_TRIAL_ID_LEN]) {
     uint8_t body[D2K_KEY_WIRE_LEN + 4 + D2K_TRIAL_ID_LEN];
     memset(body, 0, D2K_KEY_WIRE_LEN);
+    body[0] = 4;
     body[D2K_KEY_WIRE_LEN] = (uint8_t)(type >> 8);
     body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)type;
     body[D2K_KEY_WIRE_LEN + 2] = (uint8_t)(ok != 0);
@@ -112,6 +121,7 @@ void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen) {
        версии не увидел и обязан считать это несовпадением. */
     uint8_t body[D2K_KEY_WIRE_LEN + 6];
     memset(body, 0, sizeof body);
+    body[0] = 4;
     body[D2K_KEY_WIRE_LEN]     = (uint8_t)(D2K_CTL_PROTO_VERSION >> 8);
     body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)D2K_CTL_PROTO_VERSION;
     body[D2K_KEY_WIRE_LEN + 2] = (uint8_t)(send_maxlen >> 24);
@@ -196,7 +206,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
-        d2k_addr_probe_flow flow;
+        d2k_addr_probe_flow flow = {0};
         memcpy(flow.src_ip4, b, 4);
         memcpy(&flow.src_port_be, b + 4, 2);
         memcpy(flow.dst_ip4, b + 6, 4);
@@ -253,6 +263,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             if (sh && slen > 0 && cx->ctl) {
                 uint8_t body[D2K_KEY_WIRE_LEN + 2048];
                 memset(body, 0, D2K_KEY_WIRE_LEN);
+                body[0] = 4;
                 /* Транспорт кладётся в ключ, а не рядом: место под него на
                    проводе уже есть, и контроллер разбирает его общим путём. */
                 body[D2K_KEY_WIRE_LEN - 1] = want_tr;
@@ -304,7 +315,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
-        d2k_addr_probe_flow flow;
+        d2k_addr_probe_flow flow = {0};
         memcpy(flow.src_ip4, b, 4);
         memcpy(&flow.src_port_be, b + 4, 2);
         memcpy(flow.dst_ip4, b + 6, 4);

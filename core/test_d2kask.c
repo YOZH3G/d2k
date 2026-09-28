@@ -686,11 +686,13 @@ static void send_event_frame(int fd, uint16_t kind,
     frame[2] = (uint8_t)(plen >> 8);  frame[3] = (uint8_t)plen;
     frame[4] = (uint8_t)(kind >> 8);  frame[5] = (uint8_t)kind;
     uint8_t *k = frame + 6;
-    if (low_ip) { memcpy(k, low_ip, 4); } else { memset(k, 0, 4); }
-    if (high_ip) { memcpy(k + 4, high_ip, 4); } else { memset(k + 4, 0, 4); }
-    k[8] = (uint8_t)(low_port >> 8); k[9] = (uint8_t)low_port;
-    k[10] = (uint8_t)(high_port >> 8); k[11] = (uint8_t)high_port;
-    k[12] = transport;
+    memset(k, 0, D2K_KEY_WIRE_LEN);
+    k[0] = 4;
+    if (low_ip) { memcpy(k + 1, low_ip, 4); }
+    if (high_ip) { memcpy(k + 17, high_ip, 4); }
+    k[33] = (uint8_t)(low_port >> 8); k[34] = (uint8_t)low_port;
+    k[35] = (uint8_t)(high_port >> 8); k[36] = (uint8_t)high_port;
+    k[37] = transport;
     if (rest_len) { memcpy(frame + 6 + D2K_KEY_WIRE_LEN, rest, rest_len); }
     (void)write(fd, frame, 6 + body_len);
 }

@@ -73,6 +73,7 @@ static void send_synthetic(int fd, uint16_t kind, const uint8_t *rest, size_t re
     frame[4] = (uint8_t)(kind >> 8);
     frame[5] = (uint8_t)kind;
     memset(frame + 6, 0xAB, D2K_KEY_WIRE_LEN);
+    frame[6] = 6;
     if (rest_len) {
         memcpy(frame + 6 + D2K_KEY_WIRE_LEN, rest, rest_len);
     }
@@ -219,6 +220,37 @@ static d2k_ev ev_with_seen(uint8_t seen_types) {
 }
 
 int main(void) {
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "IPv6 event socketpair");
+        /* v4 control: family, two 16-byte addresses, ports, transport, name. */
+        uint8_t frame[45] = {0,0,0,41,0,0};
+        frame[4] = (uint8_t)(D2K_EV_HELLO >> 8);
+        frame[5] = (uint8_t)D2K_EV_HELLO;
+        frame[6] = 6;
+        frame[7] = 0x20; frame[8] = 1; frame[22] = 1;
+        frame[23] = 0x20; frame[24] = 2; frame[38] = 2;
+        frame[39] = 0xc0; frame[40] = 1;
+        frame[41] = 1; frame[42] = 0xbb;
+        frame[43] = 6; frame[44] = 0;
+        CHECK(write(sv[0], frame, sizeof frame) == (ssize_t)sizeof frame, "IPv6 frame write");
+        d2k_ev ev;
+        char err[256];
+        int rc = d2k_link_next(sv[1], &ev, 100, err, sizeof err);
+        CHECK(rc == 0 && ev.low_port == 49153 && ev.high_port == 443 && ev.transport == 6,
+              "IPv6 control event misdecoded");
+        CHECK(ev.family == 6 && memcmp(ev.low_ip, frame + 7, 16) == 0 &&
+              memcmp(ev.high_ip, frame + 23, 16) == 0, "IPv6 control address truncated");
+        frame[6] = 7;
+        CHECK(write(sv[0], frame, sizeof frame) == (ssize_t)sizeof frame, "bad family write");
+        CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == -1,
+              "unknown address family accepted");
+        frame[6] = 4;
+        CHECK(write(sv[0], frame, sizeof frame) == (ssize_t)sizeof frame, "noncanonical IPv4 write");
+        CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == -1,
+              "IPv4 address with nonzero tail accepted");
+        close(sv[0]); close(sv[1]);
+    }
     /* Controller status must turn false when the datapath peer vanishes;
        checking a live PID alone is not enough to prove this link is alive. */
     {
@@ -244,6 +276,9 @@ int main(void) {
               "socketpair (финальная очередь событий) не создался");
         if (sv[0] >= 0 && sv[1] >= 0) {
             const uint8_t hello[] = {0};
+            int capacity = 256 * 1024;
+            CHECK(setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &capacity, sizeof capacity) == 0,
+                  "room for 300 queued IPv6 events");
             for (int i = 0; i < 300; i++) {
                 send_synthetic(sv[1], D2K_EV_HELLO, hello, sizeof hello);
             }

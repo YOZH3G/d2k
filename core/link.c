@@ -252,11 +252,24 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
     }
 
     out->kind = type;
-    memcpy(out->low_ip, g_scratch + 0, 4);
-    memcpy(out->high_ip, g_scratch + 4, 4);
-    out->low_port = (uint16_t)((uint16_t)g_scratch[8] << 8 | g_scratch[9]);
-    out->high_port = (uint16_t)((uint16_t)g_scratch[10] << 8 | g_scratch[11]);
-    out->transport = g_scratch[12]; /* см. большой комментарий в d2k_link.h */
+    if (g_scratch[0] != 4 && g_scratch[0] != 6) {
+        say(err, errcap, "неизвестное семейство ключа потока: %u", g_scratch[0]);
+        return -1;
+    }
+    out->family = g_scratch[0];
+    if (out->family == 4) {
+        for (size_t i = 4; i < 16; ++i) {
+            if (g_scratch[1 + i] || g_scratch[17 + i]) {
+                say(err, errcap, "ненулевой хвост IPv4-адреса в ключе потока");
+                return -1;
+            }
+        }
+    }
+    memcpy(out->low_ip, g_scratch + 1, 16);
+    memcpy(out->high_ip, g_scratch + 17, 16);
+    out->low_port = (uint16_t)((uint16_t)g_scratch[33] << 8 | g_scratch[34]);
+    out->high_port = (uint16_t)((uint16_t)g_scratch[35] << 8 | g_scratch[36]);
+    out->transport = g_scratch[37];
 
     const uint8_t *rest = g_scratch + D2K_KEY_WIRE_LEN;
     size_t rlen = body_len - D2K_KEY_WIRE_LEN;

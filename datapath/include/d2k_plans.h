@@ -91,6 +91,8 @@ typedef struct {
     uint8_t  dst_ip4[4];
     uint16_t dst_port_be;
     uint8_t  transport;
+    uint8_t  family; /* 0 is the existing IPv4 caller default; otherwise 4/6. */
+    uint8_t  src_ip6[16], dst_ip6[16];
 } d2k_addr_probe_flow;
 
 d2k_plantab *d2k_plantab_new(size_t cap);

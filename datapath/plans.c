@@ -447,20 +447,29 @@ static int probe_flow_valid(const d2k_addr_probe_flow *f) {
     if (!f || f->transport != 17 || f->src_port_be == 0 || f->dst_port_be == 0) {
         return 0;
     }
+    if (f->family != 0 && f->family != 4 && f->family != 6) return 0;
+    const uint8_t *s = f->family == 6 ? f->src_ip6 : f->src_ip4;
+    const uint8_t *d = f->family == 6 ? f->dst_ip6 : f->dst_ip4;
+    size_t n = f->family == 6 ? 16 : 4;
     uint8_t src = 0, dst = 0;
-    for (size_t i = 0; i < sizeof f->src_ip4; i++) {
-        src |= f->src_ip4[i];
-        dst |= f->dst_ip4[i];
+    for (size_t i = 0; i < n; i++) {
+        src |= s[i];
+        dst |= d[i];
     }
     return src != 0 && dst != 0;
 }
 
 static int probe_flow_equal(const d2k_addr_probe_flow *a,
                             const d2k_addr_probe_flow *b) {
+    if ((a->family == 6) != (b->family == 6)) return 0;
+    size_t n = a->family == 6 ? 16 : 4;
+    const uint8_t *as = a->family == 6 ? a->src_ip6 : a->src_ip4;
+    const uint8_t *ad = a->family == 6 ? a->dst_ip6 : a->dst_ip4;
+    const uint8_t *bs = b->family == 6 ? b->src_ip6 : b->src_ip4;
+    const uint8_t *bd = b->family == 6 ? b->dst_ip6 : b->dst_ip4;
     return a->transport == b->transport &&
            a->src_port_be == b->src_port_be && a->dst_port_be == b->dst_port_be &&
-           memcmp(a->src_ip4, b->src_ip4, sizeof a->src_ip4) == 0 &&
-           memcmp(a->dst_ip4, b->dst_ip4, sizeof a->dst_ip4) == 0;
+           memcmp(as, bs, n) == 0 && memcmp(ad, bd, n) == 0;
 }
 
 static void probe_drop(d2k_plantab *t, probe_entry *e) {
