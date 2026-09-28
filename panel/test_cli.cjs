@@ -10,6 +10,8 @@ async function main() {
   const version = spawnSync(exe, ['--version'], { encoding: 'utf8' });
   assert.equal(version.status, 0, version.stderr);
   assert.match(version.stdout, /^d2kpanel\b/);
+  assert.match(version.stdout, /features=.*telegram-control/,
+    'the installed ARM64 bundle must advertise Telegram control CLI support');
 
   const bad = spawnSync(exe, ['--unknown-option'], { encoding: 'utf8' });
   assert.notEqual(bad.status, 0, 'unknown options must not silently start a default service');

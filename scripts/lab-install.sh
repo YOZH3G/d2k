@@ -43,6 +43,8 @@ REL=/tmp/rel
 fail() { echo "ПРОВАЛ: $*" >&2; dump; exit 1; }
 dump() {
     echo "--- статус ---";  [ -x "$INIT" ] && "$INIT" status 2>&1 || true
+    echo "--- API-панели ---"; curl -fsS http://127.0.0.1:8090/api/status 2>&1 || true; echo
+    echo "--- повторная диагностика reapply ---"; sh -x "$INIT" reapply 2>&1 || true
     echo "--- правила ---"; iptables -t mangle -S 2>&1 | grep -i d2k || echo "(нет)"
     echo "--- журналы ---"; tail -n 15 "$DIR"/log/*.log 2>/dev/null || true
 }
@@ -51,7 +53,7 @@ rules() { iptables -t mangle -S 2>/dev/null | sort; }
 
 echo "== подготовка контейнера =="
 apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq iptables >/dev/null 2>&1
+apt-get install -y -qq iptables ipset >/dev/null 2>&1
 command -v start-stop-daemon >/dev/null || fail "нет start-stop-daemon — установщик на такой системе не работает"
 
 case "$(uname -m)" in
@@ -69,11 +71,13 @@ make -s -C datapath d2kd
 mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets"
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
+cp builds/d2ktg-linux-arm64 "$REL/builds/d2ktg-linux-$ARCH"
 make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
 cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/logo-d2k.png internal/web/assets/mascot-d2k.png "$REL/internal/web/assets/"
 cp files/S99d2k files/config files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
+cp files/d2k-tg-firewall.sh files/d2k-tg-watchdog.sh files/tg-roots.pem "$REL/files/"
 cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fake/"
 
 # СНИМОК ЧИСТОЙ СИСТЕМЫ. По нему проверяются и остановка, и удаление: обе
@@ -85,12 +89,23 @@ echo "== 1. чистая установка =="
 D2K_LOCAL="$REL" sh scripts/install.sh 2>&1 | tee /tmp/install1.log
 [ "$(tail -1 /tmp/install1.log)" != "" ] || true
 grep -q "готово" /tmp/install1.log || fail "установка с чистого состояния не прошла: $(tail -3 /tmp/install1.log)"
+[ "$(stat -c '%a' "$DIR/config")" = 600 ] || fail "конфигурация с relay-секретом должна быть доступна только root"
+[ "$(grep -c '^MODE=apply$' "$DIR/config")" = 1 ] || fail "чистая установка должна включать активный режим D2K"
 
 "$INIT" status | grep -q "датапат: работает" || fail "после установки датапат не работает"
 "$INIT" status | grep -q "правила: стоят"    || fail "после установки правил нет"
 "$INIT" status | grep -q "очередь .*привязана" || fail "очередь не привязана"
 [ -x /opt/sbin/d2kd ] || fail "d2kd не установлен"
 [ -x /opt/sbin/d2kc ] || fail "d2kc не установлен"
+[ -x /opt/sbin/d2ktg ] || fail "C-туннель Telegram не установлен"
+[ -x "$DIR/d2k-tg-firewall.sh" ] || fail "не установлен firewall Telegram"
+[ -x "$DIR/d2k-tg-watchdog.sh" ] || fail "не установлен сторож Telegram"
+[ -s "$DIR/files/tg-roots.pem" ] || fail "не установлен CA bundle Telegram"
+[ "$(/opt/sbin/d2ktg --version)" = "d2k-tg-0.1" ] || fail "не запускается C-туннель Telegram"
+[ "$(grep -c '^TG_ENABLED=0$' "$DIR/config")" = 1 ] || fail "Telegram должен быть выключен по умолчанию"
+[ "$(grep -Ec '^#[[:space:]]*TG_RELAY_SECRET=' "$DIR/config")" = 1 ] || fail "секрет ретранслятора не должен задаваться по умолчанию"
+[ "$(grep -Ec '^[[:space:]]*TG_RELAY_SECRET=' "$DIR/config" || true)" = 0 ] || fail "шаблон не должен задавать relay secret активным ключом"
+[ ! -e "$DIR/run/d2ktg.pid" ] || fail "Telegram запущен без включения пользователем"
 [ -x /opt/sbin/d2kpanel ] || fail "C-панель не установлена"
 [ ! -x /opt/sbin/d2k ] || fail "legacy Go-панель осталась установленной"
 [ -s "$DIR/panel/index.html" ] && [ -s "$DIR/panel/panel.css" ] && [ -s "$DIR/panel/panel.js" ] && [ -s "$DIR/panel/logo-d2k.png" ] && [ -s "$DIR/panel/mascot-d2k.png" ] || fail "не установлены статические ресурсы панели"
@@ -111,6 +126,12 @@ done
 [ "$PANEL_OK" = 1 ] || fail "C-панель не отдала /api/status"
 grep -q '"snapshot"' /tmp/d2k-panel-status.json || fail "API не вернул status snapshot"
 grep -q '"controls_enabled":true' /tmp/d2k-panel-status.json || fail "loopback-панель не включила управление сервисом"
+grep -q '"telegram_enabled":false' /tmp/d2k-panel-status.json || fail "API считает выключенный Telegram включённым"
+grep -q '"telegram_configured":false' /tmp/d2k-panel-status.json || fail "API считает Telegram настроенным без секрета и URL"
+grep -q '"telegram_status":"not_configured"' /tmp/d2k-panel-status.json || fail "API неверно показывает состояние не настроенного Telegram"
+if grep -q 'TG_RELAY_SECRET\|relay_secret\|telegram.*secret' /tmp/d2k-panel-status.json; then
+    fail "API раскрыл поле или значение секрета ретранслятора"
+fi
 curl -fsS http://127.0.0.1:8090/ | grep -q 'id="app"' || fail "C-панель не отдала главную страницу"
 curl -fsS http://127.0.0.1:8090/assets/logo-d2k.png -o /tmp/d2k-logo.png || fail "C-панель не отдала знак D2K"
 curl -fsS http://127.0.0.1:8090/assets/mascot-d2k.png -o /tmp/d2k-mascot.png || fail "C-панель не отдала маскота D2K"
@@ -119,9 +140,67 @@ curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/c
 curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-stopped.json || fail "панель недоступна после остановки движка"
 grep -q '"engine_running":false' /tmp/d2k-panel-stopped.json || fail "после остановки API продолжает считать движок работающим"
 grep -q '"controller_running":false' /tmp/d2k-panel-stopped.json || fail "после остановки API продолжает считать контроллер работающим"
-grep -q '"linked":false' /tmp/d2k-panel-stopped.json || fail "API сохранил linked=true после остановки движка"
+grep -Eq '"linked"[[:space:]]*:[[:space:]]*false' /tmp/d2k-panel-stopped.json || fail "API сохранил linked=true после остановки движка"
 curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/start | grep -q '"ok":true' || fail "локальная панель не запустила движок"
 "$INIT" status | grep -q "датапат: работает" || fail "движок не восстановился из панели"
+echo "== параллельное восстановление правил =="
+REAPPLY_PIDS=
+for i in 1 2 3 4; do
+    sh "$INIT" reapply >"/tmp/d2k-reapply-$i.log" 2>&1 &
+    REAPPLY_PIDS="$REAPPLY_PIDS $!"
+done
+REAPPLY_FAILED=0
+for pid in $REAPPLY_PIDS; do wait "$pid" || REAPPLY_FAILED=1; done
+[ "$REAPPLY_FAILED" = 0 ] || fail "параллельное восстановление завершилось ошибкой"
+"$INIT" status | grep -q "правила: стоят" || fail "параллельное восстановление оставило firewall частичным"
+if curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-enable >/tmp/d2k-telegram-enable.json; then
+    fail "панель включила Telegram без URL и relay secret"
+fi
+curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-telegram-unconfigured.json || fail "панель недоступна после отказа включить Telegram"
+grep -q '"telegram_enabled":false' /tmp/d2k-panel-telegram-unconfigured.json || fail "не настроенный Telegram остался включён после отказа"
+echo "== Telegram: локальный старт, redirect, отключение =="
+# Указываем только loopback-релей без слушателя. C-клиент проверяется как
+# процесс и firewall, но ни к VPS, ни к Telegram не подключается. Временный
+# контейнерный watchdog выключен, чтобы лабораторная проверка не делала
+# внешний health-probe.
+printf '\nTG_RELAY_URL=wss://127.0.0.1:11443/ws\nTG_RELAY_SECRET=lab-only-not-a-real-secret\n' >> "$DIR/config"
+chmod -x "$DIR/d2k-tg-watchdog.sh"
+curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-enable | grep -q '"ok":true' || fail "панель не включила настроенный Telegram-туннель"
+[ -f "$DIR/run/d2ktg.pid" ] || fail "d2ktg не создал pid-файл после включения"
+TG_PID_NOW=$(cat "$DIR/run/d2ktg.pid")
+[ -d "/proc/$TG_PID_NOW" ] || fail "d2ktg завершился после включения"
+"$INIT" status | grep -q "Telegram tunnel: работает" || fail "служба не показывает активный Telegram-туннель"
+ipset test d2k_tg_dc 149.154.167.51 >/dev/null 2>&1 || fail "ipset не содержит Telegram DC IPv4"
+! ipset test d2k_tg_dc 203.0.113.1 >/dev/null 2>&1 || fail "ipset ошибочно включает посторонний IPv4"
+iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "нет Telegram PREROUTING redirect"
+iptables -t nat -C OUTPUT -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "нет Telegram OUTPUT redirect"
+if ipset test d2k_tg_dc6 2001:67c:4e8::1 >/dev/null 2>&1; then
+    echo "IPv6 Telegram set and rules are available"
+    ip6tables -C FORWARD -p tcp -m set --match-set d2k_tg_dc6 dst -j REJECT --reject-with tcp-reset || fail "нет IPv6 Telegram fast-reject в FORWARD"
+    ip6tables -C OUTPUT -p tcp -m set --match-set d2k_tg_dc6 dst -j REJECT --reject-with tcp-reset || fail "нет IPv6 Telegram fast-reject в OUTPUT"
+else
+    echo "IPv6 Telegram rules unavailable in this container kernel (donor behavior is best-effort)"
+fi
+iptables -t nat -D PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443
+printf '#!/bin/sh\nexit 0\n' > /opt/sbin/curl
+chmod +x /opt/sbin/curl
+chmod +x "$DIR/d2k-tg-watchdog.sh"
+if timeout 2 "$DIR/d2k-tg-watchdog.sh" >/tmp/d2k-tg-watchdog.log 2>&1; then
+    fail "watchdog неожиданно завершился вместо продолжения цикла"
+else
+    WATCHDOG_RC=$?
+    [ "$WATCHDOG_RC" = 124 ] || [ "$WATCHDOG_RC" = 143 ] || {
+        cat /tmp/d2k-tg-watchdog.log >&2
+        fail "локальный watchdog завершился с кодом $WATCHDOG_RC"
+    }
+fi
+rm -f /opt/sbin/curl
+iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "watchdog не восстановил Telegram redirect"
+curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-disable | grep -q '"ok":true' || fail "панель не отключила Telegram-туннель"
+[ ! -e "$DIR/run/d2ktg.pid" ] || fail "pid-файл d2ktg остался после отключения"
+! iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "PREROUTING redirect остался после отключения"
+! iptables -t nat -C OUTPUT -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "OUTPUT redirect остался после отключения"
+grep -q '^TG_ENABLED=0$' "$DIR/config" || fail "disable не сохранил TG_ENABLED=0"
 curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/reapply | grep -q '"ok":true' || fail "локальная панель не восстановила правила"
 echo "установлено и работает"
 
@@ -183,9 +262,15 @@ echo "остановка и повторный запуск возвращают
 echo "== 6. удаление =="
 sh scripts/uninstall.sh >/dev/null
 [ -e /opt/sbin/d2kd ] && fail "после удаления остался d2kd"
+[ -e /opt/sbin/d2ktg ] && fail "после удаления остался C-туннель Telegram"
 [ -e /opt/sbin/d2kc ] && fail "после удаления остался d2kc"
 [ -e /opt/sbin/d2kpanel ] && fail "после удаления осталась C-панель"
 [ -e "$DIR/panel" ] && fail "после удаления остались ресурсы панели"
+[ -e "$DIR/d2k-tg-firewall.sh" ] && fail "после удаления остался firewall Telegram"
+[ -e "$DIR/d2k-tg-watchdog.sh" ] && fail "после удаления остался сторож Telegram"
+[ -e "$DIR/files/tg-roots.pem" ] && fail "после удаления остался CA bundle Telegram"
+ipset list d2k_tg_dc >/dev/null 2>&1 && fail "после удаления остался IPv4 Telegram ipset"
+ipset list d2k_tg_dc6 >/dev/null 2>&1 && fail "после удаления остался IPv6 Telegram ipset"
 [ -e "$INIT" ]        && fail "после удаления остался init-скрипт"
 [ "$(rules)" = "$CLEAN_RULES" ] || fail "после удаления список правил не совпал с исходным"
 # Каталог изученных коробок по умолчанию сохраняется — это заявленное

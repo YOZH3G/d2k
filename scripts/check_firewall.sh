@@ -76,6 +76,23 @@ echo "$RULES" | grep -qE -- '-A D2K_OUT -p tcp .*--dports 0:65535.*--queue-bypas
 echo "$RULES" | grep -qE -- '-A D2K_IN -p tcp .*--sports 0:65535.*--queue-bypass' \
     || fail "нет входящего TCP-правила полного диапазона с --queue-bypass (регресс задачи 3)"
 
+# connbytes-dir выбирает счётчик направления, а не направление текущего
+# пакета. При диапазоне 0:8 счётчик противоположной стороны равен нулю и
+# тоже проходит фильтр; для PORTS=0:65535 это ловит исходящий SYN в D2K_IN
+# до Keenetic NDMMARK и ломает SNAT. Направление пакета фиксируется отдельно.
+echo "$RULES" | grep -qE -- '-A D2K_OUT -p tcp -m conntrack --ctdir ORIGINAL .*--dports 0:65535' \
+    || fail "D2K_OUT не ограничен conntrack-направлением ORIGINAL"
+echo "$RULES" | grep -qE -- '-A D2K_OUT -p udp -m conntrack --ctdir ORIGINAL .*--dports 0:65535' \
+    || fail "D2K_OUT UDP не ограничен conntrack-направлением ORIGINAL"
+echo "$RULES" | grep -qE -- '-A D2K_IN -p tcp -m conntrack --ctdir REPLY .*--sports 0:65535' \
+    || fail "D2K_IN TCP не ограничен conntrack-направлением REPLY"
+echo "$RULES" | grep -qE -- '-A D2K_IN -p udp -m conntrack --ctdir REPLY .*--sports 0:65535' \
+    || fail "D2K_IN UDP не ограничен conntrack-направлением REPLY"
+echo "$RULES" | grep -qE -- '-A D2K_OUT -p udp -m conntrack --ctdir ORIGINAL .*--dports 50000:50099,1400,3478:3481,5349,19294:19344' \
+    || fail "голосовое UDP-правило D2K_OUT не ограничено conntrack-направлением ORIGINAL"
+echo "$RULES" | grep -qE -- '-A D2K_IN -p udp -m conntrack --ctdir REPLY .*--sports 50000:50099,1400,3478:3481,5349,19294:19344' \
+    || fail "голосовое UDP-правило D2K_IN не ограничено conntrack-направлением REPLY"
+
 MARK_LINE=$(echo "$RULES" | grep -E -- '-A D2K_OUT -m mark .* -j RETURN' || true)
 [ -n "$MARK_LINE" ] || fail "нет правила RETURN по метке в исходящей цепочке"
 echo "$MARK_LINE" | grep -q -- '-p ' && fail "правило RETURN по метке сузили протоколом -p — UDP перестанет исключаться"
@@ -97,11 +114,12 @@ echo "== потеря любого обязательного правила д�
 for proto in tcp udp; do
     for chain in D2K_OUT D2K_IN; do
         if [ "$chain" = D2K_OUT ]; then
-            ports=--dports; direction=original
+            ports=--dports; direction=original; ctdir=ORIGINAL
         else
-            ports=--sports; direction=reply
+            ports=--sports; direction=reply; ctdir=REPLY
         fi
-        iptables -t mangle -D "$chain" -p "$proto" -m multiport "$ports" "$PORTS" \
+        iptables -t mangle -D "$chain" -p "$proto" -m conntrack --ctdir "$ctdir" \
+            -m multiport "$ports" "$PORTS" \
             -m connbytes --connbytes "$CONNBYTES" --connbytes-dir "$direction" \
             --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
         if fw_installed; then fail "потеря $proto в $chain не обнаружена"; fi

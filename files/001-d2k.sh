@@ -18,7 +18,15 @@ HEAL="${HEAL:-/opt/d2k/d2k-fw-heal.sh}"
 # d2k живёт в mangle. nat трогаем тоже: при переподключении Keenetic дёргает
 # хук и на нём, а сброс к тому моменту уже случился (та же оговорка, что у
 # z2k в 000-zapret2.sh).
-[ "$table" != "mangle" ] && [ "$table" != "nat" ] && exit 0
+if [ "$table" = "mangle" ] || [ "$table" = "nat" ]; then
+    [ ! -x "$HEAL" ] || "$HEAL"
+fi
 
-[ -x "$HEAL" ] || exit 0
-exec "$HEAL"
+# Telegram owns independent nat redirects and IPv6 fast-fail rules. NDM's nat
+# rebuild removes them, so ask the existing init service to restore only that
+# tunnel's rules; never restart or mutate the D2K strategy engine here.
+if [ "$table" = "nat" ]; then
+    INIT=/opt/etc/init.d/S99d2k
+    [ ! -x "$INIT" ] || "$INIT" telegram-reapply >/dev/null 2>&1 || true
+fi
+exit 0

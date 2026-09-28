@@ -50,6 +50,7 @@ render(root, {
     mode: 'apply', config_path: '/tmp/config', config_exists: true,
     state_dir: '/tmp/state', state_dir_note: 'каталог доступен',
     queue_num: 2000, panel_listen: '127.0.0.1:8090',
+    telegram_enabled: true, telegram_configured: true, telegram_status: 'connected',
     unknown_keys: ['FUTURE_OPTION'], stages: [], absent: [], taken: 'now',
   },
   knowledge: {
@@ -99,8 +100,10 @@ assert.match(root.textContent, /Как устроена работа D2K/,
 assert.match(root.textContent, /Управление D2K/,
   'panel must expose real service controls rather than remain read-only');
 assert.deepEqual(root.walk().filter((node) => node.attributes['data-control'])
-  .map((node) => node.attributes['data-control']), ['start', 'stop', 'restart', 'reapply'],
-  'the UI must expose only the four fixed service actions');
+  .map((node) => node.attributes['data-control']), ['telegram-disable', 'start', 'stop', 'restart', 'reapply'],
+  'the UI must expose the Telegram toggle and the existing fixed engine actions');
+assert.match(root.textContent, /Telegram-туннель/);
+assert.match(root.textContent, /Работает/);
 assert.match(root.textContent, /1 результат/,
   'the overview must expose saved knowledge counts from the real API');
 assert.match(root.textContent, /сервер ответил/,

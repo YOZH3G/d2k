@@ -286,6 +286,24 @@
     api.setAttribute("href", "/api/status");
     var controls = section(doc, rootNode, "controls", "Управление D2K",
       "Остановка подбора не удаляет уже сохранённые результаты.");
+    var tgStatusNames = {
+      not_configured: "Не настроен", stopped: "Выключен",
+      connecting: "Подключается", connected: "Работает"
+    };
+    var tgCard = append(controls, node(doc, "div", undefined, "telegram-control"));
+    var tgCopy = append(tgCard, node(doc, "div", undefined, "telegram-copy"));
+    append(tgCopy, node(doc, "strong", "Telegram-туннель"));
+    var tgState = append(tgCopy, node(doc, "span", tgStatusNames[snapshot.telegram_status] || "Состояние неизвестно", "telegram-state"));
+    tgState.setAttribute("data-state", snapshot.telegram_status || "unknown");
+    append(tgCopy, node(doc, "p", snapshot.telegram_configured
+      ? "Отдельный TCP-туннель для Telegram; подбор D2K управляется независимо."
+      : "Для включения сначала задайте TG_RELAY_URL и TG_RELAY_SECRET в конфигурации роутера."));
+    var tgAction = snapshot.telegram_enabled ? "telegram-disable" : "telegram-enable";
+    var tgButton = append(tgCard, node(doc, "button",
+      snapshot.telegram_enabled ? "Выключить" : "Включить", "control-button " + (snapshot.telegram_enabled ? "button-danger" : "button-primary")));
+    tgButton.setAttribute("type", "button");
+    tgButton.setAttribute("data-control", tgAction);
+    tgButton.disabled = !snapshot.controls_enabled || !snapshot.telegram_configured || controlInFlight;
     append(controls, node(doc, "p", snapshot.controls_enabled
       ? (snapshot.mode === "off"
         ? "Подбор выключен в настройках. Включите его там, чтобы D2K снова искал обходы."
@@ -312,8 +330,10 @@
         var button = event.target && event.target.closest ? event.target.closest("[data-control]") : null;
         if (!button || button.disabled) return;
         var action = button.getAttribute("data-control");
-        if ((action === "stop" || action === "restart") && root.confirm &&
-            !root.confirm(action === "stop" ? "Приостановить подбор? Сохранённые результаты останутся на месте." : "Перезапустить D2K? Текущие соединения могут на короткое время переключиться на прямое подключение.")) return;
+        if ((action === "stop" || action === "restart" || action === "telegram-disable") && root.confirm &&
+            !root.confirm(action === "stop" ? "Приостановить подбор? Сохранённые результаты останутся на месте." :
+              action === "telegram-disable" ? "Выключить Telegram-туннель? Новые Telegram-соединения пойдут напрямую." :
+              "Перезапустить D2K? Текущие соединения могут на короткое время переключиться на прямое подключение.")) return;
         runControl(action, button, doc);
       });
     }

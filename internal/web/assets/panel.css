@@ -266,6 +266,14 @@ button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visibl
 .not-measured p { margin: 5px 0; color: var(--muted); font-size: 9px; }
 .not-measured b { color: var(--ink-2); }
 .control-note { margin: -5px 0 13px; color: var(--muted); font-size: 10px; }
+.telegram-control { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin: 0 0 18px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+.telegram-copy { display: grid; grid-template-columns: auto auto; align-items: center; justify-content: start; gap: 4px 10px; }
+.telegram-copy strong { font-size: 12px; }
+.telegram-copy p { grid-column: 1 / -1; margin: 2px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.telegram-state { color: var(--muted); font-size: 9px; }
+.telegram-state::before { content: ""; display: inline-block; width: 6px; height: 6px; margin: 0 5px 1px 0; border-radius: 50%; background: #a5b0aa; }
+.telegram-state[data-state="connected"]::before { background: #168675; }
+.telegram-state[data-state="connecting"]::before { background: #d79332; }
 .control-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 .control-button { min-height: 38px; padding: 0 14px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); color: var(--ink); font-size: 11px; font-weight: 620; cursor: pointer; transition: transform 120ms ease, border-color 120ms ease, opacity 120ms ease; }
 .control-button:hover:not(:disabled) { transform: translateY(-1px); border-color: var(--blue); }

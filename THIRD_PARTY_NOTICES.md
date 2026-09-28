@@ -41,3 +41,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## OpenSSL
+
+The optional Telegram tunnel runtime statically links OpenSSL 3.5.8 from
+upstream commit `f4dc4d58b48d346a8270183f89acf826d459b0ca`. OpenSSL is licensed
+under the Apache License 2.0. Source and license: <https://www.openssl.org/source/license.html>.
+
+`files/tg-roots.pem` contains the public ISRG Root X1 and ISRG Root X2 trust
+anchors published by Internet Security Research Group (ISRG) for the relay's
+Let's Encrypt certificate chain. Inclusion adds trust anchors without
+disabling certificate-chain or hostname verification.

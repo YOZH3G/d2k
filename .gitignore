@@ -12,6 +12,12 @@ builds/*
 !builds/d2kd-linux-arm64
 !builds/d2kc-linux-arm64
 !builds/d2kpanel-linux-arm64
+!builds/d2ktg-linux-arm64
+/build/
+/telegram/build/
+/panel/d2kpanel
+/panel/test_server
+/panel/test_server_san
 
 # Планы реализации — локальные, как и в z2k: публикуется спека, а не план.
 docs/superpowers/

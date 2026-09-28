@@ -22,6 +22,17 @@ if [ -x "$INIT" ]; then
     "$INIT" stop || say "остановка вернула ошибку — продолжаю удаление"
 fi
 
+# Defense in depth when init has already been removed: stop only the owned
+# Telegram PID and remove only the two D2K-owned redirect rule sets.
+if [ -f "$DIR/run/d2ktg.pid" ]; then
+    start-stop-daemon -K -q -p "$DIR/run/d2ktg.pid" 2>/dev/null || true
+fi
+[ ! -x "$DIR/d2k-tg-firewall.sh" ] || "$DIR/d2k-tg-firewall.sh" stop >/dev/null 2>&1 || true
+if command -v ipset >/dev/null 2>&1; then
+    ipset destroy d2k_tg_dc 2>/dev/null || true
+    ipset destroy d2k_tg_dc6 2>/dev/null || true
+fi
+
 # Цепочка снимается даже если init-скрипта уже нет: он мог быть удалён руками,
 # а правила остаться.
 # Старое имя D2K тоже снимается: установка прошлой версии могла оставить его.
@@ -41,7 +52,8 @@ say "правила сняты"
 # Хук NDM снимается ПЕРВЫМ: оставленный, он будет звать сторожа, которого уже
 # нет, на каждое изменение netfilter — мусор в журнале на ровном месте.
 rm -f /opt/etc/ndm/netfilter.d/001-d2k.sh
-rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd"
+rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2ktg"
+rm -f "$DIR/d2k-tg-firewall.sh" "$DIR/d2k-tg-watchdog.sh" "$DIR/files/tg-roots.pem"
 rm -rf "$DIR/run" "$DIR/log" "$DIR/panel"
 
 if [ "$KEEP" = "1" ]; then

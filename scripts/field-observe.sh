@@ -268,9 +268,9 @@ set -e
 if [ $PPE = 1 ]; then
     iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS $NARROW -m connskip --connskip 1000000 -m comment --comment $TOKEN -j PPE
 fi
-iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS $NARROW $NOTSELF $NOTMEASURE -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+iptables -t mangle -I POSTROUTING -p tcp -m conntrack --ctdir ORIGINAL --dport $PORTS $NARROW $NOTSELF $NOTMEASURE -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 if [ $REV = 1 ]; then
-    iptables -t mangle -I FORWARD -p tcp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I FORWARD -p tcp -m conntrack --ctdir REPLY --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
 if [ $LEARN = 1 ]; then
     # Исходящее локальное УЖЕ проходит POSTROUTING, как и транзит.
@@ -290,9 +290,9 @@ if [ $LEARN = 1 ]; then
     # правила забирали ВЕСЬ 443-й порт самого роутера — а на нём живут и
     # вебпанель, и прокси, и обновления. §2.6 требует узкого опыта не ради
     # вежливости: применение плана к чужому соединению это уже не эксперимент.
-    iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS -m mark --mark $CTL_MARK -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I POSTROUTING -p tcp -m conntrack --ctdir ORIGINAL --dport $PORTS -m mark --mark $CTL_MARK -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
     iptables -t mangle -I OUTPUT -m mark --mark $CTL_MARK -m comment --comment $TOKEN -j CONNMARK --save-mark
-    iptables -t mangle -I INPUT -m connmark --mark $CTL_MARK -p tcp --sport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I INPUT -m connmark --mark $CTL_MARK -p tcp -m conntrack --ctdir REPLY --sport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
     if [ $QUIC = 1 ]; then
         # Собственный QUIC verifier-зонд — локально исходящий UDP, а не
         # транзитный клиент. Без отдельного помеченного правила он минует
@@ -300,22 +300,22 @@ if [ $LEARN = 1 ]; then
         # маршрутизатора-зонда возвращается в INPUT, не FORWARD; connmark
         # удерживает его в той же изолированной паре правил. В узком опыте
         # фиксируем целевой сервер тем же DST.
-        iptables -t mangle -I POSTROUTING -p udp --dport $PORTS $CTL_DST -m mark --mark $CTL_MARK -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
-        iptables -t mangle -I INPUT -p udp --sport $PORTS $CTL_SRC -m connmark --mark $CTL_MARK -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+        iptables -t mangle -I POSTROUTING -p udp -m conntrack --ctdir ORIGINAL --dport $PORTS $CTL_DST -m mark --mark $CTL_MARK -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+        iptables -t mangle -I INPUT -p udp -m conntrack --ctdir REPLY --sport $PORTS $CTL_SRC -m connmark --mark $CTL_MARK -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
     fi
 fi
 if [ $VOICE = 1 ]; then
     # Первые пакеты туда: IP Discovery и повторы — по ним датапат узнаёт
     # голос и приговаривает «молчат». Первые оттуда: ответ сервера —
     # ЕДИНСТВЕННОЕ подтверждение приёма голоса, зонда у голоса нет.
-    iptables -t mangle -I POSTROUTING -p udp -m multiport --dports $VOICE_PORTS $NARROW $NOTSELF -m connbytes --connbytes 0:4 --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
-    iptables -t mangle -I FORWARD -p udp -m multiport --sports $VOICE_PORTS $RNARROW -m connbytes --connbytes 0:4 --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I POSTROUTING -p udp -m conntrack --ctdir ORIGINAL -m multiport --dports $VOICE_PORTS $NARROW $NOTSELF -m connbytes --connbytes 0:4 --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I FORWARD -p udp -m conntrack --ctdir REPLY -m multiport --sports $VOICE_PORTS $RNARROW -m connbytes --connbytes 0:4 --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
 if [ $QUIC = 1 ]; then
-    iptables -t mangle -I POSTROUTING -p udp --dport $PORTS $NARROW $NOTSELF $NOTMEASURE -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
-    iptables -t mangle -I FORWARD -p udp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I POSTROUTING -p udp -m conntrack --ctdir ORIGINAL --dport $PORTS $NARROW $NOTSELF $NOTMEASURE -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I FORWARD -p udp -m conntrack --ctdir REPLY --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
     if [ $LEARN = 1 ]; then
-        iptables -t mangle -I INPUT -p udp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+        iptables -t mangle -I INPUT -p udp -m conntrack --ctdir REPLY --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
     fi
 fi
 if [ $VOICE = 1 ] || [ $QUIC = 1 ]; then

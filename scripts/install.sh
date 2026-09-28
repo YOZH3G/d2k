@@ -74,10 +74,14 @@ say "загрузка"
 fetch "builds/d2kpanel-linux-$ARCH" "$TMP/d2kpanel"
 fetch "builds/d2kc-linux-$ARCH" "$TMP/d2kc"
 fetch "builds/d2kd-linux-$ARCH" "$TMP/d2kd"
+fetch "builds/d2ktg-linux-$ARCH" "$TMP/d2ktg"
 fetch "files/S99d2k"            "$TMP/S99d2k"
 fetch "files/config"            "$TMP/config"
 fetch "files/d2k-fw-heal.sh"    "$TMP/d2k-fw-heal.sh"
 fetch "files/001-d2k.sh"        "$TMP/001-d2k.sh"
+fetch "files/d2k-tg-firewall.sh" "$TMP/d2k-tg-firewall.sh"
+fetch "files/d2k-tg-watchdog.sh" "$TMP/d2k-tg-watchdog.sh"
+fetch "files/tg-roots.pem" "$TMP/tg-roots.pem"
 fetch "files/fake/stun.bin" "$TMP/stun.bin"
 fetch "files/fake/quic_initial_dbankcloud_ru.bin" "$TMP/quic_initial_dbankcloud_ru.bin"
 mkdir -p "$TMP/panel"
@@ -87,12 +91,18 @@ fetch "internal/web/assets/panel.js"   "$TMP/panel/panel.js"
 fetch "internal/web/assets/logo-d2k.png" "$TMP/panel/logo-d2k.png"
 fetch "internal/web/assets/mascot-d2k.png" "$TMP/panel/mascot-d2k.png"
 
-chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kd" "$TMP/S99d2k" \
-         "$TMP/d2k-fw-heal.sh" "$TMP/001-d2k.sh"
+chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kd" "$TMP/d2ktg" \
+         "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/001-d2k.sh" \
+         "$TMP/d2k-tg-firewall.sh" "$TMP/d2k-tg-watchdog.sh"
 
 # Проверка ДО замены: запускается ли то, что скачалось, и та ли это арка.
-"$TMP/d2kpanel" --version >/dev/null 2>&1 || die "скачанный d2kpanel не запускается на этой системе"
+PANEL_VERSION=$("$TMP/d2kpanel" --version 2>/dev/null) || die "скачанный d2kpanel не запускается на этой системе"
+case "$PANEL_VERSION" in
+    *features=telegram-control*) ;;
+    *) die "скачанный d2kpanel устарел: в нём нет управления Telegram-туннелем" ;;
+esac
 "$TMP/d2kd" --help  >/dev/null 2>&1 || die "скачанный d2kd не запускается на этой системе"
+"$TMP/d2ktg" --version >/dev/null 2>&1 || die "скачанный d2ktg не запускается на этой системе"
 # d2kc без обязательного --control печатает использование и выходит кодом 2 —
 # это и есть признак «запускается и та арка». Ноль он здесь вернуть не может.
 #
@@ -131,6 +141,7 @@ install_data_atomic() {
 install_atomic "$TMP/d2kpanel" "$SBIN/d2kpanel"
 install_atomic "$TMP/d2kc"   "$SBIN/d2kc"
 install_atomic "$TMP/d2kd"   "$SBIN/d2kd"
+install_atomic "$TMP/d2ktg"  "$SBIN/d2ktg"
 install_atomic "$TMP/S99d2k" "$INIT"
 install_data_atomic "$TMP/panel/index.html" "$DIR/panel/index.html"
 install_data_atomic "$TMP/panel/panel.css"  "$DIR/panel/panel.css"
@@ -138,6 +149,9 @@ install_data_atomic "$TMP/panel/panel.js"   "$DIR/panel/panel.js"
 install_data_atomic "$TMP/panel/logo-d2k.png" "$DIR/panel/logo-d2k.png"
 install_data_atomic "$TMP/panel/mascot-d2k.png" "$DIR/panel/mascot-d2k.png"
 install_atomic "$TMP/d2k-fw-heal.sh" "$DIR/d2k-fw-heal.sh"
+install_atomic "$TMP/d2k-tg-firewall.sh" "$DIR/d2k-tg-firewall.sh"
+install_atomic "$TMP/d2k-tg-watchdog.sh" "$DIR/d2k-tg-watchdog.sh"
+install_data_atomic "$TMP/tg-roots.pem" "$DIR/files/tg-roots.pem"
 install_atomic "$TMP/stun.bin" "$DIR/files/fake/stun.bin"
 install_atomic "$TMP/quic_initial_dbankcloud_ru.bin" "$DIR/files/fake/quic_initial_dbankcloud_ru.bin"
 # Хук NDM — событийное восстановление правил. Каталог может отсутствовать на
@@ -156,6 +170,10 @@ if [ ! -f "$DIR/config" ]; then
 else
     say "конфигурация уже есть — не трогаю"
 fi
+# В конфигурации хранится relay secret. Содержимое сохраняем, но ограничиваем
+# чтение root даже при обновлении ранее установленного файла с более широкими
+# правами.
+chmod 0600 "$DIR/config" || die "не защитить права конфигурации"
 # Убираем только legacy Go-панельный бинарник прежней установки; новый C
 # runtime уже проверен выше и установлен отдельно как d2kpanel.
 rm -f "$SBIN/d2k"
@@ -172,4 +190,4 @@ fi
 
 "$INIT" status
 say "готово. Панель: http://127.0.0.1:8090/ (адрес меняется в $DIR/config)"
-say "режим по умолчанию — наблюдение. Активный обход включается MODE=apply."
+say "режим по умолчанию — активный обход (MODE=apply). Для наблюдения задайте MODE=observe."

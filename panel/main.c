@@ -28,6 +28,7 @@
 #ifndef D2K_PANEL_DIRTY
 #define D2K_PANEL_DIRTY 0
 #endif
+#define D2K_PANEL_FEATURES "telegram-control"
 
 #define UNKNOWN_MAX 64
 #define UNKNOWN_KEY_MAX 128
@@ -68,7 +69,9 @@ static int known_key(const char *key) {
         "SCHEMA", "MODE", "PANEL_LISTEN", "STATE_DIR", "QUEUE_NUM",
         "CONTROL_SOCKET", "DECOY_SNI", "MARK", "PROBE_MARK", "FLOWS",
         "STATS_SEC", "HEAL_EVERY", "LOGMAX", "LOGKEEP", "PORTS",
-        "CONNBYTES", "VOICE_PORTS", "VOICE_CONNBYTES"
+        "CONNBYTES", "VOICE_PORTS", "VOICE_CONNBYTES", "TG_ENABLED",
+        "TG_RELAY_URL", "TG_RELAY_SECRET", "TG_IDENTITY", "TG_CA_BUNDLE",
+        "TG_STATUS", "TG_PORT"
     };
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
         if (strcmp(key, keys[i]) == 0) { return 1; }
@@ -229,7 +232,8 @@ static void set_state_note(const char *dir, char *out, size_t cap) {
 static int serve(const char *listen_addr, const char *live_path, const char *asset_dir,
                  const char *config_path, const char *mode, const char *state_dir,
                  int queue, const char *service_path, const char *engine_pid_path,
-                 const char *controller_pid_path, const char *log_path) {
+                 const char *controller_pid_path, const char *telegram_pid_path,
+                 const char *telegram_status_path, const char *log_path) {
     if (log_path && log_path[0]) {
         int logfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (logfd < 0) { say("не открыть журнал %s: %s", log_path, strerror(errno)); return 1; }
@@ -287,6 +291,8 @@ static int serve(const char *listen_addr, const char *live_path, const char *ass
         .service_path = service_path,
         .engine_pid_path = engine_pid_path,
         .controller_pid_path = controller_pid_path,
+        .telegram_pid_path = telegram_pid_path,
+        .telegram_status_path = telegram_status_path,
         .unknown_keys = unknown_ptrs,
         .unknown_key_count = n_unknown,
         .started_epoch = (long long)time(NULL),
@@ -323,7 +329,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        printf("d2kpanel %s commit %s\n", D2K_PANEL_VERSION, D2K_PANEL_COMMIT);
+        printf("d2kpanel %s commit %s features=%s\n", D2K_PANEL_VERSION,
+               D2K_PANEL_COMMIT, D2K_PANEL_FEATURES);
         return 0;
     }
     if (argc < 2 || strcmp(argv[1], "serve") != 0) {
@@ -341,6 +348,8 @@ int main(int argc, char **argv) {
     const char *service_path = "/opt/etc/init.d/S99d2k";
     const char *engine_pid_path = "/opt/d2k/run/d2kd.pid";
     const char *controller_pid_path = "/opt/d2k/run/d2k.pid";
+    const char *telegram_pid_path = "/opt/d2k/run/d2ktg.pid";
+    const char *telegram_status_path = "/opt/d2k/state/telegram.status";
     int cli_listen = 0, cli_mode = 0, cli_state = 0, cli_queue = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) { config_path = argv[++i]; }
@@ -366,6 +375,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--service") == 0 && i + 1 < argc) { service_path = argv[++i]; }
         else if (strcmp(argv[i], "--engine-pid") == 0 && i + 1 < argc) { engine_pid_path = argv[++i]; }
         else if (strcmp(argv[i], "--controller-pid") == 0 && i + 1 < argc) { controller_pid_path = argv[++i]; }
+        else if (strcmp(argv[i], "--telegram-pid") == 0 && i + 1 < argc) { telegram_pid_path = argv[++i]; }
+        else if (strcmp(argv[i], "--telegram-status") == 0 && i + 1 < argc) { telegram_status_path = argv[++i]; }
         else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) { log_path = argv[++i]; }
         else { usage(stderr); return 2; }
     }
@@ -388,5 +399,5 @@ int main(int argc, char **argv) {
     }
     return serve(listen_addr, live_path, asset_dir, config_path, mode,
                  state_dir, queue, service_path, engine_pid_path,
-                 controller_pid_path, log_path);
+                 controller_pid_path, telegram_pid_path, telegram_status_path, log_path);
 }

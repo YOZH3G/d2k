@@ -319,6 +319,40 @@ static int run_service_action(const d2k_panel_config *cfg, const char *action) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
 }
 
+static void telegram_config_flags(const d2k_panel_config *cfg,int *enabled,int *configured) {
+    *enabled=0;*configured=0;
+    if(!cfg||!cfg->config_path)return;
+    FILE *f=fopen(cfg->config_path,"r");if(!f)return;
+    char line[2048];int have_url=0,have_secret=0;
+    while(fgets(line,sizeof(line),f)) {
+        char *p=line;while(*p==' '||*p=='\t')p++;
+        if(*p=='#'||!*p)continue;
+        char *eq=strchr(p,'=');if(!eq)continue;*eq++='\0';
+        char *end=p+strlen(p);while(end>p&&(end[-1]==' '||end[-1]=='\t'||end[-1]=='\r'||end[-1]=='\n'))*--end='\0';
+        while(*eq==' '||*eq=='\t')eq++;
+        end=eq+strlen(eq);while(end>eq&&(end[-1]==' '||end[-1]=='\t'||end[-1]=='\r'||end[-1]=='\n'))*--end='\0';
+        if(strcmp(p,"TG_ENABLED")==0)*enabled=strcmp(eq,"1")==0||strcmp(eq,"yes")==0;
+        else if(strcmp(p,"TG_RELAY_URL")==0)have_url=*eq!='\0';
+        else if(strcmp(p,"TG_RELAY_SECRET")==0)have_secret=*eq!='\0';
+    }
+    fclose(f);*configured=have_url&&have_secret;
+}
+
+static void telegram_status_value(const d2k_panel_config *cfg,int enabled,int configured,int *running,char out[24]) {
+    *running=cfg&&cfg->telegram_pid_path?pid_path_running(cfg->telegram_pid_path,NULL):0;
+    const char *fallback=!configured?"not_configured":(!enabled||!*running?"stopped":"connecting");
+    if(!configured||!enabled||!*running){snprintf(out,24,"%s",fallback);return;}
+    int fd=cfg&&cfg->telegram_status_path?
+        open(cfg->telegram_status_path,O_RDONLY|O_CLOEXEC|O_NOFOLLOW):-1;
+    if(fd<0){snprintf(out,24,"%s",fallback);return;}
+    char buf[64];ssize_t n=read(fd,buf,sizeof(buf)-1);close(fd);
+    if(n<=0){snprintf(out,24,"%s",fallback);return;}buf[n]='\0';
+    char *end=buf+strlen(buf);while(end>buf&&(end[-1]=='\r'||end[-1]=='\n'||end[-1]==' '||end[-1]=='\t'))*--end='\0';
+    if(strcmp(buf,"connected")==0||strcmp(buf,"connecting")==0||strcmp(buf,"stopped")==0||strcmp(buf,"not_configured")==0)
+        snprintf(out,24,"%.23s",buf);
+    else snprintf(out,24,"%s",fallback);
+}
+
 static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
                        const char *path) {
     static const struct { const char *path; const char *command; const char *label; } actions[] = {
@@ -326,6 +360,8 @@ static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
         { "/api/control/stop", "engine-stop", "Остановка движка" },
         { "/api/control/restart", "engine-restart", "Перезапуск движка" },
         { "/api/control/reapply", "reapply", "Восстановление правил" },
+        { "/api/control/telegram-enable", "telegram-enable", "Включение Telegram-туннеля" },
+        { "/api/control/telegram-disable", "telegram-disable", "Отключение Telegram-туннеля" },
     };
     const char *command = NULL, *label = NULL;
     for (size_t i = 0; i < sizeof actions / sizeof actions[0]; i++) {
@@ -351,6 +387,13 @@ static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
         static const char body[] = "{\"ok\":false,\"message\":\"В config задан MODE=off; сначала измените режим движка\"}";
         return response(fd, 409, "Conflict", "application/json; charset=utf-8",
                         body, sizeof body - 1);
+    }
+    if(strcmp(command,"telegram-enable")==0) {
+        int enabled=0,configured=0;telegram_config_flags(cfg,&enabled,&configured);(void)enabled;
+        if(!configured) {
+            static const char body[]="{\"ok\":false,\"message\":\"Сначала задайте TG_RELAY_URL и TG_RELAY_SECRET в конфигурации\"}";
+            return response(fd,409,"Conflict","application/json; charset=utf-8",body,sizeof body-1);
+        }
     }
     const char *transfer = NULL;
     size_t transfer_len = 0;
@@ -518,6 +561,9 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     const char *mode = cfg && cfg->mode ? cfg->mode : "observe";
     const char *panel_listen = cfg && cfg->panel_listen ? cfg->panel_listen : "127.0.0.1:8090";
     int queue = cfg ? cfg->queue_num : 2000;
+    int telegram_enabled=0,telegram_configured=0,telegram_running=0;char telegram_status[24];
+    telegram_config_flags(cfg,&telegram_enabled,&telegram_configured);
+    telegram_status_value(cfg,telegram_enabled,telegram_configured,&telegram_running,telegram_status);
     buf_puts(b, "{\"taken\":"); buf_json_string(b, now_iso);
     buf_puts(b, ",\"version\":"); buf_json_string(b, cfg ? cfg->version : "dev");
     buf_puts(b, ",\"commit\":"); buf_json_string(b, cfg ? cfg->commit : "");
@@ -532,6 +578,9 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     buf_printf(b, ",\"live_fresh\":%s", live_fresh ? "true" : "false");
     buf_printf(b, ",\"engine_running\":%s", engine_running ? "true" : "false");
     buf_printf(b, ",\"controller_running\":%s", controller_running ? "true" : "false");
+    buf_printf(b, ",\"telegram_enabled\":%s,\"telegram_configured\":%s,\"telegram_running\":%s,\"telegram_status\":",
+               telegram_enabled?"true":"false",telegram_configured?"true":"false",telegram_running?"true":"false");
+    buf_json_string(b,telegram_status);
     buf_puts(b, ",\"state_dir\":"); buf_json_string(b, state_dir);
     buf_puts(b, ",\"state_dir_note\":"); buf_json_string(b, state_note);
     buf_printf(b, ",\"queue_num\":%d,\"unknown_keys\":[", queue);

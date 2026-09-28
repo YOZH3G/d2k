@@ -73,6 +73,8 @@ CHAIN_IN=D2K_IN
 QUEUE_NUM=2000
 PANEL_LISTEN=127.0.0.1:8090
 STATE_DIR=$DIR/state
+TG_ENABLED=0
+TG_PORT=1443
 MARK=0x2d
 # Controller probes must traverse NFQUEUE for exact trial Plans, while raw
 # packets emitted by d2kd bypass it using MARK. Keep a distinct observable
@@ -95,7 +97,7 @@ CONNBYTES=0:8
 # очередь гнать нельзя вовсе — на MIPS он её захлёбывает.
 VOICE_PORTS=50000:50099,1400,3478:3481,5349,19294:19344
 VOICE_CONNBYTES=0:4
-MODE=observe
+MODE=apply
 FLOWS=2048
 # Период сводки датапата в журнал. Ноль выключает; без сводки нечем понять,
 # видит ли служба трафик вообще.
@@ -103,6 +105,16 @@ STATS_SEC=60
 
 # shellcheck disable=SC1090  # путь к конфигурации задан выше и постоянен
 [ -r "$CONF" ] && . "$CONF"
+
+TGBIN=/opt/sbin/d2ktg
+TG_PID=$RUN/d2ktg.pid
+TG_STATUS=$STATE_DIR/telegram.status
+TG_FIREWALL=$DIR/d2k-tg-firewall.sh
+TG_WATCHDOG=$DIR/d2k-tg-watchdog.sh
+TG_WD_PID=$RUN/d2k-tg-watchdog.pid
+TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
+unset TG_RELAY_SECRET TG_RELAY_URL TG_IDENTITY TG_CA_BUNDLE
+FW_LOCK=${FW_LOCK:-/tmp/d2k-fw-operation.lock}
 
 say() { echo "$NAME: $*"; }
 die() { echo "$NAME: $*" >&2; exit 1; }
@@ -123,9 +135,7 @@ running() {
 # идёт через POSTROUTING и FORWARD, собственные зонды — через OUTPUT и INPUT:
 # зонд идёт С САМОГО роутера, и транзитные цепочки его не видят.
 
-fw_up() {
-    fw_down   # идемпотентность: повторный запуск не должен плодить правила
-
+fw_up_unlocked() {
     iptables -t mangle -N "$CHAIN_OUT" 2>/dev/null || return 1
     iptables -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
 
@@ -141,11 +151,16 @@ fw_up() {
     # останавливать его (§10). Это касается и UDP-правил ниже в той же мере,
     # что и TCP: без --queue-bypass там остановка датапата обрывает весь QUIC
     # в сети, а не просто перестаёт его обрабатывать.
-    iptables -t mangle -A "$CHAIN_OUT" -p tcp -m multiport --dports "$PORTS" \
+    # connbytes-dir выбирает счётчик ORIGINAL, но не проверяет направление
+    # текущего пакета. При диапазоне 0:8 встречный счётчик равен нулю и тоже
+    # совпадает. Явный ctdir не даёт широким PORTS захватить чужую сторону.
+    iptables -t mangle -A "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL \
+        -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
-    iptables -t mangle -A "$CHAIN_IN" -p tcp -m multiport --sports "$PORTS" \
+    iptables -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY \
+        -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
@@ -155,11 +170,13 @@ fw_up() {
     # симметрии: D2K_HELLO_WINDOW в session.c ограничивает разбор QUIC
     # ровно тем же числом первых датаграмм потока, так что очередь ничего не
     # выигрывает, продолжая получать пакеты сверх этого окна.
-    iptables -t mangle -A "$CHAIN_OUT" -p udp -m multiport --dports "$PORTS" \
+    iptables -t mangle -A "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL \
+        -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
-    iptables -t mangle -A "$CHAIN_IN" -p udp -m multiport --sports "$PORTS" \
+    iptables -t mangle -A "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY \
+        -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
@@ -167,11 +184,13 @@ fw_up() {
     # Голос: первые пакеты туда (IP Discovery и повторы — по ним датапат
     # узнаёт голос и приговаривает «молчат») и первые оттуда (ответ сервера —
     # единственное подтверждение приёма голоса: зонда у голоса нет).
-    iptables -t mangle -A "$CHAIN_OUT" -p udp -m multiport --dports "$VOICE_PORTS" \
+    iptables -t mangle -A "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL \
+        -m multiport --dports "$VOICE_PORTS" \
         -m connbytes --connbytes "$VOICE_CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
-    iptables -t mangle -A "$CHAIN_IN" -p udp -m multiport --sports "$VOICE_PORTS" \
+    iptables -t mangle -A "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY \
+        -m multiport --sports "$VOICE_PORTS" \
         -m connbytes --connbytes "$VOICE_CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
@@ -206,7 +225,7 @@ fw_up() {
     return 0
 }
 
-fw_down() {
+fw_down_unlocked() {
     # Своё правило в nat снимается по тем же признакам, по которым ставилось.
     while iptables -t nat -D POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE 2>/dev/null; do :; done
@@ -221,6 +240,55 @@ fw_down() {
             iptables -t mangle -X "$ch" 2>/dev/null
         fi
     done
+    return 0
+}
+
+# Все изменения собственных цепочек сериализуются: периодический сторож,
+# NDM-хук, UI и ручная команда могут заметить сброс почти одновременно.
+# Без общей блокировки два `fw_up` удаляют/создают одни и те же цепочки
+# параллельно, и один из них оставляет пустой набор правил.
+fw_lock_acquire() {
+    attempt=0
+    while ! mkdir "$FW_LOCK" 2>/dev/null; do
+        owner=$(cat "$FW_LOCK/pid" 2>/dev/null)
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -f "$FW_LOCK/pid" 2>/dev/null
+            rmdir "$FW_LOCK" 2>/dev/null
+            continue
+        fi
+        [ "$attempt" -lt 300 ] || return 1
+        attempt=$((attempt + 1))
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    printf '%s\n' "$$" > "$FW_LOCK/pid" || { rmdir "$FW_LOCK" 2>/dev/null; return 1; }
+}
+
+fw_lock_release() {
+    owner=$(cat "$FW_LOCK/pid" 2>/dev/null)
+    [ "$owner" = "$$" ] || return 1
+    rm -f "$FW_LOCK/pid" 2>/dev/null
+    rmdir "$FW_LOCK" 2>/dev/null
+}
+
+fw_up() {
+    fw_lock_acquire || return 1
+    fw_down_unlocked
+    if fw_up_unlocked; then
+        rc=0
+    else
+        fw_down_unlocked
+        rc=1
+    fi
+    fw_lock_release || return 1
+    return "$rc"
+}
+
+fw_down() {
+    fw_lock_acquire || return 1
+    fw_down_unlocked
+    rc=$?
+    fw_lock_release || return 1
+    return "$rc"
 }
 
 fw_installed() {
@@ -233,11 +301,13 @@ fw_installed() {
     iptables -t mangle -C "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN 2>/dev/null || return 1
     iptables -t mangle -C "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN 2>/dev/null || return 1
     for proto in tcp udp; do
-        iptables -t mangle -C "$CHAIN_OUT" -p "$proto" -m multiport --dports "$PORTS" \
+        iptables -t mangle -C "$CHAIN_OUT" -p "$proto" -m conntrack --ctdir ORIGINAL \
+            -m multiport --dports "$PORTS" \
             -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
             --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
             --queue-bypass 2>/dev/null || return 1
-    iptables -t mangle -C "$CHAIN_IN" -p "$proto" -m multiport --sports "$PORTS" \
+        iptables -t mangle -C "$CHAIN_IN" -p "$proto" -m conntrack --ctdir REPLY \
+            -m multiport --sports "$PORTS" \
             -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
             --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
             --queue-bypass 2>/dev/null || return 1
@@ -398,6 +468,7 @@ start_panel() {
             --listen "$PANEL_LISTEN" --state-dir "$STATE_DIR" --mode "$MODE" \
             --queue "$QUEUE_NUM" --service /opt/etc/init.d/S99d2k \
             --engine-pid "$DP_PID" --controller-pid "$CT_PID" \
+            --telegram-pid "$TG_PID" --telegram-status "$TG_STATUS" \
             --log "$LOG/panel.log" \
             || say "панель не запустилась — обход это не затрагивает"
     fi
@@ -405,6 +476,7 @@ start_panel() {
 
 start() {
     start_engine || return $?
+    telegram_start || say "Telegram tunnel не поднят; D2K продолжает работу независимо"
     start_panel
 }
 
@@ -422,6 +494,98 @@ stop_pidfile() {
     rm -f "$p"
 }
 
+write_telegram_status() {
+    mkdir -p "$(dirname "$TG_STATUS")" || return 1
+    tmp=$TG_STATUS.new.$$
+    printf '%s\n' "$1" > "$tmp" || return 1
+    chmod 0644 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$TG_STATUS"
+}
+
+telegram_start() {
+    [ "${TG_ENABLED:-0}" = 1 ] || { write_telegram_status stopped; return 0; }
+    [ -x "$TGBIN" ] || { say "Telegram включён, но нет $TGBIN"; write_telegram_status error; return 1; }
+    "$TGBIN" --check-config "$CONF" >/dev/null 2>&1 || {
+        say "Telegram включён, но TG_RELAY_URL/TG_RELAY_SECRET не настроены корректно"
+        write_telegram_status not_configured
+        return 1
+    }
+    mkdir -p "$RUN" "$LOG" "$(dirname "$TG_STATUS")" || return 1
+    if running "$TG_PID"; then
+        [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" heal || true
+        return 0
+    fi
+    stop_pidfile "$TG_PID"
+    start-stop-daemon -S -b -m -p "$TG_PID" -x "$TGBIN" -- \
+        --config "$CONF" --log "$LOG/telegram.log" || { write_telegram_status error; return 1; }
+    i=0
+    while [ $i -lt 20 ]; do
+        running "$TG_PID" && break
+        i=$((i + 1)); sleep 0.1 2>/dev/null || sleep 1
+    done
+    if ! running "$TG_PID"; then
+        say "d2ktg завершился при запуске — см. $LOG/telegram.log"
+        write_telegram_status error
+        return 1
+    fi
+    if [ -x "$TG_FIREWALL" ]; then
+        "$TG_FIREWALL" start || { stop_pidfile "$TG_PID"; write_telegram_status error; return 1; }
+    else
+        stop_pidfile "$TG_PID"; write_telegram_status error; say "нет правил Telegram firewall $TG_FIREWALL"; return 1
+    fi
+    if [ -x "$TG_WATCHDOG" ] && ! running "$TG_WD_PID"; then
+        start-stop-daemon -S -b -m -p "$TG_WD_PID" -x "$TG_WATCHDOG" \
+            || say "Telegram health watchdog не запустился"
+    fi
+    say "Telegram TCP tunnel запущен на :$TG_PORT"
+}
+
+telegram_stop() {
+    stop_pidfile "$TG_WD_PID"
+    stop_pidfile "$TG_PID"
+    [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" stop || true
+    write_telegram_status stopped
+    say "Telegram tunnel остановлен"
+}
+
+telegram_restart() {
+    stop_pidfile "$TG_PID"
+    [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" stop || true
+    [ "${TG_ENABLED:-0}" = 1 ] || { write_telegram_status stopped; return 0; }
+    telegram_start
+}
+
+telegram_reapply() {
+    [ "${TG_ENABLED:-0}" = 1 ] || return 0
+    running "$TG_PID" || return 0
+    [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" heal
+}
+
+set_telegram_enabled() {
+    value=$1
+    [ -f "$CONF" ] || return 1
+    tmp=$CONF.new.$$
+    (umask 077; awk -v value="$value" '
+        /^[[:space:]]*TG_ENABLED=/ { if (!done) print "TG_ENABLED=" value; done=1; next }
+        { print }
+        END { if (!done) print "TG_ENABLED=" value }
+    ' "$CONF" > "$tmp") || { rm -f "$tmp"; return 1; }
+    chmod 0600 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$CONF" || { rm -f "$tmp"; return 1; }
+}
+
+telegram_enable() {
+    set_telegram_enabled 1 || die "не изменить TG_ENABLED"
+    TG_ENABLED=1
+    telegram_start
+}
+
+telegram_disable() {
+    set_telegram_enabled 0 || die "не изменить TG_ENABLED"
+    TG_ENABLED=0
+    telegram_stop
+}
+
 engine_stop() {
     # Сторож гасится ДО снятия правил: иначе он может заметить снятые правила
     # и успеть восстановить их, пока служба останавливается.
@@ -435,6 +599,7 @@ engine_stop() {
 }
 
 stop() {
+    telegram_stop
     engine_stop
     stop_pidfile "$PN_PID"
     say "служба остановлена"
@@ -450,6 +615,8 @@ status() {
                       || echo "  панель: не работает"
     running "$HL_PID" && echo "  сторож правил: работает (pid $(cat $HL_PID))" \
                       || echo "  сторож правил: не работает"
+    running "$TG_PID" && echo "  Telegram tunnel: работает (pid $(cat $TG_PID))" \
+                       || echo "  Telegram tunnel: не работает (enabled=${TG_ENABLED:-0})"
     fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
     bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
         /proc/net/netfilter/nfnetlink_queue 2>/dev/null)
@@ -482,7 +649,11 @@ case "$1" in
         engine_stop
         start_engine
         ;;
+    telegram-enable) telegram_enable ;;
+    telegram-disable) telegram_disable ;;
+    telegram-restart) telegram_restart ;;
+    telegram-reapply) telegram_reapply ;;
     status)  status ;;
     reapply) reapply ;;
-    *) echo "использование: $0 {start|stop|restart|engine-start|engine-stop|engine-restart|status|reapply}" >&2; exit 2 ;;
+    *) echo "использование: $0 {start|stop|restart|engine-start|engine-stop|engine-restart|telegram-enable|telegram-disable|telegram-restart|telegram-reapply|status|reapply}" >&2; exit 2 ;;
 esac

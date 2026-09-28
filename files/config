@@ -1,10 +1,16 @@
 # Конфигурация d2k. Файл принадлежит владельцу: установщик его не
 # перезаписывает при обновлении.
 SCHEMA=1
-MODE=observe
+MODE=apply
 PANEL_LISTEN=127.0.0.1:8090
 STATE_DIR=/opt/d2k/state
 QUEUE_NUM=2000
 CONTROL_SOCKET=/opt/d2k/run/d2kd.sock
 DECOY_SNI=disk.rzd.ru
 MARK=0x2d
+# Telegram TCP tunnel is opt-in until a private relay credential is configured.
+TG_ENABLED=0
+# Set these two values only after receiving relay access details; never commit a secret.
+# TG_RELAY_URL=wss://relay.example/ws
+# TG_RELAY_SECRET=put-private-relay-secret-here
+# TG_PORT=1443

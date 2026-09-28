@@ -76,6 +76,10 @@ static void write_temp_file(char path[], const char *contents) {
     close(fd);
 }
 
+static void rewrite_file(const char *path,const char *contents) {
+    FILE *f=fopen(path,"w");assert(f);assert(fwrite(contents,1,strlen(contents),f)==strlen(contents));assert(fclose(f)==0);
+}
+
 static void test_api_exposes_live_knowledge(void) {
     char live[] = "/tmp/d2k-panel-live.XXXXXX";
     write_temp_file(live, "{\"linked\":true,\"link_note\":\"\",\"boxes\":[],\"searches\":[],\"targets\":0,\"confirms\":0,\"probes_used\":0,\"client_unfit\":0}");
@@ -156,6 +160,37 @@ static void test_invalid_live_json_is_not_reported_as_empty_knowledge(void) {
     unlink(live);
 }
 
+static void test_telegram_status_is_dynamic_and_never_exposes_secret(void) {
+    char live[]="/tmp/d2k-panel-tg-live.XXXXXX",config[]="/tmp/d2k-panel-tg-config.XXXXXX";
+    char status[]="/tmp/d2k-panel-tg-status.XXXXXX",pid[]="/tmp/d2k-panel-tg-pid.XXXXXX";
+    write_temp_file(live,"{\"linked\":false,\"boxes\":[],\"searches\":[],\"targets\":0,\"confirms\":0,\"probes_used\":0,\"client_unfit\":0}");
+    write_temp_file(config,"TG_ENABLED=0\nTG_RELAY_URL=wss://relay.example/ws\nTG_RELAY_SECRET=secret-must-not-leak\n");
+    write_temp_file(status,"connected\n");write_temp_file(pid,"1\n");
+    d2k_panel_config cfg={.live_path=live,.asset_dir="panel/assets",.config_path=config,
+        .telegram_status_path=status,.telegram_pid_path=pid,.mode="observe",.state_dir="/tmp/state",.started_epoch=1};
+    char response[32768];
+    (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
+    assert(strstr(response,"\"telegram_configured\":true")!=NULL);
+    assert(strstr(response,"\"telegram_enabled\":false")!=NULL);
+    assert(strstr(response,"\"telegram_running\":false")!=NULL);
+    assert(strstr(response,"\"telegram_status\":\"stopped\"")!=NULL);
+    assert(strstr(response,"secret-must-not-leak")==NULL);
+
+    rewrite_file(config,"TG_ENABLED=1\nTG_RELAY_URL=wss://relay.example/ws\nTG_RELAY_SECRET=secret-must-not-leak\n");
+    FILE *f=fopen(pid,"w");assert(f);assert(fprintf(f,"%ld\n",(long)getpid())>0);fclose(f);
+    (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
+    assert(strstr(response,"\"telegram_enabled\":true")!=NULL);
+    assert(strstr(response,"\"telegram_running\":true")!=NULL);
+    assert(strstr(response,"\"telegram_status\":\"connected\"")!=NULL);
+    assert(strstr(response,"secret-must-not-leak")==NULL);
+
+    rewrite_file(config,"TG_ENABLED=1\nTG_RELAY_URL=wss://relay.example/ws\n");
+    (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
+    assert(strstr(response,"\"telegram_configured\":false")!=NULL);
+    assert(strstr(response,"\"telegram_status\":\"not_configured\"")!=NULL);
+    unlink(live);unlink(config);unlink(status);unlink(pid);
+}
+
 static void test_unsupported_method_is_rejected(void) {
     d2k_panel_config cfg = { .live_path = "/absent", .asset_dir = "panel/assets" };
     char response[4096];
@@ -199,7 +234,7 @@ static void test_panel_accepts_a_control_action_request(void) {
     assert(strcmp(action, "engine-stop") == 0);
     static const struct { const char *path; const char *command; } routes[] = {
         { "start", "engine-start" }, { "restart", "engine-restart" },
-        { "reapply", "reapply" },
+        { "reapply", "reapply" }, { "telegram-disable", "telegram-disable" },
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) {
         char req[512];
@@ -218,6 +253,22 @@ static void test_panel_accepts_a_control_action_request(void) {
         assert(strcmp(action, routes[i].command) == 0);
     }
     (void)request(&cfg,
+        "POST /api/control/telegram-enable HTTP/1.1\r\nHost: localhost:8090\r\n"
+        "Origin: http://localhost:8090\r\nContent-Length: 0\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response,"HTTP/1.1 409 Conflict")!=NULL);
+    char tg_config[]="/tmp/d2k-panel-tg-control-config.XXXXXX";
+    write_temp_file(tg_config,"TG_ENABLED=0\nTG_RELAY_URL=wss://relay.example/ws\nTG_RELAY_SECRET=private\n");
+    cfg.config_path=tg_config;
+    (void)request(&cfg,
+        "POST /api/control/telegram-enable HTTP/1.1\r\nHost: localhost:8090\r\n"
+        "Origin: http://localhost:8090\r\nContent-Length: 0\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response,"HTTP/1.1 200 OK")!=NULL);
+    f=fopen(marker,"r");assert(f);strcpy(action,"");assert(fgets(action,sizeof action,f));fclose(f);
+    assert(strcmp(action,"telegram-enable")==0);
+    assert(strstr(response,"private")==NULL);unlink(tg_config);
+    (void)request(&cfg,
         "POST /api/control/start HTTP/1.1\r\n"
         "Host: localhost:8090\r\n"
         "Origin: http://attacker.example\r\n"
@@ -229,7 +280,7 @@ static void test_panel_accepts_a_control_action_request(void) {
     strcpy(action, "");
     assert(fgets(action, sizeof action, f) != NULL);
     fclose(f);
-    assert(strcmp(action, "reapply") == 0);
+    assert(strcmp(action, "telegram-enable") == 0);
     cfg.mode = "off";
     (void)request(&cfg,
         "POST /api/control/start HTTP/1.1\r\nHost: localhost:8090\r\n"
@@ -246,7 +297,7 @@ static void test_panel_accepts_a_control_action_request(void) {
     strcpy(action, "");
     assert(fgets(action, sizeof action, f) != NULL);
     fclose(f);
-    assert(strcmp(action, "reapply") == 0);
+    assert(strcmp(action, "telegram-enable") == 0);
     cfg.mode = NULL;
     cfg.control_enabled = 0;
     (void)request(&cfg,
@@ -377,6 +428,7 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
     test_api_exposes_live_knowledge();
     test_invalid_live_json_is_not_reported_as_empty_knowledge();
+    test_telegram_status_is_dynamic_and_never_exposes_secret();
     test_unsupported_method_is_rejected();
     test_panel_accepts_a_control_action_request();
     test_unknown_and_traversal_paths_are_not_served();
