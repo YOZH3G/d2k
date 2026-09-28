@@ -306,6 +306,9 @@ echo "== 5. возврат в прежний режим =="
 echo "остановка и повторный запуск возвращают систему в оба состояния"
 
 echo "== 6. удаление =="
+# Simulate the explicitly D2K-owned rollback snapshots left by earlier router
+# development installs. A full uninstall must remove these, not only runtime.
+touch /opt/sbin/d2kc.before-d2k-lab /opt/sbin/d2kc.pre-goal-lab /opt/sbin/d2kc.pre-sched-lab
 sh scripts/uninstall.sh >/dev/null
 [ -e /opt/sbin/d2kd ] && fail "после удаления остался d2kd"
 [ -e /opt/sbin/d2ktg ] && fail "после удаления остался C-туннель Telegram"
@@ -323,6 +326,9 @@ sh scripts/uninstall.sh >/dev/null
 ipset list d2k_tg_dc >/dev/null 2>&1 && fail "после удаления остался IPv4 Telegram ipset"
 ipset list d2k_tg_dc6 >/dev/null 2>&1 && fail "после удаления остался IPv6 Telegram ipset"
 [ -e "$INIT" ]        && fail "после удаления остался init-скрипт"
+[ -e /opt/sbin/d2kc.before-d2k-lab ] && fail "после удаления остался before-d2k backup"
+[ -e /opt/sbin/d2kc.pre-goal-lab ] && fail "после удаления остался pre-goal backup"
+[ -e /opt/sbin/d2kc.pre-sched-lab ] && fail "после удаления остался pre-sched backup"
 [ "$(rules)" = "$CLEAN_RULES" ] || fail "после удаления список правил не совпал с исходным"
 [ ! -e "$DIR" ] && fail "обычное удаление оставило каталог D2K"
 echo "удалено без следов, включая каталог коробок"

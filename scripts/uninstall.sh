@@ -63,6 +63,9 @@ say "правила сняты"
 # нет, на каждое изменение netfilter — мусор в журнале на ровном месте.
 rm -f /opt/etc/ndm/netfilter.d/001-d2k.sh
 rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2ktg"
+# Remove only d2kc snapshots explicitly named as D2K pre-install/work backups.
+# These were created during router development and are not user configuration.
+rm -f "$SBIN"/d2kc.before-d2k-* "$SBIN"/d2kc.pre-goal-* "$SBIN"/d2kc.pre-sched-*
 rm -f "$DIR/d2k-tg-firewall.sh" "$DIR/d2k-tg-watchdog.sh" "$DIR/d2k-instagram-dns.sh" \
     "$DIR/d2k-instagram-dns-scheduler.sh" \
     "$DIR/files/meta-ranges.txt" "$DIR/files/tg-roots.pem"
