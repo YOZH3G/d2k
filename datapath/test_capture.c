@@ -28,6 +28,21 @@ static void frame(uint8_t *b, size_t n) {
 }
 
 int main(void) {
+    {
+        uint8_t b[32]; frame(b, sizeof b);
+        d2k_key a = {.family=6, .proto=6, .low_port=1, .high_port=2};
+        a.low_ip6[0] = a.high_ip6[0] = 0x20;
+        a.low_ip6[15] = 1; a.high_ip6[15] = 2;
+        d2k_key other = a; other.low_ip6[4] = 1;
+        memset(&c, 0, sizeof c);
+        CHECK(d2k_capture_feed(&c, &a, 1, 1, 100, 100, 1, b, 16,
+                               &result, &result_len, &result_seq) == 0);
+        CHECK(d2k_capture_feed(&c, &other, 1, 2, 116, 100, 1, b + 16, 16,
+                               &result, &result_len, &result_seq) == 0);
+        CHECK(d2k_capture_feed(&c, &a, 1, 3, 116, 100, 1, b + 16, 16,
+                               &result, &result_len, &result_seq) == 1);
+        memset(&c, 0, sizeof c);
+    }
     uint8_t b[D2K_CAPTURE_BYTES + 1], bad[D2K_CAPTURE_BYTES + 1];
     size_t n = 1544;
     frame(b, n);

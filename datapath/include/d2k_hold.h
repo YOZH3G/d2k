@@ -16,6 +16,7 @@ typedef struct {
     int src_low;
     size_t ihl, header, total, payload;
     uint32_t seq, ack, dst_be;
+    d2k_addr dst;
     uint16_t sport_be;
     uint8_t flags;
 } d2k_hold_info;

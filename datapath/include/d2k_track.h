@@ -16,6 +16,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "d2k_plan.h"
 #include "d2k_quic.h"
@@ -69,6 +70,15 @@ typedef struct {
     uint8_t family;
     uint8_t low_ip6[16], high_ip6[16];
 } d2k_key;
+
+static inline int d2k_key_equal(const d2k_key *a, const d2k_key *b) {
+    if (a->proto != b->proto || a->low_port != b->low_port || a->high_port != b->high_port ||
+        (a->family == 6) != (b->family == 6)) { return 0; }
+    if (a->family == 6) {
+        return !memcmp(a->low_ip6, b->low_ip6, 16) && !memcmp(a->high_ip6, b->high_ip6, 16);
+    }
+    return a->low_ip == b->low_ip && a->high_ip == b->high_ip;
+}
 
 int d2k_key_make_addr(d2k_key *k, uint8_t proto,
                      const d2k_addr *src, const d2k_addr *dst,

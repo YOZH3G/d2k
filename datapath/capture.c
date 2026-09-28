@@ -2,9 +2,7 @@
 #include "d2k_capture.h"
 
 static int same(const d2k_key *a, const d2k_key *b) {
-    return a->low_ip == b->low_ip && a->high_ip == b->high_ip &&
-           a->low_port == b->low_port && a->high_port == b->high_port &&
-           a->proto == b->proto;
+    return d2k_key_equal(a, b);
 }
 
 void d2k_capture_forget(d2k_capture *c, const d2k_key *key) {

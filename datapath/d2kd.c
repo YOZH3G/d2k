@@ -1001,9 +1001,10 @@ int main(int argc, char **argv) {
                         size_t too_long = 0;
                         for (size_t k = 0; k < res.n_out; k++) {
                             const uint8_t *ip = obuf + res.out[k].off;
-                            size_t here = res.out[k].len >= 20
-                                              ? d2k_raw_route_maxlen(raw, ip + 16)
-                                              : cap;
+                            uint8_t family = ip[0] >> 4;
+                            size_t here = res.out[k].len >= (family == 6 ? 40u : 20u)
+                                ? d2k_raw_route_maxlen_family(raw, ip + (family == 6 ? 24 : 16), family)
+                                : cap;
                             if (res.out[k].len > here) {
                                 too_long = res.out[k].len;
                                 cap = here;

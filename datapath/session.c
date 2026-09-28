@@ -1924,11 +1924,11 @@ void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed) {
 
 int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
                                uint64_t now_ns, d2k_key *key_out) {
-    if (!s || !p || n < 28 || (p[0] >> 4) != 4 || p[9] != 17) { return 0; }
-    size_t ihl = (size_t)(p[0] & 15) * 4;
-    if (ihl < 20 || ihl + 8 > n || (rd16(p + 6) & 0x1fff) != 0) { return 0; }
+    d2k_packet_view ip;
+    if (!s || !d2k_packet_parse(p, n, &ip) || ip.protocol != 17 || (ip.fragment & 0x3fff)) { return 0; }
+    size_t ihl = ip.l4;
     const uint8_t *u = p + ihl;
-    size_t total = rd16(p + 2);
+    size_t total = ip.total;
     if (total < ihl + 8 || total > n) {
         return 0;
     }
@@ -1949,7 +1949,7 @@ int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
         return 0;
     }
     d2k_key key;
-    (void)d2k_key_make(&key, 17, p + 12, p + 16, u, u + 2);
+    (void)d2k_key_make_addr(&key, 17, &ip.src, &ip.dst, u, u + 2);
     d2k_flow *fl = d2k_track_get(s->uflows, &key, now_ns);
     if (!fl) { return 0; }
     if (fl->plan_done || fl->damaged || fl->saw_hello) { return 0; }
@@ -2079,9 +2079,9 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
         if (tls.have_sni) { return 0; }
     }
     int candidate = d2k_plan_stream_input(s->plan) ||
-        d2k_plantab_stream_candidate(s->plans,
+        d2k_plantab_stream_candidate_target(s->plans,
             tls.have_sni ? p + v.header + tls.sni_off : NULL,
-            tls.have_sni ? tls.sni_len : 0, v.dst_be, v.sport_be);
+            tls.have_sni ? tls.sni_len : 0, v.dst.bytes, v.sport_be, v.dst.family);
     /* Also mark a failed capacity attempt: its head must not be held later
        after we have already released it unchanged. */
     /* stream_attempted — только у головы: пометка закрывает потоку удержание

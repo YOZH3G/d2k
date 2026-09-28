@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "d2k_hold.h"
+#include "d2k_packet.h"
 
 typedef struct {
     size_t count;
@@ -11,26 +12,28 @@ typedef struct {
     uint8_t packets[D2K_HOLD_IDS][D2K_HOLD_PACKET];
 } held;
 struct d2k_hold { held slots[D2K_HOLD_SLOTS]; d2k_capture capture; d2k_hold_stats stats; };
-static uint16_t r16(const uint8_t *p) { return (uint16_t)((unsigned)p[0] << 8 | p[1]); }
 static uint32_t r32(const uint8_t *p) { return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3]; }
 static int same(const d2k_key *a, const d2k_key *b) {
-    return a->proto == b->proto && a->low_ip == b->low_ip && a->high_ip == b->high_ip &&
-           a->low_port == b->low_port && a->high_port == b->high_port;
+    return d2k_key_equal(a, b);
 }
 int d2k_hold_parse(const uint8_t *p, size_t n, d2k_hold_info *v) {
+    if (!v) { return 0; }
     memset(v, 0, sizeof *v);
-    if (!p || n < 40 || p[0] >> 4 != 4 || p[9] != 6 || (r16(p+6)&0x3fff)) { return 0; }
-    v->ihl = (size_t)(p[0]&15)*4;
+    d2k_packet_view ip;
+    if (!d2k_packet_parse(p, n, &ip) || ip.protocol != 6 || (ip.fragment & 0x3fff)) { return 0; }
+    v->ihl = ip.l4;
     if (v->ihl < 20 || v->ihl + 20 > n) { return 0; }
     const uint8_t *t = p + v->ihl;
     size_t th = (size_t)(t[12]>>4)*4;
     v->header = v->ihl + th;
-    v->total = r16(p+2);
+    v->total = ip.total;
     if (th < 20 || v->total > n || v->total < v->header) { return 0; }
     v->payload = v->total - v->header;
-    v->src_low = d2k_key_make(&v->key, 6, p+12, p+16, t, t+2);
+    v->src_low = d2k_key_make_addr(&v->key, 6, &ip.src, &ip.dst, t, t+2);
     v->seq = r32(t+4); v->ack = r32(t+8); v->flags = t[13];
-    memcpy(&v->dst_be, p+16, 4); memcpy(&v->sport_be, t, 2);
+    v->dst = ip.dst;
+    if (ip.family == 4) { memcpy(&v->dst_be, ip.dst.bytes, 4); }
+    memcpy(&v->sport_be, t, 2);
     return 1;
 }
 d2k_hold *d2k_hold_new(void) { return calloc(1, sizeof(d2k_hold)); }
@@ -178,8 +181,13 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
     batch->len = hv.header + hello_len;
     memcpy(batch->packet, s->packets[head_i], hv.header);
     memcpy(batch->packet + hv.header, hello, hello_len);
-    batch->packet[2] = (uint8_t)(batch->len >> 8);
-    batch->packet[3] = (uint8_t)batch->len;
+    if (hv.key.family == 6) {
+        batch->packet[4] = (uint8_t)((batch->len - 40) >> 8);
+        batch->packet[5] = (uint8_t)(batch->len - 40);
+    } else {
+        batch->packet[2] = (uint8_t)(batch->len >> 8);
+        batch->packet[3] = (uint8_t)batch->len;
+    }
     /* Sequence/ACK/context — головы. Синтетические суммы IPv4/TCP намеренно
        не для отправки. */
     h->stats.pending -= s->count;

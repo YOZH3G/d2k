@@ -117,6 +117,7 @@ uint32_t d2k_raw_limits(const d2k_raw *r);
  * датапат резал бы формы, которые проходят, из-за интерфейса, к делу не
  * относящегося. */
 size_t   d2k_raw_route_maxlen(d2k_raw *r, const uint8_t dst[4]);
+size_t d2k_raw_route_maxlen_family(d2k_raw *r, const uint8_t *dst, uint8_t family);
 
 /* Сколько байт унесёт ОДНА посылка этим способом отправки — весь пакет
  * целиком, вместе с заголовком IP. Объявляется рядом с D2K_RAW_CANT_* не

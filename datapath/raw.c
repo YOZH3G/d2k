@@ -31,12 +31,14 @@
 #define ROUTE_CACHE 16
 
 typedef struct {
-    uint8_t ip[4];
+    uint8_t ip[16];
+    uint8_t family;
     size_t  mtu;    /* 0 — ячейка пуста */
 } route_entry;
 
 struct d2k_raw {
     int      fd;
+    int      fd6;
     int      fragment_fd;
     uint32_t limits;
     size_t   maxlen;
@@ -130,32 +132,40 @@ static size_t pick_maxlen(const char *ifname) {
  * Порт 443 не значит ничего: у UDP connect не спрашивает согласия адресата, а
  * маршрут от порта не зависит. Ноль там был бы отвергнут ядром как
  * недопустимый адресат. */
-static size_t route_mtu(uint32_t mark, const uint8_t dst[4]) {
+static size_t route_mtu(uint32_t mark, const uint8_t *dst, uint8_t family) {
 #ifdef IP_MTU
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int s = socket(family == 6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
     if (s < 0) { return 0; }
 #ifdef SO_MARK
     if (mark) { (void)setsockopt(s, SOL_SOCKET, SO_MARK, &mark, sizeof mark); }
 #else
     (void)mark;
 #endif
-    struct sockaddr_in to;
+    struct sockaddr_storage to;
     memset(&to, 0, sizeof to);
-    to.sin_family = AF_INET;
-    to.sin_port = htons(443);
-    memcpy(&to.sin_addr.s_addr, dst, 4);
+    socklen_t to_len;
+    if (family == 6) {
+        struct sockaddr_in6 *a = (struct sockaddr_in6 *)&to;
+        a->sin6_family = AF_INET6; a->sin6_port = htons(443);
+        memcpy(&a->sin6_addr, dst, 16); to_len = sizeof *a;
+    } else {
+        struct sockaddr_in *a = (struct sockaddr_in *)&to;
+        a->sin_family = AF_INET; a->sin_port = htons(443);
+        memcpy(&a->sin_addr, dst, 4); to_len = sizeof *a;
+    }
     size_t got = 0;
-    if (connect(s, (struct sockaddr *)&to, sizeof to) == 0) {
+    if (connect(s, (struct sockaddr *)&to, to_len) == 0) {
         int mtu = 0;
         socklen_t sl = sizeof mtu;
-        if (getsockopt(s, IPPROTO_IP, IP_MTU, &mtu, &sl) == 0 && mtu > 0) {
+        if (getsockopt(s, family == 6 ? IPPROTO_IPV6 : IPPROTO_IP,
+                       family == 6 ? IPV6_MTU : IP_MTU, &mtu, &sl) == 0 && mtu > 0) {
             got = (size_t)mtu;
         }
     }
     close(s);
     return got;
 #else
-    (void)mark; (void)dst;
+    (void)mark; (void)dst; (void)family;
     return 0;   /* нет IP_MTU — нет и ответа; врать нечем */
 #endif
 }
@@ -183,6 +193,7 @@ d2k_raw *d2k_raw_open(uint32_t mark, const char *ifname, char *err, size_t errca
        сам способ отправки, а не наша конфигурация. */
     r->limits = D2K_RAW_CANT_IPID | D2K_RAW_CANT_IPSUM;
     r->fragment_fd = -1;
+    r->fd6 = -1;
     /* Один раз при старте — см. шапку в d2k_raw.h про цену этого выбора. */
     r->maxlen = pick_maxlen(ifname);
     r->mark = mark;
@@ -244,6 +255,7 @@ void d2k_raw_close(d2k_raw *r) {
         close(r->fd);
     }
     if (r->fragment_fd >= 0) close(r->fragment_fd);
+    if (r->fd6 >= 0) close(r->fd6);
     free(r);
 }
 
@@ -264,15 +276,21 @@ static size_t blend(const d2k_raw *r, size_t route, size_t cap_all) {
 }
 
 size_t d2k_raw_route_maxlen(d2k_raw *r, const uint8_t dst[4]) {
+    return d2k_raw_route_maxlen_family(r, dst, 4);
+}
+
+size_t d2k_raw_route_maxlen_family(d2k_raw *r, const uint8_t *dst, uint8_t family) {
     size_t cap_all = d2k_raw_maxlen(r);
-    if (!r || !dst) { return cap_all; }
+    if (!r || !dst || (family != 4 && family != 6)) { return cap_all; }
+    size_t alen = family == 6 ? 16 : 4;
     for (size_t i = 0; i < ROUTE_CACHE; i++) {
-        if (r->route[i].mtu && memcmp(r->route[i].ip, dst, 4) == 0) {
+        if (r->route[i].mtu && r->route[i].family == family &&
+            memcmp(r->route[i].ip, dst, alen) == 0) {
             return blend(r, r->route[i].mtu, cap_all);
         }
     }
-    size_t m = route_mtu(r->mark, dst);
-    if (m < (size_t)D2K_RAW_MTU_FLOOR) {
+    size_t m = route_mtu(r->mark, dst, family);
+    if (m < (family == 6 ? 1280u : (size_t)D2K_RAW_MTU_FLOOR)) {
         /* Ответа нет или он бессмысленно мал. Запоминать такое нельзя: пустая
            ячейка честнее выдуманного числа, а ниже минимума IPv4 маршрутов не
            бывает. Общий предел остаётся в силе. */
@@ -280,7 +298,9 @@ size_t d2k_raw_route_maxlen(d2k_raw *r, const uint8_t dst[4]) {
     }
     route_entry *e = &r->route[r->route_next % ROUTE_CACHE];
     r->route_next++;
-    memcpy(e->ip, dst, 4);
+    memset(e->ip, 0, sizeof e->ip);
+    memcpy(e->ip, dst, alen);
+    e->family = family;
     e->mtu = m;
     return blend(r, m, cap_all);
 }
@@ -288,6 +308,32 @@ size_t d2k_raw_route_maxlen(d2k_raw *r, const uint8_t dst[4]) {
 int d2k_raw_prepare(d2k_raw *r, const uint8_t *pkt, size_t len,
                     char *err, size_t errcap) {
     if (!r || !pkt || len<20) {errno=EINVAL;return -1;}
+    if ((pkt[0] >> 4) == 6) {
+        if (len < 40 || len != 40u + ((size_t)pkt[4] << 8) + pkt[5]) {
+            say(err, errcap, "invalid IPv6 packet length"); errno=EINVAL; return -1;
+        }
+        if (r->fd6 >= 0) { return 0; }
+        int fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW), one = 1;
+        if (fd < 0) { say(err, errcap, "IPv6 raw socket: %s", strerror(errno)); return -1; }
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_HDRINCL, &one, sizeof one) < 0) {
+            int saved=errno; close(fd); errno=saved;
+            say(err, errcap, "IPV6_HDRINCL: %s", strerror(errno)); return -1;
+        }
+        if (r->mark) {
+#ifdef SO_MARK
+            if (setsockopt(fd, SOL_SOCKET, SO_MARK, &r->mark, sizeof r->mark) < 0) {
+                int saved=errno; close(fd); errno=saved;
+                say(err, errcap, "IPv6 SO_MARK: %s", strerror(errno)); return -1;
+            }
+#else
+            close(fd); errno=ENOPROTOOPT;
+            say(err, errcap, "IPv6 SO_MARK unavailable"); return -1;
+#endif
+        }
+        r->fd6 = fd;
+        return 0;
+    }
+    if ((pkt[0] >> 4) != 4) { errno=EAFNOSUPPORT; return -1; }
     if (!((pkt[6]&0x3f) || pkt[7])) return 0;
     if (pkt[0]!=0x45 || pkt[9]!=17 || !(pkt[4] || pkt[5])) {
         say(err,errcap,"неподдержанный контекст IP-фрагмента");errno=EINVAL;return -1;
@@ -326,22 +372,31 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
         errno = EINVAL;
         return -1;
     }
-    if ((pkt[0] >> 4) != 4) {
-        say(err, errcap, "сырой сокет умеет только IPv4");
+    uint8_t family = pkt[0] >> 4;
+    if (family != 4 && family != 6) {
+        say(err, errcap, "unsupported IP version");
         errno = EAFNOSUPPORT;
         return -1;
     }
     if(d2k_raw_prepare(r,pkt,len,err,errcap)<0) {r->errors++;return -1;}
-    int fd=((pkt[6]&0x3f) || pkt[7])?r->fragment_fd:r->fd;
+    int fd = family == 6 ? r->fd6 :
+        ((pkt[6]&0x3f) || pkt[7]) ? r->fragment_fd : r->fd;
 
-    struct sockaddr_in to;
+    struct sockaddr_storage to;
     memset(&to, 0, sizeof to);
-    to.sin_family = AF_INET;
-    to.sin_port = 0;                      /* для сырого сокета не используется */
-    memcpy(&to.sin_addr.s_addr, pkt + 16, 4);
+    socklen_t to_len;
+    const uint8_t *dst = pkt + (family == 6 ? 24 : 16);
+    size_t alen = family == 6 ? 16 : 4;
+    if (family == 6) {
+        struct sockaddr_in6 *a = (struct sockaddr_in6 *)&to;
+        a->sin6_family = AF_INET6; memcpy(&a->sin6_addr, dst, 16); to_len = sizeof *a;
+    } else {
+        struct sockaddr_in *a = (struct sockaddr_in *)&to;
+        a->sin_family = AF_INET; memcpy(&a->sin_addr, dst, 4); to_len = sizeof *a;
+    }
 
     for (;;) {
-        ssize_t n = sendto(fd, pkt, len, 0, (struct sockaddr *)&to, sizeof to);
+        ssize_t n = sendto(fd, pkt, len, 0, (struct sockaddr *)&to, to_len);
         if (n >= 0) {
             if ((size_t)n != len) {
                 r->errors++;
@@ -357,7 +412,7 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
         }
         int failure = errno;
         r->errors++;
-        if (failure == EMSGSIZE && len > D2K_RAW_MTU_FLOOR) {
+        if (failure == EMSGSIZE && len > (family == 6 ? 1280u : D2K_RAW_MTU_FLOOR)) {
             /* ПРЕДЕЛ ПРИШЁЛ ЗАМЕРОМ, А НЕ ИЗ КОНФИГУРАЦИИ.
                Объявленный предел взят с интерфейса при старте, а настоящий
                принадлежит МАРШРУТУ и может быть меньше: туннель, PPPoE,
@@ -374,7 +429,8 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
                ниже: ядро сказало про ЭТО направление, и следующий план к нему
                обязан считаться с ответом, а не с общей оценкой. */
             for (size_t i = 0; i < ROUTE_CACHE; i++) {
-                if (r->route[i].mtu && memcmp(r->route[i].ip, pkt + 16, 4) == 0) {
+                if (r->route[i].mtu && r->route[i].family == family &&
+                    memcmp(r->route[i].ip, dst, alen) == 0) {
                     if (lowered < r->route[i].mtu) { r->route[i].mtu = lowered; }
                     break;
                 }

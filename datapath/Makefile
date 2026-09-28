@@ -59,6 +59,13 @@ test_addr: test_addr.c addr.c include/d2k_addr.h include/d2k_packet.h
 test-addr: test_addr
 	./test_addr
 
+# Real raw IPv6 delivery and failure injection. Linux network namespace only.
+.PHONY: test-raw6-linux
+test-raw6-linux: test_raw6.c raw.c wire_udp.c $(HDR)
+	$(CC) $(CFLAGS) -Dsetsockopt=d2k_test_setsockopt -c raw.c -o raw6_test.o
+	$(CC) $(CFLAGS) -o test_raw6 test_raw6.c raw6_test.o wire_udp.c $(LDFLAGS)
+	./test_raw6
+
 check: test-addr
 
 plan_parse.o: plan_parse.c $(HDR)

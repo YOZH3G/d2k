@@ -26,6 +26,19 @@ static int verdict(void *ctx, uint32_t id, uint32_t v) {
     return id == 2 ? -1 : 0;
 }
 int main(void) {
+    {
+        uint8_t pkt6[64] = {0x60};
+        pkt6[5]=24; pkt6[6]=6; pkt6[7]=64;
+        pkt6[8]=pkt6[24]=0x20; pkt6[23]=1; pkt6[39]=2;
+        w16(pkt6+40, 2000); w16(pkt6+42, 443);
+        w32(pkt6+44, 1000); pkt6[52]=0x50; pkt6[53]=0x18;
+        d2k_hold_info info;
+        CHECK(d2k_hold_parse(pkt6, sizeof pkt6, &info) == 1);
+        CHECK(info.key.family == 6 && info.ihl == 40 && info.header == 60 && info.payload == 4);
+        CHECK(info.dst.family == 6 && info.dst.bytes[15] == 2);
+        pkt6[6]=44;
+        CHECK(d2k_hold_parse(pkt6, sizeof pkt6, &info) == 0);
+    }
     uint8_t hello[1544], p[1600], old[1600];
     memset(hello, 0x42, sizeof hello);
     hello[0]=22; hello[1]=3; hello[2]=1; w16(hello+3, sizeof hello-5);

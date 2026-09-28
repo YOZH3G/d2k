@@ -16,9 +16,7 @@ typedef struct {
 struct d2k_udp_hold { udp_slot slots[D2K_UDP_HOLD_SLOTS]; };
 
 static int same_key(const d2k_key *a, const d2k_key *b) {
-    return a->proto == b->proto && a->low_ip == b->low_ip &&
-           a->high_ip == b->high_ip && a->low_port == b->low_port &&
-           a->high_port == b->high_port;
+    return d2k_key_equal(a, b);
 }
 
 static void clear_slot(udp_slot *s) {
