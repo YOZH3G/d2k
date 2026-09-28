@@ -138,9 +138,9 @@
 #define D2K_CMD_SET_NAME_PROBE 0x0088
 #define D2K_CMD_SET_ADDR_PROBE 0x0089 /* family+src/dst+ports+proto(38), trial-id(16), lease-ms(u32), Plan */
 #define D2K_CMD_DEL_ADDR_PROBE 0x008A /* flow(38), trial-id(16); stale delete is no-op */
-#define D2K_CMD_SET_ADDR 0x0082  /* адрес u32 BE, план TLV */
+#define D2K_CMD_SET_ADDR 0x0082  /* family u8, address(16), план TLV */
 #define D2K_CMD_DEL_NAME 0x0083  /* длина имени u8, имя, family u8 */
-#define D2K_CMD_DEL_ADDR 0x0084  /* адрес u32 BE */
+#define D2K_CMD_DEL_ADDR 0x0084  /* family u8, address(16) */
 #define D2K_CMD_CLEAR    0x0085  /* убрать все планы */
 #define D2K_CMD_STATS    0x0086  /* прислать счётчики */
 /* Поймать форму следующего приветствия: длина имени u8, имя, transport u8, family u8.

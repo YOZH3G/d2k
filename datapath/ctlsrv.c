@@ -131,6 +131,13 @@ void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen) {
     d2k_ctl_event(ctl, D2K_EV_PROTO, body, sizeof body);
 }
 
+static int canonical_address(uint8_t family, const uint8_t *ip) {
+    if (family == 6) { return 1; }
+    if (family != 4) { return 0; }
+    for (size_t i = 4; i < 16; i++) { if (ip[i]) { return 0; } }
+    return 1;
+}
+
 static int read_probe_flow(const uint8_t *b, d2k_addr_probe_flow *flow) {
     if (b[0] != 4 && b[0] != 6) { return -1; }
     memset(flow, 0, sizeof *flow);
@@ -164,13 +171,17 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
            План занимает остаток тела; адресное семейство обязательно. */
         size_t hdr;
         if (type == D2K_CMD_SET_ADDR) {
-            hdr = 4u;
+            hdr = 17u;
         } else if (type == D2K_CMD_SET_NAME_PROBE) {
             hdr = len ? 5u + b[0] : 5u;
         } else {
             hdr = len ? 3u + b[0] : 3u;
         }
         if (len < hdr) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        if (type == D2K_CMD_SET_ADDR && !canonical_address(b[0], b + 1)) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
@@ -199,9 +210,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             rc = d2k_plantab_set_name_family(tab, b + 1, b[0], cx->now_ns, p,
                                             b[1u + b[0]], sport_be, b[2u + b[0]]);
         } else {
-            uint32_t addr;
-            memcpy(&addr, b, 4);
-            rc = d2k_plantab_set_addr(tab, addr, cx->now_ns, p);
+            rc = d2k_plantab_set_addr_family(tab, b + 1, b[0], cx->now_ns, p);
         }
         /* Владение планом перешло таблице в любом случае, включая отказ.
            rc различает ДВЕ разные по вине причины: -1 — таблице планов
@@ -327,13 +336,11 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         ack(cx, type, 1, D2K_ACK_OK);
         return;
     case D2K_CMD_DEL_ADDR: {
-        if (len < 4) {
+        if (len != 17 || !canonical_address(b[0], b + 1)) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
-        uint32_t addr;
-        memcpy(&addr, b, 4);
-        d2k_plantab_del_addr(tab, addr);
+        d2k_plantab_del_addr_family(tab, b + 1, b[0]);
         ack(cx, type, 1, D2K_ACK_OK);
         return;
     }

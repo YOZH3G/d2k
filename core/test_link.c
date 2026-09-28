@@ -816,6 +816,16 @@ int main(void) {
               "IPv6 snapshot request");
         CHECK(read(sv[1], wire, sizeof wire) == 10 && wire[8] == 17 && wire[9] == 6,
               "snapshot wire carries transport and family");
+        const uint8_t ip6[16] = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,1};
+        CHECK(d2k_link_set_addr_family(sv[0], ip6, 6, "aabb", err, sizeof err) == 0,
+              "IPv6 address binding command");
+        CHECK(read(sv[1], wire, sizeof wire) == 25 && wire[6] == 6 &&
+              !memcmp(wire + 7, ip6, 16) && wire[23] == 0xaa && wire[24] == 0xbb,
+              "IPv6 address binding wire");
+        CHECK(d2k_link_del_addr_family(sv[0], ip6, 6, err, sizeof err) == 0,
+              "IPv6 address unbind command");
+        CHECK(read(sv[1], wire, sizeof wire) == 23 && wire[6] == 6 &&
+              !memcmp(wire + 7, ip6, 16), "IPv6 address unbind wire");
         close(sv[0]); close(sv[1]);
     }
     /* Address-trial command encoding is byte-level protocol, not a struct ABI. */

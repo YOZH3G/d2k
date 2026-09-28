@@ -557,7 +557,12 @@ static int send_name_only(int fd, uint16_t cmd, const char *what,
 
 int d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
                       char *err, size_t errcap) {
-    if (fd < 0) {
+    return d2k_link_set_addr_family(fd, ip4, 4, plan_text, err, errcap);
+}
+
+int d2k_link_set_addr_family(int fd, const uint8_t *ip4, uint8_t family,
+    const char *plan_text, char *err, size_t errcap) {
+    if (fd < 0 || (family != 4 && family != 6)) {
         say(err, errcap, "сокет не открыт");
         return -1;
     }
@@ -575,8 +580,10 @@ int d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
     }
 
     size_t o = HDR;
-    memcpy(g_scratch + o, ip4, 4);
-    o += 4;
+    g_scratch[o++] = family;
+    memset(g_scratch + o, 0, 16);
+    memcpy(g_scratch + o, ip4, family == 6 ? 16 : 4);
+    o += 16;
     long planlen = hex_decode(plan_text, g_scratch + o, sizeof g_scratch - o);
     if (planlen < 0) {
         say(err, errcap, "план не hex: недопустимый символ");
@@ -779,13 +786,19 @@ int d2k_link_del_name_probe_family(int fd, const char *name, uint8_t transport,
 }
 
 int d2k_link_del_addr(int fd, const uint8_t ip4[4], char *err, size_t errcap) {
-    if (fd < 0 || !ip4) {
+    return d2k_link_del_addr_family(fd, ip4, 4, err, errcap);
+}
+
+int d2k_link_del_addr_family(int fd, const uint8_t *ip4, uint8_t family,
+    char *err, size_t errcap) {
+    if (fd < 0 || !ip4 || (family != 4 && family != 6)) {
         say(err, errcap, "сокет не открыт или адрес цели не задан");
         return -1;
     }
-    uint8_t frame[HDR + 4] = {0, 0, 0, 6,
+    uint8_t frame[HDR + 17] = {0, 0, 0, 19,
         (uint8_t)(D2K_CMD_DEL_ADDR >> 8), (uint8_t)D2K_CMD_DEL_ADDR};
-    memcpy(frame + HDR, ip4, 4);
+    frame[HDR] = family;
+    memcpy(frame + HDR + 1, ip4, family == 6 ? 16 : 4);
     if (write_all(fd, frame, sizeof frame) != 0) {
         say(err, errcap, "команда DEL_ADDR не отправилась: %s", strerror(errno));
         return -1;

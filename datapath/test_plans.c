@@ -47,6 +47,24 @@ static uint32_t addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 int main(void) {
     {
         d2k_plantab *t = d2k_plantab_new(8);
+        const uint8_t a[16] = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,192,0,2,1};
+        uint8_t b[16]; memcpy(b, a, 16); b[4] = 1;
+        d2k_plan *p = mkplan(), *q = mkplan(), *v4 = mkplan();
+        CHECK(d2k_plantab_set_addr_family(t, a, 6, 1, p) == 0, "IPv6 address plan");
+        CHECK(d2k_plantab_set_addr_family(t, b, 6, 1, q) == 0, "upper bits address plan");
+        CHECK(d2k_plantab_set_addr_family(t, a + 12, 4, 1, v4) == 0, "IPv4 address plan");
+        CHECK(d2k_plantab_count(t) == 3, "address families/upper bits merged");
+        CHECK(d2k_plantab_find_target(t, NULL, 0, a, 6, 2, 0, 0) == p, "IPv6 address lookup");
+        CHECK(d2k_plantab_find_target(t, NULL, 0, b, 6, 2, 0, 0) == q, "IPv6 upper bits lookup");
+        CHECK(d2k_plantab_find_target(t, NULL, 0, a + 12, 4, 2, 0, 0) == v4, "IPv4 address lookup");
+        CHECK(d2k_plantab_del_addr_family(t, a, 6) == 1, "IPv6 address removal");
+        CHECK(d2k_plantab_find_target(t, NULL, 0, b, 6, 3, 0, 0) == q &&
+              d2k_plantab_find_target(t, NULL, 0, a + 12, 4, 3, 0, 0) == v4,
+              "IPv6 delete removed other target");
+        d2k_plantab_free(t);
+    }
+    {
+        d2k_plantab *t = d2k_plantab_new(8);
         const uint8_t name[] = "dual.example";
         d2k_plan *v4 = mkplan(), *v6 = mkplan(), *trial = mkplan();
         CHECK(d2k_plantab_set_name_family(t, name, 12, 1, v4, D2K_PLAN_SHAPE_MODERN, 0, 4) == 0,

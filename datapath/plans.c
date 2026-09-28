@@ -11,7 +11,7 @@ typedef struct {
     uint8_t  family;
     uint8_t  name_len;
     uint8_t  name[D2K_TARGET_NAME_MAX];
-    uint32_t addr_be;
+    uint8_t addr[16];
     /* Давность последнего обращения — единственное, что нужно вытеснению по
        LRU. Не индекс и не список: список давности стоил бы указателей на
        каждую запись ради таблицы, которую и так обходят целиком раз на
@@ -141,14 +141,20 @@ int d2k_plantab_stream_candidate(const d2k_plantab *t, const uint8_t *name,
 
 int d2k_plantab_stream_candidate_family(const d2k_plantab *t, const uint8_t *name,
     size_t len, uint32_t addr_be, uint16_t sport_be, uint8_t family) {
+    return d2k_plantab_stream_candidate_target(t, name, len,
+        family == 4 ? (const uint8_t *)&addr_be : NULL, sport_be, family);
+}
+
+int d2k_plantab_stream_candidate_target(const d2k_plantab *t, const uint8_t *name,
+    size_t len, const uint8_t *addr, uint16_t sport_be, uint8_t family) {
     if (!t || (family != 4 && family != 6)) { return 0; }
     for (size_t i = 0; i < t->used; i++) {
         const entry *e = &t->v[i];
-        if ((e->kind == KEY_NAME && e->family != family) ||
-            (e->kind == KEY_ADDR && family != 4)) { continue; }
+        if (e->family != family) { continue; }
         if (!d2k_plan_stream_input(e->plan) ||
             (e->only_sport && e->only_sport != sport_be)) { continue; }
-        if (e->kind == KEY_ADDR && e->addr_be == addr_be) { return 1; }
+        if (e->kind == KEY_ADDR && addr &&
+            memcmp(e->addr, addr, family == 6 ? 16 : 4) == 0) { return 1; }
         if (e->kind == KEY_NAME &&
             (!name || !len || name_eq(e->name, e->name_len, name, len))) { return 1; }
     }
@@ -215,9 +221,11 @@ static entry *find_name_shape(d2k_plantab *t, const uint8_t *name, size_t len,
     return find_name_shape_port(t, name, len, shape, 0, family);
 }
 
-static entry *find_addr(d2k_plantab *t, uint32_t addr_be) {
+static entry *find_addr(d2k_plantab *t, const uint8_t *addr, uint8_t family) {
+    if (!addr || (family != 4 && family != 6)) { return NULL; }
     for (size_t i = 0; i < t->used; i++) {
-        if (t->v[i].kind == KEY_ADDR && t->v[i].addr_be == addr_be) {
+        if (t->v[i].kind == KEY_ADDR && t->v[i].family == family &&
+            memcmp(t->v[i].addr, addr, family == 6 ? 16 : 4) == 0) {
             return &t->v[i];
         }
     }
@@ -365,12 +373,17 @@ int d2k_plantab_set_name(d2k_plantab *t, const uint8_t *name, size_t len,
 
 int d2k_plantab_set_addr(d2k_plantab *t, uint32_t addr_be, uint64_t now_ns,
                          d2k_plan *p) {
-    if (!t) {
+    return d2k_plantab_set_addr_family(t, (const uint8_t *)&addr_be, 4, now_ns, p);
+}
+
+int d2k_plantab_set_addr_family(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+                                uint64_t now_ns, d2k_plan *p) {
+    if (!t || !addr || (family != 4 && family != 6)) {
         d2k_plan_free(p);
         return -2;
     }
     t->revision++;
-    entry *e = find_addr(t, addr_be);
+    entry *e = find_addr(t, addr, family);
     if (!e) {
         e = take_free_or_evict(t);
         if (!e) {
@@ -379,7 +392,9 @@ int d2k_plantab_set_addr(d2k_plantab *t, uint32_t addr_be, uint64_t now_ns,
         }
         t->used++;
         e->kind = KEY_ADDR;
-        e->addr_be = addr_be;
+        e->family = family;
+        memset(e->addr, 0, sizeof e->addr);
+        memcpy(e->addr, addr, family == 6 ? 16 : 4);
     }
     /* Адрес не приветствие: формы у него нет по построению, и лечится это не
        проверкой при поиске, а честно названным исключением. */
@@ -457,7 +472,11 @@ int d2k_plantab_del_name_probe_family(d2k_plantab *t, const uint8_t *name, size_
 }
 
 int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be) {
-    return t ? drop(t, find_addr(t, addr_be)) : 0;
+    return d2k_plantab_del_addr_family(t, (const uint8_t *)&addr_be, 4);
+}
+
+int d2k_plantab_del_addr_family(d2k_plantab *t, const uint8_t *addr, uint8_t family) {
+    return t ? drop(t, find_addr(t, addr, family)) : 0;
 }
 
 static int trial_id_valid(const uint8_t id[D2K_TRIAL_ID_LEN]) {
@@ -635,6 +654,12 @@ const d2k_plan *d2k_plantab_find_sport(d2k_plantab *t, const uint8_t *name,
 const d2k_plan *d2k_plantab_find_family(d2k_plantab *t, const uint8_t *name,
     size_t len, uint32_t addr_be, uint64_t now_ns, uint8_t seen_shape,
     uint16_t sport_be, uint8_t family) {
+    return d2k_plantab_find_target(t, name, len,
+        family == 4 ? (const uint8_t *)&addr_be : NULL, family, now_ns, seen_shape, sport_be);
+}
+
+const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, size_t len,
+    const uint8_t *addr, uint8_t family, uint64_t now_ns, uint8_t seen_shape, uint16_t sport_be) {
     if (!t || (family != 4 && family != 6)) {
         return NULL;
     }
@@ -728,7 +753,7 @@ const d2k_plan *d2k_plantab_find_family(d2k_plantab *t, const uint8_t *name,
     }
     /* Только теперь по адресу: обратный порядок дал бы плану соседа по CDN
        перебить план, подтверждённый для этого имени. */
-    entry *e = family == 4 ? find_addr(t, addr_be) : NULL;
+    entry *e = find_addr(t, addr, family);
     if (e) {
         e->last_used_ns = now_ns;
         if (shape_fits(e->shape, seen_shape)) {

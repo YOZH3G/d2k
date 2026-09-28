@@ -335,6 +335,10 @@ int  d2k_link_del_name_probe(int fd, const char *name, uint8_t transport,
  * их — терять подтверждённое. */
 int  d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
                        char *err, size_t errcap);
+int d2k_link_set_addr_family(int fd, const uint8_t *ip, uint8_t family,
+    const char *plan_text, char *err, size_t errcap);
+int d2k_link_del_addr_family(int fd, const uint8_t *ip, uint8_t family,
+    char *err, size_t errcap);
 
 /* Временная адресная проба для одного UDP 5-tuple. Адреса/порты передаются
  * байтами сетевого порядка; trial_id — случайный ненулевой токен поколения,
