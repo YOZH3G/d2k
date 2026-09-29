@@ -213,7 +213,8 @@ int main(int argc, char **argv) {
 
     d2k_sched *s = d2k_sched_new(&cat, fd, mark);
     if (!s) {
-        fprintf(stderr, "d2kc: планировщик не завёлся\n");
+        fprintf(stderr, "d2kc: планировщик не завёлся: %s\n",
+                strerror(errno ? errno : EIO));
         d2k_link_close(fd);
         d2k_catalog_free(&cat);
         return 1;

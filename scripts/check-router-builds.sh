@@ -1,5 +1,6 @@
 #!/bin/sh
-# Run on Linux with qemu-user + binutils. Does not install or change networking.
+# Run on Linux with qemu-user + binutils; Node.js is also needed for the
+# controller/datapath handshake on MIPS. Does not install or change networking.
 set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 ARCHES=${ARCHES:-"arm64 arm mipsel mips mips64el amd64 x86 ppc64 riscv64"}
@@ -39,6 +40,18 @@ for arch in $ARCHES; do
     case "$arch" in
         mips|mipsel) timeout 60 "qemu-$cpu" -cpu 4Kc "$ROOT/build/telegram/tg-session-$arch" ;;
         x86) timeout 60 "qemu-$cpu" -cpu pentium2 "$ROOT/build/telegram/tg-session-$arch" ;;
+    esac
+    case "$arch" in
+        mips|mipsel)
+            command -v node >/dev/null 2>&1 || {
+                echo "node is required for the MIPS controller startup regression" >&2
+                exit 1
+            }
+            D2K_TEST_BINARY="$ROOT/builds/d2kc-linux-$arch" \
+            D2K_TEST_RUNNER="qemu-$cpu" \
+            D2K_TEST_RUNNER_ARGS='-cpu 24Kc' \
+                node "$ROOT/scripts/test-controller-handshake.cjs"
+            ;;
     esac
     echo "$arch: static executables + startup + crypto/wire/plan/OpenSSL tests PASS"
 done

@@ -2452,7 +2452,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
  * -------------------------------------------------------------------- */
 
 d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
-    if (!cat) { return NULL; }
+    if (!cat) { errno = EINVAL; return NULL; }
     d2k_sched *s = calloc(1, sizeof *s);
     if (!s) { return NULL; }
     s->cat = cat;
@@ -2461,7 +2461,11 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     s->measure_mark = mark;
     s->wake[0] = s->wake[1] = -1;
     s->wall_base_s = (int64_t)time(NULL);
-    if (pipe(s->wake) != 0) {
+    /* The MIPS Linux pipe syscall returns the first descriptor in v0 (and
+       the second in v1); Zig's musl wrapper exposes that positive value here
+       instead of normalizing success to POSIX's zero. The descriptor pair is
+       still written to wake[]. Accept every non-negative success value. */
+    if (pipe(s->wake) < 0) {
         free(s);
         return NULL;
     }
@@ -2469,9 +2473,11 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
         int fl = fcntl(s->wake[i], F_GETFL, 0);
         if (fl >= 0) { (void)fcntl(s->wake[i], F_SETFL, fl | O_NONBLOCK); }
     }
-    if (pthread_mutex_init(&s->mu, NULL) != 0) {
+    int mutex_error = pthread_mutex_init(&s->mu, NULL);
+    if (mutex_error != 0) {
         close(s->wake[0]); close(s->wake[1]);
         free(s);
+        errno = mutex_error;
         return NULL;
     }
     return s;

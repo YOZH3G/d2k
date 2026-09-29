@@ -5,6 +5,10 @@ const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 
+const controller = process.env.D2K_TEST_BINARY || path.resolve(__dirname, '../core/d2kc');
+const runner = process.env.D2K_TEST_RUNNER || '';
+const runnerArgs = (process.env.D2K_TEST_RUNNER_ARGS || '').split(/\s+/).filter(Boolean);
+
 async function trial(version, legacy = false) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd2k-greet-'));
   const socket = path.join(dir, 'ctl.sock');
@@ -27,8 +31,10 @@ async function trial(version, legacy = false) {
   });
   try {
     await new Promise(resolve => server.listen(socket, resolve));
-    child = spawn(path.resolve(__dirname, '../core/d2kc'),
-      ['--control', socket, '--catalog', path.join(dir, 'catalog.json')]);
+    const args = ['--control', socket, '--catalog', path.join(dir, 'catalog.json')];
+    child = runner
+      ? spawn(runner, [...runnerArgs, controller, ...args])
+      : spawn(controller, args);
     let output = '';
     child.stdout.on('data', b => { output += b; });
     child.stderr.on('data', b => { output += b; });
@@ -42,6 +48,7 @@ async function trial(version, legacy = false) {
     clearTimeout(deadline);
     if (version === 4 && !legacy) {
       assert.equal(result.timeout, true, `valid peer rejected: ${output}`);
+      assert.match(output, /d2kc: запущен/, `controller stayed alive without completing startup: ${output}`);
     } else {
       assert.equal(result.timeout, undefined, `controller accepted missing/incompatible greeting: ${output}`);
       assert.equal(result.code, 1, output);
@@ -60,7 +67,9 @@ async function trial(version, legacy = false) {
 }
 
 (async () => {
-  const header = fs.readFileSync(path.resolve(__dirname, '../datapath/include/d2k_ctl.h'), 'utf8');
+  const headerPath = process.env.D2K_PROTOCOL_HEADER ||
+    path.resolve(__dirname, '../datapath/include/d2k_ctl.h');
+  const header = fs.readFileSync(headerPath, 'utf8');
   assert.match(header, /#define D2K_EV_PROTO\s+0x000A/);
   await trial(null);
   await trial(3);

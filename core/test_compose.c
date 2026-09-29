@@ -200,7 +200,7 @@ static int probe_start(probe *p, const char *sock_path) {
         return -1;
     }
     int inpipe[2], outpipe[2];
-    if (pipe(inpipe) != 0 || pipe(outpipe) != 0) {
+    if (pipe(inpipe) < 0 || pipe(outpipe) < 0) {
         fprintf(stderr, "pipe: %s\n", strerror(errno));
         return -1;
     }

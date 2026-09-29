@@ -19,7 +19,7 @@ static int64_t now_ms(void) {
 
 static int run(int with_quit) {
     int input[2], output[2];
-    if (pipe(input) || pipe(output)) { return 1; }
+    if (pipe(input) < 0 || pipe(output) < 0) { return 1; }
     char path[100];
     snprintf(path, sizeof path, "/tmp/d2k-ctlprobe-batch-%ld-%d.sock", (long)getpid(), with_quit);
     pid_t child = fork();
