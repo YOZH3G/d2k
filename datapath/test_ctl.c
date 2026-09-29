@@ -324,10 +324,92 @@ static void check_proto_greeting(void) {
     unlink(SOCK);
 }
 
+static void count_disconnect(void *ctx) { (*(unsigned *)ctx)++; }
+
+static void test_probe_owner_disconnect(void) {
+    char err[256];
+    d2k_ctl *ctl = d2k_ctl_open(SOCK, err, sizeof err);
+    d2k_session *sess = d2k_session_new(16, 0);
+    CHECK(ctl && sess, "probe ownership fixture opens");
+    if (!ctl || !sess) { d2k_ctl_close(ctl); d2k_session_free(sess); return; }
+    d2k_ctlsrv cx = {.sess = sess, .ctl = ctl, .now_ns = 1000000};
+    d2k_ctl_set_disconnect_hook(ctl, d2k_ctlsrv_peer_closed, &cx);
+    int peer = dial();
+    CHECK(peer >= 0, "probe owner connects");
+    d2k_ctl_accept(ctl);
+    d2k_plantab *tab = d2k_session_plans(sess);
+    const char *name = "owner.example";
+    size_t nl = strlen(name);
+    uint8_t body[160], packet[180];
+    uint16_t sport;
+    const uint8_t port[2] = {0x9c, 0x40};
+    memcpy(&sport, port, 2);
+    d2k_addr_probe_flow flow = {.family = 6, .transport = 17};
+    flow.src_ip6[0] = flow.dst_ip6[0] = 0xfd;
+    flow.src_ip6[15] = 1; flow.dst_ip6[15] = 2;
+    flow.src_port_be = sport;
+    const uint8_t https[2] = {1, 0xbb};
+    memcpy(&flow.dst_port_be, https, 2);
+    for (unsigned kind = 0; kind < 3; kind++) {
+        uint16_t type;
+        size_t len;
+        if (kind < 2) {
+            len = set_name_body_shaped(body, name, tiny, sizeof tiny,
+                                      D2K_PLAN_SHAPE_QUIC);
+            body[2 + nl] = 6;
+            type = kind ? D2K_CMD_SET_NAME_PROBE : D2K_CMD_SET_NAME;
+            if (kind) {
+                memmove(body + nl + 5, body + nl + 3, sizeof tiny);
+                memcpy(body + nl + 3, port, 2);
+                len += 2;
+            }
+        } else {
+            memset(body, 0, 58);
+            body[0] = 6;
+            memcpy(body + 1, flow.src_ip6, 16);
+            memcpy(body + 17, flow.dst_ip6, 16);
+            memcpy(body + 33, port, 2);
+            memcpy(body + 35, https, 2);
+            body[37] = 17; body[38] = 1;
+            body[56] = 0xea; body[57] = 0x60;
+            memcpy(body + 58, tiny, sizeof tiny);
+            len = 58 + sizeof tiny;
+            type = D2K_CMD_SET_ADDR_PROBE;
+        }
+        frame(packet, type, body, len);
+        CHECK(write(peer, packet, len + 6) == (ssize_t)(len + 6), "owner command written");
+        CHECK(poll_frames(ctl, d2k_ctlsrv_command, &cx, 1) == 1, "owner command parsed");
+        d2k_ctl_flush(ctl);
+        uint16_t cmd; int ok; uint8_t reason;
+        CHECK(read_ack(peer, &cmd, &ok, &reason) && ok, "owner command accepted");
+    }
+    CHECK(d2k_session_plan_count(sess) == 2, "permanent and named trial installed");
+    CHECK(d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, NULL), "address trial installed");
+    close(peer);
+    CHECK(d2k_ctl_poll(ctl, d2k_ctlsrv_command, &cx) < 0, "owner EOF observed");
+    CHECK(d2k_session_plan_count(sess) == 1, "disconnect removes named trial only");
+    CHECK(!d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, NULL), "disconnect removes address trial");
+    CHECK(d2k_plantab_find_family(tab, (const uint8_t *)name, nl, 0,
+          cx.now_ns, D2K_PLAN_SHAPE_QUIC, 0, 6), "disconnect preserves confirmed strategy");
+    peer = dial();
+    d2k_ctl_accept(ctl);
+    CHECK(peer >= 0 && d2k_ctl_peer_fd(ctl) >= 0, "replacement controller accepted");
+    CHECK(d2k_session_plan_count(sess) == 1 &&
+          !d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, NULL),
+          "replacement controller cannot inherit stale trials");
+    close(peer);
+    d2k_ctl_poll(ctl, d2k_ctlsrv_command, &cx);
+    d2k_ctl_close(ctl);
+    d2k_session_free(sess);
+}
+
 int main(void) {
+    test_probe_owner_disconnect();
     check_proto_greeting();
     char err[160];
     d2k_ctl *c = d2k_ctl_open(SOCK, err, sizeof err);
+    unsigned disconnects = 0;
+    d2k_ctl_set_disconnect_hook(c, count_disconnect, &disconnects);
     CHECK(c != NULL, "сокет не создался");
     if (!c) {
         printf("  причина: %s\n", err);
@@ -481,6 +563,7 @@ int main(void) {
         CHECK(write(cli, f, 6) == 6, "кадр с врущей длиной не записался");
         CHECK(d2k_ctl_poll(c, on_cmd, NULL) == -1, "врущая длина не порвала соединение");
         CHECK(d2k_ctl_peer_fd(c) == -1, "собеседник остался после врущей длины");
+        CHECK(disconnects == 1, "invalid frame must retire controller ownership");
         close(cli);
     }
 
@@ -492,6 +575,7 @@ int main(void) {
         close(cli);
         CHECK(d2k_ctl_poll(c, on_cmd, NULL) == -1, "уход собеседника не замечен");
         CHECK(d2k_ctl_peer_fd(c) == -1, "собеседник числится живым после ухода");
+        CHECK(disconnects == 2, "EOF must retire the next controller ownership");
     }
 
     /* --- слишком большое событие теряется, а не переполняет буфер ------------ */

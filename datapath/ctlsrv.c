@@ -131,6 +131,11 @@ void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen) {
     d2k_ctl_event(ctl, D2K_EV_PROTO, body, sizeof body);
 }
 
+void d2k_ctlsrv_peer_closed(void *ctx) {
+    d2k_ctlsrv *cx = ctx;
+    if (cx && cx->sess) d2k_plantab_clear_probes(d2k_session_plans(cx->sess));
+}
+
 static int canonical_address(uint8_t family, const uint8_t *ip) {
     if (family == 6) { return 1; }
     if (family != 4) { return 0; }

@@ -1209,6 +1209,25 @@ int main(void) {
         CHECK(d2k_session_want_shape(s6, (const uint8_t *)"example.com", 11, 17) == 0,
               "IPv6 QUIC snapshot leaked to IPv4");
         d2k_session_free(s6);
+        s6 = d2k_session_new(32, 32); p6 = NULL;
+        CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p6, err6, sizeof err6) == 0,
+              "IPv6 private trial fixture");
+        CHECK(d2k_plantab_set_name_family(d2k_session_plans(s6),
+                  (const uint8_t *)"example.com", 11, 1, p6, D2K_PLAN_SHAPE_QUIC,
+                  htons(50011), 6) == 0, "IPv6 private trial install");
+        d2k_session_packet(s6, pkt, n4 + 20, 2, output, sizeof output, &r6);
+        CHECK(!r6.applied && r6.n_out == 0 && r6.verdict == D2K_VERDICT_ACCEPT,
+              "ordinary IPv6 client sharing a probe port must not receive a trial");
+        pkt[23] = 3;
+        d2k_session_packet_probe(s6, pkt, n4 + 20, 3, output, sizeof output, &r6);
+        CHECK(r6.applied && r6.n_out > 0,
+              "marked IPv6 controller probe must still execute its trial");
+        pkt[39] = 4;
+        d2k_session_packet(s6, pkt, n4 + 20, 4, output, sizeof output, &r6);
+        CHECK(!r6.applied && r6.n_out == 0 && r6.verdict == D2K_VERDICT_ACCEPT,
+              "another destination on the same probe port must stay direct");
+        pkt[23] = 1; pkt[39] = 2;
+        d2k_session_free(s6);
         d2k_nat_family_fn saved6 = d2k_nat_family_hook;
         d2k_nat_family_hook = frag_nat6;
         for (int shape = 1; shape <= 4; shape++) {

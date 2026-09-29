@@ -958,7 +958,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     if (!use) { use = d2k_plantab_find_target(s->plans,
                                                  named ? (const uint8_t *)name : NULL,
                                                  name_len, ip->dst.bytes, ip->family, now_ns,
-                                                 seen_shape, sport_be); }
+                                                 seen_shape, controller_probe ? sport_be : 0); }
     if (!use) {
         use = s->plan;
     }
@@ -1713,7 +1713,8 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         use = d2k_plantab_find_target(s->plans,
                                      tls.have_sni ? pkt + payload_off + tls.sni_off : NULL,
                                      tls.have_sni ? tls.sni_len : 0,
-                                     ip.dst.bytes, ip.family, now_ns, seen_shape, sport_be);
+                                     ip.dst.bytes, ip.family, now_ns, seen_shape,
+                                     controller_probe ? sport_be : 0);
         if (!use) {
             use = s->plan;
         }
@@ -2089,7 +2090,8 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
     int candidate = d2k_plan_stream_input(s->plan) ||
         d2k_plantab_stream_candidate_target(s->plans,
             tls.have_sni ? p + v.header + tls.sni_off : NULL,
-            tls.have_sni ? tls.sni_len : 0, v.dst.bytes, v.sport_be, v.dst.family);
+            tls.have_sni ? tls.sni_len : 0, v.dst.bytes,
+            fl->controller_probe ? v.sport_be : 0, v.dst.family);
     /* Also mark a failed capacity attempt: its head must not be held later
        after we have already released it unchanged. */
     /* stream_attempted — только у головы: пометка закрывает потоку удержание

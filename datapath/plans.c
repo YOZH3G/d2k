@@ -523,6 +523,18 @@ static void probe_drop(d2k_plantab *t, probe_entry *e) {
     t->revision++;
 }
 
+void d2k_plantab_clear_probes(d2k_plantab *t) {
+    if (!t) return;
+    for (size_t i = 0; i < t->used;) {
+        if (t->v[i].kind == KEY_NAME && t->v[i].only_sport) {
+            (void)drop(t, &t->v[i]);
+        } else {
+            i++;
+        }
+    }
+    for (size_t i = 0; i < t->cap; i++) probe_drop(t, &t->probes[i]);
+}
+
 int d2k_plantab_set_addr_probe(d2k_plantab *t,
                                const d2k_addr_probe_flow *flow,
                                const uint8_t trial_id[D2K_TRIAL_ID_LEN],

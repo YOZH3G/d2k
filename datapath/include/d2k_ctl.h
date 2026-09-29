@@ -166,6 +166,7 @@ void     d2k_ctl_close(d2k_ctl *c);
 
 int d2k_ctl_listen_fd(const d2k_ctl *c);
 int d2k_ctl_peer_fd(const d2k_ctl *c);   /* -1 — контроллер не подключён */
+void d2k_ctl_set_disconnect_hook(d2k_ctl *, void (*hook)(void *), void *ctx);
 
 /* Принимает подключение, если оно ждёт. Второй контроллер отвергается. */
 void d2k_ctl_accept(d2k_ctl *c);

@@ -78,6 +78,13 @@ int main(void) {
               "IPv6 received IPv4 plan");
         CHECK(d2k_plantab_set_name_family(t, name, 12, 3, trial, D2K_PLAN_SHAPE_MODERN, 123, 6) == 0,
               "IPv6 trial setup");
+        d2k_plantab_clear_probes(t);
+        CHECK(d2k_plantab_count(t) == 2 &&
+              d2k_plantab_find_family(t, name, 12, 0, 4, D2K_PLAN_SHAPE_MODERN, 123, 6) == v6,
+              "controller disconnect must remove trials but preserve confirmed families");
+        trial = mkplan();
+        CHECK(d2k_plantab_set_name_family(t, name, 12, 3, trial, D2K_PLAN_SHAPE_MODERN, 123, 6) == 0,
+              "new controller trial setup");
         CHECK(d2k_plantab_find_family(t, NULL, 0, 0, 4, D2K_PLAN_SHAPE_MODERN, 123, 4) == NULL,
               "nameless IPv4 received IPv6 trial");
         CHECK(d2k_plantab_find_family(t, NULL, 0, 0, 4, D2K_PLAN_SHAPE_MODERN, 123, 6) == trial,

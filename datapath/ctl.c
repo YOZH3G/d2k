@@ -23,6 +23,8 @@
 struct d2k_ctl {
     int      lfd;
     int      pfd;
+    void (*disconnect_hook)(void *);
+    void *disconnect_ctx;
     char     path[108];
 
     /* КОЛЬЦО ИСХОДЯЩИХ КАДРОВ, а не место под один.
@@ -141,6 +143,12 @@ void d2k_ctl_close(d2k_ctl *c) {
 int d2k_ctl_listen_fd(const d2k_ctl *c) { return c ? c->lfd : -1; }
 int d2k_ctl_peer_fd(const d2k_ctl *c)   { return c ? c->pfd : -1; }
 
+void d2k_ctl_set_disconnect_hook(d2k_ctl *c, void (*hook)(void *), void *ctx) {
+    if (!c) return;
+    c->disconnect_hook = hook;
+    c->disconnect_ctx = ctx;
+}
+
 void d2k_ctl_accept(d2k_ctl *c) {
     if (!c || c->lfd < 0) {
         return;
@@ -169,12 +177,14 @@ void d2k_ctl_accept(d2k_ctl *c) {
 }
 
 static void drop_peer(d2k_ctl *c) {
+    int connected = c->pfd >= 0;
     if (c->pfd >= 0) {
         close(c->pfd);
         c->pfd = -1;
     }
     c->out_head = c->out_used = 0;
     c->in_len = 0;
+    if (connected && c->disconnect_hook) c->disconnect_hook(c->disconnect_ctx);
 }
 
 void d2k_ctl_flush(d2k_ctl *c) {

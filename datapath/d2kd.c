@@ -668,6 +668,7 @@ int main(int argc, char **argv) {
     memset(&cx, 0, sizeof cx);
     cx.sess = sess;
     cx.ctl = ctl;
+    d2k_ctl_set_disconnect_hook(ctl, d2k_ctlsrv_peer_closed, &cx);
     cx.send_limits = raw ? d2k_raw_limits(raw) : 0;
     /* Ноль без сырого сокета — «предел не объявлен»: в режиме наблюдения на
        провод ничего не пойдёт, и резать по длине нечего. */

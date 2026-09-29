@@ -262,6 +262,7 @@ int main(int argc, char **argv) {
     memset(&cx, 0, sizeof cx);
     cx.sess = sess;
     cx.ctl = ctl;
+    d2k_ctl_set_disconnect_hook(ctl, d2k_ctlsrv_peer_closed, &cx);
     /* Пределы как у сырого сокета: стенд обязан отвергать те же планы, что и
        служба, иначе он проверял бы не то. */
     cx.send_limits = D2K_RAW_CANT_IPID | D2K_RAW_CANT_IPSUM;

@@ -1646,7 +1646,7 @@ int main(void) {
                 gp = NULL;
                 for (uint16_t port = 47504; port <= 47505; port++) {
                     pn = build_pkt(part, port, 0x02, NULL, 0);
-                    d2k_session_packet(g, part, pn, 31, buf, sizeof buf, &r);
+                    d2k_session_packet_probe(g, part, pn, 31, buf, sizeof buf, &r);
                     pn = build_pkt(part, port, 0x18, whole, 1);
                     wr32(part + 24, 1001);
                     CHECK(d2k_session_hold_candidate(g, part, pn) == (port == 47504),

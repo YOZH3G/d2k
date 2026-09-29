@@ -115,6 +115,8 @@ typedef struct {
 
 d2k_plantab *d2k_plantab_new(size_t cap);
 void         d2k_plantab_free(d2k_plantab *t);
+/* Drop controller-owned experiments, retaining all confirmed bindings. */
+void         d2k_plantab_clear_probes(d2k_plantab *t);
 
 /* Ставит план для цели. Владение планом переходит таблице В ЛЮБОМ СЛУЧАЕ,
  * включая отказ: иначе каждая ошибка вызывающего оставляла бы течь.
