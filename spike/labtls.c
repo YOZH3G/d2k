@@ -32,8 +32,8 @@ static const char *RESPONSE =
     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok";
 
 int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "использование: labtls <порт> <cert.pem> <key.pem>\n");
+    if ((argc != 4 && argc != 5) || (argc == 5 && strcmp(argv[4], "6"))) {
+        fprintf(stderr, "использование: labtls <порт> <cert.pem> <key.pem> [6]\n");
         return 2;
     }
     int port = atoi(argv[1]);
@@ -59,16 +59,28 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    int family = argc == 5 ? AF_INET6 : AF_INET;
+    int lfd = socket(family, SOCK_STREAM, 0);
     if (lfd < 0) { perror("socket"); return 1; }
     int one = 1;
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
-    a.sin_port = htons((unsigned short)port);
-    if (bind(lfd, (struct sockaddr *)&a, sizeof a) != 0) { perror("bind"); return 1; }
+    if (family == AF_INET6) {
+        struct sockaddr_in6 a;
+        memset(&a, 0, sizeof a);
+        a.sin6_family = AF_INET6;
+        a.sin6_port = htons((unsigned short)port);
+        if (setsockopt(lfd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) != 0 ||
+            bind(lfd, (struct sockaddr *)&a, sizeof a) != 0) {
+            perror("bind IPv6"); return 1;
+        }
+    } else {
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_ANY);
+        a.sin_port = htons((unsigned short)port);
+        if (bind(lfd, (struct sockaddr *)&a, sizeof a) != 0) { perror("bind"); return 1; }
+    }
     if (listen(lfd, 64) != 0) { perror("listen"); return 1; }
     printf("labtls: слушаю %d\n", port);
     fflush(stdout);
