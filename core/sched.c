@@ -412,6 +412,9 @@ typedef struct {
     uint8_t    ctrl[2048];
     size_t     ctrl_len;
     int        shape_armed;
+    int        watch_shape_pending;
+    char       watch_shape_ip[INET6_ADDRSTRLEN];
+    uint16_t   watch_shape_port;
     /* Снимок в trig СНЯТ С ПРОВОДА, а не собран из профиля холодного старта.
        Различать обязательно: fill_hellos при пустом снимке подставляет
        профиль MODERN, и без этого признака «форма живого клиента» читалась бы
@@ -3349,8 +3352,20 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
            подряд, и наблюдение снималось зря. Ноль в поле — «не сказано»
            (старая служба), и по нему поведение остаётся прежним. */
         if (ev->planned == D2K_LINK_PLANNED_NO) {
+            /* No application is not necessarily an old flow: a different
+               TLS version deliberately does not match the confirmed plan.
+               Ask for bytes, not another network measurement. */
+            if (t->transport == 6 && !t->watch_shape_pending) {
+                char err[128];
+                if (d2k_link_arm_shape_family(s->link_fd, t->name, 6,
+                                              t->family, err, sizeof err) == 0) {
+                    t->watch_shape_pending = 1;
+                    server_of(ev, t->watch_shape_ip, sizeof t->watch_shape_ip,
+                              &t->watch_shape_port);
+                }
+            }
             say(s, "по %s подозрение о потоке, к которому план НЕ ПРИМЕНЯЛСЯ "
-                   "(начат раньше, чем план встал) — уликой против подтверждённого "
+                   "— уликой против подтверждённого "
                    "плана не считаю, наблюдение продолжаю", t->name);
             return 0;
         }
@@ -3510,6 +3525,31 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
          * заходит. */
         if (t->state == T_WATCHING && t->transport == ev->transport &&
             strcmp(t->name, name) == 0) {
+            if (t->watch_shape_pending && t->transport == 6) {
+                t->watch_shape_pending = 0;
+                d2k_shape shape = d2k_hello_shape(ev->shape, ev->shape_len);
+                int covered = 0;
+                for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
+                    const d2k_cat_box *b = &s->cat->boxes[bi];
+                    for (size_t j = 0; j < b->n_binds; j++) {
+                        const d2k_cat_binding *bd = &b->binds[j];
+                        if (bd->enabled && bd->level >= 3 &&
+                            (bd->transport ? bd->transport : 6) == 6 &&
+                            (bd->family ? bd->family : 4) == t->family &&
+                            strcmp(bd->kind, "name") == 0 &&
+                            strcmp(bd->target, name) == 0 && bd->shape == shape)
+                            covered = 1;
+                    }
+                }
+                if (!covered && shape != D2K_SHAPE_UNKNOWN &&
+                    shape != d2k_hello_shape(t->trig, t->trig_len)) {
+                    snprintf(t->ip, sizeof t->ip, "%s", t->watch_shape_ip);
+                    t->port = t->watch_shape_port;
+                    t->started_ms = s->now_ms;
+                    remeasure_snapped(s, t, ev->shape, ev->shape_len);
+                    continue;
+                }
+            }
             const d2k_cat_binding *bd = binding_for(s, t->name, t->transport, t->family);
             if (bd && bd->input == D2K_INPUT_PROFILE) {
                 remeasure_snapped(s, t, ev->shape, ev->shape_len);

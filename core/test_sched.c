@@ -823,7 +823,8 @@ int main(int argc, char **argv) {
     int rst_only = argc == 2 && strcmp(argv[1], "--rst-only") == 0;
     int admission_only = argc == 2 && strcmp(argv[1], "--admission-only") == 0;
     int question_only = argc == 2 && strcmp(argv[1], "--question-only") == 0;
-    if (argc > 1 && !voice_only && !rst_only && !admission_only && !question_only) {
+    int shape_only = argc == 2 && strcmp(argv[1], "--shape-only") == 0;
+    if (argc > 1 && !voice_only && !rst_only && !admission_only && !question_only && !shape_only) {
         fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only]\n");
         return 2;
     }
@@ -875,6 +876,7 @@ int main(int argc, char **argv) {
     memset(&cat, 0, sizeof cat);
     uint8_t question_prev_id[D2K_PLAN_ID_LEN] = {0};
     if (question_only) { goto question_test; }
+    if (shape_only) { goto shape_test; }
     {
         d2k_catalog empty = {0};
         d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
@@ -2428,6 +2430,77 @@ admission_only_run:
         d2k_sched_free(s);
         d2k_catalog_free(&c2);
     }
+
+shape_test:
+    /* A confirmed TLS1.3 task must not hide blocked TLS1.2 of the same name. */
+    for (int family = 4; family <= 6; family += 2) {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 1;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        ver_answer_port = 41017;
+        drain(); forget_sent();
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE;
+        sh.transport = 6; sh.family = (uint8_t)family;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "versions.example",
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "modern snapshot");
+        d2k_sched_event(s, &sh);
+        d2k_ev h = ev_hello(6, 41017, "versions.example");
+        h.family = (uint8_t)family;
+        if (family == 6) {
+            (void)inet_pton(AF_INET6, "::1", h.low_ip);
+            (void)inet_pton(AF_INET6, "2001:db8::2", h.high_ip);
+        }
+        d2k_sched_event(s, &h);
+        d2k_ev su = h; su.kind = D2K_EV_SUSPECT; su.code = D2K_SUSPECT_RST_CUT;
+        d2k_sched_event(s, &su); settle(s);
+        d2k_ev ap = ev_applied(6, 41017);
+        ap.family = h.family;
+        memcpy(ap.low_ip, h.low_ip, 16); memcpy(ap.high_ip, h.high_ip, 16);
+        d2k_sched_event(s, &ap); spin(s, 40);
+        CHECK(binding_of(&c, "versions.example", 6) != NULL, "modern binding exists");
+        int before = tcp_calls;
+        forget_sent();
+        h.high_port++; su.high_port++;
+        d2k_sched_event(s, &h);
+        su.planned = D2K_LINK_PLANNED_NO;
+        d2k_sched_event(s, &su); drain();
+        CHECK(sent_command_count(D2K_CMD_ARM_SHAPE, NULL, 0) == 1,
+              "unplanned suspicious flow must request snapshot without discarding binding");
+        d2k_sched_event(s, &sh); spin(s, 10);
+        CHECK(tcp_calls == before, "same TLS shape must not trigger a new measurement");
+        d2k_sched_event(s, &su);
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "versions.example",
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "legacy snapshot");
+        sh.family = family == 4 ? 6 : 4;
+        d2k_sched_event(s, &sh); spin(s, 10);
+        CHECK(tcp_calls == before, "other address family cannot resolve pending TLS snapshot");
+        sh.family = (uint8_t)family;
+        d2k_sched_event(s, &sh); settle(s);
+        CHECK(tcp_calls > before && ver_last_shape == D2K_SHAPE_LEGACY,
+              "blocked TLS1.2 must be measured and verified as TLS1.2 after TLS1.3");
+        ap = ev_applied(6, 41017); ap.family = h.family;
+        memcpy(ap.low_ip, h.low_ip, 16); memcpy(ap.high_ip, h.high_ip, 16);
+        d2k_sched_event(s, &ap); spin(s, 40);
+        unsigned modern = 0, legacy = 0;
+        for (size_t b = 0; b < c.n_boxes; b++) {
+            for (size_t j = 0; j < c.boxes[b].n_binds; j++) {
+                const d2k_cat_binding *bd = &c.boxes[b].binds[j];
+                modern += bd->shape == D2K_SHAPE_MODERN;
+                legacy += bd->shape == D2K_SHAPE_LEGACY;
+            }
+        }
+        CHECK(modern == 1 && legacy == 1, "both TLS bindings must survive confirmation");
+        before = tcp_calls;
+        d2k_sched_event(s, &su);
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "versions.example",
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "returning modern snapshot");
+        d2k_sched_event(s, &sh); spin(s, 10);
+        CHECK(tcp_calls == before, "already covered TLS1.3 must not be measured again after TLS1.2");
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    tcp_owns_search = tcp_found_arm = 0;
+    if (shape_only) { goto voice_only_done; }
 
 question_test:
     /* --- вопросы о свойствах: задаются, проходят, и ответ меняет план --- */
