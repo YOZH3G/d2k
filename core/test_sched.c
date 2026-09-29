@@ -548,22 +548,41 @@ static size_t collect_addr_probes(uint8_t dst[][4], uint8_t trial[][D2K_TRIAL_ID
     return found;
 }
 
-/* Идентификатор ПОСЛЕДНЕГО отправленного плана — прямо с провода.
- *
- * Планировщик подставляет его в запись REC_ID кандидата перед отправкой
- * (install_next, sched.c) байтами ASCII "plan-xxxxxxxx", добитыми нулями до
- * шестнадцати. Тест ищет эти байты в отправленной команде, а не вычисляет их
- * заново: вторая реализация правила разошлась бы с первой молча, и тест
- * проверял бы себя. Возвращает 1, если нашёл. */
+/* Read the last REC_ID from complete command frames. Trial IDs are binary,
+   not a printable catalog hash; never derive the expectation from the plan. */
 static int last_plan_id(uint8_t out[16]) {
-    if (sent_len < 16) { return 0; }
-    for (size_t i = sent_len - 16 + 1; i-- > 0;) {
-        if (memcmp(sentbuf + i, "plan-", 5) == 0) {
-            memcpy(out, sentbuf + i, 16);
-            return 1;
+    int found = 0;
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3];
+        if (n < 2 || n > sent_len - off - 4) break;
+        uint16_t type = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
+        const uint8_t *body = p + 6;
+        size_t len = n - 2, start = len;
+        if ((type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) && len) {
+            start = 3u + body[0] + (type == D2K_CMD_SET_NAME_PROBE ? 2u : 0u);
+        } else if (type == D2K_CMD_SET_ADDR) {
+            start = 17;
+        } else if (type == D2K_CMD_SET_ADDR_PROBE) {
+            start = 58;
         }
+        if (start <= len && len - start >= 12 && !memcmp(body + start, "D2KP", 4)) {
+            for (size_t at = start + 12; at + 4 <= len;) {
+                unsigned record = ((unsigned)body[at] << 8) | body[at + 1];
+                size_t size = ((size_t)body[at + 2] << 8) | body[at + 3];
+                at += 4;
+                if (size > len - at) break;
+                if (record == 1 && size == 16) {
+                    memcpy(out, body + at, 16);
+                    found = 1;
+                }
+                at += size;
+            }
+        }
+        off += 4 + n;
     }
-    return 0;
+    return found;
 }
 
 /* Событие применения ПО КЛЮЧУ ПОТОКА ЗОНДА и с идентификатором того плана,
@@ -2918,6 +2937,8 @@ admission_only_run:
         CHECK(ver_calls == 1, "кандидат не испытан");
         CHECK(said("жду применения плана"),
               "зонд дошёл до приложения, а применения плана никто не ждёт");
+        uint8_t first_attempt_id[D2K_PLAN_ID_LEN], second_attempt_id[D2K_PLAN_ID_LEN];
+        CHECK(last_plan_id(first_attempt_id), "first trial identity captured from wire");
 
         /* Связь сообщает о потерях, и события применения так и нет: считать
            это уликой против кандидата нельзя — испытываем его ЕЩЁ РАЗ. */
@@ -2931,7 +2952,16 @@ admission_only_run:
         CHECK(said("молчание не в счёт"),
               "потери событий не учтены — молчание засчитано как улика против кандидата");
         CHECK(ver_calls == 2, "кандидат не испытан повторно, хотя связь теряла события");
+        CHECK(last_plan_id(second_attempt_id), "second trial identity captured from wire");
+        CHECK(memcmp(first_attempt_id, second_attempt_id, sizeof first_attempt_id) != 0,
+              "retry of the same plan must not inherit the previous trial identity");
         CHECK(total_bindings(&c9) == 0, "потеря событий записана как успех");
+        d2k_ev delayed = ev_applied(6, 40070);
+        memcpy(delayed.plan_id, first_attempt_id, sizeof delayed.plan_id);
+        d2k_sched_event(s, &delayed);
+        spin(s, 20);
+        CHECK(total_bindings(&c9) == 0,
+              "late APPLIED from previous trial cannot confirm reused tuple and plan");
 
         /* А когда потерь больше нет — кандидат честно сменяется, и поиск
            доходит до конца очереди сам. */
@@ -3722,7 +3752,7 @@ admission_only_run:
 
         /* Датапат говорит, что план применился к пакетам ЭТОГО потока. */
         d2k_ev ap = ev_applied(6, 40090);
-        CHECK(ap.plan_id[0] != 0,
+        CHECK(memcmp(ap.plan_id, (const uint8_t[16]){0}, 16) != 0,
               "кандидат ушёл на провод без идентификатора — сверять применение нечем");
         d2k_sched_event(s, &ap);
         spin(s, 40);
@@ -3804,7 +3834,7 @@ admission_only_run:
         d2k_ev hc = ev_hello(6, 40161, "непереносимая.цель");
         d2k_sched_event(s, &hc);
         d2k_ev big = ev_refused(6, 40161, D2K_REFUSE_TOO_LONG, 1);
-        CHECK(big.plan_id[0] != 0,
+        CHECK(memcmp(big.plan_id, (const uint8_t[16]){0}, 16) != 0,
               "кандидат ушёл на провод без идентификатора — приписать отказ нечему");
         d2k_sched_event(s, &big);
 

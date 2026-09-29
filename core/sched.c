@@ -1953,29 +1953,20 @@ static int install_next(d2k_sched *s, task *t) {
            Пишется только подтверждённый зондом, в verify_confirm ниже. */
         char err[160];
 
-        /* Кандидат уходит на провод СО СВОИМ идентификатором — тем же, под
-           которым он ляжет в каталог.
-
-           Без этого шага сверять было бы нечего: d2k_compose печатает в шапке
-           плана НУЛЕВОЙ REC_ID (emit_header, compose.c — перенос Go-стороны,
-           где идентификатор каталога считается позже хэшем текста), и событие
-           применения несло бы нули у КАЖДОГО кандидата. «Применился наш» стало
-           бы неотличимо от «применился предыдущий, чьё событие опоздало», —
-           ровно то, ради чего идентификатор в событие и завели (d2k_link.h).
-
-           Подставляется в КОПИЮ текста, а не в сам план задачи: в каталог
-           обязан лечь тот текст, который выдал d2k_compose, иначе его
-           собственный хэш перестанет сходиться с идентификатором. */
+        /* Stamp only the wire copy. The catalog retains the original plan
+           text and its stable hash, independently of this trial's identity. */
         static char wire[sizeof t->plans[0]];
-        char cat_id[40];
-        plan_ident(text, cat_id, sizeof cat_id, t->ver_plan_id);
+        /* Catalog identity describes the plan; wire identity describes THIS
+           attempt. Reusing the hash lets a delayed APPLIED acknowledge a
+           different attempt after the kernel reuses its source port. */
+        if (fresh_trial_id(t->ver_plan_id) != 0) {
+            say(s, "по %s не удалось создать идентификатор опыта", t->name);
+            return -2;
+        }
         snprintf(wire, sizeof wire, "%s", text);
         if (stamp_plan_id(wire, t->ver_plan_id) != 0) {
-            /* Строки id в тексте нет — подставить некуда. Кандидата всё равно
-               ставим: испытание тогда опирается на один ключ потока. Это
-               слабее, но не ложь; нули здесь значат ровно то же, что нули в
-               событии, — «плану нечем представиться» (d2k_link.h). */
-            memset(t->ver_plan_id, 0, sizeof t->ver_plan_id);
+            say(s, "по %s кандидат без идентичности опыта не устанавливаю", t->name);
+            return -2;
         }
 
         /* d2k_compose выдаёт ТЕКСТ, датапат принимает hex от TLV — перевод
@@ -3569,7 +3560,11 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     }
     int unfit_here = 0;
     for (size_t k = 0; k < t->unfit_seen; k++) {
-        if (memcmp(t->unfit_plan_id[k], wire_id, D2K_PLAN_ID_LEN) == 0) { unfit_here = 1; break; }
+        if (memcmp(t->unfit_plan_id[k], wire_id, D2K_PLAN_ID_LEN) == 0 ||
+            memcmp(t->unfit_plan_id[k], t->ver_plan_id, D2K_PLAN_ID_LEN) == 0) {
+            unfit_here = 1;
+            break;
+        }
     }
     if (unfit_here) {
         say(s, "по %s план %s зонду исполнился, а потоку клиента — нет "

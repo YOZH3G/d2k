@@ -122,6 +122,34 @@ int main(void) {
         CHECK(d2k_plantab_del_addr_probe(t, &f, trial) == 1, "IPv6 cleanup failed");
         d2k_plantab_free(t);
     }
+    {
+        d2k_plantab *t = d2k_plantab_new(8);
+        const uint8_t old[] = "old.example", next[] = "new.example";
+        d2k_plan *confirmed = mkplan(), *prior = mkplan(), *current = mkplan();
+        d2k_plan *udp = mkplan(), *ipv4 = mkplan();
+        CHECK(d2k_plantab_set_name_family(t, old, 11, 1, confirmed,
+                  D2K_PLAN_SHAPE_MODERN, 0, 6) == 0, "confirmed port-reuse fixture");
+        CHECK(d2k_plantab_set_name_family(t, old, 11, 2, prior,
+                  D2K_PLAN_SHAPE_MODERN, 123, 6) == 0, "old probe owner");
+        CHECK(d2k_plantab_set_name_family(t, old, 11, 2, udp,
+                  D2K_PLAN_SHAPE_QUIC, 123, 6) == 0, "independent UDP port owner");
+        CHECK(d2k_plantab_set_name_family(t, old, 11, 2, ipv4,
+                  D2K_PLAN_SHAPE_MODERN, 123, 4) == 0, "independent IPv4 port owner");
+        CHECK(d2k_plantab_set_name_family(t, next, 11, 3, current,
+                  D2K_PLAN_SHAPE_MODERN, 123, 6) == 0, "new probe owner");
+        CHECK(d2k_plantab_find_family(t, NULL, 0, 0, 4,
+                  D2K_PLAN_SHAPE_MODERN, 123, 6) == current,
+              "reused probe port must not select old target's trial");
+        CHECK(d2k_plantab_count(t) == 4, "only the old TCP IPv6 port owner must be retired");
+        CHECK(d2k_plantab_find_family(t, NULL, 0, 0, 4,
+                  D2K_PLAN_SHAPE_QUIC, 123, 6) == udp, "TCP reuse preserves UDP owner");
+        CHECK(d2k_plantab_find_family(t, NULL, 0, 0, 4,
+                  D2K_PLAN_SHAPE_MODERN, 123, 4) == ipv4, "IPv6 reuse preserves IPv4 owner");
+        CHECK(d2k_plantab_find_family(t, old, 11, 0, 4,
+                  D2K_PLAN_SHAPE_MODERN, 0, 6) == confirmed,
+              "port reuse must preserve confirmed strategies");
+        d2k_plantab_free(t);
+    }
     /* --- поиск по имени и по адресу ---------------------------------------- */
     {
         d2k_plantab *t = d2k_plantab_new(8);
@@ -421,12 +449,13 @@ int main(void) {
                       == probe_plan,
                   "зонд без собранного SNI потерял свой план по порту");
             const uint8_t other[] = "other.example";
-            CHECK(d2k_plantab_set_name_probe(t, other, sizeof other - 1, 2, mkplan(),
+            d2k_plan *next_probe = mkplan();
+            CHECK(d2k_plantab_set_name_probe(t, other, sizeof other - 1, 2, next_probe,
                                              D2K_PLAN_SHAPE_MODERN, sport) == 0,
                   "второй тестовый план не поставился");
             CHECK(d2k_plantab_find_sport(t, NULL, 0, 0, 2, D2K_PLAN_SHAPE_MODERN, sport)
-                      == NULL,
-                  "неоднозначный пустой SNI выбрал чужой тестовый план");
+                      == next_probe,
+                  "переиспользованный порт не перешёл новому владельцу");
             /* Чужой поток — НЕ получает: для него этой записи нет вовсе. */
             CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 3, D2K_PLAN_SHAPE_MODERN, 0x9988)
                       == NULL,
@@ -445,11 +474,11 @@ int main(void) {
             CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 7, D2K_PLAN_SHAPE_MODERN, 0x9988)
                       == common,
                   "чужой поток не получил подтверждённый план");
-            /* А поток зонда всё ещё судит испытуемый: иначе испытание мерило
-               бы не то, что поставили. */
+            /* The old name no longer owns this probe port. Its confirmed
+               strategy remains usable, but its retired trial cannot return. */
             CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 8, D2K_PLAN_SHAPE_MODERN, sport)
-                      == probe_plan,
-                  "поток зонда перестал получать испытуемый план");
+                      == common,
+                  "старый владелец порта получил уже снятый пробный план");
             d2k_plantab_free(t);
         }
     }

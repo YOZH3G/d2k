@@ -310,6 +310,14 @@ int d2k_plantab_set_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
     return d2k_plantab_set_name_family(t, name, len, now_ns, p, shape, sport_be, 4);
 }
 
+static int drop(d2k_plantab *t, entry *e);
+
+static uint8_t probe_transport(const d2k_plan *p, uint8_t shape) {
+    uint8_t transport = d2k_plan_transport(p);
+    if (transport) return transport;
+    return shape == D2K_PLAN_SHAPE_QUIC || shape == D2K_PLAN_SHAPE_VOICE ? 17 : 6;
+}
+
 int d2k_plantab_set_name_family(d2k_plantab *t, const uint8_t *name, size_t len,
     uint64_t now_ns, d2k_plan *p, uint8_t shape, uint16_t sport_be, uint8_t family) {
     if (!t || !name || len == 0 || len > D2K_TARGET_NAME_MAX ||
@@ -318,6 +326,22 @@ int d2k_plantab_set_name_family(d2k_plantab *t, const uint8_t *name, size_t len,
         return -2;
     }
     t->revision++;
+    /* The controller reserves this local port exclusively. Reuse transfers
+       ownership, even if the previous task missed its cleanup. Do not leave
+       two candidates for an as-yet unnamed ClientHello on that same socket. */
+    if (sport_be) {
+        uint8_t transport = probe_transport(p, shape);
+        for (size_t i = 0; i < t->used;) {
+            entry *old = &t->v[i];
+            if (old->kind == KEY_NAME && old->family == family &&
+                old->only_sport == sport_be &&
+                probe_transport(old->plan, old->shape) == transport) {
+                (void)drop(t, old);
+            } else {
+                i++;
+            }
+        }
+    }
     /* Своя запись на КАЖДУЮ ИЗМЕРЕННУЮ форму этого имени — см.
        find_name_shape выше. Прежде запись была одна на имя, и вторая
        привязка (например, QUIC) затирала первую (TCP).
