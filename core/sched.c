@@ -1226,11 +1226,8 @@ static void *worker_run(void *vp) {
     }
 
     if (t->job == JOB_CONTACT) {
-        /* ОДНО обращение к цели — общее с d2kask (d2k_props_contact,
-           compose.c): непомеченное (иначе только что поставленный план-вопрос
-           прошёл бы мимо очереди нетронутым) и с ОТКРЫТЫМ сокетом наружу
-           (иначе FIN удалит ячейку потока раньше ответа сервера, и обмену не
-           с чем будет связаться). Закрывает сокет цикл, после ожидания. */
+        /* Keep the reserved, controller-marked socket open until the reply
+           is judged. Its mark selects the probe queue, not the raw bypass. */
         uint8_t local_addr[16] = {0};
         uint16_t lport = 0;
         int fd = -1;
@@ -1656,6 +1653,11 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         if (plan_tlv_stamp_ident(planbuf, plan_len, t->prop_plan_id) != 0) {
             continue; /* раскладка не та — вопрос без идентичности не задаём */
         }
+        if (fresh_trial_id(t->prop_plan_id) != 0) {
+            continue;
+        }
+        /* stamp_ident above validated the first REC_ID at header12+record4. */
+        memcpy(planbuf + 16, t->prop_plan_id, D2K_PLAN_ID_LEN);
         static const char digits[] = "0123456789abcdef";
         for (size_t i = 0; i < plan_len; i++) {
             hex[2 * i] = digits[planbuf[i] >> 4];
@@ -1682,6 +1684,13 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
             }
             t->prop_bound_fd = bfd;
             t->prop_sport_be = bsp;
+        }
+        if (s->mark && d2k_sched_mark_hook(t->prop_bound_fd, s->mark) != 0) {
+            say(s, "по %s сокет вопроса не помечен — опыт не запускаю", t->name);
+            close(t->prop_bound_fd);
+            t->prop_bound_fd = -1;
+            t->prop_sport_be = 0;
+            continue;
         }
         /* Форма приветствия вопроса — та же, что у снятого триггера. */
         if (d2k_link_set_name_family(s->link_fd, t->name, t->transport, hex,

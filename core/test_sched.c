@@ -822,8 +822,9 @@ int main(int argc, char **argv) {
     int voice_only = argc == 2 && strcmp(argv[1], "--voice-only") == 0;
     int rst_only = argc == 2 && strcmp(argv[1], "--rst-only") == 0;
     int admission_only = argc == 2 && strcmp(argv[1], "--admission-only") == 0;
-    if (argc > 1 && !voice_only && !rst_only && !admission_only) {
-        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only]\n");
+    int question_only = argc == 2 && strcmp(argv[1], "--question-only") == 0;
+    if (argc > 1 && !voice_only && !rst_only && !admission_only && !question_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only]\n");
         return 2;
     }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
@@ -872,6 +873,8 @@ int main(int argc, char **argv) {
 
     d2k_catalog cat;
     memset(&cat, 0, sizeof cat);
+    uint8_t question_prev_id[D2K_PLAN_ID_LEN] = {0};
+    if (question_only) { goto question_test; }
     {
         d2k_catalog empty = {0};
         d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
@@ -2426,8 +2429,9 @@ admission_only_run:
         d2k_catalog_free(&c2);
     }
 
+question_test:
     /* --- вопросы о свойствах: задаются, проходят, и ответ меняет план --- */
-    {
+    for (int question_run = 0; question_run < 2; question_run++) {
         /* Что здесь проверяется. На вердикт «решает содержимое» разрез коробку
            не берёт — и до появления вопросов планировщик получал от
            d2k_compose РОВНО ОДИН запасной план (пустой вектор), ставил его и
@@ -2473,6 +2477,7 @@ admission_only_run:
         tcp_answer = D2K_V_OPAQUE;
 
         d2k_ev h = ev_hello(6, 40060, "непрозрачная.цель");
+        mark_calls = 0;
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(6, 40060);
         d2k_sched_event(s, &su);
@@ -2483,6 +2488,15 @@ admission_only_run:
         }
         CHECK(said("спрашиваю коробку о свойствах"),
               "на вердикт «решает содержимое» вопросы о свойствах не начались");
+        CHECK(mark_calls > 0 && last_mark == 0x2d,
+              "property question socket must carry the controller probe mark");
+        uint8_t question_id[D2K_PLAN_ID_LEN] = {0};
+        CHECK(last_plan_id(question_id), "question identity captured from wire");
+        if (question_run) {
+            CHECK(memcmp(question_prev_id, question_id, sizeof question_id) != 0,
+                  "same property question in a new task must have a new trial identity");
+        }
+        memcpy(question_prev_id, question_id, sizeof question_id);
 
         /* Подтверждения команды планировщик не ждёт и ждать не может: события
            у датапата лосси по контракту, и привязать ack к своей команде по
@@ -2583,6 +2597,7 @@ admission_only_run:
         tcp_answer = D2K_V_OPAQUE;
     }
 
+    if (question_only) { goto voice_only_done; }
     /* --- узнанная коробка отдаёт свои планы, и успех идёт ЕЙ ----------- */
     {
         d2k_catalog c6;
