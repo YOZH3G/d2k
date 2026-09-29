@@ -40,6 +40,7 @@
 #include "d2k_nfq.h"
 #include "d2k_nl.h"
 #include "d2k_quic.h"
+#include "d2k_packet.h"
 
 #define NF_DROP   0u
 #define NF_ACCEPT 1u
@@ -49,7 +50,7 @@
 
 typedef struct {
     int      used;
-    uint8_t  a_ip[4], b_ip[4];
+    uint8_t  family, a_ip[16], b_ip[16];
     uint16_t a_port, b_port;
     uint32_t base_seq;
     int      have_base;
@@ -62,11 +63,12 @@ typedef struct {
 static flow flows[FLOWS];
 static unsigned long long n_seen, n_dropped_name, n_dropped_ttl, n_pass;
 
-static flow *flow_of(const uint8_t *ip, const uint8_t *tcp) {
+static flow *flow_of(const d2k_packet_view *ip, const uint8_t *tcp) {
     for (size_t i = 0; i < FLOWS; i++) {
         flow *f = &flows[i];
         if (!f->used) { continue; }
-        if (memcmp(f->a_ip, ip + 12, 4) == 0 && memcmp(f->b_ip, ip + 16, 4) == 0 &&
+        if (f->family == ip->family &&
+            memcmp(f->a_ip, ip->src.bytes, 16) == 0 && memcmp(f->b_ip, ip->dst.bytes, 16) == 0 &&
             f->a_port == (uint16_t)((uint16_t)tcp[0] << 8 | tcp[1]) &&
             f->b_port == (uint16_t)((uint16_t)tcp[2] << 8 | tcp[3])) {
             return f;
@@ -77,8 +79,9 @@ static flow *flow_of(const uint8_t *ip, const uint8_t *tcp) {
         if (f->used) { continue; }
         memset(f, 0, sizeof *f);
         f->used = 1;
-        memcpy(f->a_ip, ip + 12, 4);
-        memcpy(f->b_ip, ip + 16, 4);
+        f->family = ip->family;
+        memcpy(f->a_ip, ip->src.bytes, 16);
+        memcpy(f->b_ip, ip->dst.bytes, 16);
         f->a_port = (uint16_t)((uint16_t)tcp[0] << 8 | tcp[1]);
         f->b_port = (uint16_t)((uint16_t)tcp[2] << 8 | tcp[3]);
         return f;
@@ -169,7 +172,7 @@ static int found_name(const flow *f, const char *name) {
 
 typedef struct {
     int      used;
-    uint32_t sip, dip;
+    uint8_t family, sip[16], dip[16];
     uint16_t sport, dport;
     int      decided;   /* первая датаграмма уже разобрана */
     int      blocked;   /* и разобрана как «наше имя» — поток закрыт целиком */
@@ -177,27 +180,27 @@ typedef struct {
 
 static uflow g_uflows[UFLOWS];
 
-static uflow *uflow_of(uint32_t sip, uint16_t sport, uint32_t dip, uint16_t dport) {
+static uflow *uflow_of(const d2k_packet_view *ip, uint16_t sport, uint16_t dport) {
     uflow *free_slot = NULL;
     for (size_t i = 0; i < UFLOWS; i++) {
         uflow *f = &g_uflows[i];
         if (!f->used) { if (!free_slot) { free_slot = f; } continue; }
-        if (f->sip == sip && f->dip == dip && f->sport == sport && f->dport == dport) {
+        if (f->family == ip->family && !memcmp(f->sip, ip->src.bytes, 16) &&
+            !memcmp(f->dip, ip->dst.bytes, 16) && f->sport == sport && f->dport == dport) {
             return f;
         }
     }
     if (!free_slot) { return NULL; }   /* таблица полна — коробка просто смотрит всё */
     free_slot->used = 1;
-    free_slot->sip = sip; free_slot->dip = dip;
+    free_slot->family = ip->family;
+    memcpy(free_slot->sip, ip->src.bytes, 16);
+    memcpy(free_slot->dip, ip->dst.bytes, 16);
     free_slot->sport = sport; free_slot->dport = dport;
     free_slot->decided = 0;
     free_slot->blocked = 0;
     return free_slot;
 }
 
-static uint32_t rd32be(const uint8_t *p) {
-    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
-}
 static uint16_t rd16be(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] << 8 | p[1]); }
 
 static volatile sig_atomic_t stop_now;
@@ -272,25 +275,26 @@ int main(int argc, char **argv) {
             d2k_nl_pkt p;
             if (d2k_nl_packet(&m, &p) != 0 || !p.have_hdr) { continue; }
             uint32_t verdict = NF_ACCEPT;
+            d2k_packet_view view;
+            int parsed = p.have_payload && !p.truncated &&
+                         d2k_packet_parse(p.payload, p.payload_len, &view);
             /* QUIC: имя лежит в ЗАШИФРОВАННОМ Initial, и настоящая коробка
                достаёт его ровно так же, как мы — ключами, выведенными из
                идентификатора соединения, который лежит открытым текстом
                (RFC 9001 §5.2). Никакой сборки потока здесь не нужно: у
                датаграммы её нет, и весь смысл плеча QUIC в том, чтобы имя
                в собранном коробкой Initial оказалось не тем. */
-            if (quic_mode && p.have_payload && !p.truncated && p.payload_len >= 28 &&
-                (p.payload[0] >> 4) == 4 && p.payload[9] == 17) {
+            if (quic_mode && parsed && view.protocol == 17) {
                 const uint8_t *ip = p.payload;
-                size_t ihl = (size_t)(ip[0] & 0x0F) * 4;
-                if (ihl >= 20 && p.payload_len > ihl + 8) {
+                size_t ihl = view.l4;
+                if (view.total > ihl + 8) {
                     const uint8_t *udp = ip + ihl;
-                    size_t plen = p.payload_len - ihl - 8;
+                    size_t plen = view.total - ihl - 8;
                     n_seen++;
                     int look = 1;
                     uflow *f = NULL;
                     if (first_only) {
-                        f = uflow_of(rd32be(ip + 12), rd16be(udp + 0),
-                                     rd32be(ip + 16), rd16be(udp + 2));
+                        f = uflow_of(&view, rd16be(udp + 0), rd16be(udp + 2));
                         if (f) { look = !f->decided; }
                     }
                     char sni[256];
@@ -328,7 +332,7 @@ int main(int argc, char **argv) {
                             verdict = NF_DROP;
                             n_dropped_name++;
                         }
-                    } else if (ip[8] <= (uint8_t)hops) {
+                    } else if (view.hop_limit <= (uint8_t)hops) {
                         /* Смерть по TTL — это СЕТЬ, а не решение коробки, и
                            она случается независимо от того, смотрела коробка
                            эту датаграмму или уже приняла решение по потоку. */
@@ -341,17 +345,16 @@ int main(int argc, char **argv) {
                 (void)d2k_nfq_verdict(q, p.id, verdict, err, sizeof err);
                 continue;
             }
-            if (p.have_payload && !p.truncated && p.payload_len >= 40 &&
-                (p.payload[0] >> 4) == 4 && p.payload[9] == 6) {
+            if (parsed && view.protocol == 6) {
                 const uint8_t *ip = p.payload;
-                size_t ihl = (size_t)(ip[0] & 0x0F) * 4;
-                if (ihl >= 20 && p.payload_len > ihl + 20) {
+                size_t ihl = view.l4;
+                if (view.total >= ihl + 20) {
                     const uint8_t *tcp = ip + ihl;
                     size_t doff = (size_t)(tcp[12] >> 4) * 4;
-                    if (doff >= 20 && p.payload_len >= ihl + doff) {
+                    if (doff >= 20 && view.total >= ihl + doff) {
                         n_seen++;
-                        flow *f = flow_of(ip, tcp);
-                        size_t plen = p.payload_len - ihl - doff;
+                        flow *f = flow_of(&view, tcp);
+                        size_t plen = view.total - ihl - doff;
                         uint32_t seq = (uint32_t)tcp[4] << 24 | (uint32_t)tcp[5] << 16 |
                                        (uint32_t)tcp[6] << 8 | tcp[7];
                         /* Начало потока берётся у SYN, как у настоящей коробки:
@@ -379,7 +382,7 @@ int main(int argc, char **argv) {
                         if (hit) {
                             verdict = NF_DROP;
                             n_dropped_name++;
-                        } else if (ip[8] <= (uint8_t)hops) {
+                        } else if (view.hop_limit <= (uint8_t)hops) {
                             /* Коробка это ВИДЕЛА (сборка уже отравлена), но до
                                сервера пакет не доживёт: расстояние. */
                             verdict = NF_DROP;

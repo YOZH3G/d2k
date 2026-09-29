@@ -30,8 +30,9 @@ class Server(QuicConnectionProtocol):
 async def main():
     config = QuicConfiguration(is_client=False, alpn_protocols=H3_ALPN)
     config.load_cert_chain(sys.argv[1], sys.argv[2])
-    server = await serve("::1", 4444, configuration=config, create_protocol=Server)
-    print("HTTP/3 ready on [::1]:4444", flush=True)
+    address = sys.argv[3] if len(sys.argv) > 3 else "::1"
+    server = await serve(address, 4444, configuration=config, create_protocol=Server)
+    print(f"HTTP/3 ready on [{address}]:4444", flush=True)
     try:
         await asyncio.Event().wait()
     finally:
