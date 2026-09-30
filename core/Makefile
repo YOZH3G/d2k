@@ -62,6 +62,17 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 HDR += include/d2k_ip6frag_send.h
 HDR += profiles/rx_fake.h
 HDR += include/d2k_resource.h
+HDR += include/d2k_domain.h include/d2k_groups.h
+
+.PHONY: test-domain test-groups
+test-domain: test_domain
+	./test_domain
+test_domain: test_domain.c domain.c include/d2k_domain.h profiles/psl_index.h
+	$(CC) $(CFLAGS) -o $@ test_domain.c domain.c $(LDFLAGS)
+test-groups: test_groups
+	./test_groups
+test_groups: test_groups.c groups.c domain.c include/d2k_groups.h include/d2k_domain.h profiles/psl_index.h
+	$(CC) $(CFLAGS) -o $@ test_groups.c groups.c domain.c $(LDFLAGS)
 TESTHDR = test_stand.h
 
 # test_d2kask — ЧЁРНЫЙ ЯЩИК (см. её шапку): не общий стенд test_stand.h сам
@@ -70,6 +81,8 @@ TESTHDR = test_stand.h
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
 TESTS   = test_stun test_voice test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_fresh_repeats test_quic_arms test_ipfrag test_quic_original_arms test_quic_run_order test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify test_measured
 TESTS += test_ech
+TESTS += test_domain test_groups
+check: test-domain test-groups
 
 test_ech: test_ech.c verify.o tls12.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
