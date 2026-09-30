@@ -1564,7 +1564,8 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     /* Повтор приветствия: тот же номер последовательности с той же стороны.
        Клиент повторяет, когда ответа нет, — самая дешёвая улика из доступных,
        и видна она в направлении, которое и так наблюдается. */
-    if (fwd && fl->saw_hello && in_seq == fl->hello_seq) {
+    if (fwd && fl->saw_hello && in_seq == fl->hello_seq &&
+        !fl->rev_server_hello && !(fl->rev_types & (uint8_t)(1u << (23 - 20)))) {
         fl->hello_repeats++;
         if (fl->hello_repeats >= 2) {
             suspect(s, now_ns, &key, fl, D2K_SUSPECT_REPEAT, NULL);

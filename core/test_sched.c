@@ -1050,23 +1050,40 @@ static d2k_cat_binding *binding_mut(d2k_catalog *c, const char *target, uint8_t 
    его вызывающий и смотрит; планировщик после прохода закрывается, потому что
    проверяется именно НАКОПЛЕННОЕ в файле, а не живое состояние задачи. Порт
    клиента задаёт вызывающий: по нему сходятся зонд и событие. */
-static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
-                         uint16_t cport) {
+static void confirm_transport(d2k_catalog *cat, int link_fd, const char *target,
+                              uint16_t cport, uint8_t transport) {
     d2k_sched *s = d2k_sched_new(cat, link_fd, 0x2d);
     if (!s) { CHECK(0, "планировщик не завёлся"); return; }
     d2k_sched_set_say(s, collect_say, NULL);
     ver_answer_port = cport;
     ver_calls = 0;
     forget_sent();
-    d2k_ev h = ev_hello(6, cport, target);
+    d2k_ev h = ev_hello(transport, cport, target);
     d2k_sched_event(s, &h);
-    d2k_ev su = ev_suspect(6, cport);
+    d2k_ev su = ev_suspect(transport, cport);
     d2k_sched_event(s, &su);
     settle(s);
-    d2k_ev ap = ev_applied(6, cport);
+    d2k_ev ap = ev_applied(transport, cport);
     d2k_sched_event(s, &ap);
     spin(s, 40);
+    char live_path[] = "/tmp/d2k-confirmed-live-XXXXXX";
+    int live_fd = mkstemp(live_path);
+    CHECK(live_fd >= 0, "confirmed live fixture");
+    if (live_fd >= 0) {
+        close(live_fd);
+        CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "confirmed live write");
+        FILE *live = fopen(live_path, "r"); char body[32768] = {0};
+        if (live) { fread(body, 1, sizeof body - 1, live); fclose(live); }
+        CHECK(!strstr(body, "подтверждено, смотрим живой трафик"),
+              "confirmed passive watcher must not be exported as an ongoing search");
+        unlink(live_path);
+    }
     d2k_sched_free(s);
+}
+
+static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
+                         uint16_t cport) {
+    confirm_transport(cat, link_fd, target, cport, 6);
 }
 
 int main(int argc, char **argv) {
@@ -1236,7 +1253,35 @@ int main(int argc, char **argv) {
               !d2k_group_match(c.groups, "unfit.googlevideo.com", &key) &&
               d2k_group_match(c.groups, "rr-other.googlevideo.com", &key),
               "runtime failure exception survives restore without losing siblings");
-        d2k_sched_free(s); d2k_catalog_free(&c); close(sv[0]); close(sv[1]);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        d2k_catalog qc = {0};
+        quic_answer = D2K_V_OPAQUE;
+        confirm_transport(&qc, sv[0], "q-a.googlevideo.com", 40401, 17);
+        confirm_transport(&qc, sv[0], "q-b.googlevideo.com", 40402, 17);
+        confirm_transport(&qc, sv[0], "q-c.googlevideo.com", 40403, 17);
+        d2k_group_key qkey = {0}; qkey.transport=17; qkey.family=4; qkey.shape=3;
+        strcpy(qkey.probe_path,"/");
+        CHECK(d2k_group_match(qc.groups,"q-new.googlevideo.com",&qkey),
+              "three own QUIC outcomes teach their own family, not TCP's");
+        s=d2k_sched_new(&qc,sv[0],0x2d); spin(s,1);
+        tcp_block_until_stop=1; tcp_calls=quic_calls=0;
+        for (uint16_t port=40411; port<40413; port++) {
+            d2k_ev busy=ev_hello(6,port,port==40411?"busy-a.example":"busy-b.example");
+            d2k_sched_event(s,&busy);
+            d2k_ev suspect=ev_suspect(6,port); d2k_sched_event(s,&suspect);
+        }
+        h=ev_hello(17,40414,"q-new.googlevideo.com"); d2k_sched_event(s,&h);
+        su=ev_suspect(17,40414); su.planned=D2K_LINK_PLANNED_NO;
+        d2k_sched_event(s,&su); spin(s,2);
+        CHECK(d2k_sched_active(s)==3,"uncovered QUIC suspicion is queued before area ACK");
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        ack.code=D2K_CMD_SET_SUFFIX; ack.num=1u<<8; area_ack_id(&ack);
+        skip_ahead(s,10); d2k_sched_event(s,&ack); spin(s,2);
+        CHECK(d2k_sched_active(s)==2 && quic_calls==0,
+              "newly installed family retires older unplanned QUIC queue without a probe");
+        CHECK(!binding_of(&qc,"q-new.googlevideo.com",17),"queue adoption creates no exact enrollment");
+        tcp_block_until_stop=0;
+        d2k_sched_free(s); d2k_catalog_free(&qc); close(sv[0]); close(sv[1]);
         return fails ? 1 : 0;
     }
     uint8_t question_prev_id[D2K_PLAN_ID_LEN] = {0};
@@ -2031,6 +2076,7 @@ admission_only_run:
         tcp_saw_stop = 0;
         CHECK(s != NULL, "планировщик ограничения нагрузки не завёлся");
         if (s) {
+            spin(s, 1); /* Establish the monotonic/wall clock before admission. */
             for (uint16_t i = 0; i < 3; i++) {
                 char name[48];
                 uint16_t port = (uint16_t)(41030 + i);
@@ -2045,6 +2091,23 @@ admission_only_run:
                   "всплеск запустил больше двух сетевых замеров одновременно");
             CHECK(d2k_sched_active(s) == 3,
                   "третий сигнал потерян, а не сохранён в ограниченной очереди");
+            char live_path[] = "/tmp/d2k-queue-time-XXXXXX";
+            int live_fd = mkstemp(live_path);
+            CHECK(live_fd >= 0, "queue time fixture");
+            if (live_fd >= 0) {
+                close(live_fd);
+                CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "queue live write");
+                char body[16384] = {0}; FILE *live = fopen(live_path, "r");
+                if (live) { fread(body, 1, sizeof body - 1, live); fclose(live); }
+                const char *row = strstr(body, "burst-2.example");
+                const char *since = row ? strstr(row, "\"since\": \"") : NULL;
+                struct tm tm = {0}; time_t queued_at = 0;
+                if (since && strptime(since + strlen("\"since\": \""),
+                                      "%Y-%m-%dT%H:%M:%SZ", &tm)) queued_at = timegm(&tm);
+                CHECK(queued_at >= time(NULL) - 30 && queued_at <= time(NULL) + 30,
+                      "queued task reports its admission time, not router boot time");
+                unlink(live_path);
+            }
             tcp_block_until_stop = 0;
             d2k_sched_free(s);
         }

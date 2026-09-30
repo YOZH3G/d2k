@@ -537,6 +537,7 @@ typedef struct {
     int        search_started; /* classifier/voice measurement started, even at zero probes */
     int        cached_measure_valid; /* preserve measured candidates after box-plan reuse */
     uint8_t    trigger_code;   /* signal that admitted this measurement; cooldown key */
+    uint8_t    trigger_planned;
     /* Форма приветствия, КОТОРЫМ шёл замер, и было ли уже повторение из-за
        её расхождения со снимком. Нужны затем, что снимок настоящего клиента
        приходит уже ПОСЛЕ старта поиска: первый поиск идёт профилем холодного
@@ -677,6 +678,7 @@ typedef struct {
     char name[256], plan_id[40];
     uint8_t kind, transport, shape, family;
     uint8_t confirmed;
+    int64_t confirmed_ms;
 } installed_area;
 
 struct d2k_sched {
@@ -2990,7 +2992,9 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
     int first = 1;
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         const task *t = &s->tasks[i];
-        if (t->state == T_FREE) { continue; }
+        if (t->state == T_FREE || t->state == T_WATCHING || t->state == T_RESTING) {
+            continue; /* Passive monitoring/backoff is not an active search. */
+        }
         fputs(first ? "\n    {" : ",\n    {", f);
         first = 0;
         fputs("\"target\": ", f); json_str(f, t->name);
@@ -2999,7 +3003,9 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         fputs(", \"ip\": ", f); json_str(f, t->ip);
         fprintf(f, ", \"port\": %u", (unsigned)t->port);
         fputs(", \"phase\": ", f); json_str(f, task_phase(t));
-        fputs(", \"since\": ", f); json_time(f, wall_s(s, t->started_ms));
+        fputs(", \"since\": ", f);
+        int64_t admitted_ms = t->state == T_QUEUED ? t->queued_ms : t->started_ms;
+        json_time(f, wall_s(s, admitted_ms ? admitted_ms : s->now_ms));
         fprintf(f, ", \"attempts\": %zu, \"probes\": %d, ", t->next_plan, t->probes);
         fputs("\"candidate\": ", f);
         json_str(f, t->next_plan > 0 ? "план поставлен" : "");
@@ -3802,6 +3808,47 @@ static size_t queued_measurements(const d2k_sched *s) {
     return n;
 }
 
+/* An unplanned flow queued BEFORE a compatible area was installed cannot
+   testify against that new area. Let its next flow inherit without an old
+   backlog probe. Applied-plan failures and exact overrides remain diagnostic. */
+static int queued_family_ready(const d2k_sched *s, const task *t) {
+    const d2k_group_state *state = s->cat->groups;
+    if (!state || t->by_addr || t->trigger_planned != D2K_LINK_PLANNED_NO ||
+        !t->queued_ms) return 0;
+    uint8_t shape = t->transport == 17 ? D2K_LINK_SHAPE_QUIC : 0;
+    if (t->transport == 6 && !strcmp(s->tcp_shape_name[t->family == 6], t->name) &&
+        s->tcp_shape_len[t->family == 6]) {
+        const uint8_t *hello = s->tcp_shape[t->family == 6];
+        size_t len = s->tcp_shape_len[t->family == 6];
+        shape = d2k_hello_ech_offer(hello, len, NULL) == 1 ? D2K_LINK_SHAPE_ECH_TCP :
+            (uint8_t)d2k_hello_shape(hello, len);
+    }
+    if (!shape) return 0;
+    for (size_t bi=0; bi<s->cat->n_boxes; bi++) {
+        const d2k_cat_box *b=&s->cat->boxes[bi];
+        for (size_t j=0; j<b->n_binds; j++) {
+            const d2k_cat_binding *bd=&b->binds[j];
+            if (bd->enabled && bd->level>=3 && !strcmp(bd->kind,"name") &&
+                !strcmp(bd->target,t->name) &&
+                (bd->transport ? bd->transport : 6)==t->transport &&
+                (bd->family ? bd->family : 4)==t->family &&
+                d2k_cat_shape_fits(bd->shape,shape)) return 0;
+        }
+    }
+    for (size_t i=0; i<state->n_groups; i++) {
+        const d2k_domain_group *g=&state->groups[i]; installed_area desired;
+        if (g->key.transport!=t->transport || g->key.family!=t->family ||
+            g->key.shape!=shape || d2k_group_match(state,t->name,&g->key)!=g ||
+            !desired_area(s,i,&desired)) continue;
+        for (size_t j=0; j<s->n_areas; j++) {
+            const installed_area *a=&s->areas[j];
+            if (a->confirmed && a->confirmed_ms>t->queued_ms &&
+                area_key_same(a,&desired) && !strcmp(a->plan_id,desired.plan_id)) return 1;
+        }
+    }
+    return 0;
+}
+
 static int launch_task(d2k_sched *s, task *t) {
     t->started_ms = s->clock_seen ? s->now_ms : 0;
     t->queued_ms = 0;
@@ -4082,6 +4129,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     t->family = ev->family ? ev->family : 4;
     t->by_addr = by_addr;
     t->trigger_code = ev->code;
+    t->trigger_planned = ev->planned;
     t->fp.method = D2K_FP_METHOD;
     if (!late_app_rst) {
         d2k_cat_signal sig = signal_of(ev);
@@ -4912,6 +4960,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
                 } else if (s->areas && i < D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
                     s->areas[i] = s->area_pending;
                     s->areas[i].confirmed = 1;
+                    s->areas[i].confirmed_ms = s->now_ms;
                     if (i == s->n_areas) s->n_areas++;
                 }
             }
@@ -5122,6 +5171,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
 
         if (t->state == T_QUEUED) {
             if (t->queued_ms == 0) { t->queued_ms = now_ms; }
+            if (queued_family_ready(s,t)) {
+                say(s,"по %s прежнюю очередь снимаю: новое семейство уже установлено; "
+                      "следующий поток наследует обход без отдельного замера",t->name);
+                task_done(t); moved++; continue;
+            }
             if (now_ms - t->queued_ms > SCHED_TASK_LIFE_MS) {
                 say(s, "по %s подозрение устарело в очереди — сетевой замер не запускал",
                     t->name);

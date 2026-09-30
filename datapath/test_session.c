@@ -399,6 +399,28 @@ static void test_suspect_tells_planned(void) {
         d2k_session_free(s);
     }
 
+    /* A duplicate ClientHello after a real server TLS response is not
+       evidence that the hello went unanswered. Late response cuts have their
+       own RST/FIN path and must not re-enter the early-hello search. */
+    {
+        d2k_session *s = d2k_session_new(64, 64);
+        d2k_plan *p = NULL; char err[160];
+        CHECK(d2k_plan_load(plan_owns_payload, sizeof plan_owns_payload, &p,
+                            err, sizeof err) == 0, "answered-repeat plan fixture");
+        d2k_session_set_plan(s, p);
+        uint8_t pkt[1024], buf[8192]; d2k_result r;
+        size_t pn = build_pkt(pkt, 47702, 0x18, hello, hl);
+        d2k_session_packet(s, pkt, pn, 1000, buf, sizeof buf, &r);
+        const uint8_t appdata[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0x00};
+        pn = build_rev_pkt(pkt, 47702, 0x18, appdata, sizeof appdata);
+        d2k_session_packet(s, pkt, pn, 2000, buf, sizeof buf, &r);
+        pn = build_pkt(pkt, 47702, 0x18, hello, hl);
+        d2k_session_packet(s, pkt, pn, 3000, buf, sizeof buf, &r);
+        d2k_session_packet(s, pkt, pn, 4000, buf, sizeof buf, &r);
+        CHECK(!last_suspect(s), "answered TLS flow must not restart search on duplicate hello");
+        d2k_session_free(s);
+    }
+
     /* Плана не было вовсе — подозрение о таком потоке про план не говорит. */
     {
         d2k_session *s = d2k_session_new(64, 64);
