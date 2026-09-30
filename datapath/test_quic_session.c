@@ -1162,6 +1162,19 @@ static int frag_nat6(const char *path, uint8_t proto, const uint8_t *src,
 
 int main(void) {
     {
+        d2k_session *s = d2k_session_new(32, 32);
+        uint8_t pkt[1400], out[8192]; char err[128]; d2k_plan *p = NULL;
+        CHECK(!d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err), "QUIC area plan parse");
+        CHECK(!d2k_plantab_set_suffix_family(d2k_session_plans(s),
+            (const uint8_t *)"example.com", 11, 1, p, D2K_PLAN_SHAPE_QUIC, 4), "QUIC suffix install");
+        size_t n = build_udp_pkt(pkt, 50011, 443, v1_initial, sizeof v1_initial);
+        d2k_result r;
+        d2k_session_packet(s, pkt, n, 2, out, sizeof out, &r);
+        CHECK(r.applied && r.n_out, "QUIC first Initial inherits area");
+        CHECK(!d2k_plantab_count(d2k_session_plans(s)), "QUIC area does not create exact binding");
+        d2k_session_free(s);
+    }
+    {
         /* An IPv4 server reply cannot prove the IPv6 reply hook exists. */
         d2k_session *s = d2k_session_new(32, 32);
         uint8_t old[1400], pkt[1420] = {0}, out[8192], reply[] = {1, 2, 3};

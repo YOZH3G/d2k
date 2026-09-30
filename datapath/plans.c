@@ -39,6 +39,12 @@ typedef struct {
     d2k_plan *plan;
 } probe_entry;
 
+typedef struct {
+    uint8_t name[D2K_TARGET_NAME_MAX];
+    uint8_t len, transport, shape, family;
+    d2k_plan *plan;
+} area_entry;
+
 /* ИНВАРИАНТ УПЛОТНЕНИЯ, общий для всего файла: занятые записи всегда лежат
  * ПОДРЯД в v[0..used), свободные — в v[used..cap). Читают его find_name,
  * find_addr и oldest; держат — drop и take_free_or_evict, единственные, кто
@@ -74,6 +80,9 @@ struct d2k_plantab {
     size_t used;
     probe_entry *probes;
     size_t probe_used;
+    area_entry suffixes[D2K_PLAN_SUFFIX_MAX];
+    area_entry bypasses[D2K_PLAN_BYPASS_MAX];
+    size_t suffix_used, bypass_used;
 };
 
 d2k_plantab *d2k_plantab_new(size_t cap) {
@@ -109,6 +118,7 @@ void d2k_plantab_free(d2k_plantab *t) {
         d2k_plan_free(t->v[i].plan);
         d2k_plan_free(t->probes[i].plan);
     }
+    for (size_t i = 0; i < t->suffix_used; i++) d2k_plan_free(t->suffixes[i].plan);
     free(t->probes);
     free(t->v);
     free(t);
@@ -132,6 +142,120 @@ static int name_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen)
     return 1;
 }
 
+static uint8_t shape_transport(uint8_t shape) {
+    if (shape == D2K_PLAN_SHAPE_QUIC) return 17;
+    if (shape == D2K_PLAN_SHAPE_MODERN || shape == D2K_PLAN_SHAPE_LEGACY ||
+        shape == D2K_PLAN_SHAPE_ECH_TCP) return 6;
+    return 0;
+}
+
+static int area_name_valid(const uint8_t *name, size_t len) {
+    if (!name || !len || len > 253) return 0;
+    size_t label = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = name[i];
+        if (c == '.') {
+            if (!label || name[i-1] == '-') return 0;
+            label = 0;
+        } else {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-') || (!label && c == '-') || ++label > 63) return 0;
+        }
+    }
+    return label && name[len-1] != '-';
+}
+
+static int suffix_member(const area_entry *e, const uint8_t *name, size_t len) {
+    if (!name || len < e->len) return 0;
+    return (len == e->len || name[len-e->len-1] == '.') &&
+           name_eq(name+len-e->len, e->len, e->name, e->len);
+}
+
+static area_entry *area_exact(area_entry *v, size_t used, const uint8_t *name,
+    size_t len, uint8_t transport, uint8_t shape, uint8_t family) {
+    for (size_t i = 0; i < used; i++) {
+        area_entry *e = &v[i];
+        if (e->transport == transport && e->shape == shape && e->family == family &&
+            name_eq(e->name, e->len, name, len)) return e;
+    }
+    return NULL;
+}
+
+static int area_set(d2k_plantab *t, area_entry *v, size_t *used, size_t cap,
+    const uint8_t *name, size_t len, uint8_t transport, uint8_t shape,
+    uint8_t family, d2k_plan *p) {
+    if (!area_name_valid(name, len) || transport != shape_transport(shape) ||
+        !transport || (family != 4 && family != 6)) {
+        d2k_plan_free(p); return -2;
+    }
+    area_entry *e = area_exact(v, *used, name, len, transport, shape, family);
+    if (!e) {
+        if (*used == cap) { d2k_plan_free(p); return -1; }
+        e = &v[(*used)++];
+        memcpy(e->name, name, len); e->len = (uint8_t)len;
+        e->transport = transport; e->shape = shape; e->family = family;
+    }
+    d2k_plan_free(e->plan); e->plan = p; t->revision++;
+    return 0;
+}
+
+int d2k_plantab_set_suffix_family(d2k_plantab *t, const uint8_t *name, size_t len,
+    uint64_t now_ns, d2k_plan *p, uint8_t shape, uint8_t family) {
+    (void)now_ns;
+    if (!t || !p || (d2k_plan_transport(p) && d2k_plan_transport(p) != shape_transport(shape))) {
+        d2k_plan_free(p); return -2;
+    }
+    return area_set(t, t->suffixes, &t->suffix_used, D2K_PLAN_SUFFIX_MAX,
+        name, len, shape_transport(shape), shape, family, p);
+}
+
+int d2k_plantab_set_bypass_family(d2k_plantab *t, const uint8_t *name, size_t len,
+    uint8_t transport, uint8_t shape, uint8_t family) {
+    if (!t) return -2;
+    return area_set(t, t->bypasses, &t->bypass_used, D2K_PLAN_BYPASS_MAX,
+        name, len, transport, shape, family, NULL);
+}
+
+static int area_del(d2k_plantab *t, area_entry *v, size_t *used,
+    const uint8_t *name, size_t len, uint8_t transport, uint8_t shape, uint8_t family) {
+    if (!t || !name || !len) return 0;
+    area_entry *e = area_exact(v, *used, name, len, transport, shape, family);
+    if (!e) return 0;
+    d2k_plan_free(e->plan); *e = v[--*used]; memset(&v[*used], 0, sizeof *v);
+    t->revision++; return 1;
+}
+
+int d2k_plantab_del_suffix_family(d2k_plantab *t, const uint8_t *name, size_t len,
+    uint8_t transport, uint8_t shape, uint8_t family) {
+    return t ? area_del(t, t->suffixes, &t->suffix_used, name, len, transport, shape, family) : 0;
+}
+
+int d2k_plantab_del_bypass_family(d2k_plantab *t, const uint8_t *name, size_t len,
+    uint8_t transport, uint8_t shape, uint8_t family) {
+    return t ? area_del(t, t->bypasses, &t->bypass_used, name, len, transport, shape, family) : 0;
+}
+
+static int area_bypassed(const d2k_plantab *t, const uint8_t *name, size_t len,
+    uint8_t shape, uint8_t family) {
+    for (size_t i = 0; i < t->bypass_used; i++) {
+        const area_entry *e = &t->bypasses[i];
+        if (e->family == family && e->shape == shape && name && len &&
+            name_eq(e->name, e->len, name, len)) return 1;
+    }
+    return 0;
+}
+
+static const area_entry *area_match(const d2k_plantab *t, const uint8_t *name,
+    size_t len, uint8_t shape, uint8_t family) {
+    const area_entry *best = NULL;
+    for (size_t i = 0; i < t->suffix_used; i++) {
+        const area_entry *e = &t->suffixes[i];
+        if (e->shape == shape && e->family == family && suffix_member(e, name, len) &&
+            (!best || e->len > best->len)) best = e;
+    }
+    return best;
+}
+
 uint64_t d2k_plantab_revision(const d2k_plantab *t) { return t ? t->revision : 0; }
 
 int d2k_plantab_has_ech_target(const d2k_plantab *t, const uint8_t *name,
@@ -141,12 +265,14 @@ int d2k_plantab_has_ech_target(const d2k_plantab *t, const uint8_t *name,
         const entry *e = &t->v[i];
         if (e->family != family || e->shape != D2K_PLAN_SHAPE_ECH_TCP ||
             (e->only_sport && e->only_sport != sport_be)) continue;
+        if (!e->only_sport && area_bypassed(t, name, len, e->shape, family)) continue;
         if (e->kind == KEY_NAME && name && len &&
             name_eq(e->name, e->name_len, name, len)) return 1;
         if (e->kind == KEY_ADDR && addr &&
             !memcmp(e->addr, addr, family == 6 ? 16 : 4)) return 1;
     }
-    return 0;
+    if (area_bypassed(t, name, len, D2K_PLAN_SHAPE_ECH_TCP, family)) return 0;
+    return area_match(t, name, len, D2K_PLAN_SHAPE_ECH_TCP, family) != NULL;
 }
 
 int d2k_plantab_stream_candidate(const d2k_plantab *t, const uint8_t *name,
@@ -166,12 +292,20 @@ int d2k_plantab_stream_candidate_target(const d2k_plantab *t, const uint8_t *nam
     for (size_t i = 0; i < t->used; i++) {
         const entry *e = &t->v[i];
         if (e->family != family) { continue; }
+        if (!e->only_sport && area_bypassed(t, name, len, e->shape, family)) continue;
         if (!d2k_plan_stream_input(e->plan) ||
             (e->only_sport && e->only_sport != sport_be)) { continue; }
         if (e->kind == KEY_ADDR && addr &&
             memcmp(e->addr, addr, family == 6 ? 16 : 4) == 0) { return 1; }
         if (e->kind == KEY_NAME &&
             (!name || !len || name_eq(e->name, e->name_len, name, len))) { return 1; }
+    }
+    for (size_t i = 0; i < t->suffix_used; i++) {
+        const area_entry *e = &t->suffixes[i];
+        if (e->family == family && e->transport == 6 &&
+            d2k_plan_stream_input(e->plan) &&
+            (!name || !len || suffix_member(e, name, len)) &&
+            !area_bypassed(t, name, len, e->shape, family)) return 1;
     }
     return 0;
 }
@@ -776,6 +910,7 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
             }
         }
         /* Сперва запись СВОЕЙ формы: у имени их может быть несколько. */
+        if (area_bypassed(t, name, len, seen_shape, family)) return NULL;
         e = find_name_shape(t, name, len, seen_shape, family);
         if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP)
             e = find_name_shape(t, name, len, D2K_PLAN_SHAPE_MODERN, family);
@@ -785,6 +920,8 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
             e = find_name_shape(t, name, len, D2K_PLAN_SHAPE_GRANDFATHER, family);
         }
         if (!e) {
+            const area_entry *area = area_match(t, name, len, seen_shape, family);
+            if (area) return area->plan;
             /* Имя знаем, а формы такой у него нет — это отдельный факт, см.
                счётчик ниже. */
             e = find_name(t, name, len, family);

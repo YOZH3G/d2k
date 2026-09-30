@@ -46,6 +46,56 @@ static uint32_t addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 
 int main(void) {
     {
+        d2k_plantab *t = d2k_plantab_new(1);
+        char name[64];
+        for (size_t i = 0; i < D2K_PLAN_SUFFIX_MAX; i++) {
+            snprintf(name, sizeof name, "g%zu.example.com", i);
+            CHECK(!d2k_plantab_set_suffix_family(t, (const uint8_t *)name, strlen(name), 1, mkplan(), 1, 4),
+                "bounded area insertion");
+        }
+        CHECK(d2k_plantab_set_suffix_family(t, (const uint8_t *)"overflow.example.com", 20, 1, mkplan(), 1, 4) == -1,
+            "area overflow refuses without eviction");
+        CHECK(d2k_plantab_find(t, (const uint8_t *)"new.g0.example.com", 18, 0, 2, 1), "old group survives overflow");
+        CHECK(d2k_plantab_set_suffix_family(t, (const uint8_t *)"bad..example.com", 16, 1, mkplan(), 1, 4) == -2,
+            "invalid labels rejected");
+        CHECK(d2k_plantab_set_suffix_family(t, (const uint8_t *)"example.com", 11, 1, mkplan(), 0, 4) == -2,
+            "unknown shape cannot broaden learned group");
+        d2k_plantab_free(t);
+    }
+    {
+        const uint8_t root[] = "googlevideo.com", child[] = "rr-new.googlevideo.com";
+        const uint8_t narrow[] = "edge.googlevideo.com", leaf[] = "rr.edge.googlevideo.com";
+        d2k_plantab *t = d2k_plantab_new(2);
+        d2k_plan *group = mkplan(), *specific = mkplan(), *exact = mkplan(), *trial = mkplan();
+        CHECK(!d2k_plantab_set_suffix_family(t, root, sizeof root-1, 1, group, 1, 4), "install suffix");
+        CHECK(d2k_plantab_find(t, child, sizeof child-1, 0, 2, 1) == group, "unseen child inherits immediately");
+        CHECK(d2k_plantab_count(t) == 0, "inheritance creates no exact slots");
+        CHECK(d2k_plantab_find(t, root, sizeof root-1, 0, 2, 1) == group, "suffix includes root");
+        CHECK(!d2k_plantab_find(t, (const uint8_t *)"evilgooglevideo.com", 19, 0, 2, 1), "DNS label boundary");
+        CHECK(!d2k_plantab_find(t, child, sizeof child-1, 0, 2, 2), "TLS12 does not inherit TLS13");
+        CHECK(!d2k_plantab_find_family(t, child, sizeof child-1, 0, 2, 1, 0, 6), "family isolation");
+        CHECK(!d2k_plantab_find(t, NULL, 0, 0, 2, 1), "no SNI means no suffix inheritance");
+        CHECK(!d2k_plantab_set_suffix_family(t, narrow, sizeof narrow-1, 3, specific, 1, 4), "narrow suffix");
+        CHECK(d2k_plantab_find(t, leaf, sizeof leaf-1, 0, 4, 1) == specific, "longest suffix wins");
+        CHECK(!d2k_plantab_set_name_shaped(t, child, sizeof child-1, 3, exact, 1), "exact override");
+        CHECK(d2k_plantab_find(t, child, sizeof child-1, 0, 4, 1) == exact, "exact overrides suffix");
+        CHECK(!d2k_plantab_set_bypass_family(t, child, sizeof child-1, 6, 1, 4), "install exact bypass");
+        CHECK(!d2k_plantab_find(t, child, sizeof child-1, 0, 5, 1), "bypass prevents suffix and exact plan");
+        CHECK(!d2k_plantab_set_name_probe(t, child, sizeof child-1, 5, trial, 1, 123), "trial setup");
+        CHECK(d2k_plantab_find_sport(t, child, sizeof child-1, 0, 6, 1, 123) == trial, "trial overrides bypass");
+        CHECK(d2k_plantab_del_bypass_family(t, child, sizeof child-1, 6, 1, 4) == 1, "remove bypass");
+        CHECK(d2k_plantab_find(t, child, sizeof child-1, 0, 7, 1) == exact, "exact survives bypass removal");
+        CHECK(d2k_plantab_del_suffix_family(t, root, sizeof root-1, 6, 1, 4) == 1, "remove only broad suffix");
+        CHECK(d2k_plantab_find(t, leaf, sizeof leaf-1, 0, 8, 1) == specific, "narrow suffix survives");
+        d2k_plan *ech_group = mkplan();
+        CHECK(!d2k_plantab_set_suffix_family(t, root, sizeof root-1, 9, ech_group, 6, 6), "IPv6 ECH suffix");
+        CHECK(d2k_plantab_has_ech_target(t, child, sizeof child-1, NULL, 6, 0), "fragmented ECH gets group hold");
+        CHECK(!d2k_plantab_has_ech_target(t, NULL, 0, NULL, 6, 0), "ECH group never inferred from IP");
+        CHECK(!d2k_plantab_set_bypass_family(t, child, sizeof child-1, 6, 6, 6), "ECH bypass");
+        CHECK(!d2k_plantab_has_ech_target(t, child, sizeof child-1, NULL, 6, 0), "ECH exception suppresses hold");
+        d2k_plantab_free(t);
+    }
+    {
         const uint8_t nm[] = "outer.test";
         d2k_plantab *t = d2k_plantab_new(8);
         d2k_plan *ordinary = mkplan(), *ech = mkplan();

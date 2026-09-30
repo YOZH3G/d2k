@@ -21,6 +21,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+int d2k_link_set_suffix_family(int, const char *, uint8_t transport,
+    const char *plan_text, uint8_t shape, uint8_t family, char *, size_t);
+int d2k_link_del_suffix_family(int, const char *, uint8_t transport,
+    uint8_t shape, uint8_t family, char *, size_t);
+int d2k_link_set_bypass_family(int, const char *, uint8_t transport,
+    uint8_t shape, uint8_t family, char *, size_t);
+int d2k_link_del_bypass_family(int, const char *, uint8_t transport,
+    uint8_t shape, uint8_t family, char *, size_t);
+
 /* Номера событий/команд и коды подтверждения — оттуда же, откуда их берёт
  * датапат. d2k_ev.kind сравнивается с D2K_EV_*, d2k_link_next возвращает
  * ошибки, различимые по D2K_ACK_* через err (см. ниже). */

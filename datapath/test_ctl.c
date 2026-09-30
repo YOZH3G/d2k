@@ -641,6 +641,31 @@ int main(void) {
         d2k_ctl_accept(c);
         CHECK(d2k_ctl_peer_fd(c) >= 0, "подключение для разбора команд не принято");
 
+        {
+            uint8_t body[64];
+            size_t n = set_name_body_shaped(body, "googlevideo.com", tiny, sizeof tiny, 1);
+            d2k_ctlsrv_command(&cx, D2K_CMD_SET_SUFFIX, body, n);
+            CHECK(d2k_plantab_find(d2k_session_plans(sess),
+                (const uint8_t *)"rr-new.googlevideo.com", 22, 0, 1, 1) != NULL,
+                "ctl suffix installs first unseen child");
+            d2k_ctl_flush(c);
+            uint16_t cmd; int ok; uint8_t reason;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && cmd == D2K_CMD_SET_SUFFIX && ok,
+                "suffix ACK confirms installation");
+            const char *name = "rr-new.googlevideo.com";
+            n = strlen(name); body[0] = (uint8_t)n; memcpy(body+1, name, n);
+            body[n+1] = 6; body[n+2] = 1; body[n+3] = 4;
+            d2k_ctlsrv_command(&cx, D2K_CMD_SET_BYPASS, body, n+4);
+            CHECK(!d2k_plantab_find(d2k_session_plans(sess), (const uint8_t *)name, n, 0, 2, 1),
+                "ctl bypass excludes child");
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok, "bypass ACK");
+            d2k_ctlsrv_command(&cx, D2K_CMD_DEL_BYPASS, body, n+4);
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok, "remove bypass ACK");
+            CHECK(d2k_plantab_find(d2k_session_plans(sess), (const uint8_t *)name, n, 0, 3, 1),
+                "ctl remove bypass restores group");
+        }
         /* Годная команда: ack ok=1, причина D2K_ACK_OK. */
         {
             uint8_t body[64], f[80];

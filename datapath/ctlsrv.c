@@ -170,6 +170,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
 
     switch (type) {
     case D2K_CMD_SET_NAME:
+    case D2K_CMD_SET_SUFFIX:
     case D2K_CMD_SET_NAME_PROBE:
     case D2K_CMD_SET_ADDR: {
         /* v4: [длина имени][имя][форма][family][пробный порт?][план].
@@ -207,7 +208,10 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             return;
         }
         int rc;
-        if (type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) {
+        if (type == D2K_CMD_SET_SUFFIX) {
+            rc = d2k_plantab_set_suffix_family(tab, b+1, b[0], cx->now_ns, p,
+                b[1u+b[0]], b[2u+b[0]]);
+        } else if (type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) {
             uint16_t sport_be = 0;
             if (type == D2K_CMD_SET_NAME_PROBE) {
                 memcpy(&sport_be, b + 3u + b[0], 2);
@@ -312,6 +316,25 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             }
         }
         ack(cx, type, 1, D2K_ACK_OK);
+        return;
+    }
+    case D2K_CMD_DEL_SUFFIX:
+    case D2K_CMD_SET_BYPASS:
+    case D2K_CMD_DEL_BYPASS: {
+        if (len < 5 || len != 4u+b[0] || !b[0] ||
+            (b[3u+b[0]] != 4 && b[3u+b[0]] != 6) ||
+            !((b[1u+b[0]] == 6 && (b[2u+b[0]] == 1 || b[2u+b[0]] == 2 || b[2u+b[0]] == 6)) ||
+              (b[1u+b[0]] == 17 && b[2u+b[0]] == 3))) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS); return;
+        }
+        int rc;
+        if (type == D2K_CMD_SET_BYPASS)
+            rc = d2k_plantab_set_bypass_family(tab, b+1, b[0], b[1u+b[0]], b[2u+b[0]], b[3u+b[0]]);
+        else if (type == D2K_CMD_DEL_SUFFIX)
+            rc = d2k_plantab_del_suffix_family(tab, b+1, b[0], b[1u+b[0]], b[2u+b[0]], b[3u+b[0]]);
+        else
+            rc = d2k_plantab_del_bypass_family(tab, b+1, b[0], b[1u+b[0]], b[2u+b[0]], b[3u+b[0]]);
+        ack(cx, type, rc >= 0, rc == -1 ? D2K_ACK_NO_ROOM : rc < 0 ? D2K_ACK_BAD_ARGS : D2K_ACK_OK);
         return;
     }
     case D2K_CMD_DEL_NAME:

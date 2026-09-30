@@ -170,6 +170,19 @@ void         d2k_plantab_clear_probes(d2k_plantab *t);
 #define D2K_PLAN_SHAPE_VOICE  5
 #define D2K_PLAN_SHAPE_ECH_TCP 6
 
+/* Learned areas never consume/evict exact bindings. Set owns p on all paths,
+ * like set_name_family. Exceptions are exact and context-specific. */
+#define D2K_PLAN_SUFFIX_MAX 64
+#define D2K_PLAN_BYPASS_MAX 256
+int d2k_plantab_set_suffix_family(d2k_plantab *, const uint8_t *, size_t,
+    uint64_t, d2k_plan *, uint8_t shape, uint8_t family);
+int d2k_plantab_del_suffix_family(d2k_plantab *, const uint8_t *, size_t,
+    uint8_t transport, uint8_t shape, uint8_t family);
+int d2k_plantab_set_bypass_family(d2k_plantab *, const uint8_t *, size_t,
+    uint8_t transport, uint8_t shape, uint8_t family);
+int d2k_plantab_del_bypass_family(d2k_plantab *, const uint8_t *, size_t,
+    uint8_t transport, uint8_t shape, uint8_t family);
+
 /* ИМЯ ГОЛОСА — КЛАСС, А НЕ ДОМЕН.
  *
  * У голоса имени нет: точка выдаётся на сессию, в DNS её нет, и выдумать ей

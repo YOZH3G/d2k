@@ -47,7 +47,8 @@
  * адресную пробу с exact-flow key и поколением, а также trial ID в
  * APPLIED/REFUSED. Версия 4 добавляет полные адреса и семейство в ключи
  * событий и команды привязок. Смешанная пара останавливается на приветствии. */
-#define D2K_CTL_PROTO_VERSION 4
+/* v5: learned suffix areas and exact context bypass commands. */
+#define D2K_CTL_PROTO_VERSION 5
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */
@@ -147,6 +148,10 @@
  * Взводится один раз и срабатывает один раз. */
 #define D2K_CMD_ARM_SHAPE 0x0087
 #define D2K_CMD_DEL_NAME_PROBE 0x008B /* длина имени u8, имя, форма u8, family u8, порт u16 BE */
+#define D2K_CMD_SET_SUFFIX 0x008C /* length/name/shape/family/TLV */
+#define D2K_CMD_DEL_SUFFIX 0x008D /* length/name/transport/shape/family */
+#define D2K_CMD_SET_BYPASS 0x008E /* length/name/transport/shape/family */
+#define D2K_CMD_DEL_BYPASS 0x008F /* length/name/transport/shape/family */
 
 /* Контроллер задаёт lease относительным временем, datapath сравнивает
  * абсолютный monotonic expires_ns. Ограничение не даёт аварийному disconnect

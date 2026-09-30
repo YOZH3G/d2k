@@ -431,10 +431,10 @@ int d2k_link_set_name_probe(int fd, const char *name, uint8_t transport,
                                     sport_be, 4, err, errcap);
 }
 
-int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
+static int send_name_plan(int fd, const char *name, uint8_t transport,
                              const char *plan_text, uint8_t shape,
                              uint16_t sport_be, uint8_t family,
-                             char *err, size_t errcap) {
+                             char *err, size_t errcap, uint16_t cmd) {
     if (family != 4 && family != 6) {
         say(err, errcap, "семейство адресов должно быть 4 или 6");
         return -1;
@@ -507,7 +507,6 @@ int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
     g_scratch[1] = (uint8_t)(plen >> 16);
     g_scratch[2] = (uint8_t)(plen >> 8);
     g_scratch[3] = (uint8_t)plen;
-    uint16_t cmd = sport_be ? D2K_CMD_SET_NAME_PROBE : D2K_CMD_SET_NAME;
     g_scratch[4] = (uint8_t)(cmd >> 8);
     g_scratch[5] = (uint8_t)cmd;
 
@@ -516,6 +515,60 @@ int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
         return -1;
     }
     return 0;
+}
+
+int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
+    const char *plan_text, uint8_t shape, uint16_t sport_be, uint8_t family,
+    char *err, size_t errcap) {
+    return send_name_plan(fd, name, transport, plan_text, shape, sport_be, family,
+        err, errcap, sport_be ? D2K_CMD_SET_NAME_PROBE : D2K_CMD_SET_NAME);
+}
+
+static int area_context_valid(uint8_t transport, uint8_t shape, uint8_t family) {
+    return (family == 4 || family == 6) &&
+        ((transport == 6 && (shape == 1 || shape == 2 || shape == 6)) ||
+         (transport == 17 && shape == 3));
+}
+
+int d2k_link_set_suffix_family(int fd, const char *name, uint8_t transport,
+    const char *plan_text, uint8_t shape, uint8_t family, char *err, size_t errcap) {
+    if (!area_context_valid(transport, shape, family)) {
+        say(err, errcap, "неверный контекст семейства доменов"); return -1;
+    }
+    return send_name_plan(fd, name, transport, plan_text, shape, 0, family,
+        err, errcap, D2K_CMD_SET_SUFFIX);
+}
+
+static int send_area_key(int fd, uint16_t cmd, const char *name,
+    uint8_t transport, uint8_t shape, uint8_t family, char *err, size_t errcap) {
+    if (fd < 0 || !name || !*name || strlen(name) > 253 ||
+        !area_context_valid(transport, shape, family)) {
+        say(err, errcap, "неверный ключ семейства доменов"); return -1;
+    }
+    size_t nl = strlen(name), o = HDR;
+    g_scratch[o++] = (uint8_t)nl; memcpy(g_scratch+o, name, nl); o += nl;
+    g_scratch[o++] = transport; g_scratch[o++] = shape; g_scratch[o++] = family;
+    uint32_t plen = (uint32_t)(o-HDR+2);
+    g_scratch[0] = (uint8_t)(plen>>24); g_scratch[1] = (uint8_t)(plen>>16);
+    g_scratch[2] = (uint8_t)(plen>>8); g_scratch[3] = (uint8_t)plen;
+    g_scratch[4] = (uint8_t)(cmd>>8); g_scratch[5] = (uint8_t)cmd;
+    if (write_all(fd, g_scratch, o) != 0) {
+        say(err, errcap, "команда семейства не отправилась: %s", strerror(errno)); return -1;
+    }
+    return 0;
+}
+
+int d2k_link_del_suffix_family(int fd, const char *name, uint8_t transport,
+    uint8_t shape, uint8_t family, char *err, size_t errcap) {
+    return send_area_key(fd, D2K_CMD_DEL_SUFFIX, name, transport, shape, family, err, errcap);
+}
+int d2k_link_set_bypass_family(int fd, const char *name, uint8_t transport,
+    uint8_t shape, uint8_t family, char *err, size_t errcap) {
+    return send_area_key(fd, D2K_CMD_SET_BYPASS, name, transport, shape, family, err, errcap);
+}
+int d2k_link_del_bypass_family(int fd, const char *name, uint8_t transport,
+    uint8_t shape, uint8_t family, char *err, size_t errcap) {
+    return send_area_key(fd, D2K_CMD_DEL_BYPASS, name, transport, shape, family, err, errcap);
 }
 
 /* Family-scoped name removal. ARM_SHAPE has its own snapshot contract. */
