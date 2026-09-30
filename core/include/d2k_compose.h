@@ -141,6 +141,14 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
                       size_t send_cap,
                       char *buf, size_t cap);
 
+/* Точечная лестница для подтверждённого обрыва входящего TLS identity-body.
+ * Fake TLS hcaptcha.com идёт перед настоящим ClientHello, который всегда
+ * разрезан; nodrop не используется. Сначала проверяются планы совпавшей
+ * коробки, затем варианты около ручного split pos=2. */
+#define D2K_RX_VOLUME_PLAN_VARIANTS 5
+int d2k_rx_volume_plan(unsigned variant, d2k_shape shape, size_t send_cap,
+                       char *buf, size_t cap);
+
 /* СКОЛЬКО ВСЕГО ПЛЕЧ В ЗАПАСНОМ ПЕРЕБОРЕ.
  *
  * Нужно бюджету зондов: он обязан покрывать ЛЕСТНИЦУ ЦЕЛИКОМ, иначе поиск

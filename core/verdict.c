@@ -89,10 +89,23 @@ static void pause_note(char *out, size_t cap, uint32_t gap_us) {
  * дороже всего. */
 #define D2K_CLEAR_CONFIRM_REPEATS 2
 
-d2k_vres d2k_classify(const char *ip, uint16_t port,
-                       d2k_hello trigger, d2k_hello control,
-                       uint32_t mark, int repeats,
-                       uint32_t gap_us, uint32_t wait_ms) {
+static int stop_requested(const volatile sig_atomic_t *stop) {
+    return stop && *stop;
+}
+
+static d2k_vres classify_cancelled(d2k_vres r, uint32_t mark, int all_marked) {
+    r.verdict = D2K_V_INCONCLUSIVE;
+    r.marked = (mark != 0) && all_marked;
+    snprintf(r.reason, sizeof r.reason,
+             "профильный замер отменён: пришёл снимок приветствия клиента");
+    return r;
+}
+
+d2k_vres d2k_classify_cancelable(const char *ip, uint16_t port,
+                                  d2k_hello trigger, d2k_hello control,
+                                  uint32_t mark, int repeats,
+                                  uint32_t gap_us, uint32_t wait_ms,
+                                  const volatile sig_atomic_t *stop) {
     d2k_vres r;
     memset(&r, 0, sizeof r);
     /* Копится по И: один неподтверждённый опыт гасит метку всего прогона —
@@ -120,6 +133,10 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
     char gap_note[96];
     pause_note(gap_note, sizeof gap_note, gap_us);
 
+    if (stop_requested(stop)) {
+        return classify_cancelled(r, mark, all_marked);
+    }
+
     /* Разрез на 1 определён только когда в приветствии есть что резать
        ПОСЛЕ первого байта — вопрос 2 дерева не имеет смысла на триггере
        короче двух байт. Это не «повторы разошлись» (обычный смысл FLAKY,
@@ -139,6 +156,9 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
                               acc_trig, repeats);
     r.probes += repeats;
     if (!base.marked) { all_marked = 0; }
+    if (stop_requested(stop)) {
+        return classify_cancelled(r, mark, all_marked);
+    }
 
     if (base.pass == 0 && base.err == repeats) {
         r.verdict = D2K_V_UNREACHABLE;
@@ -159,6 +179,9 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
                                       mark, acc_trig, D2K_CLEAR_CONFIRM_REPEATS);
         r.probes += D2K_CLEAR_CONFIRM_REPEATS;
         if (!confirm.marked) { all_marked = 0; }
+        if (stop_requested(stop)) {
+            return classify_cancelled(r, mark, all_marked);
+        }
 
         if (confirm.err > 0) {
             r.verdict = D2K_V_FLAKY;
@@ -203,6 +226,9 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
                                  acc_trig, repeats);
         r.probes += repeats;
         if (!one.marked) { all_marked = 0; }
+        if (stop_requested(stop)) {
+            return classify_cancelled(r, mark, all_marked);
+        }
 
         if (one.err > 0) {
             /* ЛЮБАЯ ошибка транспорта в серии — не только полный отказ
@@ -241,6 +267,9 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
                                      acc_ctl, repeats);
             r.probes += repeats;
             if (!ctl.marked) { all_marked = 0; }
+            if (stop_requested(stop)) {
+                return classify_cancelled(r, mark, all_marked);
+            }
 
             if (ctl.err > 0) {
                 /* Тот же принцип, что и у разреза на 1 чуть выше — ЛЮБАЯ
@@ -302,4 +331,12 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
 
     r.marked = (mark != 0) && all_marked;
     return r;
+}
+
+d2k_vres d2k_classify(const char *ip, uint16_t port,
+                       d2k_hello trigger, d2k_hello control,
+                       uint32_t mark, int repeats,
+                       uint32_t gap_us, uint32_t wait_ms) {
+    return d2k_classify_cancelable(ip, port, trigger, control, mark, repeats,
+                                   gap_us, wait_ms, NULL);
 }

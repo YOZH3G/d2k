@@ -132,6 +132,26 @@ int main(void) {
     CHECK(memcmp(pkt + 40, body, sizeof body) == 0, "полезная нагрузка не на месте");
     CHECK(d2k_wire_tcp_checksum_ok(pkt, n), "контрольная сумма чистого пакета неверна");
 
+    /* Один TCP urgent byte: флаг, указатель и сумма должны попасть в сам
+       сформированный wire-пакет, а не остаться только в модели действия. */
+    {
+        static const uint8_t urgent_byte = 0x0f;
+        memset(&e, 0, sizeof e);
+        e.seq = 2000;
+        e.bytes = &urgent_byte;
+        e.len = 1;
+        e.urgent = 1;
+        e.urgent_ptr = 1;
+        n = d2k_wire_build(&c, &e, pkt, sizeof pkt);
+        CHECK(n == 41 && pkt[33] == 0x38 && rd16(pkt + 38) == 1,
+              "TCP URG flag/pointer missing from wire header");
+        CHECK(pkt[40] == urgent_byte && d2k_wire_tcp_checksum_ok(pkt, n),
+              "TCP urgent-byte payload or checksum invalid");
+        e.urgent_ptr = 2;
+        CHECK(d2k_wire_build(&c, &e, pkt, sizeof pkt) == 0,
+              "urgent pointer beyond emitted urgent payload accepted");
+    }
+
     /* Сумма IP тоже обязана сходиться: свёртка заголовка даёт ноль. */
     {
         uint32_t acc = 0;

@@ -26,12 +26,14 @@
  *                  доказательства нет;
  *   рукопожатие  — НАШЕ рукопожатие TLS 1.3 завершено нашим ключом, но
  *                  приложение молчит;
- *   приложение   — получены заголовки окончательного HTTP-ответа;
+ *   приложение   — получен конечный HTTP-ответ вместе с полным телом; одноимённые
+ *                  редиректы проверяются на той же TLS-сессии;
  *   challenge    — Cloudflare явно прислал cf-mitigated: challenge. Ответ
  *                  дошёл до HTTP, но это не доказательство полезного обхода.
  *
- * Уровень «приложение» доказывает только HTTP-ответ внутри собственной сессии.
- * Тело, подлинность сервера и доступность нужной страницы НЕ проверены.
+ * Уровень «приложение» доказывает завершённый HTTP-обмен внутри собственной
+ * сессии. Подлинность сервера и доступность страницы после переходов на другое
+ * имя НЕ проверены.
  * В частности, 403 остаётся HTTP-ответом, а не доказательством снятой блокировки.
  *
  * Сокет обращения остаётся ОТКРЫТЫМ до d2k_verify_close — не удобство, а
@@ -49,13 +51,22 @@ typedef enum {
     D2K_VER_NOT_MEASURED = 0, /* обращение не состоялось — про линию не сказано ничего */
     D2K_VER_TRANSPORT,        /* TCP встал, рукопожатие не дошло до конца */
     D2K_VER_HANDSHAKE,        /* рукопожатие завершено, прикладного ответа нет */
-    D2K_VER_APPLICATION,      /* заголовки обычного окончательного HTTP-ответа */
+    D2K_VER_APPLICATION,      /* конечный HTTP-ответ и его тело полностью получены */
     D2K_VER_CHALLENGE         /* Cloudflare cf-mitigated: challenge; не успех обхода */
 } d2k_ver_level;
 
 typedef struct {
     d2k_ver_level level;
     int      status;        /* код состояния HTTP, 0 — не разобран */
+    uint64_t body_bytes;    /* прочитанное тело HTTP, без chunk framing */
+    uint64_t body_expected; /* Content-Length либо измеренное число chunk-байт */
+    int      body_complete; /* тело полностью прочитано по HTTP framing */
+    int      body_has_length; /* получен однозначный Content-Length */
+    int      body_chunked;   /* применён Transfer-Encoding: chunked */
+    int      body_framing_valid; /* разбор framing однозначен, даже если тело оборвалось */
+    int      body_encoding;  /* 0 identity/нет, 1 gzip, 2 другое/несколько */
+    char     location[512];  /* Location ответа; только для внутреннего redirect-follow */
+    int      cloudflare_challenge; /* получен cf-mitigated: challenge */
     uint16_t local_port;    /* местный порт обращения — ключ потока для привязки события */
     uint8_t  local_ip4[4];
     uint8_t  family;
@@ -125,6 +136,15 @@ d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,
 d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
                                      const char *sni, int deadline_ms,
                                      size_t hello_wire);
+
+/* Базовое измерение полноты ответа на сокете, который обходит активные планы
+ * через SO_MARK. encoding: 0 — identity, 1 — gzip; tls12 выбирает ровно ту же
+ * форму клиента, что и живой поток. Используется парным измерителем объёма,
+ * не кандидатом: проверочные зонды, наоборот, обязаны проходить через план. */
+d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
+                                         const char *sni, int deadline_ms,
+                                         size_t hello_wire, int tls12,
+                                         int encoding, uint32_t mark);
 
 /* ТО ЖЕ САМОЕ, НО ПО QUIC. Уровни и их смысл не меняются ни на йоту:
  * TRANSPORT — датаграммы уходят, ответа нет; HANDSHAKE — рукопожатие

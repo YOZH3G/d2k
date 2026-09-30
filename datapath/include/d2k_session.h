@@ -230,6 +230,11 @@ void d2k_session_set_plan(d2k_session *s, d2k_plan *p);
 int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap,
                        d2k_result *out);
+/* Вариант для отправителя, который уже знает безопасную длину TCP payload
+ * по MTU маршрута. Ограничение применяется только к TCP-плану с перекрытием. */
+int d2k_session_packet_mtu(d2k_session *s, const uint8_t *pkt, size_t len,
+                           uint64_t now_ns, size_t tcp_segment_cap,
+                           uint8_t *buf, size_t bufcap, d2k_result *out);
 
 /* Controller-owned active probe packet. It is still parsed and may receive
  * its exact trial plan, but it must not become fresh user-traffic evidence
@@ -237,6 +242,9 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
 int d2k_session_packet_probe(d2k_session *s, const uint8_t *pkt, size_t len,
                              uint64_t now_ns, uint8_t *buf, size_t bufcap,
                              d2k_result *out);
+int d2k_session_packet_probe_mtu(d2k_session *s, const uint8_t *pkt, size_t len,
+                                 uint64_t now_ns, size_t tcp_segment_cap,
+                                 uint8_t *buf, size_t bufcap, d2k_result *out);
 
 /* Освобождает потоки, молчавшие дольше idle_ns. Возвращает сколько освободил.
  * Зовётся вызывающим, а не сама: датапат не заводит таймеров и не решает, как

@@ -30,8 +30,9 @@
  * pace, ни settle её не выражают (см. d2k_plan_internal.h про delay_us).
  * Понадобилась датаграммам: приветствие QUIC настоящего клиента едет двумя
  * Initial в 40 мкс друг от друга, и коробка складывает имя из обоих. */
-/* Version 7: original IPv4/UDP fragment shapes, independently of fake. */
-#define D2K_EXEC_VERSION 7
+/* Version 7: original IPv4/UDP fragment shapes, independently of fake.
+ * Version 8 adds per-fake TLS random/session-ID runtime modifiers. */
+#define D2K_EXEC_VERSION 8
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_SCHEMA_MAX   1
 
@@ -95,6 +96,9 @@ typedef struct {
        One PAYLOAD action owns the entire UDP datagram. Session expands it
        into wire fragments, never independent partial UDP datagrams. */
     uint8_t  ipfrag;
+    /* This emitted segment carries one TCP urgent byte. */
+    uint8_t  urgent;
+    uint16_t urgent_ptr;
     /* Приставка перед нагрузкой — байты, которых в исходном пакете нет.
      *
      * Нужна перекрытию: сегмент выходит с номером на pre_len МЕНЬШЕ, чем
@@ -109,6 +113,9 @@ typedef struct {
     size_t   pre_len;
     const uint8_t *bytes;
     size_t   len;
+    /* Не NULL только для фальшивок, созданных из шаблона с tlsmod. Владеет
+       d2k_actions и освобождается d2k_actions_free. */
+    uint8_t *owned_bytes;
 } d2k_emit;
 
 typedef struct {
@@ -124,8 +131,12 @@ typedef struct {
     size_t   payload_len;
     uint32_t seq;
     int      have_sni;
+    int      is_tls13;
     size_t   sni_off;
     size_t   sni_len;
+    /* Максимальная длина полезной части одного TCP-сегмента, выведенная из
+       MTU маршрута вызывающей стороной. Ноль — обычное поведение плана. */
+    size_t   segment_cap;
 } d2k_pkt;
 
 /* Состояние потока определяется в d2k_track.h. Здесь только опережающее

@@ -38,7 +38,7 @@
 static int same_evidence(const d2k_cat_signal *a, const d2k_cat_signal *b) {
     int d;
 
-    if (strcmp(a->kind, "volume") == 0) {
+    if (strcmp(a->kind, "volume") == 0 || strcmp(a->kind, "rx-volume") == 0) {
         /* У обрыва по объёму нет ни TTL, ни идентификатора: коробка ничего
          * не присылает, она просто перестаёт пропускать. Сравнивать
          * нечего, кроме объёма. */

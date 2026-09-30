@@ -1230,7 +1230,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
 static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap,
                        d2k_result *out, int observe_only,
-                       int controller_probe) {
+                       int controller_probe, size_t tcp_segment_cap) {
     if (!out) {
         return 0;
     }
@@ -1490,6 +1490,22 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             det.tos = pkt[1];
             det.ipid = ip.ip_id;
             suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST, &det);
+        } else if (rst && fl->saw_hello && rev_before > 0 &&
+                   (fl->rev_types & (uint8_t)(1u << (23 - 20)))) {
+            /* Поздний RST после TLS app-data сам по себе НЕ диагноз: сбросить
+               мог сервер или клиент (например, браузер, прекративший ждать
+               оборванный ответ). Это лишь дешёвый сигнал, после которого
+               контроллер обязан доказать парой identity/gzip, что режется
+               именно входящий объём; без воспроизводимого среза дальнейший
+               перебор запрещён. */
+            d2k_jrn_detail det;
+            det.ttl = pkt[8];
+            det.ref_ttl = fl->rev_profiled ? fl->rev_ttl : 0;
+            det.tos = pkt[1];
+            det.ipid = rd16(pkt + 4);
+            det.server_hello = fl->rev_server_hello;
+            det.planned = fl->plan_done ? D2K_PLANNED_YES : D2K_PLANNED_NO;
+            suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST_AFTER_APP, &det);
         }
         d2k_capture_forget(&s->capture, &key);
         d2k_track_remove(s->flows, &key);
@@ -1773,8 +1789,10 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     in.payload_len = payload_len;
     in.seq = in_seq;
     in.have_sni = tls.have_sni;
+    in.is_tls13 = tls.is_tls13;
     in.sni_off = tls.sni_off;
     in.sni_len = tls.sni_len;
+    in.segment_cap = tcp_segment_cap;
 
     d2k_actions acts;
     memset(&acts, 0, sizeof acts);
@@ -1895,18 +1913,32 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
 
 int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap, d2k_result *out) {
-    return session_packet(s, pkt, len, now_ns, buf, bufcap, out, 0, 0);
+    return session_packet(s, pkt, len, now_ns, buf, bufcap, out, 0, 0, 0);
+}
+
+int d2k_session_packet_mtu(d2k_session *s, const uint8_t *pkt, size_t len,
+                           uint64_t now_ns, size_t tcp_segment_cap,
+                           uint8_t *buf, size_t bufcap, d2k_result *out) {
+    return session_packet(s, pkt, len, now_ns, buf, bufcap, out, 0, 0,
+                          tcp_segment_cap);
 }
 
 int d2k_session_packet_probe(d2k_session *s, const uint8_t *pkt, size_t len,
                              uint64_t now_ns, uint8_t *buf, size_t bufcap,
                              d2k_result *out) {
-    return session_packet(s, pkt, len, now_ns, buf, bufcap, out, 0, 1);
+    return session_packet(s, pkt, len, now_ns, buf, bufcap, out, 0, 1, 0);
+}
+
+int d2k_session_packet_probe_mtu(d2k_session *s, const uint8_t *pkt, size_t len,
+                                 uint64_t now_ns, size_t tcp_segment_cap,
+                                 uint8_t *buf, size_t bufcap, d2k_result *out) {
+    return session_packet(s, pkt, len, now_ns, buf, bufcap, out, 0, 1,
+                          tcp_segment_cap);
 }
 
 void d2k_session_observe_tcp(d2k_session *s, const uint8_t *p, size_t n, uint64_t now) {
     d2k_result out;
-    (void)session_packet(s, p, n, now, NULL, 0, &out, 1, 0);
+    (void)session_packet(s, p, n, now, NULL, 0, &out, 1, 0, 0);
 }
 
 uint64_t d2k_session_plan_revision(const d2k_session *s) {

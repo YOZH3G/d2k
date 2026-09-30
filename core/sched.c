@@ -93,11 +93,11 @@
 #define SCHED_CLEAR_BACKOFF_1_MS (10LL * 60 * 1000)
 #define SCHED_CLEAR_BACKOFF_2_MS (30LL * 60 * 1000)
 #define SCHED_CLEAR_BACKOFF_MAX_MS (60LL * 60 * 1000)
+#define SCHED_INCOMPLETE_BACKOFF_MS (10LL * 60 * 1000)
 #define SCHED_CHALLENGE_BACKOFF_MS (60LL * 60 * 1000)
 /* Явный порог планировщика, согласованный с владельцем: обычный TCP RST —
    низкоуверенное подозрение, второй должен прийти по независимому flow key,
    пока первое ещё отражает текущую линию. Это не порог дерева оригинала. */
-#define SCHED_RST_CONFIRM_MS (30 * 1000)
 /* Сколько ждать решения по потоку разговора с применённым приёмом голоса.
    Приговор «молчит» датапат выносит через две секунды после приветствия
    (silence_deadline); пятнадцать — с запасом на медленную очередь событий, и
@@ -141,15 +141,17 @@
  * того приёма, ради которого и затевался.
  *
  * Слагаемые: пять вопросов дерева (D2K_PROPS_QUESTIONS), выведенные из
- * вердикта кандидаты (их не больше очереди, SCHED_MAX_PLANS) и запасной
- * перебор ЦЕЛИКОМ (d2k_fallback_arms — считается по самим таблицам, чтобы
- * рост списка не разошёлся с бюджетом молча).
+ * вердикта кандидаты (их не больше очереди, SCHED_MAX_PLANS), короткая
+ * объёмная fake-SNI/split-лестница и запасной перебор ЦЕЛИКОМ
+ * (d2k_fallback_arms — считается по самим таблицам, чтобы рост списка не
+ * разошёлся с бюджетом молча).
  *
  * Цена названа прямо: поиск по одной цели может занять до сотни зондов. С тех
  * пор как пробный план виден ТОЛЬКО потоку зонда, эта цена платится нашим
  * трафиком, а не работой человека — раньше каждый зонд шёл за его счёт. */
 #define SCHED_MAX_PROBES \
-    ((int)(D2K_PROPS_QUESTIONS + SCHED_MAX_PLANS + d2k_fallback_arms()))
+    ((int)(D2K_PROPS_QUESTIONS + SCHED_MAX_PLANS + \
+           D2K_RX_VOLUME_PLAN_VARIANTS + d2k_fallback_arms()))
 
 /* Сколько раз повторять испытание кандидата после ВРЕМЕННОГО отказа отправки.
  *
@@ -310,8 +312,8 @@ static d2k_vres classify_no_cancel(const char *ip, uint16_t port,
                                    uint32_t mark, int repeats,
                                    uint32_t gap_us, uint32_t wait_ms,
                                    const volatile sig_atomic_t *stop) {
-    (void)stop;
-    return d2k_classify(ip, port, trigger, control, mark, repeats, gap_us, wait_ms);
+    return d2k_classify_cancelable(ip, port, trigger, control, mark, repeats,
+                                   gap_us, wait_ms, stop);
 }
 
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
@@ -328,7 +330,6 @@ d2k_sched_voice_fn d2k_sched_voice_hook = voice_default;
 
 typedef enum {
     T_FREE = 0,
-    T_RST_PENDING,  /* одиночный обычный TCP RST, ждём независимое подтверждение */
     T_QUEUED,       /* подозрение сохранено, ждёт безопасного слота измерения */
     T_ASKING,        /* сетевой оракул работает в потоке */
     /* Снимок приветствия заказан, поиск ЖДЁТ его. Состояние заведено ради
@@ -380,10 +381,9 @@ typedef struct {
     char       ip[INET6_ADDRSTRLEN];
     uint16_t   port;
 
-    int64_t    started_ms;
+    int64_t    started_ms; /* active search/lifecycle budget begins on launch */
+    int64_t    queued_ms;  /* independent age of a queued suspicion */
     int64_t    rest_until_ms;
-    int64_t    rst_confirm_until_ms;
-    d2k_flowkey rst_pending_flow;
     int        probes;
 
     /* ГОЛОС/АДРЕСНЫЙ UDP: поток, к которому применился приём, и наблюдения.
@@ -511,6 +511,7 @@ typedef struct {
        узнанной коробки не заводит новую) и в логе. */
     size_t     n_known;
     int        researched;     /* whether this target has had a direct measurement */
+    int        search_started; /* classifier/voice measurement started, even at zero probes */
     int        cached_measure_valid; /* preserve measured candidates after box-plan reuse */
     uint8_t    trigger_code;   /* signal that admitted this measurement; cooldown key */
     /* Форма приветствия, КОТОРЫМ шёл замер, и было ли уже повторение из-за
@@ -571,6 +572,12 @@ typedef struct {
     d2k_vres   res;
     d2k_voice_res voice_res;
     d2k_vol_result vol;
+    /* A late TLS RST is only permission for the paired receive-volume probe.
+       Until that probe proves a repeatable identity cut with complete gzip,
+       the ordinary classifier and candidate queue must remain untouched. */
+    int        rx_volume_only;
+    int        rx_volume_candidate_pending; /* special candidate after a full saved-plan queue */
+    unsigned   rx_volume_next_variant;
     int        res_ready;   /* пишется потоком под мьютексом планировщика */
     /* Подобранное плечо QUIC и признак того, что подбор состоялся. Отдельно
        от вердикта: «плечо не найдено» и «вердикта нет» — разные утверждения,
@@ -869,6 +876,13 @@ static d2k_cat_signal signal_of(const d2k_ev *ev) {
 static void fp_add(d2k_cat_fp *fp, const d2k_cat_signal *sig) {
     for (size_t i = 0; i < fp->n_sig; i++) {
         d2k_cat_signal *x = &fp->sig[i];
+        if ((strcmp(x->kind, "volume") == 0 || strcmp(x->kind, "rx-volume") == 0) &&
+            strcmp(x->kind, sig->kind) == 0) {
+            int d = x->volume - sig->volume;
+            if (d < 0) { d = -d; }
+            if (d <= D2K_VOLUME_SLACK) { x->seen += sig->seen; return; }
+            continue;
+        }
         int d = (int)x->ttl - (int)sig->ttl;
         if (d < 0) { d = -d; }
         if (strcmp(x->kind, sig->kind) == 0 && d <= D2K_TTL_SLACK &&
@@ -1019,9 +1033,20 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
         return;
     }
     if (c->challenge && s->now_ms < c->until_ms) { return; }
+    if (kind == 2) {
+        /* Incomplete/exhausted work is a different observation from a clean
+           direct CLEAR. Cap retries at one fixed interval; do not inherit
+           or advance the CLEAR 10/30/60-minute escalation. */
+        c->negative_streak = 0;
+        c->challenge = 0;
+        c->exhausted = 1;
+        c->signal_code = t->trigger_code;
+        c->until_ms = s->now_ms + SCHED_INCOMPLETE_BACKOFF_MS;
+        return;
+    }
     if (c->negative_streak < UINT8_MAX) { c->negative_streak++; }
     c->challenge = 0;
-    c->exhausted = kind == 2;
+    c->exhausted = 0;
     c->signal_code = t->trigger_code;
     c->until_ms = s->now_ms + clear_backoff_ms(c->negative_streak);
 }
@@ -1248,27 +1273,53 @@ static void *worker_run(void *vp) {
         return NULL;
     }
 
-    /* Проба на объём идёт ПЕРВОЙ, и это не порядок ради порядка: пока её
-       ответ неизвестен, вопрос «режут по имени или по адресу» ЛЖЁТ — при
-       блоке по объёму рукопожатие проходит с любым именем, поток умирает и
-       там и там, и ответ всегда получается «по адресу» (шапка d2k_volume.h).
-       Только TCP: у QUIC нет установленного потока в этом смысле, и лестница
-       HTTP-запросов туда неприменима. */
+    /* Два направленных измерения идут перед классификацией TLS: лестница
+       исходящего запроса сохраняется для унаследованного TX-класса, а парные
+       identity/gzip GET отдельно проверяют обрыв ВХОДЯЩЕГО тела. Последний
+       становится своим rx-volume-сигналом и может приоритизировать план,
+       который доказательно обходит такой профиль. QUIC сюда не попадает. */
     if (t->transport == 6) {
-        t->vol = d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80, s->measure_mark);
-        if (t->vol.verdict == D2K_VOL_CUT) {
-            /* Разрезом этот класс не лечится вовсе: режется не рукопожатие.
-               Дальше мерить дерево вердиктов незачем — оно ответит про имя и
-               адрес то, что диктует оборванный поток, а не коробка. */
+        int tls12 = d2k_hello_shape(trig.bytes, trig.len) == D2K_SHAPE_LEGACY;
+        t->vol = d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80,
+                                    tls12, trig.len, s->measure_mark);
+        if (t->vol.verdict == D2K_VOL_CUT || t->vol.rx_cut) {
+            /* Объёмное измерение не даёт честного ответа на старые вопросы
+               про имя/адрес: оборванный поток исказит их вердикт. Вместо этого
+               записываем направленную улику и сразу идём к соответствующему
+               кандидату; после его отказа общий перебор сохранится. */
             pthread_mutex_lock(&s->mu);
             memset(&t->res, 0, sizeof t->res);
             t->res.verdict = D2K_V_INCONCLUSIVE;
-            snprintf(t->res.reason, sizeof t->res.reason,
-                     "обрыв по объёму на %d КБ — разрезом не лечится", t->vol.at_kb);
+            if (t->vol.rx_cut) {
+                if (t->vol.rx_expected_kb > 0) {
+                    snprintf(t->res.reason, sizeof t->res.reason,
+                             "identity-тело дважды оборвалось около %d/%d КБ, gzip завершился",
+                             t->vol.rx_at_kb, t->vol.rx_expected_kb);
+                } else {
+                    snprintf(t->res.reason, sizeof t->res.reason,
+                             "chunked identity-тело дважды оборвалось около %d КБ, gzip завершился",
+                             t->vol.rx_at_kb);
+                }
+            } else {
+                snprintf(t->res.reason, sizeof t->res.reason,
+                         "исходящая лестница оборвалась около %d КБ", t->vol.at_kb);
+            }
             t->res_ready = 1;
             pthread_mutex_unlock(&s->mu);
             ssize_t ign2 = write(s->wake[1], "w", 1);
             (void)ign2;
+            return NULL;
+        }
+        if (t->rx_volume_only) {
+            pthread_mutex_lock(&s->mu);
+            memset(&t->res, 0, sizeof t->res);
+            t->res.verdict = D2K_V_INCONCLUSIVE;
+            snprintf(t->res.reason, sizeof t->res.reason,
+                     "поздний RST не подтвердился парной RX-volume-пробой");
+            t->res_ready = 1;
+            pthread_mutex_unlock(&s->mu);
+            ssize_t ign3 = write(s->wake[1], "w", 1);
+            (void)ign3;
             return NULL;
         }
     }
@@ -1326,6 +1377,7 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
         return -1;
     }
     t->th_live = 1;
+    if (job == JOB_CLASSIFY || job == JOB_VOICE) { t->search_started = 1; }
     return 0;
 }
 
@@ -1819,11 +1871,49 @@ static void task_done(task *t) {
    готовых планов коробки и синтеза по измеренному вектору (0007/0008).
    Это часть перенесённого поиска, не внешний пул заранее назначенных целей.
    Возвращает число долитых планов. */
-static size_t refill_from_fallback(const d2k_sched *s, task *t) {
+static int next_rx_volume_plan(d2k_sched *s, task *t, d2k_shape sh,
+                               char *text, size_t cap) {
+    while (t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS) {
+        unsigned variant = t->rx_volume_next_variant++;
+        if (d2k_rx_volume_plan(variant, sh, s->send_cap, text, cap) != 0) { continue; }
+        uint32_t h = fnv1a(text);
+        int seen = 0;
+        for (size_t i = 0; i < t->n_plans && !seen; i++) {
+            if (strcmp(t->plans[i], text) == 0) { seen = 1; }
+        }
+        for (size_t i = 0; i < t->n_tried && !seen; i++) {
+            if (t->tried[i] == h) { seen = 1; }
+        }
+        if (seen) { continue; }
+        if (t->n_tried < sizeof t->tried / sizeof t->tried[0]) {
+            t->tried[t->n_tried++] = h;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static size_t refill_from_fallback(d2k_sched *s, task *t) {
     if (t->search_owned || t->transport == 17) { return 0; }
     size_t cap = sizeof t->plans / sizeof t->plans[0];
     size_t added = 0;
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
+    while (t->rx_volume_candidate_pending && added < cap) {
+        char text[sizeof t->plans[0]];
+        if (!next_rx_volume_plan(s, t, sh, text, sizeof text)) {
+            t->rx_volume_candidate_pending = 0;
+            break;
+        }
+        snprintf(t->plans[added], sizeof t->plans[added], "%s", text);
+        t->plan_boxes[added][0] = '\0';
+        added++;
+        say(s, "по %s исчерпаны сохранённые планы коробки — "
+            "теперь проверяю измеренную fake-SNI + split-лестницу (%u/%u)",
+            t->name, t->rx_volume_next_variant,
+            (unsigned)D2K_RX_VOLUME_PLAN_VARIANTS);
+    }
+    t->rx_volume_candidate_pending =
+        t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS;
     while (added < cap) {
         char text[sizeof t->plans[0]];
         if (d2k_fallback_plan(t->fb_next, sh, SCHED_DECOY, s->send_cap,
@@ -2172,6 +2262,10 @@ static size_t known_plans(d2k_sched *s, task *t) {
                 for (size_t k = 0; k < took; k++) {
                     if (strcmp(t->plans[k], p->text) == 0) { used = 1; break; }
                 }
+                uint32_t h = fnv1a(p->text);
+                for (size_t k = 0; k < t->n_tried && !used; k++) {
+                    if (t->tried[k] == h) { used = 1; }
+                }
                 if (!used && (!best || p->successes > best->successes)) {
                     best = p;
                     owner = b;
@@ -2181,6 +2275,10 @@ static size_t known_plans(d2k_sched *s, task *t) {
         if (!best) { break; }
         memcpy(t->plans[took], best->text, strlen(best->text) + 1);
         snprintf(t->plan_boxes[took], sizeof t->plan_boxes[took], "%s", owner->id);
+        uint32_t h = fnv1a(best->text);
+        if (t->n_tried < sizeof t->tried / sizeof t->tried[0]) {
+            t->tried[t->n_tried++] = h;
+        }
         took++;
     }
     return took;
@@ -2407,6 +2505,38 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
 
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
 
+    if (t->transport == 6 &&
+        (t->vol.verdict == D2K_VOL_CUT || t->vol.rx_cut)) {
+        if (t->vol.verdict == D2K_VOL_CUT) {
+            d2k_cat_signal sig;
+            memset(&sig, 0, sizeof sig);
+            snprintf(sig.kind, sizeof sig.kind, "volume");
+            sig.volume = t->vol.at_kb;
+            sig.seen = 1;
+            fp_add(&t->fp, &sig);
+        }
+        if (t->vol.rx_cut) {
+            d2k_cat_signal sig;
+            memset(&sig, 0, sizeof sig);
+            snprintf(sig.kind, sizeof sig.kind, "rx-volume");
+            sig.volume = t->vol.rx_at_kb;
+            sig.seen = 1;
+            fp_add(&t->fp, &sig);
+        }
+        /* Повторно узнаём коробку уже по полной примете, включая измеренный
+           объём. Первичный lookup был до сетевого измерения и не мог знать
+           этого сигнала; новые домены иначе не переиспользовали бы подходящую
+           коробку. known_plans пропускает уже испытанные тексты. */
+        t->n_known = known_plans(s, t);
+        t->n_plans = t->n_known;
+        if (t->n_known) {
+            snprintf(t->box_id, sizeof t->box_id, "%s", t->plan_boxes[0]);
+            say(s, "по %s обрыв объёма %d КБ совпал с коробкой %s — "
+                   "сначала проверяю её сохранённые планы",
+                t->name, t->vol.at_kb, t->box_id);
+        }
+    }
+
     /* НАЙДЕННОЕ ЗАМЕРОМ — ПЕРВЫМ, и это не приоритет «на всякий случай».
        Плечо здесь не гипотеза: измеритель уже прогнал его по цели столько раз,
        сколько задано повторами, и засчитал только при единогласии. Ставить
@@ -2426,6 +2556,36 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
             say(s, "по %s приём «%s» сработал на замере, но сегодняшним языком плана "
                    "не задаётся", t->name, r->arm_name);
         }
+    }
+
+    /* После сохранённых коробок и уже найденного самим измерителем приёма,
+       подтверждённый RX-volume профиль добавляет короткую fake-SNI/split-
+       лестницу до общего синтеза. Это общий fingerprint-путь, без списка
+       имён и без исключения для отдельного сайта. */
+    if (t->transport == 6 && t->vol.rx_cut && sh != D2K_SHAPE_MODERN) {
+        say(s, "по %s RX-volume замер подтверждён, но TLS-форма %u не modern — "
+               "fake-SNI/split-профиль не применим",
+            t->name, (unsigned)sh);
+    }
+    if (t->transport == 6 && t->vol.rx_cut && sh == D2K_SHAPE_MODERN) {
+        char text[sizeof t->plans[0]];
+        while (t->n_plans < cap &&
+               next_rx_volume_plan(s, t, sh, text, sizeof text)) {
+            snprintf(t->plans[t->n_plans], sizeof t->plans[t->n_plans], "%s", text);
+            t->plan_boxes[t->n_plans][0] = '\0';
+            t->n_plans++;
+        }
+        t->rx_volume_candidate_pending =
+            t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS;
+        if (t->rx_volume_candidate_pending) {
+            say(s, "по %s сохранённые планы коробки занимают очередь; "
+                "объёмная fake-SNI/split-лестница ждёт их испытания",
+                t->name);
+        }
+        say(s, "по %s повторяемый обрыв входящего identity-тела около %d КБ "
+               "при полном gzip-ответе: проверю короткую fake-SNI + split-лестницу "
+               "после сохранённых планов",
+            t->name, t->vol.rx_at_kb);
     }
 
     if (r->owns_search) {
@@ -2540,6 +2700,8 @@ static void signal_human(const d2k_cat_signal *sig, char *out, size_t cap) {
                  (unsigned)sig->ttl, sig->ttl_delta, (unsigned)sig->tos, (unsigned)sig->ipid);
     } else if (strcmp(sig->kind, "volume") == 0) {
         snprintf(out, cap, "обрыв по объёму около %d КБ", sig->volume);
+    } else if (strcmp(sig->kind, "rx-volume") == 0) {
+        snprintf(out, cap, "identity-ответ стабильно оборвался около %d КБ", sig->volume);
     } else if (strcmp(sig->kind, "silent") == 0) {
         snprintf(out, cap, "ответа на приветствие не было");
     } else if (strcmp(sig->kind, "repeat") == 0) {
@@ -2555,7 +2717,6 @@ static void signal_human(const d2k_cat_signal *sig, char *out, size_t cap) {
 static const char *task_phase(const task *t) {
     switch (t->state) {
     case T_QUEUED:        return "ожидает безопасного слота замера";
-    case T_RST_PENDING:   return "ждём независимое подтверждение RST";
     case T_SHAPE_WAIT:    return "ждём форму приветствия";
     case T_ASKING:        return "распознаём поведение";
     case T_PROPS_CONTACT:
@@ -2656,8 +2817,7 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         fputs("\"candidate\": ", f);
         json_str(f, t->next_plan > 0 ? "план поставлен" : "");
         fputs(", \"source\": ", f);
-        json_str(f, t->state == T_RST_PENDING ? "поиск ещё не запущен" :
-                    t->n_known > 0 && t->next_plan <= t->n_known
+        json_str(f, t->n_known > 0 && t->next_plan <= t->n_known
                         ? "готовый план узнанной коробки" : "выведен из замера");
         fputc('}', f);
     }
@@ -2895,6 +3055,23 @@ static int start_search(d2k_sched *s, task *t) {
         task_reset(t);
         return 0;
     }
+    if (t->rx_volume_only) {
+        /* Do not try catalog plans on a generic late reset. First establish
+           the measured response-volume fingerprint; only then can its box
+           donate plans in the volume-aware result path. */
+        t->n_known = 0;
+        t->n_plans = 0;
+        t->researched = 1;
+        t->state = T_ASKING;
+        t->asked_shape = (uint8_t)d2k_hello_shape(t->trig, t->trig_len);
+        if (start_worker(s, t, JOB_CLASSIFY) != 0) {
+            task_reset(t);
+            return 0;
+        }
+        say(s, "по %s поздний RST: сначала проверяю только повторяемый обрыв входящего ответа",
+            t->name);
+        return 1;
+    }
     t->researched = 1;
     t->state = T_ASKING;
     t->asked_shape = (uint8_t)(t->transport == 17 ? D2K_SHAPE_UNKNOWN
@@ -3093,6 +3270,8 @@ static size_t queued_measurements(const d2k_sched *s) {
 }
 
 static int launch_task(d2k_sched *s, task *t) {
+    t->started_ms = s->clock_seen ? s->now_ms : 0;
+    t->queued_ms = 0;
     if (t->by_addr) {
         quic_addr_start(s, t);
         return t->state != T_FREE && t->state != T_RESTING;
@@ -3127,7 +3306,8 @@ static int launch_or_queue(d2k_sched *s, task *t) {
             return 0;
         }
         t->state = T_QUEUED;
-        t->started_ms = s->now_ms;
+        t->started_ms = 0;
+        t->queued_ms = s->clock_seen ? s->now_ms : 0;
         say(s, "по %s подозрение сохранено в ограниченной очереди замеров "
                "(%zu из %d); новые измерения ограничены до %d одновременно",
             t->name, queued_measurements(s), SCHED_MAX_QUEUED_MEASUREMENTS,
@@ -3284,7 +3464,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     if (cooldown_blocks(s, name, ev->transport, ev->family, ev->code, &cooldown_left_ms)) {
         target_cooldown *cool = cooldown_find(s, name, ev->transport, ev->family);
         const char *reason = cool && cool->challenge ? "антибот-ответа" :
-                             cool && cool->exhausted ? "исчерпания прошлого поиска" :
+                             cool && cool->exhausted ? "неподтверждённого прошлого замера" :
                              "повторного CLEAR";
         say(s, "по %s замер отложен после %s ещё примерно %lld мин",
             name, reason,
@@ -3293,46 +3473,20 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     }
     task *t = task_of(s, name, ev->transport, ev->family);
     int ordinary_tcp_rst = ev->transport == 6 && ev->code == D2K_SUSPECT_RST;
-    d2k_cat_fp carried_fp;
-    int have_carried_fp = 0;
-    memset(&carried_fp, 0, sizeof carried_fp);
+    const int late_app_rst = ev->code == D2K_SUSPECT_RST_AFTER_APP;
     if (t && t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
         /* Поток разговора, к которому применился приём, остался без ответа —
            решает тик (записи и снятию нужны часы). */
         t->voice_silent = 1;
         return 0;
     }
-    if (t && t->state == T_RST_PENDING) {
-        int within_window = t->rst_confirm_until_ms == 0 ||
-                            s->now_ms < t->rst_confirm_until_ms;
-        if (within_window && ordinary_tcp_rst &&
-            ev_matches_flow(ev, &t->rst_pending_flow)) {
-            /* Дубликат события по тому же TCP 5-tuple не независимое
-               подтверждение: datapath мог повторно сообщить о том же сбросе. */
-            return 0;
-        }
-        if (!within_window) {
-            say(s, "по %s одиночный RST не подтвердился за 30 с — забываю подозрение",
+    if (t) {
+        if (late_app_rst) {
+            if (t->state != T_WATCHING) { return 0; }
+            /* Keep the confirmed catalog binding, but replace its passive
+               watcher with a targeted measurement task. */
+            say(s, "по %s поздний RST после app-data — проверяю повторяемость обрыва ответа",
                 t->name);
-            task_done(t);
-            t = NULL;
-        } else {
-            /* Сохраняем первое наблюдение в отпечатке: модель коробки должна
-               учитывать оба независимых потока, а не только подтверждающий. */
-            carried_fp = t->fp;
-            d2k_cat_signal sig = signal_of(ev);
-            fp_add(&carried_fp, &sig);
-            have_carried_fp = 1;
-            if (ordinary_tcp_rst) {
-                say(s, "по %s второй обычный RST на независимом потоке за 30 с — подтверждаю подозрение",
-                    t->name);
-                ordinary_tcp_rst = 0; /* это подтверждение, теперь запускаем поиск */
-            } else {
-                char human[200];
-                signal_human(&sig, human, sizeof human);
-                say(s, "по %s пришёл дополнительный сигнал (%s) — подтверждаю подозрение",
-                    t->name, human);
-            }
             task_done(t);
             t = NULL;
         }
@@ -3394,13 +3548,12 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     t->family = ev->family ? ev->family : 4;
     t->by_addr = by_addr;
     t->trigger_code = ev->code;
-    if (have_carried_fp) {
-        t->fp = carried_fp;
-    } else {
-        t->fp.method = D2K_FP_METHOD;
+    t->fp.method = D2K_FP_METHOD;
+    if (!late_app_rst) {
         d2k_cat_signal sig = signal_of(ev);
         fp_add(&t->fp, &sig);
     }
+    t->rx_volume_only = late_app_rst;
     server_of(ev, t->ip, sizeof t->ip, &t->port);
     if (is_voice_class(t->name, t->transport)) {
         uint8_t target_ip[4];
@@ -3420,24 +3573,13 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         }
     }
     t->started_ms = 0;
-    if (ordinary_tcp_rst) {
-        t->state = T_RST_PENDING;
-        t->rst_pending_flow.transport = ev->transport;
-        t->rst_pending_flow.family = t->family;
-        memcpy(t->rst_pending_flow.a_ip, ev->low_ip, sizeof t->rst_pending_flow.a_ip);
-        memcpy(t->rst_pending_flow.b_ip, ev->high_ip, sizeof t->rst_pending_flow.b_ip);
-        t->rst_pending_flow.a_port = ev->low_port;
-        t->rst_pending_flow.b_port = ev->high_port;
-        t->rst_confirm_until_ms = s->clock_seen
-                                      ? s->now_ms + SCHED_RST_CONFIRM_MS
-                                      : 0;
-        say(s, "по %s одиночный обычный RST — жду второй независимый поток до 30 с; поиск пока не запускаю",
-            t->name);
-        return 0;
-    }
     /* Голос, QUIC по адресу и TLS идут через одну общую очередь: иначе
        ограничение только одного транспорта оставило бы остальные источником
        неограниченных параллельных сетевых измерений. */
+    if (ordinary_tcp_rst) {
+        say(s, "по %s одиночный обычный RST — запускаю прямую проверку; обход появится только при подтверждённой блокировке",
+            t->name);
+    }
     return launch_or_queue(s, t);
 }
 
@@ -3516,6 +3658,19 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
         if (t->family != (ev->family ? ev->family : 4)) { continue; }
+        if (t->state == T_ASKING && t->transport == 6 &&
+            strcmp(t->name, name) == 0) {
+            if (!t->trig_snapped && !t->reasked) {
+                /* The worker owns an immutable cold-start profile copy. Ask
+                   it to stop at its next bounded probe boundary; T_ASKING's
+                   completion path will restart with tcp_shape. */
+                t->stop = 1;
+                say(s, "по %s во время профильного замера пойман ClientHello клиента — "
+                       "останавливаю устаревший прогон и повторю его снятыми байтами",
+                    t->name);
+            }
+            continue;
+        }
         /* The whole experiment, not just the worker, owns its input:
          * result conversion, Plan guards and verification must describe
          * the same bytes. New observations remain cached for NEXT search. */
@@ -4186,8 +4341,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         if (t->state == T_FREE) { continue; }
 
         if (t->state == T_QUEUED) {
-            if (t->started_ms == 0) { t->started_ms = now_ms; }
-            if (now_ms - t->started_ms > SCHED_TASK_LIFE_MS) {
+            if (t->queued_ms == 0) { t->queued_ms = now_ms; }
+            if (now_ms - t->queued_ms > SCHED_TASK_LIFE_MS) {
                 say(s, "по %s подозрение устарело в очереди — сетевой замер не запускал",
                     t->name);
                 task_done(t);
@@ -4205,27 +4360,15 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (active < SCHED_MAX_ACTIVE_MEASUREMENTS && !start_gap) {
                 s->last_measure_start_ms = now_ms;
                 s->measure_start_seen = 1;
+                long long waited_s = (long long)((now_ms - t->queued_ms + 500) / 1000);
+                say(s, "по %s ожидание в очереди замеров: %lld с; запускаю поиск",
+                    t->name, waited_s);
                 (void)launch_task(s, t);
                 moved++;
             }
             continue;
         }
 
-        if (t->state == T_RST_PENDING) {
-            /* Первое событие может прийти до первого тика планировщика. В
-               таком случае начинаем 30-секундное окно от его первых часов,
-               а не от нуля/времени запуска ОС. */
-            if (t->rst_confirm_until_ms == 0) {
-                t->started_ms = now_ms;
-                t->rst_confirm_until_ms = now_ms + SCHED_RST_CONFIRM_MS;
-            } else if (now_ms >= t->rst_confirm_until_ms) {
-                say(s, "по %s одиночный RST не подтвердился за 30 с — забываю подозрение",
-                    t->name);
-                task_done(t);
-                moved++;
-            }
-            continue;
-        }
         if (t->state == T_RESTING) {
             if (now_ms >= t->rest_until_ms) { task_done(t); moved++; }
             continue;
@@ -4260,9 +4403,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            "результат не применяется",
                         t->name, SCHED_TASK_LIFE_MS / 60000);
                 }
-                if (t->probes > 0) {
+                if (t->search_started || t->probes > 0) {
                     cooldown_record(s, t, 2);
-                    say(s, "по %s после долгого незавершённого поиска новый замер временно отложен",
+                    say(s, "по %s после незавершённой попытки новый поиск временно отложен на 10 мин",
                         t->name);
                 }
                 task_fail(s, t, now_ms);
@@ -4316,6 +4459,19 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
+            if (t->rx_volume_only) {
+                t->rx_volume_only = 0;
+                if (!t->vol.rx_cut) {
+                    say(s, "по %s поздний RST не подтвердился парными измерениями ответа; "
+                           "перебор не запускаю", t->name);
+                    task_fail(s, t, now_ms);
+                    moved++;
+                    continue;
+                }
+                say(s, "по %s подтверждён повторяемый обрыв входящего ответа около %d КБ "
+                       "при полном gzip-контроле — теперь ищу коробку и её планы",
+                    t->name, t->vol.rx_at_kb);
+            }
             /* QUIC snapshots can arrive while the original Run is in flight.
                Keep that Run's copied input immutable, then discard its result
                and repeat once with the exact target-owned client Initial. */
@@ -4381,7 +4537,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     continue;
                 }
             }
-            if (!verdict_proves_block(r.verdict)) {
+            int volume_proven = t->transport == 6 &&
+                (t->vol.verdict == D2K_VOL_CUT || t->vol.rx_cut);
+            if (!verdict_proves_block(r.verdict) && !volume_proven) {
                 say(s, "по %s прямой замер не подтвердил блокировку (%s: %s) — "
                        "подбор и применение обхода не запускаю",
                     t->name, verdict_name(r.verdict), r.reason);
@@ -4395,6 +4553,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     say(s, "по %s напрямую проходит — повторный поиск отложен на %lld мин; "
                            "это временный ограничитель, а не запись в каталоге",
                         t->name, (long long)((delay_ms + 59999) / 60000));
+                } else {
+                    cooldown_record(s, t, 2);
+                    say(s, "по %s результат неубедителен — повторный замер отложен на %lld мин",
+                        t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
                 }
                 task_fail(s, t, now_ms);
                 moved++;
@@ -4402,7 +4564,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             }
             cooldown_clear(s, t->name, t->transport, t->family);
             {
-                size_t known = known_plans(s, t);
+                /* Volume fingerprint is installed by make_plans before its
+                   catalog lookup; do not match the earlier generic reset. */
+                size_t known = volume_proven ? 0 : known_plans(s, t);
                 if (known > 0) {
                     t->res = r;
                     t->cached_measure_valid = 1;
@@ -4632,6 +4796,20 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        "ответ будет тот же, а знание в каталог не попадёт",
                     t->name, t->transport == 17 ? "QUIC" : "TCP", t->ver.reason);
                 ver_close(t);
+                task_fail(s, t, now_ms);
+                moved++;
+                continue;
+            }
+            if (t->ver.cloudflare_challenge) {
+                /* Cloudflare challenge is an HTTP response, but not the
+                   requested application content. Treating it as success
+                   would persist a useless plan; cycling through more plans
+                   would repeat bot-like probes while the challenge remains.
+                   The exact header is parsed by verify.c, not guessed from a
+                   generic 403 which some APIs legitimately return. */
+                say(s, "по %s получен Cloudflare challenge (cf-mitigated: challenge) — "
+                       "это не обход; останавливаю поиск и даю цели отдохнуть",
+                    t->name);
                 task_fail(s, t, now_ms);
                 moved++;
                 continue;
@@ -4886,14 +5064,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        "измерить было нечем, их и нет",
                     t->name, t->probes);
                 cooldown_record(s, t, 2);
-                {
-                    target_cooldown *cool = cooldown_find(s, t->name, t->transport, t->family);
-                    int64_t delay_ms = cool
-                                           ? clear_backoff_ms(cool->negative_streak)
-                                           : SCHED_CLEAR_BACKOFF_1_MS;
-                    say(s, "по %s после исчерпания кандидатов новый поиск отложен на %lld мин",
-                        t->name, (long long)((delay_ms + 59999) / 60000));
-                }
+                say(s, "по %s после исчерпания кандидатов новый поиск отложен на 10 мин",
+                    t->name);
                 task_fail(s, t, now_ms);
                 moved++;
                 continue;

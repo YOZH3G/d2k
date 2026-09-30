@@ -550,6 +550,22 @@ static int raw_send(raw_conn *c, const uint8_t *payload, size_t plen,
     return 0;
 }
 
+/* The measured pos=2 multidisorder candidate is exactly two segments, sent
+ * tail first and then the original two-byte prefix. Keep this separate from
+ * SNI-middle disorder: it has neither the third one-byte segment nor a pace. */
+static int raw_send_disorder_pos(raw_conn *c, const d2k_trigger *tr,
+                                 uint32_t base, size_t split)
+{
+    d2k_poison none;
+    memset(&none, 0, sizeof none);
+    if (!c || !tr || split == 0 || split >= tr->len) { return -1; }
+    c->seq = base + (uint32_t)split;
+    if (raw_send(c, tr->payload + split, tr->len - split,
+                 (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) { return -1; }
+    c->seq = base;
+    return raw_send(c, tr->payload, split, (uint8_t)(TCP_PSH | TCP_ACK), &none);
+}
+
 /* sendSYN шлёт SYN с обычным набором опций: MSS, SACK-permitted, метки
  * времени, масштаб окна — ровно то, что кладёт ядро. Голое приветствие без
  * них само по себе аномалия: так не здоровается ни один настоящий клиент, и
@@ -1002,6 +1018,10 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
         d2k_sleep_ms(12);
         c.seq = base + (uint32_t)mid;
         if (raw_send(&c, tr->payload + mid, n - mid, (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
+            goto senderr;
+        }
+    } else if (p->disorder_pos > 0) {
+        if (raw_send_disorder_pos(&c, tr, base, (size_t)p->disorder_pos) != 0) {
             goto senderr;
         }
     } else if (p->seqovl > 0 && p->disorder) {

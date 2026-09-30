@@ -276,9 +276,19 @@ static int read_record(d2k_tls12 *t, int encrypted, uint8_t *type,
                        int64_t deadline, char *err, size_t errcap) {
     uint8_t hdr[5];
     if (read_exact(t->fd, hdr, 5, deadline, err, errcap) != 0) { return -1; }
+    /* На TLS/443 сетевой узел иногда отвечает открытым HTTP (на Rutracker
+       Cloudflare прислал HTTP/1.1 400). P/ из HTTP/ — не TLS length=20527. */
+    if (memcmp(hdr, "HTTP/", 5) == 0) {
+        say(err, errcap,
+            "не TLS: открытый HTTP-ответ вместо TLS (заголовок %02x %02x %02x %02x %02x)",
+            hdr[0], hdr[1], hdr[2], hdr[3], hdr[4]);
+        return -1;
+    }
     size_t rlen = get16(hdr + 3);
     if (rlen == 0 || rlen > REC_MAX) {
-        say(err, errcap, "запись длиной %zu вне предела", rlen);
+        say(err, errcap,
+            "не TLS-заголовок %02x %02x %02x %02x %02x: длина %zu вне предела",
+            hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], rlen);
         return -1;
     }
     if (read_exact(t->fd, t->raw, rlen, deadline, err, errcap) != 0) { return -1; }

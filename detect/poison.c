@@ -69,6 +69,7 @@ static void init_poisons(void)
     p = add("badsum-x2-g80");      p->badsum = 1; p->repeats = 2; p->gap_ms = 80;
     p = add("badsum-x7");          p->badsum = 1; p->repeats = 7;
     p = add("disorder");           p->disorder = 1;
+    p = add("disorder-pos2");      p->disorder = 1; p->disorder_pos = 2;
     p = add("badsum");             p->badsum = 1;
     p = add("md5");                p->md5 = 1;
     p = add("seq-out-of-window");  p->seq_shift = -66000;
@@ -275,6 +276,12 @@ void d2k_strategy_for_poison(const d2k_poison *p, char *out, size_t cap)
         strncat(st, " --lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld",
                 sizeof(st) - strlen(st) - 1);
         snprintf(out, cap, "%s", st);
+        return;
+    }
+    if (p->disorder_pos > 0) {
+        snprintf(out, cap,
+                 "--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=%d",
+                 p->disorder_pos);
         return;
     }
     if (p->disorder) {

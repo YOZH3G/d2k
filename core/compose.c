@@ -1355,17 +1355,19 @@ typedef d2k_arm fb_arm;
 
 /* Голова списка — дословно donor poisons()[0..7], без неподдержанных. */
 static const fb_arm g_fb_head[] = {
-    { "seqovl-1",        1, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0 },
-    { "badsum-x2-g20",   0, 0, 1, 2, 20, 0, 0, 0, 0, 0, 0, 0 },
-    { "badsum-x2-g80",   0, 0, 1, 2, 80, 0, 0, 0, 0, 0, 0, 0 },
-    { "badsum-x7",       0, 0, 1, 7,  0, 0, 0, 0, 0, 0, 0, 0 },
-    { "disorder",        0, 0, 0, 0,  0, 1, 0, 0, 0, 0, 0, 0 },
-    { "badsum",          0, 0, 1, 1,  0, 0, 0, 0, 0, 0, 0, 0 },
-    { "seq-out-of-window", 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0 },
-    { "fakedsplit",      0, 0, 1, 1,  0, 0, 1, 0, 0, 0, 0, 0 },
-    { "fakedsplit-x7",   0, 0, 1, 7,  0, 0, 1, 0, 0, 0, 0, 0 },
-    { "seqovl-hello",    0, 1, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0 },
-    { "seqovl-hello+disorder", 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 },
+    { .name="seqovl-1", .seqovl=1 },
+    { .name="badsum-x2-g20", .badsum=1, .repeats=2, .gap_ms=20 },
+    { .name="badsum-x2-g80", .badsum=1, .repeats=2, .gap_ms=80 },
+    { .name="badsum-x7", .badsum=1, .repeats=7 },
+    { .name="disorder", .disorder=1 },
+    { .name = "disorder-pos2", .disorder=1, .disorder_pos = 2 },
+    { .name="badsum", .badsum=1, .repeats=1 },
+    { .name="seq-out-of-window", .repeats=1, .seq_out=1 },
+    { .name="fakedsplit", .badsum=1, .repeats=1, .between=1 },
+    { .name="fakedsplit-x7", .badsum=1, .repeats=7, .between=1 },
+    { .name="seqovl-hello", .seqovl_hello=1 },
+    { .name="seqovl-hello+disorder", .seqovl_hello=1, .disorder=1 },
+    { .name="oob-sni-middle", .oob=1 },
 };
 
 /* Хвост — параметрические семейства донора в его же порядке. */
@@ -1381,8 +1383,7 @@ static const unsigned g_fb_dup_reps[]  = { 2, 3, 4, 7 };
                    (sizeof g_fb_dup_reps / sizeof g_fb_dup_reps[0]))
 
 /* Сколько всего плеч в списке — см. контракт в d2k_compose.h. Складывается из
-   тех же слагаемых, что и разбор индекса в fb_arm_at ниже: голова плюс четыре
-   параметрических семейства. */
+   тех же слагаемых, что и разбор индекса в fb_arm_at ниже. */
 size_t d2k_fallback_arms(void) {
     return FB_N_HEAD + FB_N_FAKE + FB_N_FAKE + FB_N_OVL * 2 + FB_N_DUP;
 }
@@ -1547,8 +1548,36 @@ int d2k_voice_plan(const uint8_t *decoy, size_t dlen, char *buf, size_t cap) {
 int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
                       size_t send_cap, char *buf, size_t cap) {
     fb_arm a;
-    if (!buf || cap == 0 || fb_arm_at(idx, &a) != 0) { return -1; }
+    if (!buf || cap == 0) { return -1; }
+    int arm_rc = fb_arm_at(idx, &a);
+    if (arm_rc != 0) { return -1; }
     return d2k_arm_plan(&a, shape, decoy, send_cap, buf, cap);
+}
+
+int d2k_rx_volume_plan(unsigned variant, d2k_shape shape, size_t send_cap,
+                       char *buf, size_t cap) {
+    static const unsigned split_at[D2K_RX_VOLUME_PLAN_VARIANTS] = {2, 1, 3, 4, 5};
+    uint8_t hello[D2K_COMPOSE_HELLO_MAX];
+    size_t hello_len = 0, pos = 0;
+    if (!buf || cap == 0 || variant >= D2K_RX_VOLUME_PLAN_VARIANTS ||
+        shape != D2K_SHAPE_MODERN ||
+        d2k_hello_from_profile(D2K_SHAPE_LEGACY, "hcaptcha.com", hello,
+                               sizeof hello, &hello_len) != 0) { return -1; }
+    /* Manual evidence establishes the ingredients and order, not every wire
+       parameter. Search only the narrow family: one stale-timestamp fake
+       first, no nodrop, and a split original modern ClientHello in every
+       candidate (it is never emitted as one complete packet). */
+    if (send_cap > 0 && (hello_len > send_cap || send_cap - hello_len < 132)) { return -1; }
+    if (append_fmt(buf, cap, &pos,
+            "d2k-plan 1 8\nid 00000000000000000000000000000000\n"
+            "proto tcp tls\nwire detect-tcp-v1\ninput tls-sni\nsegment %u\n",
+            (unsigned)D2K_ARM_SEGMENT_MAX) != 0 ||
+        append_fmt(buf, cap, &pos, "payload 1 ") != 0 ||
+        append_hex(buf, cap, &pos, hello, hello_len) != 0 ||
+        append_fmt(buf, cap, &pos,
+            "\npoison 1 tcpts\nfake payload=1 poison=1 repeats=1 gap_us=0 place=before\n"
+            "split payload_start +%u\norder forward\n", split_at[variant]) != 0) { return -1; }
+    return 0;
 }
 
 /* Compact text, exact binary payload: keep the measured prefix and the
@@ -1580,6 +1609,29 @@ int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
         in->decoy_len > sizeof in->decoy || in->sni_off > in->trigger_len ||
         in->sni_len > in->trigger_len - in->sni_off || a->repeats > 255 ||
         a->ttl > 255 || a->gap_ms > UINT32_MAX / 1000u) { return -1; }
+    if (a->disorder_pos) {
+        if (!a->disorder || a->disorder_pos >= in->trigger_len || a->seqovl ||
+            a->seqovl_hello || a->badsum || a->repeats || a->gap_ms || a->between ||
+            a->ttl || a->seq_out || a->decoy_hello || a->tcpts || a->ipidzero ||
+            a->oob) { return -1; }
+        size_t plan_pos = 0;
+        return append_fmt(buf, cap, &plan_pos,
+            "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
+            "wire detect-tcp-v1\ninput tls-sni\nsegment %u\nsplit payload_start +%u\n"
+            "order reverse\n",
+            (unsigned)D2K_ARM_SEGMENT_MAX, a->disorder_pos);
+    }
+    if (a->oob) {
+        if (a->seqovl || a->seqovl_hello || a->badsum || a->repeats || a->gap_ms ||
+            a->disorder || a->between || a->ttl || a->seq_out || a->decoy_hello ||
+            a->tcpts || a->ipidzero || in->sni_off == 0 || in->sni_len <= 1 ||
+            in->sni_off + in->sni_len > in->trigger_len) { return -1; }
+        size_t pos = 0;
+        return append_fmt(buf, cap, &pos,
+            "d2k-plan 1 8\nid 00000000000000000000000000000000\nproto tcp tls\n"
+            "wire detect-tcp-v1\ninput tls-sni\nsegment %u\noob sni_middle 0f\norder forward\n",
+            (unsigned)D2K_ARM_SEGMENT_MAX);
+    }
     size_t n = in->trigger_len, pos = 0;
     size_t ov = a->seqovl_hello ? in->decoy_len : a->seqovl;
     if (ov > D2K_ARM_DECOY_MAX) { return -1; }
@@ -1594,7 +1646,16 @@ int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
     }
     if (between) { if (mid >= n) { mid = 1; } ov = 0; }
     else { if (mid < 2) { mid = 2; } if (mid >= n) { mid = n - 1; } }
-    if (!fake && !between && !disorder && !ov) { return -1; }
+    if (!fake && !between && !disorder && !ov && !a->disorder_pos) { return -1; }
+    if (a->disorder_pos) {
+        if (a->disorder_pos >= n) { return -1; }
+        if (append_fmt(buf, cap, &pos,
+            "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
+            "wire detect-tcp-v1\ninput tls-sni\nsegment %u\n"
+            "split payload_start +%u\norder reverse\n",
+            (unsigned)D2K_ARM_SEGMENT_MAX, a->disorder_pos)) { return -1; }
+        return 0;
+    }
     /* Перестановка режет вход не по измеренному числу, а по середине SNI.
      * Поэтому длина и смещения конкретного ClientHello не являются
      * зависимостью плана: зонд TLS 1.2 может построить своё приветствие с
@@ -1660,7 +1721,10 @@ int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
         } else if (measured_payload(buf, cap, &pos, 2, ov, prefix, prefix_len)) { return -1; }
         if (append_fmt(buf, cap, &pos, "seqovl payload=2 poison=0\n")) { return -1; }
     }
-    if (disorder && append_fmt(buf, cap, &pos, "split payload_start +1\n")) { return -1; }
+    /* The donor's exported seqovl strategy is multisplit(pos=1), including
+     * plain seqovl arms; the property probe itself remains unsplit. */
+    if ((ov || disorder) &&
+        append_fmt(buf, cap, &pos, "split payload_start +1\n")) { return -1; }
     if ((disorder || between) &&
         append_fmt(buf, cap, &pos, "split payload_start +%zu\n", mid)) { return -1; }
     if (fake || between) {
@@ -1680,6 +1744,29 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
     fb_arm a;
     if (!buf || cap == 0 || !arm) { return -1; }
     a = *arm;
+    if (a.disorder_pos) {
+        if (a.disorder_pos > D2K_ARM_DECOY_MAX || !a.disorder || a.seqovl ||
+            a.seqovl_hello || a.badsum || a.repeats || a.gap_ms || a.between ||
+            a.ttl || a.seq_out || a.decoy_hello || a.tcpts || a.ipidzero || a.oob) {
+            return -1;
+        }
+        size_t plan_pos = 0;
+        return append_fmt(buf, cap, &plan_pos,
+            "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
+            "wire detect-tcp-v1\ninput tls-sni\nsegment %u\nsplit payload_start +%u\n"
+            "order reverse\n",
+            (unsigned)D2K_ARM_SEGMENT_MAX, a.disorder_pos);
+    }
+    if (a.oob) {
+        if (a.seqovl || a.seqovl_hello || a.badsum || a.repeats || a.gap_ms ||
+            a.disorder || a.between || a.ttl || a.seq_out || a.decoy_hello ||
+            a.tcpts || a.ipidzero) { return -1; }
+        size_t pos = 0;
+        return append_fmt(buf, cap, &pos,
+            "d2k-plan 1 8\nid 00000000000000000000000000000000\nproto tcp tls\n"
+            "wire detect-tcp-v1\ninput tls-sni\nsegment %u\noob sni_middle 0f\norder forward\n",
+            (unsigned)D2K_ARM_SEGMENT_MAX);
+    }
 
     uint8_t hello[D2K_COMPOSE_HELLO_MAX];
     size_t hello_len = 0;
@@ -1695,6 +1782,18 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
 
     size_t pos = 0;
     if (emit_header(buf, cap, &pos) != 0) { return -1; }
+
+    /* Single-cut TLS 1.3 multidisorder: preserve the selected split position
+       and reverse order exactly, without the extra SNI-middle cut or pacing
+       used by the separate generic disorder hypothesis. */
+    if (a.disorder_pos) {
+        if (shape != D2K_SHAPE_MODERN || a.disorder_pos < 1 ||
+            a.disorder_pos >= D2K_ARM_DECOY_MAX) { return -1; }
+        if (append_fmt(buf, cap, &pos, "wire detect-tcp-v1\ninput tls-sni\nsegment %u\n"
+                       "split payload_start +%u\norder reverse\n",
+                       (unsigned)D2K_ARM_SEGMENT_MAX, a.disorder_pos)) { return -1; }
+        return 0;
+    }
 
     /* payload 1 — тело фальшивки; payload 2 — приставка перекрытия. */
     int have_fake = a.badsum || a.repeats > 0 || a.between;
@@ -1790,8 +1889,10 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
         if (append_fmt(buf, cap, &pos, "\n") != 0) { return -1; }
     }
 
-    if (a.disorder || a.between) {
+    if (a.seqovl || a.seqovl_hello || a.disorder || a.between) {
         if (append_fmt(buf, cap, &pos, "split payload_start +1\n") != 0) { return -1; }
+    }
+    if (a.disorder || a.between) {
         if (append_fmt(buf, cap, &pos, "split sni_middle +0\n") != 0) { return -1; }
     }
     if (have_fake) {

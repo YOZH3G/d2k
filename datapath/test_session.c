@@ -417,6 +417,72 @@ static void test_suspect_tells_planned(void) {
     }
 }
 
+/* Поздний RST после TLS app-data — лишь триггер узкой проверки объёма.
+   Он не должен сливаться с ранним RST «в ответ на ClientHello»: сервер уже
+   прислал прикладные данные, поэтому причиной поиска может стать только
+   воспроизводимый обрыв ответа, измеренный контроллером. */
+static void test_late_rst_after_tls_appdata(void) {
+    d2k_session *s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "сессия позднего RST не создалась");
+    if (!s) { return; }
+
+    uint8_t hello[512], pkt[1024], buf[8192];
+    size_t hlen = build_hello(hello);
+    d2k_result r;
+
+    size_t n = build_pkt(pkt, 47801, 0x18, hello, hlen);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+
+    /* Тип записи 23 важен, содержимое зашифровано и разбирать его не надо. */
+    const uint8_t appdata[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0x00};
+    n = build_rev_pkt(pkt, 47801, 0x18, appdata, sizeof appdata);
+    d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+    CHECK(count_kind(s, D2K_JRN_EXCHANGE) == 1,
+          "TLS app-data не записаны до позднего RST");
+
+    n = build_rev_pkt(pkt, 47801, 0x14, NULL, 0);
+    d2k_session_packet(s, pkt, n, 3000, buf, sizeof buf, &r);
+    const d2k_jrn_entry *e = last_suspect(s);
+    CHECK(e != NULL, "поздний RST после TLS app-data не замечен");
+    CHECK(e && e->code == D2K_SUSPECT_RST_AFTER_APP,
+          "поздний RST смешан с ранним RST до ответа");
+    d2k_session_free(s);
+
+    /* Если браузер закрывает зависшую загрузку сам, его поздний RST тоже
+       должен инициировать только парное измерение RX-объёма. Входящий
+       ClientHello и обычное число исходящих пакетов попадают в узкое окно;
+       firewall отдельно пропускает сюда поздний RST. */
+    s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "сессия позднего клиентского RST не создалась");
+    if (!s) { return; }
+    n = build_pkt(pkt, 47803, 0x18, hello, hlen);
+    d2k_session_packet(s, pkt, n, 3100, buf, sizeof buf, &r);
+    n = build_rev_pkt(pkt, 47803, 0x18, appdata, sizeof appdata);
+    d2k_session_packet(s, pkt, n, 3200, buf, sizeof buf, &r);
+    n = build_pkt(pkt, 47803, 0x14, NULL, 0);
+    d2k_session_packet(s, pkt, n, 3300, buf, sizeof buf, &r);
+    e = last_suspect(s);
+    CHECK(e != NULL && e->code == D2K_SUSPECT_RST_AFTER_APP,
+          "клиентский RST после TLS app-data не дал узкий RX-volume-сигнал");
+    d2k_session_free(s);
+
+    /* A handshake/ServerHello response followed by RST is not enough to
+       start an RX-volume search: application-data must have been observed. */
+    s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "контрольная сессия late-RST не создалась");
+    if (!s) { return; }
+    const uint8_t handshake[] = {0x16, 0x03, 0x03, 0x00, 0x01, 0x00};
+    n = build_pkt(pkt, 47802, 0x18, hello, hlen);
+    d2k_session_packet(s, pkt, n, 4000, buf, sizeof buf, &r);
+    n = build_rev_pkt(pkt, 47802, 0x18, handshake, sizeof handshake);
+    d2k_session_packet(s, pkt, n, 5000, buf, sizeof buf, &r);
+    n = build_rev_pkt(pkt, 47802, 0x14, NULL, 0);
+    d2k_session_packet(s, pkt, n, 6000, buf, sizeof buf, &r);
+    CHECK(d2k_session_suspects(s) == 0,
+          "late-RST measurement trigger fired before TLS app-data");
+    d2k_session_free(s);
+}
+
 int main(void) {
     {
         d2k_session *v6 = d2k_session_new(32, 32);
@@ -450,6 +516,7 @@ int main(void) {
         d2k_session_free(v6);
     }
     test_suspect_tells_planned();
+    test_late_rst_after_tls_appdata();
     d2k_session *s = d2k_session_new(64, 32);
     CHECK(s != NULL, "сессия не создалась");
     if (!s) {

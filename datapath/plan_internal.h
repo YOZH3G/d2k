@@ -38,7 +38,8 @@ enum {
     REC_WIRE    = 0x0109,
     REC_INPUT_TLS = 0x010a,
     REC_DELAY     = 0x010b,
-    REC_IPFRAG    = 0x010c
+    REC_IPFRAG    = 0x010c,
+    REC_OOB       = 0x010d
 };
 
 /* Якоря семантических позиций. */
@@ -81,7 +82,11 @@ struct d2k_fake {
     uint8_t  repeats;
     uint8_t  placement;
     uint32_t gap_us;
+    uint8_t  tls_mod;
 };
+
+#define D2K_TLS_MOD_RND    (1u << 0)
+#define D2K_TLS_MOD_DUPSID (1u << 1)
 
 struct d2k_seqovl {
     uint16_t payload_id;
@@ -102,6 +107,9 @@ struct d2k_plan {
     uint8_t wire_profile;
     uint8_t input_tls;
     uint8_t ipfrag;
+    uint8_t oob_enabled;
+    uint16_t oob_anchor;
+    uint8_t oob_byte;
 
     struct d2k_payload *payloads; size_t n_payloads;
     struct d2k_poison  *poisons;  size_t n_poisons;

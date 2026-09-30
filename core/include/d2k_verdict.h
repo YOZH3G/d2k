@@ -53,6 +53,7 @@
 #ifndef D2K_VERDICT_H
 #define D2K_VERDICT_H
 
+#include <signal.h>
 #include <stdint.h>
 
 #include "d2k_arm.h"
@@ -236,5 +237,14 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
                        d2k_hello trigger, d2k_hello control,
                        uint32_t mark, int repeats,
                        uint32_t gap_us, uint32_t wait_ms);
+
+/* Same decision tree, but returns promptly between network-question batches
+ * when stop is raised by the scheduler (for example, a real client snapshot
+ * arrived while a cold-start profile was being measured). */
+d2k_vres d2k_classify_cancelable(const char *ip, uint16_t port,
+                                  d2k_hello trigger, d2k_hello control,
+                                  uint32_t mark, int repeats,
+                                  uint32_t gap_us, uint32_t wait_ms,
+                                  const volatile sig_atomic_t *stop);
 
 #endif /* D2K_VERDICT_H */

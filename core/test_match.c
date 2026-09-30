@@ -87,6 +87,13 @@ static void add_volume(d2k_cat_fp *f, int kb) {
     s->volume = kb;
 }
 
+static void add_rx_volume(d2k_cat_fp *f, int kb) {
+    d2k_cat_signal *s = &f->sig[f->n_sig++];
+    memset(s, 0, sizeof *s);
+    strcpy(s->kind, "rx-volume");
+    s->volume = kb;
+}
+
 int main(void) {
     /* =====================================================================
      * 1. Узнавание смотрит ВСЕ приметы рода, а не первую попавшуюся.
@@ -174,6 +181,16 @@ int main(void) {
         CHECK(d2k_fp_same(&a, &b) == 1, "19 и 23 КБ сочтены разными коробками");
         b.sig[0].volume = 40;
         CHECK(d2k_fp_same(&a, &b) == 0, "19 и 40 КБ сочтены одной коробкой");
+    }
+    {
+        /* Направление — часть класса: исходящая лестница и обрыв входящего
+           HTTP-тела нельзя склеить в одну коробку при равном объёме. */
+        d2k_cat_fp a, b;
+        memset(&a, 0, sizeof a); a.method = 2; add_volume(&a, 24);
+        memset(&b, 0, sizeof b); b.method = 2; add_rx_volume(&b, 24);
+        CHECK(d2k_fp_same(&a, &b) == 0, "TX и RX объём ошибочно сочлись одной коробкой");
+        add_rx_volume(&a, 24);
+        CHECK(d2k_fp_same(&a, &b) == 1, "одинаковый RX-объём не распознался");
     }
 
     /* =====================================================================

@@ -101,6 +101,41 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * NS_PER_S + (uint64_t)ts.tv_nsec;
 }
 
+/* Route lookup is needed only when a TLS ClientHello is about to be examined,
+   not for every packet that crosses NFQUEUE. The resulting cap reserves the
+   largest TCP header the wire builder can emit (32 bytes) and therefore
+   keeps a split payload below the route's IP MTU even when TCP timestamps are
+   requested by the measured strategy. */
+static size_t tls_route_segment_cap(d2k_raw *raw, const uint8_t *pkt, size_t len) {
+    if (!raw || !pkt || len < 40) { return 0; }
+    uint8_t family = pkt[0] >> 4;
+    size_t ip_len, tcp_off;
+    const uint8_t *dst;
+    if (family == 4) {
+        ip_len = (size_t)(pkt[0] & 15u) * 4u;
+        if (ip_len < 20 || len < ip_len + 20 || pkt[9] != 6) { return 0; }
+        dst = pkt + 16;
+        tcp_off = ip_len;
+    } else if (family == 6) {
+        /* The session parser handles extension headers. For this fast-path
+           MTU hint, skip them rather than guessing their length. */
+        if (len < 60 || pkt[6] != 6) { return 0; }
+        ip_len = 40;
+        dst = pkt + 24;
+        tcp_off = 40;
+    } else {
+        return 0;
+    }
+    size_t tcp_len = (size_t)(pkt[tcp_off + 12] >> 4) * 4u;
+    if (tcp_len < 20 || len < tcp_off + tcp_len + 5 ||
+        pkt[tcp_off + tcp_len] != 0x16 || pkt[tcp_off + tcp_len + 1] != 3) {
+        return 0;
+    }
+    size_t mtu = d2k_raw_route_maxlen_family(raw, dst, family);
+    size_t overhead = ip_len + 32u; /* 20-byte TCP base + 12-byte options */
+    return mtu > overhead ? mtu - overhead : 0;
+}
+
 /* --- учёт причин пропуска -------------------------------------------------
  * «План не сработал» и «план не применялся» — разные факты, и сводка обязана
  * их различать. Причины приходят строковыми литералами из session.c, поэтому
@@ -872,6 +907,8 @@ int main(int argc, char **argv) {
                     res.first_payload = 0xFF;
                     int controller_probe = probe_mark != 0 && np.have_mark &&
                                            np.mark == probe_mark;
+                    size_t tcp_segment_cap = mode == MODE_APPLY
+                        ? tls_route_segment_cap(raw, np.payload, np.payload_len) : 0;
 
                     if (!np.have_payload) {
                         st.no_payload++;
@@ -882,11 +919,21 @@ int main(int argc, char **argv) {
                         res.skipped = "пакет обрезан copy_range";
                     } else {
                         if (controller_probe) {
-                            d2k_session_packet_probe(sess, np.payload, np.payload_len, t,
-                                                     obuf, sizeof obuf, &res);
+                            if (tcp_segment_cap) {
+                                d2k_session_packet_probe_mtu(sess, np.payload, np.payload_len, t,
+                                                             tcp_segment_cap, obuf, sizeof obuf, &res);
+                            } else {
+                                d2k_session_packet_probe(sess, np.payload, np.payload_len, t,
+                                                         obuf, sizeof obuf, &res);
+                            }
                         } else {
-                            d2k_session_packet(sess, np.payload, np.payload_len, t,
-                                               obuf, sizeof obuf, &res);
+                            if (tcp_segment_cap) {
+                                d2k_session_packet_mtu(sess, np.payload, np.payload_len, t,
+                                                       tcp_segment_cap, obuf, sizeof obuf, &res);
+                            } else {
+                                d2k_session_packet(sess, np.payload, np.payload_len, t,
+                                                   obuf, sizeof obuf, &res);
+                            }
                         }
                     }
 
@@ -926,11 +973,21 @@ int main(int argc, char **argv) {
                         res.verdict = D2K_VERDICT_ACCEPT;
                         res.first_payload = 0xFF;
                         if (controller_probe) {
-                            d2k_session_packet_probe(sess, np.payload, np.payload_len, t,
-                                                     obuf, sizeof obuf, &res);
+                            if (tcp_segment_cap) {
+                                d2k_session_packet_probe_mtu(sess, np.payload, np.payload_len, t,
+                                                             tcp_segment_cap, obuf, sizeof obuf, &res);
+                            } else {
+                                d2k_session_packet_probe(sess, np.payload, np.payload_len, t,
+                                                         obuf, sizeof obuf, &res);
+                            }
                         } else {
-                            d2k_session_packet(sess, np.payload, np.payload_len, t,
-                                               obuf, sizeof obuf, &res);
+                            if (tcp_segment_cap) {
+                                d2k_session_packet_mtu(sess, np.payload, np.payload_len, t,
+                                                       tcp_segment_cap, obuf, sizeof obuf, &res);
+                            } else {
+                                d2k_session_packet(sess, np.payload, np.payload_len, t,
+                                                   obuf, sizeof obuf, &res);
+                            }
                         }
                         if (controller_probe) {
                             fprintf(stderr, "d2kd: verifier QUIC replay: %s; applied=%u emits=%zu\n",

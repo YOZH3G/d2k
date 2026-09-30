@@ -79,6 +79,8 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
         return 0;
     }
     if (c->family != 0 && c->family != 4 && c->family != 6) { return 0; }
+    if ((e->urgent && (!e->urgent_ptr || e->urgent_ptr > e->len)) ||
+        (!e->urgent && e->urgent_ptr)) { return 0; }
     int ipv6 = c->family == 6;
     size_t ip_hdr = ipv6 ? 40u : IP_HDR;
     if (ipv6 && (e->poison & D2K_POISON_IPID_ZERO)) { return 0; }
@@ -131,10 +133,10 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     wr32(t + 4, e->seq + (uint32_t)e->seq_shift);
     wr32(t + 8, c->ack);
     t[12] = (uint8_t)(((TCP_HDR + opt_len) / 4) << 4);
-    t[13] = 0x18;                        /* PSH | ACK */
+    t[13] = (uint8_t)(0x18 | (e->urgent ? 0x20 : 0)); /* PSH | ACK | URG? */
     wr16(t + 14, measured ? 65535 : c->window);
     wr16(t + 16, 0);                     /* сумма */
-    wr16(t + 18, 0);                     /* указатель срочных данных */
+    wr16(t + 18, e->urgent ? e->urgent_ptr : 0);
 
     if (opt_len) {
         uint8_t *o = t + TCP_HDR;

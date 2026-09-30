@@ -25,6 +25,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
+#include <sys/socket.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -35,6 +36,7 @@
 #include "d2k_tls13.h"
 #include "d2k_tls12.h"
 #include "d2k_verify.h"
+#include "d2k_meas.h"
 
 static int64_t verify_now_ms(void) {
     struct timespec t;
@@ -43,9 +45,10 @@ static int64_t verify_now_ms(void) {
 }
 
 /* RFC 9112 §4, RFC 9110 §15.2. Записи TLS не являются границами HTTP.
-   Ждём полную строку и конец заголовков окончательного ответа; 1xx сам по
-   себе не успех. Ограничены и общий объём заголовков, и время всей сборки.
-   Тело ответа, происхождение страницы и сертификат здесь НЕ проверяются. */
+   Нужны окончательные заголовки И полное тело по framing: один HTTP 200 не
+   означает, что страница загрузилась (на RuTracker тело обрывалось около
+   24 КБ при уже полученных заголовках). Происхождение страницы и цепочка
+   сертификата здесь всё ещё не проверяются. */
 /* Ищет CRLFCRLF в ПАМЯТИ, а не строковыми функциями: ответ содержит нулевые
    байты, и strstr останавливается на первом из них. */
 static const uint8_t *find_hdr_end(const uint8_t *b, size_t n) {
@@ -65,45 +68,46 @@ static const uint8_t *find_eol(const uint8_t *b, size_t n) {
     return NULL;
 }
 
-static int ascii_equal_ci(const uint8_t *p, size_t n, const char *s) {
-    size_t sn = strlen(s);
-    if (n != sn) { return 0; }
+static uint8_t lower_ascii(uint8_t c) {
+    return (c >= 'A' && c <= 'Z') ? (uint8_t)(c + ('a' - 'A')) : c;
+}
+
+static int span_eq_ascii_ci(const uint8_t *p, size_t n, const char *s) {
+    size_t m = strlen(s);
+    if (n != m) { return 0; }
     for (size_t i = 0; i < n; i++) {
-        uint8_t a = p[i], b = (uint8_t)s[i];
-        if (a >= 'A' && a <= 'Z') { a = (uint8_t)(a + ('a' - 'A')); }
-        if (b >= 'A' && b <= 'Z') { b = (uint8_t)(b + ('a' - 'A')); }
-        if (a != b) { return 0; }
+        if (lower_ascii(p[i]) != (uint8_t)s[i]) { return 0; }
     }
     return 1;
 }
 
-/* `cf-mitigated: challenge` is Cloudflare's explicit anti-bot signal. A
- * generic 403 is deliberately NOT special: many origins use it for normal
- * authorization failures, and status alone says nothing about DPI bypass.
- */
-static int has_cf_challenge(const uint8_t *buf, size_t hdr_len) {
-    const uint8_t *line_end = find_eol(buf, hdr_len + 2);
-    if (!line_end) { return 0; }
-    size_t pos = (size_t)(line_end - buf) + 2;
+/* Cloudflare marks every challenge page with this response header. Checking
+   the exact marker is safer than treating every HTTP error as a blocked page:
+   some legitimate endpoints return 404/403 while still proving that the
+   request reached the intended application. */
+static int has_cf_challenge(const uint8_t *buf, size_t hdr_len,
+                           const uint8_t *status_eol) {
+    size_t pos = (size_t)(status_eol - buf) + 2;
     while (pos < hdr_len) {
         const uint8_t *line = buf + pos;
-        const uint8_t *eol = find_eol(line, hdr_len - pos + 2);
-        if (!eol) { break; }
-        size_t line_len = (size_t)(eol - line);
+        const uint8_t *eol = find_eol(line, hdr_len - pos);
+        size_t line_len = eol ? (size_t)(eol - line) : hdr_len - pos;
         const uint8_t *colon = memchr(line, ':', line_len);
-        if (colon && ascii_equal_ci(line, (size_t)(colon - line), "cf-mitigated")) {
-            const uint8_t *value = colon + 1;
-            const uint8_t *end = line + line_len;
-            while (value < end && (*value == ' ' || *value == '\t')) { value++; }
-            while (end > value && (end[-1] == ' ' || end[-1] == '\t')) { end--; }
-            if (ascii_equal_ci(value, (size_t)(end - value), "challenge")) { return 1; }
+        if (colon && span_eq_ascii_ci(line, (size_t)(colon - line), "cf-mitigated")) {
+            size_t off = (size_t)(colon - line) + 1;
+            size_t end = line_len;
+            while (off < end && (line[off] == ' ' || line[off] == '\t')) { off++; }
+            while (end > off && (line[end - 1] == ' ' || line[end - 1] == '\t')) { end--; }
+            if (span_eq_ascii_ci(line + off, end - off, "challenge")) { return 1; }
         }
+        if (!eol) { break; }
         pos += line_len + 2;
     }
     return 0;
 }
 
-/* Код окончательного ответа HTTP, либо 0 — «полных заголовков нет».
+/* Код окончательного ответа HTTP (тело и framing возвращаются отдельно),
+ * либо 0 — «полных заголовков нет».
  *
  * НОЛЬ В ТЕЛЕ БОЛЬШЕ НИЧЕГО НЕ РЕШАЕТ. Здесь стояло `if (memchr(...0...)) break;`
  * — разбор бросался, едва во ВХОДЯЩИХ байтах попадался нулевой. Тело ответа
@@ -137,11 +141,149 @@ static long read12(void *sess, uint8_t *buf, size_t cap, int wait_ms,
     return d2k_tls12_read((d2k_tls12 *)sess, buf, cap, wait_ms, err, errcap);
 }
 
-static int read_status_rd(read_fn rd, void *sess, int wait_ms, char *err, size_t errcap,
-                          int *cf_challenge) {
+typedef struct {
+    read_fn rd;
+    void *sess;
+    uint8_t *buf;
+    size_t used, pos;
+    int64_t until;
+    char *err;
+    size_t errcap;
+} body_stream;
+
+/* Следующий байт из уже прочитанной части ответа либо из TLS. */
+static int body_byte(body_stream *s, uint8_t *out) {
+    if (s->pos == s->used) {
+        int64_t left = s->until - verify_now_ms();
+        if (left <= 0) { snprintf(s->err, s->errcap, "тайм-аут чтения тела"); return -1; }
+        long n = s->rd(s->sess, s->buf, 8192, (int)left, s->err, s->errcap);
+        if (n <= 0) { return (int)n; }
+        s->used = (size_t)n;
+        s->pos = 0;
+    }
+    *out = s->buf[s->pos++];
+    return 1;
+}
+
+static int body_exact(body_stream *s, uint64_t n, uint64_t *bytes) {
+    while (n) {
+        if (s->pos == s->used) {
+            int64_t left = s->until - verify_now_ms();
+            if (left <= 0) { snprintf(s->err, s->errcap, "тайм-аут чтения тела"); return -1; }
+            long got = s->rd(s->sess, s->buf, 8192, (int)left, s->err, s->errcap);
+            if (got <= 0) { return -1; }
+            s->used = (size_t)got;
+            s->pos = 0;
+        }
+        size_t take = s->used - s->pos;
+        if ((uint64_t)take > n) { take = (size_t)n; }
+        s->pos += take;
+        n -= take;
+        *bytes += take;
+    }
+    return 0;
+}
+
+static int body_line(body_stream *s, char *line, size_t cap) {
+    size_t n = 0;
+    int cr = 0;
+    for (;;) {
+        uint8_t c;
+        int r = body_byte(s, &c);
+        if (r <= 0) { return -1; }
+        if (cr) {
+            if (c != '\n') { return -1; }
+            line[n] = '\0';
+            return 0;
+        }
+        if (c == '\r') { cr = 1; continue; }
+        if (c == '\n' || n + 1 >= cap) { return -1; }
+        line[n++] = (char)c;
+    }
+}
+
+/* Читает тело целиком по Content-Length, chunked или закрытию TLS. Для
+   chunked тело и framing считаются раздельно; размер чанка проверяется до
+   сложения, а завершение требует нулевого чанка и конца trailers. */
+static int read_http_body(body_stream *s, int status, int has_length,
+                          uint64_t length, int chunked,
+                          uint64_t *body_bytes, uint64_t *body_expected) {
+    *body_bytes = 0;
+    *body_expected = has_length ? length : 0;
+    if (status == 204 || status == 304) { return 1; }
+    if (has_length) {
+        uint64_t already = (uint64_t)(s->used - s->pos);
+        if (already > length) { already = length; }
+        s->pos += (size_t)already;
+        *body_bytes = already;
+        if (already < length && body_exact(s, length - already, body_bytes) != 0) { return 0; }
+        return 1;
+    }
+    if (chunked) {
+        char line[128];
+        for (;;) {
+            if (body_line(s, line, sizeof line) != 0) { return 0; }
+            uint64_t chunk = 0;
+            size_t i = 0, digits = 0;
+            while (line[i] && line[i] != ';') {
+                unsigned char c = (unsigned char)line[i++];
+                unsigned v;
+                if (c >= '0' && c <= '9') { v = c - '0'; }
+                else if (c >= 'a' && c <= 'f') { v = c - 'a' + 10; }
+                else if (c >= 'A' && c <= 'F') { v = c - 'A' + 10; }
+                else { return 0; }
+                if (chunk > (UINT64_MAX - v) / 16) { return 0; }
+                chunk = chunk * 16 + v;
+                digits++;
+            }
+            if (!digits || UINT64_MAX - *body_bytes < chunk) { return 0; }
+            if (chunk == 0) {
+                do {
+                    if (body_line(s, line, sizeof line) != 0) { return 0; }
+                } while (line[0]);
+                *body_expected = *body_bytes;
+                return 1;
+            }
+            if (body_exact(s, chunk, body_bytes) != 0) { return 0; }
+            uint8_t a, b;
+            if (body_byte(s, &a) != 1 || body_byte(s, &b) != 1 || a != '\r' || b != '\n') {
+                return 0;
+            }
+        }
+    }
+    /* Без явного framing RFC 9112 использует закрытие соединения как конец
+       тела. Читаем до close_notify; timeout/RST — неполная страница. */
+    *body_bytes = (uint64_t)(s->used - s->pos);
+    s->pos = s->used;
+    for (;;) {
+        int64_t left = s->until - verify_now_ms();
+        if (left <= 0) { snprintf(s->err, s->errcap, "тайм-аут чтения тела"); return 0; }
+        long got = s->rd(s->sess, s->buf, 8192, (int)left, s->err, s->errcap);
+        if (got == 0) { *body_expected = *body_bytes; return 1; }
+        if (got < 0) { return 0; }
+        if (UINT64_MAX - *body_bytes < (uint64_t)got) { return 0; }
+        *body_bytes += (uint64_t)got;
+    }
+}
+
+static int read_status_rd(read_fn rd, void *sess, int wait_ms,
+                          int *cloudflare_challenge, uint64_t *body_bytes,
+                          uint64_t *body_expected, int *body_complete,
+                          int *body_has_length, int *body_chunked,
+                          int *body_framing_valid, int *body_encoding,
+                          char *location, size_t location_cap,
+                          char *err, size_t errcap) {
     uint8_t buf[8193];
     size_t used = 0;
-    if (cf_challenge) { *cf_challenge = 0; }
+    if (cloudflare_challenge) { *cloudflare_challenge = 0; }
+    if (body_bytes) { *body_bytes = 0; }
+    if (body_expected) { *body_expected = 0; }
+    if (body_complete) { *body_complete = 0; }
+    if (body_has_length) { *body_has_length = 0; }
+    if (body_chunked) { *body_chunked = 0; }
+    if (body_framing_valid) { *body_framing_valid = 0; }
+    if (body_encoding) { *body_encoding = 0; }
+    if (location && location_cap) { location[0] = '\0'; }
     int64_t until = verify_now_ms() + (wait_ms > 0 ? wait_ms : 8000);
     for (;;) {
         const uint8_t *end = find_hdr_end(buf, used);
@@ -166,7 +308,92 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms, char *err, size_t
             }
             int code = (buf[9] - '0') * 100 + (buf[10] - '0') * 10 + buf[11] - '0';
             if (code >= 200) {
-                if (cf_challenge) { *cf_challenge = has_cf_challenge(buf, hdr_len); }
+                if (cloudflare_challenge) {
+                    *cloudflare_challenge = has_cf_challenge(buf, hdr_len, eol);
+                }
+                int has_length = 0, chunked = 0, framing_valid = 1;
+                int transfer_encoding_seen = 0;
+                int encoding = 0;
+                int encoding_seen = 0;
+                uint64_t length = 0;
+                size_t pos = (size_t)(eol - buf) + 2;
+                while (pos < hdr_len) {
+                    const uint8_t *line = buf + pos;
+                    const uint8_t *le = find_eol(line, hdr_len - pos);
+                    size_t ln = le ? (size_t)(le - line) : hdr_len - pos;
+                    const uint8_t *colon = memchr(line, ':', ln);
+                    if (colon) {
+                        size_t kn = (size_t)(colon - line), v = kn + 1;
+                        while (v < ln && (line[v] == ' ' || line[v] == '\t')) { v++; }
+                        if (span_eq_ascii_ci(line, kn, "content-length")) {
+                            uint64_t x = 0; size_t digits = 0;
+                            while (v < ln && line[v] >= '0' && line[v] <= '9') {
+                                unsigned d = (unsigned)(line[v++] - '0');
+                                if (x > (UINT64_MAX - d) / 10) { return code; }
+                                x = x * 10 + d; digits++;
+                            }
+                            while (v < ln && (line[v] == ' ' || line[v] == '\t')) { v++; }
+                            if (!digits || v != ln || (has_length && x != length)) { return code; }
+                            has_length = 1; length = x;
+                        } else if (span_eq_ascii_ci(line, kn, "transfer-encoding")) {
+                            size_t end = ln;
+                            while (end > v && (line[end - 1] == ' ' || line[end - 1] == '\t')) { end--; }
+                            if (transfer_encoding_seen++ ||
+                                !span_eq_ascii_ci(line + v, end - v, "chunked")) {
+                                framing_valid = 0;
+                            } else { chunked = 1; }
+                        } else if (span_eq_ascii_ci(line, kn, "content-encoding")) {
+                            size_t end = ln;
+                            while (end > v && (line[end - 1] == ' ' || line[end - 1] == '\t')) { end--; }
+                            /* Multiple Content-Encoding fields are a coding
+                               stack, not interchangeable aliases. This small
+                               verifier does not decode stacks; keep them
+                               explicitly unknown so the volume matcher cannot
+                               confuse them with a plain or one-layer gzip body. */
+                            if (encoding_seen++) { encoding = 2; }
+                            else if (span_eq_ascii_ci(line + v, end - v, "gzip")) { encoding = 1; }
+                            else if (span_eq_ascii_ci(line + v, end - v, "identity")) { encoding = 0; }
+                            else { encoding = 2; }
+                        } else if (span_eq_ascii_ci(line, kn, "location") && location && location_cap) {
+                            size_t end = ln;
+                            while (end > v && (line[end - 1] == ' ' || line[end - 1] == '\t')) { end--; }
+                            size_t value_len = end - v;
+                            if (value_len < location_cap) {
+                                int safe = 1;
+                                for (size_t k = v; k < end; k++) {
+                                    if (line[k] < 0x21 || line[k] == 0x7f) { safe = 0; break; }
+                                }
+                                if (safe) {
+                                    memcpy(location, line + v, value_len);
+                                    location[value_len] = '\0';
+                                }
+                            }
+                        }
+                    }
+                    if (!le) { break; }
+                    pos += ln + 2;
+                }
+                body_stream bs;
+                memset(&bs, 0, sizeof bs);
+                bs.rd = rd; bs.sess = sess; bs.buf = buf;
+                bs.used = used; bs.pos = hdr_len + 4;
+                bs.until = until; bs.err = err; bs.errcap = errcap;
+                uint64_t got = 0, expected = 0;
+                /* Ambiguous framing must never be accepted as a complete
+                   response: intermediaries disagree about TE vs CL and can
+                   otherwise make a truncated body look whole. */
+                int complete = framing_valid && !(has_length && chunked) &&
+                    read_http_body(&bs, code, has_length, length,
+                                   chunked, &got, &expected);
+                if (body_bytes) { *body_bytes = got; }
+                if (body_expected) { *body_expected = expected; }
+                if (body_complete) { *body_complete = complete; }
+                if (body_has_length) { *body_has_length = has_length; }
+                if (body_chunked) { *body_chunked = chunked; }
+                if (body_framing_valid) {
+                    *body_framing_valid = framing_valid && !(has_length && chunked);
+                }
+                if (body_encoding) { *body_encoding = encoding; }
                 return code;
             }
             if (code == 101) { return 0; } /* upgrade не запрашивали */
@@ -194,13 +421,139 @@ d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
 /* use_fd — УЖЕ ЗАНЯТЫЙ сокет (d2k_props_bind), чей местный порт вызывающий
    назвал датапату заранее, чтобы пробный план достался только этому потоку.
    Меньше нуля — создать свой, тогда это в точности d2k_verify_probe. */
-static int read_status(d2k_tls *t, int wait_ms, char *err, size_t errcap,
-                       int *cf_challenge) {
-    return read_status_rd(read13, t, wait_ms, err, errcap, cf_challenge);
+typedef int (*write_fn)(void *sess, const uint8_t *buf, size_t len,
+                        char *err, size_t errcap);
+
+static int write13(void *sess, const uint8_t *buf, size_t len,
+                   char *err, size_t errcap) {
+    return d2k_tls_write((d2k_tls *)sess, buf, len, err, errcap);
 }
 
-d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port, const char *sni,
-                                   int deadline_ms, size_t hello_wire) {
+static int write12(void *sess, const uint8_t *buf, size_t len,
+                   char *err, size_t errcap) {
+    return d2k_tls12_write((d2k_tls12 *)sess, buf, len, err, errcap);
+}
+
+/* Resolve only same-origin HTTPS redirects. A redirect to a different host
+   starts a different measurement target and must not be credited to this one. */
+static int redirect_path(const char *location, const char *host,
+                         char *path, size_t path_cap) {
+    if (!location || !location[0] || !host || !host[0] || !path || path_cap < 2) { return 0; }
+    const char *p = location;
+    if (strlen(p) >= 8 && span_eq_ascii_ci((const uint8_t *)p, 8, "https://")) {
+        p += 8;
+        const char *authority = p;
+        while (*p && *p != '/' && *p != '?' && *p != '#') { p++; }
+        size_t authority_len = (size_t)(p - authority);
+        size_t host_len = strlen(host);
+        int same = authority_len == host_len &&
+                   span_eq_ascii_ci((const uint8_t *)authority, authority_len, host);
+        if (!same && authority_len == host_len + 4 &&
+            span_eq_ascii_ci((const uint8_t *)authority, host_len, host) &&
+            memcmp(authority + host_len, ":443", 4) == 0) { same = 1; }
+        if (!same) { return 0; }
+        if (*p == '?') {
+            if (path_cap < strlen(p) + 2) { return 0; }
+            path[0] = '/'; strcpy(path + 1, p);
+            return 1;
+        }
+        if (*p != '/') { p = "/"; }
+    } else if (*p != '/') {
+        return 0;
+    }
+    size_t n = strlen(p);
+    if (n == 0 || n >= path_cap || p[0] != '/') { return 0; }
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (c <= 0x20 || c == 0x7f || c == '#') { return 0; }
+    }
+    memcpy(path, p, n + 1);
+    return 1;
+}
+
+static void request_complete_page(read_fn rd, write_fn wr, void *sess,
+                                  const char *host, int encoding,
+                                  int deadline_ms, int tls12,
+                                  d2k_ver_result *r, char *err, size_t errcap) {
+    char path[1024] = "/";
+    const char *accept_encoding = encoding == 1 ? "gzip" :
+                                  encoding == 2 ? "gzip, deflate" : "identity";
+    for (int redirects = 0; redirects <= 3; redirects++) {
+        char req[2048];
+        int n = snprintf(req, sizeof req,
+                         "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
+                         "Accept: */*\r\nAccept-Encoding: %s\r\nConnection: keep-alive\r\n\r\n",
+                         path, host, accept_encoding);
+        if (n <= 0 || (size_t)n >= sizeof req) {
+            snprintf(r->reason, sizeof r->reason, "запрос не собрался: путь/имя слишком длинные");
+            return;
+        }
+        if (wr(sess, (const uint8_t *)req, (size_t)n, err, errcap) != 0) {
+            snprintf(r->reason, sizeof r->reason, "запрос не ушёл: %.150s", err);
+            return;
+        }
+        r->location[0] = '\0';
+        int code = read_status_rd(rd, sess, deadline_ms,
+                                  &r->cloudflare_challenge, &r->body_bytes,
+                                  &r->body_expected, &r->body_complete,
+                                  &r->body_has_length, &r->body_chunked,
+                                  &r->body_framing_valid, &r->body_encoding, r->location,
+                                  sizeof r->location, err, errcap);
+        r->status = code;
+        if (r->cloudflare_challenge) { r->level = D2K_VER_CHALLENGE; return; }
+        if (code >= 300 && code < 400) {
+            char next[sizeof path];
+            if (redirects < 3 && redirect_path(r->location, host, next, sizeof next)) {
+                memcpy(path, next, strlen(next) + 1);
+                continue;
+            }
+            r->level = D2K_VER_HANDSHAKE;
+            snprintf(r->reason, sizeof r->reason,
+                     "HTTP %d redirect не является подтверждением страницы этой цели", code);
+            return;
+        }
+        if (code && r->body_complete) {
+            r->level = D2K_VER_APPLICATION;
+            snprintf(r->reason, sizeof r->reason,
+                     "HTTP %d, тело загружено полностью (%llu байт)%s", code,
+                     (unsigned long long)r->body_bytes, tls12 ? " по TLS 1.2" : "");
+        } else if (code) {
+            snprintf(r->reason, sizeof r->reason,
+                     "HTTP %d, тело оборвалось (%llu/%llu байт): %.80s", code,
+                     (unsigned long long)r->body_bytes,
+                     (unsigned long long)r->body_expected, err);
+        } else {
+            snprintf(r->reason, sizeof r->reason,
+                     "нет полных заголовков окончательного HTTP-ответа: %.100s", err);
+        }
+        return;
+    }
+    r->level = D2K_VER_HANDSHAKE;
+    snprintf(r->reason, sizeof r->reason, "превышена глубина same-origin redirect");
+}
+
+/* Set the measurement mark before connect(). SO_MARK applied to a connected
+   socket can leave the route selected without that mark, so baseline probes
+   must prepare the socket first and pass its already-bound fd to the shared
+   connection helper. */
+static int verify_contact(int use_fd, const char *ip, uint16_t port,
+                          uint32_t mark, uint8_t family, uint8_t *local_addr,
+                          uint16_t *local_port, int *out_fd) {
+    int fd = use_fd;
+    if (mark) {
+        if (fd < 0 && d2k_props_bind_family(family, &fd, NULL) != 0) { return -1; }
+        if (d2k_mark_hook(fd, mark) != 0) {
+            close(fd);
+            return -2;
+        }
+    }
+    return d2k_props_contact_on_family(fd, ip, port, (d2k_hello){ NULL, 0 }, family,
+                                local_addr, local_port, out_fd);
+}
+
+static d2k_ver_result verify_probe13_on(int use_fd, const char *ip, uint16_t port,
+                                        const char *sni, int deadline_ms,
+                                        size_t hello_wire, int encoding, uint32_t mark) {
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
     r.fd = -1;
@@ -220,13 +573,12 @@ d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port, co
        потока. Пустое приветствие d2k_props_contact принимает намеренно —
        нужны от неё ровно непомеченный сокет, открытый наружу, и местные
        адрес с портом. */
-    d2k_hello none;
-    none.bytes = NULL;
-    none.len = 0;
     r.family = ip && strchr(ip, ':') ? 6 : 4;
-    if (d2k_props_contact_on_family(use_fd, ip, port, none, r.family,
-                                    r.local_addr, &r.local_port, &r.fd) != 0) {
-        snprintf(r.reason, sizeof r.reason, "нет TCP");
+    int contact = verify_contact(use_fd, ip, port, mark, r.family,
+                                 r.local_addr, &r.local_port, &r.fd);
+    if (contact != 0) {
+        snprintf(r.reason, sizeof r.reason, contact == -2
+                 ? "метка измерительного сокета не поставилась" : "нет TCP");
         return r;
     }
     r.level = D2K_VER_TRANSPORT;
@@ -244,37 +596,19 @@ d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port, co
     r.name_ok = d2k_tls_peer_name(t);
     snprintf(r.reason, sizeof r.reason, "рукопожатие завершено, приложение молчит");
 
-    char req[512];
-    int n = snprintf(req, sizeof req,
-                     "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
-                     "Accept: */*\r\nConnection: close\r\n\r\n",
-                     host);
-    if (n <= 0 || (size_t)n >= sizeof req) {
-        snprintf(r.reason, sizeof r.reason, "запрос не собрался: имя длиннее запроса");
-    } else if (d2k_tls_write(t, (const uint8_t *)req, (size_t)n, err, sizeof err) != 0) {
-        snprintf(r.reason, sizeof r.reason, "запрос не ушёл: %.150s", err);
-    } else {
-        int cf_challenge = 0;
-        int code = read_status(t, deadline_ms, err, sizeof err, &cf_challenge);
-        if (code) {
-            r.level = cf_challenge ? D2K_VER_CHALLENGE : D2K_VER_APPLICATION;
-            r.status = code;
-            if (cf_challenge) {
-                snprintf(r.reason, sizeof r.reason,
-                         "Cloudflare challenge получен, HTTP %d; обход не подтверждён", code);
-            } else {
-                snprintf(r.reason, sizeof r.reason, "HTTP-заголовки получены, статус %d", code);
-            }
-        } else {
-            snprintf(r.reason, sizeof r.reason,
-                     "нет полных заголовков окончательного HTTP-ответа: %.100s", err);
-        }
-    }
+    request_complete_page(read13, write13, t, host, encoding,
+                          deadline_ms, 0, &r, err, sizeof err);
     /* Сессию освобождаем, сокет — нет: d2k_tls_free владения им не берёт
        (d2k_tls13.h), а закрыть его здесь значило бы послать FIN и потерять
        ячейку потока в датапате раньше, чем вызывающий свяжет с ней событие. */
     d2k_tls_free(t);
     return r;
+}
+
+d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,
+                                   const char *sni, int deadline_ms,
+                                   size_t hello_wire) {
+    return verify_probe13_on(use_fd, ip, port, sni, deadline_ms, hello_wire, 2, 0);
 }
 
 /* ТО ЖЕ САМОЕ, НО ПО TLS 1.2 — и это не «вторая проба», а та же проба другим
@@ -286,9 +620,10 @@ d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port, co
    зонд 1.3 и по той же причине. Почему не профиль старого клиента, сказано в
    шапке d2k_tls12.h: он предлагает шифрнаборы, которых зонд не умеет, и
    сервер выбирал бы именно их. */
-d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
-                                     const char *sni, int deadline_ms,
-                                     size_t hello_wire) {
+static d2k_ver_result verify_probe12_internal(int use_fd, const char *ip, uint16_t port,
+                                             const char *sni, int deadline_ms,
+                                             size_t hello_wire, int encoding,
+                                             uint32_t mark) {
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
     r.fd = -1;
@@ -303,13 +638,12 @@ d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
         }
     }
 
-    d2k_hello none;
-    none.bytes = NULL;
-    none.len = 0;
     r.family = ip && strchr(ip, ':') ? 6 : 4;
-    if (d2k_props_contact_on_family(use_fd, ip, port, none, r.family,
-                                    r.local_addr, &r.local_port, &r.fd) != 0) {
-        snprintf(r.reason, sizeof r.reason, "нет TCP");
+    int contact = verify_contact(use_fd, ip, port, mark, r.family,
+                                 r.local_addr, &r.local_port, &r.fd);
+    if (contact != 0) {
+        snprintf(r.reason, sizeof r.reason, contact == -2
+                 ? "метка измерительного сокета не поставилась" : "нет TCP");
         return r;
     }
     r.level = D2K_VER_TRANSPORT;
@@ -327,35 +661,37 @@ d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
     r.name_ok = d2k_tls12_peer_name(t);
     snprintf(r.reason, sizeof r.reason, "рукопожатие 1.2 завершено, приложение молчит");
 
-    char req[512];
-    int n = snprintf(req, sizeof req,
-                     "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
-                     "Accept: */*\r\nConnection: close\r\n\r\n",
-                     host);
-    if (n <= 0 || (size_t)n >= sizeof req) {
-        snprintf(r.reason, sizeof r.reason, "запрос не собрался: имя длиннее запроса");
-    } else if (d2k_tls12_write(t, (const uint8_t *)req, (size_t)n, err, sizeof err) != 0) {
-        snprintf(r.reason, sizeof r.reason, "запрос не ушёл: %.150s", err);
-    } else {
-        int cf_challenge = 0;
-        int code = read_status_rd(read12, t, deadline_ms, err, sizeof err, &cf_challenge);
-        if (code) {
-            r.level = cf_challenge ? D2K_VER_CHALLENGE : D2K_VER_APPLICATION;
-            r.status = code;
-            if (cf_challenge) {
-                snprintf(r.reason, sizeof r.reason,
-                         "Cloudflare challenge получен по TLS 1.2, HTTP %d; обход не подтверждён", code);
-            } else {
-                snprintf(r.reason, sizeof r.reason,
-                         "HTTP-заголовки получены по TLS 1.2, статус %d", code);
-            }
-        } else {
-            snprintf(r.reason, sizeof r.reason,
-                     "нет полных заголовков окончательного HTTP-ответа: %.100s", err);
-        }
-    }
+    request_complete_page(read12, write12, t, host, encoding,
+                          deadline_ms, 1, &r, err, sizeof err);
     d2k_tls12_free(t);
     return r;
+}
+
+d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
+                                     const char *sni, int deadline_ms,
+                                     size_t hello_wire) {
+    return verify_probe12_internal(use_fd, ip, port, sni, deadline_ms,
+                                   hello_wire, 2, 0);
+}
+
+d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
+                                         const char *sni, int deadline_ms,
+                                         size_t hello_wire, int tls12,
+                                         int encoding, uint32_t mark) {
+    if (encoding != 0 && encoding != 1) {
+        d2k_ver_result r;
+        memset(&r, 0, sizeof r);
+        r.fd = -1;
+        r.name_ok = -1;
+        snprintf(r.reason, sizeof r.reason, "неподдерживаемый режим сжатия");
+        return r;
+    }
+    if (tls12) {
+        return verify_probe12_internal(-1, ip, port, sni, deadline_ms,
+                                       hello_wire, encoding, mark);
+    }
+    return verify_probe13_on(-1, ip, port, sni, deadline_ms,
+                             hello_wire, encoding, mark);
 }
 
 void d2k_verify_close(d2k_ver_result *r) {

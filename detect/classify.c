@@ -615,7 +615,9 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         if (opt->only[0] != '\0' && strcmp(p.name, opt->only) != 0) {
             continue;
         }
-        if (!d2k_poison_supports_family(&p, family) || d2k_opts_skipped(opt, p.name)) {
+        if (!d2k_poison_supports_family(&p, family) ||
+            (p.disorder_pos > 0 && (size_t)p.disorder_pos >= tr->len) ||
+            d2k_opts_skipped(opt, p.name)) {
             continue;
         }
         snprintf(pname, sizeof(pname), "poison:%s", p.name);

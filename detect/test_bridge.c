@@ -94,6 +94,10 @@ int main(void)
     p.seq_shift = -123;
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
     p.seq_shift = 0;
+    p.disorder = 1; p.disorder_pos = 2;
+    CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) == 0);
+    CHECK(arm.disorder && arm.disorder_pos == 2);
+    p.disorder = 0; p.disorder_pos = 0;
     p.syn_data = 1;
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
     p.syn_data = 0; p.oob = 1;

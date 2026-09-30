@@ -1745,6 +1745,18 @@ int main(int argc, char **argv) {
         CHECK(d2k_fallback_plan(d2k_fallback_arms(), D2K_SHAPE_MODERN, "disk.rzd.ru",
                                 1492, buf, sizeof buf) != 0,
               "за концом списка выдалось плечо");
+        CHECK(d2k_fallback_plan(0, D2K_SHAPE_MODERN, "disk.rzd.ru", 1492,
+                                buf, sizeof buf) == 0 &&
+              strstr(buf, "seqovl payload=2 poison=0\n") != NULL &&
+              strstr(buf, "split payload_start +1\n") != NULL,
+              "seqovl-1 должен экспортироваться как z2k multisplit pos=1 с перекрытием");
+        int oob_found = 0;
+        for (size_t i = 0; i < d2k_fallback_arms(); i++) {
+            if (d2k_fallback_plan(i, D2K_SHAPE_MODERN, "disk.rzd.ru", 1492,
+                                  buf, sizeof buf) == 0 &&
+                strstr(buf, "oob sni_middle 0f\n")) { oob_found = 1; break; }
+        }
+        CHECK(oob_found, "в исходном поиске отсутствует проверяемое TCP URG-плечо");
     }
 
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }

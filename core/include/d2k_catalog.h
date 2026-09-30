@@ -61,7 +61,7 @@
 #include "d2k_hello.h" /* d2k_shape — значения поля d2k_cat_binding.shape */
 
 /* Одна наблюдавшаяся примета коробки (см. internal/catalog/catalog.go,
- * Signal). kind — вид приметы ("rst", "volume", "repeat", "silent" в
+ * Signal). kind — вид приметы ("rst", "volume", "rx-volume", "repeat", "silent" в
  * реальных данных на 2026-09-07, но разбор не ограничивает набор:
  * незнакомый kind проходит как обычная строка). ttl_delta — знаковый:
  * разность TTL подделки и TTL сервера гуляет в обе стороны от маршрута. */
@@ -71,7 +71,7 @@ typedef struct {
     uint8_t  tos;
     uint16_t ipid;
     char     kind[24];
-    int      volume;      /* килобайты, только для kind=="volume" */
+    int      volume;      /* килобайты, для kind=="volume" и "rx-volume" */
     int      seen;        /* сколько раз примета встречена */
 } d2k_cat_signal;
 
@@ -352,10 +352,9 @@ void d2k_catalog_free(d2k_catalog *c);
  *
  * Согласие по улике (по kind):
  *
- *   - kind == "volume": сравнивается только volume, в пределах
- *     D2K_VOLUME_SLACK. У обрыва по объёму нет ни TTL, ни идентификатора —
- *     коробка ничего не присылает, она просто перестаёт пропускать,
- *     сравнивать нечего, кроме объёма.
+ *   - kind == "volume" или "rx-volume": сравнивается только volume, в
+ *     пределах D2K_VOLUME_SLACK. TX и RX хранятся разными видами сигнала:
+ *     направление — часть измеренного поведения, их нельзя склеивать.
  *   - любой другой kind (в реальных данных на 2026-09-07 это "rst",
  *     "repeat", "silent"): ttl сравнивается в пределах D2K_TTL_SLACK, а
  *     tos и ipid — ТОЧНО. Допуска у них нет не потому, что они "точные" по

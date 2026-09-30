@@ -13,6 +13,7 @@
  * операция с double там становится вызовом libgcc.
  */
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "d2k_plan.h"
@@ -108,21 +109,99 @@ static int split_points(const d2k_plan *p, const d2k_pkt *in,
     return 0;
 }
 
-static void emit_fake(d2k_emit *e, const d2k_plan *p, const struct d2k_fake *f,
-                      uint32_t seq, uint32_t delay) {
+static int tls_ch_layout(const uint8_t *b, size_t n, size_t *rnd_off,
+                         size_t *sid_off, size_t *sid_len) {
+    if (!b || n < 44 || b[0] != 0x16 || b[1] != 3 || b[5] != 1) { return -1; }
+    size_t rec_len = ((size_t)b[3] << 8) | b[4];
+    size_t hs_len = ((size_t)b[6] << 16) | ((size_t)b[7] << 8) | b[8];
+    if (rec_len + 5 != hs_len + 9 || hs_len > n - 9 || rec_len > n - 5) { return -1; }
+    size_t len_off = 43;
+    size_t sl = b[len_off];
+    if (sl > 32 || sl > n - (len_off + 1)) { return -1; }
+    *rnd_off = 11; *sid_off = len_off + 1; *sid_len = sl;
+    return 0;
+}
+
+static int random_bytes(uint8_t *out, size_t n) {
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) { return -1; }
+    size_t got = fread(out, 1, n, f);
+    int bad = ferror(f);
+    fclose(f);
+    return got == n && !bad ? 0 : -1;
+}
+
+static void wr16(uint8_t *b, size_t off, size_t v) {
+    b[off] = (uint8_t)(v >> 8); b[off + 1] = (uint8_t)v;
+}
+static void wr24(uint8_t *b, size_t off, size_t v) {
+    b[off] = (uint8_t)(v >> 16); b[off + 1] = (uint8_t)(v >> 8);
+    b[off + 2] = (uint8_t)v;
+}
+
+static int fake_tls_bytes(const d2k_plan *p, const struct d2k_fake *f,
+                          const struct d2k_payload *pl, const d2k_pkt *in,
+                          uint8_t **owned) {
+    size_t fake_rnd, fake_sid, fake_sid_len;
+    size_t real_rnd, real_sid, real_sid_len;
+    *owned = NULL;
+    if (!in->is_tls13 || tls_ch_layout(in->payload, in->payload_len,
+            &real_rnd, &real_sid, &real_sid_len) != 0 ||
+        tls_ch_layout(pl->bytes, pl->len, &fake_rnd, &fake_sid,
+                      &fake_sid_len) != 0) { return -1; }
+    size_t out_len = pl->len;
+    if (f->tls_mod & D2K_TLS_MOD_DUPSID) {
+        out_len = pl->len - fake_sid_len + real_sid_len;
+        if (out_len > 65540 || out_len < 9 || out_len - 5 > 65535 || out_len - 9 > 0xffffff) { return -1; }
+    }
+    uint8_t *b = malloc(out_len);
+    if (!b) { return -1; }
+    if (f->tls_mod & D2K_TLS_MOD_DUPSID) {
+        memcpy(b, pl->bytes, fake_sid);
+        memcpy(b + fake_sid, in->payload + real_sid, real_sid_len);
+        memcpy(b + fake_sid + real_sid_len, pl->bytes + fake_sid + fake_sid_len,
+               pl->len - fake_sid - fake_sid_len);
+        b[fake_sid - 1] = (uint8_t)real_sid_len;
+        wr16(b, 3, out_len - 5);
+        wr24(b, 6, out_len - 9);
+    } else {
+        memcpy(b, pl->bytes, pl->len);
+    }
+    if ((f->tls_mod & D2K_TLS_MOD_RND) && random_bytes(b + fake_rnd, 32) != 0) {
+        free(b); return -1;
+    }
+    (void)p;
+    *owned = b;
+    return 0;
+}
+
+static int emit_fake(d2k_emit *e, const d2k_plan *p, const struct d2k_fake *f,
+                     const d2k_pkt *in, uint32_t seq, uint32_t delay) {
     const struct d2k_payload *pl = d2k_find_payload(p, f->payload_id);
     const struct d2k_poison *po = f->poison_id ? d2k_find_poison(p, f->poison_id) : NULL;
+    if (!pl) { return -1; }
     memset(e, 0, sizeof *e);
     e->kind = D2K_EMIT_FAKE;
     e->delay_us = delay;
     e->seq = seq;
     e->bytes = pl->bytes;
     e->len = pl->len;
+    if (f->tls_mod) {
+        if (fake_tls_bytes(p, f, pl, in, &e->owned_bytes) != 0) { return -1; }
+        e->bytes = e->owned_bytes;
+    }
     if (po) {
         e->ttl = po->ttl;
         e->poison = po->flags;
         e->seq_shift = po->seq_shift;
     }
+    return 0;
+}
+
+static void emit_vec_free(d2k_emit *v, size_t n) {
+    if (!v) { return; }
+    for (size_t i = 0; i < n; i++) { free(v[i].owned_bytes); }
+    free(v);
 }
 
 /* Заголовки на проводе — те же числа, что у сборщиков (wire.c, wire_udp.c).
@@ -158,7 +237,7 @@ size_t d2k_plan_max_emit(const d2k_plan *p) {
         }
         const struct d2k_poison *po = p->fakes[i].poison_id
             ? d2k_find_poison(p, p->fakes[i].poison_id) : NULL;
-        size_t body = pl->len;
+        size_t body = pl->len + ((p->fakes[i].tls_mod & D2K_TLS_MOD_DUPSID) ? 32u : 0u);
         if (p->segment_size && body > p->segment_size) { body = p->segment_size; }
         size_t n = emit_overhead(p, po) + body;
         if (n > max) { max = n; }
@@ -226,6 +305,38 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
          (in->have_sni ? in->sni_len : 0) != p->input_sni_len ||
          (p->input_sni_len && in->sni_off != p->input_sni_off))) {
         return -1; /* not the input for which fixed measured bytes were built */
+    }
+
+    if (p->oob_enabled) {
+        size_t mid = 0;
+        if (anchor_offset(in, p->oob_anchor, &mid) != 0 ||
+            mid == 0 || mid >= in->payload_len) { return -1; }
+        d2k_emit *v = calloc(3, sizeof *v);
+        if (!v) { return -1; }
+        v[0].kind = D2K_EMIT_PAYLOAD;
+        v[0].seq = in->seq;
+        v[0].bytes = in->payload;
+        v[0].len = mid;
+
+        v[1].kind = D2K_EMIT_PAYLOAD;
+        v[1].seq = in->seq + (uint32_t)mid;
+        v[1].bytes = &p->oob_byte;
+        v[1].len = 1;
+        v[1].urgent = 1;
+        v[1].urgent_ptr = 1;
+
+        /* TCP sequence space includes urgent data even though the receiving
+           application normally removes that byte from its in-band stream.
+           Therefore replay the original suffix unchanged at seq+mid+1. */
+        v[2].kind = D2K_EMIT_PAYLOAD;
+        v[2].seq = in->seq + (uint32_t)mid + 1u;
+        v[2].bytes = in->payload + mid;
+        v[2].len = in->payload_len - mid;
+
+        out->fate = D2K_ORIG_DROP;
+        out->n = 3;
+        out->v = v;
+        return 0;
     }
 
     size_t *pts = NULL;
@@ -296,8 +407,11 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         }
         uint8_t reps = p->fakes[i].repeats ? p->fakes[i].repeats : 1;
         for (uint8_t r = 0; r < reps; r++) {
-            emit_fake(&v[n++], p, &p->fakes[i], in->seq,
-                      r == 0 ? 0 : p->fakes[i].gap_us);
+            if (emit_fake(&v[n], p, &p->fakes[i], in, in->seq,
+                          r == 0 ? 0 : p->fakes[i].gap_us) != 0) {
+                free(pts); emit_vec_free(v, n); return -1;
+            }
+            n++;
         }
     }
 
@@ -353,8 +467,12 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
                     }
                     uint8_t reps = p->fakes[k].repeats ? p->fakes[k].repeats : 1;
                     for (uint8_t r = 0; r < reps; r++) {
-                        emit_fake(&v[n++], p, &p->fakes[k], in->seq + (uint32_t)start,
-                                  r == 0 ? 0 : p->fakes[k].gap_us);
+                        if (emit_fake(&v[n], p, &p->fakes[k], in,
+                                      in->seq + (uint32_t)start,
+                                      r == 0 ? 0 : p->fakes[k].gap_us) != 0) {
+                            free(pts); emit_vec_free(v, n); return -1;
+                        }
+                        n++;
                     }
                 }
             }
@@ -452,26 +570,39 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     }
     free(pts);
     for (size_t i = 0; i < n; i++) { v[i].wire_profile = p->wire_profile; }
-    if (p->segment_size) {
+    if (p->segment_size || in->segment_cap) {
         /* Match raw_send: split the concatenated prefix+body, preserving
-         * bytes, sequence space, fooling and only the first chunk's delay. */
+         * bytes, sequence space, fooling and only the first chunk's delay.
+         * The route MTU cap is deliberately narrower than segment_size:
+         * it only splits overlapping TCP payload emits (pre_len != 0), and
+         * never changes fake packets or plans without a measured overlap. */
         size_t count = 0;
         for (size_t i = 0; i < n; i++) {
             size_t bytes = v[i].pre_len + v[i].len;
-            size_t chunks = bytes ? (bytes - 1) / p->segment_size + 1 : 1;
-            if (chunks > 65536 || count > 65536 - chunks) { free(v); return -1; }
+            size_t limit = p->segment_size;
+            if (in->segment_cap && v[i].kind == D2K_EMIT_PAYLOAD && v[i].pre_len &&
+                (!limit || in->segment_cap < limit)) {
+                limit = in->segment_cap;
+            }
+            size_t chunks = limit && bytes ? (bytes - 1) / limit + 1 : 1;
+            if (chunks > 65536 || count > 65536 - chunks) { emit_vec_free(v, n); return -1; }
             count += chunks;
         }
         d2k_emit *split = calloc(count, sizeof *split);
-        if (!split) { free(v); return -1; }
+        if (!split) { emit_vec_free(v, n); return -1; }
         size_t k = 0;
         for (size_t i = 0; i < n; i++) {
+            size_t limit = p->segment_size;
+            if (in->segment_cap && v[i].kind == D2K_EMIT_PAYLOAD && v[i].pre_len &&
+                (!limit || in->segment_cap < limit)) {
+                limit = in->segment_cap;
+            }
             size_t total = v[i].pre_len + v[i].len, off = 0;
             do {
                 d2k_emit *e = &split[k++];
                 *e = v[i];
                 size_t take = total - off;
-                if (take > p->segment_size) { take = p->segment_size; }
+                if (limit && take > limit) { take = limit; }
                 e->seq += (uint32_t)off;
                 if (off) { e->delay_us = 0; }
                 e->pre_len = off < v[i].pre_len ? v[i].pre_len - off : 0;
@@ -479,10 +610,12 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
                 e->pre = e->pre_len ? v[i].pre + off : NULL;
                 e->len = take - e->pre_len;
                 e->bytes = e->len ? v[i].bytes + (off > v[i].pre_len ? off - v[i].pre_len : 0) : NULL;
+                e->owned_bytes = off == 0 ? v[i].owned_bytes : NULL;
                 off += take;
             } while (off < total);
+            v[i].owned_bytes = NULL; /* ownership transferred to first chunk */
         }
-        free(v); v = split; n = count;
+        emit_vec_free(v, n); v = split; n = count;
     }
     out->v = v;
     out->n = n;
@@ -542,6 +675,7 @@ void d2k_actions_free(d2k_actions *a) {
     if (!a) {
         return;
     }
+    for (size_t i = 0; i < a->n; i++) { free(a->v[i].owned_bytes); }
     free(a->v);
     a->v = NULL;
     a->n = 0;

@@ -426,7 +426,7 @@ test-link: test_link ../datapath/ctlprobe
 test-d2kask: test_d2kask d2kask ../datapath/ctlprobe
 	./test_d2kask
 
-check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify test-measured
+check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify test-volume test-httpup-logic test-measured
 
 test_measured: test_measured.c compose.o plantlv.o hello.o meas.o link.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h ../datapath/wire.c ../datapath/include/d2k_session.h
 	$(CC) $(CFLAGS) -o $@ test_measured.c compose.o plantlv.o hello.o meas.o link.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
@@ -707,7 +707,24 @@ test_quicconn6: test_quicconn6.c quicconn.o quicwire.o compose.o hello.o meas.o 
 	$(CC) $(CFLAGS) -o $@ $< quicconn.o quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 
 .PHONY: test-quicconn6
-TESTS += test_quicconn6
+TESTS += test_quicconn6 test_volume test_httpup_logic
+
+test_volume: test_volume.c volume.o verify.o tls13.o tls13core.o tls12.o x25519.o crypto.o compose.o meas.o hello.o link.o quicconn.o quicwire.o h3.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< volume.o verify.o tls13.o tls13core.o tls12.o x25519.o crypto.o compose.o meas.o hello.o link.o quicconn.o quicwire.o h3.o $(TEST_LDFLAGS)
+
+test-volume: test_volume
+	./test_volume
+
+test_httpup_logic: test_httpup_logic.c httpup_logic.c include/d2k_httpup.h
+	$(CC) $(CFLAGS) -o $@ test_httpup_logic.c httpup_logic.c $(TEST_LDFLAGS)
+
+test-httpup-logic: test_httpup_logic
+	./test_httpup_logic
+
+.PHONY: release-httpup test-volume test-httpup-logic
+release-httpup:
+	mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) -static -Wl,-S -Os -std=c11 -Wall -Wextra -Werror -Iinclude -o $(BUILDDIR)/d2khttp-linux-$(ARCH) httpup.c httpup_logic.c -lpthread
 check: test-quicconn6
 test-quicconn6: test_quicconn6
 	./test_quicconn6

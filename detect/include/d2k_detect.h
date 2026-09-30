@@ -125,6 +125,7 @@ typedef struct {
     const uint8_t *decoy;  /* готовые байты приманки */
     size_t  decoy_len;
     int     disorder;      /* слать сегменты НЕ ПО ПОРЯДКУ */
+    int     disorder_pos;  /* одиночный абсолютный разрез для reverse-disorder */
     int     tcp_ts;        /* метка времени со сдвигом назад */
     int     ip_id_zero;    /* обнулить идентификатор IP */
     int     gap_ms;        /* пауза между копиями фальшивки */

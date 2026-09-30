@@ -96,7 +96,8 @@ typedef d2k_vres (*d2k_sched_quic_fn)(const char *ip, uint16_t port, const char 
  * два оракула выше: тест обязан утверждать поведение планировщика, не выходя
  * в сеть. */
 typedef d2k_vol_result (*d2k_sched_vol_fn)(const char *ip, uint16_t port,
-                                           const char *sni, int plain, uint32_t mark);
+                                           const char *sni, int plain, int tls12,
+                                           size_t hello_wire, uint32_t mark);
 extern d2k_sched_vol_fn  d2k_sched_vol_hook;
 
 /* ЗАНЯТЬ ПОРТ ДЛЯ ОПЫТА. Крючок, а не прямой вызов, по той же причине, что и

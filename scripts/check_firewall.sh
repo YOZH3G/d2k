@@ -53,11 +53,13 @@ if [ -z "$CASE_LINE" ]; then
     exit 1
 fi
 head -n "$((CASE_LINE - 1))" "$S99" > "$WORK/s99funcs.sh"
+cp "$ROOT/scripts/uninstall.sh" "$WORK/uninstall.sh"
 
 cat > "$WORK/driver.sh" <<'DRIVER'
 #!/bin/sh
 set -e
 . /work/s99funcs.sh
+MODE=observe
 
 fail() { echo "ПРОВАЛ: $*" >&2; exit 1; }
 
@@ -79,6 +81,19 @@ ip6tables -t mangle -S | grep 'NFQUEUE' | grep -vE -- '-p (tcp|udp) ' && fail "I
 if ip6tables -t nat -S | grep -q MASQUERADE; then fail "IPv4 MASQUERADE скопирован в IPv6"; fi
 RULES=$(iptables -t mangle -S)
 echo "$RULES"
+
+for tool in iptables ip6tables; do
+    loopback=127.0.0.0/8
+    [ "$tool" != ip6tables ] || loopback=::1/128
+    for chain in D2K_OUT D2K_IN; do
+        "$tool" -t mangle -C "$chain" -s "$loopback" -j RETURN || fail "$tool queues local resolver IPC"
+        "$tool" -t mangle -C "$chain" -d "$loopback" -j RETURN || fail "$tool queues local resolver IPC"
+    done
+    for proto in tcp udp; do
+        "$tool" -t mangle -C D2K_OUT -p "$proto" -m multiport --dports 53,853 -j RETURN || fail "$tool queues DNS"
+        "$tool" -t mangle -C D2K_IN -p "$proto" -m multiport --sports 53,853 -j RETURN || fail "$tool queues DNS replies"
+    done
+done
 
 echo "$RULES" | grep -qE -- '-A D2K_OUT -p udp .*--dports 0:65535.*--queue-bypass' \
     || fail "нет исходящего UDP-правила полного диапазона с --queue-bypass"
@@ -114,7 +129,7 @@ echo "$MARK_LINE" | grep -q -- '--mark 0x2f' || fail "измерительный
 echo "== fw_up повторно (идемпотентность) =="
 fw_up
 COUNT_OUT=$(iptables -t mangle -S D2K_OUT | wc -l)
-[ "$COUNT_OUT" -eq 6 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 6 включая -N)"
+[ "$COUNT_OUT" -eq 11 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 11 включая -N)"
 
 echo "== пустые цепочки с сохранёнными переходами — НЕ работающий firewall =="
 iptables -t mangle -F D2K_OUT
@@ -124,6 +139,13 @@ if fw_installed; then fail "переходы в пустые цепочки об
 fw_up
 
 echo "== потеря любого обязательного правила должна обнаруживаться =="
+for round in 1 2 3; do
+    fw_up >/tmp/fw-first.log 2>&1 & first=$!
+    fw_up >/tmp/fw-second.log 2>&1 & second=$!
+    wait "$first" || fail "first concurrent recovery failed"
+    wait "$second" || fail "second concurrent recovery failed"
+    fw_installed || fail "concurrent recovery left incomplete IPv4/IPv6 rules"
+done
 for proto in tcp udp; do
     for chain in D2K_OUT D2K_IN; do
         if [ "$chain" = D2K_OUT ]; then
@@ -171,7 +193,7 @@ if fw_installed; then fail "потеря IPv6 ответов не обнаруж
 fw_up
 fw_installed || fail "IPv6 не восстановлен"
 COUNT6=$(ip6tables -t mangle -S D2K_OUT | wc -l)
-[ "$COUNT6" -eq 6 ] || fail "IPv6 дубли после восстановления"
+[ "$COUNT6" -eq 11 ] || fail "IPv6 дубли после восстановления"
 
 echo "== fw_down =="
 fw_down
@@ -198,6 +220,39 @@ unset -f ip6tables
 fw_up
 fw_installed || fail "запуск после частичного отказа не восстановлен"
 fw_down
+
+echo "== HTTP helper совместно с IPv6 =="
+MODE=apply
+HTTP_UPGRADE=1
+HTTPUPBIN=/bin/true
+HU_PID=/tmp/d2k-test-http.pid
+echo "$$" > "$HU_PID"
+ip() {
+    [ "$1" = "-4" ] && [ "$2" = "route" ] &&
+        echo "192.168.1.0/24 dev br0 proto kernel scope link src 192.168.1.1"
+}
+fw_up
+fw_installed || fail "HTTP+IPv6 правила не распознаны"
+iptables -t nat -C PREROUTING -j D2K_HTTP || fail "нет HTTP redirect"
+iptables -t nat -C D2K_HTTP -d 192.168.1.0/24 -j RETURN || fail "HTTP захватывает LAN"
+iptables -t mangle -C OUTPUT -j D2K_HTTP_MARK || fail "нет метки upstream HTTP"
+iptables -t mangle -C D2K_IN -m connmark --mark "$HTTPUP_MARK" -j RETURN || fail "HTTP upstream попадает в NFQUEUE"
+if ip6tables -t nat -S | grep -q D2K_HTTP; then fail "IPv4 HTTP redirect попал в IPv6"; fi
+fw_up
+fw_installed || fail "повторный HTTP+IPv6 запуск сломал правила"
+fw_down
+if iptables -t nat -S | grep -q D2K_HTTP; then fail "HTTP redirect остался после остановки"; fi
+if iptables -t mangle -S | grep -q D2K; then fail "HTTP метка осталась после остановки"; fi
+ip6tables -t mangle -C INPUT -p ipv6-icmp -j ACCEPT || fail "HTTP удалил чужое IPv6 правило"
+
+echo "== удаление без init-скрипта =="
+fw_up
+sh /work/uninstall.sh
+for tool in iptables ip6tables; do
+    if "$tool" -t mangle -S | grep -q D2K; then fail "uninstall оставил $tool mangle цепочку"; fi
+    if "$tool" -t nat -S | grep -q D2K; then fail "uninstall оставил $tool nat цепочку"; fi
+done
+ip6tables -t mangle -C INPUT -p ipv6-icmp -j ACCEPT || fail "uninstall удалил чужое правило"
 
 echo "ВСЁ ЗЕЛЕНО: правила files/S99d2k проверены настоящим iptables"
 DRIVER

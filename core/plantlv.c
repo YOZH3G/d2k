@@ -53,7 +53,8 @@ enum {
     REC_WIRE    = 0x0109,
     REC_INPUT_TLS = 0x010a,
     REC_DELAY   = 0x010b,
-    REC_IPFRAG  = 0x010c
+    REC_IPFRAG  = 0x010c,
+    REC_OOB     = 0x010d
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -83,6 +84,7 @@ typedef struct {
     uint16_t payload_id, poison_id;
     uint8_t  repeats, placement;
     uint32_t gap_us;
+    uint8_t  tls_mod;
 } pl_fake;
 typedef struct { uint16_t payload_id, poison_id; } pl_seqovl;
 
@@ -103,6 +105,9 @@ typedef struct {
     uint8_t    wire_profile;
     uint8_t    input_tls;
     uint8_t    ipfrag;
+    uint8_t    oob_enabled;
+    uint16_t   oob_anchor;
+    uint8_t    oob_byte;
 } pl_plan;
 
 static int b64_value(unsigned char c) {
@@ -422,8 +427,23 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             }
             v->offset = (int16_t)strtol(f[2], NULL, 10);
             p->n_splits++;
+        } else if (strcmp(f[0], "oob") == 0) {
+            uint16_t anchor = 0;
+            uint8_t *byte = NULL;
+            size_t byte_len = 0;
+            char why[96];
+            if (nf != 3 || p->oob_enabled || anchor_by_name(f[1], &anchor) != 0 ||
+                parse_hex(f[2], &byte, &byte_len, why, sizeof why) != 0 || byte_len != 1) {
+                free(byte);
+                say(err, errcap, "строка %zu: oob ждёт один якорь и ровно один байт hex", lineno);
+                goto bad;
+            }
+            p->oob_enabled = 1;
+            p->oob_anchor = anchor;
+            p->oob_byte = byte[0];
+            free(byte);
         } else if (strcmp(f[0], "fake") == 0) {
-            if (nf != 6) { say(err, errcap, "строка %zu: fake ждёт пять параметров", lineno); goto bad; }
+            if (nf != 6 && nf != 7) { say(err, errcap, "строка %zu: fake ждёт параметры и необязательный tlsmod=", lineno); goto bad; }
             if (p->n_fakes >= MAX_FAKES) { say(err, errcap, "строка %zu: фальшивок больше %d", lineno, MAX_FAKES); goto bad; }
             pl_fake *v = &p->fakes[p->n_fakes];
             memset(v, 0, sizeof *v);
@@ -439,6 +459,13 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             if (strcmp(f[5], "place=before") == 0) { v->placement = 0; }
             else if (strcmp(f[5], "place=between") == 0) { v->placement = 1; }
             else { say(err, errcap, "строка %zu: неизвестное место \"%s\"", lineno, f[5]); goto bad; }
+            if (nf == 7) {
+                if (strcmp(f[6], "tlsmod=rnd,dupsid") == 0) { v->tls_mod = 3; }
+                else if (strcmp(f[6], "tlsmod=rnd") == 0) { v->tls_mod = 1; }
+                else if (strcmp(f[6], "tlsmod=dupsid") == 0) { v->tls_mod = 2; }
+                else { say(err, errcap, "строка %zu: неизвестный tlsmod \"%s\"", lineno, f[6]); goto bad; }
+                if (p->minexec < 8) { say(err, errcap, "строка %zu: tlsmod требует minexec=8", lineno); goto bad; }
+            }
             p->n_fakes++;
         } else if (strcmp(f[0], "seqovl") == 0) {
             if (nf != 3) { say(err, errcap, "строка %zu: seqovl ждёт payload= и poison=", lineno); goto bad; }
@@ -507,6 +534,11 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
     if (p->input_tls && (p->minexec < 5 || p->transport != 6)) {
         say(err, errcap, "input tls-sni требует TCP и minexec=5"); goto bad;
     }
+    if (p->oob_enabled && (p->minexec < 8 || p->transport != 6 || p->proto != 1 ||
+        !p->input_tls || !p->wire_profile || p->n_splits || p->n_seqovls || p->n_fakes ||
+        p->ipfrag || p->pace_us || p->settle_us || p->delay_us)) {
+        say(err, errcap, "oob требует minexec=8, измеренный TCP/TLS-вход и отдельный план"); goto bad;
+    }
     if ((p->input_len || p->settle_us || p->segment_size) && p->minexec < 3) {
         say(err, errcap, "input/settle/segment требуют minexec=3"); goto bad;
     }
@@ -567,7 +599,8 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
                        p.n_fakes + p.n_seqovls + 1 + (p.pace_us ? 1u : 0u) +
                        (p.guards ? 1u : 0u) + (p.input_len ? 1u : 0u) + (p.settle_us ? 1u : 0u) +
                        (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u) +
-                       (p.input_tls ? 1u : 0u) + (p.delay_us ? 1u : 0u) + (p.ipfrag ? 1u : 0u);
+                       (p.input_tls ? 1u : 0u) + (p.delay_us ? 1u : 0u) +
+                       (p.ipfrag ? 1u : 0u) + (p.oob_enabled ? 1u : 0u);
     if (n_records > 0xFFFFu) {
         plan_free(&p);
         say(err, errcap, "слишком много записей (%zu)", n_records);
@@ -612,14 +645,15 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
         put_rec(&w, REC_SPLIT, v, sizeof v);
     }
     for (size_t i = 0; i < p.n_fakes; i++) {
-        uint8_t v[10];
+        uint8_t v[11];
         v[0] = (uint8_t)(p.fakes[i].payload_id >> 8); v[1] = (uint8_t)p.fakes[i].payload_id;
         v[2] = (uint8_t)(p.fakes[i].poison_id >> 8);  v[3] = (uint8_t)p.fakes[i].poison_id;
         v[4] = p.fakes[i].repeats;
         v[5] = p.fakes[i].placement;
         v[6] = (uint8_t)(p.fakes[i].gap_us >> 24); v[7] = (uint8_t)(p.fakes[i].gap_us >> 16);
         v[8] = (uint8_t)(p.fakes[i].gap_us >> 8);  v[9] = (uint8_t)p.fakes[i].gap_us;
-        put_rec(&w, REC_FAKE, v, sizeof v);
+        v[10] = p.fakes[i].tls_mod;
+        put_rec(&w, REC_FAKE, v, p.fakes[i].tls_mod ? sizeof v : sizeof v - 1);
     }
     for (size_t i = 0; i < p.n_seqovls; i++) {
         uint8_t v[4] = { (uint8_t)(p.seqovls[i].payload_id >> 8), (uint8_t)p.seqovls[i].payload_id,
@@ -654,6 +688,10 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     }
     if (p.wire_profile) { put_rec(&w, REC_WIRE, &p.wire_profile, 1); }
     if (p.ipfrag) { put_rec(&w, REC_IPFRAG, &p.ipfrag, 1); }
+    if (p.oob_enabled) {
+        uint8_t v[3] = { (uint8_t)(p.oob_anchor >> 8), (uint8_t)p.oob_anchor, p.oob_byte };
+        put_rec(&w, REC_OOB, v, sizeof v);
+    }
     if (p.guards) {
         put_rec(&w, REC_GUARD, &p.guards, 1);
     }

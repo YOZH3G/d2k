@@ -1,5 +1,6 @@
-/* Measured arm -> text -> canonical TLV -> real datapath actions.
- * Expected sends follow detect/raw.c's branches, not the text builder.
+/* Measured arm -> runtime strategy text -> canonical TLV -> real datapath actions.
+ * Expected sends follow z2k's exported strategy semantics, not its one-packet
+ * raw classifier probe (classify.go strategy() adds multisplit pos=1).
  * D2K_TEST_LEGACY_BUILDER=1 reproduces the replaced builder's mismatches. */
 #include "d2k_compose.h"
 #include "d2k_plantlv.h"
@@ -12,6 +13,13 @@
 
 static int failures;
 static const char *case_name;
+static int has_bytes(const uint8_t *haystack, size_t haystack_len,
+                     const uint8_t *needle, size_t needle_len) {
+    if (!needle_len || needle_len > haystack_len) { return 0; }
+    for (size_t i = 0; i <= haystack_len - needle_len; i++)
+        if (memcmp(haystack + i, needle, needle_len) == 0) { return 1; }
+    return 0;
+}
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "%s:%d: %s\n", case_name, __LINE__, #c); failures++; \
 } } while (0)
@@ -76,6 +84,13 @@ static void reference(const d2k_arm *a, const d2k_arm_input *in, const uint8_t *
                     0, 0, 0, 12000);
         return;
     }
+    if (a->disorder_pos) {
+        size_t cut = a->disorder_pos;
+        expect_send(D2K_EMIT_PAYLOAD, BASE + (uint32_t)cut, NULL, 0,
+                    tr + cut, n - cut, 0, 0, 0, 0);
+        expect_send(D2K_EMIT_PAYLOAD, BASE, NULL, 0, tr, cut, 0, 0, 0, 0);
+        return;
+    }
     size_t ov = a->seqovl_hello ? in->decoy_len : a->seqovl;
     memset(overlap, 15, ov);
     memcpy(overlap, in->decoy, in->decoy_len < ov ? in->decoy_len : ov);
@@ -86,6 +101,14 @@ static void reference(const d2k_arm *a, const d2k_arm_input *in, const uint8_t *
                     0, 0, 0, has_fake ? 15000 : 0);
         expect_send(D2K_EMIT_PAYLOAD, BASE + 1, NULL, 0, tr + 1, mid - 1, 0, 0, 0, 12000);
         expect_send(D2K_EMIT_PAYLOAD, BASE - (uint32_t)ov, overlap, ov, tr, 1, 0, 0, 0, 12000);
+    } else if (ov) {
+        /* The raw classifier probe sends one overlapped segment. Its exported
+         * runtime strategy is multisplit(pos=1): overlap+first byte, then the
+         * remainder at its original sequence number. */
+        expect_send(D2K_EMIT_PAYLOAD, BASE - (uint32_t)ov, overlap, ov, tr, 1,
+                    0, 0, 0, has_fake ? 15000 : 0);
+        expect_send(D2K_EMIT_PAYLOAD, BASE + 1, NULL, 0, tr + 1, n - 1,
+                    0, 0, 0, 0);
     } else {
         expect_send(D2K_EMIT_PAYLOAD, BASE - (uint32_t)ov, overlap, ov, tr, n,
                     0, 0, 0, has_fake ? 15000 : 0);
@@ -256,8 +279,135 @@ static void malformed(void) {
                               sizeof tlv, &len, err, sizeof err) != 0);
 }
 
+static void fallback_disorder_pos2(void) {
+    char text[2048], err[200];
+    uint8_t tlv[D2K_PLAN_TLV_MAX], payload[128], wire[256];
+    size_t tlv_len = 0;
+    d2k_plan *p = NULL;
+    d2k_pkt pkt = {0};
+    d2k_actions out = {0};
+    case_name = "fallback disorder-pos2";
+
+    CHECK(d2k_fallback_plan(5, D2K_SHAPE_MODERN, "disk.rzd.ru", 1492,
+                            text, sizeof text) == 0);
+    CHECK(strstr(text, "split payload_start +2\n") != NULL);
+    CHECK(strstr(text, "order reverse\n") != NULL);
+    CHECK(strstr(text, "split payload_start +1\n") == NULL);
+    CHECK(strstr(text, "split sni_middle") == NULL);
+    CHECK(strstr(text, "pace ") == NULL);
+    if (!strstr(text, "split payload_start +2\n") ||
+        !strstr(text, "order reverse\n") ||
+        strstr(text, "split payload_start +1\n") ||
+        strstr(text, "split sni_middle") || strstr(text, "pace ")) {
+        return;
+    }
+
+    if (d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tlv_len,
+                             err, sizeof err) != 0) { return; }
+    CHECK(d2k_plan_load(tlv, tlv_len, &p, err, sizeof err) == 0);
+    if (!p) { return; }
+    for (size_t i = 0; i < sizeof payload; i++) { payload[i] = (uint8_t)i; }
+    payload[0] = 0x16; payload[1] = 3; payload[2] = 3;
+    payload[3] = 0; payload[4] = sizeof payload - 5;
+    payload[5] = 1; payload[6] = 0; payload[7] = 0;
+    payload[8] = sizeof payload - 9;
+    pkt.seq = BASE; pkt.payload = payload; pkt.payload_len = sizeof payload;
+    pkt.have_sni = 1; pkt.sni_off = 10; pkt.sni_len = 20;
+    CHECK(d2k_plan_apply(p, NULL, &pkt, &out) == 0);
+    CHECK(out.fate == D2K_ORIG_DROP && out.n == 2);
+    if (out.n == 2) {
+        CHECK(out.v[0].seq == BASE + 2 && out.v[0].len == 126 &&
+              out.v[0].delay_us == 0 && out.v[0].kind == D2K_EMIT_PAYLOAD);
+        CHECK(memcmp(out.v[0].bytes, payload + 2, 126) == 0);
+        CHECK(out.v[1].seq == BASE && out.v[1].len == 2 &&
+              out.v[1].delay_us == 0 && out.v[1].kind == D2K_EMIT_PAYLOAD);
+        CHECK(memcmp(out.v[1].bytes, payload, 2) == 0);
+        size_t n = d2k_wire_build(&(d2k_conn){.ttl=64,.window=65535},
+                                  &out.v[0], wire, sizeof wire);
+        CHECK(n == 40 + 126 && memcmp(wire + 40, payload + 2, 126) == 0);
+        n = d2k_wire_build(&(d2k_conn){.ttl=64,.window=65535},
+                           &out.v[1], wire, sizeof wire);
+        CHECK(n == 40 + 2 && memcmp(wire + 40, payload, 2) == 0);
+    }
+    d2k_actions_free(&out);
+    d2k_plan_free(p);
+}
+
+static void rx_volume_fake_sni_split(void) {
+    char text[4096], err[200];
+    uint8_t tlv[D2K_PLAN_TLV_MAX], payload[512], wire[2048];
+    size_t tlv_len = 0;
+    d2k_plan *p = NULL;
+    d2k_pkt pkt = {0};
+    d2k_actions out = {0};
+    case_name = "RX-volume fake-SNI split ladder";
+
+    /* The screenshot establishes ordering and ingredients, not the complete
+       numeric recipe. Keep the candidate family out of the general fallback
+       so it is only reached by a confirmed RX-volume measurement. */
+    CHECK(d2k_rx_volume_plan(0, D2K_SHAPE_MODERN, 1492, text, sizeof text) == 0);
+    CHECK(strstr(text, "input tls-sni\n") != NULL);
+    CHECK(strstr(text, "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n") != NULL);
+    CHECK(strstr(text, "poison 1 tcpts\n") != NULL);
+    CHECK(strstr(text, "split payload_start +2\norder forward\n") != NULL);
+    CHECK(strstr(text, "hcaptcha.com") == NULL); /* binary payload, not text */
+    CHECK(strstr(text, "nodrop") == NULL && strstr(text, "tlsmod=") == NULL);
+    if (!strstr(text, "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n") ||
+        !strstr(text, "split payload_start +2\norder forward\n")) { return; }
+    static const unsigned expected_split[D2K_RX_VOLUME_PLAN_VARIANTS] = {2, 1, 3, 4, 5};
+    for (unsigned i = 0; i < D2K_RX_VOLUME_PLAN_VARIANTS; i++) {
+        char variant[4096], split[48];
+        CHECK(d2k_rx_volume_plan(i, D2K_SHAPE_MODERN, 1492,
+                                 variant, sizeof variant) == 0);
+        snprintf(split, sizeof split, "split payload_start +%u\n", expected_split[i]);
+        CHECK(strstr(variant, split) != NULL);
+        CHECK(strstr(variant, "nodrop") == NULL);
+    }
+    CHECK(d2k_rx_volume_plan(0, D2K_SHAPE_LEGACY, 1492,
+                             text, sizeof text) != 0);
+
+    if (d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tlv_len,
+                             err, sizeof err) != 0) { return; }
+    CHECK(d2k_plan_load(tlv, tlv_len, &p, err, sizeof err) == 0);
+    if (!p) { return; }
+
+    /* Model a valid, complete TLS 1.3 ClientHello envelope. The session parser
+       supplies SNI metadata, as it does for a live packet. */
+    memset(payload, 0x5a, sizeof payload);
+    payload[0] = 0x16; payload[1] = 3; payload[2] = 1;
+    payload[3] = 1; payload[4] = 251;
+    payload[5] = 1; payload[6] = 0; payload[7] = 1; payload[8] = 247;
+    pkt.seq = BASE; pkt.payload = payload; pkt.payload_len = sizeof payload;
+    pkt.have_sni = 1; pkt.sni_off = 100; pkt.sni_len = 18; pkt.is_tls13 = 1;
+    payload[43] = 32;
+    for (size_t i = 0; i < 32; i++) { payload[44 + i] = (uint8_t)(0xc0 + i); }
+    CHECK(d2k_plan_apply(p, NULL, &pkt, &out) == 0);
+    CHECK(out.fate == D2K_ORIG_DROP && out.n == 3);
+    if (out.n == 3) {
+        CHECK(out.v[0].kind == D2K_EMIT_FAKE && out.v[0].len > 100 &&
+              (out.v[0].poison & D2K_POISON_TCPTS_BACK));
+        static const uint8_t hcaptcha[] = "hcaptcha.com";
+        CHECK(has_bytes(out.v[0].bytes, out.v[0].len,
+                        hcaptcha, sizeof hcaptcha - 1));
+        size_t wire_len = d2k_wire_build(&(d2k_conn){.ttl=64,.window=65535},
+                                         &out.v[0], wire, sizeof wire);
+        CHECK(wire_len == out.v[0].len + 52 && wire[32] == 0x80 &&
+              wire[42] == 8 && wire[43] == 10 && wire[44] == 0 &&
+              wire[45] == 0 && wire[46] == 0 && wire[47] == 1);
+        CHECK(out.v[1].kind == D2K_EMIT_PAYLOAD && out.v[1].seq == BASE &&
+              out.v[1].len == 2 && memcmp(out.v[1].bytes, payload, 2) == 0);
+        CHECK(out.v[2].kind == D2K_EMIT_PAYLOAD && out.v[2].seq == BASE + 2 &&
+              out.v[2].len == sizeof payload - 2 &&
+              memcmp(out.v[2].bytes, payload + 2, sizeof payload - 2) == 0);
+    }
+    d2k_actions_free(&out);
+    d2k_plan_free(p);
+}
+
 int main(void) {
     malformed();
+    fallback_disorder_pos2();
+    rx_volume_fake_sni_split();
     d2k_arm a = {0};
     a.seqovl = 1; run_case("seqovl-1", a, 289, 0);
     a.seqovl = 0; a.badsum = 1; a.repeats = 2; a.gap_ms = 20;
@@ -267,6 +417,8 @@ int main(void) {
     a.disorder = 1; run_case("fake-overlap-disorder", a, 1538, 1465);
     a.between = 1; a.repeats = 7; run_case("fake-between-priority", a, 1538, 1465);
     memset(&a, 0, sizeof a); a.disorder = 1; run_case("disorder", a, 1538, 0);
+    memset(&a, 0, sizeof a); a.disorder = 1; a.disorder_pos = 2;
+    run_case("disorder-pos2", a, 1538, 0);
     memset(&a, 0, sizeof a); a.seqovl_hello = 1; a.disorder = 1;
     run_case("captured-overlap-disorder-dynamic-sni", a, 289, 173);
     a.seqovl = 336; run_case("partial-captured-overlap", a, 1538, 500);

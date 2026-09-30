@@ -43,6 +43,7 @@ DIR=/opt/d2k
 # ограничено локальной loopback-привязкой и командами из фиксированного списка.
 BIN=/opt/sbin/d2kc
 PANELBIN=/opt/sbin/d2kpanel
+HTTPUPBIN=/opt/sbin/d2khttp
 PANEL_ASSETS=$DIR/panel
 DPBIN=/opt/sbin/d2kd
 CONF=$DIR/config
@@ -52,6 +53,7 @@ LOG=$DIR/log
 DP_PID=$RUN/d2kd.pid
 CT_PID=$RUN/d2k.pid
 PN_PID=$RUN/d2k-panel.pid
+HU_PID=$RUN/d2k-http.pid
 HL_PID=$RUN/d2k-heal.pid
 HEAL=$DIR/d2k-fw-heal.sh
 SOCK=$RUN/d2kd.sock
@@ -72,9 +74,9 @@ CHAIN_IN=D2K_IN
 # Значения по умолчанию; конфигурация их перекрывает.
 QUEUE_NUM=2000
 PANEL_LISTEN=127.0.0.1:8090
+HTTP_UPGRADE=1
+HTTPUP_PORT=18080
 STATE_DIR=$DIR/state
-TG_ENABLED=0
-TG_PORT=1443
 MARK=0x2d
 # Controller probes must traverse NFQUEUE for exact trial Plans, while raw
 # packets emitted by d2kd bypass it using MARK. Keep a distinct observable
@@ -83,6 +85,9 @@ PROBE_MARK=0x2e
 # Контроллерские измерения обходят собственный NFQUEUE. Точные проверки
 # кандидата используют PROBE_MARK и специально идут через datapath.
 MEASURE_MARK=0x2f
+# Transparent HTTP relay gets its own mark: its reply packets must not be
+# confused with controller measurement replies that the datapath must inspect.
+HTTPUP_MARK=0x30
 # Наблюдаем весь TCP/UDP трафик, а не только привычный HTTPS-порт. Протокол
 # определяется разбором первых пакетов в d2kd; ограничение портом 443 теряло
 # QUIC/DoT/нестандартные TLS и адресные потоки до того, как ядро могло выбрать
@@ -105,7 +110,12 @@ STATS_SEC=60
 
 # shellcheck disable=SC1090  # путь к конфигурации задан выше и постоянен
 [ -r "$CONF" ] && . "$CONF"
-
+# DNS and encrypted DNS are transport infrastructure, not strategy candidates.
+# Keep standard DNS/DoT/DoQ ports out of the packet classifier even when PORTS
+# is 0:65535; this does not alter resolver settings or DNS routing.
+DNS_PORTS=53,853
+TG_ENABLED=${TG_ENABLED:-0}
+TG_PORT=${TG_PORT:-1443}
 TGBIN=/opt/sbin/d2ktg
 TG_PID=$RUN/d2ktg.pid
 TG_STATUS=$STATE_DIR/telegram.status
@@ -117,6 +127,8 @@ DNS_SCHED_PID=$RUN/d2k-instagram-dns-scheduler.pid
 TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
 unset TG_RELAY_SECRET TG_RELAY_URL TG_IDENTITY TG_CA_BUNDLE
 FW_LOCK=${FW_LOCK:-/tmp/d2k-fw-operation.lock}
+
+httpup_enabled() { [ "$MODE" = "apply" ] && [ "$HTTP_UPGRADE" = "1" ]; }
 
 say() { echo "$NAME: $*"; }
 die() { echo "$NAME: $*" >&2; exit 1; }
@@ -137,10 +149,34 @@ running() {
 # идёт через POSTROUTING и FORWARD, собственные зонды — через OUTPUT и INPUT:
 # зонд идёт С САМОГО роутера, и транзитные цепочки его не видят.
 
+late_rst_from() {
+    local late_rst_upper
+    case "$CONNBYTES" in
+        0:*) ;;
+        *) return 1 ;;
+    esac
+    late_rst_upper=${CONNBYTES#0:}
+    case "$late_rst_upper" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$late_rst_upper" -le 65535 ] || return 1
+    echo $((late_rst_upper + 1))
+}
+
 fw_family_up() (
     fw_tool=$1
+    loopback=127.0.0.0/8
+    [ "$fw_tool" != ip6tables ] || loopback=::1/128
+    local local_routes httpup_mark_num mark_num probe_mark_num measure_mark_num late_from
+    late_from=$(late_rst_from) || return 1
+
     "$fw_tool" -t mangle -N "$CHAIN_OUT" 2>/dev/null || return 1
     "$fw_tool" -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
+
+    # Keenetic's DNS proxy talks to local encrypted-DNS helpers on dynamic
+    # loopback ports. That IPC is not internet traffic and must not be queued.
+    for chain in "$CHAIN_OUT" "$CHAIN_IN"; do
+        "$fw_tool" -t mangle -A "$chain" -s $loopback -j RETURN || return 1
+        "$fw_tool" -t mangle -A "$chain" -d $loopback -j RETURN || return 1
+    done
 
     # Собственные сырые посылки датапата и измерительные запросы контроллера
     # исключаются. Активные verifier-зонды
@@ -149,21 +185,65 @@ fw_family_up() (
     # порождает из них новое обнаружение.
     "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN || return 1
     "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN || return 1
+    if [ "$fw_tool" = iptables ] && httpup_enabled; then
+        case "$HTTPUP_PORT" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$HTTPUP_PORT" -gt 0 ] && [ "$HTTPUP_PORT" -le 65535 ] && \
+            [ "$HTTPUP_PORT" -ne 80 ] || return 1
+        httpup_mark_num=$((HTTPUP_MARK))
+        mark_num=$((MARK))
+        probe_mark_num=$((PROBE_MARK))
+        measure_mark_num=$((MEASURE_MARK))
+        [ "$httpup_mark_num" -gt 0 ] && \
+            [ "$httpup_mark_num" -ne "$mark_num" ] && \
+            [ "$httpup_mark_num" -ne "$probe_mark_num" ] && \
+            [ "$httpup_mark_num" -ne "$measure_mark_num" ] || return 1
+        "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$HTTPUP_MARK" -j RETURN || return 1
+        # HTTP-upstream sockets carry their own mark. Persist it on conntrack,
+        # so only their replies bypass input NFQUEUE—not controller probes.
+        "$fw_tool" -t mangle -N D2K_HTTP_MARK 2>/dev/null || return 1
+        "$fw_tool" -t mangle -A D2K_HTTP_MARK -m mark --mark "$HTTPUP_MARK" \
+            -j CONNMARK --save-mark || return 1
+        "$fw_tool" -t mangle -I OUTPUT -j D2K_HTTP_MARK || return 1
+        "$fw_tool" -t mangle -A "$CHAIN_IN" -m connmark --mark "$HTTPUP_MARK" \
+            -j RETURN || return 1
+        # REDIRECTed client requests become local INPUT packets on this port.
+        "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp --dport "$HTTPUP_PORT" \
+            -j RETURN || return 1
+    fi
+
+    # Never queue DNS (UDP/TCP 53) or encrypted DNS (DoT/DoQ, 853). These
+    # packets are required for ordinary connectivity and are not useful
+    # strategy inputs. Place exclusions before the broad TCP/UDP NFQUEUE rules.
+    for proto in tcp udp; do
+        "$fw_tool" -t mangle -A "$CHAIN_OUT" -p "$proto" -m multiport --dports "$DNS_PORTS" \
+            -j RETURN || return 1
+        "$fw_tool" -t mangle -A "$CHAIN_IN" -p "$proto" -m multiport --sports "$DNS_PORTS" \
+            -j RETURN || return 1
+    done
 
     # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
     # останавливать его (§10). Это касается и UDP-правил ниже в той же мере,
     # что и TCP: без --queue-bypass там остановка датапата обрывает весь QUIC
     # в сети, а не просто перестаёт его обрабатывать.
-    # connbytes-dir выбирает счётчик ORIGINAL, но не проверяет направление
-    # текущего пакета. При диапазоне 0:8 встречный счётчик равен нулю и тоже
-    # совпадает. Явный ctdir не даёт широким PORTS захватить чужую сторону.
-    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL \
-        -m multiport --dports "$PORTS" \
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
-    "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY \
-        -m multiport --sports "$PORTS" \
+    # Если браузер сам сбрасывает зависший ответ после окна первых пакетов,
+    # пропускаем в датапат только RST — payload большого потока не ставится
+    # в очередь. Датапат поднимет volume-пару только если до этого видел TLS
+    # app-data; один RST диагнозом или основанием для перебора не является.
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
+        --tcp-flags RST RST -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    # Поздний RST — редкий, узкий сигнал для ответа, оборванного уже после
+    # TLS app-data. Его надо видеть и ПОСЛЕ окна первых восьми пакетов, но не
+    # ставить весь ответ в очередь. Правило ограничено трафиком за пределом
+    # прежнего окна; ранние RST по-прежнему ловит обычная очередь ниже.
+    "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
+        --tcp-flags RST RST -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
@@ -173,13 +253,11 @@ fw_family_up() (
     # симметрии: D2K_HELLO_WINDOW в session.c ограничивает разбор QUIC
     # ровно тем же числом первых датаграмм потока, так что очередь ничего не
     # выигрывает, продолжая получать пакеты сверх этого окна.
-    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL \
-        -m multiport --dports "$PORTS" \
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
-    "$fw_tool" -t mangle -A "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY \
-        -m multiport --sports "$PORTS" \
+    "$fw_tool" -t mangle -A "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
@@ -187,13 +265,11 @@ fw_family_up() (
     # Голос: первые пакеты туда (IP Discovery и повторы — по ним датапат
     # узнаёт голос и приговаривает «молчат») и первые оттуда (ответ сервера —
     # единственное подтверждение приёма голоса: зонда у голоса нет).
-    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL \
-        -m multiport --dports "$VOICE_PORTS" \
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL -m multiport --dports "$VOICE_PORTS" \
         -m connbytes --connbytes "$VOICE_CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
-    "$fw_tool" -t mangle -A "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY \
-        -m multiport --sports "$VOICE_PORTS" \
+    "$fw_tool" -t mangle -A "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY -m multiport --sports "$VOICE_PORTS" \
         -m connbytes --connbytes "$VOICE_CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
@@ -222,17 +298,56 @@ fw_family_up() (
     # непроверенное на живой линии нельзя.
     [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -A POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE || say "не поставить MASQUERADE для своих посылок — QUIC за роутером не пойдёт"
+
+    # Only redirect HTTP after the listener is alive. It rewrites a response
+    # only when an ordinary GET/HEAD receives an explicit cross-host portal
+    # redirect; normal public HTTP and unrelated redirects are relayed intact.
+    # Connected LAN/router destinations bypass the NAT rule below.
+    if [ "$fw_tool" = iptables ] && httpup_enabled; then
+        [ -x "$HTTPUPBIN" ] && running "$HU_PID" || return 1
+        "$fw_tool" -t nat -N D2K_HTTP 2>/dev/null || return 1
+        "$fw_tool" -t nat -A D2K_HTTP -m addrtype --dst-type LOCAL -j RETURN || return 1
+        # Skip directly-connected router/LAN subnets, but do not blanket-skip
+        # RFC1918: some ISPs return a private sinkhole address for blocked DNS
+        # names, and HTTP to that address must still reach this portal detector.
+        command -v ip >/dev/null 2>&1 || return 1
+        local_routes=$(ip -4 route show table main scope link 2>/dev/null |
+            awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ { print $1 }')
+        [ -n "$local_routes" ] || return 1
+        for net in 0.0.0.0/8 127.0.0.0/8 169.254.0.0/16 \
+                   224.0.0.0/4 240.0.0.0/4 $local_routes; do
+            "$fw_tool" -t nat -A D2K_HTTP -d "$net" -j RETURN || return 1
+        done
+        "$fw_tool" -t nat -A D2K_HTTP -p tcp --dport 80 \
+            -j REDIRECT --to-ports "$HTTPUP_PORT" || return 1
+        "$fw_tool" -t nat -I PREROUTING -j D2K_HTTP || return 1
+    fi
+
     "$fw_tool" -t mangle -I POSTROUTING -j "$CHAIN_OUT" || return 1
     "$fw_tool" -t mangle -I FORWARD     -j "$CHAIN_IN"  || return 1
     "$fw_tool" -t mangle -I INPUT       -j "$CHAIN_IN"  || return 1
     return 0
 )
 
+fw_up_unlocked() { fw_family_up iptables && fw_family_up ip6tables; }
+
 fw_family_down() (
     fw_tool=$1
+    while "$fw_tool" -t nat -D PREROUTING -j D2K_HTTP 2>/dev/null; do :; done
+    if "$fw_tool" -t nat -n -L D2K_HTTP >/dev/null 2>&1; then
+        "$fw_tool" -t nat -F D2K_HTTP 2>/dev/null
+        "$fw_tool" -t nat -X D2K_HTTP 2>/dev/null
+    fi
     # Своё правило в nat снимается по тем же признакам, по которым ставилось.
-    while [ "$fw_tool" = iptables ] && "$fw_tool" -t nat -D POSTROUTING -p udp -m mark --mark "$MARK" \
+    while "$fw_tool" -t nat -D POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE 2>/dev/null; do :; done
+    while "$fw_tool" -t mangle -D OUTPUT -m mark --mark "$HTTPUP_MARK" \
+        -j CONNMARK --save-mark 2>/dev/null; do :; done
+    while "$fw_tool" -t mangle -D OUTPUT -j D2K_HTTP_MARK 2>/dev/null; do :; done
+    if "$fw_tool" -t mangle -n -L D2K_HTTP_MARK >/dev/null 2>&1; then
+        "$fw_tool" -t mangle -F D2K_HTTP_MARK 2>/dev/null
+        "$fw_tool" -t mangle -X D2K_HTTP_MARK 2>/dev/null
+    fi
     for hook in POSTROUTING FORWARD OUTPUT INPUT; do
         for ch in "$CHAIN_OUT" "$CHAIN_IN"; do
             while "$fw_tool" -t mangle -D "$hook" -j "$ch" 2>/dev/null; do :; done
@@ -244,50 +359,39 @@ fw_family_down() (
             "$fw_tool" -t mangle -X "$ch" 2>/dev/null
         fi
     done
-    return 0
 )
 
-# Все изменения собственных цепочек сериализуются: периодический сторож,
-# NDM-хук, UI и ручная команда могут заметить сброс почти одновременно.
-# Без общей блокировки два `fw_up` удаляют/создают одни и те же цепочки
-# параллельно, и один из них оставляет пустой набор правил.
+fw_down_unlocked() { fw_family_down iptables; fw_family_down ip6tables; }
+
 fw_lock_acquire() {
+    local attempt owner
     attempt=0
     while ! mkdir "$FW_LOCK" 2>/dev/null; do
         owner=$(cat "$FW_LOCK/pid" 2>/dev/null)
-        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-            rm -f "$FW_LOCK/pid" 2>/dev/null
-            rmdir "$FW_LOCK" 2>/dev/null
-            continue
-        fi
+        case "$owner" in
+            ''|*[!0-9]*) ;;
+            *)
+                if ! kill -0 "$owner" 2>/dev/null; then
+                    rm -f "$FW_LOCK/pid" 2>/dev/null
+                    rmdir "$FW_LOCK" 2>/dev/null
+                    continue
+                fi ;;
+        esac
         [ "$attempt" -lt 300 ] || return 1
         attempt=$((attempt + 1))
         sleep 0.1 2>/dev/null || sleep 1
     done
-    printf '%s\n' "$$" > "$FW_LOCK/pid" || { rmdir "$FW_LOCK" 2>/dev/null; return 1; }
+    printf '%s\n' "$$" > "$FW_LOCK/pid" || { rmdir "$FW_LOCK"; return 1; }
 }
 
 fw_lock_release() {
-    owner=$(cat "$FW_LOCK/pid" 2>/dev/null)
-    [ "$owner" = "$$" ] || return 1
-    rm -f "$FW_LOCK/pid" 2>/dev/null
-    rmdir "$FW_LOCK" 2>/dev/null
-}
-
-fw_up_unlocked() {
-    fw_family_up iptables && fw_family_up ip6tables
-}
-
-fw_down_unlocked() {
-    fw_family_down iptables
-    fw_family_down ip6tables
-}
-
-fw_installed() {
-    fw_family_installed iptables && fw_family_installed ip6tables
+    [ "$(cat "$FW_LOCK/pid" 2>/dev/null)" = "$$" ] || return 1
+    rm -f "$FW_LOCK/pid"
+    rmdir "$FW_LOCK"
 }
 
 fw_up() {
+    local rc
     fw_lock_acquire || return 1
     fw_down_unlocked
     if fw_up_unlocked; then
@@ -301,6 +405,7 @@ fw_up() {
 }
 
 fw_down() {
+    local rc
     fw_lock_acquire || return 1
     fw_down_unlocked
     rc=$?
@@ -310,30 +415,69 @@ fw_down() {
 
 fw_family_installed() (
     fw_tool=$1
+    loopback=127.0.0.0/8
+    [ "$fw_tool" != ip6tables ] || loopback=::1/128
+    local late_from
+    late_from=$(late_rst_from) || return 1
     # A jump into an empty chain does not send a single packet to d2kd.
     # Check the complete contract, including reply traffic and bypass. -C
     # is supported by the target's iptables 1.4.21 (verified 12.09).
+    for chain in "$CHAIN_OUT" "$CHAIN_IN"; do
+        "$fw_tool" -t mangle -C "$chain" -s $loopback -j RETURN 2>/dev/null || return 1
+        "$fw_tool" -t mangle -C "$chain" -d $loopback -j RETURN 2>/dev/null || return 1
+    done
     "$fw_tool" -t mangle -C POSTROUTING -j "$CHAIN_OUT" 2>/dev/null || return 1
     "$fw_tool" -t mangle -C FORWARD -j "$CHAIN_IN" 2>/dev/null || return 1
     "$fw_tool" -t mangle -C INPUT -j "$CHAIN_IN" 2>/dev/null || return 1
     "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN 2>/dev/null || return 1
     "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN 2>/dev/null || return 1
+    if [ "$fw_tool" = iptables ] && httpup_enabled; then
+        "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$HTTPUP_MARK" \
+            -j RETURN 2>/dev/null || return 1
+        "$fw_tool" -t mangle -C OUTPUT -j D2K_HTTP_MARK 2>/dev/null || return 1
+        "$fw_tool" -t mangle -C D2K_HTTP_MARK -m mark --mark "$HTTPUP_MARK" \
+            -j CONNMARK --save-mark 2>/dev/null || return 1
+        "$fw_tool" -t mangle -C "$CHAIN_IN" -m connmark --mark "$HTTPUP_MARK" \
+            -j RETURN 2>/dev/null || return 1
+        "$fw_tool" -t mangle -C "$CHAIN_IN" -p tcp --dport "$HTTPUP_PORT" \
+            -j RETURN 2>/dev/null || return 1
+    fi
     for proto in tcp udp; do
-        "$fw_tool" -t mangle -C "$CHAIN_OUT" -p "$proto" -m conntrack --ctdir ORIGINAL \
-            -m multiport --dports "$PORTS" \
+        "$fw_tool" -t mangle -C "$CHAIN_OUT" -p "$proto" -m multiport --dports "$DNS_PORTS" \
+            -j RETURN 2>/dev/null || return 1
+        "$fw_tool" -t mangle -C "$CHAIN_IN" -p "$proto" -m multiport --sports "$DNS_PORTS" \
+            -j RETURN 2>/dev/null || return 1
+    done
+    for proto in tcp udp; do
+        "$fw_tool" -t mangle -C "$CHAIN_OUT" -p "$proto" -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
             -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
             --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
             --queue-bypass 2>/dev/null || return 1
-        "$fw_tool" -t mangle -C "$CHAIN_IN" -p "$proto" -m conntrack --ctdir REPLY \
-            -m multiport --sports "$PORTS" \
+        "$fw_tool" -t mangle -C "$CHAIN_IN" -p "$proto" -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
             -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
             --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
             --queue-bypass 2>/dev/null || return 1
     done
+    "$fw_tool" -t mangle -C "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
+        --tcp-flags RST RST -j NFQUEUE --queue-num "$QUEUE_NUM" \
+        --queue-bypass 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
+        --tcp-flags RST RST -j NFQUEUE --queue-num "$QUEUE_NUM" \
+        --queue-bypass 2>/dev/null || return 1
     [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE 2>/dev/null || return 1
+    if [ "$fw_tool" = iptables ] && httpup_enabled; then
+        running "$HU_PID" || return 1
+        "$fw_tool" -t nat -C PREROUTING -j D2K_HTTP 2>/dev/null || return 1
+        "$fw_tool" -t nat -C D2K_HTTP -p tcp --dport 80 \
+            -j REDIRECT --to-ports "$HTTPUP_PORT" 2>/dev/null || return 1
+    fi
     return 0
 )
+
+fw_installed() { fw_family_installed iptables && fw_family_installed ip6tables; }
 
 # --- запуск --------------------------------------------------------------
 
@@ -378,6 +522,7 @@ start_engine() {
 
     if running "$DP_PID"; then
         if running "$CT_PID" && fw_installed && \
+            { ! httpup_enabled || running "$HU_PID"; } && \
             { [ ! -x "$HEAL" ] || running "$HL_PID"; }; then
             say "движок уже запущен полностью"
             return 0
@@ -417,6 +562,15 @@ start_engine() {
     if [ -z "$bound" ] || [ "$bound" = "0" ]; then
         engine_stop
         die "очередь $QUEUE_NUM не привязалась — правила не ставлю"
+    fi
+
+    if httpup_enabled; then
+        [ -x "$HTTPUPBIN" ] || { engine_stop; die "нет $HTTPUPBIN для обычного HTTP-входа"; }
+        start-stop-daemon -S -b -m -p "$HU_PID" -x "$HTTPUPBIN" -- \
+            --port "$HTTPUP_PORT" --mark "$HTTPUP_MARK" || {
+                engine_stop; die "HTTP-upgrade listener не запустился"
+            }
+        if ! running "$HU_PID"; then engine_stop; die "HTTP-upgrade listener завершился сразу"; fi
     fi
 
     fw_up || { engine_stop; die "не поставить правила"; }
@@ -486,7 +640,6 @@ start_panel() {
             --listen "$PANEL_LISTEN" --state-dir "$STATE_DIR" --mode "$MODE" \
             --queue "$QUEUE_NUM" --service /opt/etc/init.d/S99d2k \
             --engine-pid "$DP_PID" --controller-pid "$CT_PID" \
-            --telegram-pid "$TG_PID" --telegram-status "$TG_STATUS" \
             --log "$LOG/panel.log" \
             || say "панель не запустилась — обход это не затрагивает"
     fi
@@ -613,6 +766,7 @@ engine_stop() {
     # и успеть восстановить их, пока служба останавливается.
     stop_pidfile "$HL_PID"
     fw_down
+    stop_pidfile "$HU_PID"
     fastnat_restore
     stop_pidfile "$CT_PID"
     stop_pidfile "$DP_PID"
@@ -636,12 +790,14 @@ status() {
                       || echo "  контроллер: не работает"
     running "$PN_PID" && echo "  панель: работает (pid $(cat $PN_PID))" \
                       || echo "  панель: не работает"
-    running "$HL_PID" && echo "  сторож правил: работает (pid $(cat $HL_PID))" \
-                      || echo "  сторож правил: не работает"
     running "$TG_PID" && echo "  Telegram tunnel: работает (pid $(cat $TG_PID))" \
                        || echo "  Telegram tunnel: не работает (enabled=${TG_ENABLED:-0})"
     running "$DNS_SCHED_PID" && echo "  Instagram DNS: суточное обновление запланировано (pid $(cat $DNS_SCHED_PID))" \
                               || echo "  Instagram DNS: планировщик не работает"
+    running "$HU_PID" && echo "  HTTP→HTTPS: listener работает" \
+                      || echo "  HTTP→HTTPS: listener не работает"
+    running "$HL_PID" && echo "  сторож правил: работает (pid $(cat $HL_PID))" \
+                      || echo "  сторож правил: не работает"
     fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
     bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
         /proc/net/netfilter/nfnetlink_queue 2>/dev/null)
@@ -659,6 +815,11 @@ status() {
 # Руками она тоже годится.
 reapply() {
     running "$DP_PID" || die "датапат не работает — ставить правила не для кого"
+    if httpup_enabled && ! running "$HU_PID"; then
+        [ -x "$HTTPUPBIN" ] || die "нет $HTTPUPBIN для HTTP→HTTPS"
+        start-stop-daemon -S -b -m -p "$HU_PID" -x "$HTTPUPBIN" -- \
+            --port "$HTTPUP_PORT" --mark "$HTTPUP_MARK" || die "HTTP-upgrade listener не запустился"
+    fi
     fw_up || { fw_down; die "не поставить полный набор правил"; }
     say "правила поставлены заново"
 }
@@ -680,5 +841,5 @@ case "$1" in
     telegram-reapply) telegram_reapply ;;
     status)  status ;;
     reapply) reapply ;;
-    *) echo "использование: $0 {start|stop|restart|engine-start|engine-stop|engine-restart|telegram-enable|telegram-disable|telegram-restart|telegram-reapply|status|reapply}" >&2; exit 2 ;;
+    *) echo "использование: $0 {start|stop|restart|engine-start|engine-stop|engine-restart|status|reapply}" >&2; exit 2 ;;
 esac

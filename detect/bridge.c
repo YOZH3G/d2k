@@ -90,6 +90,7 @@ int d2k_arm_from_poison(const d2k_poison *p, d2k_arm *a, char *why, size_t whyca
     if (a->repeats == 0 && d2k_poison_has_fake(p)) { a->repeats = 1; }
     a->gap_ms       = p->gap_ms > 0 ? (unsigned)p->gap_ms : 0u;
     a->disorder     = p->disorder;
+    a->disorder_pos = p->disorder_pos > 0 ? (unsigned)p->disorder_pos : 0u;
     a->between      = p->fake_between;
     a->ttl          = p->ttl > 0 ? (unsigned)p->ttl : 0u;
     a->seq_out      = p->seq_shift != 0;

@@ -67,28 +67,38 @@ static int fails;
 #define ROLE_SILENT 1
 /* Доводит рукопожатие и отвечает внутри сессии настоящим ответом HTTP. */
 #define ROLE_APP    2
+/* Редирект и конечный ответ идут в одном TLS-соединении. */
+#define ROLE_REDIRECT_COMPLETE 64
+#define ROLE_REDIRECT_TRUNCATED 65
 
 static const struct {
     const char *text;
     int status;
     size_t split;
     int cloudflare_challenge;
+    int body_complete;
 } replies[] = {
-    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 200, 0, 0},
-    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 200, 10, 0},
-    {"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\n\r\n", 200, 0, 0},
-    {"HTTP/1.1 103 Early Hints\r\n\r\n", 0, 0, 0},
-    {"HTTP/1.1 200", 0, 0, 0},
-    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n", 0, 0, 0},
-    {"HTTP/1.1 2000 OK\r\n\r\n", 0, 0, 0},
-    {"HTTP/1.1 200x OK\r\n\r\n", 0, 0, 0},
-    {"HTTP/1.12 200 OK\r\n\r\n", 0, 0, 0},
-    {"HTTP/1.1 999 Invalid\r\n\r\n", 0, 0, 0},
-    {"HTTP/1.0 403 Forbidden\r\n\r\n", 403, 0, 0},
-    {"HTTP/1.1 403 Forbidden\r\nCF-Mitigated:  challenge \t\r\n\r\n", 403, 0, 1},
-    {"HTTP/1.1 101 Switching Protocols\r\n\r\n", 0, 0, 0},
-    {"HTTP/1.1 204 No Content\r\n\r\n", 204, 10, 0},
-    {"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n", 204, 0, 0},
+    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 200, 0, 0, 1},
+    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 200, 10, 0, 1},
+    {"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 200, 0, 0, 1},
+    {"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort", 200, 0, 0, 0},
+    {"HTTP/1.1 200", 0, 0, 0, 0},
+    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n", 0, 0, 0, 0},
+    {"HTTP/1.1 2000 OK\r\n\r\n", 0, 0, 0, 0},
+    {"HTTP/1.1 200x OK\r\n\r\n", 0, 0, 0, 0},
+    {"HTTP/1.12 200 OK\r\n\r\n", 0, 0, 0, 0},
+    {"HTTP/1.1 999 Invalid\r\n\r\n", 0, 0, 0, 0},
+    {"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n", 403, 0, 0, 1},
+    {"HTTP/1.1 101 Switching Protocols\r\n\r\n", 0, 0, 0, 0},
+    {"HTTP/1.1 204 No Content\r\n\r\n", 204, 10, 0, 1},
+    {"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n", 204, 0, 0, 1},
+    {"HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nCf-Mitigated: challenge\r\nContent-Length: 15\r\n\r\n<!doctype html>", 403, 0, 1, 1},
+    {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n2\r\ntw\r\n0\r\nX-End: yes\r\n\r\n", 200, 0, 0, 1},
+    {"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 2\r\n\r\nok", 200, 0, 0, 1},
+    {"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Encoding: identity\r\nContent-Length: 2\r\n\r\nok", 200, 0, 0, 1},
+    {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4000\r\nshort", 200, 0, 0, 0},
+    {"HTTP/1.1 302 Found\r\nLocation: https://other.example/\r\nContent-Length: 0\r\n\r\n", 302, 0, 0, 1},
+    {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n0\r\n\r\n", 200, 0, 0, 0},
 };
 
 struct stand {
@@ -96,6 +106,7 @@ struct stand {
     uint16_t  port;
     int       role;
     uint16_t  peer_port; /* местный порт зонда, каким его ВИДИТ мишень */
+    int       accepted_compression;
     pthread_t th;
 };
 
@@ -133,6 +144,15 @@ static int wr_all(int fd, const uint8_t *b, size_t n) {
 #endif
         if (w <= 0) { return -1; }
         sent += (size_t)w;
+    }
+    return 0;
+}
+
+static int contains_bytes(const uint8_t *buf, size_t len, const char *needle) {
+    size_t n = strlen(needle);
+    if (n > len) { return 0; }
+    for (size_t i = 0; i <= len - n; i++) {
+        if (memcmp(buf + i, needle, n) == 0) { return 1; }
     }
     return 0;
 }
@@ -290,6 +310,9 @@ static size_t stand_ch_wire;
    строить не будет (см. d2k_tls_peer_name). Стенд кладёт эти байты и ничего
    больше — так проверяется РАЗБОР, а не чужая библиотека X.509. */
 static const char *stand_cert_name;
+static char stand_request[REC_MAX + 1];
+static int stand_same_origin_redirect;
+static int stand_redirect_followed;
 
 static int stand_handshake(int c, struct dir *rd, struct dir *wr) {
     uint8_t tr[REC_MAX * 2];
@@ -458,15 +481,34 @@ static void *stand_run(void *arg) {
     (void)setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 
     if (s->role == ROLE_PLAIN) {
-        /* Дожидаемся приветствия и отвечаем настоящим успехом HTTP открытым
-           текстом. Клиент отвергает это сразу, на заголовке записи: байты
-           'P' и '/' на месте длины дают 20527 — больше предела записи TLS
-           (RFC 8446 §5.1), то есть отказ приходит мгновенно, а не по
-           тайм-ауту, и тест не платит за него секундами. */
+        /* Точный вид полевого ответа Cloudflare, пойманного на Rutracker
+           при плане 8: открытый HTTP 400 на TCP/443, затем FIN. Первые пять
+           байт "HTTP/" не являются TLS-заголовком; P/ в позициях длины
+           дают 20527. Это не запись TLS и не повод поднимать REC_MAX. */
         uint8_t junk[4096];
         (void)recv(c, junk, sizeof junk, 0);
-        static const char ok[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-        (void)wr_all(c, (const uint8_t *)ok, sizeof ok - 1);
+        static const char cloudflare_400[] =
+            "HTTP/1.1 400 Bad Request\r\n"
+            "Server: cloudflare\r\n"
+            "Date: Tue, 29 Sep 2026 11:32:03 GMT\r\n"
+            "Content-Type: text/html\r\n"
+            "Content-Length: 155\r\n"
+            "Connection: close\r\n"
+            "CF-RAY: -\r\n\r\n"
+            "<html>\r\n"
+            "<head><title>400 Bad Request</title></head>\r\n"
+            "<body>\r\n"
+            "<center><h1>400 Bad Request</h1></center>\r\n"
+            "<hr><center>cloudflare</center>\r\n"
+            "</body>\r\n"
+            "</html>\r\n";
+        CHECK(sizeof cloudflare_400 - 1 == 316,
+              "захваченный Cloudflare 400 должен содержать 316 байт TCP payload");
+        static const char cf_prefix[] =
+            "HTTP/1.1 400 Bad Request\r\nServer: cloudflare\r\n";
+        CHECK(memcmp(cloudflare_400, cf_prefix, sizeof cf_prefix - 1) == 0,
+              "fixture соответствует наблюдаемому ответу Cloudflare");
+        (void)wr_all(c, (const uint8_t *)cloudflare_400, sizeof cloudflare_400 - 1);
         /* Держим открытым, пока зонд не уйдёт сам: закрытие сразу после
            ответа дало бы зонду RST вместо тишины, и «транспорт встал» стало
            бы неотличимо от «транспорта не было». */
@@ -490,6 +532,66 @@ static void *stand_run(void *arg) {
         close(c);
         return NULL;
     }
+    size_t copy = rlen < sizeof stand_request - 1 ? rlen : sizeof stand_request - 1;
+    memcpy(stand_request, req, copy);
+    stand_request[copy] = '\0';
+
+    if (stand_same_origin_redirect) {
+        static const char moved[] =
+            "HTTP/1.1 301 Moved Permanently\r\n"
+            "Location: /forum/index.php\r\nContent-Length: 0\r\n"
+            "Connection: keep-alive\r\n\r\n";
+        static const char page[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+            "Connection: keep-alive\r\n\r\nok";
+        if (rec_write(c, &wr, REC_APPDATA, (const uint8_t *)moved, sizeof moved - 1) == 0 &&
+            rec_read(c, &rd, 1, &type, req, sizeof req, &rlen) == 0 &&
+            type == REC_APPDATA) {
+            copy = rlen < sizeof stand_request - 1 ? rlen : sizeof stand_request - 1;
+            memcpy(stand_request, req, copy);
+            stand_request[copy] = '\0';
+            stand_redirect_followed = 1;
+            (void)rec_write(c, &wr, REC_APPDATA, (const uint8_t *)page, sizeof page - 1);
+        }
+        uint8_t drain_redirect[256];
+        (void)recv(c, drain_redirect, sizeof drain_redirect, 0);
+        close(c);
+        return NULL;
+    }
+
+    if (s->role == ROLE_REDIRECT_COMPLETE || s->role == ROLE_REDIRECT_TRUNCATED) {
+        s->accepted_compression = contains_bytes(req, rlen, "Accept-Encoding: gzip, deflate");
+        static const char redirect[] =
+            "HTTP/1.1 301 Moved Permanently\r\n"
+            "Location: /forum/index.php\r\n"
+            "Content-Length: 0\r\n\r\n";
+        struct timeval short_wait = { 0, 500000 };
+        (void)setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &short_wait, sizeof short_wait);
+        if (rec_write(c, &wr, REC_APPDATA, (const uint8_t *)redirect,
+                      sizeof redirect - 1) != 0 ||
+            rec_read(c, &rd, 1, &type, req, sizeof req, &rlen) != 0 ||
+            type != REC_APPDATA ||
+            rlen < 29 || memcmp(req, "GET /forum/index.php HTTP/1.1", 29) != 0) {
+            close(c);
+            return NULL;
+        }
+        static const char headers[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        static const char complete[] = "4\r\npage\r\n0\r\n\r\n";
+        static const char truncated[] = "4\r\npa";
+        const char *body = s->role == ROLE_REDIRECT_COMPLETE ? complete : truncated;
+        size_t body_len = s->role == ROLE_REDIRECT_COMPLETE
+            ? sizeof complete - 1 : sizeof truncated - 1;
+        uint8_t close_notify[2] = { 1, 0 };
+        (void)rec_write(c, &wr, REC_APPDATA, (const uint8_t *)headers,
+                        sizeof headers - 1);
+        (void)rec_write(c, &wr, REC_APPDATA, (const uint8_t *)body, body_len);
+        if (s->role == ROLE_REDIRECT_TRUNCATED) {
+            (void)rec_write(c, &wr, REC_ALERT, close_notify, sizeof close_notify);
+        }
+        close(c);
+        return NULL;
+    }
 
     if (s->role >= ROLE_APP) {
         size_t i = (size_t)(s->role - ROLE_APP);
@@ -509,6 +611,7 @@ static void *stand_run(void *arg) {
 
 static uint16_t stand_start_family(struct stand *s, int role, int family) {
     memset(s, 0, sizeof *s);
+    stand_request[0] = '\0';
     s->fd = socket(family, SOCK_STREAM, 0);
     struct sockaddr_storage a;
     memset(&a, 0, sizeof a);
@@ -623,6 +726,10 @@ int main(void) {
         CHECK(r.level == D2K_VER_TRANSPORT,
               "не-TLS ответ засчитан выше уровня транспорта");
         CHECK(r.status == 0, "кода состояния взяться неоткуда, а он не ноль");
+        CHECK(strstr(r.reason, "48 54 54 50 2f") != NULL &&
+              strstr(r.reason, "открытый HTTP") != NULL &&
+              strstr(r.reason, "20527") == NULL,
+              "verifier принял открытый HTTP-ответ Cloudflare за поле длины TLS");
         CHECK(mark_calls == 0, "зонд пометил обращение — план к нему не применится");
         CHECK(r.fd >= 0, "сокет закрыт до явного d2k_verify_close");
 
@@ -644,6 +751,24 @@ int main(void) {
         stand_stop(&s);
         CHECK(r.local_port != 0 && r.local_port == s.peer_port,
               "местный порт обращения не тот, что увидела мишень");
+    }
+
+    /* Тот же неверный формат серверного ответа должен быть виден при
+       подтверждении старой TLS-формой, а не только у TLS 1.3 verifier. */
+    {
+        struct stand s;
+        uint16_t port = stand_start(&s, ROLE_PLAIN);
+        CHECK(port != 0, "стенд ROLE_PLAIN для TLS 1.2 не поднялся");
+        d2k_ver_result r = d2k_verify_probe12_on(-1, "127.0.0.1", port,
+                                                  "стенд.пример", 2000, 0);
+        CHECK(r.level == D2K_VER_TRANSPORT,
+              "TLS 1.2 verifier принял открытый HTTP за TLS");
+        CHECK(strstr(r.reason, "48 54 54 50 2f") != NULL &&
+              strstr(r.reason, "открытый HTTP") != NULL &&
+              strstr(r.reason, "20527") == NULL,
+              "TLS 1.2 verifier принял открытый HTTP-ответ за поле длины TLS");
+        d2k_verify_close(&r);
+        stand_stop(&s);
     }
 
     /* --- рукопожатие завершено, приложение молчит ------------------------- */
@@ -671,6 +796,31 @@ int main(void) {
               "разобранный ответ приложения не поднял уровень до прикладного");
         CHECK(r.status == 200, "код состояния разобран неверно");
         CHECK(r.fd >= 0, "сокет закрыт до явного d2k_verify_close");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+    }
+
+    /* Успех проверяется по конечному ответу на той же TLS-сессии, а не по
+       промежуточному 301. Chunked-ответ должен дойти до нулевого чанка. */
+    {
+        struct stand s;
+        uint16_t port = stand_start(&s, ROLE_REDIRECT_COMPLETE);
+        CHECK(port != 0, "стенд редиректа с полным ответом не поднялся");
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "http.example", 1800, 0);
+        CHECK(r.level == D2K_VER_APPLICATION && r.status == 200,
+              "проверка остановилась на 301 вместо конечного ответа по тому же TLS-соединению");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+        CHECK(s.accepted_compression,
+              "HTTP verifier не запросил обычное сжатие, из-за чего меняется поведение источника");
+    }
+    {
+        struct stand s;
+        uint16_t port = stand_start(&s, ROLE_REDIRECT_TRUNCATED);
+        CHECK(port != 0, "стенд оборванного ответа не поднялся");
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "http.example", 1800, 0);
+        CHECK(r.level != D2K_VER_APPLICATION,
+              "оборванное тело конечного ответа засчитано как рабочий обход");
         d2k_verify_close(&r);
         stand_stop(&s);
     }
@@ -768,6 +918,44 @@ int main(void) {
               "приветствие внезапно укоротилось до невозможного");
     }
 
+    /* RX-измерительный зонд умеет запросить gzip отдельно от identity и
+       подтверждает полное framing тела. Тест смотрит на запрос, реально
+       дошедший до TLS-стенда, а не на переданный вызывающим режим. */
+    {
+        struct stand s;
+        uint16_t port = stand_start(&s, ROLE_APP);
+        CHECK(port != 0, "стенд для baseline gzip-зонда не поднялся");
+        d2k_ver_result r = d2k_verify_probe_baseline("127.0.0.1", port,
+            "baseline.example", 3000, 0, 0, 1, 0);
+        CHECK(r.level == D2K_VER_APPLICATION && r.body_complete && r.body_bytes == 2,
+              "baseline-зонд не прочитал тело ответа полностью");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+        CHECK(strstr(stand_request, "Accept-Encoding: gzip\r\n") != NULL,
+              "gzip-контроль фактически ушёл как другой запрос");
+    }
+
+    /* Root redirect RuTracker is same-origin; the verifier must ask for the
+       redirected page on the same TLS flow and credit only its full response. */
+    {
+        struct stand s;
+        stand_same_origin_redirect = 1;
+        stand_redirect_followed = 0;
+        uint16_t port = stand_start(&s, ROLE_APP);
+        CHECK(port != 0, "стенд same-origin redirect не поднялся");
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port,
+                                             "redirect.example", 3000, 0);
+        CHECK(r.level == D2K_VER_APPLICATION && r.status == 200 &&
+              r.body_complete && r.body_bytes == 2,
+              "same-origin redirect не довёл проверку до тела страницы");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+        stand_same_origin_redirect = 0;
+        CHECK(stand_redirect_followed &&
+              strstr(stand_request, "GET /forum/index.php HTTP/1.1\r\n") != NULL,
+              "same-origin redirect не запросил целевой путь на том же TLS-потоке");
+    }
+
     /* Ни обрыв строки, ни промежуточный 1xx не заменяют окончательный ответ.
        Валидный ответ, разделённый между TLS-записями, не теряется. */
     for (size_t i = 1; i < sizeof replies / sizeof replies[0]; i++) {
@@ -780,12 +968,41 @@ int main(void) {
                     i, replies[i].status, r.status, (int)r.level, r.reason);
         }
         CHECK(r.status == replies[i].status, "неверный статус HTTP на граничном ответе");
-        if (replies[i].cloudflare_challenge) {
-            CHECK(strstr(r.reason, "Cloudflare challenge") != NULL,
-                  "challenge Cloudflare принят за обычный HTTP-ответ");
-        } else {
-            CHECK((r.level == D2K_VER_APPLICATION) == (replies[i].status != 0),
-                  "фрагмент или промежуточный ответ засчитан как окончательный HTTP");
+        int expected_application = replies[i].body_complete &&
+            !(replies[i].status >= 300 && replies[i].status < 400) &&
+            !replies[i].cloudflare_challenge;
+        CHECK((r.level == D2K_VER_APPLICATION) == expected_application,
+              "неполное тело или непосещённый redirect засчитан как страница");
+        CHECK(r.body_complete == replies[i].body_complete,
+              "ошибочный вывод о полноте HTTP-тела");
+        CHECK(r.cloudflare_challenge == replies[i].cloudflare_challenge,
+              "challenge Cloudflare не отличён от обычного ответа приложения");
+        CHECK((r.level == D2K_VER_CHALLENGE) == replies[i].cloudflare_challenge,
+              "антибот challenge потерял отдельный неуспешный уровень");
+        if (strstr(replies[i].text, "Transfer-Encoding: chunked\r\n") != NULL &&
+            strstr(replies[i].text, "4000\r\nshort") == NULL &&
+            strstr(replies[i].text, "Transfer-Encoding: chunked\r\nTransfer-Encoding") == NULL) {
+            CHECK(r.body_chunked && r.body_framing_valid,
+                  "валидный chunked-ответ потерял framing metadata");
+        }
+        if (strstr(replies[i].text, "Transfer-Encoding: chunked\r\nTransfer-Encoding") != NULL) {
+            CHECK(!r.body_framing_valid && !r.body_complete,
+                  "дублированный Transfer-Encoding принят как однозначный framing");
+        }
+        if (strstr(replies[i].text, "Content-Encoding: gzip\r\nContent-Encoding:") != NULL) {
+            CHECK(r.body_encoding == 2 && r.body_framing_valid,
+                  "несколько Content-Encoding не помечены как неизвестная coding-stack");
+        } else if (strstr(replies[i].text, "Content-Encoding: gzip\r\n") != NULL) {
+            CHECK(r.body_encoding == 1 && r.body_framing_valid,
+                  "gzip-ответ не распознан как сжатый и однозначно оформленный");
+        }
+        if (r.status != 0 && strstr(replies[i].text, "Content-Length:") != NULL) {
+            CHECK(r.body_has_length && r.body_framing_valid,
+                  "Content-Length-ответ потерял достоверную framing metadata");
+        }
+        if (strstr(replies[i].text, "4000\r\nshort") != NULL) {
+            CHECK(r.body_chunked && !r.body_complete && r.body_bytes == 5,
+                  "обрыв chunked-тела не сохранил реально полученный объём");
         }
         d2k_verify_close(&r);
         stand_stop(&s);

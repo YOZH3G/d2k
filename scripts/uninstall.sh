@@ -37,6 +37,9 @@ fi
 if [ -f "$DIR/run/d2ktg.pid" ]; then
     start-stop-daemon -K -q -p "$DIR/run/d2ktg.pid" 2>/dev/null || true
 fi
+if [ -f "$DIR/run/d2k-http.pid" ]; then
+    start-stop-daemon -K -q -p "$DIR/run/d2k-http.pid" 2>/dev/null || true
+fi
 [ ! -x "$DIR/d2k-tg-firewall.sh" ] || "$DIR/d2k-tg-firewall.sh" stop >/dev/null 2>&1 || true
 if command -v ipset >/dev/null 2>&1; then
     ipset destroy d2k_tg_dc 2>/dev/null || true
@@ -47,6 +50,16 @@ fi
 # а правила остаться.
 # Старое имя D2K тоже снимается: установка прошлой версии могла оставить его.
 for fw_tool in iptables ip6tables; do
+while "$fw_tool" -t nat -D PREROUTING -j D2K_HTTP 2>/dev/null; do :; done
+if "$fw_tool" -t nat -n -L D2K_HTTP >/dev/null 2>&1; then
+    "$fw_tool" -t nat -F D2K_HTTP 2>/dev/null || true
+    "$fw_tool" -t nat -X D2K_HTTP 2>/dev/null || true
+fi
+while "$fw_tool" -t mangle -D OUTPUT -j D2K_HTTP_MARK 2>/dev/null; do :; done
+if "$fw_tool" -t mangle -n -L D2K_HTTP_MARK >/dev/null 2>&1; then
+    "$fw_tool" -t mangle -F D2K_HTTP_MARK 2>/dev/null || true
+    "$fw_tool" -t mangle -X D2K_HTTP_MARK 2>/dev/null || true
+fi
 for hook in POSTROUTING FORWARD OUTPUT INPUT; do
     for ch in D2K_OUT D2K_IN D2K; do
         while "$fw_tool" -t mangle -D "$hook" -j "$ch" 2>/dev/null; do :; done
@@ -64,7 +77,7 @@ say "правила сняты"
 # Хук NDM снимается ПЕРВЫМ: оставленный, он будет звать сторожа, которого уже
 # нет, на каждое изменение netfilter — мусор в журнале на ровном месте.
 rm -f /opt/etc/ndm/netfilter.d/001-d2k.sh
-rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2ktg"
+rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2ktg" "$SBIN/d2khttp"
 # Remove only d2kc snapshots explicitly named as D2K pre-install/work backups.
 # These were created during router development and are not user configuration.
 rm -f "$SBIN"/d2kc.before-d2k-* "$SBIN"/d2kc.pre-goal-* "$SBIN"/d2kc.pre-sched-*

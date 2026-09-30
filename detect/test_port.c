@@ -104,7 +104,8 @@ static int differs_on_the_wire(d2k_poison a, d2k_poison b)
     }
     return a.ttl != b.ttl || a.badsum != b.badsum || a.seq_shift != b.seq_shift ||
            a.md5 != b.md5 || a.decoy_hello != b.decoy_hello ||
-           a.disorder != b.disorder || a.tcp_ts != b.tcp_ts ||
+           a.disorder != b.disorder || a.disorder_pos != b.disorder_pos ||
+           a.tcp_ts != b.tcp_ts ||
            a.ip_id_zero != b.ip_id_zero || a.syn_data != b.syn_data ||
            a.oob != b.oob || a.fake_between != b.fake_between ||
            a.repeats != b.repeats || a.seqovl_exact != b.seqovl_exact ||
@@ -163,6 +164,32 @@ static void test_named_primitives_carry_their_flags(void)
     }
     if (!seen_syn) { fail("гипотеза «syndata» пропала из перебора"); }
     if (!seen_oob) { fail("гипотеза «oob» пропала из перебора"); }
+}
+
+/* A known working multidisorder variant cuts at byte 2 only. It is not the
+ * donor's existing pos=1,midsld three-piece probe, so it must be independently
+ * measurable and exported without silently changing its split position. */
+static void test_disorder_pos2_candidate_is_measured_and_exported(void)
+{
+    const d2k_poison *ps;
+    int n, found = 0;
+    ps = d2k_poisons(&n);
+    for (int i = 0; i < n; i++) {
+        if (strcmp(ps[i].name, "disorder-pos2") != 0) { continue; }
+        char st[1024];
+        found = 1;
+        if (!ps[i].disorder || ps[i].disorder_pos != 2) {
+            fail("disorder-pos2 несёт неверные параметры: disorder=%d pos=%d",
+                 ps[i].disorder, ps[i].disorder_pos);
+        }
+        d2k_strategy_for_poison(&ps[i], st, sizeof(st));
+        if (!strstr(st, "--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=2") ||
+            strstr(st, "midsld")) {
+            fail("disorder-pos2 экспортирован как другой разрез: %s", st);
+        }
+        break;
+    }
+    if (!found) { fail("из измеряемого перебора отсутствует disorder-pos2"); }
 }
 
 /* Свойство «коробка проверяет контрольную сумму» нельзя выводить из молчания.
@@ -317,6 +344,7 @@ int main(void)
     test_fooling_flags_reach_the_strategy();
     test_distinct_poisons_give_distinct_strategies();
     test_named_primitives_carry_their_flags();
+    test_disorder_pos2_candidate_is_measured_and_exported();
     test_checksum_verdict_never_inferred_from_silence();
     test_stale_rule_recognition_is_exact();
     test_split_offsets_ignores_out_of_range_cuts();

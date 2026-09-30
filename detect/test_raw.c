@@ -4,9 +4,16 @@
  * separate from these deterministic ownership/wire-format assertions. */
 #define _DARWIN_C_SOURCE 1
 #define D2K_RAW_UNIT_TEST 1
+#include <sys/socket.h>
+#include <sys/types.h>
+static ssize_t raw_test_sendto(int, const void *, size_t, int,
+                               const struct sockaddr *, socklen_t);
+ssize_t raw_test_recvfrom(int, void *, size_t, int, struct sockaddr *, socklen_t *);
 #define recvfrom raw_test_recvfrom
+#define sendto raw_test_sendto
 #include "raw.c"
 #undef recvfrom
+#undef sendto
 #include "d2k_wire.h"
 
 #define WORKERS 16
@@ -15,10 +22,46 @@ static uint16_t ports[WORKERS][PORTS_PER_WORKER];
 static uint8_t incoming[2][128];
 static size_t incoming_len[2];
 static uint8_t incoming_src[2][16];
+static uint8_t outgoing[4][2048];
+static size_t outgoing_len[4];
+static size_t outgoing_count;
 static int failures;
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "raw:%d: %s\n", __LINE__, #c); failures++; \
 } } while (0)
+
+static ssize_t raw_test_sendto(int fd, const void *buf, size_t len, int flags,
+                               const struct sockaddr *addr, socklen_t alen)
+{
+    (void)fd; (void)flags; (void)addr; (void)alen;
+    if (outgoing_count >= 4 || len > sizeof outgoing[0]) { return -1; }
+    memcpy(outgoing[outgoing_count], buf, len);
+    outgoing_len[outgoing_count++] = len;
+    return (ssize_t)len;
+}
+
+static void test_disorder_pos2_emits_exact_reverse_segments(void)
+{
+    raw_conn c;
+    d2k_trigger tr;
+    static const uint8_t bytes[] = {0x16, 0x03, 0x01, 0xaa, 0xbb, 0xcc};
+    memset(&c, 0, sizeof c); memset(&tr, 0, sizeof tr);
+    c.family = 4; c.send_fd = 1; c.seq = 1000; c.ack = 900;
+    c.sport = 41000; c.dport = 443; c.src[0] = 192; c.dst[0] = 198;
+    memcpy(c.src + 1, (uint8_t[]){0, 2, 1}, 3);
+    memcpy(c.dst + 1, (uint8_t[]){51, 100, 7}, 3);
+    memcpy(tr.payload, bytes, sizeof bytes); tr.len = sizeof bytes;
+    outgoing_count = 0; memset(outgoing_len, 0, sizeof outgoing_len);
+    CHECK(raw_send_disorder_pos(&c, &tr, 1000, 2) == 0);
+    CHECK(outgoing_count == 2);
+    if (outgoing_count == 2) {
+        CHECK(rd32(outgoing[0] + 24) == 1002 && outgoing_len[0] == 44 &&
+              memcmp(outgoing[0] + 40, bytes + 2, 4) == 0);
+        CHECK(rd32(outgoing[1] + 24) == 1000 && outgoing_len[1] == 42 &&
+              memcmp(outgoing[1] + 40, bytes, 2) == 0);
+        CHECK((outgoing[0][33] & TCP_PSH) && (outgoing[1][33] & TCP_PSH));
+    }
+}
 
 ssize_t raw_test_recvfrom(int fd, void *buf, size_t len, int flags,
                          struct sockaddr *addr, socklen_t *alen)
@@ -189,6 +232,7 @@ int main(void)
     test_checksum_matches_original();
     test_receive_is_owned_by_connection();
     test_datapath_matches_raw_headers();
+    test_disorder_pos2_emits_exact_reverse_segments();
     if (failures) { return 1; }
     puts("raw: checksum, connection-owned receives and concurrent ports passed (no network)");
     return 0;

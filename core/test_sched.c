@@ -114,7 +114,10 @@ static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
    сколько обошлось ожидание. */
 #define STUB_BLOCK_MS 5000
 static int tcp_block_until_stop;
+static int tcp_wait_until_stop;
+static int tcp_release_waiters;
 static int tcp_saw_stop;
+static int tcp_stop_count;
 
 static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
                          d2k_hello control, uint32_t mark, int repeats,
@@ -124,6 +127,13 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
     (void)repeats; (void)gap_us; (void)wait_ms;
     tcp_calls++;
     tcp_last_wire = trigger.len;
+    if (tcp_wait_until_stop) {
+        while (!(stop && *stop) && !tcp_release_waiters) { usleep(1000); }
+        if (stop && *stop) {
+            tcp_saw_stop = 1;
+            tcp_stop_count++;
+        }
+    }
     if (tcp_block_until_stop) {
         /* Так ведёт себя настоящий сетевой оракул: он в сети, и бросить его
            может только просьба. Без неё цикл ждал бы его до конца. */
@@ -162,15 +172,22 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
    HTTP-запросов к стенду, который TLS не умеет, и тест мерил бы это. */
 static int vol_calls;
 static d2k_vol_verdict vol_answer = D2K_VOL_PASSED;
+static int vol_rx_cut;
 
 static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
-                               int plain, uint32_t mark) {
-    (void)ip; (void)port; (void)sni; (void)plain; (void)mark;
+                               int plain, int tls12, size_t hello_wire,
+                               uint32_t mark) {
+    (void)ip; (void)port; (void)sni; (void)plain; (void)tls12;
+    (void)hello_wire; (void)mark;
     vol_calls++;
     d2k_vol_result r;
     memset(&r, 0, sizeof r);
     r.verdict = vol_answer;
     r.at_kb = 20;
+    r.rx_cut = vol_rx_cut;
+    r.rx_at_kb = 24;
+    r.rx_expected_kb = 96;
+    r.rx_compressed_complete = vol_rx_cut;
     snprintf(r.reason, sizeof r.reason, "подменённая проба объёма");
     return r;
 }
@@ -243,6 +260,7 @@ static int ver_name_ok = -1;
 /* Умеет ли подменённый зонд такой транспорт. Ноль — умеет (так он вёл себя
    всегда), единица — «не про кандидата, а про транспорт». */
 static int ver_unsupported;
+static int ver_cloudflare_challenge;
 
 /* Сокет зонда приходит УЖЕ ЗАНЯТЫМ (под его порт поставлен пробный план).
    Подменённый зонд в сеть не ходит, но владение обязан взять: иначе каждый
@@ -281,6 +299,7 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
        подтверждения теста. */
     r.name_ok = ver_name_ok;
     r.unsupported = ver_unsupported;
+    r.cloudflare_challenge = ver_cloudflare_challenge;
     /* Сокета нет вовсе: ver_close планировщика на отрицательном дескрипторе
        ничего не закрывает, и чужой дескриптор тест не теряет. */
     r.fd = -1;
@@ -410,6 +429,15 @@ static d2k_ev ev_suspect(uint8_t transport, uint16_t cport) {
     e.tos = 0x88;
     e.ipid = 54321;
     return e;
+}
+
+static int tls_shape_event(d2k_ev *e, const char *name, d2k_shape shape) {
+    if (!e) { return -1; }
+    memset(e, 0, sizeof *e);
+    e->kind = D2K_EV_SHAPE;
+    e->transport = 6;
+    return d2k_hello_from_profile(shape, name, e->shape, sizeof e->shape,
+                                  &e->shape_len);
 }
 
 /* СНИМОК ПРИВЕТСТВИЯ QUIC для имени. У TLS ту же роль в этом файле играет
@@ -583,6 +611,150 @@ static int last_plan_id(uint8_t out[16]) {
         off += 4 + n;
     }
     return found;
+}
+
+/* SET_NAME(_PROBE) несёт шестнадцатеричный текстовый план. Ищем в отправленной
+   команде фрагмент его внутреннего payload, закодированный дважды: сначала
+   сам ClientHello в hex, затем весь текст плана в hex. Это позволяет тесту
+   проверить порядок кандидатов по фактически ушедшей команде, не дублируя
+   разбор TLV и не подглядывая в task планировщика. */
+static int sent_contains_plan_ascii(const char *fragment) {
+    char inner[256], outer[512];
+    size_t n = strlen(fragment);
+    if (n * 2 + 1 > sizeof inner) { return 0; }
+    for (size_t i = 0; i < n; i++) {
+        (void)snprintf(inner + i * 2, sizeof inner - i * 2, "%02x",
+                       (unsigned char)fragment[i]);
+    }
+    inner[n * 2] = '\0';
+    n = strlen(inner);
+    if (n * 2 + 1 > sizeof outer) { return 0; }
+    for (size_t i = 0; i < n; i++) {
+        (void)snprintf(outer + i * 2, sizeof outer - i * 2, "%02x",
+                       (unsigned char)inner[i]);
+    }
+    outer[n * 2] = '\0';
+    size_t m = strlen(outer);
+    for (size_t i = 0; i + m <= sent_len; i++) {
+        if (memcmp(sentbuf + i, outer, m) == 0) { return 1; }
+    }
+    return 0;
+}
+
+/* Binary payload bytes (for example the literal SNI in a generated ClientHello)
+   are encoded once by d2k_plan_text_to_hex as the complete TLV frame. */
+static int sent_contains_plan_payload(const char *fragment) {
+    char current[1024], hex[2048];
+    size_t n = strlen(fragment);
+    if (n >= sizeof current) { return 0; }
+    for (size_t i = 0; i + n <= sent_len; i++) {
+        if (memcmp(sentbuf + i, fragment, n) == 0) { return 1; }
+    }
+    memcpy(current, fragment, n + 1);
+    for (unsigned depth = 0; depth < 3; depth++) {
+        n = strlen(current);
+        if (n * 2 + 1 > sizeof hex) { return 0; }
+        for (size_t i = 0; i < n; i++) {
+            (void)snprintf(hex + i * 2, sizeof hex - i * 2, "%02x",
+                           (unsigned char)current[i]);
+        }
+        hex[n * 2] = '\0';
+        for (size_t i = 0; i + n * 2 <= sent_len; i++) {
+            if (memcmp(sentbuf + i, hex, n * 2) == 0) { return 1; }
+        }
+        memcpy(current, hex, n * 2 + 1);
+    }
+    return 0;
+}
+
+static int region_has_encoded(const uint8_t *bytes, size_t bytes_len,
+                              const char *fragment, unsigned target_depth) {
+    char current[1024], next[2048];
+    size_t n = strlen(fragment);
+    if (n >= sizeof current) { return 0; }
+    for (size_t i = 0; i + n <= bytes_len; i++) {
+        if (memcmp(bytes + i, fragment, n) == 0) { return 1; }
+    }
+    memcpy(current, fragment, n + 1);
+    for (unsigned depth = 1; depth <= target_depth; depth++) {
+        n = strlen(current);
+        if (n * 2 + 1 > sizeof next) { return 0; }
+        for (size_t i = 0; i < n; i++) {
+            (void)snprintf(next + i * 2, sizeof next - i * 2, "%02x",
+                           (unsigned char)current[i]);
+        }
+        next[n * 2] = '\0';
+        if (depth == target_depth) {
+            for (size_t i = 0; i + n * 2 <= bytes_len; i++) {
+                if (memcmp(bytes + i, next, n * 2) == 0) { return 1; }
+            }
+        }
+        memcpy(current, next, n * 2 + 1);
+    }
+    return 0;
+}
+
+static int sent_first_split_index(unsigned wanted_offset) {
+    size_t plan_index = 0;
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *frame = sentbuf + off;
+        uint32_t n = ((uint32_t)frame[0] << 24) | ((uint32_t)frame[1] << 16) |
+                     ((uint32_t)frame[2] << 8) | frame[3];
+        if (n < 2 || n > sent_len - off - 4) { break; }
+        uint16_t type = (uint16_t)(((uint16_t)frame[4] << 8) | frame[5]);
+        if (type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) {
+            const uint8_t *body = frame + 6;
+            size_t body_len = n - 2;
+            size_t nl = body_len ? body[0] : body_len;
+            size_t prefix = 1 + nl + 2 + (type == D2K_CMD_SET_NAME_PROBE ? 2 : 0);
+            int found = 0;
+            if (prefix <= body_len && body_len - prefix >= 12) {
+                const uint8_t *plan = body + prefix;
+                size_t plan_len = body_len - prefix;
+                size_t pos = 12; /* D2KP header */
+                while (pos + 4 <= plan_len) {
+                    uint16_t rec = (uint16_t)(((uint16_t)plan[pos] << 8) | plan[pos + 1]);
+                    size_t len = ((size_t)plan[pos + 2] << 8) | plan[pos + 3];
+                    pos += 4;
+                    if (len > plan_len - pos) { break; }
+                    if (rec == 0x0100 && len == 4) {
+                        unsigned split = ((unsigned)plan[pos + 2] << 8) | plan[pos + 3];
+                        if (split == wanted_offset) { found = 1; break; }
+                    }
+                    pos += len;
+                }
+            }
+            if (found) { return (int)plan_index; }
+            plan_index++;
+        }
+        off += 4 + n;
+    }
+    return -1;
+}
+
+static int sent_plan_index(const char *fragment, unsigned first_depth,
+                           unsigned last_depth) {
+    size_t plan_index = 0;
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *frame = sentbuf + off;
+        uint32_t n = ((uint32_t)frame[0] << 24) | ((uint32_t)frame[1] << 16) |
+                     ((uint32_t)frame[2] << 8) | frame[3];
+        if (n < 2 || n > sent_len - off - 4) { break; }
+        uint16_t type = (uint16_t)(((uint16_t)frame[4] << 8) | frame[5]);
+        if (type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) {
+            int found = 0;
+            for (unsigned depth = first_depth; depth <= last_depth; depth++) {
+                if (region_has_encoded(frame + 6, n - 2, fragment, depth)) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (found) { return (int)plan_index; }
+            plan_index++;
+        }
+        off += 4 + n;
+    }
+    return -1;
 }
 
 /* Событие применения ПО КЛЮЧУ ПОТОКА ЗОНДА и с идентификатором того плана,
@@ -820,11 +992,12 @@ static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
 int main(int argc, char **argv) {
     d2k_sched_mark_fn saved_mark = d2k_sched_mark_hook;
     int voice_only = argc == 2 && strcmp(argv[1], "--voice-only") == 0;
+    int rx_only = argc == 2 && strcmp(argv[1], "--rx-volume-only") == 0;
     int rst_only = argc == 2 && strcmp(argv[1], "--rst-only") == 0;
     int admission_only = argc == 2 && strcmp(argv[1], "--admission-only") == 0;
     int question_only = argc == 2 && strcmp(argv[1], "--question-only") == 0;
     int shape_only = argc == 2 && strcmp(argv[1], "--shape-only") == 0;
-    if (argc > 1 && !voice_only && !rst_only && !admission_only && !question_only && !shape_only) {
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only) {
         fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only]\n");
         return 2;
     }
@@ -875,12 +1048,14 @@ int main(int argc, char **argv) {
     d2k_catalog cat;
     memset(&cat, 0, sizeof cat);
     uint8_t question_prev_id[D2K_PLAN_ID_LEN] = {0};
+    if (rx_only) { goto rx_volume_tests; }
     if (question_only) { goto question_test; }
     if (shape_only) { goto shape_test; }
     {
         d2k_catalog empty = {0};
         d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
-        /* No tick: only admission and name recall, never network work. */
+        /* Each family starts its own direct classifier; an address/name
+           mismatch is still discarded rather than attached to either task. */
         d2k_ev h4 = ev_hello(6, 41001, "dual.example");
         h4.family = 4;
         d2k_sched_event(s, &h4);
@@ -895,17 +1070,17 @@ int main(int argc, char **argv) {
         r4.name[0] = r6.name[0] = 0;
         d2k_sched_event(s, &r4);
         d2k_sched_event(s, &r6);
-        CHECK(d2k_sched_active(s) == 0, "IPv4/IPv6 RSTs cannot confirm each other");
+        CHECK(d2k_sched_active(s) == 2, "IPv4/IPv6 direct checks were incorrectly merged");
         /* Same IPv6 /32 but distinct endpoints: must not recall dual.example. */
         d2k_ev other = r6;
         other.low_ip[15] = 3;
         d2k_sched_event(s, &other);
-        CHECK(d2k_sched_active(s) == 0, "IPv6 name recall compares all 128 bits");
+        CHECK(d2k_sched_active(s) == 2, "IPv6 name recall compares all 128 bits");
         h6.high_port++;
         d2k_sched_event(s, &h6);
         r6.high_port++;
         d2k_sched_event(s, &r6);
-        CHECK(d2k_sched_active(s) == 1, "independent IPv6 RST confirms IPv6 suspicion");
+        CHECK(d2k_sched_active(s) == 2, "repeat RST created a duplicate IPv6 classifier");
         d2k_sched_free(s);
         d2k_catalog_free(&empty);
     }
@@ -1034,6 +1209,83 @@ int main(int argc, char **argv) {
         tcp_answer = D2K_V_OPAQUE;
     }
 
+    /* Time spent in the bounded admission queue must not consume the active
+       search lifetime. Two deliberately held workers fill the measurement
+       slots; the third target waits nine minutes, then receives its own full
+       ten-minute active budget after those workers time out. */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_wait_until_stop = 1;
+        tcp_saw_stop = tcp_stop_count = tcp_calls = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        CHECK(s != NULL, "планировщик проверки очереди не завёлся");
+        if (s) {
+            for (uint16_t port = 40601; port <= 40603; port++) {
+                char name[64];
+                snprintf(name, sizeof name, "queue-life-%u.example", port);
+                d2k_ev h = ev_hello(6, port, name);
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port);
+                d2k_sched_event(s, &su);
+            }
+            spin(s, 60);
+            CHECK(tcp_calls == 2, "очередь не ограничила одновременные замеры двумя");
+            skip_ahead(s, 9 * 60 * 1000);
+            tcp_release_waiters = 1;
+            spin(s, 60);
+            CHECK(tcp_calls == 3, "ожидавшая цель не стартовала после освобождения слота");
+            tcp_release_waiters = 0;
+            skip_ahead(s, 60 * 1000 + 1);
+            CHECK(tcp_stop_count == 0,
+                  "время ожидания в очереди сократило активный лимит поиска");
+            d2k_sched_free(s);
+        }
+        tcp_release_waiters = 0;
+        tcp_wait_until_stop = 0;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* A direct classifier timeout with zero candidate probes is still an
+       incomplete search and must receive the bounded, target-local cooldown. */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_wait_until_stop = 1;
+        tcp_saw_stop = tcp_stop_count = tcp_calls = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        CHECK(s != NULL, "планировщик cooldown незавершённого замера не завёлся");
+        if (s) {
+            d2k_ev h = ev_hello(6, 40620, "incomplete-cooldown.example");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 40620);
+            d2k_sched_event(s, &su);
+            spin(s, 60);
+            CHECK(tcp_calls == 1, "незавершённый прямой замер не стартовал");
+            skip_ahead(s, 10 * 60 * 1000 + 1);
+            CHECK(tcp_stop_count == 1, "десятиминутный таймаут не остановил замер");
+            skip_ahead(s, 2 * 60 * 1000 + 1);
+            d2k_ev h2 = ev_hello(6, 40621, "incomplete-cooldown.example");
+            d2k_sched_event(s, &h2);
+            d2k_ev su2 = ev_suspect(6, 40621);
+            d2k_sched_event(s, &su2);
+            spin(s, 60);
+            CHECK(tcp_calls == 1,
+                  "замер с нулём кандидатов не получил cooldown и сразу повторился");
+            skip_ahead(s, 8 * 60 * 1000 + 1);
+            d2k_ev h3 = ev_hello(6, 40622, "incomplete-cooldown.example");
+            d2k_sched_event(s, &h3);
+            d2k_ev su3 = ev_suspect(6, 40622);
+            d2k_sched_event(s, &su3);
+            spin(s, 60);
+            CHECK(tcp_calls == 2,
+                  "ограниченный cooldown незавершённого поиска не истёк через 10 минут");
+            d2k_sched_free(s);
+        }
+        tcp_wait_until_stop = 0;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
     /* SHAPE arrives while the oracle holds its trigger. Main-thread writes
      * must not alter the bytes of an already-running measurement. */
     {
@@ -1087,13 +1339,16 @@ int main(int argc, char **argv) {
 
     tcp_answer = D2K_V_OPAQUE;
 
-    /* Обычный входящий RST — наблюдение, а не достаточный диагноз.
-       Одиночный RST не должен запускать дорогой поиск; второй RST по тому же
-       имени, но по другому TCP-потоку в пределах 30 секунд — должен. */
+    /* Обычный входящий RST запускает ТОЛЬКО прямую классификацию. Пока она
+       не докажет блокировку, ни готовые планы, ни синтез не запускаются.
+       Неопределённый результат охлаждает цель, чтобы повторные RST не
+       превращались в непрерывный перебор. */
     {
         d2k_catalog c_rst = {0};
         d2k_sched *s = d2k_sched_new(&c_rst, sv[0], 0x2d);
         tcp_calls = quic_calls = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        ver_answer = D2K_VER_NOT_MEASURED;
         saidbuf[0] = '\0';
         CHECK(s != NULL, "планировщик для порога RST не завёлся");
         if (s) {
@@ -1102,58 +1357,66 @@ int main(int argc, char **argv) {
             d2k_sched_event(s, &h1);
             d2k_ev r1 = ev_suspect(6, 41001);
             r1.code = D2K_SUSPECT_RST;
-            CHECK(d2k_sched_event(s, &r1) == 0,
-                  "один обычный RST запустил поиск вместо ожидания подтверждения");
-            CHECK(d2k_sched_active(s) == 0,
-                  "ожидающий подтверждения RST засчитан как активный поиск");
+            CHECK(d2k_sched_event(s, &r1) == 1,
+                  "одиночный обычный RST не запустил прямую классификацию");
             settle(s);
-            CHECK(tcp_calls == 0 && quic_calls == 0,
-                  "одиночный RST дошёл до сетевого оракула");
+            CHECK(tcp_calls == 1 && quic_calls == 0,
+                  "одиночный RST не прошёл ровно одну прямую TCP-проверку");
+            CHECK(bindings_of(&c_rst, "single-reset.example", 6) == 0,
+                  "неопределённый прямой замер записал обход");
+            CHECK(said("прямой замер не подтвердил блокировку"),
+                  "неопределённый прямой вердикт не отражён в журнале");
 
+            /* После обязательного двухминутного отдыха задача освобождается,
+               но десятиминутный cooldown неопределённого замера всё ещё
+               не позволяет повторно запускать измеритель. */
+            skip_ahead(s, 121000);
             d2k_ev h2 = ev_hello(6, 41002, "single-reset.example");
             d2k_sched_event(s, &h2);
             d2k_ev r2 = ev_suspect(6, 41002);
             r2.code = D2K_SUSPECT_RST;
-            CHECK(d2k_sched_event(s, &r2) == 1,
-                  "второй RST на независимом потоке не запустил поиск");
-            CHECK(said("второй обычный RST на независимом потоке"),
-                  "второй поток не распознан как подтверждение; журнал: ");
+            CHECK(d2k_sched_event(s, &r2) == 0,
+                  "неопределённый RST обошёл десятиминутный cooldown");
             settle(s);
-            CHECK(tcp_calls == 1 && quic_calls == 0,
-                  "подтверждённый RST не запустил ровно один TCP-поиск");
+            CHECK(tcp_calls == 1,
+                  "повторный RST запустил измерение до истечения cooldown");
+            CHECK(said("замер отложен после неподтверждённого прошлого замера"),
+                  "причина cooldown не отражена в журнале");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c_rst);
+        tcp_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
     }
 
-    /* Повтор того же flow key не является независимым подтверждением. По
-       окончании окна старый одиночный RST забывается: новый тоже ждёт второго. */
+    /* Таймер второго RST больше не является условием допуска к прямой
+       классификации: каждый новый flow того же имени уже покрыт её cooldown. */
     {
         d2k_catalog c_rst = {0};
         d2k_sched *s = d2k_sched_new(&c_rst, sv[0], 0x2d);
-        tcp_calls = 0;
+        tcp_calls = 0; tcp_answer = D2K_V_INCONCLUSIVE;
         CHECK(s != NULL, "планировщик для границ RST не завёлся");
         if (s) {
             d2k_ev h = ev_hello(6, 41003, "reset-window.example");
             d2k_sched_event(s, &h);
             d2k_ev r = ev_suspect(6, 41003);
             r.code = D2K_SUSPECT_RST;
-            CHECK(d2k_sched_event(s, &r) == 0, "первый RST окна не отложен");
-            tick_once(s); /* привязать окно к модельным часам планировщика */
-            CHECK(d2k_sched_event(s, &r) == 0,
-                  "повтор RST того же потока ошибочно подтвердил блокировку");
+            CHECK(d2k_sched_event(s, &r) == 1, "прямой замер по первому RST не начат");
+            settle(s);
+            CHECK(tcp_calls == 1, "первый RST не запустил прямой замер ровно один раз");
             skip_ahead(s, 30001);
             d2k_ev h2 = ev_hello(6, 41004, "reset-window.example");
             d2k_sched_event(s, &h2);
             d2k_ev r2 = ev_suspect(6, 41004);
             r2.code = D2K_SUSPECT_RST;
             CHECK(d2k_sched_event(s, &r2) == 0,
-                  "RST за пределами окна подтвердил старое подозрение");
+                  "повторное соединение обошло cooldown прямого замера");
             settle(s);
-            CHECK(tcp_calls == 0, "неподтверждённое/просроченное RST запустило поиск");
+            CHECK(tcp_calls == 1, "повторное соединение запустило второй прямой замер");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c_rst);
+        tcp_answer = D2K_V_OPAQUE;
     }
 
     /* Более сильные сигналы не должны ждать второго потока: повтор ClientHello,
@@ -1184,8 +1447,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Сильный сигнал по соседнему потоку немедленно подтверждает уже ожидающий
-       RST, не требуя второго обычного сброса. */
+    /* Сильный сигнал на соседнем потоке не создаёт второй прямой замер,
+       пока первый классификатор уже проверяет цель. */
     {
         d2k_catalog c_promote = {0};
         d2k_sched *s = d2k_sched_new(&c_promote, sv[0], 0x2d);
@@ -1196,14 +1459,14 @@ int main(int argc, char **argv) {
             d2k_sched_event(s, &h1);
             d2k_ev r1 = ev_suspect(6, 41020);
             r1.code = D2K_SUSPECT_RST;
-            CHECK(d2k_sched_event(s, &r1) == 0,
-                  "обычный RST не перешёл в ожидание подтверждения");
+            CHECK(d2k_sched_event(s, &r1) == 1,
+                  "первый обычный RST не запустил прямую классификацию");
             d2k_ev h2 = ev_hello(6, 41021, "promote-reset.example");
             d2k_sched_event(s, &h2);
             d2k_ev repeat = ev_suspect(6, 41021);
             repeat.code = D2K_SUSPECT_REPEAT;
-            CHECK(d2k_sched_event(s, &repeat) == 1,
-                  "повтор ClientHello не повысил ожидающее подозрение");
+            CHECK(d2k_sched_event(s, &repeat) == 0,
+                  "дополнительный сигнал создал параллельный поиск той же цели");
             settle(s);
             CHECK(tcp_calls == 1,
                   "усиленное подозрение не запустило ровно один поиск");
@@ -2432,6 +2695,48 @@ admission_only_run:
     }
 
 shape_test:
+    /* A late TCP snapshot must stop a search based on the synthetic profile,
+       then start exactly one search with the captured ClientHello. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        tcp_wait_until_stop = 1; tcp_release_waiters = 0;
+        tcp_saw_stop = tcp_stop_count = tcp_calls = 0;
+        tcp_last_wire = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev h = ev_hello(6, 39988, "late.tcp.snapshot.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 39988);
+        d2k_sched_event(s, &su);
+        spin(s, 30);
+        CHECK(tcp_calls == 1, "TCP cold-start classifier did not start");
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "late.tcp.snapshot.example",
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+              "TCP late-snapshot fixture failed");
+        d2k_sched_event(s, &sh);
+        /* On the old implementation this release prevents the test itself
+           from waiting forever; only a real stop request satisfies the
+           assertion below. */
+        tcp_release_waiters = 1;
+        spin(s, 50);
+        CHECK(tcp_saw_stop,
+              "late TCP snapshot did not cancel the stale profile measurement");
+        tcp_wait_until_stop = 0;
+        spin(s, 80);
+        CHECK(tcp_calls == 2,
+              "late TCP snapshot did not cause exactly one measurement restart");
+        CHECK(tcp_last_wire == sh.shape_len,
+              "restarted TCP measurement did not use the captured ClientHello");
+        CHECK(said("повторяю поиск его байтами"),
+              "late TCP snapshot restart was not reported");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        tcp_wait_until_stop = 0; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
     /* A confirmed TLS1.3 task must not hide blocked TLS1.2 of the same name. */
     for (int family = 4; family <= 6; family += 2) {
         d2k_catalog c = {0};
@@ -3465,12 +3770,11 @@ question_test:
         d2k_catalog_free(&cC);
     }
 
-    /* --- обрыв по объёму: дерево вердиктов не зовём, в каталог не пишем -- */
+    /* --- TX-volume не открывает RX-volume-лестницу ---------------------- */
     {
-        /* Пока ответ про объём неизвестен, вопрос «режут по имени или по
-           адресу» ЛЖЁТ: при блоке по объёму рукопожатие проходит с любым
-           именем, и дерево всегда отвечает «по адресу». Поэтому проба идёт
-           ПЕРВОЙ, а на её «обрыв» дерево не зовётся вовсе. */
+        /* Один только обрыв исходящей лестницы не эквивалентен подтверждённому
+           срезу входящего ответа. Специальная fake-SNI/split-лестница не
+           должна попадать в очередь по этому другому профилю. */
         d2k_catalog cA;
         memset(&cA, 0, sizeof cA);
         d2k_sched *s = d2k_sched_new(&cA, sv[0], 0x2d);
@@ -3478,6 +3782,10 @@ question_test:
         d2k_sched_set_say(s, collect_say, NULL);
         vol_calls = tcp_calls = 0;
         vol_answer = D2K_VOL_CUT;
+        tcp_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_NOT_MEASURED;
+        ver_calls = 0;
+        forget_sent();
 
         d2k_ev h = ev_hello(6, 40080, "режут.по.объёму");
         d2k_sched_event(s, &h);
@@ -3488,13 +3796,186 @@ question_test:
         CHECK(vol_calls == 1, "проба на объём не вызвана");
         CHECK(tcp_calls == 0,
               "на обрыв по объёму позвано дерево вердиктов — его ответ там ложен");
+        CHECK(!sent_contains_plan_ascii("68636170746368612e636f6d"),
+              "TX-volume ошибочно запустил профильную RX fake-SNI-лестницу");
         CHECK(total_bindings(&cA) == 0, "обрыв по объёму записан в каталог");
-        CHECK(said("обрыв по объёму"), "обрыв по объёму не назван в отчёте");
+        CHECK(said("исходящая лестница оборвалась"), "TX-volume не назван в отчёте");
         vol_answer = D2K_VOL_PASSED;
+        vol_rx_cut = 0;
         d2k_sched_free(s);
         d2k_catalog_free(&cA);
     }
 
+rx_volume_tests:
+    /* Парный RX-замер тоже поднимает поиск без доменного списка и сохраняет
+       направление/объём как отдельную примету; gzip completion — часть
+       критерия, не просто статус заголовков. */
+    {
+        d2k_catalog cRx = {0};
+        d2k_sched *s = d2k_sched_new(&cRx, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_answer = D2K_VOL_PASSED;
+        vol_rx_cut = 1;
+        tcp_calls = 0;
+        d2k_ev h = ev_hello(6, 40081, "непрофильная.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev sh;
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
+              "не удалось собрать TLS 1.3 shape для RX-volume-теста");
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40081);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(tcp_calls == 0, "RX-обрыв ошибочно отправлен в TLS-разрезный классификатор");
+        CHECK(said("identity-тело дважды оборвалось") && said("gzip завершился"),
+              "причина RX-volume не раскрыла парный результат");
+        CHECK(sent_contains_plan_payload("hcaptcha.com"),
+              "RX-volume не приоритизировал fake-SNI/multisplit-кандидат");
+        if (!sent_contains_plan_payload("hcaptcha.com")) { fprintf(stderr, "%s\n", saidbuf); }
+        vol_rx_cut = 0;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cRx);
+    }
+
+    /* Поздний RST после TLS app-data не считается блокировкой сам по себе:
+       он допускает только RX-volume-пару, а общий классификатор и кандидаты
+       запускаются лишь после воспроизводимого identity-cut + полного gzip. */
+    {
+        d2k_catalog cLate = {0};
+        d2k_sched *s = d2k_sched_new(&cLate, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = 0;
+        vol_answer = D2K_VOL_PASSED;
+        vol_rx_cut = 0;
+        d2k_ev h = ev_hello(6, 40082, "late-reset-volume.test");
+        d2k_sched_event(s, &h);
+        d2k_ev sh;
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
+              "не удалось собрать TLS 1.3 shape для позднего RST");
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40082);
+        su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(vol_calls == 1, "поздний RST не запустил узкую RX-volume-пару");
+        CHECK(tcp_calls == 0, "поздний RST без RX-cut запустил общий перебор");
+        CHECK(!sent_contains_plan_payload("hcaptcha.com"),
+              "кандидат отправлен без подтверждения RX-volume");
+        vol_calls = tcp_calls = 0;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cLate);
+
+        d2k_catalog cLateConfirmed = {0};
+        s = d2k_sched_new(&cLateConfirmed, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_answer = D2K_VOL_PASSED;
+        vol_rx_cut = 1;
+        d2k_ev h2 = ev_hello(6, 40083, "late-reset-volume-confirmed.test");
+        d2k_sched_event(s, &h2);
+        CHECK(tls_shape_event(&sh, h2.name, D2K_SHAPE_MODERN) == 0,
+              "не удалось собрать TLS 1.3 shape для подтверждённого позднего RST");
+        d2k_sched_event(s, &sh);
+        d2k_ev su2 = ev_suspect(6, 40083);
+        su2.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su2);
+        settle(s);
+        CHECK(vol_calls == 1, "подтверждённый поздний RST замерен не один раз");
+        CHECK(tcp_calls == 0,
+              "после подтверждённого RX-volume запущено постороннее дерево классификации");
+        CHECK(sent_contains_plan_payload("hcaptcha.com"),
+              "подтверждённый RX-volume не открыл очередь volume-кандидатов");
+        vol_rx_cut = 0;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cLateConfirmed);
+    }
+
+    /* Полная очередь сохранённых планов коробки не должна вытеснять новый
+       RX-volume-кандидат навсегда. Все восемь сохранённых испытываются
+       первыми; после восьми отказов в проводной очереди появляется профильная
+       fake-SNI/split-лестница. */
+    {
+        d2k_catalog cFull;
+        memset(&cFull, 0, sizeof cFull);
+        cFull.boxes = calloc(1, sizeof *cFull.boxes);
+        CHECK(cFull.boxes != NULL, "не удалось создать коробку для полной очереди");
+        if (cFull.boxes) {
+            cFull.n_boxes = 1;
+            d2k_cat_box *b = &cFull.boxes[0];
+            snprintf(b->id, sizeof b->id, "box-rx-volume-full");
+            b->fp.method = D2K_FP_METHOD;
+            b->fp.n_sig = 1;
+            snprintf(b->fp.sig[0].kind, sizeof b->fp.sig[0].kind, "rx-volume");
+            b->fp.sig[0].volume = 24;
+            b->fp.sig[0].seen = 1;
+            b->plans = calloc(8, sizeof *b->plans);
+            CHECK(b->plans != NULL, "не удалось создать восемь сохранённых планов");
+            if (b->plans) {
+                b->n_plans = 8;
+                int ready = 1;
+                for (unsigned i = 0; i < 8; i++) {
+                    d2k_cat_plan *p = &b->plans[i];
+                    p->enabled = 1;
+                    p->successes = (int)(8 - i);
+                    snprintf(p->proto, sizeof p->proto, "tls");
+                    char plan[256];
+                    snprintf(plan, sizeof plan,
+                             "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                             "proto tcp tls\nsplit payload_start +%u\norder forward\n",
+                             i + 11);
+                    p->text = strdup(plan);
+                    if (!p->text) { ready = 0; break; }
+                }
+                CHECK(ready, "не удалось подготовить планы полной очереди");
+                if (ready) {
+                    d2k_sched *s = d2k_sched_new(&cFull, sv[0], 0x2d);
+                    saidbuf[0] = '\0';
+                    forget_sent();
+                    d2k_sched_set_say(s, collect_say, NULL);
+                    vol_calls = tcp_calls = 0;
+                    vol_answer = D2K_VOL_PASSED;
+                    vol_rx_cut = 1;
+                    ver_answer = D2K_VER_HANDSHAKE;
+                    ver_fail_first = 0;
+                    ver_calls = 0;
+                    ver_answer_port = 40240;
+                    d2k_ev h = ev_hello(6, 40240, "full-rx-box.test");
+                    d2k_sched_event(s, &h);
+                    d2k_ev sh;
+                    CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
+                          "не удалось собрать TLS 1.3 shape для полной коробки");
+                    d2k_sched_event(s, &sh);
+                    d2k_ev su = ev_suspect(6, 40240);
+                    su.code = D2K_SUSPECT_RST_AFTER_APP;
+                    d2k_sched_event(s, &su);
+                    settle(s);
+                    CHECK(vol_calls == 1 && tcp_calls == 0,
+                          "поздний RST не остался в парном RX-измерении");
+                    CHECK(sent_first_split_index(11) == 0 &&
+                          sent_plan_index("hcaptcha.com", 0, 3) >= 8,
+                          "RX-volume-кандидат поставлен раньше восьми сохранённых планов коробки");
+                    for (unsigned i = 0; i < 8; i++) {
+                        d2k_ev ap = ev_applied(6, 40240);
+                        d2k_sched_event(s, &ap);
+                        spin(s, 40);
+                    }
+                    CHECK(sent_contains_plan_payload("hcaptcha.com"),
+                          "после всех сохранённых планов не долита RX-volume-лестница");
+                    ver_fail_first = 0;
+                    vol_rx_cut = 0;
+                    d2k_sched_free(s);
+                }
+            }
+        }
+        d2k_catalog_free(&cFull);
+    }
+
+    if (rx_only) { goto voice_only_done; }
     /* --- внешний тип 23 сам по себе не подтверждает ничего (задача 4) --- */
     {
         /* В TLS 1.3 внешним типом записи 23 наружу едет ВЕСЬ второй полёт
@@ -5328,6 +5809,42 @@ voice_only_run:
         quic_answer = D2K_V_CLEAR;
         d2k_sched_free(s);
         d2k_catalog_free(&cU);
+    }
+
+    /* --- Cloudflare challenge не подтверждает обход и останавливает поиск --- */
+    {
+        d2k_catalog cC;
+        memset(&cC, 0, sizeof cC);
+        d2k_sched *s = d2k_sched_new(&cC, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40175;
+        ver_calls = 0;
+        ver_cloudflare_challenge = 1;
+        forget_sent();
+
+        d2k_ev h = ev_hello(6, 40175, "challenge.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40175);
+        d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev ap = ev_applied(6, 40175);
+        d2k_sched_event(s, &ap);
+        spin(s, 40);
+
+        CHECK(said("Cloudflare challenge"),
+              "ответ cf-mitigated: challenge не назван challenge и поиск не остановлен");
+        CHECK(binding_of(&cC, "challenge.example", 6) == NULL,
+              "страница Cloudflare challenge записана как подтверждённый обход");
+        CHECK(ver_calls == 1,
+              "после challenge был испытан ещё один кандидат и послан лишний запрос");
+
+        ver_cloudflare_challenge = 0;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cC);
     }
 
     /* --- сервер представился ЧУЖИМ именем: это не обход ---------------- */

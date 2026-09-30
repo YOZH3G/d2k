@@ -39,7 +39,7 @@ static void fail(char *err, size_t errlen, const char *msg) {
  * наращивать массивы по ходу. Проход дешёвый, а realloc в датапате — лишний
  * источник ошибок. */
 struct counts {
-    size_t payloads, poisons, splits, fakes, seqovls;
+    size_t payloads, poisons, splits, fakes, seqovls, oob;
 };
 
 static int scan(const uint8_t *b, size_t len, struct counts *c,
@@ -71,6 +71,15 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
                 fail(err, errlen, "ipfrag требует minexec=7 и форму 1..4"); return -1;
             }
             break;
+        case REC_OOB:
+            if (rd16(b + 6) < 8 || ln != 3 || rd16(b + off) > ANCHOR_SNI_MIDDLE) {
+                fail(err, errlen, "oob требует minexec=8, якорь и один байт"); return -1;
+            }
+            c->oob++;
+            if (c->oob > 1) {
+                fail(err, errlen, "повторная запись oob"); return -1;
+            }
+            break;
         case REC_ID:
             if (ln != D2K_PLAN_ID_LEN) { fail(err, errlen, "id не 16 байт"); return -1; }
             break;
@@ -90,7 +99,13 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             c->splits++;
             break;
         case REC_FAKE:
-            if (ln != 10) { fail(err, errlen, "фальшивка не 10 байт"); return -1; }
+            if (ln != 10 && ln != 11) { fail(err, errlen, "фальшивка не 10/11 байт"); return -1; }
+            if (ln == 11 && rd16(b + 6) < 8) {
+                fail(err, errlen, "tlsmod требует minexec=8"); return -1;
+            }
+            if (ln == 11 && (b[off + 10] & ~(D2K_TLS_MOD_RND | D2K_TLS_MOD_DUPSID))) {
+                fail(err, errlen, "неизвестный tlsmod"); return -1;
+            }
             c->fakes++;
             break;
         case REC_SEQOVL:
@@ -171,6 +186,12 @@ static int check_refs(const d2k_plan *p, char *err, size_t errlen) {
         p->order || p->input_len || p->input_tls || p->settle_us ||
         p->segment_size || p->wire_profile || p->guards)) {
         fail(err, errlen, "ipfrag требует UDP без TCP-операций/перестановки");
+        return -1;
+    }
+    if (p->oob_enabled && (p->minexec < 8 || p->transport != 6 || p->proto != 1 ||
+        !p->input_tls || !p->wire_profile || p->n_splits || p->n_seqovls || p->n_fakes ||
+        p->ipfrag || p->pace_us || p->settle_us || p->delay_us)) {
+        fail(err, errlen, "oob требует измеренный TCP/TLS-вход и отдельный план");
         return -1;
     }
     for (size_t i = 0; i < p->n_fakes; i++) {
@@ -321,6 +342,11 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
             }
             p->ipfrag = v[0];
             break;
+        case REC_OOB:
+            p->oob_enabled = 1;
+            p->oob_anchor = rd16(v);
+            p->oob_byte = v[2];
+            break;
         case REC_ID:
             memcpy(p->id, v, D2K_PLAN_ID_LEN);
             break;
@@ -364,6 +390,7 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
             f->repeats = v[4];
             f->placement = v[5];
             f->gap_us = rd32(v + 6);
+            f->tls_mod = ln == 11 ? v[10] : 0;
             break;
         }
         case REC_SEQOVL: {

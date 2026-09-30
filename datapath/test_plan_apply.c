@@ -23,6 +23,72 @@ static int fails;
         }                                                  \
     } while (0)
 
+/* REC_FAKE minexec=8 carries native TLS rnd+dupsid modifiers. */
+static void put16(uint8_t *b, size_t *n, uint16_t v) {
+    b[(*n)++] = (uint8_t)(v >> 8); b[(*n)++] = (uint8_t)v;
+}
+static void putrec(uint8_t *b, size_t *n, uint16_t type,
+                   const uint8_t *v, uint16_t len) {
+    put16(b, n, type); put16(b, n, len); memcpy(b + *n, v, len); *n += len;
+}
+static size_t tls_fake_plan(uint8_t *plan) {
+    uint8_t hello[87] = {0};
+    size_t n = 0;
+    hello[0]=0x16; hello[1]=3; hello[2]=1; hello[3]=0; hello[4]=82;
+    hello[5]=1; hello[6]=0; hello[7]=0; hello[8]=78;
+    hello[9]=3; hello[10]=3;
+    for (size_t i=0; i<32; i++) hello[11+i]=(uint8_t)(0x40+i);
+    hello[43]=32;
+    for (size_t i=0; i<32; i++) hello[44+i]=(uint8_t)(0x80+i);
+    hello[76]=0; hello[77]=2; hello[78]=0x13; hello[79]=1;
+    hello[80]=1; hello[81]=0; hello[82]=0; hello[83]=0;
+    memcpy(plan, "D2KP", 4); plan[4]=0; plan[5]=1; plan[6]=0; plan[7]=8;
+    plan[8]=0; plan[9]=0; plan[10]=0; plan[11]=7; n=12;
+    uint8_t id[16]={0}; putrec(plan,&n,0x0001,id,sizeof id);
+    uint8_t proto[2]={6,1}; putrec(plan,&n,0x0002,proto,sizeof proto);
+    uint8_t payload[89]={0}; payload[1]=1; memcpy(payload+2,hello,sizeof hello);
+    putrec(plan,&n,0x0010,payload,sizeof payload);
+    uint8_t poison[8]={0,1,0,2,0,0,0,0}; putrec(plan,&n,0x0011,poison,8);
+    uint8_t fake[11]={0,1,0,1,1,0,0,0,0,0,3}; putrec(plan,&n,0x0101,fake,11);
+    uint8_t order=0; putrec(plan,&n,0x0103,&order,1);
+    putrec(plan,&n,0x010a,NULL,0);
+    return n;
+}
+
+static void test_tls_fake_modifiers(void) {
+    uint8_t plan[256], client[87]={0};
+    size_t plan_len=tls_fake_plan(plan);
+    d2k_plan *p=NULL; d2k_actions a={0}; d2k_pkt in={0};
+    d2k_flow flow={0}; char err[160];
+    client[0]=0x16;client[1]=3;client[2]=1;client[3]=0;client[4]=82;
+    client[5]=1;client[6]=0;client[7]=0;client[8]=78;client[9]=3;client[10]=3;
+    for(size_t i=0;i<32;i++)client[11+i]=(uint8_t)(0x10+i);
+    client[43]=32;
+    for(size_t i=0;i<32;i++)client[44+i]=(uint8_t)(0xc0+i);
+    client[76]=0;client[77]=2;client[78]=0x13;client[79]=1;
+    client[80]=1;client[81]=0;client[82]=0;client[83]=0;
+    int load_rc=d2k_plan_load(plan,plan_len,&p,err,sizeof err);
+    if(load_rc!=0)printf("TLS modifier plan rejected: %s\n",err);
+    CHECK(load_rc==0,"TLS modifiers plan should parse at exec 8");
+    if(!p)return;
+    in.payload=client;in.payload_len=sizeof client;in.seq=100;
+    in.have_sni=1;in.sni_off=20;in.sni_len=8;in.is_tls13=1;
+    CHECK(d2k_plan_apply(p,&flow,&in,&a)==0,"TLS modifier plan should apply");
+    CHECK(a.n==1,"TLS modifier plan should emit one fake");
+    if(a.n==1) {
+        CHECK(a.v[0].len==sizeof client,"modified fake keeps template length");
+        CHECK(memcmp(a.v[0].bytes+11,client+11,32)!=0,
+              "rnd changes fake ClientHello random");
+        CHECK(memcmp(a.v[0].bytes+44,client+44,32)==0,
+              "dupsid copies the live ClientHello session ID");
+    }
+    d2k_actions_free(&a);
+    in.is_tls13=0;
+    CHECK(d2k_plan_apply(p,&flow,&in,&a)!=0,
+          "TLS modifiers reject non-TLS-1.3 input");
+    d2k_plan_free(p);
+}
+
 /* Фальшивка перед всеми кусками, две копии с паузой 78 мс — ровно то, чем
    обходится боевое плечо донора. Байты собраны здесь, а не подсунуты внешним
    символом: тест не должен зависеть от порядка сборки. */
@@ -50,6 +116,17 @@ static const uint8_t plan_split_sni_tls[] = {
     0x00, 0x02, 0x00, 0x02, 0x06, 0x01,
     0x01, 0x0a, 0x00, 0x00,
     0x01, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
+/* Измеренное плечо URG: сервер вынимает вставленный байт из потока,
+   DPI может оставить его. Якорь — середина имени текущего TLS-входа. */
+static const uint8_t plan_oob_sni[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 8, 0, 0, 0, 5,
+    0x00, 0x02, 0x00, 0x02, 0x06, 0x01,
+    0x01, 0x09, 0x00, 0x01, 0x01,
+    0x01, 0x0a, 0x00, 0x00,
+    0x01, 0x0d, 0x00, 0x03, 0x00, 0x05, 0x0f,
     0x01, 0x03, 0x00, 0x01, 0x00
 };
 
@@ -277,6 +354,8 @@ int main(void) {
     d2k_actions a;
     d2k_pkt in;
 
+    test_tls_fake_modifiers();
+
     /* --- фальшивка перед кусками ------------------------------------- */
     CHECK(d2k_plan_load(plan_fake_before, sizeof plan_fake_before, &p, err, sizeof err) == 0,
           "план с фальшивкой не загрузился");
@@ -295,6 +374,30 @@ int main(void) {
         }
         /* Оригинал мы не трогали — его обязан выпустить вызывающий. */
         CHECK(a.fate == D2K_ORIG_PASS, "судьба оригинала должна быть «пропустить»");
+        d2k_actions_free(&a);
+        d2k_plan_free(p);
+        p = NULL;
+    }
+
+    /* --- OOB/URG: вставка не удаляет байт оригинального TLS ---------------- */
+    CHECK(d2k_plan_load(plan_oob_sni, sizeof plan_oob_sni, &p, err, sizeof err) == 0,
+          "план TCP URG по середине SNI не загрузился");
+    if (p) {
+        init_frag(&in, 64, 64);
+        for (size_t i = 20; i < 28; i++) { frag[i] = (uint8_t)('a' + i - 20); }
+        memset(&a, 0, sizeof a);
+        CHECK(d2k_plan_apply(p, &f, &in, &a) == 0, "план TCP URG не применился");
+        CHECK(a.n == 3, "OOB должен дать префикс, срочный байт и суффикс");
+        if (a.n == 3) {
+            CHECK(a.v[0].seq == 1000 && a.v[0].len == 24,
+                  "префикс OOB разрезан не по середине SNI");
+            CHECK(a.v[1].seq == 1024 && a.v[1].len == 1 && a.v[1].urgent &&
+                  a.v[1].urgent_ptr == 1,
+                  "срочный байт не помечен TCP URG в правильной позиции");
+            CHECK(a.v[2].seq == 1025 && a.v[2].len == 40 && a.v[2].bytes == frag + 24,
+                  "суффикс OOB потерял байт исходного ClientHello");
+        }
+        CHECK(a.fate == D2K_ORIG_DROP, "исходный ClientHello не снят при OOB-вставке");
         d2k_actions_free(&a);
         d2k_plan_free(p);
         p = NULL;
@@ -495,6 +598,32 @@ int main(void) {
                 CHECK(a.v[0].len == in.payload_len, "нагрузка урезана");
                 CHECK(a.fate == D2K_ORIG_DROP, "оригинал обязан быть подавлен: мы шлём его сами");
             }
+            d2k_actions_free(&a);
+
+            /* MTU-предел — только дополнительная граница TCP-сегментации:
+               prefix + исходное тело режутся вместе, без потери/дублирования
+               байтов и с непрерывными номерами последовательности. */
+            uint8_t large_payload[2200];
+            memset(large_payload, 0x5a, sizeof large_payload);
+            memset(&in, 0, sizeof in);
+            in.payload = large_payload;
+            in.payload_len = sizeof large_payload;
+            in.seq = 1000;
+            in.segment_cap = 1400;
+            CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0,
+                  "перекрытие с пределом MTU не применилось");
+            CHECK(a.n == 2, "перекрытие выше MTU автоматически делится на два сегмента");
+            size_t total = 0;
+            uint32_t expected_seq = in.seq - 2;
+            for (size_t i = 0; i < a.n; i++) {
+                size_t body = a.v[i].pre_len + a.v[i].len;
+                CHECK(body <= in.segment_cap, "сегмент после деления не превышает MTU-предел");
+                CHECK(a.v[i].seq == expected_seq, "после деления последовательность непрерывна");
+                expected_seq += (uint32_t)body;
+                total += body;
+            }
+            CHECK(total == sizeof large_payload + 2,
+                  "деление сохраняет приставку перекрытия и все исходные байты");
             d2k_actions_free(&a);
             d2k_plan_free(p);
         }

@@ -594,6 +594,9 @@ int main(void) {
     {
         CHECK(strcmp(d2k_suspect_text(D2K_SUSPECT_RST),
                      "сброс в ответ на приветствие") == 0, "текст причины RST не тот");
+        CHECK(strcmp(d2k_suspect_text(D2K_SUSPECT_RST_AFTER_APP),
+                     "сброс клиента или сервера после TLS app-data; проверить объём ответа") == 0,
+              "поздний TLS-сброс потерял отдельное диагностическое значение");
         CHECK(d2k_suspect_text(200) != NULL, "неизвестный код без текста");
     }
 

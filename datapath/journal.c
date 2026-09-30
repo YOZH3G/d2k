@@ -44,6 +44,7 @@ const char *d2k_suspect_text(uint8_t code) {
     case D2K_SUSPECT_REPEAT:  return "приветствие повторено";
     case D2K_SUSPECT_SILENT:  return "ответа на приветствие не было";
     case D2K_SUSPECT_RST_CUT: return "снят чужой сброс в ответ на приветствие";
+    case D2K_SUSPECT_RST_AFTER_APP: return "сброс клиента или сервера после TLS app-data; проверить объём ответа";
     default:                  return "подозрение без кода";
     }
 }

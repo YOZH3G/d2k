@@ -1,21 +1,19 @@
-/* volume.c — проба на блокировку по объёму. См. d2k_volume.h.
+/* volume.c — направленные измерения объёма. См. d2k_volume.h.
  *
  * ЛЕСТНИЦА ИСХОДЯЩЕГО ОБЪЁМА: десять запросов по одному соединению, со второго
  * — с мусорным заголовком. Мусор в заголовке остаётся единственным способом
  * накачать соединение СВОИМ объёмом, не завися от того, что отдаёт мишень.
  *
- * Направление накачки здесь одно — исходящее. У Go-стороны есть и входящее
- * (PumpIn: один запрос и чтение тела), и оно там нужно, чтобы выяснить, за
- * каким направлением коробка вообще следит. Здесь его нет НАМЕРЕННО, и это
- * названо, а не забыто: входящее направление меряет ещё и мишень (её скорость,
- * её длину документа, её готовность отдать сорок килобайт), а планировщику
- * нужен ответ про линию. Понадобится — добавится отдельным параметром, а не
- * тихо подмешается в этот.
+ * Отдельная RX-пара identity/gzip ниже измеряет тело ответа и требует двух
+ * совпавших обрывов плюс полного gzip-контроля. Направления не смешиваются:
+ * TX-ступень и RX-обрыв возвращаются отдельными полями и попадают в каталог
+ * под разными видами приметы.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -27,8 +25,10 @@
 #include <unistd.h>
 
 #include "d2k_meas.h"   /* d2k_mark_hook — метка ставится тем же путём, что везде */
+#include "d2k_catalog.h" /* общий допуск для сопоставления RX-объёмов */
 #include "d2k_tls13.h"
 #include "d2k_volume.h"
+#include "d2k_verify.h"
 
 /* Восемь секунд на подключение и на рукопожатие — из пробы донора
    (z2k-detect/internal/tcp16), замер на этой линии. */
@@ -38,6 +38,7 @@
 /* Пауза между запросами. Без неё десять запросов уходят одной очередью, и
    коробка видит поток иначе, чем видит его браузер: вердикт плывёт. */
 #define CHUNK_DELAY_MS 50
+#define RESPONSE_PROBE_GAP_MS 500
 
 /* Ожидание ответа считается от ИЗМЕРЕННОГО RTT, а не берётся с потолка. Живой
    ответ приходит за один RTT; «нет ответа» — это неподходящее имя, на котором
@@ -46,6 +47,50 @@
    первом пакете, верхняя — от линии с большим RTT. */
 #define READ_MIN_MS  1500
 #define READ_MAX_MS  12000
+
+int d2k_volume_rx_evidence(const d2k_ver_result *a,
+                           const d2k_ver_result *b,
+                           const d2k_ver_result *gzip,
+                           d2k_vol_result *out) {
+    const uint64_t min_bytes = (uint64_t)D2K_VOL_MIN_KB * 1024;
+    if (!a || !b || !gzip || !out) { return 0; }
+    if (a->status < 200 || a->status >= 300 || b->status < 200 || b->status >= 300 ||
+        a->body_complete || b->body_complete || a->body_encoding != 0 ||
+        !a->body_framing_valid || !b->body_framing_valid ||
+        b->body_encoding != 0 || a->body_bytes < min_bytes || b->body_bytes < min_bytes ||
+        a->body_has_length != b->body_has_length || a->body_chunked != b->body_chunked ||
+        (!a->body_has_length && !a->body_chunked) ||
+        (a->body_has_length && a->body_chunked)) { return 0; }
+    if (a->body_has_length && (a->body_expected <= a->body_bytes ||
+                               b->body_expected <= b->body_bytes)) { return 0; }
+    uint64_t delta = a->body_bytes > b->body_bytes
+                   ? a->body_bytes - b->body_bytes : b->body_bytes - a->body_bytes;
+    if (delta > (uint64_t)D2K_VOLUME_SLACK * 1024) { return 0; }
+    if (gzip->status < 200 || gzip->status >= 300 || !gzip->body_framing_valid ||
+        !gzip->body_complete ||
+        gzip->body_encoding != 1 || gzip->body_bytes == 0) { return 0; }
+
+    out->rx_cut = 1;
+    uint64_t midpoint = (a->body_bytes < b->body_bytes ? a->body_bytes : b->body_bytes)
+                      + delta / 2;
+    uint64_t cut_kb = midpoint / 1024;
+    out->rx_at_kb = cut_kb > INT_MAX ? INT_MAX : (int)cut_kb;
+    out->rx_expected_kb = 0;
+    if (a->body_has_length && a->body_expected <= (uint64_t)INT_MAX * 1024) {
+        out->rx_expected_kb = (int)(a->body_expected / 1024);
+    }
+    out->rx_compressed_complete = 1;
+    if (out->rx_expected_kb > 0) {
+        snprintf(out->reason, sizeof out->reason,
+                 "identity-тело повторно оборвалось около %d/%d КБ; gzip завершился",
+                 out->rx_at_kb, out->rx_expected_kb);
+    } else {
+        snprintf(out->reason, sizeof out->reason,
+                 "chunked identity-тело повторно оборвалось около %d КБ; gzip завершился",
+                 out->rx_at_kb);
+    }
+    return 1;
+}
 
 const char *d2k_vol_verdict_name(d2k_vol_verdict v) {
     switch (v) {
@@ -198,8 +243,49 @@ static int drain_head_plain(int fd, int wait_ms, char *reason, size_t cap) {
     }
 }
 
+/* Входящее измерение — другой вопрос, чем лестница исходящих HEAD выше.
+   Ищем воспроизводимую асимметрию: два identity-ответа с одним framing видом
+   обрываются на близком объёме, а gzip-представление той же страницы доходит
+   до конца. Chunked ответы допустимы: у них полного размера заранее нет.
+   Ответ без Content-Length и без chunked framing не классифицируем — там
+   локальный timeout нельзя отличить от конца/медленной отдачи. Все сокеты
+   помечены measure_mark и не проходят через пробуемый план. */
+static void probe_response_volume(d2k_vol_result *res, const char *ip,
+                                  uint16_t port, const char *sni, int tls12,
+                                  size_t hello_wire, uint32_t mark) {
+    if (!res || !ip || !sni || !sni[0] || port == 80) { return; }
+    d2k_ver_result a = d2k_verify_probe_baseline(ip, port, sni, 6000,
+                                                  hello_wire, tls12, 0, mark);
+    if (a.status < 200 || a.status >= 300 || a.body_complete || !a.body_framing_valid ||
+        (!a.body_has_length && !a.body_chunked) || a.body_encoding != 0 ||
+        a.body_bytes < (uint64_t)D2K_VOL_MIN_KB * 1024 ||
+        (a.body_has_length && a.body_expected <= a.body_bytes)) {
+        d2k_verify_close(&a);
+        return;
+    }
+    nap_ms(RESPONSE_PROBE_GAP_MS);
+    d2k_ver_result b = d2k_verify_probe_baseline(ip, port, sni, 6000,
+                                                  hello_wire, tls12, 0, mark);
+    if (b.status < 200 || b.status >= 300 || b.body_complete || !b.body_framing_valid ||
+        b.body_has_length != a.body_has_length || b.body_chunked != a.body_chunked ||
+        b.body_encoding != 0 || b.body_bytes < (uint64_t)D2K_VOL_MIN_KB * 1024 ||
+        (b.body_has_length && b.body_expected <= b.body_bytes)) {
+        d2k_verify_close(&a);
+        d2k_verify_close(&b);
+        return;
+    }
+    nap_ms(RESPONSE_PROBE_GAP_MS);
+    d2k_ver_result gz = d2k_verify_probe_baseline(ip, port, sni, 6000,
+                                                   hello_wire, tls12, 1, mark);
+    (void)d2k_volume_rx_evidence(&a, &b, &gz, res);
+    d2k_verify_close(&a);
+    d2k_verify_close(&b);
+    d2k_verify_close(&gz);
+}
+
 d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
-                                int plain, uint32_t mark) {
+                                int plain, int tls12, size_t hello_wire,
+                                uint32_t mark) {
     d2k_vol_result res;
     memset(&res, 0, sizeof res);
     res.verdict = D2K_VOL_UNREACHABLE;
@@ -252,6 +338,9 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
             snprintf(res.reason, sizeof res.reason, "запрос не поместился");
             if (tls) { d2k_tls_free(tls); }
             close(fd);
+            if (!plain) {
+                probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);
+            }
             return res;
         }
 
@@ -289,6 +378,9 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
             }
             if (tls) { d2k_tls_free(tls); }
             close(fd);
+            if (!plain) {
+                probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);
+            }
             return res;
         }
         if (i == 0) {
@@ -304,5 +396,8 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
     snprintf(res.reason, sizeof res.reason, "лестница пройдена целиком");
     if (tls) { d2k_tls_free(tls); }
     close(fd);
+    if (!plain) {
+        probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);
+    }
     return res;
 }
