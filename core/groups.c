@@ -2,6 +2,16 @@
 #include "include/d2k_domain.h"
 #include "include/d2k_groups.h"
 
+int d2k_group_key_make(d2k_group_key *key,uint8_t transport,uint8_t family,
+    uint8_t shape,const char *path,const char *origin) {
+    if(!key || !path || !origin || strlen(path)>=sizeof key->probe_path ||
+       strlen(origin)>=sizeof key->ech_origin) return -1;
+    memset(key,0,sizeof *key);
+    key->transport=transport; key->family=family; key->shape=shape;
+    strcpy(key->probe_path,path); strcpy(key->ech_origin,origin);
+    return 0;
+}
+
 int d2k_group_key_same(const d2k_group_key *a,const d2k_group_key *b) {
     return a && b && a->transport==b->transport && a->family==b->family &&
         a->shape==b->shape && !strcmp(a->probe_path,b->probe_path) &&

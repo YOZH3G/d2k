@@ -81,7 +81,7 @@ int d2k_plan_fits(const d2k_plan *p, uint32_t limits, uint32_t maxlen,
 static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
     /* Место под ключ потока есть у всех событий одинаково: подтверждение не
        про поток, но общая раскладка проще и сборке, и разбору. Ключ нулевой. */
-    uint8_t body[D2K_KEY_WIRE_LEN + 4];
+    uint8_t body[D2K_KEY_WIRE_LEN + 4 + D2K_TRIAL_ID_LEN];
     memset(body, 0, sizeof body);
     body[0] = 4;
     body[D2K_KEY_WIRE_LEN] = (uint8_t)(type >> 8);
@@ -94,7 +94,11 @@ static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
         cx->bad_cmds++;
     }
     if (cx->ctl) {
-        d2k_ctl_event(cx->ctl, D2K_EV_ACK, body, sizeof body);
+        size_t len = D2K_KEY_WIRE_LEN+4;
+        if (type >= D2K_CMD_SET_SUFFIX && type <= D2K_CMD_DEL_BYPASS) {
+            memcpy(body+len, cx->area_id, D2K_TRIAL_ID_LEN); len += D2K_TRIAL_ID_LEN;
+        }
+        d2k_ctl_event(cx->ctl, D2K_EV_ACK, body, len);
     }
 }
 
@@ -167,6 +171,13 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
     d2k_ctlsrv *cx = vctx;
     char why[200];
     d2k_plantab *tab = d2k_session_plans(cx->sess);
+
+    if (type >= D2K_CMD_SET_SUFFIX && type <= D2K_CMD_DEL_BYPASS) {
+        memset(cx->area_id, 0, sizeof cx->area_id);
+        if (len < D2K_TRIAL_ID_LEN) { ack(cx, type, 0, D2K_ACK_BAD_ARGS); return; }
+        len -= D2K_TRIAL_ID_LEN;
+        memcpy(cx->area_id, b+len, sizeof cx->area_id);
+    }
 
     switch (type) {
     case D2K_CMD_SET_NAME:
@@ -549,6 +560,7 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
         default:
             continue;
         }
+        if (type == D2K_EV_REFUSED) body[n++] = d2k_session_client_shape(s, &e->key);
         d2k_ctl_event(ctl, type, body, n);
     }
 }

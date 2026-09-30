@@ -582,6 +582,18 @@ static void drain(void) {
 
 static void forget_sent(void) { sent_len = 0; }
 
+static void area_ack_id(d2k_ev *ack) {
+    for (size_t off=0; off+6<=sent_len;) {
+        const uint8_t *p=sentbuf+off;
+        uint32_t n=(uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3];
+        if(n<2 || n>sent_len-off-4) break;
+        uint16_t cmd=(uint16_t)((uint16_t)p[4]<<8|p[5]);
+        if(cmd==ack->code && n>=2+D2K_TRIAL_ID_LEN)
+            memcpy(ack->trial_id,p+4+n-D2K_TRIAL_ID_LEN,D2K_TRIAL_ID_LEN);
+        off+=4+n;
+    }
+}
+
 /* Count complete commands from the real scheduler socket, not a byte pattern
    inside a plan. Used to distinguish removal of name and address keys. */
 static size_t sent_command_count(uint16_t kind, const uint8_t *body, size_t len) {
@@ -1119,6 +1131,17 @@ int main(int argc, char **argv) {
     d2k_catalog cat;
     memset(&cat, 0, sizeof cat);
     if (groups_only) {
+        d2k_ver_result ech_direct = {0}; d2k_vol_result ech_volume = {0};
+        ech_direct.fd = 7; ech_direct.ech_accepted=1; ech_direct.name_ok=1;
+        ech_direct.level=D2K_VER_APPLICATION; ech_direct.body_complete=1;
+        ech_direct.status=200;
+        d2k_vres ech_result=d2k_sched_ech_baseline_result(&ech_direct,&ech_volume,"origin.example.com");
+        CHECK(ech_result.verdict==D2K_V_CLEAR && ech_volume.rx_direct_complete,
+              "authenticated complete direct ECH supplies the clear learner gate");
+        ech_direct.ech_accepted=0;
+        ech_result=d2k_sched_ech_baseline_result(&ech_direct,&ech_volume,"origin.example.com");
+        CHECK(ech_result.verdict!=D2K_V_CLEAR && !ech_volume.rx_direct_complete,
+              "rejected ECH cannot become a clean bypass observation");
         tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
         d2k_catalog c = {0};
         confirm_once(&c, sv[0], "rr-a.googlevideo.com", 40301);
@@ -1139,7 +1162,26 @@ int main(int argc, char **argv) {
         CHECK(sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) == 1, "restart sync installs learned suffix");
         CHECK(g && sent_has(g->plan_id), "suffix carries its own nonzero Plan ID");
         CHECK(d2k_sched_sync_pending(s), "suffix write waits for ACK");
+        d2k_ev stale = {0}; stale.kind=D2K_EV_ACK; stale.code=D2K_CMD_SET_SUFFIX;
+        stale.num=1u<<8; area_ack_id(&stale);
+        skip_ahead(s, 6000); sync_out(s);
+        CHECK(!d2k_sched_sync_pending(s), "lost area ACK ends bounded wait");
+        c.groups->disabled=1; CHECK(!d2k_group_restore(c.groups), "disable learned areas");
+        d2k_sched_sync(s); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_DEL_SUFFIX,NULL,0)==1,
+              "possibly installed rule is removed even when its install ACK was lost");
+        d2k_ev removed={0}; removed.kind=D2K_EV_ACK; removed.code=D2K_CMD_DEL_SUFFIX;
+        removed.num=1u<<8; area_ack_id(&removed);
+        d2k_sched_event(s,&removed); sync_out(s);
+        c.groups->disabled=0; CHECK(!d2k_group_restore(c.groups), "restore eligible family");
+        g=d2k_group_match(c.groups,"rr-new.googlevideo.com",&key);
+        d2k_sched_sync(s); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) == 2,
+              "lost ACK can retry safely on next synchronization");
+        d2k_sched_event(s,&stale); sync_out(s);
+        CHECK(d2k_sched_sync_pending(s), "late ACK cannot confirm a newer area command");
         d2k_ev ack = {0}; ack.kind = D2K_EV_ACK; ack.code = D2K_CMD_SET_SUFFIX; ack.num = 1u << 8;
+        area_ack_id(&ack);
         d2k_sched_event(s, &ack); sync_out(s);
         CHECK(!d2k_sched_sync_pending(s), "positive suffix ACK completes sync");
         char live_path[] = "/tmp/d2k-family-live-XXXXXX";
@@ -1164,11 +1206,12 @@ int main(int argc, char **argv) {
         CHECK(sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) == 1 &&
               !sent_command_count(D2K_CMD_DEL_SUFFIX, NULL, 0), "one exception does not withdraw family");
         ack.code = D2K_CMD_SET_BYPASS; ack.num = D2K_ACK_NO_ROOM;
+        area_ack_id(&ack);
         d2k_sched_event(s, &ack); sync_out(s);
         CHECK(!d2k_sched_sync_pending(s), "negative area ACK ends sync explicitly");
         drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
         CHECK(sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) == 1, "negative ACK was not remembered as installed");
-        ack.num = 1u << 8; d2k_sched_event(s, &ack); sync_out(s);
+        ack.num = 1u << 8; area_ack_id(&ack); d2k_sched_event(s, &ack); sync_out(s);
         CHECK(d2k_group_match(c.groups, "rr-other.googlevideo.com", &key), "other members retain learned plan");
         tcp_answer = D2K_V_CLEAR; vol_direct_complete = 1;
         h = ev_hello(6, 40305, "clean.googlevideo.com"); d2k_sched_event(s, &h);
@@ -1178,10 +1221,21 @@ int main(int argc, char **argv) {
         vol_direct_complete = 0;
         h = ev_hello(6, 40306, "unfit.googlevideo.com"); d2k_sched_event(s, &h);
         d2k_ev refusal = h; refusal.kind = D2K_EV_REFUSED; refusal.code = D2K_REFUSE_TOO_LONG;
+        refusal.client_shape = 1;
         memset(refusal.plan_id, 0, sizeof refusal.plan_id);
         memcpy(refusal.plan_id, failed.plan_id, strlen(failed.plan_id));
+        refusal.client_shape=2; d2k_sched_event(s,&refusal);
+        CHECK(d2k_group_match(c.groups,"unfit.googlevideo.com",&key),
+              "refusal in TLS12 cannot exclude the same host from TLS13 family");
+        refusal.client_shape=1;
         d2k_sched_event(s, &refusal);
         CHECK(d2k_sched_active(s) > 0, "real inherited plan refusal starts targeted diagnosis");
+        CHECK(!d2k_group_match(c.groups, "unfit.googlevideo.com", &key),
+              "permanent inherited execution refusal persists exact exception");
+        CHECK(d2k_group_restore(c.groups)==0 &&
+              !d2k_group_match(c.groups, "unfit.googlevideo.com", &key) &&
+              d2k_group_match(c.groups, "rr-other.googlevideo.com", &key),
+              "runtime failure exception survives restore without losing siblings");
         d2k_sched_free(s); d2k_catalog_free(&c); close(sv[0]); close(sv[1]);
         return fails ? 1 : 0;
     }

@@ -676,6 +676,7 @@ typedef struct {
 typedef struct {
     char name[256], plan_id[40];
     uint8_t kind, transport, shape, family;
+    uint8_t confirmed;
 } installed_area;
 
 struct d2k_sched {
@@ -711,6 +712,8 @@ struct d2k_sched {
     size_t n_areas;
     installed_area area_pending;
     uint16_t area_command;
+    uint64_t area_sequence;
+    uint8_t area_id[D2K_TRIAL_ID_LEN];
     int64_t area_deadline_ms;
     int area_sync_failed;
 
@@ -1260,6 +1263,26 @@ typedef struct {
     size_t trig_len, ctrl_len;
 } worker_arg;
 
+d2k_vres d2k_sched_ech_baseline_result(const d2k_ver_result *baseline,
+    d2k_vol_result *volume, const char *origin) {
+    d2k_vres result = {0}; result.verdict = D2K_V_INCONCLUSIVE;
+    if (volume) volume->rx_direct_complete = 0;
+    if (!baseline) return result;
+    if (baseline->fd < 0 || baseline->level == D2K_VER_CHALLENGE) {
+        snprintf(result.reason, sizeof result.reason, "ECH: %.150s", baseline->reason);
+    } else if (baseline->ech_accepted && baseline->name_ok == 1 &&
+               baseline->level == D2K_VER_APPLICATION && baseline->body_complete) {
+        result.verdict = D2K_V_CLEAR;
+        if (volume) volume->rx_direct_complete = 1;
+        snprintf(result.reason, sizeof result.reason,
+            "прямой ECH witness %.80s завершён: HTTP %d, %llu байт",
+            origin ? origin : "", baseline->status, (unsigned long long)baseline->body_bytes);
+    } else {
+        snprintf(result.reason, sizeof result.reason, "ECH witness не завершён: %.150s", baseline->reason);
+    }
+    return result;
+}
+
 static void *worker_run(void *vp) {
     worker_arg *a = (worker_arg *)vp;
     d2k_sched *s = a->s;
@@ -1391,21 +1414,11 @@ static void *worker_run(void *vp) {
     if (t->transport == 6 && t->ech_offer) {
         d2k_ver_result baseline = d2k_verify_probe_ech_origin_on(-1, t->ip, t->port,
             t->name, t->ech_origin, SCHED_VERIFY_STEP_MS, trig.len, s->measure_mark, NULL);
-        d2k_vres result;
-        memset(&result, 0, sizeof result);
-        if (baseline.fd < 0 || baseline.level == D2K_VER_CHALLENGE) {
-            result.verdict = D2K_V_INCONCLUSIVE;
-            snprintf(result.reason, sizeof result.reason, "ECH: %.150s", baseline.reason);
-        } else if (baseline.ech_accepted && baseline.name_ok == 1 &&
-                   baseline.level == D2K_VER_APPLICATION && baseline.body_complete) {
-            result.verdict = D2K_V_CLEAR;
-            snprintf(result.reason, sizeof result.reason, "прямой ECH witness %.80s завершён: HTTP %d, %llu байт",
-                t->ech_origin, baseline.status, (unsigned long long)baseline.body_bytes);
-        } else {
+        d2k_vres result = d2k_sched_ech_baseline_result(&baseline, &t->vol, t->ech_origin);
+        if (result.verdict != D2K_V_CLEAR && baseline.fd >= 0 &&
+            baseline.level != D2K_VER_CHALLENGE) {
             /* Permission for an isolated candidate experiment, not a proved
              * DPI verdict. Only own ECH+body+APPLIED can confirm a plan. */
-            result.verdict = D2K_V_INCONCLUSIVE;
-            snprintf(result.reason, sizeof result.reason, "ECH witness не завершён: %.150s", baseline.reason);
             t->ech_trial = 1;
         }
         d2k_verify_close(&baseline);
@@ -3164,7 +3177,8 @@ static void write_live_groups(FILE *f, const d2k_sched *s) {
         installed_area a; int active = 0;
         if (desired_area(s, i, &a)) {
             for (size_t j = 0; j < s->n_areas; j++)
-                if (area_key_same(&a, &s->areas[j]) && !strcmp(a.plan_id, s->areas[j].plan_id)) active = 1;
+                if (s->areas[j].confirmed && area_key_same(&a, &s->areas[j]) &&
+                    !strcmp(a.plan_id, s->areas[j].plan_id)) active = 1;
         }
         fprintf(f, ", \"active\": %s, \"evidence\": [", active ? "true" : "false");
         int first = 1;
@@ -3190,10 +3204,13 @@ static void write_live_groups(FILE *f, const d2k_sched *s) {
     fputs(count ? "\n  ],\n" : "],\n", f);
 }
 
-/* One outstanding area command: ACK has command type, no target identity.
- * Remember installed state only after positive ACK, never after write(). */
+/* One outstanding identified area command. Remember installed state only
+ * after its positive ACK; a stale ACK cannot acknowledge a later retry. */
 static int sync_area_send(d2k_sched *s, const installed_area *a, int remove) {
     char err[200], hex[2*D2K_PLAN_TLV_MAX+1]; int rc;
+    memset(s->area_id, 0, sizeof s->area_id);
+    uint64_t seq = ++s->area_sequence;
+    memcpy(s->area_id, &seq, sizeof seq);
     uint16_t cmd;
     if (a->kind == 1 && !remove) {
         const d2k_cat_plan *p = area_plan(s, a);
@@ -3206,18 +3223,17 @@ static int sync_area_send(d2k_sched *s, const installed_area *a, int remove) {
         if (stamp_plan_id(wire, id) || d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err)) {
             say(s, "область %s: план без проверяемого идентификатора", a->name); return -1;
         }
-        rc = d2k_link_set_suffix_family(s->link_fd, a->name, a->transport, hex, a->shape, a->family, err, sizeof err);
         cmd = D2K_CMD_SET_SUFFIX;
     } else if (a->kind == 1) {
-        rc = d2k_link_del_suffix_family(s->link_fd, a->name, a->transport, a->shape, a->family, err, sizeof err);
         cmd = D2K_CMD_DEL_SUFFIX;
     } else if (remove) {
-        rc = d2k_link_del_bypass_family(s->link_fd, a->name, a->transport, a->shape, a->family, err, sizeof err);
         cmd = D2K_CMD_DEL_BYPASS;
     } else {
-        rc = d2k_link_set_bypass_family(s->link_fd, a->name, a->transport, a->shape, a->family, err, sizeof err);
         cmd = D2K_CMD_SET_BYPASS;
     }
+    rc = d2k_link_area_identified(s->link_fd, cmd, a->name, a->transport,
+        a->shape, a->family, cmd == D2K_CMD_SET_SUFFIX ? hex : NULL,
+        s->area_id, err, sizeof err);
     if (rc) { say(s, "область %s не отправлена: %s", a->name, err); return -1; }
     s->area_pending = *a; s->area_command = cmd;
     s->area_deadline_ms = s->now_ms+5000;
@@ -3229,7 +3245,15 @@ static int sync_areas(d2k_sched *s) {
     if (s->area_command) {
         if (s->now_ms < s->area_deadline_ms) return 1;
         say(s, "область %s: ACK не пришёл; применение не подтверждено", s->area_pending.name);
-        s->area_sync_failed = 1; /* keep identity pending for a late ACK */
+        /* A lost ACK does not prove the write was rejected. Retain uncertain
+           installation so a later disable/change can explicitly remove it. */
+        size_t i;
+        for (i=0; i<s->n_areas; i++) if (area_key_same(&s->area_pending,&s->areas[i])) break;
+        if (s->areas && i<D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
+            s->areas[i]=s->area_pending; s->areas[i].confirmed=0;
+            if (i==s->n_areas) s->n_areas++;
+        }
+        s->area_sync_failed = 1; s->area_command = 0;
         return 0;
     }
     if (!s->areas && s->cat->groups) {
@@ -3253,7 +3277,7 @@ static int sync_areas(d2k_sched *s) {
             if (!desired_area(s, i, &a) || a.kind != kind) continue;
             size_t j;
             for (j = 0; j < s->n_areas; j++) if (area_key_same(&a, &s->areas[j])) break;
-            if (j < s->n_areas && !strcmp(a.plan_id, s->areas[j].plan_id)) continue;
+            if (j < s->n_areas && s->areas[j].confirmed && !strcmp(a.plan_id, s->areas[j].plan_id)) continue;
             if (j == s->n_areas && s->n_areas == D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
                 say(s, "области: исчерпан бюджет синхронизации"); return 0;
             }
@@ -4275,9 +4299,11 @@ static void group_record(d2k_sched *s, const task *t, unsigned evidence,
     d2k_group_observation o = {0};
     snprintf(o.name, sizeof o.name, "%s", t->name);
     snprintf(o.plan_id, sizeof o.plan_id, "%s", plan_id ? plan_id : "");
-    o.key.transport = t->transport; o.key.family = t->family; o.key.shape = shape;
-    snprintf(o.key.probe_path, sizeof o.key.probe_path, "%s", t->measure_path[0] ? t->measure_path : "/");
-    snprintf(o.key.ech_origin, sizeof o.key.ech_origin, "%s", t->ech_offer ? t->ech_origin : "");
+    if (d2k_group_key_make(&o.key, t->transport, t->family, shape,
+            t->measure_path[0] ? t->measure_path : "/", t->ech_offer ? t->ech_origin : "")) {
+        say(s, "по %s контекст слишком длинный для обучения области; точный обход сохранён", t->name);
+        return;
+    }
     o.evidence = evidence; o.at = wall_s(s, now_ms);
     if (!s->cat->groups) s->cat->groups = calloc(1, sizeof *s->cat->groups);
     if (!s->cat->groups) return;
@@ -4733,19 +4759,31 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
        браузер под него не подошёл. */
     if (refuse_is_permanent((uint8_t)ev->code) && s->cat->groups) {
         const char *name = recall(s, ev);
-        if (name && !task_of(s, name, ev->transport, ev->family)) {
+        if (name) {
             for (size_t i = 0; i < s->cat->groups->n_groups; i++) {
                 const d2k_domain_group *g = &s->cat->groups->groups[i];
                 uint8_t id[D2K_PLAN_ID_LEN] = {0};
                 size_t n = strlen(g->plan_id); if (n > sizeof id) n = sizeof id;
                 memcpy(id, g->plan_id, n);
                 if (g->key.transport != ev->transport || g->key.family != (ev->family ? ev->family : 4) ||
+                    g->key.shape != ev->client_shape ||
                     !d2k_domain_member(name, g->suffix) || memcmp(id, ev->plan_id, sizeof id)) continue;
                 d2k_ev suspicion = *ev;
                 suspicion.kind = D2K_EV_SUSPECT;
                 suspicion.code = D2K_SUSPECT_REPEAT;
                 suspicion.planned = D2K_LINK_PLANNED_NO;
-                (void)on_suspect(s, &suspicion);
+                if (!task_of(s, name, ev->transport, ev->family)) (void)on_suspect(s, &suspicion);
+                /* The exact wire plan refused execution on this client.
+                   Retain that fact even when subsequent diagnosis cannot
+                   establish a DPI verdict. It never invalidates siblings. */
+                d2k_group_observation failed = {0};
+                snprintf(failed.name, sizeof failed.name, "%s", name);
+                snprintf(failed.plan_id, sizeof failed.plan_id, "%s", g->plan_id);
+                failed.key = g->key; failed.evidence = D2K_GROUP_PLAN_FAILED;
+                failed.at = wall_s(s, s->now_ms);
+                if (d2k_group_learn(s->cat->groups, &failed) > 0) {
+                    s->cat->revision++; s->sync_pending = 1;
+                }
                 break; /* refusal is execution evidence, not a DPI verdict */
             }
         }
@@ -4861,7 +4899,8 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         remember(s, ev);
         return 0;
     case D2K_EV_ACK:
-        if (s->area_command && ev->code == s->area_command) {
+        if (s->area_command && ev->code == s->area_command &&
+            !memcmp(ev->trial_id, s->area_id, sizeof s->area_id)) {
             if (((ev->num >> 8) & 255) != 1) {
                 say(s, "область %s отвергнута датапатом (код %u)", s->area_pending.name, (unsigned)(ev->num & 255));
                 s->area_sync_failed = 1;
@@ -4872,6 +4911,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
                     if (i < s->n_areas) s->areas[i] = s->areas[--s->n_areas];
                 } else if (s->areas && i < D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
                     s->areas[i] = s->area_pending;
+                    s->areas[i].confirmed = 1;
                     if (i == s->n_areas) s->n_areas++;
                 }
             }

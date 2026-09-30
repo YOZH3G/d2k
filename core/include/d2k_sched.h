@@ -63,6 +63,8 @@
 #include "d2k_voice.h"
 
 typedef struct d2k_sched d2k_sched;
+d2k_vres d2k_sched_ech_baseline_result(const d2k_ver_result *baseline,
+    d2k_vol_result *volume, const char *origin);
 
 /* Точки подмены сетевых оракулов — тот же приём, что d2k_mark_hook
  * (d2k_meas.h) и по той же причине: тест обязан утверждать развилку по

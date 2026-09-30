@@ -134,6 +134,7 @@ typedef struct {
      * Это НЕ уровень доказательства обхода: ServerHello значит, что сервер
      * ответил на наше приветствие, и ровно это (§4.2). */
     uint8_t  server_hello;
+    uint8_t  client_shape; /* REFUSED v6: observed wire protocol context */
     /* APPLIED/REFUSED: идентификатор плана, 16 байт (REC_ID, тот же, что
      * в TLV — datapath/plan_parse.c). Значим при этих двух видах;
      * остальные события его зануляют, как и прочие
@@ -433,4 +434,8 @@ int  d2k_link_del_addr(int fd, const uint8_t ip4[4], char *err, size_t errcap);
  * + 2 байта тела), то есть отказ. */
 int d2k_ev_outer_appdata(const d2k_ev *ev);
 
+/* v6 area commands carry a correlation ID echoed in ACK.trial_id. */
+int d2k_link_area_identified(int fd, uint16_t cmd, const char *name,
+    uint8_t transport, uint8_t shape, uint8_t family, const char *plan_text,
+    const uint8_t id[D2K_TRIAL_ID_LEN], char *err, size_t errcap);
 #endif /* D2K_LINK_H */

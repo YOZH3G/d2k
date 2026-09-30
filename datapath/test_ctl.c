@@ -103,6 +103,7 @@ static void frame(uint8_t *o, uint16_t type, const uint8_t *body, size_t len) {
  * длины (ключ нулевой, но место под него есть у всех событий одинаково), так
  * что read() одним вызовом на весь кадр — не подгонка под этот тест, а свойство
  * формата. Возвращает 1, если прочитан целый и это действительно ACK. */
+static uint8_t last_ack_id[D2K_TRIAL_ID_LEN];
 static int read_ack(int fd, uint16_t *cmd, int *ok, uint8_t *reason) {
     uint8_t hdr[6], body[128];
     size_t got = 0;
@@ -129,6 +130,9 @@ static int read_ack(int fd, uint16_t *cmd, int *ok, uint8_t *reason) {
     *cmd = (uint16_t)((body[D2K_KEY_WIRE_LEN] << 8) | body[D2K_KEY_WIRE_LEN + 1]);
     *ok = body[D2K_KEY_WIRE_LEN + 2];
     *reason = body[D2K_KEY_WIRE_LEN + 3];
+    memset(last_ack_id,0,sizeof last_ack_id);
+    if(body_len>=D2K_KEY_WIRE_LEN+4+D2K_TRIAL_ID_LEN)
+        memcpy(last_ack_id,body+D2K_KEY_WIRE_LEN+4,sizeof last_ack_id);
     return 1;
 }
 
@@ -644,6 +648,7 @@ int main(void) {
         {
             uint8_t body[64];
             size_t n = set_name_body_shaped(body, "googlevideo.com", tiny, sizeof tiny, 1);
+            memset(body+n, 0x72, D2K_TRIAL_ID_LEN); n += D2K_TRIAL_ID_LEN;
             d2k_ctlsrv_command(&cx, D2K_CMD_SET_SUFFIX, body, n);
             CHECK(d2k_plantab_find(d2k_session_plans(sess),
                 (const uint8_t *)"rr-new.googlevideo.com", 22, 0, 1, 1) != NULL,
@@ -652,15 +657,20 @@ int main(void) {
             uint16_t cmd; int ok; uint8_t reason;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && cmd == D2K_CMD_SET_SUFFIX && ok,
                 "suffix ACK confirms installation");
+            CHECK(last_ack_id[0]==0x72 && last_ack_id[15]==0x72,
+                "suffix ACK echoes the complete command identity");
             const char *name = "rr-new.googlevideo.com";
             n = strlen(name); body[0] = (uint8_t)n; memcpy(body+1, name, n);
             body[n+1] = 6; body[n+2] = 1; body[n+3] = 4;
-            d2k_ctlsrv_command(&cx, D2K_CMD_SET_BYPASS, body, n+4);
+            memset(body+n+4, 0x73, D2K_TRIAL_ID_LEN);
+            d2k_ctlsrv_command(&cx, D2K_CMD_SET_BYPASS, body, n+4+D2K_TRIAL_ID_LEN);
             CHECK(!d2k_plantab_find(d2k_session_plans(sess), (const uint8_t *)name, n, 0, 2, 1),
                 "ctl bypass excludes child");
             d2k_ctl_flush(c);
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok, "bypass ACK");
-            d2k_ctlsrv_command(&cx, D2K_CMD_DEL_BYPASS, body, n+4);
+            CHECK(last_ack_id[0]==0x73 && last_ack_id[15]==0x73,
+                "bypass ACK echoes its separate command identity");
+            d2k_ctlsrv_command(&cx, D2K_CMD_DEL_BYPASS, body, n+4+D2K_TRIAL_ID_LEN);
             d2k_ctl_flush(c);
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok, "remove bypass ACK");
             CHECK(d2k_plantab_find(d2k_session_plans(sess), (const uint8_t *)name, n, 0, 3, 1),
@@ -1277,7 +1287,7 @@ int main(void) {
             if (type != D2K_EV_REFUSED) {
                 continue;
             }
-            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 1 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN),
+            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 2 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN),
                   "тело REFUSED не содержит код, Plan ID и trial ID");
             if (n < (ssize_t)(D2K_KEY_WIRE_LEN + 1)) {
                 continue;
@@ -1290,7 +1300,7 @@ int main(void) {
                 seen_damaged = 1;
                 /* Идентичность обязана доехать: без неё повреждение нельзя
                    приписать ни попытке, ни плану. */
-                CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 1 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN),
+                CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 2 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN),
                       "повреждение приехало без Plan ID/trial ID");
                 int nonzero = 0;
                 for (int b = 0; b < 16; b++) {

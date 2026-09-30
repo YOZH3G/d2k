@@ -809,11 +809,11 @@ int main(void) {
               "IPv6 delete is family scoped");
         CHECK(d2k_link_set_suffix_family(sv[0], "x.com", 6, "aabb", 1, 6, err, sizeof err) == 0,
               "IPv6 suffix send");
-        CHECK(read(sv[1], wire, sizeof wire) == 16 && wire[5] == D2K_CMD_SET_SUFFIX &&
+        CHECK(read(sv[1], wire, sizeof wire) == 32 && wire[5] == D2K_CMD_SET_SUFFIX &&
               wire[12] == 1 && wire[13] == 6 && wire[14] == 0xaa, "suffix wire layout");
         CHECK(d2k_link_set_bypass_family(sv[0], "x.com", 6, 1, 6, err, sizeof err) == 0,
               "IPv6 exact bypass send");
-        CHECK(read(sv[1], wire, sizeof wire) == 15 && wire[5] == D2K_CMD_SET_BYPASS &&
+        CHECK(read(sv[1], wire, sizeof wire) == 31 && wire[5] == D2K_CMD_SET_BYPASS &&
               wire[12] == 6 && wire[13] == 1 && wire[14] == 6, "bypass context wire layout");
         CHECK(d2k_link_del_name_probe_family(sv[0], "x", 17, 3, htons(40000), 6,
                                              err, sizeof err) == 0, "IPv6 probe delete");

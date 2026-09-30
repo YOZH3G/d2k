@@ -48,7 +48,8 @@
  * APPLIED/REFUSED. Версия 4 добавляет полные адреса и семейство в ключи
  * событий и команды привязок. Смешанная пара останавливается на приветствии. */
 /* v5: learned suffix areas and exact context bypass commands. */
-#define D2K_CTL_PROTO_VERSION 5
+/* v6: area command correlation IDs, safe retry after lost/late ACK. */
+#define D2K_CTL_PROTO_VERSION 6
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */

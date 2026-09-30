@@ -838,6 +838,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     }
     size_t name_len = strlen(name);
     uint8_t seen_shape = voice ? D2K_PLAN_SHAPE_VOICE : D2K_PLAN_SHAPE_QUIC;
+    fl->client_shape = seen_shape;
 
     /* Внешний UDP hold уже сохранил эту датаграмму.  Пока ClientHello не
        собран, только накапливаем состояние; когда имя появилось, сообщаем
@@ -1761,6 +1762,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             /* Признака нет, блок оборван — «ещё не всё пришло». Формы не
                объявляем: LEGACY здесь был бы выдуманным замером. */
         }
+        fl->client_shape = seen_shape;
         /* Местный порт — см. ту же оговорку в ветке UDP выше. */
         uint16_t sport_be;
         memcpy(&sport_be, t + 0, 2);
@@ -2512,6 +2514,12 @@ uint8_t d2k_session_guards(const d2k_session *s, const d2k_key *k) {
     if (!s || !k) { return 0; }
     d2k_flow *fl = d2k_track_find(table_of((d2k_session *)s, k), k);
     return fl ? fl->guards : 0;
+}
+
+uint8_t d2k_session_client_shape(const d2k_session *s, const d2k_key *k) {
+    if (!s || !k) return 0;
+    d2k_flow *fl = d2k_track_find(table_of((d2k_session *)s, k), k);
+    return fl ? fl->client_shape : 0;
 }
 
 void d2k_session_damaged(d2k_session *s, const d2k_key *k, uint64_t execution) {

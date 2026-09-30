@@ -14,6 +14,14 @@ static void observe(d2k_group_state *s, const char *name, const char *plan,
     CHECK(d2k_group_learn(s,&o)>=0);
 }
 int main(void) {
+    d2k_group_key long_key;
+    char path_a[512],path_b[512];
+    memset(path_a,'a',sizeof path_a); path_a[0]='/'; path_a[300]=0;
+    memcpy(path_b,path_a,sizeof path_b); path_b[299]='b';
+    CHECK(d2k_group_key_make(&long_key,6,4,1,path_a,"")==-1);
+    CHECK(d2k_group_key_make(&long_key,6,4,1,path_b,"")==-1);
+    CHECK(d2k_group_key_make(&long_key,6,4,1,"/public/site.css","")==0 &&
+          !strcmp(long_key.probe_path,"/public/site.css"));
     d2k_group_state *s=calloc(1,sizeof *s);
     CHECK(s!=NULL); if(!s) return 1;
     /* Counting requests rather than independent host evidence must fail. */

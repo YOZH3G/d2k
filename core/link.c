@@ -407,6 +407,8 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         }
         memcpy(out->plan_id, rest + 1, D2K_PLAN_ID_LEN);
         memcpy(out->trial_id, rest + 1 + D2K_PLAN_ID_LEN, D2K_TRIAL_ID_LEN);
+        if (rlen > 1+D2K_PLAN_ID_LEN+D2K_TRIAL_ID_LEN)
+            out->client_shape = rest[1+D2K_PLAN_ID_LEN+D2K_TRIAL_ID_LEN];
         break;
     default:
         /* Вид события, которого этот модуль пока не разбирает глубже, —
@@ -434,7 +436,8 @@ int d2k_link_set_name_probe(int fd, const char *name, uint8_t transport,
 static int send_name_plan(int fd, const char *name, uint8_t transport,
                              const char *plan_text, uint8_t shape,
                              uint16_t sport_be, uint8_t family,
-                             char *err, size_t errcap, uint16_t cmd) {
+                             char *err, size_t errcap, uint16_t cmd,
+                             const uint8_t *area_id) {
     if (family != 4 && family != 6) {
         say(err, errcap, "семейство адресов должно быть 4 или 6");
         return -1;
@@ -468,7 +471,8 @@ static int send_name_plan(int fd, const char *name, uint8_t transport,
         return -1;
     }
     size_t extra = sport_be ? 2u : 0u;                  /* местный порт, если пробный */
-    size_t plan_cap = sizeof g_scratch - HDR - 3 - nl - extra;
+    size_t seq_len = cmd == D2K_CMD_SET_SUFFIX ? D2K_TRIAL_ID_LEN : 0;
+    size_t plan_cap = sizeof g_scratch - HDR - 3 - nl - extra - seq_len;
     if (hexlen / 2 > plan_cap) {
         say(err, errcap, "план длиннее предела кадра");
         return -1;
@@ -493,6 +497,11 @@ static int send_name_plan(int fd, const char *name, uint8_t transport,
         return -1;
     }
     o += (size_t)planlen;
+    if (seq_len) {
+        memset(g_scratch+o, 0, seq_len);
+        if (area_id) memcpy(g_scratch+o, area_id, seq_len);
+        o += seq_len;
+    }
 
     size_t body_len = o - HDR;
     if (body_len > (size_t)D2K_CTL_FRAME_MAX - 2) {
@@ -521,7 +530,7 @@ int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
     const char *plan_text, uint8_t shape, uint16_t sport_be, uint8_t family,
     char *err, size_t errcap) {
     return send_name_plan(fd, name, transport, plan_text, shape, sport_be, family,
-        err, errcap, sport_be ? D2K_CMD_SET_NAME_PROBE : D2K_CMD_SET_NAME);
+        err, errcap, sport_be ? D2K_CMD_SET_NAME_PROBE : D2K_CMD_SET_NAME, NULL);
 }
 
 static int area_context_valid(uint8_t transport, uint8_t shape, uint8_t family) {
@@ -536,11 +545,12 @@ int d2k_link_set_suffix_family(int fd, const char *name, uint8_t transport,
         say(err, errcap, "неверный контекст семейства доменов"); return -1;
     }
     return send_name_plan(fd, name, transport, plan_text, shape, 0, family,
-        err, errcap, D2K_CMD_SET_SUFFIX);
+        err, errcap, D2K_CMD_SET_SUFFIX, NULL);
 }
 
 static int send_area_key(int fd, uint16_t cmd, const char *name,
-    uint8_t transport, uint8_t shape, uint8_t family, char *err, size_t errcap) {
+    uint8_t transport, uint8_t shape, uint8_t family, char *err, size_t errcap,
+    const uint8_t *area_id) {
     if (fd < 0 || !name || !*name || strlen(name) > 253 ||
         !area_context_valid(transport, shape, family)) {
         say(err, errcap, "неверный ключ семейства доменов"); return -1;
@@ -548,6 +558,9 @@ static int send_area_key(int fd, uint16_t cmd, const char *name,
     size_t nl = strlen(name), o = HDR;
     g_scratch[o++] = (uint8_t)nl; memcpy(g_scratch+o, name, nl); o += nl;
     g_scratch[o++] = transport; g_scratch[o++] = shape; g_scratch[o++] = family;
+    memset(g_scratch+o, 0, D2K_TRIAL_ID_LEN);
+    if (area_id) memcpy(g_scratch+o, area_id, D2K_TRIAL_ID_LEN);
+    o += D2K_TRIAL_ID_LEN;
     uint32_t plen = (uint32_t)(o-HDR+2);
     g_scratch[0] = (uint8_t)(plen>>24); g_scratch[1] = (uint8_t)(plen>>16);
     g_scratch[2] = (uint8_t)(plen>>8); g_scratch[3] = (uint8_t)plen;
@@ -560,15 +573,27 @@ static int send_area_key(int fd, uint16_t cmd, const char *name,
 
 int d2k_link_del_suffix_family(int fd, const char *name, uint8_t transport,
     uint8_t shape, uint8_t family, char *err, size_t errcap) {
-    return send_area_key(fd, D2K_CMD_DEL_SUFFIX, name, transport, shape, family, err, errcap);
+    return send_area_key(fd, D2K_CMD_DEL_SUFFIX, name, transport, shape, family, err, errcap, NULL);
 }
 int d2k_link_set_bypass_family(int fd, const char *name, uint8_t transport,
     uint8_t shape, uint8_t family, char *err, size_t errcap) {
-    return send_area_key(fd, D2K_CMD_SET_BYPASS, name, transport, shape, family, err, errcap);
+    return send_area_key(fd, D2K_CMD_SET_BYPASS, name, transport, shape, family, err, errcap, NULL);
 }
 int d2k_link_del_bypass_family(int fd, const char *name, uint8_t transport,
     uint8_t shape, uint8_t family, char *err, size_t errcap) {
-    return send_area_key(fd, D2K_CMD_DEL_BYPASS, name, transport, shape, family, err, errcap);
+    return send_area_key(fd, D2K_CMD_DEL_BYPASS, name, transport, shape, family, err, errcap, NULL);
+}
+
+int d2k_link_area_identified(int fd, uint16_t cmd, const char *name,
+    uint8_t transport, uint8_t shape, uint8_t family, const char *plan_text,
+    const uint8_t id[D2K_TRIAL_ID_LEN], char *err, size_t errcap) {
+    if (!id || !area_context_valid(transport, shape, family)) return -1;
+    if (cmd == D2K_CMD_SET_SUFFIX)
+        return send_name_plan(fd, name, transport, plan_text, shape, 0, family,
+            err, errcap, cmd, id);
+    if (cmd != D2K_CMD_DEL_SUFFIX && cmd != D2K_CMD_SET_BYPASS && cmd != D2K_CMD_DEL_BYPASS)
+        return -1;
+    return send_area_key(fd, cmd, name, transport, shape, family, err, errcap, id);
 }
 
 /* Family-scoped name removal. ARM_SHAPE has its own snapshot contract. */

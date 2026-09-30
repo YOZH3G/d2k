@@ -391,4 +391,5 @@ const d2k_journal *d2k_session_journal(const d2k_session *s);
 void d2k_session_nat_stats(uint64_t *ok, uint64_t *miss, uint64_t *none,
                            uint64_t *retried);
 
+uint8_t d2k_session_client_shape(const d2k_session *s, const d2k_key *k);
 #endif /* D2K_SESSION_H */
