@@ -67,6 +67,8 @@ typedef struct {
     char     reason[160]; /* человеческая причина, заполняется всегда */
     char     rx_reason[200]; /* отдельный исход GET, даже если TX не дошёл до TLS */
     int      rx_tls_unavailable; /* прямой GET не дошёл до TLS; RX-тела ещё не измерить */
+    d2k_resource resources[D2K_RESOURCE_COUNT];
+    size_t n_resources;
 } d2k_vol_result;
 
 /* Гоняет TX-лестницу, затем для HTTPS — парное RX-измерение тела ответа.
@@ -80,6 +82,8 @@ typedef struct {
 d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
                                 int plain, int tls12, size_t hello_wire,
                                 uint32_t mark);
+d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *sni,
+    int plain, int tls12, size_t hello_wire, uint32_t mark, const char *path);
 
 /* Чистая проверка трёх уже полученных ответов: две повторные identity-обрезки
  * и полный gzip-контроль. Нужна также тестам, чтобы границы RX-диагноза были

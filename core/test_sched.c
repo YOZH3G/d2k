@@ -174,6 +174,8 @@ static int vol_calls;
 static d2k_vol_verdict vol_answer = D2K_VOL_PASSED;
 static int vol_rx_cut;
 static int vol_rx_tls_unavailable;
+static int resource_fixture;
+static int resource_volume_calls, resource_verify_calls;
 
 static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
                                int plain, int tls12, size_t hello_wire,
@@ -190,6 +192,11 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     r.rx_at_kb = 24;
     r.rx_expected_kb = 96;
     r.rx_compressed_complete = vol_rx_cut;
+    if (resource_fixture) {
+        r.n_resources = 1;
+        strcpy(r.resources[0].host, "assets.example");
+        strcpy(r.resources[0].path, "/public/app.min.css");
+    }
     snprintf(r.reason, sizeof r.reason, "подменённая проба объёма");
     return r;
 }
@@ -330,6 +337,29 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
         while (!ver_snapshot_release) { pthread_cond_wait(&snapshot_cv, &snapshot_mu); }
         pthread_mutex_unlock(&snapshot_mu);
     }
+    return r;
+}
+
+static d2k_vol_result stub_resource_volume(const char *ip, uint16_t port,
+    const char *name, int plain, int tls12, size_t wire, uint32_t mark, const char *path) {
+    resource_volume_calls++;
+    CHECK(!strcmp(path, "/public/app.min.css") && !strcmp(name, "assets.example"),
+          "volume worker changed resource context");
+    d2k_vol_result r = stub_vol(ip, port, name, plain, tls12, wire, mark);
+    r.rx_cut = r.rx_compressed_complete = 1;
+    return r;
+}
+
+static d2k_ver_result stub_resource_verify(int fd, const char *ip, uint16_t port,
+    const char *name, int deadline, size_t wire, int tls12, int encoding,
+    uint32_t mark, const char *path) {
+    resource_verify_calls++;
+    CHECK(!strcmp(path, "/public/app.min.css") && encoding == 0 && mark == 0,
+          "candidate did not prove the same identity resource");
+    d2k_ver_result r = stub_ver(fd, ip, port, 6, name, deadline, wire,
+                              tls12 ? D2K_SHAPE_LEGACY : D2K_SHAPE_MODERN);
+    r.body_complete = r.body_framing_valid = r.body_has_length = 1;
+    r.body_bytes = r.body_expected = 40000;
     return r;
 }
 
@@ -3845,6 +3875,55 @@ question_test:
     }
 
 rx_volume_tests:
+    /* A hint never launches its target. A subsequent live public TLS target
+       measures and verifies the same resource, then persists its witness. */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        resource_fixture = 1; vol_rx_cut = 0; vol_answer = D2K_VOL_PASSED;
+        tcp_answer = D2K_V_CLEAR; tcp_calls = 0;
+        d2k_ev parent = ev_hello(6, 40381, "parent.example");
+        d2k_sched_event(s, &parent);
+        d2k_ev su = ev_suspect(6, 40381); d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(tcp_calls == 1 && total_bindings(&c) == 0,
+              "CSS hint invented a target or confirmed an unrelated bypass");
+        resource_fixture = 0;
+        uint16_t saved = g_server_port; g_server_port = 443;
+        d2k_sched_vol_path_hook = stub_resource_volume;
+        d2k_sched_path_ver_hook = stub_resource_verify;
+        resource_volume_calls = resource_verify_calls = 0;
+        ver_calls = 0; ver_fail_first = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_answer_port = 40382;
+        d2k_ev h = ev_hello(6, 40382, "assets.example"), sh;
+        inet_pton(AF_INET, "8.8.8.8", h.low_ip);
+        d2k_sched_event(s, &h);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0, "CSS task TLS fixture");
+        d2k_sched_event(s, &sh);
+        su = h; su.kind = D2K_EV_SUSPECT; su.code = D2K_SUSPECT_FIN_RETRY;
+        d2k_sched_event(s, &su);
+        size_t installed = 0;
+        for (int i = 0; i < 2000 && !total_bindings(&c); i++) {
+            tick_once(s);
+            size_t n = sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+            if (n > installed) {
+                installed = n;
+                d2k_ev ap = ev_applied(6, 40382);
+                memcpy(ap.low_ip, h.low_ip, 4);
+                d2k_sched_event(s, &ap);
+            }
+        }
+        CHECK(resource_volume_calls == 1 && resource_verify_calls >= 1,
+              "public resource measured/verifier silently reverted to /");
+        CHECK(total_bindings(&c) == 1 &&
+              !strcmp(c.boxes[0].binds[0].probe_path, "/public/app.min.css"),
+              "confirmed resource witness lost on binding");
+        d2k_sched_free(s); d2k_catalog_free(&c); g_server_port = saved;
+        d2k_sched_vol_path_hook = d2k_volume_probe_path;
+        d2k_sched_path_ver_hook = d2k_verify_probe_path_on;
+        vol_rx_cut = 0;
+    }
     /* IPv4 success is only a candidate for IPv6. A failed native baseline
        checks it on an isolated native socket; own APPLIED and complete
        identity are required. Failure resumes the original classifier once. */

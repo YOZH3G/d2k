@@ -538,6 +538,11 @@ static void check_binding_family_persistence(void) {
         "{\"target\":\"example.com\",\"transport\":6,\"family\":6}]}]}");
     d2k_catalog c;
     CHECK(d2k_catalog_load(path, &c, err, sizeof err) == 0, "load family fixture");
+    CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 2 &&
+          c.boxes[0].binds[0].probe_path[0] == 0,
+          "legacy binding invented resource witness");
+    if (c.n_boxes == 1 && c.boxes[0].n_binds == 2)
+        strcpy(c.boxes[0].binds[1].probe_path, "/public/main.css");
     CHECK(d2k_catalog_save(&c, out, err, sizeof err) == 0, "save family fixture");
     d2k_catalog_free(&c);
     FILE *f = fopen(out, "r");
@@ -550,6 +555,9 @@ static void check_binding_family_persistence(void) {
     }
     CHECK(d2k_catalog_load(out, &c, err, sizeof err) == 0, "reload family fixture");
     CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 2, "both bindings survive");
+    if (c.n_boxes == 1 && c.boxes[0].n_binds == 2)
+        CHECK(!strcmp(c.boxes[0].binds[1].probe_path, "/public/main.css"),
+              "resource witness not preserved across save/reload");
     if (c.n_boxes == 1 && c.boxes[0].n_binds == 2) {
         CHECK(c.boxes[0].binds[0].family == 4, "legacy binding reloads as IPv4");
         CHECK(c.boxes[0].binds[1].family == 6, "IPv6 binding reloads as IPv6");

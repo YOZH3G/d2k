@@ -46,6 +46,7 @@
 #define D2K_VERIFY_H
 
 #include <stdint.h>
+#include "d2k_resource.h"
 
 typedef enum {
     D2K_VER_NOT_MEASURED = 0, /* обращение не состоялось — про линию не сказано ничего */
@@ -95,7 +96,16 @@ typedef struct {
      * Это утверждение о НАС, а не о коробке и не о кандидате: в каталог по
      * нему не идёт ничего, ни положительного, ни отрицательного (§10). */
     int      unsupported;
+    d2k_resource resources[D2K_RESOURCE_COUNT];
+    size_t n_resources; /* hints only, from a complete anonymous HTML response */
 } d2k_ver_result;
+
+/* Same verifier and protocol, with a public stylesheet witness instead of /.
+ * NULL preserves /. No arbitrary URI, credentials, query strings or redirects
+ * to a different host are accepted. mark must be set before connect(). */
+d2k_ver_result d2k_verify_probe_path_on(int use_fd, const char *ip, uint16_t port,
+    const char *sni, int deadline_ms, size_t hello_wire, int tls12,
+    int encoding, uint32_t mark, const char *path);
 
 /* Одно обращение к цели со СВОИМ рукопожатием и настоящим запросом.
  *

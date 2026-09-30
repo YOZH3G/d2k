@@ -60,6 +60,7 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 # (datapath/ctlprobe.c), отдельным процессом, а не петля-мишень в потоке.
 HDR += include/d2k_ip6frag_send.h
 HDR += profiles/rx_fake.h
+HDR += include/d2k_resource.h
 TESTHDR = test_stand.h
 
 # test_d2kask — ЧЁРНЫЙ ЯЩИК (см. её шапку): не общий стенд test_stand.h сам

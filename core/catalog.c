@@ -854,6 +854,9 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
         return jparse_u8(j, &out->verified_by, "binding.verified_by", err, errcap);
     if (strcmp(key, "input") == 0)
         return jparse_u8(j, &out->input, "binding.input", err, errcap);
+    if (strcmp(key, "probe_path") == 0)
+        return jparse_string_fixed(j, out->probe_path, sizeof out->probe_path,
+                                   "binding.probe_path", err, errcap);
     return jskip_value(j, depth + 1, err, errcap);
 }
 static int parse_binding(jctx *j, d2k_cat_binding *out, int depth, char *err, size_t errcap) {
@@ -1168,7 +1171,12 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
        делать вид, что поля нет вовсе. */
     wr_indent(f, depth + 1); fprintf(f, "\"shape\": %u,\n", (unsigned)bd->shape);
     wr_indent(f, depth + 1); fprintf(f, "\"verified_by\": %u,\n", (unsigned)bd->verified_by);
-    wr_indent(f, depth + 1); fprintf(f, "\"input\": %u\n", (unsigned)bd->input);
+    wr_indent(f, depth + 1); fprintf(f, "\"input\": %u", (unsigned)bd->input);
+    if (bd->probe_path[0]) {
+        fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"probe_path\": ", f);
+        write_json_string(f, bd->probe_path);
+    }
+    fputc('\n', f);
     wr_indent(f, depth); fputc('}', f);
 }
 

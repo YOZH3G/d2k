@@ -182,6 +182,7 @@ typedef struct {
     /* ЧЕМ ГОВОРИЛ ЗАМЕР, ИЗ КОТОРОГО ВЫВЕДЕН ЭТОТ ПЛАН. D2K_INPUT_* ниже,
        0 — не записано (файл снят до появления поля). */
     uint8_t  input;
+    char probe_path[512]; /* public stylesheet witness; empty means legacy / */
 } d2k_cat_binding;
 
 /* ПОЛНОТА ВХОДА ЗАМЕРА.

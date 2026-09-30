@@ -4,6 +4,7 @@
 
 static int failures, legacy_calls, modern_calls, baseline_calls;
 static int expected_legacy;
+static const char *expected_path;
 static size_t expected_wire;
 static int mark_calls;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "volume-context:%d: %s\n", __LINE__, #c); failures++; } } while (0)
@@ -59,9 +60,17 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
 }
 void d2k_verify_close(d2k_ver_result *r) { CHECK(r->fd == -1); }
 
+d2k_ver_result d2k_verify_probe_path_on(int fd, const char *ip, uint16_t port,
+    const char *sni, int ms, size_t wire, int legacy, int encoding,
+    uint32_t mark, const char *path) {
+    CHECK(fd == -1 && (expected_path ? path && !strcmp(path, expected_path) : !path));
+    return d2k_verify_probe_baseline(ip, port, sni, ms, wire, legacy, encoding, mark);
+}
+
 int main(void) {
     for (int family = 4; family <= 6; family += 2) {
     for (int legacy = 0; legacy <= 1; legacy++) {
+    for (int resource = 0; resource <= 1; resource++) {
         int fd = socket(family == 6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         struct sockaddr_storage addr = {0};
         socklen_t len;
@@ -82,14 +91,18 @@ int main(void) {
             : ntohs(((struct sockaddr_in *)&addr)->sin_port);
         expected_legacy = legacy; expected_wire = legacy ? 512 : 1489;
         baseline_calls = 0;
-        d2k_vol_result r = d2k_volume_probe(ip, port,
-                            "context.test", 0, legacy, expected_wire, 0x2f);
+        expected_path = resource ? "/public/main.css" : NULL;
+        d2k_vol_result r = resource
+            ? d2k_volume_probe_path(ip, port, "context.test", 0, legacy,
+                                    expected_wire, 0x2f, expected_path)
+            : d2k_volume_probe(ip, port, "context.test", 0, legacy, expected_wire, 0x2f);
         CHECK(r.verdict == D2K_VOL_UNREACHABLE && r.rx_cut &&
               baseline_calls == 3 && r.rx_at_kb == 23);
         close(fd);
     }
     }
-    CHECK(modern_calls == 2 && legacy_calls == 2 && mark_calls == 4);
+    }
+    CHECK(modern_calls == 4 && legacy_calls == 4 && mark_calls == 8);
     if (failures) return 1;
     puts("test_volume_context: OK"); return 0;
 }

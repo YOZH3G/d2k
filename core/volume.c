@@ -272,11 +272,15 @@ static int drain_head_plain(int fd, int wait_ms, char *reason, size_t cap) {
    помечены measure_mark и не проходят через пробуемый план. */
 static void probe_response_volume(d2k_vol_result *res, const char *ip,
                                   uint16_t port, const char *sni, int tls12,
-                                  size_t hello_wire, uint32_t mark) {
+                                  size_t hello_wire, uint32_t mark, const char *path) {
     if (!res || !ip || !sni || !sni[0] || port == 80) { return; }
-    d2k_ver_result a = d2k_verify_probe_baseline(ip, port, sni, 6000,
-                                                  hello_wire, tls12, 0, mark);
+    d2k_ver_result a = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
+                                                  hello_wire, tls12, 0, mark, path);
     res->rx_tls_unavailable = a.level == D2K_VER_TRANSPORT && a.status == 0;
+    if (a.body_complete && a.status >= 200 && a.status < 300 && a.name_ok != 0) {
+        memcpy(res->resources, a.resources, sizeof res->resources);
+        res->n_resources = a.n_resources;
+    }
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity-1 HTTP %d, тело %llu/%llu, complete=%d: %.90s",
              a.status, (unsigned long long)a.body_bytes,
@@ -289,8 +293,8 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
         return;
     }
     nap_ms(RESPONSE_PROBE_GAP_MS);
-    d2k_ver_result b = d2k_verify_probe_baseline(ip, port, sni, 6000,
-                                                  hello_wire, tls12, 0, mark);
+    d2k_ver_result b = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
+                                                  hello_wire, tls12, 0, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity-2 HTTP %d, тело %llu/%llu, complete=%d: %.90s",
              b.status, (unsigned long long)b.body_bytes,
@@ -304,8 +308,8 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
         return;
     }
     nap_ms(RESPONSE_PROBE_GAP_MS);
-    d2k_ver_result gz = d2k_verify_probe_baseline(ip, port, sni, 6000,
-                                                   hello_wire, tls12, 1, mark);
+    d2k_ver_result gz = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
+                                                   hello_wire, tls12, 1, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity %llu/%llu; gzip HTTP %d, тело %llu, complete=%d, encoding=%d",
              (unsigned long long)a.body_bytes, (unsigned long long)b.body_bytes,
@@ -316,9 +320,9 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     d2k_verify_close(&gz);
 }
 
-d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
+d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *sni,
                                 int plain, int tls12, size_t hello_wire,
-                                uint32_t mark) {
+                                uint32_t mark, const char *path) {
     d2k_vol_result res;
     memset(&res, 0, sizeof res);
     res.verdict = D2K_VOL_UNREACHABLE;
@@ -350,7 +354,7 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
             close(fd);
             /* TX handshake failure is not a result of the independent
                GET-body measurement, which uses the client's own context. */
-            probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);
+            probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark, path);
             return res;
         }
     }
@@ -382,7 +386,7 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
             if (tls_legacy) { d2k_tls12_free(tls_legacy); }
             close(fd);
             if (!plain) {
-                probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);
+                probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark, path);
             }
             return res;
         }
@@ -426,7 +430,7 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
             if (tls_legacy) { d2k_tls12_free(tls_legacy); }
             close(fd);
             if (!plain) {
-                probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);
+                probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark, path);
             }
             return res;
         }
@@ -445,7 +449,12 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
     if (tls_legacy) { d2k_tls12_free(tls_legacy); }
     close(fd);
     if (!plain) {
-        probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);
+        probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark, path);
     }
     return res;
+}
+
+d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
+    int plain, int tls12, size_t hello_wire, uint32_t mark) {
+    return d2k_volume_probe_path(ip, port, sni, plain, tls12, hello_wire, mark, NULL);
 }

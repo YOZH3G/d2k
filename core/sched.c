@@ -320,6 +320,8 @@ static int mark_default(int fd, uint32_t mark) {
 d2k_sched_bind_fn d2k_sched_bind_hook = bind_default;
 d2k_sched_mark_fn d2k_sched_mark_hook = mark_default;
 d2k_sched_vol_fn  d2k_sched_vol_hook  = d2k_volume_probe;
+d2k_sched_vol_path_fn d2k_sched_vol_path_hook = d2k_volume_probe_path;
+d2k_sched_path_ver_fn d2k_sched_path_ver_hook = d2k_verify_probe_path_on;
 /* Прежнее дерево вердиктов (core/verdict.c) отмены не умеет: у него нет ни
    контекста, ни проверок между зондами. Переходник это НЕ скрывает — он
    просто не передаёт флаг дальше, и join такого замера ждёт его до конца.
@@ -596,6 +598,7 @@ typedef struct {
     int        rx_bootstrap_only; /* measure an already confirmed target plan */
     int        family_reuse; /* 1 baseline pending, 2 isolated trial, 3 exhausted */
     int        skip_volume_once; /* resume classifier with existing baseline */
+    char       measure_path[512]; /* selected before worker start, never guessed from ciphertext */
     d2k_ver_result rx_identity[2]; /* body evidence only; sockets closed normally */
     int64_t    rx_retry_after_ms;
     /* A late TLS RST is only permission for the paired receive-volume probe.
@@ -677,6 +680,8 @@ struct d2k_sched {
     size_t       seen_next;   /* кольцо: старое вытесняется, а не отказывает */
     target_cooldown cooldowns[SCHED_COOLDOWN_SLOTS];
     size_t       cooldown_next;
+    struct { d2k_resource ref; int64_t expires_ms; } resources[8];
+    size_t resource_next;
     int64_t      last_measure_start_ms;
     int          measure_start_seen;
 
@@ -1270,7 +1275,14 @@ static void *worker_run(void *vp) {
         d2k_sched_ver_fn verifier = t->rx_phase == 2 ? d2k_sched_rx_gzip_ver_hook :
                                    t->transport == 6 && (t->vol.rx_cut || layered_rx)
                                   ? d2k_sched_rx_ver_hook : d2k_sched_ver_hook;
-        d2k_ver_result vr = verifier(a_use_fd, t->ip, t->port, t->transport,
+        d2k_ver_result vr;
+        if (t->transport == 6 && t->measure_path[0]) {
+            int encoding = t->rx_phase == 2 ? 1 : 0;
+            vr = d2k_sched_path_ver_hook(a_use_fd, t->ip, t->port, t->name,
+                SCHED_VERIFY_STEP_MS, trig.len,
+                d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY,
+                encoding, 0, t->measure_path);
+        } else vr = verifier(a_use_fd, t->ip, t->port, t->transport,
                                                t->name, SCHED_VERIFY_STEP_MS,
                                                trig.len,
                                                (uint8_t)(t->transport == 17
@@ -1312,8 +1324,11 @@ static void *worker_run(void *vp) {
        который доказательно обходит такой профиль. QUIC сюда не попадает. */
     if (t->transport == 6 && !t->skip_volume_once) {
         int tls12 = d2k_hello_shape(trig.bytes, trig.len) == D2K_SHAPE_LEGACY;
-        t->vol = d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80,
-                                    tls12, trig.len, s->measure_mark);
+        t->vol = t->measure_path[0]
+            ? d2k_sched_vol_path_hook(t->ip, t->port, t->name, t->port == 80,
+                                     tls12, trig.len, s->measure_mark, t->measure_path)
+            : d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80,
+                                tls12, trig.len, s->measure_mark);
         if (t->vol.rx_reason[0]) {
             say(s, "по %s объёмный замер TLS %s, hello=%zu: TX %s; RX %s",
                 t->name, tls12 ? "1.2" : "1.3", trig.len,
@@ -3131,6 +3146,57 @@ static int has_other_family_target_plan(const d2k_sched *s, const task *t) {
     return 0;
 }
 
+/* HTML hints are not targets or proofs. No DNS lookup or request is caused by
+ * a hint; they can refine an existing public TLS task only. */
+static void remember_resources(d2k_sched *s, const d2k_resource *refs, size_t n) {
+    if (n > D2K_RESOURCE_COUNT) return;
+    for (size_t i = 0; i < n; i++) {
+        if (!refs[i].host[0] || !d2k_resource_path_ok(refs[i].path)) continue;
+        size_t slot = 8;
+        for (size_t j = 0; j < 8; j++)
+            if (!strcmp(s->resources[j].ref.host, refs[i].host)) { slot = j; break; }
+        if (slot == 8) slot = s->resource_next++ % 8;
+        s->resources[slot].ref = refs[i];
+        s->resources[slot].expires_ms = s->now_ms + 3600000;
+    }
+}
+
+static int public_resource_peer(const task *t) {
+    uint8_t ip[16];
+    if (inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, ip) != 1) return 0;
+    if (t->family == 6) return (ip[0] & 0xe0) == 0x20; /* global unicast only */
+    return ip[0] != 0 && ip[0] != 10 && ip[0] != 127 && ip[0] < 224 &&
+        !(ip[0] == 169 && ip[1] == 254) && !(ip[0] == 192 && ip[1] == 168) &&
+        !(ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) &&
+        !(ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127);
+}
+
+static void select_resource_path(d2k_sched *s, task *t) {
+    if (t->transport != 6 || t->port != 443 || t->by_addr || !public_resource_peer(t)) return;
+    /* Confirmed witness survives restart; never borrow proof across family
+       or TLS shape. A live HTML hint contains no protocol proof at all. */
+    const d2k_cat_binding *best = NULL;
+    d2k_shape shape = d2k_hello_shape(t->trig, t->trig_len);
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++)
+        for (size_t j = 0; j < s->cat->boxes[bi].n_binds; j++) {
+            const d2k_cat_binding *bd = &s->cat->boxes[bi].binds[j];
+            if (bd->enabled && bd->level >= 3 && !strcmp(bd->kind, "name") &&
+                !strcmp(bd->target, t->name) && bd->transport == 6 &&
+                (bd->family ? bd->family : 4) == t->family && bd->shape == shape &&
+                d2k_resource_path_ok(bd->probe_path) &&
+                (!best || best->confirmed < bd->confirmed)) best = bd;
+        }
+    if (best) snprintf(t->measure_path, sizeof t->measure_path, "%s", best->probe_path);
+    else for (size_t j = 0; j < 8; j++)
+        if (s->resources[j].expires_ms > s->now_ms &&
+            !strcmp(s->resources[j].ref.host, t->name)) {
+            snprintf(t->measure_path, sizeof t->measure_path, "%s", s->resources[j].ref.path);
+            break;
+        }
+    if (t->measure_path[0]) say(s, "по %s RX и кандидат проверяются по публичному stylesheet %s, не по короткому /",
+                               t->name, t->measure_path);
+}
+
 static int start_search(d2k_sched *s, task *t) {
     if (fill_hellos(s, t) != 0) {
         if (t->transport == 17 && t->shape_armed) {
@@ -3144,6 +3210,7 @@ static int start_search(d2k_sched *s, task *t) {
         task_reset(t);
         return 0;
     }
+    select_resource_path(s, t);
     if (!t->rx_volume_only && !t->family_reuse && has_other_family_target_plan(s, t))
         t->family_reuse = 1;
     if (t->rx_volume_only) {
@@ -3905,6 +3972,20 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          t->name, t->by_addr ? "addr" : "name", t->transport, t->family, rec_shape,
                          D2K_VERBY_PROBE, rec_input,
                          wall_s(s, now_ms), &t->fp);
+    if (t->measure_path[0]) {
+        for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+            d2k_cat_box *b = &s->cat->boxes[bi];
+            if (strcmp(b->id, box_id)) continue;
+            for (size_t j = 0; j < b->n_binds; j++) {
+                d2k_cat_binding *bd = &b->binds[j];
+                if (!strcmp(bd->target, t->name) && !strcmp(bd->plan_id, plan_id) &&
+                    bd->family == t->family && bd->shape == rec_shape && bd->transport == 6) {
+                    snprintf(bd->probe_path, sizeof bd->probe_path, "%s", t->measure_path);
+                    s->cat->revision++;
+                }
+            }
+        }
+    }
     if (t->by_addr) {
         uint8_t addr[16] = {0};
         char err[160], permanent_wire[sizeof t->plans[0]];
@@ -4668,6 +4749,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
+            remember_resources(s, t->vol.resources, t->vol.n_resources);
             if (t->rx_volume_only) {
                 t->rx_volume_only = 0;
                 if (!t->vol.rx_cut) {
@@ -4960,6 +5042,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; } /* зонд в сети; срок задачи считается выше */
             join_worker(t);
+            if (t->transport == 6 && t->ver.body_complete &&
+                t->ver.status >= 200 && t->ver.status < 300 && t->ver.name_ok != 0)
+                remember_resources(s, t->ver.resources, t->ver.n_resources);
             /* Если настоящий QUIC snapshot пришёл уже после установки этого
                trial, его результат относится к профилю, а не к байтам клиента.
                Кандидат обязан быть снят exact-командой ДО повторного поиска;

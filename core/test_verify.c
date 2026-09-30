@@ -70,6 +70,7 @@ static int fails;
 /* Редирект и конечный ответ идут в одном TLS-соединении. */
 #define ROLE_REDIRECT_COMPLETE 64
 #define ROLE_REDIRECT_TRUNCATED 65
+#define ROLE_PUBLIC_HTML 66
 
 static const struct {
     const char *text;
@@ -595,7 +596,15 @@ static void *stand_run(void *arg) {
         return NULL;
     }
 
-    if (s->role >= ROLE_APP) {
+    if (s->role == ROLE_PUBLIC_HTML) {
+        const char *body = "<head><link rel='stylesheet' href='//assets.example/main.css'></head><body>ok";
+        char header[180];
+        int n = snprintf(header, sizeof header,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %zu\r\n\r\n", strlen(body));
+        (void)rec_write(c, &wr, REC_APPDATA, (const uint8_t *)header, (size_t)n);
+        (void)rec_write(c, &wr, REC_APPDATA, (const uint8_t *)body, 43);
+        (void)rec_write(c, &wr, REC_APPDATA, (const uint8_t *)body + 43, strlen(body) - 43);
+    } else if (s->role >= ROLE_APP) {
         size_t i = (size_t)(s->role - ROLE_APP);
         const uint8_t *p = (const uint8_t *)replies[i].text;
         size_t n = strlen(replies[i].text), split = replies[i].split;
@@ -687,7 +696,55 @@ static uint16_t closed_port(void) {
 }
 
 int main(void) {
+    const char *html = "<head><!-- <link rel='stylesheet' href='//bad.test/a.css'> -->"
+        "<script>var x=\"<link rel='stylesheet' href='//bad.test/b.css'>\";</script>"
+        "<LINK HREF='https://Assets.Example/a.min.css' REL='stylesheet'>"
+        "<link href='//second.example/b.css?token=secret' rel='stylesheet'>"
+        "<link href='//third.example/c.css' rel='stylesheet'></head><body>"
+        "<link href='//bad.test/d.css' rel='stylesheet'>";
+    for (size_t chunk = 1; chunk < 40; chunk++) {
+        d2k_resource_scan scan = {0};
+        for (size_t i = 0; i < strlen(html); i += chunk) {
+            size_t take = strlen(html) - i;
+            if (take > chunk) take = chunk;
+            d2k_resource_feed(&scan, (const uint8_t *)html + i, take);
+        }
+        CHECK(scan.count == 2 && !strcmp(scan.refs[0].host, "assets.example") &&
+              !strcmp(scan.refs[0].path, "/a.min.css") &&
+              !strcmp(scan.refs[1].host, "third.example"),
+              "streamed public CSS hints depend on chunk boundaries or include unsafe context");
+    }
+    CHECK(!d2k_resource_path_ok("//evil/a.css") &&
+          !d2k_resource_path_ok("/a.css?token=secret") &&
+          !d2k_resource_path_ok("/a/../b.css") &&
+          !d2k_resource_path_ok("/a.css\r\nX: yes"), "unsafe witness path accepted");
     d2k_mark_hook = counting_mark;
+    {
+        struct stand s;
+        uint16_t port = stand_start(&s, ROLE_PUBLIC_HTML);
+        d2k_ver_result r = d2k_verify_probe_identity_on(-1, "127.0.0.1", port,
+            "public.example", 3000, 0, 0);
+        CHECK(r.body_complete && r.n_resources == 1 &&
+              !strcmp(r.resources[0].host, "assets.example") &&
+              !strcmp(r.resources[0].path, "/main.css"),
+              "native HTTP-body reader lost CSS hint across TLS records");
+        d2k_verify_close(&r); stand_stop(&s);
+    }
+    {
+        struct stand s;
+        uint16_t port = stand_start(&s, ROLE_APP);
+        d2k_ver_result r = d2k_verify_probe_path_on(-1, "127.0.0.1", port,
+            "public.example", 3000, 0, 0, 0, 0, "/assets/app.min.css");
+        CHECK(r.body_complete && r.status == 200, "stylesheet verifier lost existing HTTP proof");
+        CHECK(strstr(stand_request, "GET /assets/app.min.css HTTP/1.1\r\n") != NULL &&
+              strstr(stand_request, "Accept-Encoding: identity") != NULL,
+              "stylesheet witness silently replaced with root or compressed request");
+        d2k_verify_close(&r); stand_stop(&s);
+        r = d2k_verify_probe_path_on(-1, "127.0.0.1", 1, "public.example",
+            100, 0, 0, 0, 0, "/app.css?private=yes");
+        CHECK(r.fd == -1 && r.level == D2K_VER_NOT_MEASURED,
+              "invalid witness opened a socket");
+    }
     {
         struct stand s;
         uint16_t port = stand_start_family(&s, ROLE_APP, AF_INET6);

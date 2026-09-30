@@ -99,6 +99,9 @@ typedef d2k_vol_result (*d2k_sched_vol_fn)(const char *ip, uint16_t port,
                                            const char *sni, int plain, int tls12,
                                            size_t hello_wire, uint32_t mark);
 extern d2k_sched_vol_fn  d2k_sched_vol_hook;
+typedef d2k_vol_result (*d2k_sched_vol_path_fn)(const char *, uint16_t,
+    const char *, int, int, size_t, uint32_t, const char *);
+extern d2k_sched_vol_path_fn d2k_sched_vol_path_hook;
 
 /* ЗАНЯТЬ ПОРТ ДЛЯ ОПЫТА. Крючок, а не прямой вызов, по той же причине, что и
  * у сетевых оракулов: отказ bind обязан быть ВОСПРОИЗВОДИМ в тесте. Именно на
@@ -144,6 +147,9 @@ typedef d2k_ver_result (*d2k_sched_ver_fn)(int use_fd, const char *ip, uint16_t 
 extern d2k_sched_ver_fn  d2k_sched_ver_hook;
 extern d2k_sched_ver_fn  d2k_sched_rx_ver_hook;
 extern d2k_sched_ver_fn  d2k_sched_rx_gzip_ver_hook;
+typedef d2k_ver_result (*d2k_sched_path_ver_fn)(int, const char *, uint16_t,
+    const char *, int, size_t, int, int, uint32_t, const char *);
+extern d2k_sched_path_ver_fn d2k_sched_path_ver_hook;
 
 extern d2k_sched_tcp_fn  d2k_sched_tcp_hook;
 extern d2k_sched_quic_fn d2k_sched_quic_hook;
