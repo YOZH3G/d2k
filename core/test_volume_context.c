@@ -60,22 +60,36 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
 void d2k_verify_close(d2k_ver_result *r) { CHECK(r->fd == -1); }
 
 int main(void) {
+    for (int family = 4; family <= 6; family += 2) {
     for (int legacy = 0; legacy <= 1; legacy++) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in a = {0};
-        a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(0x7f000001u);
-        CHECK(fd >= 0 && bind(fd, (struct sockaddr *)&a, sizeof a) == 0);
-        socklen_t len = sizeof a;
-        CHECK(getsockname(fd, (struct sockaddr *)&a, &len) == 0 && listen(fd, 2) == 0);
+        int fd = socket(family == 6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_storage addr = {0};
+        socklen_t len;
+        const char *ip;
+        if (family == 6) {
+            struct sockaddr_in6 *a = (struct sockaddr_in6 *)&addr;
+            a->sin6_family = AF_INET6; a->sin6_addr = in6addr_loopback;
+            len = sizeof *a; ip = "::1";
+        } else {
+            struct sockaddr_in *a = (struct sockaddr_in *)&addr;
+            a->sin_family = AF_INET; a->sin_addr.s_addr = htonl(0x7f000001u);
+            len = sizeof *a; ip = "127.0.0.1";
+        }
+        CHECK(fd >= 0 && bind(fd, (struct sockaddr *)&addr, len) == 0);
+        CHECK(getsockname(fd, (struct sockaddr *)&addr, &len) == 0 && listen(fd, 2) == 0);
+        uint16_t port = family == 6
+            ? ntohs(((struct sockaddr_in6 *)&addr)->sin6_port)
+            : ntohs(((struct sockaddr_in *)&addr)->sin_port);
         expected_legacy = legacy; expected_wire = legacy ? 512 : 1489;
         baseline_calls = 0;
-        d2k_vol_result r = d2k_volume_probe("127.0.0.1", ntohs(a.sin_port),
+        d2k_vol_result r = d2k_volume_probe(ip, port,
                             "context.test", 0, legacy, expected_wire, 0x2f);
         CHECK(r.verdict == D2K_VOL_UNREACHABLE && r.rx_cut &&
               baseline_calls == 3 && r.rx_at_kb == 23);
         close(fd);
     }
-    CHECK(modern_calls == 1 && legacy_calls == 1 && mark_calls == 2);
+    }
+    CHECK(modern_calls == 2 && legacy_calls == 2 && mark_calls == 4);
     if (failures) return 1;
     puts("test_volume_context: OK"); return 0;
 }

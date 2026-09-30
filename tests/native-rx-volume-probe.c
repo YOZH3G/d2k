@@ -15,6 +15,9 @@
 int main(int argc, char **argv) {
     if (argc != 4 && argc != 5) return 2;
     const char *ip = argv[1], *name = argv[2];
+    uint8_t address[16];
+    uint8_t family = inet_pton(AF_INET6, ip, address) == 1 ? 6 : 4;
+    if (family == 4 && inet_pton(AF_INET, ip, address) != 1) return 2;
     size_t hello = (size_t)strtoul(argv[3], NULL, 10);
     char text[8192], hex[16384], err[200];
     if (d2k_rx_volume_plan(0, D2K_SHAPE_MODERN, 1492, text, sizeof text)) return 3;
@@ -35,8 +38,8 @@ int main(int argc, char **argv) {
     int link = d2k_link_open("/opt/d2k/run/d2kd.sock", err, sizeof err);
     if (link < 0) { puts(err); return 5; }
     int fd = -1; uint16_t port = 0;
-    if (d2k_props_bind(&fd, &port) || !port || d2k_mark_hook(fd, 0x2e)) return 6;
-    if (d2k_link_set_name_probe(link, name, 6, hex, D2K_SHAPE_MODERN, port, err, sizeof err)) {
+    if (d2k_props_bind_family(family, &fd, &port) || !port || d2k_mark_hook(fd, 0x2e)) return 6;
+    if (d2k_link_set_name_family(link, name, 6, hex, D2K_SHAPE_MODERN, port, family, err, sizeof err)) {
         puts(err); close(fd); d2k_link_close(link); return 7;
     }
     printf("probe port=%u hello=%zu\n", (unsigned)ntohs(port), hello);
@@ -58,7 +61,7 @@ int main(int argc, char **argv) {
     }
     printf("applied=%d\n", applied);
     d2k_verify_close(&r);
-    int removed = d2k_link_del_name_probe(link, name, 6, D2K_SHAPE_MODERN, port, err, sizeof err);
+    int removed = d2k_link_del_name_probe_family(link, name, 6, D2K_SHAPE_MODERN, port, family, err, sizeof err);
     if (removed) puts(err);
     d2k_link_close(link);
     return !(r.status == 200 && r.body_complete && applied && !removed);

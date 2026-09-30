@@ -147,7 +147,23 @@ static void fill_pad(char *out, size_t n) {
 
 static int connect_bounded(const char *ip, uint16_t port, uint32_t mark,
                            char *reason, size_t cap) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+    int family;
+    memset(&addr, 0, sizeof addr);
+    struct sockaddr_in *a4 = (struct sockaddr_in *)&addr;
+    struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&addr;
+    if (inet_pton(AF_INET, ip, &a4->sin_addr) == 1) {
+        family = AF_INET; a4->sin_family = AF_INET;
+        a4->sin_port = htons(port); addrlen = sizeof *a4;
+    } else if (inet_pton(AF_INET6, ip, &a6->sin6_addr) == 1) {
+        family = AF_INET6; a6->sin6_family = AF_INET6;
+        a6->sin6_port = htons(port); addrlen = sizeof *a6;
+    } else {
+        snprintf(reason, cap, "адрес \"%s\" не разбирается", ip);
+        return -1;
+    }
+    int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) { snprintf(reason, cap, "сокет: %s", strerror(errno)); return -1; }
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -163,22 +179,13 @@ static int connect_bounded(const char *ip, uint16_t port, uint32_t mark,
         return -1;
     }
 
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) {
-        snprintf(reason, cap, "адрес \"%s\" не разбирается", ip);
-        close(fd);
-        return -1;
-    }
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         snprintf(reason, cap, "неблокирующий режим: %s", strerror(errno));
         close(fd);
         return -1;
     }
-    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+    if (connect(fd, (struct sockaddr *)&addr, addrlen) != 0) {
         if (errno != EINPROGRESS) {
             snprintf(reason, cap, "нет TCP: %s", strerror(errno));
             close(fd);
