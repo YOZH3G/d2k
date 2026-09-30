@@ -33,7 +33,7 @@ typedef struct {
     d2k_domain_group groups[D2K_GROUP_MAX];
     d2k_group_observation observations[D2K_GROUP_OBSERVATION_MAX];
     size_t n_groups, n_observations;
-    int frozen;
+    int frozen, disabled;
 } d2k_group_state;
 int d2k_group_key_same(const d2k_group_key *a, const d2k_group_key *b);
 int d2k_group_learn(d2k_group_state *s, const d2k_group_observation *o);

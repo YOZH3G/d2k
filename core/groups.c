@@ -69,6 +69,7 @@ static void add_group(d2k_group_state *s,const char *suffix,
 }
 static void rebuild(d2k_group_state *s) {
     s->n_groups=0;
+    if(s->disabled) return;
     for(size_t i=0;i<s->n_observations;i++) {
         const d2k_group_observation *o=&s->observations[i];
         if(!(o->evidence&D2K_GROUP_BLOCKED_CONFIRMED)) continue;
@@ -110,7 +111,13 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
                 if(reclaim==s->n_observations &&
                    s->observations[i].evidence==D2K_GROUP_BLOCKED_CONFIRMED) reclaim=i;
             }
-            if(reclaim==s->n_observations) return changed; /* only exclusions remain: no group votes */
+            if(reclaim==s->n_observations) {
+                /* Historic votes may also carry negative evidence. Without
+                   room for this exclusion, fail closed for areas, never
+                   forget an exclusion or disturb exact catalog plans. */
+                changed |= !s->disabled; s->disabled=1; s->n_groups=0;
+                return changed;
+            }
             slot=reclaim;
             s->observations[slot]=*o; strcpy(s->observations[slot].name,name);
         } else {
@@ -127,6 +134,10 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
         if(o->evidence==D2K_GROUP_PLAN_FAILED) {
             if(strcmp(o->plan_id,old->plan_id)) return 0;
             old->evidence|=D2K_GROUP_PLAN_FAILED; old->at=o->at;
+        } else if(admitted_clear && (old->evidence&D2K_GROUP_BLOCKED_CONFIRMED)) {
+            old->evidence=D2K_GROUP_BLOCKED_CONFIRMED|D2K_GROUP_DIRECT_CLEAR|
+                D2K_GROUP_ADMITTED_EXCEPTION;
+            old->at=o->at; /* keep its historical own-plan vote for siblings */
         } else { *old=*o; strcpy(old->name,name); }
     }
     if(admitted_clear) s->observations[slot].evidence |= D2K_GROUP_ADMITTED_EXCEPTION;
@@ -141,6 +152,8 @@ int d2k_group_restore(d2k_group_state *s) {
             test.evidence=D2K_GROUP_BLOCKED_CONFIRMED;
         if(test.evidence==(D2K_GROUP_DIRECT_CLEAR|D2K_GROUP_ADMITTED_EXCEPTION))
             test.evidence=D2K_GROUP_DIRECT_CLEAR;
+        if(test.evidence==(D2K_GROUP_BLOCKED_CONFIRMED|D2K_GROUP_DIRECT_CLEAR|
+                          D2K_GROUP_ADMITTED_EXCEPTION)) test.evidence=D2K_GROUP_BLOCKED_CONFIRMED;
         char norm[256],base[256];
         if(!valid(&test) || o->at<0 || d2k_domain_normalize(o->name,norm) ||
            d2k_domain_base(norm,base)) return -1;
@@ -154,7 +167,7 @@ int d2k_group_restore(d2k_group_state *s) {
 const d2k_domain_group *d2k_group_match(const d2k_group_state *s,
                                      const char *name,const d2k_group_key *key) {
     char norm[256];
-    if(!s || !key || d2k_domain_normalize(name,norm) ||
+    if(!s || s->disabled || !key || d2k_domain_normalize(name,norm) ||
        s->n_groups>D2K_GROUP_MAX || s->n_observations>D2K_GROUP_OBSERVATION_MAX) return NULL;
     const d2k_domain_group *best=NULL;
     for(size_t i=0;i<s->n_groups;i++) {

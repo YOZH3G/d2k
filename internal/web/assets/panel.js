@@ -124,6 +124,10 @@
     var stages = Array.isArray(snapshot.stages) ? snapshot.stages : [];
     var boxes = Array.isArray(knowledge.boxes) ? knowledge.boxes : [];
     var searches = Array.isArray(knowledge.searches) ? knowledge.searches : [];
+    var groups = Array.isArray(knowledge.groups) ? knowledge.groups.filter(function (g) {
+      return g && typeof g.suffix === "string" && g.suffix;
+    }) : [];
+    var familyEvidence = Object.create(null);
     rootNode.replaceChildren();
 
     var title = append(rootNode, node(doc, "header", undefined, "page-heading"));
@@ -187,6 +191,18 @@
       searches.forEach(function (search) { renderSearch(doc, list, search); });
     }
 
+    if (groups.length) {
+      var families = section(doc, rootNode, "families", "Семейства доменов",
+        "Новые поддомены сразу получают этот обход. Отдельная проверка нужна только при сбое.");
+      var familyList = append(families, node(doc, "div", undefined, "family-list"));
+      groups.forEach(function (group) {
+        renderFamily(doc, familyList, group, linked);
+        (Array.isArray(group.evidence) ? group.evidence : []).forEach(function (name) {
+          familyEvidence[bindingFamilyKey({ target: name, transport: group.transport,
+            family: group.family, shape: group.shape, plan_id: group.plan_id })] = true;
+        });
+      });
+    }
     var boxSection = section(doc, rootNode, "boxes", "Изученные коробки",
       "Рабочие обходы сохраняются и повторно проверяются для похожих блокировок.");
     var boxToolbar = append(boxSection, node(doc, "div", undefined, "box-toolbar"));
@@ -203,11 +219,12 @@
     if (!boxes.length) {
       append(boxSection, node(doc, "p", snapshot.catalog_available === false
         ? "Сохранённые результаты сейчас недоступны."
+        : groups.length ? "Обходы объединены в семейства выше. Точные решения вне семейств появятся здесь."
         : "Пока нет сохранённых обходов. D2K добавит результат, когда проверит, что он работает.",
         snapshot.catalog_available === false ? "empty-state empty-warning" : "empty-state"));
     } else {
       var boxList = append(boxSection, node(doc, "div", undefined, "box-list"));
-      boxes.forEach(function (box, index) { renderBox(doc, boxList, box, index); });
+      boxes.forEach(function (box, index) { renderBox(doc, boxList, box, index, familyEvidence); });
       filterBoxes(rootNode, currentFilter);
       if (rootNode.addEventListener && !rootNode.__d2kFilterBound) {
         rootNode.__d2kFilterBound = true;
@@ -388,7 +405,44 @@
     if (search.candidate) append(detail, node(doc, "p", "Текущий вариант: " + search.candidate));
   }
 
-  function renderBox(doc, parent, box, index) {
+  function bindingFamilyKey(binding) {
+    return JSON.stringify([String(binding.target || "").toLowerCase(),
+      binding.transport || 6, binding.family || 4, binding.shape || 0, binding.plan_id || ""]);
+  }
+
+  function renderFamily(doc, parent, group, linked) {
+    var item = append(parent, node(doc, "article", undefined, "family-item"));
+    var head = append(item, node(doc, "header", undefined, "family-header"));
+    heading(doc, head, 3, group.suffix);
+    append(head, node(doc, "span", linked && group.active ? "Применяется" : "Сохранено, применение не подтверждено",
+      "family-state"));
+    var shape = group.shape === 1 ? "TLS 1.3" : group.shape === 2 ? "TLS 1.2" :
+      group.shape === 3 ? "QUIC" : group.shape === 6 ? "TLS 1.3 с ECH" : "Протокол не указан";
+    append(item, node(doc, "p", shape + " · " + (group.family === 6 ? "IPv6" : "IPv4") + " · " +
+      russianCount(group.evidence_count, "исходное подтверждение", "исходных подтверждения", "исходных подтверждений"),
+      "family-context"));
+    var details = append(item, node(doc, "details", undefined, "family-detail"));
+    details.setAttribute("data-ui-key", "family:" + JSON.stringify([group.suffix, group.transport,
+      group.family, group.shape, group.probe_path, group.ech_origin]));
+    append(details, node(doc, "summary", "Основания и исключения"));
+    append(details, node(doc, "p", "План: " + (group.plan_id || "не записан")));
+    if (group.probe_path) append(details, node(doc, "p", "Проверенный путь: " + group.probe_path));
+    if (group.ech_origin) append(details, node(doc, "p", "ECH-origin: " + group.ech_origin));
+    var evidence = Array.isArray(group.evidence) ? group.evidence : [];
+    if (evidence.length) {
+      append(details, node(doc, "p", "Собственные измерения, на которых обучена область:"));
+      var list = append(details, node(doc, "ul"));
+      evidence.forEach(function (name) { if (typeof name === "string") append(list, node(doc, "li", name)); });
+    }
+    var exceptions = Array.isArray(group.exceptions) ? group.exceptions.filter(function (e) { return e && e.name; }) : [];
+    if (exceptions.length) {
+      append(details, node(doc, "p", "Исключения не используют общий обход:"));
+      var excluded = append(details, node(doc, "ul"));
+      exceptions.forEach(function (e) { append(excluded, node(doc, "li", e.name + " — " + (e.reason || "отдельное решение"))); });
+    }
+  }
+
+  function renderBox(doc, parent, box, index, familyEvidence) {
     var article = append(parent, node(doc, "article", undefined, "box-item"));
     var head = append(article, node(doc, "header", undefined, "box-header"));
     var identity = append(head, node(doc, "div"));
@@ -415,7 +469,9 @@
     }
     var targets = append(article, node(doc, "div", undefined, "target-list"));
     heading(doc, targets, 4, "Адреса и обходы");
-    (Array.isArray(box.bindings) ? box.bindings : []).forEach(function (binding) {
+    (Array.isArray(box.bindings) ? box.bindings : []).filter(function (binding) {
+      return !familyEvidence || !familyEvidence[bindingFamilyKey(binding)];
+    }).forEach(function (binding) {
       var row = append(targets, node(doc, "div", undefined, "target-row" + (binding.enabled ? "" : " target-disabled")));
       var target = append(row, node(doc, "div", undefined, "target-identity"));
       append(target, node(doc, "strong", binding.target || "цель не названа", "target-name"));

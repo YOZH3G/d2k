@@ -229,6 +229,16 @@ button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visibl
 .target-row { display: grid; grid-template-columns: minmax(170px, 1.5fr) minmax(220px, 1.3fr) auto auto; align-items: center; gap: 12px; min-height: 49px; border-top: 1px solid #eff2ef; }
 .target-identity { display: grid; gap: 1px; min-width: 0; }
 .target-name { overflow-wrap: anywhere; font-size: 12px; font-weight: 620; }
+.family-list { display: grid; gap: 12px; }
+.family-item { padding: 18px 20px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+.family-header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 20px; }
+.family-header h3 { margin: 0; font-size: 16px; font-weight: 650; overflow-wrap: anywhere; }
+.family-state, .family-context { color: var(--ink-2); font-size: 12px; }
+.family-context { margin: 7px 0 13px; }
+.family-detail { color: var(--ink-2); overflow-wrap: anywhere; }
+.family-detail summary { cursor: pointer; }
+.family-detail p { margin: 12px 0 6px; }
+.family-detail ul { margin: 6px 0; padding-left: 20px; }
 .target-kind { color: var(--muted); font-size: 9px; }
 .target-disabled .target-name { color: var(--muted); text-decoration: line-through; }
 .evidence { display: flex; align-items: center; gap: 8px; }

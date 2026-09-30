@@ -112,6 +112,10 @@ static void test_api_exposes_live_knowledge(void) {
     assert(strstr(response, "\"unknown_keys\":[\"FUTURE_OPTION\"]") != NULL);
     assert(strstr(response, "\"linked\":true") != NULL);
     assert(strstr(response, "\"live_fresh\":true") != NULL);
+    rewrite_file(live, "{\"linked\":true,\"boxes\":[],\"groups\":[{\"suffix\":\"googlevideo.com\",\"shape\":1,\"active\":true,\"exceptions\":[{\"name\":\"clean.googlevideo.com\"}]}]}");
+    (void)request(&cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n", response, sizeof response);
+    assert(strstr(response, "\"groups\":[") != NULL);
+    assert(strstr(response, "clean.googlevideo.com") != NULL);
     assert(strstr(response, "Content-Security-Policy:") != NULL);
     cfg.engine_pid_path = "/tmp/d2k-panel-no-such-engine.pid";
     cfg.controller_pid_path = "/tmp/d2k-panel-no-such-controller.pid";

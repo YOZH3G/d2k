@@ -217,4 +217,30 @@ render(dual, dualState, document);
 const restored = dual.walk().filter(x => x.className === 'search-detail');
 assert.equal(restored[0].open, true);
 assert.equal(restored[1].open, false, 'opening IPv4 details must not open IPv6 details after refresh');
+const families = new Element('main');
+const familyState = {
+  snapshot: { engine_running: true, controller_running: true, live_fresh: true, controls_enabled: true },
+  knowledge: { linked: true, groups: [{ suffix: 'googlevideo.com', family: 4, transport: 6, shape: 1,
+    plan_id: 'plan-own', evidence_count: 3, active: true, evidence: ['rr-a.googlevideo.com'],
+    exceptions: [{ name: '<img src=x onerror=alert(1)>', reason: 'Напрямую работает' }] }],
+    boxes: [{ id: 'one', bindings: [
+      { target: 'rr-a.googlevideo.com', transport: 6, family: 4, shape: 1, plan_id: 'plan-own', enabled: true },
+      { target: 'meet.google.com', transport: 6, family: 4, shape: 1, plan_id: 'plan-other', enabled: true },
+    ] }], searches: [], targets: 2 },
+};
+render(families, familyState, document);
+assert.match(families.textContent, /Семейства доменов/);
+assert.match(families.textContent, /Новые поддомены сразу получают этот обход/);
+assert.match(families.textContent, /TLS 1\.3/);
+assert.equal(families.walk().filter(x => x.className === 'family-item').length, 1);
+assert.equal(families.walk().filter(x => x.className === 'target-name').length, 1,
+  'learned evidence is disclosed with its family, not duplicated as individual CDN rows');
+assert.match(families.textContent, /meet.google.com/, 'independent exact service stays visible');
+assert.match(families.textContent, /<img src=x onerror=alert\(1\)>/);
+assert.equal(families.walk().some(x => x.usedInnerHTML), false, 'group data is never HTML');
+assert.equal(families.walk().filter(x => x.attributes['data-control']).length, 5,
+  'adding families preserves existing service actions');
+render(families, { snapshot: {}, knowledge: { groups: { invalid: true }, boxes: [] } }, document);
+assert.equal(families.walk().filter(x => x.className === 'family-item').length, 0,
+  'invalid/old group snapshots render safely');
 console.log('C panel DOM renderer: all checks passed');

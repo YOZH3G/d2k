@@ -1142,6 +1142,17 @@ int main(int argc, char **argv) {
         d2k_ev ack = {0}; ack.kind = D2K_EV_ACK; ack.code = D2K_CMD_SET_SUFFIX; ack.num = 1u << 8;
         d2k_sched_event(s, &ack); sync_out(s);
         CHECK(!d2k_sched_sync_pending(s), "positive suffix ACK completes sync");
+        char live_path[] = "/tmp/d2k-family-live-XXXXXX";
+        int live_fd = mkstemp(live_path); CHECK(live_fd >= 0, "family live fixture");
+        if (live_fd >= 0) {
+            close(live_fd);
+            CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "family live write");
+            FILE *live = fopen(live_path, "r"); char body[32768] = {0};
+            if (live) { fread(body, 1, sizeof body-1, live); fclose(live); }
+            CHECK(strstr(body, "\"groups\"") && strstr(body, "\"suffix\": \"googlevideo.com\"") &&
+                  strstr(body, "\"active\": true"), "live exposes actual ACKed area, not individual inheritance proofs");
+            unlink(live_path);
+        }
         drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
         CHECK(!sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) &&
               !sent_command_count(D2K_CMD_DEL_SUFFIX, NULL, 0), "unchanged group never withdrawn or resent");

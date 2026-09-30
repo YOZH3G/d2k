@@ -974,11 +974,14 @@ static int handle_catalog_key(jctx *j, const char *key, void *ctx, int depth, ch
         return parse_array(j, (void **)&out->boxes, &out->n_boxes, &cap,
                             sizeof(d2k_cat_box), elem_box, "boxes", depth + 1, err, errcap);
     }
-    if(!strcmp(key,"domain_observations") || !strcmp(key,"domain_groups_frozen")) {
+    if(!strcmp(key,"domain_observations") || !strcmp(key,"domain_groups_frozen") ||
+       !strcmp(key,"domain_groups_disabled")) {
         if(!out->groups) out->groups=calloc(1,sizeof *out->groups);
         if(!out->groups) { set_err(err,errcap,"memory: domain groups"); return -1; }
         if(!strcmp(key,"domain_groups_frozen"))
             return jparse_bool_i(j,&out->groups->frozen,"domain_groups_frozen",err,errcap);
+        if(!strcmp(key,"domain_groups_disabled"))
+            return jparse_bool_i(j,&out->groups->disabled,"domain_groups_disabled",err,errcap);
         return parse_domain_observations(j,out->groups,depth+1,err,errcap);
     }
     /* domain_groups is a human-readable derived snapshot, never authority
@@ -1328,6 +1331,7 @@ int d2k_catalog_save(const d2k_catalog *c, const char *path, char *err, size_t e
         fputs(",\n  \"domain_observations\": ",f);
         write_json_array(f,c->groups->observations,c->groups->n_observations,sizeof(d2k_group_observation),write_domain_observation,1);
         fprintf(f,",\n  \"domain_groups_frozen\": %s",c->groups->frozen?"true":"false");
+        fprintf(f,",\n  \"domain_groups_disabled\": %s",c->groups->disabled?"true":"false");
     }
     fputs("\n}\n", f);
 

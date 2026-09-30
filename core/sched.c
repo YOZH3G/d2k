@@ -2907,6 +2907,8 @@ static const char *task_phase(const task *t) {
     }
 }
 
+static void write_live_groups(FILE *f, const d2k_sched *s);
+
 int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_path) {
     if (!s || !path) { return -1; }
     char tmp[512];
@@ -2970,6 +2972,7 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
     }
     fputs(s->cat->n_boxes ? "\n  ],\n" : "],\n", f);
 
+    write_live_groups(f, s);
     fputs("  \"searches\": [", f);
     int first = 1;
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
@@ -3144,6 +3147,47 @@ static int desired_has_key(const d2k_sched *s, const installed_area *a) {
     for (size_t i = 0; i < g->n_groups+g->n_observations; i++)
         if (desired_area(s, i, &d) && area_key_same(a, &d)) return 1;
     return 0;
+}
+
+static void write_live_groups(FILE *f, const d2k_sched *s) {
+    const d2k_group_state *state = s->cat->groups;
+    fputs("  \"groups\": [", f);
+    size_t count = state ? state->n_groups : 0;
+    for (size_t i = 0; i < count; i++) {
+        const d2k_domain_group *g = &state->groups[i];
+        fputs(i ? ",\n    {\"suffix\": " : "\n    {\"suffix\": ", f); json_str(f, g->suffix);
+        fprintf(f, ", \"transport\": %u, \"family\": %u, \"shape\": %u, \"evidence_count\": %u",
+            g->key.transport, g->key.family, g->key.shape, g->evidence_count);
+        fputs(", \"plan_id\": ", f); json_str(f, g->plan_id);
+        fputs(", \"probe_path\": ", f); json_str(f, g->key.probe_path);
+        fputs(", \"ech_origin\": ", f); json_str(f, g->key.ech_origin);
+        installed_area a; int active = 0;
+        if (desired_area(s, i, &a)) {
+            for (size_t j = 0; j < s->n_areas; j++)
+                if (area_key_same(&a, &s->areas[j]) && !strcmp(a.plan_id, s->areas[j].plan_id)) active = 1;
+        }
+        fprintf(f, ", \"active\": %s, \"evidence\": [", active ? "true" : "false");
+        int first = 1;
+        for (size_t j = 0; j < state->n_observations; j++) {
+            const d2k_group_observation *o = &state->observations[j];
+            if (!(o->evidence & D2K_GROUP_BLOCKED_CONFIRMED) ||
+                !d2k_group_key_same(&g->key, &o->key) || strcmp(g->plan_id, o->plan_id) ||
+                !d2k_domain_member(o->name, g->suffix)) continue;
+            if (!first) fputs(", ", f); first = 0; json_str(f, o->name);
+        }
+        fputs("], \"exceptions\": [", f); first = 1;
+        for (size_t j = 0; j < state->n_observations; j++) {
+            const d2k_group_observation *o = &state->observations[j];
+            if (!(o->evidence & (D2K_GROUP_DIRECT_CLEAR | D2K_GROUP_PLAN_FAILED)) ||
+                !d2k_group_key_same(&g->key, &o->key) || !d2k_domain_member(o->name, g->suffix)) continue;
+            if (!first) fputs(", ", f); first = 0;
+            fputs("{\"name\": ", f); json_str(f, o->name);
+            fputs(", \"reason\": ", f); json_str(f, o->evidence & D2K_GROUP_DIRECT_CLEAR ?
+                "Напрямую работает" : "Общий план не подошёл"); fputc('}', f);
+        }
+        fputs("]}", f);
+    }
+    fputs(count ? "\n  ],\n" : "],\n", f);
 }
 
 /* One outstanding area command: ACK has command type, no target identity.

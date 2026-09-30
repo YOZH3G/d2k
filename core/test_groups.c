@@ -95,6 +95,31 @@ int main(void) {
     CHECK(!d2k_group_match(s,"overflow-clean.googlevideo.com",&modern));
     CHECK(d2k_group_match(s,"rr-new.googlevideo.com",&modern));
     CHECK(s->n_observations==D2K_GROUP_OBSERVATION_MAX);
+    observe(s,"rr2.googlevideo.com","",2,modern);
+    CHECK(d2k_group_match(s,"rr-new.googlevideo.com",&modern));
+    CHECK(!d2k_group_match(s,"rr2.googlevideo.com",&modern));
+    observe(s,"rr3.googlevideo.com","",2,modern);
+    CHECK(d2k_group_match(s,"rr-new.googlevideo.com",&modern));
+    /* A full budget of exceptions can still contain historic positive votes.
+       Never keep an area active when a new exclusion cannot be retained. */
+    memset(s,0,sizeof *s);
+    for(int i=0;i<3;i++) {
+        char name[256]; snprintf(name,sizeof name,"h%d.googlevideo.com",i);
+        observe(s,name,"plan-a",1,modern);
+    }
+    for(int i=0;i<3;i++) {
+        char name[256]; snprintf(name,sizeof name,"h%d.googlevideo.com",i);
+        observe(s,name,"plan-a",4,modern);
+    }
+    for(int i=3;i<D2K_GROUP_OBSERVATION_MAX;i++) {
+        char name[256]; snprintf(name,sizeof name,"clean%d.example.net",i);
+        observe(s,name,"",2,modern);
+    }
+    CHECK(d2k_group_match(s,"new.googlevideo.com",&modern));
+    observe(s,"unrecordable.googlevideo.com","",2,modern);
+    CHECK(s->n_groups==0);
+    CHECK(!d2k_group_match(s,"new.googlevideo.com",&modern));
+    CHECK(d2k_group_restore(s)==0 && s->n_groups==0);
     free(s);
     if(!failed) puts("groups: passed");
     return failed?1:0;
