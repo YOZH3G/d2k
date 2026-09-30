@@ -13,7 +13,8 @@ static int valid(const d2k_group_observation *o) {
        !memchr(o->key.probe_path,0,sizeof o->key.probe_path) ||
        !memchr(o->key.ech_origin,0,sizeof o->key.ech_origin)) return 0;
     if((o->key.family!=4 && o->key.family!=6) ||
-       (o->key.transport!=6 && o->key.transport!=17) || !o->key.shape) return 0;
+       !((o->key.transport==6 && (o->key.shape==1 || o->key.shape==2 || o->key.shape==6)) ||
+         (o->key.transport==17 && o->key.shape==3))) return 0;
     if(o->evidence!=1 && o->evidence!=2 && o->evidence!=4 && o->evidence!=8) return 0;
     return (o->evidence!=D2K_GROUP_BLOCKED_CONFIRMED &&
             o->evidence!=D2K_GROUP_PLAN_FAILED) || o->plan_id[0];
@@ -29,7 +30,8 @@ static unsigned votes(const d2k_group_state *s,const char *suffix,
     for(size_t i=0;i<s->n_observations;i++) {
         const d2k_group_observation *o=&s->observations[i];
         if(!d2k_group_key_same(&o->key,&seed->key) || !member(o->name,suffix)) continue;
-        if(o->evidence&D2K_GROUP_DIRECT_CLEAR) return 0;
+        if((o->evidence&D2K_GROUP_DIRECT_CLEAR) &&
+           !(o->evidence&D2K_GROUP_ADMITTED_EXCEPTION)) return 0;
         if((o->evidence&D2K_GROUP_BLOCKED_CONFIRMED) && strcmp(o->name,suffix) &&
            !strcmp(o->plan_id,seed->plan_id)) {
             n++; if(o->at>*latest) *latest=o->at;
@@ -87,19 +89,39 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
     if(!s || !valid(o) || d2k_domain_normalize(o->name,name) ||
        d2k_domain_base(name,base) || s->n_groups>D2K_GROUP_MAX ||
        s->n_observations>D2K_GROUP_OBSERVATION_MAX) return -1;
+    int admitted_clear=o->evidence==D2K_GROUP_DIRECT_CLEAR &&
+        d2k_group_match(s,name,&o->key)!=NULL;
     size_t slot=s->n_observations;
     for(size_t i=0;i<s->n_observations;i++)
         if(!strcmp(s->observations[i].name,name) &&
            d2k_group_key_same(&s->observations[i].key,&o->key)) { slot=i; break; }
     if(slot==s->n_observations) {
         if(s->frozen || slot==D2K_GROUP_OBSERVATION_MAX) {
-            int changed=!s->frozen; s->frozen=1; return changed;
+            int changed=!s->frozen; s->frozen=1;
+            if(o->evidence!=D2K_GROUP_DIRECT_CLEAR && o->evidence!=D2K_GROUP_PLAN_FAILED)
+                return changed;
+            /* A bounded budget must never discard a new exclusion while
+             * retaining a broad rule. Reclaim unknown evidence first, then
+             * a positive vote; never evict any negative evidence. Exact
+             * confirmed catalog bindings are independent and untouched. */
+            size_t reclaim=s->n_observations;
+            for(size_t i=0;i<s->n_observations;i++) {
+                if(s->observations[i].evidence==D2K_GROUP_INCONCLUSIVE) { reclaim=i; break; }
+                if(reclaim==s->n_observations &&
+                   s->observations[i].evidence==D2K_GROUP_BLOCKED_CONFIRMED) reclaim=i;
+            }
+            if(reclaim==s->n_observations) return changed; /* only exclusions remain: no group votes */
+            slot=reclaim;
+            s->observations[slot]=*o; strcpy(s->observations[slot].name,name);
+        } else {
+            s->observations[slot]=*o; strcpy(s->observations[slot].name,name);
+            s->n_observations++;
         }
-        s->observations[slot]=*o; strcpy(s->observations[slot].name,name);
-        s->n_observations++;
     } else {
         d2k_group_observation *old=&s->observations[slot];
         if(o->at<old->at || o->evidence==D2K_GROUP_INCONCLUSIVE) return 0;
+        if(o->evidence==D2K_GROUP_DIRECT_CLEAR &&
+           (old->evidence&D2K_GROUP_ADMITTED_EXCEPTION)) admitted_clear=1;
         /* Execution failure becomes an exception, not erasure of a historic
            successful vote: other group members keep their bypass. */
         if(o->evidence==D2K_GROUP_PLAN_FAILED) {
@@ -107,6 +129,7 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
             old->evidence|=D2K_GROUP_PLAN_FAILED; old->at=o->at;
         } else { *old=*o; strcpy(old->name,name); }
     }
+    if(admitted_clear) s->observations[slot].evidence |= D2K_GROUP_ADMITTED_EXCEPTION;
     if(o->evidence!=D2K_GROUP_INCONCLUSIVE) rebuild(s);
     return 1;
 }
@@ -116,6 +139,8 @@ int d2k_group_restore(d2k_group_state *s) {
         d2k_group_observation *o=&s->observations[i], test=*o;
         if(test.evidence==(D2K_GROUP_BLOCKED_CONFIRMED|D2K_GROUP_PLAN_FAILED))
             test.evidence=D2K_GROUP_BLOCKED_CONFIRMED;
+        if(test.evidence==(D2K_GROUP_DIRECT_CLEAR|D2K_GROUP_ADMITTED_EXCEPTION))
+            test.evidence=D2K_GROUP_DIRECT_CLEAR;
         char norm[256],base[256];
         if(!valid(&test) || o->at<0 || d2k_domain_normalize(o->name,norm) ||
            d2k_domain_base(norm,base)) return -1;

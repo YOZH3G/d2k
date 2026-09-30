@@ -14,6 +14,9 @@ enum {
     D2K_GROUP_PLAN_FAILED=4,
     D2K_GROUP_INCONCLUSIVE=8
 };
+/* Additional provenance bit: clean evidence found after area admission.
+ * It blocks this exact member, not already learned unrelated siblings. */
+#define D2K_GROUP_ADMITTED_EXCEPTION 16u
 typedef struct {
     char name[256], plan_id[40];
     d2k_group_key key;

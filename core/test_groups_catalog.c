@@ -38,6 +38,14 @@ int main(void) {
     CHECK(b.groups && !d2k_group_match(b.groups,"rr0.googlevideo.com",&key));
     CHECK(b.n_boxes==1 && b.boxes[0].n_plans==1);
     d2k_catalog_free(&b);
+    memset(&o,0,sizeof o); strcpy(o.name,"clean.googlevideo.com");
+    o.key=key; o.evidence=2; o.at=125;
+    CHECK(d2k_group_learn(a.groups,&o)==1);
+    CHECK(d2k_catalog_save(&a,path,err,sizeof err)==0);
+    CHECK(d2k_catalog_load(path,&b,err,sizeof err)==0);
+    CHECK(b.groups && d2k_group_match(b.groups,"new.googlevideo.com",&key));
+    CHECK(b.groups && !d2k_group_match(b.groups,"clean.googlevideo.com",&key));
+    d2k_catalog_free(&b);
     a.groups->frozen=1;
     CHECK(d2k_catalog_save(&a,path,err,sizeof err)==0);
     CHECK(d2k_catalog_load(path,&b,err,sizeof err)==0 && b.groups && b.groups->frozen);

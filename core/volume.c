@@ -278,6 +278,7 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
                                                   hello_wire, tls12, 0, mark, path);
     res->rx_tls_unavailable = a.level == D2K_VER_TRANSPORT && a.status == 0;
     if (a.body_complete && a.status >= 200 && a.status < 300 && a.name_ok != 0) {
+        res->rx_direct_complete = a.name_ok == 1 && a.level == D2K_VER_APPLICATION;
         memcpy(res->resources, a.resources, sizeof res->resources);
         res->n_resources = a.n_resources;
     }

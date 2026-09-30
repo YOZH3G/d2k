@@ -63,9 +63,12 @@ int main(void) {
     observe(s,"b.mixed.net","plan-b",1,modern);
     observe(s,"c.mixed.net","plan-c",1,modern);
     CHECK(!d2k_group_match(s,"new.mixed.net",&modern));
-    /* A new clean observation must actually retract a previously broad area. */
+    /* A proven clean member becomes an exception, not a family-wide outage. */
     observe(s,"clean.googlevideo.com","",2,modern);
-    CHECK(!d2k_group_match(s,"rr-new.googlevideo.com",&modern));
+    CHECK(d2k_group_match(s,"rr-new.googlevideo.com",&modern));
+    CHECK(!d2k_group_match(s,"clean.googlevideo.com",&modern));
+    observe(s,"clean.googlevideo.com","",2,modern);
+    CHECK(d2k_group_match(s,"rr-new.googlevideo.com",&modern));
     observe(s,"clean.googlevideo.com","plan-a",1,modern);
     CHECK(d2k_group_match(s,"rr-new.googlevideo.com",&modern));
     d2k_group_observation invalid={0};
@@ -73,6 +76,11 @@ int main(void) {
     invalid.evidence=1;
     CHECK(d2k_group_learn(s,&invalid)==-1); /* no authenticated plan */
     strcpy(invalid.plan_id,"plan-a");
+    invalid.key.shape=255;
+    CHECK(d2k_group_learn(s,&invalid)==-1);
+    invalid.key=modern; invalid.key.transport=17;
+    CHECK(d2k_group_learn(s,&invalid)==-1);
+    invalid.key=modern;
     memset(invalid.name,'x',sizeof invalid.name);
     CHECK(d2k_group_learn(s,&invalid)==-1); /* no NUL */
     for(int i=0;s->n_observations<D2K_GROUP_OBSERVATION_MAX;i++) {
@@ -83,6 +91,10 @@ int main(void) {
     CHECK(s->frozen && s->n_observations==D2K_GROUP_OBSERVATION_MAX);
     CHECK(d2k_group_match(s,"rr-new.googlevideo.com",&modern));
     CHECK(!d2k_group_match(s,"unknown.fill.example.net",&modern));
+    observe(s,"overflow-clean.googlevideo.com","",2,modern);
+    CHECK(!d2k_group_match(s,"overflow-clean.googlevideo.com",&modern));
+    CHECK(d2k_group_match(s,"rr-new.googlevideo.com",&modern));
+    CHECK(s->n_observations==D2K_GROUP_OBSERVATION_MAX);
     free(s);
     if(!failed) puts("groups: passed");
     return failed?1:0;

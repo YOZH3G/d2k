@@ -67,6 +67,7 @@ typedef struct {
     char     reason[160]; /* человеческая причина, заполняется всегда */
     char     rx_reason[200]; /* отдельный исход GET, даже если TX не дошёл до TLS */
     int      rx_tls_unavailable; /* прямой GET не дошёл до TLS; RX-тела ещё не измерить */
+    int      rx_direct_complete; /* identity response fully received with matching certificate */
     d2k_resource resources[D2K_RESOURCE_COUNT];
     size_t n_resources;
 } d2k_vol_result;

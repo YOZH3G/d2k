@@ -174,6 +174,7 @@ static int vol_calls;
 static d2k_vol_verdict vol_answer = D2K_VOL_PASSED;
 static int vol_rx_cut;
 static int vol_rx_tls_unavailable;
+static int vol_direct_complete;
 static int resource_fixture;
 static int resource_volume_calls, resource_verify_calls;
 
@@ -189,6 +190,7 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     r.at_kb = 20;
     r.rx_cut = vol_rx_cut;
     r.rx_tls_unavailable = vol_rx_tls_unavailable;
+    r.rx_direct_complete = vol_direct_complete;
     r.rx_at_kb = 24;
     r.rx_expected_kb = 96;
     r.rx_compressed_complete = vol_rx_cut;
@@ -1063,7 +1065,8 @@ int main(int argc, char **argv) {
     int admission_only = argc == 2 && strcmp(argv[1], "--admission-only") == 0;
     int question_only = argc == 2 && strcmp(argv[1], "--question-only") == 0;
     int shape_only = argc == 2 && strcmp(argv[1], "--shape-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only) {
+    int groups_only = argc == 2 && strcmp(argv[1], "--groups-only") == 0;
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only) {
         fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only]\n");
         return 2;
     }
@@ -1115,6 +1118,62 @@ int main(int argc, char **argv) {
 
     d2k_catalog cat;
     memset(&cat, 0, sizeof cat);
+    if (groups_only) {
+        tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        d2k_catalog c = {0};
+        confirm_once(&c, sv[0], "rr-a.googlevideo.com", 40301);
+        confirm_once(&c, sv[0], "rr-b.googlevideo.com", 40302);
+        confirm_once(&c, sv[0], "rr-c.googlevideo.com", 40303);
+        d2k_group_key key = {0}; key.transport = 6; key.family = 4; key.shape = 1;
+        strcpy(key.probe_path, "/");
+        const d2k_domain_group *g = d2k_group_match(c.groups, "rr-new.googlevideo.com", &key);
+        CHECK(g && !strcmp(g->suffix, "googlevideo.com"), "three own blocking outcomes teach shared area");
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_calls = vol_calls = ver_calls = 0;
+        d2k_ev h = ev_hello(6, 40304, "rr-new.googlevideo.com");
+        d2k_sched_event(s, &h); spin(s, 5);
+        CHECK(!d2k_sched_active(s) && !tcp_calls && !vol_calls && !ver_calls,
+              "new member hello launches no measure or verification");
+        CHECK(!binding_of(&c, "rr-new.googlevideo.com", 6), "new member creates no individual binding");
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) == 1, "restart sync installs learned suffix");
+        CHECK(g && sent_has(g->plan_id), "suffix carries its own nonzero Plan ID");
+        CHECK(d2k_sched_sync_pending(s), "suffix write waits for ACK");
+        d2k_ev ack = {0}; ack.kind = D2K_EV_ACK; ack.code = D2K_CMD_SET_SUFFIX; ack.num = 1u << 8;
+        d2k_sched_event(s, &ack); sync_out(s);
+        CHECK(!d2k_sched_sync_pending(s), "positive suffix ACK completes sync");
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        CHECK(!sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) &&
+              !sent_command_count(D2K_CMD_DEL_SUFFIX, NULL, 0), "unchanged group never withdrawn or resent");
+        d2k_group_observation failed = {0};
+        strcpy(failed.name, "rr-new.googlevideo.com"); strcpy(failed.plan_id, g->plan_id);
+        failed.key = key; failed.evidence = D2K_GROUP_PLAN_FAILED; failed.at = g->at+1;
+        CHECK(d2k_group_learn(c.groups, &failed) > 0, "targeted member failure recorded");
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) == 1 &&
+              !sent_command_count(D2K_CMD_DEL_SUFFIX, NULL, 0), "one exception does not withdraw family");
+        ack.code = D2K_CMD_SET_BYPASS; ack.num = D2K_ACK_NO_ROOM;
+        d2k_sched_event(s, &ack); sync_out(s);
+        CHECK(!d2k_sched_sync_pending(s), "negative area ACK ends sync explicitly");
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) == 1, "negative ACK was not remembered as installed");
+        ack.num = 1u << 8; d2k_sched_event(s, &ack); sync_out(s);
+        CHECK(d2k_group_match(c.groups, "rr-other.googlevideo.com", &key), "other members retain learned plan");
+        tcp_answer = D2K_V_CLEAR; vol_direct_complete = 1;
+        h = ev_hello(6, 40305, "clean.googlevideo.com"); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40305); d2k_sched_event(s, &su); settle(s);
+        CHECK(d2k_group_match(c.groups, "rr-other.googlevideo.com", &key), "direct clean exception preserves family");
+        CHECK(!d2k_group_match(c.groups, "clean.googlevideo.com", &key), "complete direct application records bypass exception");
+        vol_direct_complete = 0;
+        h = ev_hello(6, 40306, "unfit.googlevideo.com"); d2k_sched_event(s, &h);
+        d2k_ev refusal = h; refusal.kind = D2K_EV_REFUSED; refusal.code = D2K_REFUSE_TOO_LONG;
+        memset(refusal.plan_id, 0, sizeof refusal.plan_id);
+        memcpy(refusal.plan_id, failed.plan_id, strlen(failed.plan_id));
+        d2k_sched_event(s, &refusal);
+        CHECK(d2k_sched_active(s) > 0, "real inherited plan refusal starts targeted diagnosis");
+        d2k_sched_free(s); d2k_catalog_free(&c); close(sv[0]); close(sv[1]);
+        return fails ? 1 : 0;
+    }
     uint8_t question_prev_id[D2K_PLAN_ID_LEN] = {0};
     if (rx_only) { goto rx_volume_tests; }
     if (question_only) { goto question_test; }

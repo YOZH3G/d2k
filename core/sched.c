@@ -66,6 +66,7 @@
 #include "d2k_sched.h"
 #include "d2k_verify.h"
 #include "d2k_volume.h"
+#include "d2k_domain.h"
 #include "d2k_meas.h"
 
 /* --------------------------------------------------------------------
@@ -597,6 +598,7 @@ typedef struct {
     unsigned   rx_phase; /* 0 identity candidate, 1 repeat, 2 gzip control */
     int        rx_bootstrap_only; /* measure an already confirmed target plan */
     int        family_reuse; /* 1 baseline pending, 2 isolated trial, 3 exhausted */
+    int        group_block_proven;
     int        skip_volume_once; /* resume classifier with existing baseline */
     char       measure_path[512]; /* selected before worker start, never guessed from ciphertext */
     int        ech_offer;
@@ -671,6 +673,11 @@ typedef struct {
     int        used;
 } target_cooldown;
 
+typedef struct {
+    char name[256], plan_id[40];
+    uint8_t kind, transport, shape, family;
+} installed_area;
+
 struct d2k_sched {
     d2k_catalog *cat;
     int          link_fd;
@@ -700,6 +707,12 @@ struct d2k_sched {
     size_t       sync_box, sync_bind;
     int          sync_active, sync_pending, sync_sent, sync_skipped;
     int          sync_weak;   /* привязки, чьё доказательство слабее обмена */
+    installed_area *areas;
+    size_t n_areas;
+    installed_area area_pending;
+    uint16_t area_command;
+    int64_t area_deadline_ms;
+    int area_sync_failed;
 
     /* Сколько событий датапат потерял к последнему отчёту. Нужно затем, что
        МОЛЧАНИЕ — не доказательство: пропавший обмен неотличим от «плана не
@@ -3009,6 +3022,7 @@ void d2k_sched_free(d2k_sched *s) {
     pthread_mutex_destroy(&s->mu);
     if (s->wake[0] >= 0) { close(s->wake[0]); }
     if (s->wake[1] >= 0) { close(s->wake[1]); }
+    free(s->areas);
     free(s);
 }
 
@@ -3051,6 +3065,7 @@ int d2k_sched_sync(d2k_sched *s) {
     s->sync_sent = 0;
     s->sync_skipped = 0;
     s->sync_weak = 0;
+    s->area_sync_failed = 0;
     return 0;
 }
 
@@ -3078,6 +3093,129 @@ static int newer_name_binding(const d2k_catalog *cat, const d2k_cat_binding *bd)
                 (other->transport == 17 && other->verified_by == D2K_VERBY_CLIENT)) continue;
             const d2k_cat_plan *plan = plan_by_id(box, other->plan_id);
             if (plan && plan->text) return 1;
+        }
+    }
+    return 0;
+}
+
+static int area_key_same(const installed_area *a, const installed_area *b) {
+    return a->kind == b->kind && a->transport == b->transport &&
+        a->shape == b->shape && a->family == b->family && !strcmp(a->name, b->name);
+}
+
+static const d2k_cat_plan *area_plan(const d2k_sched *s, const installed_area *a) {
+    for (size_t i = 0; i < s->cat->n_boxes; i++) {
+        const d2k_cat_plan *p = plan_by_id(&s->cat->boxes[i], a->plan_id);
+        if (p && p->text && !strcmp(p->proto, a->transport == 17 ? "quic" : "tls")) return p;
+    }
+    return NULL;
+}
+
+/* Diagnostic paths/origins are proof context, not visible packet fields.
+ * Never pick an arbitrary plan when two proofs collide on a wire key. */
+static int desired_area(const d2k_sched *s, size_t index, installed_area *a) {
+    const d2k_group_state *g = s->cat->groups;
+    if (!g || index >= g->n_groups+g->n_observations) return 0;
+    memset(a, 0, sizeof *a);
+    if (index < g->n_groups) {
+        const d2k_domain_group *v = &g->groups[index];
+        a->kind = 1; strcpy(a->name, v->suffix); strcpy(a->plan_id, v->plan_id);
+        a->transport = v->key.transport; a->shape = v->key.shape; a->family = v->key.family;
+        if (!area_plan(s, a)) return 0;
+        for (size_t i = 0; i < g->n_groups; i++) {
+            const d2k_domain_group *other = &g->groups[i];
+            if (i != index && other->key.transport == a->transport &&
+                other->key.shape == a->shape && other->key.family == a->family &&
+                !strcmp(other->suffix, a->name) && strcmp(other->plan_id, a->plan_id)) return 0;
+        }
+    } else {
+        const d2k_group_observation *v = &g->observations[index-g->n_groups];
+        if (!(v->evidence & (D2K_GROUP_DIRECT_CLEAR | D2K_GROUP_PLAN_FAILED))) return 0;
+        a->kind = 2; strcpy(a->name, v->name);
+        a->transport = v->key.transport; a->shape = v->key.shape; a->family = v->key.family;
+    }
+    return 1;
+}
+
+static int desired_has_key(const d2k_sched *s, const installed_area *a) {
+    const d2k_group_state *g = s->cat->groups;
+    if (!g) return 0;
+    installed_area d;
+    for (size_t i = 0; i < g->n_groups+g->n_observations; i++)
+        if (desired_area(s, i, &d) && area_key_same(a, &d)) return 1;
+    return 0;
+}
+
+/* One outstanding area command: ACK has command type, no target identity.
+ * Remember installed state only after positive ACK, never after write(). */
+static int sync_area_send(d2k_sched *s, const installed_area *a, int remove) {
+    char err[200], hex[2*D2K_PLAN_TLV_MAX+1]; int rc;
+    uint16_t cmd;
+    if (a->kind == 1 && !remove) {
+        const d2k_cat_plan *p = area_plan(s, a);
+        char wire[sizeof s->tasks[0].plans[0]];
+        uint8_t id[D2K_PLAN_ID_LEN] = {0};
+        size_t n = strlen(a->plan_id); if (n > sizeof id) n = sizeof id;
+        memcpy(id, a->plan_id, n);
+        if (!p || strlen(p->text) >= sizeof wire) return -1;
+        strcpy(wire, p->text);
+        if (stamp_plan_id(wire, id) || d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err)) {
+            say(s, "область %s: план без проверяемого идентификатора", a->name); return -1;
+        }
+        rc = d2k_link_set_suffix_family(s->link_fd, a->name, a->transport, hex, a->shape, a->family, err, sizeof err);
+        cmd = D2K_CMD_SET_SUFFIX;
+    } else if (a->kind == 1) {
+        rc = d2k_link_del_suffix_family(s->link_fd, a->name, a->transport, a->shape, a->family, err, sizeof err);
+        cmd = D2K_CMD_DEL_SUFFIX;
+    } else if (remove) {
+        rc = d2k_link_del_bypass_family(s->link_fd, a->name, a->transport, a->shape, a->family, err, sizeof err);
+        cmd = D2K_CMD_DEL_BYPASS;
+    } else {
+        rc = d2k_link_set_bypass_family(s->link_fd, a->name, a->transport, a->shape, a->family, err, sizeof err);
+        cmd = D2K_CMD_SET_BYPASS;
+    }
+    if (rc) { say(s, "область %s не отправлена: %s", a->name, err); return -1; }
+    s->area_pending = *a; s->area_command = cmd;
+    s->area_deadline_ms = s->now_ms+5000;
+    return 1;
+}
+
+static int sync_areas(d2k_sched *s) {
+    if (s->area_sync_failed) return 0;
+    if (s->area_command) {
+        if (s->now_ms < s->area_deadline_ms) return 1;
+        say(s, "область %s: ACK не пришёл; применение не подтверждено", s->area_pending.name);
+        s->area_sync_failed = 1; /* keep identity pending for a late ACK */
+        return 0;
+    }
+    if (!s->areas && s->cat->groups) {
+        s->areas = calloc(D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX, sizeof *s->areas);
+        if (!s->areas) { say(s, "области: не хватает памяти для синхронизации"); return 0; }
+    }
+    for (size_t i = 0; i < s->n_areas; i++) {
+        if (!desired_has_key(s, &s->areas[i])) {
+            int rc = sync_area_send(s, &s->areas[i], 1);
+            if (rc < 0) s->area_sync_failed = 1;
+            return rc > 0;
+        }
+    }
+    const d2k_group_state *g = s->cat->groups;
+    if (!g) return 0;
+    /* Exceptions before suffixes: a known clean/failed child must never
+     * receive a broad plan during initial synchronized installation. */
+    for (int kind = 2; kind >= 1; kind--) {
+        for (size_t i = 0; i < g->n_groups+g->n_observations; i++) {
+            installed_area a;
+            if (!desired_area(s, i, &a) || a.kind != kind) continue;
+            size_t j;
+            for (j = 0; j < s->n_areas; j++) if (area_key_same(&a, &s->areas[j])) break;
+            if (j < s->n_areas && !strcmp(a.plan_id, s->areas[j].plan_id)) continue;
+            if (j == s->n_areas && s->n_areas == D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
+                say(s, "области: исчерпан бюджет синхронизации"); return 0;
+            }
+            int rc = sync_area_send(s, &a, 0);
+            if (rc < 0) s->area_sync_failed = 1;
+            return rc > 0;
         }
     }
     return 0;
@@ -3206,6 +3344,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
     }
 
     if (s->sync_box >= s->cat->n_boxes) {
+        if (sync_areas(s)) return 1;
         s->sync_active = 0;
         if (s->sync_sent > 0 || s->sync_skipped > 0 || s->sync_weak > 0) {
             say(s, "каталог: поставлено планов по подтверждённым привязкам: %d%s",
@@ -4085,6 +4224,24 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
 /* Испытание сошлось: наш зонд довёл прикладной обмен до конца, и датапат
    сказал, что ИМЕННО ЭТОТ план применился к пакетам ИМЕННО ЭТОГО потока.
    Только теперь — каталог. */
+static void group_record(d2k_sched *s, const task *t, unsigned evidence,
+    const char *plan_id, uint8_t shape, int64_t now_ms) {
+    char base[256];
+    if (t->by_addr || d2k_domain_base(t->name, base)) return;
+    d2k_group_observation o = {0};
+    snprintf(o.name, sizeof o.name, "%s", t->name);
+    snprintf(o.plan_id, sizeof o.plan_id, "%s", plan_id ? plan_id : "");
+    o.key.transport = t->transport; o.key.family = t->family; o.key.shape = shape;
+    snprintf(o.key.probe_path, sizeof o.key.probe_path, "%s", t->measure_path[0] ? t->measure_path : "/");
+    snprintf(o.key.ech_origin, sizeof o.key.ech_origin, "%s", t->ech_offer ? t->ech_origin : "");
+    o.evidence = evidence; o.at = wall_s(s, now_ms);
+    if (!s->cat->groups) s->cat->groups = calloc(1, sizeof *s->cat->groups);
+    if (!s->cat->groups) return;
+    if (d2k_group_learn(s->cat->groups, &o) > 0) {
+        s->cat->revision++; s->sync_pending = 1;
+    }
+}
+
 static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     const char *text = t->plans[t->next_plan - 1];
     char plan_id[40], box_id[40];
@@ -4169,6 +4326,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          t->name, t->by_addr ? "addr" : "name", t->transport, t->family, rec_shape,
                          D2K_VERBY_PROBE, rec_input,
                          wall_s(s, now_ms), &t->fp);
+    if (t->group_block_proven)
+        group_record(s, t, D2K_GROUP_BLOCKED_CONFIRMED, plan_id, rec_shape, now_ms);
     if (t->ech_offer) {
         for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
             d2k_cat_box *b = &s->cat->boxes[bi];
@@ -4528,6 +4687,25 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
     /* Ни одна задача этот отказ своим не признала: поток не наш, его открыл
        кто-то в доме. План при этом применялся — значит он стоит на цели, а
        браузер под него не подошёл. */
+    if (refuse_is_permanent((uint8_t)ev->code) && s->cat->groups) {
+        const char *name = recall(s, ev);
+        if (name && !task_of(s, name, ev->transport, ev->family)) {
+            for (size_t i = 0; i < s->cat->groups->n_groups; i++) {
+                const d2k_domain_group *g = &s->cat->groups->groups[i];
+                uint8_t id[D2K_PLAN_ID_LEN] = {0};
+                size_t n = strlen(g->plan_id); if (n > sizeof id) n = sizeof id;
+                memcpy(id, g->plan_id, n);
+                if (g->key.transport != ev->transport || g->key.family != (ev->family ? ev->family : 4) ||
+                    !d2k_domain_member(name, g->suffix) || memcmp(id, ev->plan_id, sizeof id)) continue;
+                d2k_ev suspicion = *ev;
+                suspicion.kind = D2K_EV_SUSPECT;
+                suspicion.code = D2K_SUSPECT_REPEAT;
+                suspicion.planned = D2K_LINK_PLANNED_NO;
+                (void)on_suspect(s, &suspicion);
+                break; /* refusal is execution evidence, not a DPI verdict */
+            }
+        }
+    }
     on_refused_foreign(s, ev);
 }
 
@@ -4639,6 +4817,23 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         remember(s, ev);
         return 0;
     case D2K_EV_ACK:
+        if (s->area_command && ev->code == s->area_command) {
+            if (((ev->num >> 8) & 255) != 1) {
+                say(s, "область %s отвергнута датапатом (код %u)", s->area_pending.name, (unsigned)(ev->num & 255));
+                s->area_sync_failed = 1;
+            } else {
+                size_t i;
+                for (i = 0; i < s->n_areas; i++) if (area_key_same(&s->area_pending, &s->areas[i])) break;
+                if (ev->code == D2K_CMD_DEL_SUFFIX || ev->code == D2K_CMD_DEL_BYPASS) {
+                    if (i < s->n_areas) s->areas[i] = s->areas[--s->n_areas];
+                } else if (s->areas && i < D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
+                    s->areas[i] = s->area_pending;
+                    if (i == s->n_areas) s->n_areas++;
+                }
+            }
+            s->area_command = 0;
+            return 0;
+        }
         /* ТИП КОМАНДЫ В ПОДТВЕРЖДЕНИИ ЕСТЬ, И ОН ОБЯЗАТЕЛЕН.
            Имени цели подтверждение не несёт, но тип команды несёт (d2k_link.h:
            code — тип, num — (ok<<8)|причина). Засчитывать ЛЮБОЙ ack значило бы
@@ -5060,6 +5255,13 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        "подбор и применение обхода не запускаю",
                     t->name, verdict_name(r.verdict), r.reason);
                 if (r.verdict == D2K_V_CLEAR) {
+                    if (t->vol.rx_direct_complete) {
+                        uint8_t shape = t->transport == 17 ? D2K_LINK_SHAPE_QUIC :
+                            t->ech_offer ? D2K_LINK_SHAPE_ECH_TCP :
+                            d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY ?
+                            D2K_SHAPE_LEGACY : SCHED_PROBE_SHAPE;
+                        group_record(s, t, D2K_GROUP_DIRECT_CLEAR, NULL, shape, now_ms);
+                    }
                     forget_clear_target_bindings(s, t);
                     cooldown_record(s, t, 0);
                     target_cooldown *cool = cooldown_find(s, t->name, t->transport, t->family);
@@ -5079,6 +5281,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 continue;
             }
             cooldown_clear(s, t->name, t->transport, t->family);
+            t->group_block_proven = verdict_proves_block(r.verdict) || volume_proven;
             {
                 /* Volume fingerprint is installed by make_plans before its
                    catalog lookup; do not match the earlier generic reset. */
