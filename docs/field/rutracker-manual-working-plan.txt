@@ -378,3 +378,47 @@ NFQUEUE2000: backlog0, drops0/0. Это проверка сетевой безо
 оформления. Автоматическое получение подсказки в этом состоянии, выбор RX
 для CSS, повтор после restart и обычная browser/HTTP навигация остаются
 непринятыми. Нельзя подменять их ручной постоянной привязкой asset-плана.
+
+Завершение приёмки RuTracker, 30.09.2026, 23:04–23:09 MSK
+-------------------------------------------------------
+Код: cb7302b, feat/telegram-tunnel, опубликован в origin. C ECH verifier
+подключён к автоматическому поиску: fresh DNS HTTPS ECHConfig, собственный
+origin witness из наблюдений/подтверждённого знания, exact trial/APPLIED,
+принятый ECH, имя origin и полный HTTP-ответ. Обычный 301 внешнего имени
+НЕ подтверждает ECH. Нет доменного исключения RuTracker в scheduler/RX.
+
+Полевой журнал 16:27:26–36 фиксирует парный остаточный identity-обрыв,
+полный gzip-контроль, RX-перебор и собственный APPLIED/200 plan-680fbe00.
+Журнал 22:17:36–55 фиксирует автоматический ECH-перебор: первые кандидаты
+дали неполные тела 19799/22541; следующий подтвердил полный origin.
+Каталог хранит ECH отдельно (shape6, family4/6, ech_origin=rutracker.org).
+Ранее пользователь подтвердил работу сайта во всех своих браузерах.
+
+В 23:04 восстановлен финальный закоммиченный controller после выявленного
+позднего принятия предыдущего rollback-таймера. Новый guard принят в самом
+установщике после Google200/Яндекс302, до120s; затем завершился без отката.
+Controller SHA256 28a6948c46b8c4fce369fd89b6cfdf74a8d5851f80c272331edbe4e7329a0be6;
+datapath SHA256 245591344a797f9960d3fa2c849fb64cb866f3ff6951c2e2dd6bbb67498e1165.
+DP PID25700 не менялся; DNS, firewall и каталог не сбрасывались.
+При старте восстановлены216 подтверждённых планов. После этого независимый
+LAN-клиент с настоящим ECH дважды получил ECHAccepted=true, HTTP200,
+полные96827 байт, без ошибки (1.108s/0.973s). Это повторное применение
+сохранённого плана после controller restart, не ручная установка рецепта.
+
+HTTP-вход с Mac/en0: D2K307 provider-portal -> HTTPS, HTTP200,
+96460 байт, final=https://rutracker.org/forum/index.php. Safari открыт
+именно через http://rutracker.org/; screenshot /tmp/d2k-goal-final-safari.png
+показывает оформленную главную страницу RuTracker, не портал/challenge.
+
+Регрессии после обновления: YouTube TLS1.2 HTTP200898051bytes;
+TLS1.3 HTTP200897419bytes; QUIC --http3-only HTTP200/version3/900738bytes.
+NFQUEUE2000 backlog0/drops0/0. Локально exit0: core test-verify,
+test-volume, test-volume-context, test-httpup-logic, test-ech, test-quicconn6;
+datapath test-session, test-quic-session, test-plans. Контекст RX-теста
+проверяет один путь identity/identity/gzip для обеих TLS-форм и IP-семей.
+SHA256 probe.pcap/auto-client.pcap/auto-catalog.json сверены с записями выше;
+probe.pcap повторно разобран: 8fake675/staleTS -> real2+318, без целого hello.
+
+Граница результата: принят этот goal автоматического RuTracker и повторного
+использования обхода, не полное ТЗ всех протоколов/сайтов. Настоящий native
+QUIC/ECH verifier ещё не реализован; TCP/ECH-успех не выдаётся за QUIC/ECH.
