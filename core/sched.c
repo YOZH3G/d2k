@@ -594,6 +594,8 @@ typedef struct {
     d2k_vol_result vol;
     unsigned   rx_phase; /* 0 identity candidate, 1 repeat, 2 gzip control */
     int        rx_bootstrap_only; /* measure an already confirmed target plan */
+    int        family_reuse; /* 1 baseline pending, 2 isolated trial, 3 exhausted */
+    int        skip_volume_once; /* resume classifier with existing baseline */
     d2k_ver_result rx_identity[2]; /* body evidence only; sockets closed normally */
     int64_t    rx_retry_after_ms;
     /* A late TLS RST is only permission for the paired receive-volume probe.
@@ -1308,7 +1310,7 @@ static void *worker_run(void *vp) {
        identity/gzip GET отдельно проверяют обрыв ВХОДЯЩЕГО тела. Последний
        становится своим rx-volume-сигналом и может приоритизировать план,
        который доказательно обходит такой профиль. QUIC сюда не попадает. */
-    if (t->transport == 6) {
+    if (t->transport == 6 && !t->skip_volume_once) {
         int tls12 = d2k_hello_shape(trig.bytes, trig.len) == D2K_SHAPE_LEGACY;
         t->vol = d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80,
                                     tls12, trig.len, s->measure_mark);
@@ -1345,12 +1347,14 @@ static void *worker_run(void *vp) {
             (void)ign2;
             return NULL;
         }
-        if (t->rx_volume_only) {
+        if (t->rx_volume_only || (t->family_reuse == 1 && t->vol.rx_tls_unavailable)) {
             pthread_mutex_lock(&s->mu);
             memset(&t->res, 0, sizeof t->res);
             t->res.verdict = D2K_V_INCONCLUSIVE;
             snprintf(t->res.reason, sizeof t->res.reason,
-                     "позднее закрытие не подтвердилось парной RX-volume-пробой");
+                     "%s", t->rx_volume_only
+                     ? "позднее закрытие не подтвердилось парной RX-volume-пробой"
+                     : "прямая TLS-база не прошла; готовлю отдельную проверку собственного плана цели");
             t->res_ready = 1;
             pthread_mutex_unlock(&s->mu);
             ssize_t ign3 = write(s->wake[1], "w", 1);
@@ -1358,6 +1362,7 @@ static void *worker_run(void *vp) {
             return NULL;
         }
     }
+    t->skip_volume_once = 0;
 
     d2k_vres r;
     if (t->transport == 17) {
@@ -3103,6 +3108,29 @@ int d2k_sched_sync_step(d2k_sched *s) {
    узнанной коробки и/или синтез. Отдельно от on_suspect потому, что тот же
    запуск нужен ПОЗЖЕ — когда задача ждала форму приветствия и дождалась
    (on_shape ниже). Возвращает 1, если задача занята делом. */
+static int rx_saved_bootstrap(d2k_sched *s, task *t, int allow_other_family);
+static int has_other_family_target_plan(const d2k_sched *s, const task *t) {
+    if (t->transport != 6 || t->by_addr || t->port != 443 ||
+        d2k_hello_shape(t->trig, t->trig_len) != D2K_SHAPE_MODERN) return 0;
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        const d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t i = 0; i < b->n_binds; i++) {
+            const d2k_cat_binding *bd = &b->binds[i];
+            uint8_t family = bd->family ? bd->family : 4;
+            if (!bd->enabled || strcmp(bd->kind, "name") || strcmp(bd->target, t->name) ||
+                (bd->transport ? bd->transport : 6) != 6 ||
+                (family != 4 && family != 6) || family == t->family ||
+                bd->shape != D2K_SHAPE_MODERN || bd->level < 3) continue;
+            for (size_t j = 0; j < b->n_plans; j++) {
+                const d2k_cat_plan *p = &b->plans[j];
+                if (p->enabled && p->text && !strcmp(p->id, bd->plan_id) &&
+                    !strcmp(p->proto, "tls") && strlen(p->text) < sizeof t->plans[0]) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int start_search(d2k_sched *s, task *t) {
     if (fill_hellos(s, t) != 0) {
         if (t->transport == 17 && t->shape_armed) {
@@ -3116,6 +3144,8 @@ static int start_search(d2k_sched *s, task *t) {
         task_reset(t);
         return 0;
     }
+    if (!t->rx_volume_only && !t->family_reuse && has_other_family_target_plan(s, t))
+        t->family_reuse = 1;
     if (t->rx_volume_only) {
         /* Do not try catalog plans on a generic late reset. First establish
            the measured response-volume fingerprint; only then can its box
@@ -4371,7 +4401,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
 /* A working TLS bootstrap is not necessarily a complete bypass: identity
  * may still be truncated while gzip succeeds. Each follow-up reserves a new
  * socket and reinstalls only this candidate on that socket's source port. */
-static int rx_saved_bootstrap(d2k_sched *s, task *t) {
+static int rx_saved_bootstrap(d2k_sched *s, task *t, int allow_other_family) {
     if (t->transport != 6 || t->by_addr ||
         d2k_hello_shape(t->trig, t->trig_len) != D2K_SHAPE_MODERN) return 0;
     const d2k_cat_binding *best = NULL;
@@ -4383,13 +4413,18 @@ static int rx_saved_bootstrap(d2k_sched *s, task *t) {
             const d2k_cat_binding *bd = &b->binds[i];
             if (!bd->enabled || strcmp(bd->kind, "name") || strcmp(bd->target, t->name) ||
                 (bd->transport ? bd->transport : 6) != 6 ||
-                (bd->family ? bd->family : 4) != t->family ||
+                (!allow_other_family && (bd->family ? bd->family : 4) != t->family) ||
+                ((bd->family ? bd->family : 4) != 4 && bd->family != 6) ||
                 bd->shape != D2K_SHAPE_MODERN || (bd->level && bd->level < 3)) continue;
+            if ((bd->family ? bd->family : 4) != t->family && bd->level < 3) continue;
             for (size_t j = 0; j < b->n_plans; j++) {
                 const d2k_cat_plan *p = &b->plans[j];
                 if (!p->enabled || !p->text || strcmp(p->id, bd->plan_id) ||
                     strcmp(p->proto, "tls") || strlen(p->text) >= sizeof t->plans[0]) continue;
-                if (!best || bd->confirmed > best->confirmed) {
+                int exact = (bd->family ? bd->family : 4) == t->family;
+                int best_exact = best && (best->family ? best->family : 4) == t->family;
+                if (!best || (exact && !best_exact) ||
+                    (exact == best_exact && bd->confirmed > best->confirmed)) {
                     best = bd; plan = p; owner = b;
                 }
             }
@@ -4397,12 +4432,16 @@ static int rx_saved_bootstrap(d2k_sched *s, task *t) {
     }
     if (!plan) return 0;
     snprintf(t->plans[0], sizeof t->plans[0], "%s", plan->text);
-    snprintf(t->plan_boxes[0], sizeof t->plan_boxes[0], "%s", owner->id);
-    t->next_plan = 0; t->n_plans = t->n_known = 1;
+    int same_family = (best->family ? best->family : 4) == t->family;
+    snprintf(t->plan_boxes[0], sizeof t->plan_boxes[0], "%s", same_family ? owner->id : "");
+    t->next_plan = 0; t->n_plans = 1; t->n_known = same_family ? 1 : 0;
     t->researched = 1; t->rx_bootstrap_only = 1;
     t->state = T_PLANNING;
     say(s, "по %s прямой RX-зонд не дошёл до TLS; измеряю identity под уже "
            "подтверждённым планом этой цели, без нового общего перебора", t->name);
+    if (!same_family) say(s, "по %s собственный план IPv%u проверяю отдельно по IPv%u; "
+                            "подтверждение и отпечаток между семьями не переношу",
+                           t->name, (unsigned)(best->family ? best->family : 4), (unsigned)t->family);
     return 1;
 }
 
@@ -4632,7 +4671,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (t->rx_volume_only) {
                 t->rx_volume_only = 0;
                 if (!t->vol.rx_cut) {
-                    if (t->vol.rx_tls_unavailable && rx_saved_bootstrap(s, t)) {
+                    if (t->vol.rx_tls_unavailable && rx_saved_bootstrap(s, t, 0)) {
                         moved++;
                         continue;
                     }
@@ -4713,6 +4752,14 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             }
             int volume_proven = t->transport == 6 &&
                 (t->vol.verdict == D2K_VOL_CUT || t->vol.rx_cut);
+            if (t->family_reuse == 1 && t->vol.rx_tls_unavailable && !volume_proven) {
+                t->family_reuse = 2;
+                if (rx_saved_bootstrap(s, t, 1)) { moved++; continue; }
+                t->family_reuse = 3; t->skip_volume_once = 1;
+                t->state = T_ASKING;
+                if (start_worker(s, t, JOB_CLASSIFY) != 0) task_fail(s, t, now_ms);
+                moved++; continue;
+            }
             if (!verdict_proves_block(r.verdict) && !volume_proven) {
                 say(s, "по %s прямой замер не подтвердил блокировку (%s: %s) — "
                        "подбор и применение обхода не запускаю",
@@ -5168,6 +5215,18 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             }
             if (inst != 0) {
                 if (t->rx_bootstrap_only && !t->vol.rx_cut) {
+                    if (t->family_reuse == 2) {
+                        remove_trial_exact(s, t);
+                        t->family_reuse = 3; t->rx_bootstrap_only = 0;
+                        t->skip_volume_once = 1;
+                        t->n_plans = t->n_known = t->next_plan = 0;
+                        t->box_id[0] = '\0';
+                        t->state = T_ASKING;
+                        say(s, "по %s план другого семейства не подтвердился; "
+                               "продолжаю исходный поиск без повторения объёмной базы", t->name);
+                        if (start_worker(s, t, JOB_CLASSIFY) != 0) task_fail(s, t, now_ms);
+                        moved++; continue;
+                    }
                     say(s, "по %s остаточный RX-блок не подтверждён; общий перебор не запускаю", t->name);
                     task_fail(s, t, now_ms);
                     moved++;

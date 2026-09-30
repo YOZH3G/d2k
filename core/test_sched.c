@@ -358,6 +358,15 @@ static d2k_ver_result stub_layered_gzip(int fd, const char *ip, uint16_t port,
     return r;
 }
 
+static d2k_ver_result stub_family_identity(int fd, const char *ip, uint16_t port,
+        uint8_t transport, const char *name, int deadline, size_t wire, uint8_t shape) {
+    d2k_ver_result r = stub_ver(fd, ip, port, transport, name, deadline, wire, shape);
+    r.body_has_length = r.body_framing_valid = 1;
+    r.body_bytes = r.body_expected = 96460;
+    r.body_complete = r.level == D2K_VER_APPLICATION;
+    return r;
+}
+
 static char quic_last_trig[256];
 static char quic_last_ctl[256];
 static uint32_t quic_last_mark;
@@ -3836,6 +3845,88 @@ question_test:
     }
 
 rx_volume_tests:
+    /* IPv4 success is only a candidate for IPv6. A failed native baseline
+       checks it on an isolated native socket; own APPLIED and complete
+       identity are required. Failure resumes the original classifier once. */
+    for (int outcome = 0; outcome < 4; outcome++) {
+        d2k_catalog c = {0};
+        c.boxes = calloc(1, sizeof *c.boxes);
+        CHECK(c.boxes != NULL, "family reuse fixture allocation");
+        if (!c.boxes) continue;
+        c.n_boxes = 1;
+        d2k_cat_box *b = c.boxes;
+        snprintf(b->id, sizeof b->id, "box-v4-only");
+        b->plans = calloc(1, sizeof *b->plans);
+        b->binds = calloc(1, sizeof *b->binds);
+        CHECK(b->plans && b->binds, "family reuse plan fixture allocation");
+        if (!b->plans || !b->binds) { d2k_catalog_free(&c); continue; }
+        b->n_plans = b->n_binds = 1;
+        snprintf(b->plans[0].id, sizeof b->plans[0].id, "own-v4-plan");
+        snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "tls");
+        b->plans[0].enabled = 1;
+        b->plans[0].text = strdup("d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                                 "proto tcp tls\nsplit payload_start +2\norder forward\n");
+        d2k_cat_binding *bd = b->binds;
+        snprintf(bd->kind, sizeof bd->kind, "name");
+        snprintf(bd->target, sizeof bd->target, "family-reuse.test");
+        snprintf(bd->plan_id, sizeof bd->plan_id, "own-v4-plan");
+        bd->enabled = 1; bd->level = 3; bd->transport = 6;
+        bd->shape = D2K_SHAPE_MODERN; bd->family = 4;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = ver_calls = 0;
+        vol_answer = outcome == 3 ? D2K_VOL_PASSED : D2K_VOL_UNREACHABLE;
+        vol_rx_tls_unavailable = outcome != 3; vol_rx_cut = 0;
+        tcp_answer = outcome == 3 ? D2K_V_CLEAR : D2K_V_INCONCLUSIVE;
+        ver_answer = outcome == 1 ? D2K_VER_HANDSHAKE : D2K_VER_APPLICATION;
+        ver_answer_port = 40311; ver_fail_first = 0;
+        d2k_sched_rx_ver_hook = stub_family_identity;
+        d2k_ev h = ev_hello(6, 40311, "family-reuse.test"), sh;
+        h.family = 6; h.low_port = 443;
+        CHECK(inet_pton(AF_INET6, "::1", h.low_ip) == 1, "reuse destination fixture");
+        CHECK(inet_pton(AF_INET6, "2001:db8::2", h.high_ip) == 1, "reuse client fixture");
+        d2k_sched_event(s, &h);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0, "reuse shape fixture");
+        sh.family = 6; d2k_sched_event(s, &sh);
+        d2k_ev su = h; su.kind = D2K_EV_SUSPECT; su.code = D2K_SUSPECT_REPEAT;
+        d2k_sched_event(s, &su);
+        size_t installed = 0;
+        for (int i = 0; i < 2000; i++) {
+            tick_once(s);
+            size_t n = sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+            if (n > installed) {
+                installed = n;
+                d2k_ev ap = ev_applied(6, 40311); ap.family = 6;
+                ap.low_port = h.low_port;
+                memcpy(ap.low_ip, h.low_ip, 16); memcpy(ap.high_ip, h.high_ip, 16);
+                if (outcome == 2) ap.plan_id[0] ^= 1;
+                d2k_sched_event(s, &ap);
+            }
+            if ((outcome == 0 && total_bindings(&c) == 2) ||
+                ((outcome == 1 || outcome == 3) && tcp_calls) ||
+                (outcome == 2 && ver_calls >= 3)) break;
+        }
+        CHECK(vol_calls == 1, "family retry repeats baseline unnecessarily");
+        if (total_bindings(&c) != (outcome == 0 ? 2u : 1u) ||
+            tcp_calls != (outcome == 1 || outcome == 3 ? 1 : 0))
+            fprintf(stderr, "family outcome=%d tcp=%d ver=%d\n%s\n", outcome, tcp_calls, ver_calls, saidbuf);
+        CHECK(total_bindings(&c) == (outcome == 0 ? 2u : 1u),
+              "family success borrowed without own native proof");
+        CHECK(tcp_calls == (outcome == 1 || outcome == 3 ? 1 : 0),
+              "family trial does not resume original search or bypasses healthy baseline");
+        if (outcome == 0) {
+            int native = 0;
+            for (size_t bi = 0; bi < c.n_boxes; bi++)
+                for (size_t i = 0; i < c.boxes[bi].n_binds; i++)
+                    native += c.boxes[bi].binds[i].family == 6 && c.boxes[bi].binds[i].level >= 3;
+            CHECK(native == 1 && ver_socket_family == AF_INET6, "reuse did not prove a separate IPv6 binding");
+            CHECK(!strcmp(c.boxes[0].id, "box-v4-only") && c.boxes[0].n_binds == 1,
+                  "unmeasured IPv6 fingerprint merged into IPv4 box");
+        }
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        d2k_sched_rx_ver_hook = stub_ver;
+        vol_rx_tls_unavailable = 0; vol_answer = D2K_VOL_PASSED;
+    }
     /* A bootstrap must not be saved merely because gzip completed. Only
        two own applied identity cuts plus actual gzip admit the RX ladder. */
     for (int bad = 0; bad < 6; bad++) {
