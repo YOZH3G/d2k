@@ -21,6 +21,7 @@ ssize_t raw_test_recvfrom(int, void *, size_t, int, struct sockaddr *, socklen_t
 static uint16_t ports[WORKERS][PORTS_PER_WORKER];
 static uint8_t incoming[2][128];
 static size_t incoming_len[2];
+static unsigned incoming_noise;
 static uint8_t incoming_src[2][16];
 static uint8_t outgoing[4][2048];
 static size_t outgoing_len[4];
@@ -69,6 +70,12 @@ ssize_t raw_test_recvfrom(int fd, void *buf, size_t len, int flags,
     (void)flags;
     if (fd < 0 || fd > 1 || incoming_len[fd] > len) { return -1; }
     memcpy(buf, incoming[fd], incoming_len[fd]);
+    if (incoming_noise) {
+        struct timespec pause = {0, 3000000};
+        incoming_noise--;
+        ((uint8_t *)buf)[12] ^= 1; /* IPv4 packet from an unrelated peer */
+        nanosleep(&pause, NULL);
+    }
     if (addr && alen && *alen >= sizeof(struct sockaddr_in6)) {
         struct sockaddr_in6 peer = {0};
         peer.sin6_family = AF_INET6;
@@ -121,8 +128,8 @@ static void test_receive_is_owned_by_connection(void)
             body, sizeof body, &p, NULL, 0);
         CHECK(incoming_len[i] > 0);
     }
-    CHECK(raw_recv(&c[0], &flags, &seq, &ack, &first, &len) == 0 && len == 4);
-    CHECK(raw_recv(&c[1], &flags, &seq, &ack, &second, &len) == 0 && len == 4);
+    CHECK(raw_recv(&c[0], &flags, &seq, &ack, &first, &len, d2k_now_ms() + 1000, NULL) == 0 && len == 4);
+    CHECK(raw_recv(&c[1], &flags, &seq, &ack, &second, &len, d2k_now_ms() + 1000, NULL) == 0 && len == 4);
     CHECK(first && second && first != second);
     CHECK(first && first[0] == 0xa0); /* must survive the OTHER receive */
     CHECK(second && second[0] == 0xa1);
@@ -131,6 +138,29 @@ static void test_receive_is_owned_by_connection(void)
         raw_close(&c[i]);
         CHECK(c[i].buffers == NULL);
     }
+}
+
+/* A stream of unrelated packets must not reset the probe deadline. The old
+ * raw_recv loop consumed all 20 and accepted a response after the deadline. */
+static void test_unrelated_packets_do_not_extend_deadline(void)
+{
+    raw_conn c = {0};
+    d2k_poison p = {0};
+    uint8_t body[] = {1, 2, 3}, result[16];
+    size_t result_len = 0;
+    c.family = 4; c.recv_fd = 0; c.sport = 35000; c.dport = 443;
+    c.src[0] = 192; c.dst[0] = 198;
+    c.buffers = malloc(sizeof *c.buffers);
+    CHECK(c.buffers != NULL);
+    if (!c.buffers) return;
+    incoming_len[0] = build_ipv4_tcp(incoming[0], sizeof incoming[0],
+        c.dst, c.src, c.dport, c.sport, 1, 2, TCP_ACK,
+        body, sizeof body, &p, NULL, 0);
+    incoming_noise = 20;
+    CHECK(raw_read_payload(&c, 5, NULL, result, sizeof result, &result_len) == -1);
+    CHECK(result_len == 0);
+    incoming_noise = 0;
+    free(c.buffers);
 }
 
 static void *allocate_ports(void *arg)
@@ -216,7 +246,7 @@ int main(void)
         uint32_t seq, ack;
         const uint8_t *received = NULL;
         size_t received_len = 0;
-        CHECK(raw_recv(&conn, &flags, &seq, &ack, &received, &received_len) == 0);
+        CHECK(raw_recv(&conn, &flags, &seq, &ack, &received, &received_len, d2k_now_ms() + 1000, NULL) == 0);
         CHECK(flags == TCP_ACK && seq == 42 && ack == 43);
         CHECK(received_len == sizeof body && memcmp(received, body, sizeof body) == 0);
         free(conn.buffers);
@@ -231,6 +261,7 @@ int main(void)
     test_concurrent_ports_are_unique();
     test_checksum_matches_original();
     test_receive_is_owned_by_connection();
+    test_unrelated_packets_do_not_extend_deadline();
     test_datapath_matches_raw_headers();
     test_disorder_pos2_emits_exact_reverse_segments();
     if (failures) { return 1; }

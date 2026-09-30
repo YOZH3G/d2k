@@ -1846,6 +1846,12 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     size_t used = 0;
     size_t n = acts.n;
     for (size_t i = 0; i < n; i++) {
+        if (acts.v[i].wire_profile == D2K_WIRE_TCP_TEMPLATE) {
+            size_t tcp_header = (size_t)(t[12] >> 4) * 4;
+            c.tcp_options_len = (uint8_t)(tcp_header - 20);
+            memcpy(c.tcp_options, t + 20, c.tcp_options_len);
+            c.ip_id = (uint16_t)(ip.ip_id + i);
+        }
         size_t made = d2k_wire_build(&c, &acts.v[i], buf + used, bufcap - used);
         if (made == 0) {
             /* Не поместилось. Отменяем то, что ещё не ушло, и спрашиваем

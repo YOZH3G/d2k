@@ -107,6 +107,7 @@ struct stand {
     int       role;
     uint16_t  peer_port; /* местный порт зонда, каким его ВИДИТ мишень */
     int       accepted_compression;
+    int       accepted_identity;
     pthread_t th;
 };
 
@@ -561,6 +562,7 @@ static void *stand_run(void *arg) {
 
     if (s->role == ROLE_REDIRECT_COMPLETE || s->role == ROLE_REDIRECT_TRUNCATED) {
         s->accepted_compression = contains_bytes(req, rlen, "Accept-Encoding: gzip, deflate");
+        s->accepted_identity = contains_bytes(req, rlen, "Accept-Encoding: identity");
         static const char redirect[] =
             "HTTP/1.1 301 Moved Permanently\r\n"
             "Location: /forum/index.php\r\n"
@@ -783,6 +785,22 @@ int main(void) {
         CHECK(r.status == 0, "приложение молчало, а код состояния появился");
         d2k_verify_close(&r);
         stand_stop(&s);
+    }
+
+    /* The RX candidate must request identity even across its same-origin
+       redirect. A compressed control cannot prove repair of the RX cut. */
+    {
+        struct stand s;
+        uint16_t port = stand_start(&s, ROLE_REDIRECT_COMPLETE);
+        CHECK(port != 0, "identity-стенд не поднялся");
+        d2k_ver_result r = d2k_verify_probe_identity_on(-1, "127.0.0.1", port,
+                                                       "http.example", 1800, 0, 0);
+        CHECK(r.level == D2K_VER_APPLICATION && r.status == 200 && r.body_complete,
+              "identity verifier не получил полное конечное тело");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+        CHECK(s.accepted_identity && !s.accepted_compression,
+              "RX-кандидат проверяется сжатием вместо identity");
     }
 
     /* --- ответило приложение: ЭТО и есть доказательство ------------------- */

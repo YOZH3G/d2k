@@ -65,6 +65,7 @@ typedef struct {
     int      rx_compressed_complete; /* контроль gzip дошёл до конца */
     int      rtt_ms;      /* измеренный RTT до мишени */
     char     reason[160]; /* человеческая причина, заполняется всегда */
+    char     rx_reason[200]; /* отдельный исход GET, даже если TX не дошёл до TLS */
 } d2k_vol_result;
 
 /* Гоняет TX-лестницу, затем для HTTPS — парное RX-измерение тела ответа.

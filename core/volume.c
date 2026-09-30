@@ -27,6 +27,7 @@
 #include "d2k_meas.h"   /* d2k_mark_hook — метка ставится тем же путём, что везде */
 #include "d2k_catalog.h" /* общий допуск для сопоставления RX-объёмов */
 #include "d2k_tls13.h"
+#include "d2k_tls12.h"
 #include "d2k_volume.h"
 #include "d2k_verify.h"
 
@@ -195,13 +196,17 @@ static int connect_bounded(const char *ip, uint16_t port, uint32_t mark,
 }
 
 /* Читает заголовки ответа до пустой строки. 0 — прочитано, -1 — обрыв. */
-static int drain_head_tls(d2k_tls *t, int wait_ms, char *reason, size_t cap) {
+static int drain_head_tls(d2k_tls *t, d2k_tls12 *t12, int wait_ms, char *reason, size_t cap) {
     char line[4096];
     size_t n = 0;
     int seen_cr = 0;
+    int64_t deadline = now_ms() + wait_ms;
     for (;;) {
+        int64_t left = deadline - now_ms();
+        if (left <= 0) { snprintf(reason, cap, "ответа нет"); return -1; }
         uint8_t c;
-        long r = d2k_tls_read(t, &c, 1, wait_ms, reason, cap);
+        long r = t12 ? d2k_tls12_read(t12, &c, 1, (int)left, reason, cap)
+                     : d2k_tls_read(t, &c, 1, (int)left, reason, cap);
         if (r <= 0) {
             if (r == 0) { snprintf(reason, cap, "соединение закрыто"); }
             return -1;
@@ -256,6 +261,10 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     if (!res || !ip || !sni || !sni[0] || port == 80) { return; }
     d2k_ver_result a = d2k_verify_probe_baseline(ip, port, sni, 6000,
                                                   hello_wire, tls12, 0, mark);
+    snprintf(res->rx_reason, sizeof res->rx_reason,
+             "identity-1 HTTP %d, тело %llu/%llu, complete=%d: %.90s",
+             a.status, (unsigned long long)a.body_bytes,
+             (unsigned long long)a.body_expected, a.body_complete, a.reason);
     if (a.status < 200 || a.status >= 300 || a.body_complete || !a.body_framing_valid ||
         (!a.body_has_length && !a.body_chunked) || a.body_encoding != 0 ||
         a.body_bytes < (uint64_t)D2K_VOL_MIN_KB * 1024 ||
@@ -266,6 +275,10 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     nap_ms(RESPONSE_PROBE_GAP_MS);
     d2k_ver_result b = d2k_verify_probe_baseline(ip, port, sni, 6000,
                                                   hello_wire, tls12, 0, mark);
+    snprintf(res->rx_reason, sizeof res->rx_reason,
+             "identity-2 HTTP %d, тело %llu/%llu, complete=%d: %.90s",
+             b.status, (unsigned long long)b.body_bytes,
+             (unsigned long long)b.body_expected, b.body_complete, b.reason);
     if (b.status < 200 || b.status >= 300 || b.body_complete || !b.body_framing_valid ||
         b.body_has_length != a.body_has_length || b.body_chunked != a.body_chunked ||
         b.body_encoding != 0 || b.body_bytes < (uint64_t)D2K_VOL_MIN_KB * 1024 ||
@@ -277,6 +290,10 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     nap_ms(RESPONSE_PROBE_GAP_MS);
     d2k_ver_result gz = d2k_verify_probe_baseline(ip, port, sni, 6000,
                                                    hello_wire, tls12, 1, mark);
+    snprintf(res->rx_reason, sizeof res->rx_reason,
+             "identity %llu/%llu; gzip HTTP %d, тело %llu, complete=%d, encoding=%d",
+             (unsigned long long)a.body_bytes, (unsigned long long)b.body_bytes,
+             gz.status, (unsigned long long)gz.body_bytes, gz.body_complete, gz.body_encoding);
     (void)d2k_volume_rx_evidence(&a, &b, &gz, res);
     d2k_verify_close(&a);
     d2k_verify_close(&b);
@@ -300,15 +317,24 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
     if (fd < 0) { return res; }
 
     d2k_tls *tls = NULL;
+    d2k_tls12 *tls_legacy = NULL;
     if (!plain) {
         char err[160];
-        if (d2k_tls_connect(fd, (sni && sni[0]) ? sni : NULL, HANDSHAKE_MS, 0,
-                            &tls, err, sizeof err) != 0) {
+        const char *name = (sni && sni[0]) ? sni : NULL;
+        int handshake = tls12
+            ? d2k_tls12_connect(fd, name, HANDSHAKE_MS, hello_wire,
+                                &tls_legacy, err, sizeof err)
+            : d2k_tls_connect(fd, name, HANDSHAKE_MS, hello_wire,
+                              &tls, err, sizeof err);
+        if (handshake != 0) {
             /* Причина обрезается по месту, а не тянет за собой размер буфера:
                «нет TLS: » плюс хвост — читателю нужна суть, а не полный текст
                чужой ошибки (gcc ловит это как format-truncation, цель cross). */
             snprintf(res.reason, sizeof res.reason, "нет TLS: %.140s", err);
             close(fd);
+            /* TX handshake failure is not a result of the independent
+               GET-body measurement, which uses the client's own context. */
+            probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);
             return res;
         }
     }
@@ -337,6 +363,7 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
         if (n <= 0 || (size_t)n >= sizeof req) {
             snprintf(res.reason, sizeof res.reason, "запрос не поместился");
             if (tls) { d2k_tls_free(tls); }
+            if (tls_legacy) { d2k_tls12_free(tls_legacy); }
             close(fd);
             if (!plain) {
                 probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);
@@ -348,11 +375,14 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
         int64_t req_start = now_ms();
         char err[160];
         int bad = 0;
-        if (tls) {
-            if (d2k_tls_write(tls, (const uint8_t *)req, (size_t)n, err, sizeof err) != 0) {
+        if (tls || tls_legacy) {
+            int written = tls_legacy
+                ? d2k_tls12_write(tls_legacy, (const uint8_t *)req, (size_t)n, err, sizeof err)
+                : d2k_tls_write(tls, (const uint8_t *)req, (size_t)n, err, sizeof err);
+            if (written != 0) {
                 snprintf(res.reason, sizeof res.reason, "%s", err);
                 bad = 1;
-            } else if (drain_head_tls(tls, read_timeout, err, sizeof err) != 0) {
+            } else if (drain_head_tls(tls, tls_legacy, read_timeout, err, sizeof err) != 0) {
                 snprintf(res.reason, sizeof res.reason, "%s", err);
                 bad = 1;
             }
@@ -377,6 +407,7 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
                 res.verdict = D2K_VOL_SHORT;
             }
             if (tls) { d2k_tls_free(tls); }
+            if (tls_legacy) { d2k_tls12_free(tls_legacy); }
             close(fd);
             if (!plain) {
                 probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);
@@ -395,6 +426,7 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
     res.at_kb = D2K_VOL_STEPS * D2K_VOL_CHUNK / 1024;
     snprintf(res.reason, sizeof res.reason, "лестница пройдена целиком");
     if (tls) { d2k_tls_free(tls); }
+    if (tls_legacy) { d2k_tls12_free(tls_legacy); }
     close(fd);
     if (!plain) {
         probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark);

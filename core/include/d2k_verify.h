@@ -137,6 +137,11 @@ d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
                                      const char *sni, int deadline_ms,
                                      size_t hello_wire);
 
+/* RX-volume candidates must prove the previously truncated identity body,
+ * not the compressed control that already worked without a candidate. */
+d2k_ver_result d2k_verify_probe_identity_on(int use_fd, const char *ip, uint16_t port,
+    const char *sni, int deadline_ms, size_t hello_wire, int tls12);
+
 /* Базовое измерение полноты ответа на сокете, который обходит активные планы
  * через SO_MARK. encoding: 0 — identity, 1 — gzip; tls12 выбирает ровно ту же
  * форму клиента, что и живой поток. Используется парным измерителем объёма,

@@ -342,17 +342,16 @@ static void rx_volume_fake_sni_split(void) {
     d2k_actions out = {0};
     case_name = "RX-volume fake-SNI split ladder";
 
-    /* The screenshot establishes ordering and ingredients, not the complete
-       numeric recipe. Keep the candidate family out of the general fallback
-       so it is only reached by a confirmed RX-volume measurement. */
+    /* Literal recovered capture: 8 x 675-byte fake, then split +2. */
     CHECK(d2k_rx_volume_plan(0, D2K_SHAPE_MODERN, 1492, text, sizeof text) == 0);
     CHECK(strstr(text, "input tls-sni\n") != NULL);
-    CHECK(strstr(text, "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n") != NULL);
+    CHECK(strstr(text, "fake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n") != NULL);
+    CHECK(strstr(text, "wire tcp-template-v1\n") != NULL);
     CHECK(strstr(text, "poison 1 tcpts\n") != NULL);
     CHECK(strstr(text, "split payload_start +2\norder forward\n") != NULL);
     CHECK(strstr(text, "hcaptcha.com") == NULL); /* binary payload, not text */
-    CHECK(strstr(text, "nodrop") == NULL && strstr(text, "tlsmod=") == NULL);
-    if (!strstr(text, "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n") ||
+    CHECK(strstr(text, "nodrop") == NULL);
+    if (!strstr(text, "fake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n") ||
         !strstr(text, "split payload_start +2\norder forward\n")) { return; }
     static const unsigned expected_split[D2K_RX_VOLUME_PLAN_VARIANTS] = {2, 1, 3, 4, 5};
     for (unsigned i = 0; i < D2K_RX_VOLUME_PLAN_VARIANTS; i++) {
@@ -380,25 +379,34 @@ static void rx_volume_fake_sni_split(void) {
     pkt.seq = BASE; pkt.payload = payload; pkt.payload_len = sizeof payload;
     pkt.have_sni = 1; pkt.sni_off = 100; pkt.sni_len = 18; pkt.is_tls13 = 1;
     payload[43] = 32;
+    CHECK(d2k_plan_stream_input(p));
     for (size_t i = 0; i < 32; i++) { payload[44 + i] = (uint8_t)(0xc0 + i); }
     CHECK(d2k_plan_apply(p, NULL, &pkt, &out) == 0);
-    CHECK(out.fate == D2K_ORIG_DROP && out.n == 3);
-    if (out.n == 3) {
-        CHECK(out.v[0].kind == D2K_EMIT_FAKE && out.v[0].len > 100 &&
+    CHECK(out.fate == D2K_ORIG_DROP && out.n == 10);
+    if (out.n == 10) {
+        d2k_conn conn = {.ttl=63,.window=2061,.tcp_options_len=12};
+        const uint8_t options[] = {1,1,8,10,0,0,0x13,0x88,0,0,0x23,0x28};
+        memcpy(conn.tcp_options, options, sizeof options);
+        CHECK(out.v[0].kind == D2K_EMIT_FAKE && out.v[0].len == 675 &&
               (out.v[0].poison & D2K_POISON_TCPTS_BACK));
         static const uint8_t hcaptcha[] = "hcaptcha.com";
         CHECK(has_bytes(out.v[0].bytes, out.v[0].len,
                         hcaptcha, sizeof hcaptcha - 1));
-        size_t wire_len = d2k_wire_build(&(d2k_conn){.ttl=64,.window=65535},
-                                         &out.v[0], wire, sizeof wire);
-        CHECK(wire_len == out.v[0].len + 52 && wire[32] == 0x80 &&
-              wire[42] == 8 && wire[43] == 10 && wire[44] == 0 &&
-              wire[45] == 0 && wire[46] == 0 && wire[47] == 1);
-        CHECK(out.v[1].kind == D2K_EMIT_PAYLOAD && out.v[1].seq == BASE &&
-              out.v[1].len == 2 && memcmp(out.v[1].bytes, payload, 2) == 0);
-        CHECK(out.v[2].kind == D2K_EMIT_PAYLOAD && out.v[2].seq == BASE + 2 &&
-              out.v[2].len == sizeof payload - 2 &&
-              memcmp(out.v[2].bytes, payload + 2, sizeof payload - 2) == 0);
+        for (size_t i = 0; i < 8; i++) {
+            CHECK(out.v[i].kind == D2K_EMIT_FAKE && out.v[i].len == 675 &&
+                  out.v[i].seq == BASE && out.v[i].owned_bytes != NULL);
+            CHECK(memcmp(out.v[i].bytes + 44, payload + 44, 32) == 0);
+            CHECK(memcmp(out.v[i].bytes + 11, payload + 11, 32) != 0);
+            CHECK(memcmp(out.v[i].bytes, out.v[0].bytes, 675) == 0);
+            size_t wire_len = d2k_wire_build(&conn, &out.v[i], wire, sizeof wire);
+            CHECK(wire_len == 727 && wire[32] == 0x80 &&
+                  wire[42] == 8 && wire[43] == 10 && wire[46] == 0x0f && wire[47] == 0xa0);
+        }
+        CHECK(out.v[8].kind == D2K_EMIT_PAYLOAD && out.v[8].seq == BASE &&
+              out.v[8].len == 2 && memcmp(out.v[8].bytes, payload, 2) == 0);
+        CHECK(out.v[9].kind == D2K_EMIT_PAYLOAD && out.v[9].seq == BASE + 2 &&
+              out.v[9].len == sizeof payload - 2 &&
+              memcmp(out.v[9].bytes, payload + 2, sizeof payload - 2) == 0);
     }
     d2k_actions_free(&out);
     d2k_plan_free(p);

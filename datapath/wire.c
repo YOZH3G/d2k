@@ -84,9 +84,37 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     int ipv6 = c->family == 6;
     size_t ip_hdr = ipv6 ? 40u : IP_HDR;
     if (ipv6 && (e->poison & D2K_POISON_IPID_ZERO)) { return 0; }
-    if (e->ipfrag || (e->wire_profile != 0 && e->wire_profile != D2K_WIRE_DETECT_TCP)) { return 0; }
+    if (e->ipfrag || (e->wire_profile != 0 && e->wire_profile != D2K_WIRE_DETECT_TCP &&
+                      e->wire_profile != D2K_WIRE_TCP_TEMPLATE)) { return 0; }
     int measured = e->wire_profile == D2K_WIRE_DETECT_TCP;
+    int native = e->wire_profile == D2K_WIRE_TCP_TEMPLATE;
+    uint8_t native_options[40];
     size_t opt_len = (e->poison & D2K_POISON_TCPTS_BACK) ? TS_OPT_LEN : 0;
+    if (native) {
+        opt_len = c->tcp_options_len;
+        if (opt_len > sizeof native_options || opt_len % 4) return 0;
+        memcpy(native_options, c->tcp_options, opt_len);
+        int found_timestamp = 0;
+        for (size_t off = 0; off < opt_len;) {
+            uint8_t kind = native_options[off];
+            if (kind == 0) break;
+            if (kind == 1) { off++; continue; }
+            if (off + 2 > opt_len || native_options[off + 1] < 2 ||
+                native_options[off + 1] > opt_len - off) return 0;
+            if (kind == 8) {
+                if (native_options[off + 1] != 10 || found_timestamp) return 0;
+                found_timestamp = 1;
+                if (e->poison & D2K_POISON_TCPTS_BACK) {
+                    const uint8_t *v = native_options + off + 2;
+                    uint32_t ts = (uint32_t)v[0] << 24 | (uint32_t)v[1] << 16 |
+                                  (uint32_t)v[2] << 8 | v[3];
+                    wr32(native_options + off + 2, ts - 1000u);
+                }
+            }
+            off += native_options[off + 1];
+        }
+        if ((e->poison & D2K_POISON_TCPTS_BACK) && !found_timestamp) return 0;
+    }
     if (e->pre_len > 65535u || e->len > 65535u - e->pre_len) { return 0; }
     const size_t body = e->pre_len + e->len;
     size_t total = ip_hdr + TCP_HDR + opt_len + body;
@@ -111,7 +139,8 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
        Совпадение идентификатора с оригиналом — известная ловушка: сборщик
        фрагментов на той стороне может счесть пакеты частями одной дейтаграммы. */
     wr16(out + 4, (e->poison & D2K_POISON_IPID_ZERO) ? 0
-                      : measured ? (uint16_t)(random() % 65535) : (uint16_t)(c->ip_id + 1));
+                      : measured ? (uint16_t)(random() % 65535)
+                      : native ? c->ip_id : (uint16_t)(c->ip_id + 1));
     wr16(out + 6, measured ? 0 : 0x4000);
     /* TTL: если порча его задаёт, ставим её значение — пакет умрёт по дороге,
        не дойдя до сервера, но коробку пройдёт. */
@@ -138,7 +167,9 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     wr16(t + 16, 0);                     /* сумма */
     wr16(t + 18, e->urgent ? e->urgent_ptr : 0);
 
-    if (opt_len) {
+    if (native && opt_len) {
+        memcpy(t + TCP_HDR, native_options, opt_len);
+    } else if (opt_len) {
         uint8_t *o = t + TCP_HDR;
         o[0] = 1; o[1] = 1;              /* NOP, NOP */
         o[2] = 8; o[3] = 10;             /* метка времени, длина 10 */

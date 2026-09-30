@@ -134,7 +134,9 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             }
             break;
         case REC_WIRE:
-            if (rd16(b + 6) < 4 || ln != 1 || b[off] != D2K_WIRE_DETECT_TCP) {
+            if (rd16(b + 6) < 4 || ln != 1 ||
+                (b[off] != D2K_WIRE_DETECT_TCP && b[off] != D2K_WIRE_TCP_TEMPLATE) ||
+                (b[off] == D2K_WIRE_TCP_TEMPLATE && rd16(b + 6) < 8)) {
                 fail(err, errlen, "неподдержанный TCP wire profile или minexec < 4"); return -1;
             }
             break;
@@ -492,7 +494,8 @@ uint8_t d2k_plan_transport(const d2k_plan *p) {
 }
 
 int d2k_plan_stream_input(const d2k_plan *p) {
-    return p && p->transport == 6 && p->wire_profile == 1 &&
+    return p && p->transport == 6 &&
+           (p->wire_profile == D2K_WIRE_DETECT_TCP || p->wire_profile == D2K_WIRE_TCP_TEMPLATE) &&
            (p->input_tls || p->input_len);
 }
 

@@ -59,6 +59,7 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 # test_link тоже без TESTHDR-стенда: его "стенд" — настоящий ctlprobe
 # (datapath/ctlprobe.c), отдельным процессом, а не петля-мишень в потоке.
 HDR += include/d2k_ip6frag_send.h
+HDR += profiles/rx_fake.h
 TESTHDR = test_stand.h
 
 # test_d2kask — ЧЁРНЫЙ ЯЩИК (см. её шапку): не общий стенд test_stand.h сам
@@ -707,7 +708,25 @@ test_quicconn6: test_quicconn6.c quicconn.o quicwire.o compose.o hello.o meas.o 
 	$(CC) $(CFLAGS) -o $@ $< quicconn.o quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 
 .PHONY: test-quicconn6
-TESTS += test_quicconn6 test_volume test_httpup_logic
+TESTS += test_quicconn6 test_volume test_volume_context test_httpup_logic
+TESTS += test_catalog_sync
+
+test_catalog_sync: test_catalog_sync.c $(SRC:.c=.o) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(SRC:.c=.o) $(TEST_LDFLAGS)
+
+.PHONY: test-catalog-sync
+check: test-catalog-sync
+test-catalog-sync: test_catalog_sync
+	./test_catalog_sync
+
+test_volume_context: test_volume_context.c volume.c $(HDR) include/d2k_tls12.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+check: test-volume-context
+
+.PHONY: test-volume-context
+test-volume-context: test_volume_context
+	./test_volume_context
 
 test_volume: test_volume.c volume.o verify.o tls13.o tls13core.o tls12.o x25519.o crypto.o compose.o meas.o hello.o link.o quicconn.o quicwire.o h3.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< volume.o verify.o tls13.o tls13core.o tls12.o x25519.o crypto.o compose.o meas.o hello.o link.o quicconn.o quicwire.o h3.o $(TEST_LDFLAGS)

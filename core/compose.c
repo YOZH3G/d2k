@@ -98,6 +98,7 @@
 #include "d2k_link.h"
 #include "d2k_quicprobe.h" /* d2k_quic_arm: перевод подобранного плеча в текст плана */
 #include "d2k_plan.h" /* datapath/include — D2K_POISON_BADSUM, тот же публичный контракт, что уже читает d2k_link.h через d2k_ctl.h */
+#include "profiles/rx_fake.h"
 
 /* --------------------------------------------------------------------
  * Сборка канонической TLV-формы плана — см. большой комментарий в шапке
@@ -1561,21 +1562,25 @@ int d2k_rx_volume_plan(unsigned variant, d2k_shape shape, size_t send_cap,
     size_t hello_len = 0, pos = 0;
     if (!buf || cap == 0 || variant >= D2K_RX_VOLUME_PLAN_VARIANTS ||
         shape != D2K_SHAPE_MODERN ||
-        d2k_hello_from_profile(D2K_SHAPE_LEGACY, "hcaptcha.com", hello,
-                               sizeof hello, &hello_len) != 0) { return -1; }
-    /* Manual evidence establishes the ingredients and order, not every wire
-       parameter. Search only the narrow family: one stale-timestamp fake
-       first, no nodrop, and a split original modern ClientHello in every
-       candidate (it is never emitted as one complete packet). */
+        d2k_hello_rename(d2k_rx_fake_template + 5, sizeof d2k_rx_fake_template - 5,
+                          "hcaptcha.com", hello + 5, sizeof hello - 5, &hello_len) != 0) { return -1; }
+    /* hello_rename accepts the handshake, not its record wrapper. */
+    memcpy(hello, d2k_rx_fake_template, 3);
+    hello[3] = (uint8_t)(hello_len >> 8);
+    hello[4] = (uint8_t)hello_len;
+    hello_len += 5;
+    /* Recovered manual command and capture: eight 675-byte fake_default_tls
+       copies, rnd/dupsid, original TS minus 1000, then split at +2 without
+       nodrop. Adjacent split positions remain follow-up hypotheses. */
     if (send_cap > 0 && (hello_len > send_cap || send_cap - hello_len < 132)) { return -1; }
     if (append_fmt(buf, cap, &pos,
             "d2k-plan 1 8\nid 00000000000000000000000000000000\n"
-            "proto tcp tls\nwire detect-tcp-v1\ninput tls-sni\nsegment %u\n",
+            "proto tcp tls\nwire tcp-template-v1\ninput tls-sni\nsegment %u\n",
             (unsigned)D2K_ARM_SEGMENT_MAX) != 0 ||
         append_fmt(buf, cap, &pos, "payload 1 ") != 0 ||
         append_hex(buf, cap, &pos, hello, hello_len) != 0 ||
         append_fmt(buf, cap, &pos,
-            "\npoison 1 tcpts\nfake payload=1 poison=1 repeats=1 gap_us=0 place=before\n"
+            "\npoison 1 tcpts\nfake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n"
             "split payload_start +%u\norder forward\n", split_at[variant]) != 0) { return -1; }
     return 0;
 }

@@ -594,10 +594,15 @@ static int raw_send_syn(raw_conn *c)
 
 /* recv возвращает следующий сегмент ОТ НАШЕГО пира. */
 static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
-                    const uint8_t **payload, size_t *plen)
+                    const uint8_t **payload, size_t *plen,
+                    long deadline, const d2k_detect_stop *cancel)
 {
     uint8_t *buf = c->buffers->recv;
     for (;;) {
+        /* SO_RCVTIMEO bounds one recvfrom, not this filtering loop. On a
+         * busy router unrelated packets otherwise keep a silent probe alive
+         * forever, also preventing cancellation and occupying its worker. */
+        if (d2k_now_ms() >= deadline || d2k_detect_stopped(cancel)) return -1;
         struct sockaddr_storage peer;
         socklen_t peerlen = sizeof peer;
         ssize_t n = recvfrom(c->recv_fd, buf, sizeof(c->buffers->recv), 0,
@@ -651,7 +656,7 @@ static int raw_read_payload(raw_conn *c, int timeout_ms, const d2k_detect_stop *
         uint32_t seq, ack;
         const uint8_t *pay;
         size_t plen;
-        if (raw_recv(c, &flags, &seq, &ack, &pay, &plen) != 0) {
+        if (raw_recv(c, &flags, &seq, &ack, &pay, &plen, deadline, cancel) != 0) {
             continue;
         }
         if (flags & TCP_RST) {
@@ -706,7 +711,7 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
             snprintf(err, errcap, "context canceled");
             return -1;
         }
-        if (raw_recv(c, &flags, &seq, &ack, &pay, &plen) != 0) {
+        if (raw_recv(c, &flags, &seq, &ack, &pay, &plen, deadline, cancel) != 0) {
             continue;
         }
         if (flags & TCP_RST) {

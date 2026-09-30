@@ -674,6 +674,13 @@ d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
                                    hello_wire, 2, 0);
 }
 
+d2k_ver_result d2k_verify_probe_identity_on(int use_fd, const char *ip, uint16_t port,
+    const char *sni, int deadline_ms, size_t hello_wire, int tls12) {
+    if (tls12) return verify_probe12_internal(use_fd, ip, port, sni, deadline_ms,
+                                             hello_wire, 0, 0);
+    return verify_probe13_on(use_fd, ip, port, sni, deadline_ms, hello_wire, 0, 0);
+}
+
 d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
                                          const char *sni, int deadline_ms,
                                          size_t hello_wire, int tls12,

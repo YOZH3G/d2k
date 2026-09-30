@@ -41,6 +41,8 @@ typedef struct {
     uint8_t src_ip6[16], dst_ip6[16];
     uint8_t traffic_class;
     uint32_t flow_label; /* host order, low 20 bits */
+    uint8_t tcp_options[40];
+    uint8_t tcp_options_len;
 } d2k_conn;
 
 /* Собирает пакет в out. Возвращает длину или 0, если не поместилось.

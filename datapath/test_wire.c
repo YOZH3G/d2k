@@ -254,6 +254,33 @@ int main(void) {
         }
     }
 
+    /* Recovered manual profile: preserve negotiated timestamps on real
+     * split packets and subtract exactly 1000 only on fake packets. */
+    {
+        d2k_conn c = {0};
+        d2k_emit e = {0};
+        uint8_t out[128], data[] = {0x16, 3};
+        const uint8_t options[] = {1,1,8,10,0,0,0x13,0x88,0,0,0x23,0x28};
+        c.ttl = 63; c.window = 2061; c.ip_id = 7;
+        memcpy(c.tcp_options, options, sizeof options);
+        c.tcp_options_len = sizeof options;
+        e.bytes = data; e.len = sizeof data;
+        e.wire_profile = D2K_WIRE_TCP_TEMPLATE;
+        e.kind = D2K_EMIT_FAKE; e.poison = D2K_POISON_TCPTS_BACK;
+        size_t n = d2k_wire_build(&c, &e, out, sizeof out);
+        CHECK(n == 54 && rd32(out + 44) == 4000 && rd32(out + 48) == 9000,
+              "native fake не повторил TS-1000/echo ручного эталона");
+        CHECK(n && out[8] == 63 && rd16(out + 34) == 2061 && rd16(out + 4) == 7,
+              "native fake изменил TTL/window/IPID исходного потока");
+        CHECK(n && d2k_wire_tcp_checksum_ok(out, n), "native fake checksum");
+        e.kind = D2K_EMIT_PAYLOAD; e.poison = 0;
+        n = d2k_wire_build(&c, &e, out, sizeof out);
+        CHECK(n == 54 && memcmp(out + 40, options, sizeof options) == 0,
+              "real split потерял TCP options");
+        c.tcp_options_len = 0; e.poison = D2K_POISON_TCPTS_BACK;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) == 0,
+              "PAWS fake без исходного timestamp выдан за применимый");
+    }
     check_golden();
 
     if (fails) {

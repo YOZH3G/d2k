@@ -295,6 +295,15 @@ static int bind_default(uint8_t transport, uint8_t family, int *out_fd, uint16_t
                              : d2k_props_bind_family(family, out_fd, sport_be);
 }
 
+static d2k_ver_result verify_rx_default(int use_fd, const char *ip, uint16_t port,
+    uint8_t transport, const char *sni, int deadline_ms, size_t hello_wire,
+    uint8_t client_shape) {
+    if (transport != 6) return verify_default(use_fd, ip, port, transport, sni,
+                                             deadline_ms, hello_wire, client_shape);
+    return d2k_verify_probe_identity_on(use_fd, ip, port, sni, deadline_ms,
+                                       hello_wire, client_shape == D2K_SHAPE_LEGACY);
+}
+
 static int mark_default(int fd, uint32_t mark) {
     return d2k_mark_hook(fd, mark);
 }
@@ -319,6 +328,7 @@ static d2k_vres classify_no_cancel(const char *ip, uint16_t port,
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
+d2k_sched_ver_fn  d2k_sched_rx_ver_hook = verify_rx_default;
 static d2k_voice_res voice_default(const d2k_voice_opt *opt) {
     return d2k_voice_run(opt);
 }
@@ -1238,7 +1248,9 @@ static void *worker_run(void *vp) {
            под его порт: зонд обязан пойти С НЕГО, иначе испытание пройдёт
            мимо собственного плана. Владение отдаётся вниз — закроет тот, кто
            им распорядится. */
-        d2k_ver_result vr = d2k_sched_ver_hook(a_use_fd, t->ip, t->port, t->transport,
+        d2k_sched_ver_fn verifier = t->transport == 6 && t->vol.rx_cut
+                                  ? d2k_sched_rx_ver_hook : d2k_sched_ver_hook;
+        d2k_ver_result vr = verifier(a_use_fd, t->ip, t->port, t->transport,
                                                t->name, SCHED_VERIFY_STEP_MS,
                                                trig.len,
                                                (uint8_t)(t->transport == 17
@@ -1282,6 +1294,11 @@ static void *worker_run(void *vp) {
         int tls12 = d2k_hello_shape(trig.bytes, trig.len) == D2K_SHAPE_LEGACY;
         t->vol = d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80,
                                     tls12, trig.len, s->measure_mark);
+        if (t->vol.rx_reason[0]) {
+            say(s, "по %s объёмный замер TLS %s, hello=%zu: TX %s; RX %s",
+                t->name, tls12 ? "1.2" : "1.3", trig.len,
+                t->vol.reason, t->vol.rx_reason);
+        }
         if (t->vol.verdict == D2K_VOL_CUT || t->vol.rx_cut) {
             /* Объёмное измерение не даёт честного ответа на старые вопросы
                про имя/адрес: оборванный поток исказит их вердикт. Вместо этого
@@ -2900,6 +2917,31 @@ int d2k_sched_sync_pending(const d2k_sched *s) {
     return (s && (s->sync_active || s->sync_pending)) ? 1 : 0;
 }
 
+/* Several measured boxes may retain the history of one target. SET_NAME
+ * replaces the exact name/transport/family/shape slot: catalog traversal
+ * order must not let an older confirmation overwrite the newest one. */
+static int newer_name_binding(const d2k_catalog *cat, const d2k_cat_binding *bd) {
+    if (strcmp(bd->kind, "name") != 0) return 0;
+    for (size_t bi = 0; bi < cat->n_boxes; bi++) {
+        const d2k_cat_box *box = &cat->boxes[bi];
+        for (size_t j = 0; j < box->n_binds; j++) {
+            const d2k_cat_binding *other = &box->binds[j];
+            if (other == bd || !other->enabled ||
+                (other->level > 0 && other->level < 3) ||
+                other->confirmed <= bd->confirmed ||
+                strcmp(other->kind, "name") != 0 ||
+                strcmp(other->target, bd->target) != 0 ||
+                (other->transport ? other->transport : 6) != (bd->transport ? bd->transport : 6) ||
+                (other->family ? other->family : 4) != (bd->family ? bd->family : 4) ||
+                other->shape != bd->shape ||
+                (other->transport == 17 && other->verified_by == D2K_VERBY_CLIENT)) continue;
+            const d2k_cat_plan *plan = plan_by_id(box, other->plan_id);
+            if (plan && plan->text) return 1;
+        }
+    }
+    return 0;
+}
+
 int d2k_sched_sync_step(d2k_sched *s) {
     if (!s || !s->cat || !s->sync_active) { return 0; }
     static char hex[2 * D2K_PLAN_TLV_MAX + 1];
@@ -2915,6 +2957,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
         }
         const d2k_cat_binding *bd = &b->binds[s->sync_bind++];
         if (!bd->enabled) { continue; }
+        if (newer_name_binding(s->cat, bd)) { continue; }
         /* Прежний voice_confirm присваивал UDP CLIENT уровень 3 на любую
            обратную датаграмму. У таких записей нет протокольного
            свидетельства, независимо от сохранённого level. Не стираем

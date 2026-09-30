@@ -34,6 +34,7 @@
  * Version 8 adds per-fake TLS random/session-ID runtime modifiers. */
 #define D2K_EXEC_VERSION 8
 #define D2K_WIRE_DETECT_TCP 1
+#define D2K_WIRE_TCP_TEMPLATE 2
 #define D2K_SCHEMA_MAX   1
 
 /* Ширина идентификатора плана — записи REC_ID в TLV.

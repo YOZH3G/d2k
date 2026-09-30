@@ -370,10 +370,13 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             memcpy(v->bytes, src->bytes + off, v->len);
             p->n_payloads++;
         } else if (strcmp(f[0], "wire") == 0) {
-            if (nf != 2 || strcmp(f[1], "detect-tcp-v1")) {
+            if (nf != 2 || (strcmp(f[1], "detect-tcp-v1") && strcmp(f[1], "tcp-template-v1"))) {
                 say(err, errcap, "неизвестный wire profile"); goto bad;
             }
-            p->wire_profile = 1;
+            p->wire_profile = strcmp(f[1], "tcp-template-v1") == 0 ? 2 : 1;
+            if (p->wire_profile == 2 && p->minexec < 8) {
+                say(err, errcap, "tcp-template-v1 требует minexec=8"); goto bad;
+            }
         } else if (strcmp(f[0], "input") == 0) {
             if (nf == 2 && strcmp(f[1], "tls-sni") == 0) {
                 p->input_tls = 1;

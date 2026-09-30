@@ -149,6 +149,22 @@ static int fake_tls_bytes(const d2k_plan *p, const struct d2k_fake *f,
             &real_rnd, &real_sid, &real_sid_len) != 0 ||
         tls_ch_layout(pl->bytes, pl->len, &fake_rnd, &fake_sid,
                       &fake_sid_len) != 0) { return -1; }
+    if (p->wire_profile == D2K_WIRE_TCP_TEMPLATE) {
+        /* Original TLSMod: randomize fake random/SID, then duplicate SID only
+         * when lengths match. It does not resize fake_default_tls. */
+        uint8_t *b = malloc(pl->len);
+        if (!b) return -1;
+        memcpy(b, pl->bytes, pl->len);
+        if ((f->tls_mod & D2K_TLS_MOD_RND) &&
+            (random_bytes(b + fake_rnd, 32) != 0 ||
+             random_bytes(b + fake_sid, fake_sid_len) != 0)) {
+            free(b); return -1;
+        }
+        if ((f->tls_mod & D2K_TLS_MOD_DUPSID) && fake_sid_len == real_sid_len)
+            memcpy(b + fake_sid, in->payload + real_sid, real_sid_len);
+        *owned = b;
+        return 0;
+    }
     size_t out_len = pl->len;
     if (f->tls_mod & D2K_TLS_MOD_DUPSID) {
         out_len = pl->len - fake_sid_len + real_sid_len;
@@ -410,6 +426,11 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
             if (emit_fake(&v[n], p, &p->fakes[i], in, in->seq,
                           r == 0 ? 0 : p->fakes[i].gap_us) != 0) {
                 free(pts); emit_vec_free(v, n); return -1;
+            }
+            if (r && p->wire_profile == D2K_WIRE_TCP_TEMPLATE && v[n].owned_bytes) {
+                /* repeats retransmits the same mutated fake, not eight
+                 * independently randomized ClientHellos. */
+                memcpy(v[n].owned_bytes, v[n - r].bytes, v[n].len);
             }
             n++;
         }

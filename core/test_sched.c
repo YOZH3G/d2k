@@ -1031,6 +1031,7 @@ int main(int argc, char **argv) {
        рукопожатием TLS 1.3, а стенд этого теста TLS не умеет — тест мерил бы
        стенд. */
     d2k_sched_ver_hook = stub_ver;
+    d2k_sched_rx_ver_hook = stub_ver;
     d2k_sched_mark_hook = stub_mark;
 
     int sv[2];
