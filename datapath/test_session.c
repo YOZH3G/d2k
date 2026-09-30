@@ -421,6 +421,25 @@ static void test_suspect_tells_planned(void) {
         d2k_session_free(s);
     }
 
+    /* A record-type byte or truncated/invalid header is not a TLS reply. */
+    for (unsigned variant=0; variant<3; variant++) {
+        d2k_session *s=d2k_session_new(64,64);
+        uint8_t pkt[1024],buf[8192]; d2k_result r;
+        size_t pn=build_pkt(pkt,47703,0x18,hello,hl);
+        d2k_session_packet(s,pkt,pn,1000,buf,sizeof buf,&r);
+        const uint8_t bad[][6]={{0x17}, {0x17,0x03,0x03,0x00,0x10,0x00},
+                              {0x17,0x03,0xff,0x00,0x01,0x00}};
+        pn=build_rev_pkt(pkt,47703,0x18,bad[variant],variant?6:1);
+        d2k_session_packet(s,pkt,pn,2000,buf,sizeof buf,&r);
+        pn=build_pkt(pkt,47703,0x18,hello,hl);
+        d2k_session_packet(s,pkt,pn,3000,buf,sizeof buf,&r);
+        d2k_session_packet(s,pkt,pn,4000,buf,sizeof buf,&r);
+        const d2k_jrn_entry *e=last_suspect(s);
+        CHECK(e && e->code==D2K_SUSPECT_REPEAT,
+              "malformed reverse payload must not hide unanswered ClientHello repeats");
+        d2k_session_free(s);
+    }
+
     /* Плана не было вовсе — подозрение о таком потоке про план не говорит. */
     {
         d2k_session *s = d2k_session_new(64, 64);

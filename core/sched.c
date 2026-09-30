@@ -406,6 +406,7 @@ typedef struct {
 
     int64_t    started_ms; /* active search/lifecycle budget begins on launch */
     int64_t    queued_ms;  /* independent age of a queued suspicion */
+    uint64_t   queued_event;
     int64_t    rest_until_ms;
     int        probes;
 
@@ -538,6 +539,8 @@ typedef struct {
     int        cached_measure_valid; /* preserve measured candidates after box-plan reuse */
     uint8_t    trigger_code;   /* signal that admitted this measurement; cooldown key */
     uint8_t    trigger_planned;
+    uint8_t    trigger_shape;
+    d2k_flowkey trigger_flow;
     /* Форма приветствия, КОТОРЫМ шёл замер, и было ли уже повторение из-за
        её расхождения со снимком. Нужны затем, что снимок настоящего клиента
        приходит уже ПОСЛЕ старта поиска: первый поиск идёт профилем холодного
@@ -678,7 +681,7 @@ typedef struct {
     char name[256], plan_id[40];
     uint8_t kind, transport, shape, family;
     uint8_t confirmed;
-    int64_t confirmed_ms;
+    uint64_t confirmed_event;
 } installed_area;
 
 struct d2k_sched {
@@ -691,6 +694,7 @@ struct d2k_sched {
        спрашивать время у ОС в каждом обработчике незачем: тик идёт трижды в
        секунду, а сроки здесь считаются секундами. */
     int64_t      now_ms;
+    uint64_t     event_sequence;
 
     task         tasks[SCHED_MAX_TASKS];
     seen_name    seen[SCHED_SEEN];
@@ -774,6 +778,7 @@ struct d2k_sched {
     uint8_t      tcp_shape[2][2048];
     size_t       tcp_shape_len[2];
     char         tcp_shape_name[2][256];
+    d2k_flowkey   tcp_shape_flow[2];
 
     /* Для вида панели: сколько подтверждено и сколько зондов потрачено за
        жизнь процесса, и отметка стенных часов, от которой считается «с
@@ -3815,14 +3820,7 @@ static int queued_family_ready(const d2k_sched *s, const task *t) {
     const d2k_group_state *state = s->cat->groups;
     if (!state || t->by_addr || t->trigger_planned != D2K_LINK_PLANNED_NO ||
         !t->queued_ms) return 0;
-    uint8_t shape = t->transport == 17 ? D2K_LINK_SHAPE_QUIC : 0;
-    if (t->transport == 6 && !strcmp(s->tcp_shape_name[t->family == 6], t->name) &&
-        s->tcp_shape_len[t->family == 6]) {
-        const uint8_t *hello = s->tcp_shape[t->family == 6];
-        size_t len = s->tcp_shape_len[t->family == 6];
-        shape = d2k_hello_ech_offer(hello, len, NULL) == 1 ? D2K_LINK_SHAPE_ECH_TCP :
-            (uint8_t)d2k_hello_shape(hello, len);
-    }
+    uint8_t shape = t->trigger_shape;
     if (!shape) return 0;
     for (size_t bi=0; bi<s->cat->n_boxes; bi++) {
         const d2k_cat_box *b=&s->cat->boxes[bi];
@@ -3842,7 +3840,7 @@ static int queued_family_ready(const d2k_sched *s, const task *t) {
             !desired_area(s,i,&desired)) continue;
         for (size_t j=0; j<s->n_areas; j++) {
             const installed_area *a=&s->areas[j];
-            if (a->confirmed && a->confirmed_ms>t->queued_ms &&
+            if (a->confirmed && a->confirmed_event>t->queued_event &&
                 area_key_same(a,&desired) && !strcmp(a->plan_id,desired.plan_id)) return 1;
         }
     }
@@ -3888,6 +3886,7 @@ static int launch_or_queue(d2k_sched *s, task *t) {
         t->state = T_QUEUED;
         t->started_ms = 0;
         t->queued_ms = s->clock_seen ? s->now_ms : 0;
+        t->queued_event = s->event_sequence;
         say(s, "по %s подозрение сохранено в ограниченной очереди замеров "
                "(%zu из %d); новые измерения ограничены до %d одновременно",
             t->name, queued_measurements(s), SCHED_MAX_QUEUED_MEASUREMENTS,
@@ -4062,6 +4061,13 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         return 0;
     }
     if (t) {
+        if (t->state == T_QUEUED) {
+            /* An ACK must never erase a later failure of the inherited plan.
+               A different TCP flow has unknown protocol provenance here. */
+            if (ev->planned != D2K_LINK_PLANNED_NO ||
+                (t->transport == 6 && !ev_matches_flow(ev, &t->trigger_flow)))
+                t->trigger_planned = D2K_LINK_PLANNED_YES;
+        }
         if (late_app_rst) {
             if (t->state != T_WATCHING) { return 0; }
             /* Keep the confirmed catalog binding, but replace its passive
@@ -4130,6 +4136,20 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     t->by_addr = by_addr;
     t->trigger_code = ev->code;
     t->trigger_planned = ev->planned;
+    memcpy(t->trigger_flow.a_ip, ev->low_ip, 16);
+    memcpy(t->trigger_flow.b_ip, ev->high_ip, 16);
+    t->trigger_flow.a_port = ev->low_port;
+    t->trigger_flow.b_port = ev->high_port;
+    t->trigger_flow.transport = ev->transport;
+    t->trigger_flow.family = t->family;
+    if (t->transport == 17) t->trigger_shape = D2K_LINK_SHAPE_QUIC;
+    else if (!strcmp(s->tcp_shape_name[t->family == 6], name) &&
+             ev_matches_flow(ev, &s->tcp_shape_flow[t->family == 6])) {
+        const uint8_t *hello = s->tcp_shape[t->family == 6];
+        size_t len = s->tcp_shape_len[t->family == 6];
+        t->trigger_shape = d2k_hello_ech_offer(hello,len,NULL)==1 ?
+            D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(hello,len);
+    }
     t->fp.method = D2K_FP_METHOD;
     if (!late_app_rst) {
         d2k_cat_signal sig = signal_of(ev);
@@ -4251,6 +4271,10 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         memcpy(s->tcp_shape[ev->family == 6], ev->shape, ev->shape_len);
         s->tcp_shape_len[ev->family == 6] = ev->shape_len;
         memcpy(s->tcp_shape_name[ev->family == 6], name, strlen(name) + 1);
+        d2k_flowkey *flow=&s->tcp_shape_flow[ev->family == 6];
+        memcpy(flow->a_ip,ev->low_ip,16); memcpy(flow->b_ip,ev->high_ip,16);
+        flow->a_port=ev->low_port; flow->b_port=ev->high_port;
+        flow->transport=6; flow->family=ev->family ? ev->family : 4;
         say(s, "по %s (TCP) сохранён целый снимок для следующего поиска: %zu байт",
             name, ev->shape_len);
     }
@@ -4260,6 +4284,11 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
         if (t->family != (ev->family ? ev->family : 4)) { continue; }
+        if (t->state == T_QUEUED && t->transport == 6 && ev->transport == 6 &&
+            ev_matches_flow(ev,&t->trigger_flow) && !t->trigger_shape) {
+            t->trigger_shape=d2k_hello_ech_offer(ev->shape,ev->shape_len,NULL)==1 ?
+                D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(ev->shape,ev->shape_len);
+        }
         if (t->state == T_ASKING && t->transport == 6 &&
             strcmp(t->name, name) == 0) {
             if (!t->trig_snapped && !t->reasked) {
@@ -4942,6 +4971,7 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
 
 int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
     if (!s || !ev) { return -1; }
+    s->event_sequence++;
     switch (ev->kind) {
     case D2K_EV_HELLO:
         remember(s, ev);
@@ -4960,7 +4990,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
                 } else if (s->areas && i < D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
                     s->areas[i] = s->area_pending;
                     s->areas[i].confirmed = 1;
-                    s->areas[i].confirmed_ms = s->now_ms;
+                    s->areas[i].confirmed_event = s->event_sequence;
                     if (i == s->n_areas) s->n_areas++;
                 }
             }

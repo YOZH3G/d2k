@@ -224,6 +224,8 @@ struct d2k_flow {
        здесь «запись разобрана и это ответ сервера» — разные утверждения, и
        складывать их в одно поле значит однажды принять алерт за ответ. */
     uint8_t  rev_server_hello;
+    uint8_t  rev_tls_reply; /* parsed ServerHello or complete TLS data record;
+                              not proof of application success */
     int      exchange_told;    /* об обмене уже сообщили */
     uint8_t  voice_ssrc[4];    /* SSRC из клиентского IP Discovery запроса */
     uint8_t  voice_ssrc_valid;

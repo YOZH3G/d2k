@@ -594,6 +594,20 @@ static void area_ack_id(d2k_ev *ack) {
     }
 }
 
+static uint16_t last_area_command(void) {
+    uint16_t found=0;
+    for(size_t off=0;off+6<=sent_len;) {
+        const uint8_t *p=sentbuf+off;
+        uint32_t n=(uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3];
+        if(n<2 || n>sent_len-off-4) break;
+        uint16_t cmd=(uint16_t)((uint16_t)p[4]<<8|p[5]);
+        if(cmd==D2K_CMD_SET_SUFFIX || cmd==D2K_CMD_SET_BYPASS ||
+           cmd==D2K_CMD_DEL_SUFFIX || cmd==D2K_CMD_DEL_BYPASS) found=cmd;
+        off+=4+n;
+    }
+    return found;
+}
+
 /* Count complete commands from the real scheduler socket, not a byte pattern
    inside a plan. Used to distinguish removal of name and address keys. */
 static size_t sent_command_count(uint16_t kind, const uint8_t *body, size_t len) {
@@ -1253,6 +1267,43 @@ int main(int argc, char **argv) {
               !d2k_group_match(c.groups, "unfit.googlevideo.com", &key) &&
               d2k_group_match(c.groups, "rr-other.googlevideo.com", &key),
               "runtime failure exception survives restore without losing siblings");
+        d2k_sched_free(s);
+        s=d2k_sched_new(&c,sv[0],0x2d); spin(s,1);
+        tcp_block_until_stop=1;
+        for (uint16_t port=40311; port<40313; port++) {
+            h=ev_hello(6,port,port==40311?"busy-a.example":"busy-b.example");
+            d2k_sched_event(s,&h); su=ev_suspect(6,port); d2k_sched_event(s,&su);
+        }
+        for (uint16_t port=40314; port<40317; port++) {
+            const char *name=port==40314?"tls12.googlevideo.com":
+                port==40315?"tls13.googlevideo.com":"unknown.googlevideo.com";
+            h=ev_hello(6,port,name); d2k_sched_event(s,&h);
+            if (port!=40316) {
+                d2k_ev shape;
+                CHECK(tls_shape_event(&shape,name,port==40314?D2K_SHAPE_LEGACY:D2K_SHAPE_MODERN)==0,
+                      "queued TLS shape fixture");
+                memcpy(shape.low_ip,h.low_ip,16); memcpy(shape.high_ip,h.high_ip,16);
+                shape.low_port=h.low_port; shape.high_port=h.high_port;
+                d2k_sched_event(s,&shape);
+            }
+            su=ev_suspect(6,port); su.planned=D2K_LINK_PLANNED_NO; d2k_sched_event(s,&su);
+        }
+        h=ev_hello(6,40317,"tls12.googlevideo.com"); d2k_sched_event(s,&h);
+        d2k_ev later_shape;
+        CHECK(tls_shape_event(&later_shape,h.name,D2K_SHAPE_MODERN)==0,"later TLS13 fixture");
+        memcpy(later_shape.low_ip,h.low_ip,16); memcpy(later_shape.high_ip,h.high_ip,16);
+        later_shape.low_port=h.low_port; later_shape.high_port=h.high_port;
+        d2k_sched_event(s,&later_shape);
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        for(unsigned i=0;i<8;i++) {
+            ack.code=last_area_command(); if(!ack.code) break;
+            ack.num=1u<<8; area_ack_id(&ack); d2k_sched_event(s,&ack);
+            forget_sent(); sync_out(s);
+        }
+        spin(s,2);
+        CHECK(d2k_sched_active(s)==4,
+              "retire only flow-proven TLS13 queue; preserve TLS12 and unknown after later same-name snapshot");
+        tcp_block_until_stop=0;
         d2k_sched_free(s); d2k_catalog_free(&c);
         d2k_catalog qc = {0};
         quic_answer = D2K_V_OPAQUE;
@@ -1272,13 +1323,29 @@ int main(int argc, char **argv) {
         }
         h=ev_hello(17,40414,"q-new.googlevideo.com"); d2k_sched_event(s,&h);
         su=ev_suspect(17,40414); su.planned=D2K_LINK_PLANNED_NO;
-        d2k_sched_event(s,&su); spin(s,2);
-        CHECK(d2k_sched_active(s)==3,"uncovered QUIC suspicion is queued before area ACK");
+        d2k_sched_event(s,&su);
+        h=ev_hello(17,40415,"q-failed.googlevideo.com"); d2k_sched_event(s,&h);
+        su=ev_suspect(17,40415); su.planned=D2K_LINK_PLANNED_NO;
+        d2k_sched_event(s,&su);
+        CHECK(d2k_sched_active(s)==4,"uncovered QUIC suspicions are queued before area ACK");
         drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
         ack.code=D2K_CMD_SET_SUFFIX; ack.num=1u<<8; area_ack_id(&ack);
-        skip_ahead(s,10); d2k_sched_event(s,&ack); spin(s,2);
-        CHECK(d2k_sched_active(s)==2 && quic_calls==0,
-              "newly installed family retires older unplanned QUIC queue without a probe");
+        d2k_sched_event(s,&ack);
+        su.planned=D2K_LINK_PLANNED_YES; d2k_sched_event(s,&su);
+        spin(s,2);
+        CHECK(d2k_sched_active(s)==3 && quic_calls==0,
+              "same-tick family ACK retires old unplanned queue but preserves later inherited-plan failure");
+        char queued_live[]="/tmp/d2k-family-queues-XXXXXX";
+        int queued_fd=mkstemp(queued_live);
+        CHECK(queued_fd>=0,"queue retirement fixture");
+        if (queued_fd>=0) {
+            close(queued_fd); d2k_sched_write_live(s,queued_live,"catalog.json");
+            FILE *live=fopen(queued_live,"r"); char body[32768]={0};
+            if(live){fread(body,1,sizeof body-1,live);fclose(live);}
+            CHECK(!strstr(body,"q-new.googlevideo.com") && strstr(body,"q-failed.googlevideo.com"),
+                  "retirement must remove the unplanned name, not the later failed inherited flow");
+            unlink(queued_live);
+        }
         CHECK(!binding_of(&qc,"q-new.googlevideo.com",17),"queue adoption creates no exact enrollment");
         tcp_block_until_stop=0;
         d2k_sched_free(s); d2k_catalog_free(&qc); close(sv[0]); close(sv[1]);

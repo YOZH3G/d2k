@@ -1379,9 +1379,12 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                    ответа. */
                 if (!fl->rev_server_hello) {
                     d2k_tls_info ri;
-                    if (d2k_tls_parse(pkt + rpay_off, total - rpay_off, &ri) == 0 &&
-                        ri.is_server_hello) {
-                        fl->rev_server_hello = 1;
+                    if (d2k_tls_parse(pkt + rpay_off, rpay, &ri) == 0) {
+                        if (ri.is_server_hello) fl->rev_server_hello = 1;
+                        if (ri.is_server_hello || (ri.is_tls_record &&
+                            ri.record_type == 23 && ri.have_record_end &&
+                            ri.record_end > 5 && pkt[rpay_off + 2] <= 3))
+                            fl->rev_tls_reply = 1;
                     }
                 }
                 if (fl->rev_first_type == 0) {
@@ -1565,7 +1568,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        Клиент повторяет, когда ответа нет, — самая дешёвая улика из доступных,
        и видна она в направлении, которое и так наблюдается. */
     if (fwd && fl->saw_hello && in_seq == fl->hello_seq &&
-        !fl->rev_server_hello && !(fl->rev_types & (uint8_t)(1u << (23 - 20)))) {
+        !fl->rev_tls_reply) {
         fl->hello_repeats++;
         if (fl->hello_repeats >= 2) {
             suspect(s, now_ns, &key, fl, D2K_SUSPECT_REPEAT, NULL);
