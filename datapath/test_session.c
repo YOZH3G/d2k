@@ -489,6 +489,25 @@ static void test_late_rst_after_tls_appdata(void) {
           "alien RST drop hid residual RX measurement trigger");
     d2k_session_free(s);
 
+    s = d2k_session_new(64, 64);
+    guard = NULL;
+    CHECK(d2k_plan_load(plan_guard, sizeof plan_guard, &guard, err, sizeof err) == 0,
+          "FIN retry plan fixture failed");
+    d2k_session_set_plan(s, guard);
+    n = build_pkt(pkt, 47805, 0x18, hello, hlen);
+    d2k_session_packet(s, pkt, n, 3700, buf, sizeof buf, &r);
+    n = build_rev_pkt(pkt, 47805, 0x18, appdata, sizeof appdata);
+    d2k_session_packet(s, pkt, n, 3800, buf, sizeof buf, &r);
+    n = build_pkt(pkt, 47805, 0x11, NULL, 0);
+    d2k_session_packet(s, pkt, n, 3900, buf, sizeof buf, &r);
+    CHECK(!last_suspect(s) && r.verdict == D2K_VERDICT_ACCEPT,
+          "first FIN triggered RX or was intercepted");
+    d2k_session_packet(s, pkt, n, 4000, buf, sizeof buf, &r);
+    e = last_suspect(s);
+    CHECK(e && e->code == D2K_SUSPECT_FIN_RETRY && r.verdict == D2K_VERDICT_ACCEPT,
+          "unanswered FIN retry under plan did not trigger narrow RX measurement");
+    d2k_session_free(s);
+
     /* A handshake/ServerHello response followed by RST is not enough to
        start an RX-volume search: application-data must have been observed. */
     s = d2k_session_new(64, 64);

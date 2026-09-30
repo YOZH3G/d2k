@@ -1350,7 +1350,7 @@ static void *worker_run(void *vp) {
             memset(&t->res, 0, sizeof t->res);
             t->res.verdict = D2K_V_INCONCLUSIVE;
             snprintf(t->res.reason, sizeof t->res.reason,
-                     "поздний RST не подтвердился парной RX-volume-пробой");
+                     "позднее закрытие не подтвердилось парной RX-volume-пробой");
             t->res_ready = 1;
             pthread_mutex_unlock(&s->mu);
             ssize_t ign3 = write(s->wake[1], "w", 1);
@@ -3129,7 +3129,7 @@ static int start_search(d2k_sched *s, task *t) {
             task_reset(t);
             return 0;
         }
-        say(s, "по %s поздний RST: сначала проверяю только повторяемый обрыв входящего ответа",
+        say(s, "по %s позднее закрытие: сначала проверяю только повторяемый обрыв входящего ответа",
             t->name);
         return 1;
     }
@@ -3534,7 +3534,8 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     }
     task *t = task_of(s, name, ev->transport, ev->family);
     int ordinary_tcp_rst = ev->transport == 6 && ev->code == D2K_SUSPECT_RST;
-    const int late_app_rst = ev->code == D2K_SUSPECT_RST_AFTER_APP;
+    const int late_app_rst = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
+        ev->code == D2K_SUSPECT_FIN_RETRY;
     if (t && t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
         /* Поток разговора, к которому применился приём, остался без ответа —
            решает тик (записи и снятию нужны часы). */
@@ -3546,7 +3547,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
             if (t->state != T_WATCHING) { return 0; }
             /* Keep the confirmed catalog binding, but replace its passive
                watcher with a targeted measurement task. */
-            say(s, "по %s поздний RST после app-data — проверяю повторяемость обрыва ответа",
+            say(s, "по %s позднее закрытие после app-data — проверяю повторяемость обрыва ответа",
                 t->name);
             task_done(t);
             t = NULL;
@@ -4635,7 +4636,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                         moved++;
                         continue;
                     }
-                    say(s, "по %s поздний RST не подтвердился парными измерениями ответа; "
+                    say(s, "по %s позднее закрытие не подтвердилось парными измерениями ответа; "
                            "перебор не запускаю", t->name);
                     task_fail(s, t, now_ms);
                     moved++;

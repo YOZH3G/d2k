@@ -243,6 +243,15 @@ fw_family_up() (
     "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
         --tcp-flags RST RST -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    # FIN без ответа тоже может повторяться после оборванного тела. Очередь
+    # получает только закрывающие пакеты, не всю нагрузку. Первый FIN не
+    # вызывает замер; повтор допускает только RX-пару под применённым планом.
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
+        --tcp-flags FIN FIN -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
+        --tcp-flags FIN FIN -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
     "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
@@ -465,6 +474,14 @@ fw_family_installed() (
     "$fw_tool" -t mangle -C "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
         --tcp-flags RST RST -j NFQUEUE --queue-num "$QUEUE_NUM" \
+        --queue-bypass 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
+        --tcp-flags FIN FIN -j NFQUEUE --queue-num "$QUEUE_NUM" \
+        --queue-bypass 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
+        --tcp-flags FIN FIN -j NFQUEUE --queue-num "$QUEUE_NUM" \
         --queue-bypass 2>/dev/null || return 1
     [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE 2>/dev/null || return 1

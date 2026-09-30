@@ -3881,7 +3881,7 @@ rx_volume_tests:
               "layered RX shape fixture failed");
         d2k_sched_event(s, &sh);
         d2k_ev su = ev_suspect(6, 40241);
-        if (bad >= 4) su.code = D2K_SUSPECT_RST_AFTER_APP;
+        if (bad >= 4) su.code = D2K_SUSPECT_FIN_RETRY;
         d2k_sched_event(s, &su);
         int installed = 0;
         for (int i = 0; i < 4000; i++) {

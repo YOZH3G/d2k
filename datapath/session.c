@@ -1488,6 +1488,20 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     }
 
     if (rst || fin) {
+        if (fin && !rst && fwd && fl->saw_hello && fl->plan_done &&
+            (fl->rev_types & (uint8_t)(1u << (23 - 20)))) {
+            uint32_t fin_seq = rd32(t + 4) + (uint32_t)(total - ihl - doff);
+            if (fl->pending_fin && fl->pending_fin_seq == fin_seq) {
+                d2k_jrn_detail det;
+                memset(&det, 0, sizeof det);
+                det.server_hello = fl->rev_server_hello;
+                suspect(s, now_ns, &key, fl, D2K_SUSPECT_FIN_RETRY, &det);
+            }
+            fl->pending_fin = 1; fl->pending_fin_seq = fin_seq;
+            d2k_capture_forget(&s->capture, &key);
+            out->skipped = "клиент закрывает поток под планом; ждём подтверждение или повтор FIN";
+            return 0; /* retain bounded flow metadata, never hold/drop the FIN */
+        }
         if (rst && !fwd && fl->saw_hello && rev_before == 0) {
             /* Сброс пришёл с той стороны, куда ушло приветствие, и никаких
                других ответов оттуда не было. Это НАБЛЮДЕНИЕ, а не диагноз:
