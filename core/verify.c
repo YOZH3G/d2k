@@ -29,6 +29,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <poll.h>
 
 #include "d2k_compose_internal.h" /* d2k_props_contact — общее обращение к цели */
 #include "d2k_h3.h"
@@ -42,6 +44,134 @@ static int64_t verify_now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static unsigned dns16(const uint8_t *p) { return (unsigned)p[0] << 8 | p[1]; }
+
+/* Decode compression with an explicit jump budget; cursor follows the
+ * original encoded name, never a compression pointer's destination. */
+static int ech_dns_name(const uint8_t *b, size_t n, size_t *cursor,
+                         char out[256]) {
+    size_t p = *cursor, used = 0, after = 0;
+    unsigned jumps = 0;
+    while (p < n) {
+        unsigned c = b[p++];
+        if (!c) {
+            if (!after) after = p;
+            out[used] = 0; *cursor = after; return 0;
+        }
+        if ((c & 0xc0) == 0xc0) {
+            if (p >= n || ++jumps > 16) return -1;
+            if (!after) after = p + 1;
+            p = ((size_t)(c & 63) << 8) | b[p];
+            continue;
+        }
+        if (c > 63 || c > n - p || used + c + (used != 0) > 253) return -1;
+        if (used) out[used++] = '.';
+        for (unsigned j = 0; j < c; j++) {
+            unsigned v = b[p++];
+            if (v >= 'A' && v <= 'Z') v += 'a' - 'A';
+            if (!((v >= 'a' && v <= 'z') || (v >= '0' && v <= '9') || v == '-')) return -1;
+            out[used++] = (char)v;
+        }
+    }
+    return -1;
+}
+
+int d2k_ech_resolve(const char *origin, uint32_t mark, d2k_ech_config *config) {
+    if (!origin || !config || !origin[0] || strlen(origin) > 253) return -1;
+    char expected[256];
+    uint8_t query[512] = {0}, reply[4096];
+    if (d2k_t13_random(query, 2)) return -1;
+    query[2] = 1; query[5] = 1;
+    size_t p = 12, name_len = strlen(origin), at = 0;
+    for (size_t i = 0; i < name_len; i++) {
+        unsigned c = (unsigned char)origin[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        expected[i] = (char)c;
+    }
+    expected[name_len] = 0;
+    while (at < name_len) {
+        size_t end = at;
+        while (end < name_len && expected[end] != '.') end++;
+        size_t l = end - at;
+        if (!l || l > 63 || p + l + 1 >= sizeof query) return -1;
+        for (size_t i = at; i < end; i++) {
+            unsigned c = (unsigned char)expected[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return -1;
+        }
+        query[p++] = (uint8_t)l; memcpy(query + p, expected + at, l); p += l;
+        at = end + 1;
+    }
+    query[p++] = 0; query[p++] = 0; query[p++] = 65; query[p++] = 0; query[p++] = 1;
+    char resolver[64] = "127.0.0.1", line[256], parsed[64];
+    FILE *f = fopen("/etc/resolv.conf", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "nameserver %63s", parsed) == 1) {
+                snprintf(resolver, sizeof resolver, "%s", parsed); break;
+            }
+        }
+        fclose(f);
+    }
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof ss);
+    struct sockaddr_in *v4 = (struct sockaddr_in *)&ss;
+    struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&ss;
+    int af; socklen_t sl;
+    if (inet_pton(AF_INET, resolver, &v4->sin_addr) == 1) {
+        af = AF_INET; sl = sizeof *v4; v4->sin_family = AF_INET; v4->sin_port = htons(53);
+    } else if (inet_pton(AF_INET6, resolver, &v6->sin6_addr) == 1) {
+        af = AF_INET6; sl = sizeof *v6; v6->sin6_family = AF_INET6; v6->sin6_port = htons(53);
+    } else return -1;
+    int fd = socket(af, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+#ifdef SO_MARK
+    if (mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof mark)) { close(fd); return -1; }
+#else
+    (void)mark;
+#endif
+    if (connect(fd, (struct sockaddr *)&ss, sl) || send(fd, query, p, 0) != (ssize_t)p) {
+        close(fd); return -1;
+    }
+    struct pollfd pf = {fd, POLLIN, 0};
+    int ready = poll(&pf, 1, 1500);
+    ssize_t received = ready > 0 ? recv(fd, reply, sizeof reply, 0) : -1;
+    close(fd);
+    if (received < 12) return -1;
+    size_t n = (size_t)received;
+    if (memcmp(query, reply, 2) || !(reply[2] & 0x80) ||
+        (reply[2] & 0x7a) || (reply[3] & 15) || dns16(reply + 4) != 1) return -1;
+    p = 12; char owner[256];
+    if (ech_dns_name(reply, n, &p, owner) || strcmp(owner, expected) ||
+        p + 4 > n || dns16(reply + p) != 65 || dns16(reply + p + 2) != 1) return -1;
+    p += 4;
+    unsigned count = dns16(reply + 6);
+    if (count > 64) return -1;
+    for (unsigned i = 0; i < count; i++) {
+        if (ech_dns_name(reply, n, &p, owner) || p + 10 > n) return -1;
+        unsigned type = dns16(reply + p), cls = dns16(reply + p + 2);
+        size_t end = p + 10 + dns16(reply + p + 8); p += 10;
+        if (end > n) return -1;
+        if (type != 65 || cls != 1 || strcmp(owner, expected)) { p = end; continue; }
+        if (end - p < 3 || !dns16(reply + p)) { p = end; continue; }
+        p += 2; char target[256];
+        if (ech_dns_name(reply, n, &p, target) || p > end) return -1;
+        if (target[0] && strcmp(target, expected)) { p = end; continue; }
+        int last = -1, found = 0, compatible = 1;
+        d2k_ech_config candidate;
+        while (p < end) {
+            if (end - p < 4) return -1;
+            unsigned key = dns16(reply + p); size_t l = dns16(reply + p + 2); p += 4;
+            if ((int)key <= last || l > end - p) return -1;
+            last = (int)key;
+            if (key == 3 && (l != 2 || dns16(reply + p) != 443)) compatible = 0;
+            if (key == 5 && !d2k_ech_config_parse(reply + p, l, &candidate)) found = 1;
+            p += l;
+        }
+        if (found && compatible) { *config = candidate; return 0; }
+    }
+    return -1;
 }
 
 /* RFC 9112 §4, RFC 9110 §15.2. Записи TLS не являются границами HTTP.
@@ -658,8 +788,31 @@ d2k_ver_result d2k_verify_probe_ech_on(int use_fd, const char *ip, uint16_t port
         snprintf(r.reason, sizeof r.reason, "нет ECH-конфигурации/origin; опыт не состоялся");
         return r;
     }
-    return verify_probe13_internal(use_fd, ip, port, origin, deadline_ms,
-                                   hello_wire, 0, mark, path, config);
+    d2k_ver_result r = verify_probe13_internal(use_fd, ip, port, origin, deadline_ms,
+                                               hello_wire, 0, mark, path, config);
+    if (r.status >= 400) {
+        /* A real origin denial/rate limit is not a reason to hammer it with
+         * more bypass candidates and not confirmation that its page works. */
+        r.level = D2K_VER_CHALLENGE;
+        snprintf(r.reason, sizeof r.reason, "ECH origin ответил HTTP %d; подбор не должен усиливать отказ сервера", r.status);
+    }
+    return r;
+}
+
+d2k_ver_result d2k_verify_probe_ech_origin_on(int use_fd, const char *ip,
+    uint16_t port, const char *outer_name, const char *origin, int deadline_ms,
+    size_t hello_wire, uint32_t dns_mark, const char *path) {
+    d2k_ech_config config;
+    if (!outer_name || !origin || d2k_ech_resolve(origin, dns_mark, &config) ||
+        strcmp(outer_name, config.public_name)) {
+        d2k_ver_result r;
+        memset(&r, 0, sizeof r); r.fd = -1; r.name_ok = -1;
+        if (use_fd >= 0) close(use_fd);
+        snprintf(r.reason, sizeof r.reason, "ECH witness/config не совпали; опыт не состоялся");
+        return r;
+    }
+    return d2k_verify_probe_ech_on(use_fd, ip, port, origin, &config, deadline_ms,
+                                  hello_wire, use_fd < 0 ? dns_mark : 0, path);
 }
 
 d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,

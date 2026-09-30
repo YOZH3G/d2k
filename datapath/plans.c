@@ -134,6 +134,21 @@ static int name_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen)
 
 uint64_t d2k_plantab_revision(const d2k_plantab *t) { return t ? t->revision : 0; }
 
+int d2k_plantab_has_ech_target(const d2k_plantab *t, const uint8_t *name,
+    size_t len, const uint8_t *addr, uint8_t family, uint16_t sport_be) {
+    if (!t) return 0;
+    for (size_t i = 0; i < t->used; i++) {
+        const entry *e = &t->v[i];
+        if (e->family != family || e->shape != D2K_PLAN_SHAPE_ECH_TCP ||
+            (e->only_sport && e->only_sport != sport_be)) continue;
+        if (e->kind == KEY_NAME && name && len &&
+            name_eq(e->name, e->name_len, name, len)) return 1;
+        if (e->kind == KEY_ADDR && addr &&
+            !memcmp(e->addr, addr, family == 6 ? 16 : 4)) return 1;
+    }
+    return 0;
+}
+
 int d2k_plantab_stream_candidate(const d2k_plantab *t, const uint8_t *name,
                                 size_t len, uint32_t addr_be, uint16_t sport_be) {
     return d2k_plantab_stream_candidate_family(t, name, len, addr_be, sport_be, 4);
@@ -668,6 +683,9 @@ size_t d2k_plantab_probe_count(const d2k_plantab *t) {
  * вместе с миграцией каталога, где у записи есть транспорт. */
 static int shape_fits(uint8_t entry_shape, uint8_t seen_shape) {
     if (entry_shape == D2K_PLAN_SHAPE_GRANDFATHER) { return 1; }
+    /* ECH offer is also used by GREASE. Preserve the old TLS-1.3 binding
+     * when no dedicated ECH binding exists; never use ECH proof for non-ECH. */
+    if (entry_shape == D2K_PLAN_SHAPE_MODERN && seen_shape == D2K_PLAN_SHAPE_ECH_TCP) return 1;
     return entry_shape != 0 && entry_shape == seen_shape;
 }
 
@@ -734,6 +752,8 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
         entry *e = NULL;
         if (sport_be != 0) {
             e = find_name_shape_port(t, name, len, seen_shape, sport_be, family);
+            if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP)
+                e = find_name_shape_port(t, name, len, D2K_PLAN_SHAPE_MODERN, sport_be, family);
             if (!e && seen_shape == D2K_PLAN_SHAPE_ANY) {
                 /* Probe-specific SET_NAME carries the verifier's known shape;
                    a segmented ClientHello may not reveal it in its first
@@ -757,6 +777,8 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
         }
         /* Сперва запись СВОЕЙ формы: у имени их может быть несколько. */
         e = find_name_shape(t, name, len, seen_shape, family);
+        if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP)
+            e = find_name_shape(t, name, len, D2K_PLAN_SHAPE_MODERN, family);
         if (!e) {
             /* Дедушкино право — отдельная запись, и она подходит любой
                форме (см. shape_fits). Ищем её только когда своей нет. */

@@ -46,6 +46,25 @@ static uint32_t addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 
 int main(void) {
     {
+        const uint8_t nm[] = "outer.test";
+        d2k_plantab *t = d2k_plantab_new(8);
+        d2k_plan *ordinary = mkplan(), *ech = mkplan();
+        CHECK(t && ordinary && ech, "ECH fixture allocation");
+        if (t && ordinary && ech) {
+            CHECK(!d2k_plantab_set_name_shaped(t, nm, sizeof nm - 1, 1, ordinary,
+                                               D2K_PLAN_SHAPE_MODERN), "ordinary TLS seed");
+            CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, 0, 2,
+                                  D2K_PLAN_SHAPE_ECH_TCP) == ordinary, "GREASE retains old TLS plan");
+            CHECK(!d2k_plantab_set_name_shaped(t, nm, sizeof nm - 1, 3, ech,
+                                               D2K_PLAN_SHAPE_ECH_TCP), "ECH seed");
+            CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, 0, 4,
+                                  D2K_PLAN_SHAPE_ECH_TCP) == ech, "dedicated ECH preferred");
+            CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, 0, 5,
+                                  D2K_PLAN_SHAPE_MODERN) == ordinary, "ECH does not replace plain TLS");
+        }
+        d2k_plantab_free(t);
+    }
+    {
         d2k_plantab *t = d2k_plantab_new(8);
         const uint8_t a[16] = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,192,0,2,1};
         uint8_t b[16]; memcpy(b, a, 16); b[4] = 1;

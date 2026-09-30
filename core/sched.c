@@ -599,6 +599,11 @@ typedef struct {
     int        family_reuse; /* 1 baseline pending, 2 isolated trial, 3 exhausted */
     int        skip_volume_once; /* resume classifier with existing baseline */
     char       measure_path[512]; /* selected before worker start, never guessed from ciphertext */
+    int        ech_offer;
+    int        ech_trial; /* failed baseline permits hypotheses, not a DPI verdict */
+    char       ech_origin[256]; /* known own-probe witness, not inferred hidden SNI */
+    char       ech_witnesses[4][256];
+    size_t     ech_witness_count;
     d2k_ver_result rx_identity[2]; /* body evidence only; sockets closed normally */
     int64_t    rx_retry_after_ms;
     /* A late TLS RST is only permission for the paired receive-volume probe.
@@ -645,6 +650,7 @@ typedef struct {
     uint8_t  family;
     char     name[256];
     int      used;
+    int64_t observed_ms;
 } seen_name;
 
 /* Negative observations never enter the strategy catalog. This bounded,
@@ -661,6 +667,7 @@ typedef struct {
     int64_t    until_ms;
     int        challenge;
     int        exhausted;
+    int        ech_input;
     int        used;
 } target_cooldown;
 
@@ -682,6 +689,9 @@ struct d2k_sched {
     size_t       cooldown_next;
     struct { d2k_resource ref; int64_t expires_ms; } resources[8];
     size_t resource_next;
+    struct { char name[256]; uint8_t bytes[2048]; size_t len;
+             uint8_t family; int64_t observed_ms; } ech_inputs[8];
+    size_t ech_input_next;
     int64_t      last_measure_start_ms;
     int          measure_start_seen;
 
@@ -983,6 +993,7 @@ static void remember(d2k_sched *s, const d2k_ev *ev) {
     for (size_t i = 0; i < SCHED_SEEN; i++) {
         if (same_flow(&s->seen[i], ev)) {
             snprintf(s->seen[i].name, sizeof s->seen[i].name, "%s", ev->name);
+            s->seen[i].observed_ms = s->now_ms;
             return;
         }
     }
@@ -997,6 +1008,7 @@ static void remember(d2k_sched *s, const d2k_ev *ev) {
     slot->transport = ev->transport;
     snprintf(slot->name, sizeof slot->name, "%s", ev->name);
     slot->used = 1;
+    slot->observed_ms = s->now_ms;
 }
 
 static const char *recall(const d2k_sched *s, const d2k_ev *ev) {
@@ -1071,6 +1083,8 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
         c->negative_streak = 0;
         c->challenge = 0;
         c->exhausted = 1;
+        c->ech_input = t->trig_snapped && t->transport == 6 &&
+            d2k_hello_ech_offer(t->trig, t->trig_len, NULL) == 1;
         c->signal_code = t->trigger_code;
         c->until_ms = s->now_ms + SCHED_INCOMPLETE_BACKOFF_MS;
         return;
@@ -1178,6 +1192,16 @@ static int fill_hellos(d2k_sched *s, task *t) {
         }
         return 0;
     }
+    if (t->trig_len == 0) {
+        for (size_t k = 0; k < 8; k++) {
+            if (s->ech_inputs[k].len && s->ech_inputs[k].family == t->family &&
+                s->ech_inputs[k].observed_ms + 600000 >= s->now_ms &&
+                !strcmp(s->ech_inputs[k].name, t->name)) {
+                memcpy(t->trig, s->ech_inputs[k].bytes, s->ech_inputs[k].len);
+                t->trig_len = s->ech_inputs[k].len; t->trig_snapped = 1; break;
+            }
+        }
+    }
     if (t->trig_len == 0 && s->tcp_shape_len[t->family == 6] > 0 &&
         strcmp(s->tcp_shape_name[t->family == 6], t->name) == 0 &&
         s->tcp_shape_len[t->family == 6] <= sizeof t->trig) {
@@ -1276,7 +1300,11 @@ static void *worker_run(void *vp) {
                                    t->transport == 6 && (t->vol.rx_cut || layered_rx)
                                   ? d2k_sched_rx_ver_hook : d2k_sched_ver_hook;
         d2k_ver_result vr;
-        if (t->transport == 6 && t->measure_path[0]) {
+        if (t->transport == 6 && t->ech_offer) {
+            vr = d2k_verify_probe_ech_origin_on(a_use_fd, t->ip, t->port,
+                t->name, t->ech_origin, SCHED_VERIFY_STEP_MS, trig.len,
+                s->measure_mark, NULL);
+        } else if (t->transport == 6 && t->measure_path[0]) {
             int encoding = t->rx_phase == 2 ? 1 : 0;
             vr = d2k_sched_path_ver_hook(a_use_fd, t->ip, t->port, t->name,
                 SCHED_VERIFY_STEP_MS, trig.len,
@@ -1322,6 +1350,58 @@ static void *worker_run(void *vp) {
        identity/gzip GET отдельно проверяют обрыв ВХОДЯЩЕГО тела. Последний
        становится своим rx-volume-сигналом и может приоритизировать план,
        который доказательно обходит такой профиль. QUIC сюда не попадает. */
+    if (t->transport == 6 && t->ech_offer) {
+        /* Explicit previously observed/confirmed origins are witnesses, not
+         * guessed hidden names. Validate their HTTPS RR public_name first. */
+        if (t->ech_origin[0]) {
+            d2k_ech_config cfg;
+            if (d2k_ech_resolve(t->ech_origin, s->measure_mark, &cfg) ||
+                strcmp(cfg.public_name, t->name)) t->ech_origin[0] = 0;
+        }
+        if (!t->ech_origin[0]) {
+            for (size_t i = 0; i < t->ech_witness_count; i++) {
+                d2k_ech_config cfg;
+                if (!d2k_ech_resolve(t->ech_witnesses[i], s->measure_mark, &cfg) &&
+                    !strcmp(cfg.public_name, t->name)) {
+                    snprintf(t->ech_origin, sizeof t->ech_origin, "%s", t->ech_witnesses[i]);
+                    break;
+                }
+            }
+        }
+        if (!t->ech_origin[0]) {
+            /* An offer may be GREASE. No known matching ECH witness means
+             * no promotion to ECH proof; retain the existing named TLS path. */
+            t->ech_offer = 0;
+            t->asked_shape = SCHED_PROBE_SHAPE;
+        }
+    }
+    if (t->transport == 6 && t->ech_offer) {
+        d2k_ver_result baseline = d2k_verify_probe_ech_origin_on(-1, t->ip, t->port,
+            t->name, t->ech_origin, SCHED_VERIFY_STEP_MS, trig.len, s->measure_mark, NULL);
+        d2k_vres result;
+        memset(&result, 0, sizeof result);
+        if (baseline.fd < 0 || baseline.level == D2K_VER_CHALLENGE) {
+            result.verdict = D2K_V_INCONCLUSIVE;
+            snprintf(result.reason, sizeof result.reason, "ECH: %.150s", baseline.reason);
+        } else if (baseline.ech_accepted && baseline.name_ok == 1 &&
+                   baseline.level == D2K_VER_APPLICATION && baseline.body_complete) {
+            result.verdict = D2K_V_CLEAR;
+            snprintf(result.reason, sizeof result.reason, "прямой ECH witness %.80s завершён: HTTP %d, %llu байт",
+                t->ech_origin, baseline.status, (unsigned long long)baseline.body_bytes);
+        } else {
+            /* Permission for an isolated candidate experiment, not a proved
+             * DPI verdict. Only own ECH+body+APPLIED can confirm a plan. */
+            result.verdict = D2K_V_INCONCLUSIVE;
+            snprintf(result.reason, sizeof result.reason, "ECH witness не завершён: %.150s", baseline.reason);
+            t->ech_trial = 1;
+        }
+        d2k_verify_close(&baseline);
+        pthread_mutex_lock(&s->mu);
+        t->res = result; t->res_ready = 1;
+        pthread_mutex_unlock(&s->mu);
+        ssize_t ign_ech = write(s->wake[1], "w", 1); (void)ign_ech;
+        return NULL;
+    }
     if (t->transport == 6 && !t->skip_volume_once) {
         int tls12 = d2k_hello_shape(trig.bytes, trig.len) == D2K_SHAPE_LEGACY;
         t->vol = t->measure_path[0]
@@ -1631,6 +1711,7 @@ static uint8_t question_shape(const task *t) {
 }
 
 static uint8_t probe_shape(const task *t) {
+    if (t->transport == 6 && t->ech_offer) return D2K_LINK_SHAPE_ECH_TCP;
     /* У QUIC форма своя и известна ЗАРАНЕЕ, из транспорта: перечисление
        d2k_shape знает только формы TLS, и вывести по нему тройку неоткуда.
        Пока этого не было, план QUIC-задачи уезжал формой MODERN, а таблица
@@ -2493,6 +2574,28 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
        появления вопросов планировщик только его и получал. */
     size_t cap = sizeof t->plans / sizeof t->plans[0];
 
+    if (t->ech_trial) {
+        /* A known origin supplies tools, never the outer target's proof. */
+        for (size_t bi = 0; s->cat && bi < s->cat->n_boxes && t->n_plans < cap; bi++) {
+            const d2k_cat_box *b = &s->cat->boxes[bi];
+            for (size_t j = 0; j < b->n_binds && t->n_plans < cap; j++) {
+                const d2k_cat_binding *bd = &b->binds[j];
+                if (!bd->enabled || bd->level < 3 || bd->transport != 6 ||
+                    (bd->family ? bd->family : 4) != t->family ||
+                    (strcmp(bd->target, t->ech_origin) && strcmp(bd->target, t->name))) continue;
+                const d2k_cat_plan *p = plan_by_id(b, bd->plan_id);
+                if (!p || !p->enabled || !p->text || strcmp(p->proto, "tls") ||
+                    strlen(p->text) >= sizeof t->plans[0]) continue;
+                int duplicate = 0;
+                for (size_t k = 0; k < t->n_plans; k++)
+                    if (!strcmp(t->plans[k], p->text)) duplicate = 1;
+                if (!duplicate) snprintf(t->plans[t->n_plans++], sizeof t->plans[0], "%s", p->text);
+            }
+        }
+        say(s, "по %s ECH-база неубедительна; %zu собственных планов witness проверяю как гипотезы, без опроса обычного TLS",
+            t->name, t->n_plans);
+    }
+
     if (t->transport == 17) {
         /* У QUIC свой источник кандидатов — подобранное плечо. Разрезы и
            перекрытия, которые выводит d2k_compose, к датаграмме не
@@ -3211,6 +3314,70 @@ static int start_search(d2k_sched *s, task *t) {
         return 0;
     }
     select_resource_path(s, t);
+    t->ech_offer = t->transport == 6 && t->trig_snapped &&
+                   d2k_hello_ech_offer(t->trig, t->trig_len, NULL) == 1;
+    t->ech_origin[0] = 0;
+    t->ech_trial = 0;
+    t->ech_witness_count = 0;
+    if (t->ech_offer) {
+        t->asked_shape = D2K_LINK_SHAPE_ECH_TCP;
+        /* ECH baseline owns its application result. A late-reset trigger
+         * must not feed it into the ordinary identity/gzip RX gate. */
+        t->rx_volume_only = 0;
+        /* Preserve the explicit successful witness across restarts. */
+        for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
+            const d2k_cat_box *b = &s->cat->boxes[bi];
+            for (size_t j = 0; j < b->n_binds; j++) {
+                const d2k_cat_binding *bd = &b->binds[j];
+                if (bd->enabled && bd->level >= 3 && bd->transport == 6 &&
+                    bd->family == t->family && !strcmp(bd->target, t->name) && bd->ech_origin[0])
+                    snprintf(t->ech_origin, sizeof t->ech_origin, "%s", bd->ech_origin);
+            }
+        }
+        /* Recent named traffic supplies a known endpoint to probe. This is
+         * NOT a claim that it is the hidden name of the ECH client flow. */
+        uint8_t addr[16] = {0};
+        if (!t->ech_origin[0] && inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, addr) == 1) {
+            for (size_t i = 0; i < SCHED_SEEN; i++) {
+                const seen_name *w = &s->seen[i];
+                size_t bytes = t->family == 6 ? 16 : 4;
+                if (w->used && w->transport == 6 && w->family == t->family &&
+                    w->observed_ms + 600000 >= s->now_ms && strcmp(w->name, t->name) &&
+                    (!memcmp(addr, w->low_ip, bytes) || !memcmp(addr, w->high_ip, bytes))) {
+                    if (t->ech_witness_count < 2)
+                        snprintf(t->ech_witnesses[t->ech_witness_count++], 256, "%s", w->name);
+                }
+            }
+        }
+        say(s, "по %s обнаружен ECH offer; собственный witness: %s; обычный TLS/HTTP внешнего имени не используется",
+            t->name, t->ech_origin[0] ? t->ech_origin : "пока неизвестен");
+        /* Seed from OWN confirmed knowledge after restart, not an imported
+         * list. Four most recent distinct named TCP origins bound DNS cost. */
+        int64_t times[4] = {0};
+        for (size_t k = 0; k < t->ech_witness_count; k++) times[k] = INT64_MAX;
+        for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
+            const d2k_cat_box *b = &s->cat->boxes[bi];
+            for (size_t j = 0; j < b->n_binds; j++) {
+                const d2k_cat_binding *bd = &b->binds[j];
+                if (!bd->enabled || bd->level < 3 || bd->transport != 6 ||
+                    strcmp(bd->kind, "name") || !bd->target[0] ||
+                    !strcmp(bd->target, t->name) || bd->ech_origin[0]) continue;
+                int duplicate = 0;
+                for (size_t k = 0; k < t->ech_witness_count; k++)
+                    if (!strcmp(t->ech_witnesses[k], bd->target)) duplicate = 1;
+                if (duplicate) continue;
+                size_t slot = t->ech_witness_count;
+                if (slot < 4) t->ech_witness_count++;
+                else {
+                    slot = 0;
+                    for (size_t k = 1; k < 4; k++) if (times[k] < times[slot]) slot = k;
+                    if (times[slot] >= bd->confirmed) continue;
+                }
+                snprintf(t->ech_witnesses[slot], sizeof t->ech_witnesses[slot], "%s", bd->target);
+                times[slot] = bd->confirmed;
+            }
+        }
+    }
     if (!t->rx_volume_only && !t->family_reuse && has_other_family_target_plan(s, t))
         t->family_reuse = 1;
     if (t->rx_volume_only) {
@@ -3221,7 +3388,8 @@ static int start_search(d2k_sched *s, task *t) {
         t->n_plans = 0;
         t->researched = 1;
         t->state = T_ASKING;
-        t->asked_shape = (uint8_t)d2k_hello_shape(t->trig, t->trig_len);
+        t->asked_shape = t->ech_offer ? D2K_LINK_SHAPE_ECH_TCP :
+            (uint8_t)d2k_hello_shape(t->trig, t->trig_len);
         if (start_worker(s, t, JOB_CLASSIFY) != 0) {
             task_reset(t);
             return 0;
@@ -3232,8 +3400,8 @@ static int start_search(d2k_sched *s, task *t) {
     }
     t->researched = 1;
     t->state = T_ASKING;
-    t->asked_shape = (uint8_t)(t->transport == 17 ? D2K_SHAPE_UNKNOWN
-                                                  : d2k_hello_shape(t->trig, t->trig_len));
+    t->asked_shape = t->ech_offer ? D2K_LINK_SHAPE_ECH_TCP :
+        (uint8_t)(t->transport == 17 ? D2K_SHAPE_UNKNOWN : d2k_hello_shape(t->trig, t->trig_len));
     if (start_worker(s, t, JOB_CLASSIFY) != 0) {
         task_reset(t);
         return 0;
@@ -3788,6 +3956,26 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         name[len] = '\0';
     }
     if (name[0] == '\0') { return; }
+    if (ev->transport == 6 && d2k_hello_ech_offer(ev->shape, ev->shape_len, NULL) == 1) {
+        size_t slot = 8;
+        uint8_t family = ev->family ? ev->family : 4;
+        for (size_t k = 0; k < 8; k++)
+            if (s->ech_inputs[k].len && s->ech_inputs[k].family == family &&
+                !strcmp(s->ech_inputs[k].name, name)) { slot = k; break; }
+        if (slot == 8) {
+            slot = s->ech_input_next++ % 8;
+            /* New protocol evidence supersedes an inconclusive ordinary
+             * profile measurement, once per cache admission, not per retry. */
+            target_cooldown *cool = cooldown_find(s, name, 6, family);
+            if (cool && cool->exhausted && !cool->challenge && !cool->ech_input)
+                cooldown_clear(s, name, 6, family);
+        }
+        snprintf(s->ech_inputs[slot].name, 256, "%s", name);
+        memcpy(s->ech_inputs[slot].bytes, ev->shape, ev->shape_len);
+        s->ech_inputs[slot].len = ev->shape_len;
+        s->ech_inputs[slot].family = family;
+        s->ech_inputs[slot].observed_ms = s->now_ms;
+    }
     /* СНИМОК QUIC СОХРАНЯЕТСЯ ОБЩИМ, а не только задаче своего имени.
        Собственный Initial позволяет начать без него, но не является
        наблюдёнными байтами клиентского приветствия. Соседней
@@ -3848,6 +4036,8 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
             if (t->watch_shape_pending && t->transport == 6) {
                 t->watch_shape_pending = 0;
                 d2k_shape shape = d2k_hello_shape(ev->shape, ev->shape_len);
+                if (d2k_hello_ech_offer(ev->shape, ev->shape_len, NULL) == 1)
+                    shape = (d2k_shape)D2K_LINK_SHAPE_ECH_TCP;
                 int covered = 0;
                 for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
                     const d2k_cat_box *b = &s->cat->boxes[bi];
@@ -3900,6 +4090,11 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     char plan_id[40], box_id[40];
     uint8_t wire_id[D2K_PLAN_ID_LEN];
     plan_ident(text, plan_id, sizeof plan_id, wire_id);
+    if (t->ech_offer && (!t->ver.ech_accepted || t->ver.name_ok != 1 ||
+        t->ver.level != D2K_VER_APPLICATION || !t->ver.body_complete)) {
+        say(s, "по %s ECH-план не подтверждён принятым ECH и полным ответом origin", t->name);
+        ver_close(t); t->state = T_PLANNING; return;
+    }
     /* НЕПЕРЕНОСИМОСТЬ ПЕРЕВЕШИВАЕТ УСПЕХ ЗОНДА.
        Пока шло испытание, тот же план применялся и к потокам настоящих
        клиентов — план стоит на цели целиком. Если хотя бы одному из них он
@@ -3957,6 +4152,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     uint8_t rec_shape;
     if (t->transport == 17) {
         rec_shape = (uint8_t)D2K_LINK_SHAPE_QUIC;
+    } else if (t->ech_offer) {
+        rec_shape = D2K_LINK_SHAPE_ECH_TCP;
     } else {
         d2k_shape cs = d2k_hello_shape(t->trig, t->trig_len);
         rec_shape = (uint8_t)(cs == D2K_SHAPE_LEGACY ? D2K_SHAPE_LEGACY
@@ -3972,6 +4169,20 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          t->name, t->by_addr ? "addr" : "name", t->transport, t->family, rec_shape,
                          D2K_VERBY_PROBE, rec_input,
                          wall_s(s, now_ms), &t->fp);
+    if (t->ech_offer) {
+        for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+            d2k_cat_box *b = &s->cat->boxes[bi];
+            if (strcmp(b->id, box_id)) continue;
+            for (size_t j = 0; j < b->n_binds; j++) {
+                d2k_cat_binding *bd = &b->binds[j];
+                if (!strcmp(bd->target, t->name) && !strcmp(bd->plan_id, plan_id) &&
+                    bd->family == t->family && bd->shape == rec_shape && bd->transport == 6) {
+                    snprintf(bd->ech_origin, sizeof bd->ech_origin, "%s", t->ech_origin);
+                    s->cat->revision++;
+                }
+            }
+        }
+    }
     if (t->measure_path[0]) {
         for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
             d2k_cat_box *b = &s->cat->boxes[bi];
@@ -4802,8 +5013,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 strcmp(s->tcp_shape_name[t->family == 6], t->name) == 0 &&
                 s->tcp_shape_len[t->family == 6] <= sizeof t->trig &&
                 (!t->trig_snapped ||
-                 d2k_hello_shape(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6])
-                     != (d2k_shape)t->asked_shape)) {
+                 (d2k_hello_ech_offer(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6], NULL) == 1
+                    ? D2K_LINK_SHAPE_ECH_TCP :
+                    (uint8_t)d2k_hello_shape(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]))
+                     != t->asked_shape)) {
                 int other_form = d2k_hello_shape(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6])
                                      != (d2k_shape)t->asked_shape;
                 /* Снимок берём ТОЛЬКО ТЕПЕРЬ, когда замер закончен: вход
@@ -4842,7 +5055,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 if (start_worker(s, t, JOB_CLASSIFY) != 0) task_fail(s, t, now_ms);
                 moved++; continue;
             }
-            if (!verdict_proves_block(r.verdict) && !volume_proven) {
+            if (!verdict_proves_block(r.verdict) && !volume_proven && !t->ech_trial) {
                 say(s, "по %s прямой замер не подтвердил блокировку (%s: %s) — "
                        "подбор и применение обхода не запускаю",
                     t->name, verdict_name(r.verdict), r.reason);
@@ -4869,7 +5082,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             {
                 /* Volume fingerprint is installed by make_plans before its
                    catalog lookup; do not match the earlier generic reset. */
-                size_t known = volume_proven ? 0 : known_plans(s, t);
+                size_t known = volume_proven || t->ech_trial ? 0 : known_plans(s, t);
                 if (known > 0) {
                     t->res = r;
                     t->cached_measure_valid = 1;

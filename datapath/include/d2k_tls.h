@@ -55,6 +55,7 @@ typedef struct {
        ещё не пришли, честно даёт 0 — это «не разобрано», и такой поток
        план с объявленной формой не получит. */
     int is_tls13;
+    int ech_offer; /* observed complete outer extension; may be GREASE */
 
     /* Блок расширений ОБОРВАН: объявленная длина не поместилась в пришедшие
        байты. Значим при is_client_hello.

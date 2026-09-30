@@ -81,6 +81,8 @@
 #define D2K_TARGET_NAME_MAX 255
 
 typedef struct d2k_plantab d2k_plantab;
+int d2k_plantab_has_ech_target(const d2k_plantab *, const uint8_t *, size_t,
+    const uint8_t *, uint8_t family, uint16_t sport_be);
 
 /* Explicit family APIs. Legacy entry points are IPv4-only wrappers. */
 int d2k_plantab_set_addr_family(d2k_plantab *, const uint8_t *, uint8_t family,
@@ -166,6 +168,7 @@ void         d2k_plantab_clear_probes(d2k_plantab *t);
  * TLS или QUIC. Своя форма по той же причине, что у QUIC: подтверждённое на
  * одном протоколе к другому отношения не имеет. */
 #define D2K_PLAN_SHAPE_VOICE  5
+#define D2K_PLAN_SHAPE_ECH_TCP 6
 
 /* ИМЯ ГОЛОСА — КЛАСС, А НЕ ДОМЕН.
  *

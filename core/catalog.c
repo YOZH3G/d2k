@@ -857,6 +857,9 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
     if (strcmp(key, "probe_path") == 0)
         return jparse_string_fixed(j, out->probe_path, sizeof out->probe_path,
                                    "binding.probe_path", err, errcap);
+    if (strcmp(key, "ech_origin") == 0)
+        return jparse_string_fixed(j, out->ech_origin, sizeof out->ech_origin,
+                                   "binding.ech_origin", err, errcap);
     return jskip_value(j, depth + 1, err, errcap);
 }
 static int parse_binding(jctx *j, d2k_cat_binding *out, int depth, char *err, size_t errcap) {
@@ -1175,6 +1178,10 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
     if (bd->probe_path[0]) {
         fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"probe_path\": ", f);
         write_json_string(f, bd->probe_path);
+    }
+    if (bd->ech_origin[0]) {
+        fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"ech_origin\": ", f);
+        write_json_string(f, bd->ech_origin);
     }
     fputc('\n', f);
     wr_indent(f, depth); fputc('}', f);

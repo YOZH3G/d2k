@@ -183,6 +183,7 @@ typedef struct {
        0 — не записано (файл снят до появления поля). */
     uint8_t  input;
     char probe_path[512]; /* public stylesheet witness; empty means legacy / */
+    char ech_origin[256]; /* explicit own-probe witness, NOT decrypted client SNI */
 } d2k_cat_binding;
 
 /* ПОЛНОТА ВХОДА ЗАМЕРА.

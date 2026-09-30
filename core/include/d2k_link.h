@@ -269,6 +269,7 @@ int  d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap);
  * D2K_VOICE_CLASS в datapath/d2k_plans.h; почему ярлык класса, а не домен и не
  * адрес, — там же. */
 #define D2K_LINK_SHAPE_VOICE 5
+#define D2K_LINK_SHAPE_ECH_TCP 6
 #define D2K_LINK_VOICE_CLASS "@discord-voice"
 
 int  d2k_link_set_name(int fd, const char *name, uint8_t transport,

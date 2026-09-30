@@ -1668,13 +1668,17 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                     d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_NONAME,
                                     0, 0, NULL, NULL, 0, NULL);
                 }
-                if (!fl->controller_probe && s->shape_armed[k] &&
+                int requested_shape = s->shape_armed[k] &&
                     (s->shape_name_len[k] == 0 ||
                      name_same(s->last_name[k], s->last_name_len[k],
-                               s->shape_name[k], s->shape_name_len[k]))) {
+                               s->shape_name[k], s->shape_name_len[k]));
+                /* ECH cannot be regenerated from the outer name. Deliver
+                 * its observed input before another connection overwrites
+                 * last_hello, rather than waiting for a late suspicion. */
+                if (!fl->controller_probe && (requested_shape || complete.ech_offer)) {
                     memcpy(s->shape[k], hello, hello_len);
                     s->shape_len[k] = hello_len;
-                    s->shape_armed[k] = 0;
+                    if (requested_shape) s->shape_armed[k] = 0;
                     d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
                                     (uint32_t)hello_len, NULL, NULL, 0, NULL);
                 }
@@ -1738,7 +1742,17 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             if (tls.is_tls13) {
                 /* Признак найден — достоверен независимо от обрыва:
                    расширение прочитано целиком. */
-                seen_shape = D2K_PLAN_SHAPE_MODERN;
+                seen_shape = tls.ech_offer ? D2K_PLAN_SHAPE_ECH_TCP : D2K_PLAN_SHAPE_MODERN;
+                /* Absence on an incomplete extension block is unknown.
+                 * Keep the old MODERN prefix fast path where no ECH binding
+                 * exists; exact probes use their reserved-port identity. */
+                uint16_t probe_port = 0;
+                if (controller_probe) memcpy(&probe_port, t, 2);
+                if (!tls.ech_offer && tls.exts_truncated &&
+                    d2k_plantab_has_ech_target(s->plans,
+                        pkt + payload_off + tls.sni_off, tls.sni_len,
+                        ip.dst.bytes, ip.family, probe_port))
+                    seen_shape = D2K_PLAN_SHAPE_ANY;
             } else if (!tls.exts_truncated) {
                 /* Признака нет, и блок расширений пришёл ВЕСЬ — значит его
                    действительно нет. */
@@ -2128,6 +2142,16 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
        достаточно, чтобы не удерживать чужие потоки. */
     if (at_head) {
         d2k_tls_parse(p + v.header, v.payload, &tls);
+        /* Only a target with its own ECH binding needs to wait for an ECH
+         * extension potentially hidden in the tail. Reuse the existing
+         * bounded, fail-open collection, not a second stream buffer. */
+        if (!fl->controller_probe && tls.have_sni && tls.exts_truncated &&
+            !tls.ech_offer && d2k_plantab_has_ech_target(s->plans,
+                p + v.header + tls.sni_off, tls.sni_len,
+                v.dst.bytes, v.dst.family, 0)) {
+            fl->stream_attempted = 1;
+            return 1;
+        }
         /* ИМЯ И ПРИГОДНАЯ ФОРМА УЖЕ ЗДЕСЬ — ДЕРЖАТЬ НЕЧЕГО.
          *
          * Если форма уже известна (либо её знает собственный exact-port

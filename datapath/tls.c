@@ -68,6 +68,23 @@ static int skip_u16_vec(const uint8_t *b, size_t len, size_t *off) {
  * подтверждённый на приветствии другой формы (0009, U5). Переносить ради
  * этого core/hello.c в датапат незачем — признак читается из тех же
  * расширений, что уже разбираются ради имени. */
+static int has_ech_offer(const uint8_t *b, size_t off, size_t end) {
+    while (off + 4 <= end) {
+        unsigned type = rd16(b + off); size_t n = rd16(b + off + 2);
+        off += 4;
+        if (n > end - off) return 0;
+        if (type == 0xfe0d) {
+            if (n < 10 || b[off] != 0) return 0;
+            size_t enc = rd16(b + off + 6);
+            if (enc > n - 10) return 0;
+            size_t payload = rd16(b + off + 8 + enc);
+            return payload != 0 && payload == n - 10 - enc;
+        }
+        off += n;
+    }
+    return 0;
+}
+
 static int has_tls13(const uint8_t *b, size_t exts_off, size_t exts_end) {
     size_t off = exts_off;
     while (off + 4 <= exts_end) {
@@ -313,6 +330,7 @@ int d2k_tls_parse(const uint8_t *b, size_t len, d2k_tls_info *out) {
        сегменте, и молчаливый отказ классифицировать оставил бы без обхода
        ровно того клиента, ради которого всё делается. */
     out->is_tls13 = has_tls13(b, off, exts_end);
+    out->ech_offer = has_ech_offer(b, off, exts_end);
 
     size_t so = 0, sl = 0;
     if (find_sni(b, off, exts_end, &so, &sl) == 0) {

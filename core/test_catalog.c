@@ -543,6 +543,7 @@ static void check_binding_family_persistence(void) {
           "legacy binding invented resource witness");
     if (c.n_boxes == 1 && c.boxes[0].n_binds == 2)
         strcpy(c.boxes[0].binds[1].probe_path, "/public/main.css");
+        strcpy(c.boxes[0].binds[1].ech_origin, "witness.example");
     CHECK(d2k_catalog_save(&c, out, err, sizeof err) == 0, "save family fixture");
     d2k_catalog_free(&c);
     FILE *f = fopen(out, "r");
@@ -559,6 +560,8 @@ static void check_binding_family_persistence(void) {
         CHECK(!strcmp(c.boxes[0].binds[1].probe_path, "/public/main.css"),
               "resource witness not preserved across save/reload");
     if (c.n_boxes == 1 && c.boxes[0].n_binds == 2) {
+        CHECK(!strcmp(c.boxes[0].binds[1].ech_origin, "witness.example"),
+              "ECH witness not preserved across save/reload");
         CHECK(c.boxes[0].binds[0].family == 4, "legacy binding reloads as IPv4");
         CHECK(c.boxes[0].binds[1].family == 6, "IPv6 binding reloads as IPv6");
     }

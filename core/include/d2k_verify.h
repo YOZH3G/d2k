@@ -191,5 +191,13 @@ void d2k_verify_close(d2k_ver_result *r);
 d2k_ver_result d2k_verify_probe_ech_on(int use_fd, const char *ip, uint16_t port,
     const char *origin, const d2k_ech_config *config, int deadline_ms,
     size_t hello_wire, uint32_t mark, const char *path);
+/* Bounded HTTPS-RR lookup for a known origin; does not invent origin names
+ * from a shared IP, install DNS overrides, or treat missing records as clear. */
+int d2k_ech_resolve(const char *origin, uint32_t mark, d2k_ech_config *config);
+/* Resolve a fresh config, but only for the caller's explicit known witness.
+ * An unmatched public name cannot verify the target's candidate plan. */
+d2k_ver_result d2k_verify_probe_ech_origin_on(int use_fd, const char *ip,
+    uint16_t port, const char *outer_name, const char *origin, int deadline_ms,
+    size_t hello_wire, uint32_t dns_mark, const char *path);
 
 #endif /* D2K_VERIFY_H */
