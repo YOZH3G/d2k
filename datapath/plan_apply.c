@@ -109,12 +109,13 @@ static int split_points(const d2k_plan *p, const d2k_pkt *in,
     return 0;
 }
 
-static int tls_ch_layout(const uint8_t *b, size_t n, size_t *rnd_off,
+static int tls_ch_layout(const uint8_t *b, size_t n, int allow_prefix, size_t *rnd_off,
                          size_t *sid_off, size_t *sid_len) {
     if (!b || n < 44 || b[0] != 0x16 || b[1] != 3 || b[5] != 1) { return -1; }
     size_t rec_len = ((size_t)b[3] << 8) | b[4];
     size_t hs_len = ((size_t)b[6] << 16) | ((size_t)b[7] << 8) | b[8];
-    if (rec_len + 5 != hs_len + 9 || hs_len > n - 9 || rec_len > n - 5) { return -1; }
+    if (rec_len + 5 != hs_len + 9 || n > rec_len + 5 ||
+        (!allow_prefix && (hs_len > n - 9 || rec_len > n - 5))) { return -1; }
     size_t len_off = 43;
     size_t sl = b[len_off];
     if (sl > 32 || sl > n - (len_off + 1)) { return -1; }
@@ -146,8 +147,9 @@ static int fake_tls_bytes(const d2k_plan *p, const struct d2k_fake *f,
     size_t real_rnd, real_sid, real_sid_len;
     *owned = NULL;
     if (!in->is_tls13 || tls_ch_layout(in->payload, in->payload_len,
+            p->wire_profile == D2K_WIRE_TCP_TEMPLATE,
             &real_rnd, &real_sid, &real_sid_len) != 0 ||
-        tls_ch_layout(pl->bytes, pl->len, &fake_rnd, &fake_sid,
+        tls_ch_layout(pl->bytes, pl->len, 0, &fake_rnd, &fake_sid,
                       &fake_sid_len) != 0) { return -1; }
     if (p->wire_profile == D2K_WIRE_TCP_TEMPLATE) {
         /* Original TLSMod: randomize fake random/SID, then duplicate SID only

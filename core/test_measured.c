@@ -409,6 +409,19 @@ static void rx_volume_fake_sni_split(void) {
               memcmp(out.v[9].bytes, payload + 2, sizeof payload - 2) == 0);
     }
     d2k_actions_free(&out);
+    /* rnd/dupsid need random+SID from the first TCP segment, not the
+       remaining record padding. The original segment must still be split. */
+    pkt.payload_len = 128;
+    CHECK(d2k_plan_apply(p, NULL, &pkt, &out) == 0);
+    CHECK(out.fate == D2K_ORIG_DROP && out.n == 10);
+    if (out.n == 10) {
+        CHECK(out.v[8].len == 2 && out.v[9].len == 126);
+        CHECK(memcmp(out.v[0].bytes + 44, payload + 44, 32) == 0);
+    }
+    d2k_actions_free(&out);
+    pkt.payload_len = 43;
+    CHECK(d2k_plan_apply(p, NULL, &pkt, &out) != 0);
+    d2k_actions_free(&out);
     d2k_plan_free(p);
 }
 

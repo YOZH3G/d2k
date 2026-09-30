@@ -143,6 +143,7 @@ typedef d2k_ver_result (*d2k_sched_ver_fn)(int use_fd, const char *ip, uint16_t 
                                            uint8_t client_shape);
 extern d2k_sched_ver_fn  d2k_sched_ver_hook;
 extern d2k_sched_ver_fn  d2k_sched_rx_ver_hook;
+extern d2k_sched_ver_fn  d2k_sched_rx_gzip_ver_hook;
 
 extern d2k_sched_tcp_fn  d2k_sched_tcp_hook;
 extern d2k_sched_quic_fn d2k_sched_quic_hook;

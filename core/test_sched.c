@@ -173,6 +173,7 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
 static int vol_calls;
 static d2k_vol_verdict vol_answer = D2K_VOL_PASSED;
 static int vol_rx_cut;
+static int vol_rx_tls_unavailable;
 
 static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
                                int plain, int tls12, size_t hello_wire,
@@ -185,6 +186,7 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     r.verdict = vol_answer;
     r.at_kb = 20;
     r.rx_cut = vol_rx_cut;
+    r.rx_tls_unavailable = vol_rx_tls_unavailable;
     r.rx_at_kb = 24;
     r.rx_expected_kb = 96;
     r.rx_compressed_complete = vol_rx_cut;
@@ -328,6 +330,31 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
         while (!ver_snapshot_release) { pthread_cond_wait(&snapshot_cv, &snapshot_mu); }
         pthread_mutex_unlock(&snapshot_mu);
     }
+    return r;
+}
+
+/* Layered failure fixture: TLS works under the candidate, identity is cut,
+ * but the compressed control may finish. No network access is involved. */
+static int layered_identity_calls, layered_gzip_calls, layered_bad_control;
+static d2k_ver_result stub_layered_identity(int fd, const char *ip, uint16_t port,
+        uint8_t transport, const char *name, int deadline, size_t wire, uint8_t shape) {
+    d2k_ver_result r = stub_ver(fd, ip, port, transport, name, deadline, wire, shape);
+    layered_identity_calls++;
+    r.level = D2K_VER_HANDSHAKE; r.status = 200;
+    r.body_bytes = 19806; r.body_expected = 96460;
+    r.body_has_length = 1; r.body_framing_valid = 1;
+    if (layered_bad_control == 3 && layered_identity_calls == 2)
+        r.body_bytes += 10000;
+    return r;
+}
+static d2k_ver_result stub_layered_gzip(int fd, const char *ip, uint16_t port,
+        uint8_t transport, const char *name, int deadline, size_t wire, uint8_t shape) {
+    d2k_ver_result r = stub_ver(fd, ip, port, transport, name, deadline, wire, shape);
+    layered_gzip_calls++;
+    r.level = D2K_VER_APPLICATION; r.status = 200;
+    r.body_bytes = r.body_expected = 14384;
+    r.body_has_length = r.body_framing_valid = r.body_complete = 1;
+    r.body_encoding = (layered_bad_control == 1 || layered_bad_control == 5) ? 0 : 1;
     return r;
 }
 
@@ -1032,6 +1059,7 @@ int main(int argc, char **argv) {
        стенд. */
     d2k_sched_ver_hook = stub_ver;
     d2k_sched_rx_ver_hook = stub_ver;
+    d2k_sched_rx_gzip_ver_hook = stub_ver;
     d2k_sched_mark_hook = stub_mark;
 
     int sv[2];
@@ -3808,6 +3836,79 @@ question_test:
     }
 
 rx_volume_tests:
+    /* A bootstrap must not be saved merely because gzip completed. Only
+       two own applied identity cuts plus actual gzip admit the RX ladder. */
+    for (int bad = 0; bad < 6; bad++) {
+        d2k_catalog c = {0};
+        if (bad >= 4) {
+            c.boxes = calloc(1, sizeof *c.boxes);
+            CHECK(c.boxes != NULL, "late bootstrap box allocation failed");
+            if (!c.boxes) continue;
+            c.n_boxes = 1;
+            d2k_cat_box *b = c.boxes;
+            snprintf(b->id, sizeof b->id, "box-layered-bootstrap");
+            b->plans = calloc(1, sizeof *b->plans);
+            b->binds = calloc(1, sizeof *b->binds);
+            CHECK(b->plans && b->binds, "late bootstrap fixture allocation failed");
+            if (!b->plans || !b->binds) { d2k_catalog_free(&c); continue; }
+            b->n_plans = b->n_binds = 1;
+            snprintf(b->plans[0].id, sizeof b->plans[0].id, "plan-bootstrap");
+            snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "tls");
+            b->plans[0].enabled = 1;
+            b->plans[0].text = strdup("d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                "proto tcp tls\nsplit payload_start +2\norder forward\n");
+            d2k_cat_binding *bd = b->binds;
+            snprintf(bd->kind, sizeof bd->kind, "name");
+            snprintf(bd->target, sizeof bd->target, "layered-rx.test");
+            snprintf(bd->plan_id, sizeof bd->plan_id, "plan-bootstrap");
+            bd->enabled = 1; bd->level = 3; bd->transport = 6;
+            bd->shape = D2K_SHAPE_MODERN; bd->family = 4;
+        }
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_answer = D2K_VOL_UNREACHABLE; vol_rx_cut = 0;
+        vol_rx_tls_unavailable = 1; tcp_answer = D2K_V_OPAQUE;
+        ver_answer_port = 40241; ver_fail_first = 0;
+        ver_answer = D2K_VER_HANDSHAKE;
+        layered_identity_calls = layered_gzip_calls = 0;
+        layered_bad_control = bad;
+        d2k_sched_rx_ver_hook = stub_layered_identity;
+        d2k_sched_rx_gzip_ver_hook = stub_layered_gzip;
+        d2k_ev h = ev_hello(6, 40241, "layered-rx.test"), sh;
+        d2k_sched_event(s, &h);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
+              "layered RX shape fixture failed");
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40241);
+        if (bad >= 4) su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su);
+        int installed = 0;
+        for (int i = 0; i < 4000; i++) {
+            tick_once(s);
+            int n = sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+            if (n > installed) {
+                installed = n;
+                d2k_ev ap = ev_applied(6, 40241);
+                if (bad == 2) ap.plan_id[0] ^= 1;
+                d2k_sched_event(s, &ap);
+            }
+            if (layered_gzip_calls && ((bad == 1 || bad == 5) ? said("не подтверждён полным gzip") :
+                    sent_contains_plan_payload("hcaptcha.com"))) break;
+            if (bad == 2 && layered_identity_calls >= 3) break;
+            if (bad == 3 && said("повторный identity-обрыв под кандидатом не подтвердился")) break;
+        }
+        CHECK(layered_identity_calls >= 2 && layered_gzip_calls == (bad == 2 || bad == 3 ? 0 : 1),
+              "layered RX did not run two identity checks followed by gzip");
+        CHECK(total_bindings(&c) == (bad >= 4 ? 1u : 0u), "gzip bootstrap incorrectly saved as complete bypass");
+        CHECK(sent_contains_plan_payload("hcaptcha.com") == (bad == 0 || bad == 4),
+              "RX ladder admission ignored paired identity/gzip evidence");
+        if (bad < 2 && !layered_gzip_calls) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        d2k_sched_rx_ver_hook = stub_ver;
+        d2k_sched_rx_gzip_ver_hook = stub_ver;
+        vol_rx_tls_unavailable = 0; vol_answer = D2K_VOL_PASSED;
+    }
     /* Парный RX-замер тоже поднимает поиск без доменного списка и сохраняет
        направление/объём как отдельную примету; gzip completion — часть
        критерия, не просто статус заголовков. */

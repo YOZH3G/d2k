@@ -304,6 +304,15 @@ static d2k_ver_result verify_rx_default(int use_fd, const char *ip, uint16_t por
                                        hello_wire, client_shape == D2K_SHAPE_LEGACY);
 }
 
+static d2k_ver_result verify_rx_gzip_default(int use_fd, const char *ip, uint16_t port,
+    uint8_t transport, const char *sni, int deadline_ms, size_t hello_wire,
+    uint8_t client_shape) {
+    if (transport != 6) return verify_default(use_fd, ip, port, transport, sni,
+                                             deadline_ms, hello_wire, client_shape);
+    return d2k_verify_probe_gzip_on(use_fd, ip, port, sni, deadline_ms,
+                                   hello_wire, client_shape == D2K_SHAPE_LEGACY);
+}
+
 static int mark_default(int fd, uint32_t mark) {
     return d2k_mark_hook(fd, mark);
 }
@@ -329,6 +338,7 @@ d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
 d2k_sched_ver_fn  d2k_sched_rx_ver_hook = verify_rx_default;
+d2k_sched_ver_fn  d2k_sched_rx_gzip_ver_hook = verify_rx_gzip_default;
 static d2k_voice_res voice_default(const d2k_voice_opt *opt) {
     return d2k_voice_run(opt);
 }
@@ -582,6 +592,10 @@ typedef struct {
     d2k_vres   res;
     d2k_voice_res voice_res;
     d2k_vol_result vol;
+    unsigned   rx_phase; /* 0 identity candidate, 1 repeat, 2 gzip control */
+    int        rx_bootstrap_only; /* measure an already confirmed target plan */
+    d2k_ver_result rx_identity[2]; /* body evidence only; sockets closed normally */
+    int64_t    rx_retry_after_ms;
     /* A late TLS RST is only permission for the paired receive-volume probe.
        Until that probe proves a repeatable identity cut with complete gzip,
        the ordinary classifier and candidate queue must remain untouched. */
@@ -1248,7 +1262,11 @@ static void *worker_run(void *vp) {
            под его порт: зонд обязан пойти С НЕГО, иначе испытание пройдёт
            мимо собственного плана. Владение отдаётся вниз — закроет тот, кто
            им распорядится. */
-        d2k_sched_ver_fn verifier = t->transport == 6 && t->vol.rx_cut
+        int layered_rx = t->vol.rx_tls_unavailable &&
+            (t->res.verdict == D2K_V_OPAQUE || t->rx_bootstrap_only) &&
+            d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_MODERN;
+        d2k_sched_ver_fn verifier = t->rx_phase == 2 ? d2k_sched_rx_gzip_ver_hook :
+                                   t->transport == 6 && (t->vol.rx_cut || layered_rx)
                                   ? d2k_sched_rx_ver_hook : d2k_sched_ver_hook;
         d2k_ver_result vr = verifier(a_use_fd, t->ip, t->port, t->transport,
                                                t->name, SCHED_VERIFY_STEP_MS,
@@ -4349,6 +4367,114 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
     }
 }
 
+/* A working TLS bootstrap is not necessarily a complete bypass: identity
+ * may still be truncated while gzip succeeds. Each follow-up reserves a new
+ * socket and reinstalls only this candidate on that socket's source port. */
+static int rx_saved_bootstrap(d2k_sched *s, task *t) {
+    if (t->transport != 6 || t->by_addr ||
+        d2k_hello_shape(t->trig, t->trig_len) != D2K_SHAPE_MODERN) return 0;
+    const d2k_cat_binding *best = NULL;
+    const d2k_cat_plan *plan = NULL;
+    const d2k_cat_box *owner = NULL;
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        const d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t i = 0; i < b->n_binds; i++) {
+            const d2k_cat_binding *bd = &b->binds[i];
+            if (!bd->enabled || strcmp(bd->kind, "name") || strcmp(bd->target, t->name) ||
+                (bd->transport ? bd->transport : 6) != 6 ||
+                (bd->family ? bd->family : 4) != t->family ||
+                bd->shape != D2K_SHAPE_MODERN || (bd->level && bd->level < 3)) continue;
+            for (size_t j = 0; j < b->n_plans; j++) {
+                const d2k_cat_plan *p = &b->plans[j];
+                if (!p->enabled || !p->text || strcmp(p->id, bd->plan_id) ||
+                    strcmp(p->proto, "tls") || strlen(p->text) >= sizeof t->plans[0]) continue;
+                if (!best || bd->confirmed > best->confirmed) {
+                    best = bd; plan = p; owner = b;
+                }
+            }
+        }
+    }
+    if (!plan) return 0;
+    snprintf(t->plans[0], sizeof t->plans[0], "%s", plan->text);
+    snprintf(t->plan_boxes[0], sizeof t->plan_boxes[0], "%s", owner->id);
+    t->next_plan = 0; t->n_plans = t->n_known = 1;
+    t->researched = 1; t->rx_bootstrap_only = 1;
+    t->state = T_PLANNING;
+    say(s, "по %s прямой RX-зонд не дошёл до TLS; измеряю identity под уже "
+           "подтверждённым планом этой цели, без нового общего перебора", t->name);
+    return 1;
+}
+
+static int layered_rx_result(d2k_sched *s, task *t, int64_t now_ms) {
+    int eligible = t->transport == 6 && !t->vol.rx_cut &&
+        t->vol.rx_tls_unavailable &&
+        (t->res.verdict == D2K_V_OPAQUE || t->rx_bootstrap_only) &&
+        d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_MODERN;
+    if (!eligible || !t->next_plan) return 0;
+    d2k_ev own = {0};
+    own.family = t->ver_flow.family;
+    memcpy(own.low_ip, t->ver_flow.a_ip, sizeof own.low_ip);
+    memcpy(own.high_ip, t->ver_flow.b_ip, sizeof own.high_ip);
+    own.low_port = t->ver_flow.a_port; own.high_port = t->ver_flow.b_port;
+    own.transport = t->ver_flow.transport;
+    int applied = 0;
+    for (size_t k = 0; k < t->ver_seen; k++)
+        if (ev_matches_flow(&own, &t->ver_early[k])) { applied = 1; break; }
+    int partial = applied && !t->unsent_code && t->ver.name_ok != 0 &&
+        d2k_volume_rx_partial(&t->ver);
+    if (!t->rx_phase && !partial) return 0;
+
+    if (t->rx_phase == 2) {
+        int proven = applied && !t->unsent_code && t->ver.name_ok != 0 &&
+            d2k_volume_rx_evidence(&t->rx_identity[0], &t->rx_identity[1], &t->ver, &t->vol);
+        ver_close(t); remove_trial_exact(s, t); t->rx_phase = 0;
+        if (proven) {
+            t->rx_bootstrap_only = 0;
+            say(s, "по %s кандидат снял ранний TLS-блок, но identity дважды "
+                   "оборвался около %d КБ при полном gzip; ищу остаточный RX-обход",
+                t->name, t->vol.rx_at_kb);
+            t->cached_measure_valid = 0;
+            t->researched = 1;
+            t->rx_volume_next_variant = 0;
+            verdict_to_plans(s, t, &t->res);
+        } else {
+            say(s, "по %s RX-обрыв под кандидатом не подтверждён полным gzip-контролем; "
+                   "не сохраняю gzip как окончательный обход", t->name);
+        }
+        t->state = T_PLANNING;
+        t->rx_retry_after_ms = now_ms + 500;
+        return 1;
+    }
+
+    if (t->rx_phase == 1 && partial) {
+        const d2k_ver_result *a = &t->rx_identity[0], *b = &t->ver;
+        uint64_t delta = a->body_bytes > b->body_bytes
+            ? a->body_bytes - b->body_bytes : b->body_bytes - a->body_bytes;
+        partial = a->body_has_length == b->body_has_length &&
+            a->body_chunked == b->body_chunked &&
+            delta <= (uint64_t)D2K_VOLUME_SLACK * 1024;
+    }
+    if (!partial || t->probes >= SCHED_MAX_PROBES) {
+        say(s, "по %s повторный identity-обрыв под кандидатом не подтвердился; "
+               "RX-профиль не создаю", t->name);
+        ver_close(t); remove_trial_exact(s, t); t->rx_phase = 0;
+        t->state = T_PLANNING;
+        return 1;
+    }
+    t->rx_identity[t->rx_phase] = t->ver;
+    t->rx_identity[t->rx_phase].fd = -1;
+    say(s, "по %s под кандидатом identity-%u оборвался на %llu байтах; "
+           "%s на новом изолированном порту", t->name, t->rx_phase + 1,
+        (unsigned long long)t->ver.body_bytes,
+        t->rx_phase ? "проверяю gzip-контроль" : "повторяю identity");
+    ver_close(t); remove_trial_exact(s, t);
+    t->rx_phase++;
+    t->next_plan--; /* same candidate, newly reserved socket and trial */
+    t->rx_retry_after_ms = now_ms + 500;
+    t->state = T_PLANNING;
+    return 1;
+}
+
 int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     if (!s) { return 0; }
     /* Привязка монотонных часов к стенным делается ПО ПЕРВОМУ ТИКУ, а не при
@@ -4505,6 +4631,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (t->rx_volume_only) {
                 t->rx_volume_only = 0;
                 if (!t->vol.rx_cut) {
+                    if (t->vol.rx_tls_unavailable && rx_saved_bootstrap(s, t)) {
+                        moved++;
+                        continue;
+                    }
                     say(s, "по %s поздний RST не подтвердился парными измерениями ответа; "
                            "перебор не запускаю", t->name);
                     task_fail(s, t, now_ms);
@@ -4857,6 +4987,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++;
                 continue;
             }
+            if (layered_rx_result(s, t, now_ms)) { moved++; continue; }
             if (t->ver.level != D2K_VER_APPLICATION) {
                 /* СПЕРВА — НАША ЛИ ЭТО НЕУДАЧА. Зонд мог не дойти до
                    приложения просто потому, что воздействия не было: посылка
@@ -5024,6 +5155,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         }
 
         if (t->state == T_PLANNING) {
+            if (now_ms < t->rx_retry_after_ms) continue;
             int inst = install_next(s, t);
             if (inst == -2) {
                 /* ЛОКАЛЬНЫЙ ОТКАЗ, А НЕ «ПЛАНЫ КОНЧИЛИСЬ» (0010, R1). Порт для
@@ -5034,6 +5166,12 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 continue;
             }
             if (inst != 0) {
+                if (t->rx_bootstrap_only && !t->vol.rx_cut) {
+                    say(s, "по %s остаточный RX-блок не подтверждён; общий перебор не запускаю", t->name);
+                    task_fail(s, t, now_ms);
+                    moved++;
+                    continue;
+                }
                 if (t->n_known > 0 && t->cached_measure_valid) {
                     d2k_vres measured = t->res;
                     t->cached_measure_valid = 0;

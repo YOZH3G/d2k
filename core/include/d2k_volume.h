@@ -66,6 +66,7 @@ typedef struct {
     int      rtt_ms;      /* измеренный RTT до мишени */
     char     reason[160]; /* человеческая причина, заполняется всегда */
     char     rx_reason[200]; /* отдельный исход GET, даже если TX не дошёл до TLS */
+    int      rx_tls_unavailable; /* прямой GET не дошёл до TLS; RX-тела ещё не измерить */
 } d2k_vol_result;
 
 /* Гоняет TX-лестницу, затем для HTTPS — парное RX-измерение тела ответа.
@@ -88,6 +89,8 @@ int d2k_volume_rx_evidence(const d2k_ver_result *identity_a,
                            const d2k_ver_result *identity_b,
                            const d2k_ver_result *gzip_control,
                            d2k_vol_result *out);
+/* Suspicion only, never a blocking verdict without repeat + gzip control. */
+int d2k_volume_rx_partial(const d2k_ver_result *identity);
 
 const char *d2k_vol_verdict_name(d2k_vol_verdict v);
 

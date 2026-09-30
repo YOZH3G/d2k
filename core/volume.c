@@ -49,6 +49,14 @@
 #define READ_MIN_MS  1500
 #define READ_MAX_MS  12000
 
+int d2k_volume_rx_partial(const d2k_ver_result *r) {
+    return r && r->status >= 200 && r->status < 300 && !r->body_complete &&
+        r->body_encoding == 0 && r->body_framing_valid &&
+        r->body_has_length != r->body_chunked &&
+        r->body_bytes >= (uint64_t)D2K_VOL_MIN_KB * 1024 &&
+        (!r->body_has_length || r->body_expected > r->body_bytes);
+}
+
 int d2k_volume_rx_evidence(const d2k_ver_result *a,
                            const d2k_ver_result *b,
                            const d2k_ver_result *gzip,
@@ -261,6 +269,7 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     if (!res || !ip || !sni || !sni[0] || port == 80) { return; }
     d2k_ver_result a = d2k_verify_probe_baseline(ip, port, sni, 6000,
                                                   hello_wire, tls12, 0, mark);
+    res->rx_tls_unavailable = a.level == D2K_VER_TRANSPORT && a.status == 0;
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity-1 HTTP %d, тело %llu/%llu, complete=%d: %.90s",
              a.status, (unsigned long long)a.body_bytes,

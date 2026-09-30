@@ -681,6 +681,13 @@ d2k_ver_result d2k_verify_probe_identity_on(int use_fd, const char *ip, uint16_t
     return verify_probe13_on(use_fd, ip, port, sni, deadline_ms, hello_wire, 0, 0);
 }
 
+d2k_ver_result d2k_verify_probe_gzip_on(int use_fd, const char *ip, uint16_t port,
+    const char *sni, int deadline_ms, size_t hello_wire, int tls12) {
+    if (tls12) return verify_probe12_internal(use_fd, ip, port, sni, deadline_ms,
+                                             hello_wire, 1, 0);
+    return verify_probe13_on(use_fd, ip, port, sni, deadline_ms, hello_wire, 1, 0);
+}
+
 d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
                                          const char *sni, int deadline_ms,
                                          size_t hello_wire, int tls12,
