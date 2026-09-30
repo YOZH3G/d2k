@@ -1471,6 +1471,16 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             det.tos = pkt[1];
             det.ipid = ip.ip_id;
             suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST_CUT, &det);
+        } else if (fl->saw_hello && rev_before > 0 &&
+                   (fl->rev_types & (uint8_t)(1u << (23 - 20)))) {
+            /* Dropping an alien RST keeps the client alive, but must not
+             * hide the residual failure from the narrow RX measurement. */
+            d2k_jrn_detail det;
+            memset(&det, 0, sizeof det);
+            det.ttl = ip.hop_limit; det.ref_ttl = fl->rev_ttl;
+            det.tos = pkt[1]; det.ipid = ip.ip_id;
+            det.server_hello = fl->rev_server_hello;
+            suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST_AFTER_APP, &det);
         }
         out->verdict = D2K_VERDICT_DROP;
         out->skipped = "чужой сброс снят защитой";

@@ -466,6 +466,29 @@ static void test_late_rst_after_tls_appdata(void) {
           "клиентский RST после TLS app-data не дал узкий RX-volume-сигнал");
     d2k_session_free(s);
 
+    /* The protective drop must preserve the measurement trigger: an alien
+       RST after response data is still a residual RX suspicion, not proof. */
+    s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "guarded late-RST session allocation failed");
+    if (!s) return;
+    d2k_plan *guard = NULL;
+    char err[200];
+    CHECK(d2k_plan_load(plan_guard, sizeof plan_guard, &guard, err, sizeof err) == 0,
+          "guarded late-RST plan failed");
+    d2k_session_set_plan(s, guard);
+    n = build_pkt(pkt, 47804, 0x18, hello, hlen);
+    d2k_session_packet(s, pkt, n, 3400, buf, sizeof buf, &r);
+    n = build_rev_pkt(pkt, 47804, 0x18, appdata, sizeof appdata);
+    pkt[8] = 53;
+    d2k_session_packet(s, pkt, n, 3500, buf, sizeof buf, &r);
+    n = build_rev_pkt(pkt, 47804, 0x14, NULL, 0);
+    pkt[8] = 127;
+    d2k_session_packet(s, pkt, n, 3600, buf, sizeof buf, &r);
+    e = last_suspect(s);
+    CHECK(r.verdict == D2K_VERDICT_DROP && e && e->code == D2K_SUSPECT_RST_AFTER_APP,
+          "alien RST drop hid residual RX measurement trigger");
+    d2k_session_free(s);
+
     /* A handshake/ServerHello response followed by RST is not enough to
        start an RX-volume search: application-data must have been observed. */
     s = d2k_session_new(64, 64);
