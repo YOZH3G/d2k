@@ -110,6 +110,22 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
     if(o->evidence!=D2K_GROUP_INCONCLUSIVE) rebuild(s);
     return 1;
 }
+int d2k_group_restore(d2k_group_state *s) {
+    if(!s || s->n_observations>D2K_GROUP_OBSERVATION_MAX) return -1;
+    for(size_t i=0;i<s->n_observations;i++) {
+        d2k_group_observation *o=&s->observations[i], test=*o;
+        if(test.evidence==(D2K_GROUP_BLOCKED_CONFIRMED|D2K_GROUP_PLAN_FAILED))
+            test.evidence=D2K_GROUP_BLOCKED_CONFIRMED;
+        char norm[256],base[256];
+        if(!valid(&test) || o->at<0 || d2k_domain_normalize(o->name,norm) ||
+           d2k_domain_base(norm,base)) return -1;
+        strcpy(o->name,norm);
+        for(size_t j=0;j<i;j++)
+            if(!strcmp(s->observations[j].name,o->name) &&
+               d2k_group_key_same(&s->observations[j].key,&o->key)) return -1;
+    }
+    rebuild(s); return 0;
+}
 const d2k_domain_group *d2k_group_match(const d2k_group_state *s,
                                      const char *name,const d2k_group_key *key) {
     char norm[256];

@@ -59,6 +59,7 @@
 #include <stdint.h>
 
 #include "d2k_hello.h" /* d2k_shape — значения поля d2k_cat_binding.shape */
+#include "d2k_groups.h"
 
 /* Одна наблюдавшаяся примета коробки (см. internal/catalog/catalog.go,
  * Signal). kind — вид приметы ("rst", "volume", "rx-volume", "repeat", "silent" в
@@ -255,6 +256,8 @@ typedef struct {
     /* Process-local mutation counter for controller persistence decisions;
        deliberately omitted from the on-disk catalog schema. */
     uint64_t     revision;
+    /* Optional bounded learning state; allocated only when used/present. */
+    d2k_group_state *groups;
 } d2k_catalog;
 
 /* Читает каталог из path. При успехе (0) *out заполнен и владеет всей

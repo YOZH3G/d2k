@@ -34,6 +34,9 @@ typedef struct {
 } d2k_group_state;
 int d2k_group_key_same(const d2k_group_key *a, const d2k_group_key *b);
 int d2k_group_learn(d2k_group_state *s, const d2k_group_observation *o);
+/* Validate saved observations and derive active areas, never trust a saved
+   suffix alone. Preserves failure exceptions and frozen admission state. */
+int d2k_group_restore(d2k_group_state *s);
 const d2k_domain_group *d2k_group_match(const d2k_group_state *s,
                                      const char *name, const d2k_group_key *key);
 #endif

@@ -63,6 +63,9 @@ HDR += include/d2k_ip6frag_send.h
 HDR += profiles/rx_fake.h
 HDR += include/d2k_resource.h
 HDR += include/d2k_domain.h include/d2k_groups.h
+SRC += domain.c groups.c
+domain.o: domain.c include/d2k_domain.h profiles/psl_index.h
+groups.o: groups.c include/d2k_groups.h include/d2k_domain.h
 
 .PHONY: test-domain test-groups
 test-domain: test_domain
@@ -82,7 +85,14 @@ TESTHDR = test_stand.h
 TESTS   = test_stun test_voice test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_fresh_repeats test_quic_arms test_ipfrag test_quic_original_arms test_quic_run_order test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify test_measured
 TESTS += test_ech
 TESTS += test_domain test_groups
+TESTS += test_groups_catalog
 check: test-domain test-groups
+check: test-groups-catalog
+.PHONY: test-groups-catalog
+test-groups-catalog: test_groups_catalog
+	./test_groups_catalog
+test_groups_catalog: test_groups_catalog.c catalog.o groups.o domain.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< catalog.o groups.o domain.o $(LDFLAGS)
 
 test_ech: test_ech.c verify.o tls12.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
@@ -95,7 +105,7 @@ check: test-ech
 
 .PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-rst-trigger test-voice-sched test-verify FORCE
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o match.o compose.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o quicconn.o quicwire.o h3.o d2kask d2kc d2kvoice
+all: meas.o verdict.o crypto.o quic.o quicprobe.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o groups.o domain.o match.o compose.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o quicconn.o quicwire.o h3.o d2kask d2kc d2kvoice
 
 
 meas.o: meas.c $(HDR)
@@ -186,7 +196,7 @@ catalog.o: catalog.c $(HDR)
 
 # Планировщик (задача 5): развилка по транспорту. Зовёт дерево вердиктов
 # (verdict.o), вопросник QUIC (quicprobe.o, props.o), каталог с узнаванием
-# (catalog.o, match.o), сборку планов и смысл вопросов о свойствах (compose.o)
+# (catalog.o groups.o domain.o, match.o), сборку планов и смысл вопросов о свойствах (compose.o)
 # и связь с датапатом (link.o). Сетевые оракулы уезжают в рабочие потоки —
 # отсюда pthread и в боевой линковке, не только в тестовой.
 # Текст плана в байты провода (задача 5): d2k_compose выдаёт текст, датапат
@@ -338,14 +348,14 @@ test_voice: test_voice.c voice.o stun.o net4.o tls13core.o crypto.o x25519.o mea
 test_quichello: test_quichello.c quichello.o quic.o quicwire.o hello.o tls13core.o crypto.o x25519.o quicconn.o meas.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quichello.c quichello.o quic.o quicwire.o hello.o tls13core.o crypto.o x25519.o quicconn.o meas.o $(TEST_LDFLAGS)
 
-test_catalog: test_catalog.c catalog.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_catalog.c catalog.o $(TEST_LDFLAGS)
+test_catalog: test_catalog.c catalog.o groups.o domain.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_catalog.c catalog.o groups.o domain.o $(TEST_LDFLAGS)
 
 # Проверка каталога d2k_catalog_load настоящим testdata/catalog-real.json
 # (задача 2, шаг "поиск по каталогу находит и не находит") — вот откуда
-# catalog.o в этом связывании, а не только match.o.
-test_match: test_match.c match.o catalog.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_match.c match.o catalog.o $(TEST_LDFLAGS)
+# catalog.o groups.o domain.o в этом связывании, а не только match.o.
+test_match: test_match.c match.o catalog.o groups.o domain.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_match.c match.o catalog.o groups.o domain.o $(TEST_LDFLAGS)
 
 test_compose: test_compose.c compose.o hello.o meas.o link.o $(HDR) $(TESTHDR)
 	$(CC) $(CFLAGS) -o $@ test_compose.c compose.o hello.o meas.o link.o $(TEST_LDFLAGS)
@@ -713,9 +723,9 @@ test-voice-sched: test_sched sched.o quichello.o plantlv.o verify.o tls12.o quic
 # умолчание verify_default зовёт d2k_verify_probe). Тест зонд подменяет, но
 # умолчание всё равно линкуется: крючок — точка подмены, а не условная сборка.
 test_sched: test_sched.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o stun.o \
-            hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(HDR)
+            hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
-		voice.o stun.o hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(TEST_LDFLAGS)
+		voice.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 # Стенд test_verify.c — СВОЙ (не общий test_stand.h): он единственный умеет
 # довести рукопожатие TLS 1.3 до конца и умеет НЕ довести, а без этого уровни
@@ -788,10 +798,10 @@ $(DETECT_OBJ): FORCE
 	$(MAKE) -C ../detect $(notdir $@)
 
 d2kc: d2kc.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o stun.o \
-      hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
+      hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
       $(DETECT_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
-		voice.o stun.o hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
+		voice.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
 		$(DETECT_OBJ) $(TEST_LDFLAGS)
 
 clean:

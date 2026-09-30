@@ -929,6 +929,44 @@ static int elem_box(jctx *j, void *o, int depth, char *err, size_t errcap) {
  * о том, почему это не потеря: schema всегда константа 1, updated Go
  * перезаписывает текущим временем на каждой записи независимо от
  * прочитанного). */
+static int handle_domain_observation(jctx *j,const char *key,void *ctx,
+                                    int depth,char *err,size_t errcap) {
+    d2k_group_observation *o=ctx;
+    if(!strcmp(key,"name")) return jparse_string_fixed(j,o->name,sizeof o->name,"domain.name",err,errcap);
+    if(!strcmp(key,"plan_id")) return jparse_string_fixed(j,o->plan_id,sizeof o->plan_id,"domain.plan_id",err,errcap);
+    if(!strcmp(key,"transport")) return jparse_u8(j,&o->key.transport,"domain.transport",err,errcap);
+    if(!strcmp(key,"family")) return jparse_u8(j,&o->key.family,"domain.family",err,errcap);
+    if(!strcmp(key,"shape")) return jparse_u8(j,&o->key.shape,"domain.shape",err,errcap);
+    if(!strcmp(key,"probe_path")) return jparse_string_fixed(j,o->key.probe_path,sizeof o->key.probe_path,"domain.path",err,errcap);
+    if(!strcmp(key,"ech_origin")) return jparse_string_fixed(j,o->key.ech_origin,sizeof o->key.ech_origin,"domain.origin",err,errcap);
+    if(!strcmp(key,"at")) return jparse_rfc3339(j,&o->at,"domain.at",err,errcap);
+    if(!strcmp(key,"evidence")) {
+        uint8_t value=0;
+        if(jparse_u8(j,&value,"domain.evidence",err,errcap)) return -1;
+        o->evidence=value; return 0;
+    }
+    return jskip_value(j,depth+1,err,errcap);
+}
+
+static int parse_domain_observations(jctx *j,d2k_group_state *s,int depth,
+                                     char *err,size_t errcap) {
+    if(depth>D2K_JSON_MAX_DEPTH) { set_err(err,errcap,"domain observations too deep"); return -1; }
+    if(jeat(j,'[',err,errcap)) return -1;
+    if(jpeek(j)==']') { j->i++; return 0; }
+    for(;;) {
+        if(s->n_observations==D2K_GROUP_OBSERVATION_MAX) {
+            set_err(err,errcap,"too many domain observations"); return -1;
+        }
+        d2k_group_observation *o=&s->observations[s->n_observations++];
+        memset(o,0,sizeof *o);
+        if(parse_object(j,handle_domain_observation,o,depth+1,err,errcap)) return -1;
+        int c=jpeek(j);
+        if(c==']') { j->i++; return 0; }
+        if(c!=',') { set_err(err,errcap,"invalid domain observations array"); return -1; }
+        j->i++;
+    }
+}
+
 static int handle_catalog_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
     d2k_catalog *out = (d2k_catalog *)ctx;
     if (strcmp(key, "boxes") == 0) {
@@ -936,6 +974,15 @@ static int handle_catalog_key(jctx *j, const char *key, void *ctx, int depth, ch
         return parse_array(j, (void **)&out->boxes, &out->n_boxes, &cap,
                             sizeof(d2k_cat_box), elem_box, "boxes", depth + 1, err, errcap);
     }
+    if(!strcmp(key,"domain_observations") || !strcmp(key,"domain_groups_frozen")) {
+        if(!out->groups) out->groups=calloc(1,sizeof *out->groups);
+        if(!out->groups) { set_err(err,errcap,"memory: domain groups"); return -1; }
+        if(!strcmp(key,"domain_groups_frozen"))
+            return jparse_bool_i(j,&out->groups->frozen,"domain_groups_frozen",err,errcap);
+        return parse_domain_observations(j,out->groups,depth+1,err,errcap);
+    }
+    /* domain_groups is a human-readable derived snapshot, never authority
+       to activate a rule without its retained learning observations. */
     return jskip_value(j, depth + 1, err, errcap);
 }
 static int parse_catalog_obj(jctx *j, d2k_catalog *out, char *err, size_t errcap) {
@@ -944,6 +991,25 @@ static int parse_catalog_obj(jctx *j, d2k_catalog *out, char *err, size_t errcap
        Дальше глубина считается ОТСЮДА на каждый вложенный уровень — см.
        D2K_JSON_MAX_DEPTH про весь путь catalog{1->boxes[2->box{3->... */
     return parse_object(j, handle_catalog_key, out, 1, err, errcap);
+}
+
+static void prune_unavailable_domain_groups(d2k_catalog *cat) {
+    d2k_group_state *s=cat->groups;
+    if(!s) return;
+    for(size_t i=0;i<s->n_groups;) {
+        const d2k_domain_group *g=&s->groups[i];
+        int found=0;
+        const char *proto=g->key.transport==17?"quic":"tls";
+        for(size_t bi=0;bi<cat->n_boxes && !found;bi++) {
+            const d2k_cat_box *b=&cat->boxes[bi];
+            for(size_t pi=0;pi<b->n_plans;pi++) {
+                const d2k_cat_plan *p=&b->plans[pi];
+                if(p->enabled && p->text && !strcmp(p->id,g->plan_id) &&
+                   !strcmp(p->proto,proto)) { found=1; break; }
+            }
+        }
+        if(!found) s->groups[i]=s->groups[--s->n_groups]; else i++;
+    }
 }
 
 /* --------------------------------------------------------------------
@@ -969,6 +1035,8 @@ void d2k_catalog_free(d2k_catalog *c) {
         free_box(&c->boxes[i]);
     }
     free(c->boxes);
+    free(c->groups);
+    c->groups = NULL;
     c->boxes = NULL;
     c->n_boxes = 0;
 }
@@ -1029,6 +1097,10 @@ int d2k_catalog_load(const char *path, d2k_catalog *out, char *err, size_t errca
 
     jctx j; j.s = buf; j.len = len; j.i = 0;
     int rc = parse_catalog_obj(&j, out, err, errcap);
+    if(rc==0 && out->groups && d2k_group_restore(out->groups)) {
+        set_err(err,errcap,"invalid domain learning observations"); rc=-1;
+    }
+    if(rc==0) prune_unavailable_domain_groups(out);
 
     /* Ревью 2026-09-10 (круг 1): курсор после успешного разбора не
        проверялся против конца буфера — "{}x" грузился как валидный пустой
@@ -1206,6 +1278,27 @@ static void write_box_elem(FILE *f, const void *e, int depth) {
     wr_indent(f, depth); fputc('}', f);
 }
 
+static void write_domain_key(FILE *f,const d2k_group_key *key) {
+    fprintf(f,",\"transport\":%u,\"family\":%u,\"shape\":%u,\"probe_path\":",
+            key->transport,key->family,key->shape);
+    write_json_string(f,key->probe_path);
+    fputs(",\"ech_origin\":",f); write_json_string(f,key->ech_origin);
+}
+static void write_domain_observation(FILE *f,const void *value,int depth) {
+    const d2k_group_observation *o=value; char at[32];
+    format_rfc3339(o->at,at,sizeof at);
+    wr_indent(f,depth); fputs("{\"name\":",f); write_json_string(f,o->name);
+    fputs(",\"plan_id\":",f); write_json_string(f,o->plan_id);
+    write_domain_key(f,&o->key);
+    fprintf(f,",\"evidence\":%u,\"at\":\"%s\"}",o->evidence,at);
+}
+static void write_domain_group(FILE *f,const void *value,int depth) {
+    const d2k_domain_group *g=value;
+    wr_indent(f,depth); fputs("{\"suffix\":",f); write_json_string(f,g->suffix);
+    fputs(",\"plan_id\":",f); write_json_string(f,g->plan_id);
+    write_domain_key(f,&g->key); fprintf(f,",\"evidence_count\":%u}",g->evidence_count);
+}
+
 int d2k_catalog_save(const d2k_catalog *c, const char *path, char *err, size_t errcap) {
     if (err && errcap) err[0] = '\0';
 
@@ -1229,6 +1322,13 @@ int d2k_catalog_save(const d2k_catalog *c, const char *path, char *err, size_t e
     fprintf(f, "  \"updated\": \"%s\",\n", now_s);
     fputs("  \"boxes\": ", f);
     write_json_array(f, c->boxes, c->n_boxes, sizeof(d2k_cat_box), write_box_elem, 1);
+    if(c->groups) {
+        fputs(",\n  \"domain_groups\": ",f);
+        write_json_array(f,c->groups->groups,c->groups->n_groups,sizeof(d2k_domain_group),write_domain_group,1);
+        fputs(",\n  \"domain_observations\": ",f);
+        write_json_array(f,c->groups->observations,c->groups->n_observations,sizeof(d2k_group_observation),write_domain_observation,1);
+        fprintf(f,",\n  \"domain_groups_frozen\": %s",c->groups->frozen?"true":"false");
+    }
     fputs("\n}\n", f);
 
     /* Проверяется КАЖДАЯ ошибка вплоть до закрытия: неотловленный сбой
