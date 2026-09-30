@@ -2128,11 +2128,12 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
        достаточно, чтобы не удерживать чужие потоки. */
     if (at_head) {
         d2k_tls_parse(p + v.header, v.payload, &tls);
-        /* ИМЯ УЖЕ ЗДЕСЬ — ДЕРЖАТЬ НЕЧЕГО.
+        /* ИМЯ И ПРИГОДНАЯ ФОРМА УЖЕ ЗДЕСЬ — ДЕРЖАТЬ НЕЧЕГО.
          *
-         * Удержание нужно ради одного: получить имя, которого в этом куске
-         * нет. Когда имя в нём есть, план выбирается и применяется прямо
-         * сейчас, а ожидание остатка не добавляет ничего — и стоит дорого.
+         * Если форма уже известна (либо её знает собственный exact-port
+         * зонд), план выбирается прямо сейчас. Исключение — обычный клиент
+         * с именем в голове и supported_versions в хвосте: для его shaped
+         * привязки имя ещё недостаточно, и ниже разрешена ограниченная сборка.
          *
          * Замер 18.09.2026 на живой линии, три прогона подряд: пока голова
          * лежит в очереди без вердикта, ОСТАТОК ЯДРО НЕ ВЫПУСКАЕТ. Счётчики
@@ -2147,7 +2148,21 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
          * Поле говорит и о цене этого правила: «имя уехало во второй сегмент»
          * за все прогоны — ноль раз. Составная сборка остаётся ровно для того
          * случая, ради которого написана. */
-        if (tls.have_sni) { return 0; }
+        if (tls.have_sni) {
+            /* SNI precedes a large key_share in current Safari hellos, but
+             * supported_versions can be in the next segment. Ordinary
+             * shaped bindings cannot execute until that shape is known.
+             * Probe-specific bindings already carry their own known shape;
+             * keep their prefix fast path to avoid blocking kernel output. */
+            if (tls.is_tls13 || !tls.exts_truncated || fl->controller_probe || s->plan)
+                return 0;
+            if (d2k_plantab_find_target(s->plans, p + v.header + tls.sni_off,
+                tls.sni_len, v.dst.bytes, v.dst.family, fl->first_ns,
+                D2K_PLAN_SHAPE_ANY, 0)) return 0;
+            /* A grandfather/unshaped plan may already handle the prefix.
+             * Otherwise only an existing named stream plan below can own
+             * this bounded assembly; unknown targets remain pass-through. */
+        }
     }
     int candidate = d2k_plan_stream_input(s->plan) ||
         d2k_plantab_stream_candidate_target(s->plans,

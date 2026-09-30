@@ -1747,6 +1747,70 @@ int main(void) {
                 }
                 /* A probe plan never causes a different source port to be
                    held, even when SNI is still in a later segment. */
+                /* Safari puts supported_versions after a large key_share:
+                   SNI in the head is not sufficient to choose a shaped plan.
+                   Own probes know their shape, while client traffic must wait
+                   for the bounded owning assembly (never guess MODERN). */
+                for (int scenario = 0; scenario < 4; scenario++) {
+                    uint8_t late[2048];
+                    memcpy(late, whole, whole_len);
+                    size_t late_len = whole_len;
+                    if (scenario != 1) {
+                        const uint8_t versions[] = {0,43,0,3,2,3,4};
+                        memcpy(late + late_len, versions, sizeof versions);
+                        late_len += sizeof versions;
+                        size_t q = 5 + 4 + 2 + 32;
+                        q += 1 + late[q];
+                        q += 2 + ((size_t)late[q] << 8 | late[q + 1]);
+                        q += 1 + late[q];
+                        wr16(late + q, (uint16_t)(((unsigned)late[q] << 8 | late[q + 1]) + sizeof versions));
+                        wr16(late + 7, (uint16_t)(((unsigned)late[7] << 8 | late[8]) + sizeof versions));
+                        wr16(late + 3, (uint16_t)(((unsigned)late[3] << 8 | late[4]) + sizeof versions));
+                    }
+                    d2k_session *v = d2k_session_new(64, 64);
+                    d2k_hold *vh = d2k_hold_new();
+                    CHECK(v && vh, "late TLS version fixture allocation");
+                    if (!v || !vh) { d2k_session_free(v); d2k_hold_free(vh); continue; }
+                    uint16_t port = (uint16_t)(47540 + scenario);
+                    d2k_plan *vp = NULL;
+                    if (scenario != 3) {
+                        CHECK(d2k_plan_load(strict_plan, sizeof strict_plan, &vp,
+                                            err, sizeof err) == 0, "late version plan parse");
+                        CHECK(d2k_plantab_set_name_probe(d2k_session_plans(v), name,
+                            sizeof name - 1, 1, vp, D2K_PLAN_SHAPE_MODERN,
+                            scenario == 2 ? htons16(port) : 0) == 0, "late version plan install");
+                    }
+                    pn = build_pkt(part, port, 0x02, NULL, 0);
+                    if (scenario == 2) d2k_session_packet_probe(v, part, pn, 1, buf, sizeof buf, &r);
+                    else d2k_session_packet(v, part, pn, 1, buf, sizeof buf, &r);
+                    d2k_tls_info prefix;
+                    d2k_tls_parse(late, 1388, &prefix);
+                    CHECK(prefix.have_sni && prefix.exts_truncated && !prefix.is_tls13,
+                          "late TLS version not hidden in tail");
+                    pn = build_pkt(part, port, 0x18, late, 1388);
+                    wr32(part + 24, 1001);
+                    int owns = d2k_session_hold_candidate(v, part, pn);
+                    CHECK(owns == (scenario < 2), "named partial TLS shape released or own probe held");
+                    if (owns) {
+                        d2k_hold_batch vb;
+                        CHECK(d2k_hold_feed(vh, 100, part, pn, 2,
+                            d2k_session_plan_revision(v), owns, 1001, 1,
+                            hold_release, v, &vb) == 1, "ambiguous head not owned");
+                        pn = build_pkt(part, port, 0x18, late + 1388, late_len - 1388);
+                        wr32(part + 24, 2389);
+                        CHECK(d2k_hold_feed(vh, 101, part, pn, 3,
+                            d2k_session_plan_revision(v), 0, 1001, 1,
+                            hold_release, v, &vb) == 2 && vb.count == 2,
+                            "late version assembly lost original IDs");
+                        d2k_session_packet(v, vb.packet, vb.len, 4, buf, sizeof buf, &r);
+                        CHECK(r.applied == (scenario == 0), "late version applied wrong TLS plan");
+                        CHECK(scenario != 0 || r.verdict == D2K_VERDICT_DROP,
+                              "assembled modern hello sent unchanged");
+                        CHECK(scenario != 1 || r.verdict == D2K_VERDICT_ACCEPT,
+                              "legacy hello received modern plan");
+                    }
+                    d2k_hold_free(vh); d2k_session_free(v);
+                }
                 CHECK(d2k_plan_load(strict_plan, sizeof strict_plan, &gp,
                                     err, sizeof err) == 0, "probe hold plan parse");
                 CHECK(d2k_plantab_set_name_probe(d2k_session_plans(g), name,
