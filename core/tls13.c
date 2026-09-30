@@ -65,6 +65,7 @@ struct d2k_tls {
     /* Сверка имени из сертификата сервера: 1 совпало, 0 не совпало,
        -1 сказать нечего. См. большой комментарий у cert_name_ok. */
     int      peer_name;
+    int      ech_accepted;
     uint8_t  raw[REC_MAX], wire[REC_MAX + 5];
 
     /* Остаток прочитанного, ещё не отданный вызывающему. */
@@ -247,8 +248,9 @@ static int traffic_keys(const uint8_t secret[32], uint8_t key[16], uint8_t iv[12
     return d2k_hkdf_expand_label(secret, "iv", iv, 12);
 }
 
-int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
-                    d2k_tls **out, char *err, size_t errcap) {
+static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
+    size_t want_wire, const d2k_ech_config *ech,
+    d2k_tls **out, char *err, size_t errcap) {
     if (err && errcap) { err[0] = '\0'; }
     if (fd < 0 || !out) { say(err, errcap, "нечем поднимать сессию"); return -1; }
     *out = NULL;
@@ -275,7 +277,8 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
     /* Две с половиной тысячи, а не тысяча: приветствие теперь добивается до
        длины клиентского, а снимок приветствия с провода бывает до 2048 байт
        (d2k_ev.shape). */
-    uint8_t ch[2560];
+    uint8_t ch[4096], inner[2048];
+    size_t inner_len = 0;
     d2k_t13_ch_opts cho;
     memset(&cho, 0, sizeof cho);
     cho.sni = sni;
@@ -285,7 +288,16 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
     cho.alpn = "http/1.1";
     /* Добивка у ядра считается БЕЗ заголовка записи — его тут пять байт. */
     cho.pad_to = want_wire > 5 ? want_wire - 5 : 0;
-    size_t ch_len = d2k_t13_ch_build(&cho, ch, sizeof ch);
+    size_t ch_len;
+    if (ech) {
+        uint8_t hpke_priv[32], outer_random[32];
+        if (d2k_t13_random(hpke_priv, 32) || d2k_t13_random(outer_random, 32)) {
+            say(err, errcap, "нет случайности для ECH"); free(t); return -1;
+        }
+        ch_len = d2k_t13_ech_build(&cho, ech, hpke_priv, outer_random,
+            ch, sizeof ch, inner, sizeof inner, &inner_len);
+        memset(hpke_priv, 0, sizeof hpke_priv);
+    } else ch_len = d2k_t13_ch_build(&cho, ch, sizeof ch);
     if (ch_len == 0) { say(err, errcap, "приветствие не собралось"); free(t); return -1; }
 
     uint8_t rec[5 + sizeof ch];
@@ -294,8 +306,8 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
     put16(rec + 3, (uint16_t)ch_len);
     memcpy(rec + 5, ch, ch_len);
     if (write_all(fd, rec, 5 + ch_len, err, errcap) != 0) { free(t); return -1; }
-    memcpy(tr, ch, ch_len);
-    tr_len = ch_len;
+    memcpy(tr, ech ? inner : ch, ech ? inner_len : ch_len);
+    tr_len = ech ? inner_len : ch_len;
 
     /* ServerHello — открытым текстом. */
     uint8_t sh[REC_MAX];
@@ -320,6 +332,11 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
         }
         break;
     }
+    if (ech && !d2k_t13_ech_accepted(inner, inner_len, sh, sh_len)) {
+        say(err, errcap, "ECH не принят сервером: публичное имя не подтверждает origin");
+        free(t); return -1;
+    }
+    t->ech_accepted = ech != NULL;
     memcpy(tr + tr_len, sh, sh_len);
     tr_len += sh_len;
 
@@ -385,6 +402,28 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
         if (done) { break; }
     }
 
+    if (ech) {
+        size_t at = 0, previous = 0;
+        uint8_t mt = 0, expected[32];
+        const uint8_t *body = NULL;
+        size_t blen = 0;
+        int finished_ok = 0;
+        while (d2k_t13_flight_next(tr, tr_len, &at, &mt, &body, &blen)) {
+            if (mt == D2K_T13_FINISHED) {
+                if (blen == 32 && !d2k_t13_finished_mac(s_hs, tr, previous, expected)) {
+                    unsigned diff = 0;
+                    for (size_t i = 0; i < 32; i++) diff |= body[i] ^ expected[i];
+                    finished_ok = diff == 0;
+                }
+                break;
+            }
+            previous = at;
+        }
+        if (!finished_ok) {
+            say(err, errcap, "ECH: серверный Finished не подтверждён"); free(t); return -1;
+        }
+    }
+
     /* ИМЯ СЕРВЕРА — из транскрипта, а не из отдельной записи: сообщение
        рукопожатия вправе быть разрезано между записями, и разбор по одной
        записи нашёл бы половину сертификата. Транскрипт же собран подряд и
@@ -437,6 +476,22 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
     *out = t;
     return 0;
 }
+
+int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
+                    d2k_tls **out, char *err, size_t errcap) {
+    return tls_connect_internal(fd, sni, deadline_ms, want_wire, NULL, out, err, errcap);
+}
+
+int d2k_tls_connect_ech(int fd, const char *origin, const d2k_ech_config *config,
+    int deadline_ms, size_t want_wire, d2k_tls **out, char *err, size_t errcap) {
+    if (!config || !origin || !origin[0]) {
+        if (out) *out = NULL;
+        say(err, errcap, "ECH требует origin и конфигурацию"); return -1;
+    }
+    return tls_connect_internal(fd, origin, deadline_ms, want_wire, config, out, err, errcap);
+}
+
+int d2k_tls_ech_accepted(const d2k_tls *t) { return t && t->ech_accepted; }
 
 int d2k_tls_write(d2k_tls *t, const uint8_t *buf, size_t n, char *err, size_t errcap) {
     if (!t) { say(err, errcap, "сессии нет"); return -1; }

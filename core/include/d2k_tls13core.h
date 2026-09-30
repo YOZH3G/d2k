@@ -77,6 +77,23 @@ typedef struct {
 /* Собирает ClientHello. Возвращает длину сообщения или 0 при отказе. */
 size_t d2k_t13_ch_build(const d2k_t13_ch_opts *o, uint8_t *out, size_t cap);
 
+/* RFC 9849 / RFC 9180. The config is an ECHConfigList, not a captured
+ * encrypted ClientHello: the probe owns its HPKE and TLS private keys.
+ * Only X25519/HKDF-SHA256/AES-128-GCM is supported; no silent fallback. */
+typedef struct {
+    uint8_t wire[512];
+    size_t wire_len;
+    uint8_t config_id, maximum_name_length, public_key[32];
+    char public_name[256];
+} d2k_ech_config;
+int d2k_ech_config_parse(const uint8_t *list, size_t len, d2k_ech_config *out);
+size_t d2k_t13_ech_build(const d2k_t13_ch_opts *inner_opts,
+    const d2k_ech_config *config, const uint8_t hpke_private[32],
+    const uint8_t outer_random[32], uint8_t *outer, size_t outer_cap,
+    uint8_t *inner, size_t inner_cap, size_t *inner_len);
+int d2k_t13_ech_accepted(const uint8_t *inner, size_t inner_len,
+                         const uint8_t *server_hello, size_t server_hello_len);
+
 /* Разбирает ServerHello ровно до общего ключа. Возвращает 0 и указатель на
  * 32 байта ключа X25519 сервера внутри sh; -1 с причиной в err.
  *

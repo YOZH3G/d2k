@@ -278,7 +278,8 @@ size_t d2k_t13_ch_build(const d2k_t13_ch_opts *o, uint8_t *out, size_t cap) {
        quic_transport_parameters (0x0039): собирать их здесь значило бы
        затащить транспорт QUIC в общее ядро TLS. */
     if (o->extra && o->extra_len) {
-        if (p + o->extra_len > cap) { return 0; }
+        /* key_share still follows, including its 4-byte extension header. */
+        if (p + 42 > cap || o->extra_len > cap - p - 42) { return 0; }
         memcpy(out + p, o->extra, o->extra_len); p += o->extra_len;
     }
 
@@ -437,4 +438,215 @@ int d2k_t13_flight_next(const uint8_t *buf, size_t len, size_t *off,
     if (blen) { *blen = n; }
     *off = o + 4 + n;
     return 1;
+}
+
+static int ech_host_ok(const uint8_t *p, size_t n) {
+    if (!n || n > 253 || p[0] == '.' || p[n - 1] == '.') return 0;
+    size_t label = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned c = p[i];
+        if (c == '.') {
+            if (!label || label > 63 || p[i - 1] == '-') return 0;
+            label = 0;
+        } else {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-')) return 0;
+            if (!label && c == '-') return 0;
+            label++;
+        }
+    }
+    return label && label <= 63 && p[n - 1] != '-';
+}
+
+int d2k_ech_config_parse(const uint8_t *list, size_t len, d2k_ech_config *out) {
+    if (!list || !out || len < 2 || get16(list) != len - 2) return -1;
+    d2k_ech_config selected;
+    memset(&selected, 0, sizeof selected);
+    size_t at = 2;
+    int have = 0;
+    while (at < len) {
+        if (len - at < 4) return -1;
+        size_t end = at + 4 + get16(list + at + 2);
+        if (end > len) return -1;
+        if (get16(list + at) != 0xfe0d) { at = end; continue; }
+        size_t p = at + 4;
+        if (end - p < 5) return -1;
+        uint8_t id = list[p++];
+        unsigned kem = get16(list + p); p += 2;
+        size_t key_len = get16(list + p); p += 2;
+        if (key_len > end - p) return -1;
+        const uint8_t *key = list + p; p += key_len;
+        if (end - p < 2) return -1;
+        size_t suites = get16(list + p); p += 2;
+        if (!suites || suites % 4 || suites > end - p) return -1;
+        int suite_ok = 0;
+        for (size_t q = p; q < p + suites; q += 4)
+            if (get16(list + q) == 1 && get16(list + q + 2) == 1) suite_ok = 1;
+        p += suites;
+        if (end - p < 2) return -1;
+        uint8_t max_name = list[p++];
+        size_t name_len = list[p++];
+        if (name_len > end - p || !ech_host_ok(list + p, name_len)) return -1;
+        const uint8_t *name = list + p; p += name_len;
+        if (end - p < 2) return -1;
+        size_t extensions = get16(list + p); p += 2;
+        if (extensions != end - p) return -1;
+        int mandatory_unknown = 0;
+        while (p < end) {
+            if (end - p < 4) return -1;
+            unsigned kind = get16(list + p);
+            size_t n = get16(list + p + 2); p += 4;
+            if (n > end - p) return -1;
+            if (kind & 0x8000) mandatory_unknown = 1;
+            p += n;
+        }
+        if (!have && kem == 0x20 && key_len == 32 && suite_ok &&
+            !mandatory_unknown && end - at <= sizeof selected.wire) {
+            selected.wire_len = end - at;
+            memcpy(selected.wire, list + at, selected.wire_len);
+            memcpy(selected.public_key, key, 32);
+            memcpy(selected.public_name, name, name_len);
+            selected.config_id = id;
+            selected.maximum_name_length = max_name;
+            have = 1;
+        }
+        at = end;
+    }
+    if (!have) return -1;
+    *out = selected;
+    return 0;
+}
+
+/* HPKE labels have their own suite domain separation, not TLS's tls13 prefix. */
+static int hpke_extract(const uint8_t *salt, size_t salt_len,
+    const uint8_t *suite, size_t suite_len, const char *label,
+    const uint8_t *ikm, size_t ikm_len, uint8_t out[32]) {
+    uint8_t b[768];
+    size_t l = strlen(label), n = 7 + suite_len + l + ikm_len;
+    if (n > sizeof b) return -1;
+    memcpy(b, "HPKE-v1", 7); memcpy(b + 7, suite, suite_len);
+    memcpy(b + 7 + suite_len, label, l);
+    if (ikm_len) memcpy(b + 7 + suite_len + l, ikm, ikm_len);
+    d2k_hkdf_extract(salt, salt_len, b, n, out);
+    return 0;
+}
+
+static int hpke_expand(const uint8_t prk[32], const uint8_t *suite, size_t suite_len,
+    const char *label, const uint8_t *info, size_t info_len,
+    uint8_t *out, size_t out_len) {
+    uint8_t b[768], block[32];
+    size_t l = strlen(label), n = 2 + 7 + suite_len + l + info_len;
+    if (!out_len || out_len > 32 || n + 1 > sizeof b) return -1;
+    put16(b, (uint16_t)out_len); memcpy(b + 2, "HPKE-v1", 7);
+    memcpy(b + 9, suite, suite_len); memcpy(b + 9 + suite_len, label, l);
+    if (info_len) memcpy(b + 9 + suite_len + l, info, info_len);
+    b[n] = 1;
+    d2k_hmac_sha256(prk, 32, b, n + 1, block);
+    memcpy(out, block, out_len);
+    return 0;
+}
+
+static int ech_hpke(const d2k_ech_config *c, const uint8_t priv[32],
+    uint8_t enc[32], uint8_t key[16], uint8_t nonce[12]) {
+    const uint8_t kem_suite[] = {'K','E','M',0,0x20};
+    const uint8_t suite[] = {'H','P','K','E',0,0x20,0,1,0,1};
+    uint8_t dh[32], context[64], eae[32], shared[32], info[520];
+    uint8_t psk_hash[32], info_hash[32], schedule[65], secret[32];
+    if (!c || c->wire_len > 512 || !c->wire_len ||
+        d2k_x25519_base(enc, priv) || d2k_x25519(dh, priv, c->public_key)) return -1;
+    memcpy(context, enc, 32); memcpy(context + 32, c->public_key, 32);
+    memcpy(info, "tls ech", 7); info[7] = 0; memcpy(info + 8, c->wire, c->wire_len);
+    if (hpke_extract(NULL, 0, kem_suite, sizeof kem_suite, "eae_prk", dh, 32, eae) ||
+        hpke_expand(eae, kem_suite, sizeof kem_suite, "shared_secret", context, 64, shared, 32) ||
+        hpke_extract(NULL, 0, suite, sizeof suite, "psk_id_hash", NULL, 0, psk_hash) ||
+        hpke_extract(NULL, 0, suite, sizeof suite, "info_hash", info, c->wire_len + 8, info_hash) ||
+        hpke_extract(shared, 32, suite, sizeof suite, "secret", NULL, 0, secret)) return -1;
+    schedule[0] = 0; memcpy(schedule + 1, psk_hash, 32); memcpy(schedule + 33, info_hash, 32);
+    int rc = hpke_expand(secret, suite, sizeof suite, "key", schedule, 65, key, 16) ||
+             hpke_expand(secret, suite, sizeof suite, "base_nonce", schedule, 65, nonce, 12);
+    memset(dh, 0, sizeof dh); memset(eae, 0, sizeof eae);
+    memset(shared, 0, sizeof shared); memset(secret, 0, sizeof secret);
+    return rc ? -1 : 0;
+}
+
+size_t d2k_t13_ech_build(const d2k_t13_ch_opts *o, const d2k_ech_config *c,
+    const uint8_t priv[32], const uint8_t outer_random[32],
+    uint8_t *outer, size_t cap, uint8_t *inner, size_t inner_cap, size_t *inner_len) {
+    if (!o || !c || !priv || !outer_random || !outer || !inner || !inner_len ||
+        !o->sni || !ech_host_ok((const uint8_t *)o->sni, strlen(o->sni)) ||
+        o->extra_len || o->session_id_len > 32 || o->pad_to > cap ||
+        !c->public_name[0]) return 0;
+    *inner_len = 0;
+    uint8_t enc[32], key[16], nonce[12], encoded[1024], extension[1100];
+    if (ech_hpke(c, priv, enc, key, nonce)) return 0;
+    const uint8_t inner_ext[] = {0xfe,0x0d,0,1,1};
+    d2k_t13_ch_opts opts = *o;
+    opts.extra = inner_ext; opts.extra_len = sizeof inner_ext; opts.pad_to = 0;
+    size_t n = d2k_t13_ch_build(&opts, inner, inner_cap);
+    size_t sid = o->session_id_len;
+    if (!n || n < 39 + sid || n - 4 - sid > sizeof encoded) return 0;
+    /* Reconstructed inner transcript uses the outer's compatibility session ID. */
+    if (sid) memcpy(inner + 39, outer_random, sid);
+    memcpy(encoded, inner + 4, 35); encoded[34] = 0;
+    memcpy(encoded + 35, inner + 39 + sid, n - 39 - sid);
+    size_t plain_len = n - 4 - sid;
+    size_t host_len = strlen(o->sni);
+    if (c->maximum_name_length > host_len) plain_len += c->maximum_name_length - host_len;
+    plain_len = (plain_len + 31) & ~(size_t)31;
+    if (plain_len + 16 + 46 > sizeof extension || plain_len > sizeof encoded) return 0;
+    memset(encoded + n - 4 - sid, 0, plain_len - (n - 4 - sid));
+    put16(extension, 0xfe0d); put16(extension + 2, (uint16_t)(42 + plain_len + 16));
+    extension[4] = 0; put16(extension + 5, 1); put16(extension + 7, 1);
+    extension[9] = c->config_id; put16(extension + 10, 32);
+    memcpy(extension + 12, enc, 32); put16(extension + 44, (uint16_t)(plain_len + 16));
+    memset(extension + 46, 0, plain_len + 16);
+    opts = *o; opts.sni = c->public_name; opts.random = outer_random;
+    opts.extra = extension; opts.extra_len = 46 + plain_len + 16;
+    size_t outer_len = d2k_t13_ch_build(&opts, outer, cap);
+    if (!outer_len) return 0;
+    /* Locate the extension rather than assuming ordering in the TLS builder. */
+    size_t p = 39 + sid;
+    if (p + 2 > outer_len) return 0;
+    p += 2 + get16(outer + p);
+    if (p >= outer_len) return 0;
+    p += 1 + outer[p];
+    if (p + 2 > outer_len) return 0;
+    p += 2;
+    while (p + 4 <= outer_len) {
+        size_t elen = get16(outer + p + 2);
+        if (elen > outer_len - p - 4) return 0;
+        if (get16(outer + p) == 0xfe0d) {
+            if (elen != 42 + plain_len + 16) return 0;
+            uint8_t tag[16], ciphertext[1024];
+            int rc = d2k_aes128_gcm_encrypt(key, nonce, outer + 4, outer_len - 4,
+                encoded, plain_len, ciphertext, tag);
+            memset(key, 0, sizeof key);
+            if (rc) return 0;
+            memcpy(outer + p + 46, ciphertext, plain_len);
+            memcpy(outer + p + 46 + plain_len, tag, 16);
+            *inner_len = n;
+            return outer_len;
+        }
+        p += 4 + elen;
+    }
+    return 0;
+}
+
+int d2k_t13_ech_accepted(const uint8_t *inner, size_t n,
+                         const uint8_t *sh, size_t sn) {
+    if (!inner || !sh || n < 38 || n > 4096 || sn < 38 || sn > 4096 ||
+        inner[0] != 1 || sh[0] != 2) return 0;
+    const uint8_t *peer = NULL;
+    char err[80];
+    if (d2k_t13_sh_parse(sh, sn, &peer, err, sizeof err)) return 0;
+    uint8_t tr[8192], hash[32], secret[32], expected[8];
+    memcpy(tr, inner, n); memcpy(tr + n, sh, sn); memset(tr + n + 30, 0, 8);
+    d2k_sha256(tr, n + sn, hash);
+    d2k_hkdf_extract(NULL, 0, inner + 6, 32, secret);
+    if (d2k_hkdf_expand_label_ctx(secret, "ech accept confirmation", hash, 32,
+                                 expected, 8)) return 0;
+    unsigned diff = 0;
+    for (size_t i = 0; i < 8; i++) diff |= expected[i] ^ sh[30 + i];
+    memset(secret, 0, sizeof secret);
+    return diff == 0;
 }

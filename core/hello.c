@@ -319,6 +319,33 @@ int d2k_hello_sni(const uint8_t *b, size_t n, size_t *off, size_t *len) {
     return 0;
 }
 
+int d2k_hello_ech_offer(const uint8_t *b, size_t n, uint8_t *config_id) {
+    if (!d2k_hello_complete(b, n)) return -1;
+    hello_layout L;
+    parse_hello(b, n, &L);
+    if (!L.have_exts) return 0;
+    size_t p = L.exts_len_off + 2, end = p + rd16(b + L.exts_len_off);
+    int found = 0;
+    uint8_t id = 0;
+    while (p < end) {
+        if (end - p < 4) return -1;
+        size_t elen = rd16(b + p + 2);
+        if (elen > end - p - 4) return -1;
+        if (rd16(b + p) == 0xfe0d) {
+            const uint8_t *e = b + p + 4;
+            if (found || elen < 10 || e[0] != 0) return -1;
+            size_t enc_len = rd16(e + 6);
+            if (enc_len > elen - 10) return -1;
+            size_t payload_len = rd16(e + 8 + enc_len);
+            if (!payload_len || payload_len != elen - 10 - enc_len) return -1;
+            id = e[5]; found = 1;
+        }
+        p += 4 + elen;
+    }
+    if (found && config_id) *config_id = id;
+    return found;
+}
+
 /* =========================================================================
  * Сборка приветствия холодного старта из профиля.
  * ========================================================================= */

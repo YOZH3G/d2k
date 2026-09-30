@@ -577,10 +577,10 @@ static int verify_contact(int use_fd, const char *ip, uint16_t port,
                                 local_addr, local_port, out_fd);
 }
 
-static d2k_ver_result verify_probe13_on(int use_fd, const char *ip, uint16_t port,
+static d2k_ver_result verify_probe13_internal(int use_fd, const char *ip, uint16_t port,
                                         const char *sni, int deadline_ms,
                                         size_t hello_wire, int encoding, uint32_t mark,
-                                        const char *path) {
+                                        const char *path, const d2k_ech_config *ech) {
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
     r.fd = -1;
@@ -620,12 +620,16 @@ static d2k_ver_result verify_probe13_on(int use_fd, const char *ip, uint16_t por
     char err[160];
     err[0] = '\0';
     d2k_tls *t = NULL;
-    if (d2k_tls_connect(r.fd, sni, deadline_ms, hello_wire, &t, err, sizeof err) != 0) {
+    int tls_rc = ech ? d2k_tls_connect_ech(r.fd, sni, ech, deadline_ms,
+                                          hello_wire, &t, err, sizeof err)
+                     : d2k_tls_connect(r.fd, sni, deadline_ms, hello_wire, &t, err, sizeof err);
+    if (tls_rc != 0) {
         snprintf(r.reason, sizeof r.reason, "нет TLS: %.150s", err);
         return r;
     }
     r.level = D2K_VER_HANDSHAKE;
     r.name_ok = d2k_tls_peer_name(t);
+    r.ech_accepted = d2k_tls_ech_accepted(t);
     snprintf(r.reason, sizeof r.reason, "рукопожатие завершено, приложение молчит");
 
     request_complete_page(read13, write13, t, host, encoding, path,
@@ -635,6 +639,27 @@ static d2k_ver_result verify_probe13_on(int use_fd, const char *ip, uint16_t por
        ячейку потока в датапате раньше, чем вызывающий свяжет с ней событие. */
     d2k_tls_free(t);
     return r;
+}
+
+static d2k_ver_result verify_probe13_on(int use_fd, const char *ip, uint16_t port,
+    const char *sni, int deadline_ms, size_t hello_wire, int encoding,
+    uint32_t mark, const char *path) {
+    return verify_probe13_internal(use_fd, ip, port, sni, deadline_ms,
+                                   hello_wire, encoding, mark, path, NULL);
+}
+
+d2k_ver_result d2k_verify_probe_ech_on(int use_fd, const char *ip, uint16_t port,
+    const char *origin, const d2k_ech_config *config, int deadline_ms,
+    size_t hello_wire, uint32_t mark, const char *path) {
+    if (!config || !origin || !origin[0]) {
+        d2k_ver_result r;
+        memset(&r, 0, sizeof r); r.fd = -1; r.name_ok = -1;
+        if (use_fd >= 0) close(use_fd);
+        snprintf(r.reason, sizeof r.reason, "нет ECH-конфигурации/origin; опыт не состоялся");
+        return r;
+    }
+    return verify_probe13_internal(use_fd, ip, port, origin, deadline_ms,
+                                   hello_wire, 0, mark, path, config);
 }
 
 d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,

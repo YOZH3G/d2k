@@ -47,6 +47,7 @@
 
 #include <stdint.h>
 #include "d2k_resource.h"
+#include "d2k_tls13core.h"
 
 typedef enum {
     D2K_VER_NOT_MEASURED = 0, /* обращение не состоялось — про линию не сказано ничего */
@@ -96,6 +97,7 @@ typedef struct {
      * Это утверждение о НАС, а не о коробке и не о кандидате: в каталог по
      * нему не идёт ничего, ни положительного, ни отрицательного (§10). */
     int      unsupported;
+    int      ech_accepted; /* own ECH acceptance, not extension presence/GREASE */
     d2k_resource resources[D2K_RESOURCE_COUNT];
     size_t n_resources; /* hints only, from a complete anonymous HTML response */
 } d2k_ver_result;
@@ -183,5 +185,11 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
 /* Закрывает сокет обращения и обнуляет fd. Безопасна на любом результате, в
  * том числе на том, где обращения не было. */
 void d2k_verify_close(d2k_ver_result *r);
+
+/* Explicit origin witness: outer SNI is config.public_name, HTTP authority
+ * and certificate-name observation are origin. Never follows another host. */
+d2k_ver_result d2k_verify_probe_ech_on(int use_fd, const char *ip, uint16_t port,
+    const char *origin, const d2k_ech_config *config, int deadline_ms,
+    size_t hello_wire, uint32_t mark, const char *path);
 
 #endif /* D2K_VERIFY_H */

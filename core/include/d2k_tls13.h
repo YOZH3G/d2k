@@ -23,6 +23,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "d2k_tls13core.h"
 
 typedef struct d2k_tls d2k_tls;
 
@@ -40,6 +41,10 @@ typedef struct d2k_tls d2k_tls;
  * вовсе — подтверждение достаётся зонду, а не человеку. */
 int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
                     d2k_tls **out, char *err, size_t errcap);
+/* ECH rejection is an error, never an ordinary TLS success for public_name. */
+int d2k_tls_connect_ech(int fd, const char *origin, const d2k_ech_config *config,
+    int deadline_ms, size_t want_wire, d2k_tls **out, char *err, size_t errcap);
+int d2k_tls_ech_accepted(const d2k_tls *t);
 
 /* Шлёт n байт прикладными данными. Возвращает 0 или -1 с причиной. */
 int d2k_tls_write(d2k_tls *t, const uint8_t *buf, size_t n, char *err, size_t errcap);

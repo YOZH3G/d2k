@@ -104,6 +104,10 @@ int d2k_hello_complete(const uint8_t *b, size_t n);
  * а разбираться, ПОЧЕМУ имени нет, здесь как и в tls.c незачем. */
 int d2k_hello_sni(const uint8_t *b, size_t n, size_t *off, size_t *len);
 
+/* Observed RFC 9849 outer offer, NOT evidence of ECH acceptance: GREASE has
+ * the same wire structure. 1 present, 0 absent, -1 incomplete/malformed. */
+int d2k_hello_ech_offer(const uint8_t *b, size_t n, uint8_t *config_id);
+
 /* Собирает приветствие холодного старта по профилю вида s, с именем sni.
  *
  * Берёт снятый профиль (core/profiles/modern.hex или legacy.hex, встроены в

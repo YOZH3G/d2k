@@ -10,6 +10,7 @@
 # узла незамеченной.
 
 CC      ?= cc
+.DEFAULT_GOAL := all
 # -I../datapath/include — задача 4: link.c — первый модуль ядра, которому
 # нужен заголовок ИЗ ДАТАПАТА. Протокол управляющего сокета не переизобретён
 # здесь: единственный источник истины — datapath/include/d2k_ctl.h (кадры,
@@ -68,6 +69,16 @@ TESTHDR = test_stand.h
 # настоящий ctlprobe (как и test_compose/test_link) — но stand ей тоже нужен
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
 TESTS   = test_stun test_voice test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_fresh_repeats test_quic_arms test_ipfrag test_quic_original_arms test_quic_run_order test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify test_measured
+TESTS += test_ech
+
+test_ech: test_ech.c verify.o tls12.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+
+.PHONY: test-ech
+test-ech: test_ech
+	./test_ech
+
+check: test-ech
 
 .PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-rst-trigger test-voice-sched test-verify FORCE
 
