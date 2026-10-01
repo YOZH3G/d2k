@@ -116,7 +116,7 @@ int main(void) {
     {
         d2k_journal *j = d2k_journal_new(4);
         d2k_key k = mk(1);
-        d2k_jrn_detail det = {.ttl = 127, .ref_ttl = 124, .tos = 0x88, .ipid = 54321};
+        d2k_jrn_detail det = {.ttl = 127, .ref_ttl = 124, .tos = 0x88, .ipid = 54321, .client_shape = 1};
         d2k_journal_add(j, 1, &k, D2K_JRN_SUSPECT, D2K_SUSPECT_RST, 0, &det,
                         NULL, 0, NULL);
         const d2k_jrn_entry *e = d2k_journal_at(j, 0);
@@ -125,6 +125,7 @@ int main(void) {
         CHECK(e && e->d_tos == 0x88, "ToS потерян");
         CHECK(e && e->d_ipid == 54321, "идентификатор IP потерян");
         CHECK(e && e->code == D2K_SUSPECT_RST, "код причины потерян");
+        CHECK(e && e->d_client_shape == 1, "flow protocol survives expiry in journal");
 
         /* Без подробностей поля обязаны остаться нулевыми, а не мусорными. */
         d2k_journal_add(j, 2, &k, D2K_JRN_SUSPECT, D2K_SUSPECT_SILENT, 0, NULL,

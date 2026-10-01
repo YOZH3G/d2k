@@ -313,6 +313,7 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
                сказано», и менять по нему смысл подозрения нельзя. */
             out->planned = rest[6];
         }
+        if (rlen >= 8) out->client_shape = rest[7];
         break;
     case D2K_EV_STATS:
         /* Счётчики необязательны по длине: старый датапат их не слал вовсе, и

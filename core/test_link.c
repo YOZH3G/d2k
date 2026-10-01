@@ -570,7 +570,7 @@ int main(void) {
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (подробности SUSPECT) не создался");
         if (sv[0] >= 0) {
-            uint8_t rest[6] = { 1, 127, 53, 0x20, 0x12, 0x34 };
+            uint8_t rest[8] = { 1, 127, 53, 0x20, 0x12, 0x34, D2K_LINK_PLANNED_NO, 1 };
             send_synthetic(sv[1], D2K_EV_SUSPECT, rest, sizeof rest);
             d2k_ev ev; char e[200] = {0};
             CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
@@ -580,6 +580,7 @@ int main(void) {
             CHECK(ev.ref_ttl == 53, "TTL сервера потерян — без него разность не посчитать");
             CHECK(ev.tos == 0x20, "ToS подозрения потерян");
             CHECK(ev.ipid == 0x1234, "идентификатор пакета потерян");
+            CHECK(ev.client_shape == 1, "SUSPECT retains flow TLS shape for family admission");
             close(sv[0]); close(sv[1]);
         }
     }

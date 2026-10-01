@@ -168,6 +168,7 @@ typedef struct {
      * поля нет. Молча принять её ноль за «план не применялся» значило бы
      * сменить смысл её подозрений задним числом (§2.4). */
     uint8_t  d_planned;
+    uint8_t  d_client_shape;
     /* Идентификатор применённого плана (REC_ID). Значим при
      * kind == D2K_JRN_PLAN_APPLIED и у записей о судьбе посылок
      * (D2K_JRN_PLAN_DONE/D2K_JRN_PLAN_UNSENT), у остального нули.
@@ -204,6 +205,7 @@ typedef struct {
     uint8_t  server_hello;
     /* См. d_planned у записи: сюда его кладёт тот, кто подозрение поднимает. */
     uint8_t  planned;
+    uint8_t  client_shape;
 } d2k_jrn_detail;
 
 void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,

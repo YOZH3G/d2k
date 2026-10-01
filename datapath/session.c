@@ -316,6 +316,7 @@ static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     d2k_jrn_detail d;
     if (det) { d = *det; } else { memset(&d, 0, sizeof d); }
     d.planned = fl->plan_done ? D2K_PLANNED_YES : D2K_PLANNED_NO;
+    d.client_shape = fl->client_shape;
     d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_SUSPECT, code, 0, &d, NULL, 0, NULL);
 }
 
@@ -339,6 +340,7 @@ static void on_flow_expire(void *ctx, const d2k_flow *f) {
     d2k_jrn_detail d;
     memset(&d, 0, sizeof d);
     d.planned = f->plan_done ? D2K_PLANNED_YES : D2K_PLANNED_NO;
+    d.client_shape = f->client_shape;
     d2k_journal_add(s->jrn, f->last_ns, &f->key, D2K_JRN_SUSPECT, D2K_SUSPECT_SILENT, 0, &d, NULL, 0, NULL);
 }
 

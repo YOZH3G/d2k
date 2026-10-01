@@ -3816,10 +3816,9 @@ static size_t queued_measurements(const d2k_sched *s) {
 /* An unplanned flow queued BEFORE a compatible area was installed cannot
    testify against that new area. Let its next flow inherit without an old
    backlog probe. Applied-plan failures and exact overrides remain diagnostic. */
-static int queued_family_ready(const d2k_sched *s, const task *t) {
+static int installed_family_ready(const d2k_sched *s, const task *t, uint64_t after_event) {
     const d2k_group_state *state = s->cat->groups;
-    if (!state || t->by_addr || t->trigger_planned != D2K_LINK_PLANNED_NO ||
-        !t->queued_ms) return 0;
+    if (!state || t->by_addr) return 0;
     uint8_t shape = t->trigger_shape;
     if (!shape) return 0;
     for (size_t bi=0; bi<s->cat->n_boxes; bi++) {
@@ -3840,11 +3839,16 @@ static int queued_family_ready(const d2k_sched *s, const task *t) {
             !desired_area(s,i,&desired)) continue;
         for (size_t j=0; j<s->n_areas; j++) {
             const installed_area *a=&s->areas[j];
-            if (a->confirmed && a->confirmed_event>t->queued_event &&
+            if (a->confirmed && a->confirmed_event>after_event &&
                 area_key_same(a,&desired) && !strcmp(a->plan_id,desired.plan_id)) return 1;
         }
     }
     return 0;
+}
+
+static int queued_family_ready(const d2k_sched *s, const task *t) {
+    return t->queued_ms && t->trigger_planned == D2K_LINK_PLANNED_NO &&
+        installed_family_ready(s, t, t->queued_event);
 }
 
 static int launch_task(d2k_sched *s, task *t) {
@@ -4142,14 +4146,27 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     t->trigger_flow.b_port = ev->high_port;
     t->trigger_flow.transport = ev->transport;
     t->trigger_flow.family = t->family;
-    if (t->transport == 17) t->trigger_shape = D2K_LINK_SHAPE_QUIC;
+    if (ev->client_shape) t->trigger_shape = ev->client_shape;
+    else if (t->transport == 17) t->trigger_shape = D2K_LINK_SHAPE_QUIC;
     else if (!strcmp(s->tcp_shape_name[t->family == 6], name) &&
              ev_matches_flow(ev, &s->tcp_shape_flow[t->family == 6])) {
         const uint8_t *hello = s->tcp_shape[t->family == 6];
         size_t len = s->tcp_shape_len[t->family == 6];
         t->trigger_shape = d2k_hello_ech_offer(hello,len,NULL)==1 ?
-            D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(hello,len);
+                D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(hello,len);
     }
+    if ((t->trigger_planned == D2K_LINK_PLANNED_NO ||
+         (t->trigger_planned == D2K_LINK_PLANNED_YES && t->trigger_code == D2K_SUSPECT_SILENT)) &&
+        installed_family_ready(s, t, 0)) {
+        say(s, "по %s отдельный поиск не запускаю: совместимое семейство уже установлено; "
+               "новый поток наследует его план (форма %u, IPv%u)",
+            t->name, (unsigned)t->trigger_shape, (unsigned)t->family);
+        task_reset(t);
+        return 0;
+    }
+    say(s, "по %s источник нового замера: подозрение %u, исполнение плана %u, форма %u, IPv%u",
+        t->name, (unsigned)t->trigger_code, (unsigned)t->trigger_planned,
+        (unsigned)t->trigger_shape, (unsigned)t->family);
     t->fp.method = D2K_FP_METHOD;
     if (!late_app_rst) {
         d2k_cat_signal sig = signal_of(ev);
@@ -4284,7 +4301,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
         if (t->family != (ev->family ? ev->family : 4)) { continue; }
-        if (t->state == T_QUEUED && t->transport == 6 && ev->transport == 6 &&
+        if ((t->state == T_QUEUED || t->state == T_ASKING) && t->transport == 6 && ev->transport == 6 &&
             ev_matches_flow(ev,&t->trigger_flow) && !t->trigger_shape) {
             t->trigger_shape=d2k_hello_ech_offer(ev->shape,ev->shape_len,NULL)==1 ?
                 D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(ev->shape,ev->shape_len);
@@ -4849,7 +4866,6 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
                 suspicion.kind = D2K_EV_SUSPECT;
                 suspicion.code = D2K_SUSPECT_REPEAT;
                 suspicion.planned = D2K_LINK_PLANNED_NO;
-                if (!task_of(s, name, ev->transport, ev->family)) (void)on_suspect(s, &suspicion);
                 /* The exact wire plan refused execution on this client.
                    Retain that fact even when subsequent diagnosis cannot
                    establish a DPI verdict. It never invalidates siblings. */
@@ -4861,6 +4877,7 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
                 if (d2k_group_learn(s->cat->groups, &failed) > 0) {
                     s->cat->revision++; s->sync_pending = 1;
                 }
+                if (!task_of(s, name, ev->transport, ev->family)) (void)on_suspect(s, &suspicion);
                 break; /* refusal is execution evidence, not a DPI verdict */
             }
         }
@@ -5323,6 +5340,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
+            if (t->trigger_planned == D2K_LINK_PLANNED_NO && installed_family_ready(s, t, 0)) {
+                say(s, "по %s снимок подтвердил совместимое установленное семейство; "
+                       "отдельный поиск прекращаю без перебора", t->name);
+                task_done(t); moved++; continue;
+            }
             remember_resources(s, t->vol.resources, t->vol.n_resources);
             if (t->rx_volume_only) {
                 t->rx_volume_only = 0;

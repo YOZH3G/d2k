@@ -1215,6 +1215,20 @@ int main(int argc, char **argv) {
         area_ack_id(&ack);
         d2k_sched_event(s, &ack); sync_out(s);
         CHECK(!d2k_sched_sync_pending(s), "positive suffix ACK completes sync");
+        h = ev_hello(6, 40308, "rr-fresh.googlevideo.com");
+        d2k_sched_event(s, &h);
+        d2k_ev fresh = ev_suspect(6, 40308);
+        fresh.planned = D2K_LINK_PLANNED_NO;
+        fresh.client_shape = D2K_SHAPE_MODERN;
+        tcp_calls = vol_calls = ver_calls = 0;
+        d2k_sched_event(s, &fresh); spin(s, 2);
+        CHECK(!d2k_sched_active(s) && !tcp_calls && !vol_calls && !ver_calls,
+              "fresh unplanned TLS13 family member inherits without starting a search");
+        fresh.planned = D2K_LINK_PLANNED_YES;
+        fresh.code = D2K_SUSPECT_SILENT;
+        d2k_sched_event(s, &fresh); spin(s, 2);
+        CHECK(!d2k_sched_active(s) && !tcp_calls && !vol_calls && !ver_calls,
+              "single silent inherited flow cannot start a full per-member search");
         char live_path[] = "/tmp/d2k-family-live-XXXXXX";
         int live_fd = mkstemp(live_path); CHECK(live_fd >= 0, "family live fixture");
         if (live_fd >= 0) {

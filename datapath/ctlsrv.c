@@ -461,6 +461,7 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
                проверяет, а не предполагает: событие без этого байта — законный
                вход от старой службы. */
             body[n++] = e->d_planned;
+            body[n++] = e->d_client_shape;
             break;
         case D2K_JRN_PLAN_APPLIED:
             /* Prepared, not yet sent. Never expose this as positive proof. */
