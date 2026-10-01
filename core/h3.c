@@ -115,19 +115,25 @@ size_t d2k_h3_request(const char *host, const char *path, uint8_t *out, size_t c
     return r;
 }
 
-/* Код Хаффмана цифры — пять бит со значением самой цифры (RFC 7541
- * приложение B: '0'..'9' это 0x0..0x9 длиной 5). Трёхзначный статус это
- * пятнадцать бит, добитые единицами до двух байт. Полная таблица Хаффмана
- * здесь не нужна и не пишется: всё, что мы декодируем, — три цифры. */
+/* RFC 7541 прил. B: '0' 00000, '1' 00001, '2' 00010 (5 бит);
+ * '3'..'9' = 011001..011111 (6 бит). Хвост < 8 бит — только единицы (EOS).
+ * Полная таблица Хаффмана не нужна: декодируются ровно три цифры. */
 static int huff_status(const uint8_t *v, size_t n, int *status) {
-    if (n != 2) { return -1; }
-    uint32_t bits = (uint32_t)v[0] << 8 | v[1];
-    int val = 0;
-    for (int i = 0; i < 3; i++) {
-        uint32_t code = (bits >> (11 - 5 * i)) & 0x1f;
-        if (code > 9) { return -1; }
-        val = val * 10 + (int)code;
+    if (n < 2 || n > 3) { return -1; }
+    uint32_t bits = 0;
+    for (size_t i = 0; i < n; i++) { bits = bits << 8 | v[i]; }
+    int total = (int)n * 8, pos = 0, val = 0;
+    for (int d = 0; d < 3; d++) {
+        if (total - pos < 5) { return -1; }
+        uint32_t c5 = (bits >> (total - pos - 5)) & 0x1f;
+        if (c5 <= 2) { val = val * 10 + (int)c5; pos += 5; continue; }
+        if (total - pos < 6) { return -1; }
+        uint32_t c6 = (bits >> (total - pos - 6)) & 0x3f;
+        if (c6 < 0x19 || c6 > 0x1f) { return -1; }
+        val = val * 10 + (int)(c6 - 0x19 + 3); pos += 6;
     }
+    int rest = total - pos;
+    if (rest >= 8 || (bits & ((1u << rest) - 1)) != ((1u << rest) - 1)) { return -1; }
     *status = val;
     return 0;
 }
@@ -203,16 +209,40 @@ static int decode_section(const uint8_t *p, size_t n, int *status) {
             }
             i += (size_t)vlen;
         } else if ((b & 0xe0) == 0x20) {
-            /* Изменение ёмкости динамической таблицы — нам оно безразлично. */
-            if (prefix_int_read(p + i, n - i, 5, &v, &w) != 0) { return -1; }
-            i += w;
-        } else {
-            /* Литерал с ЛИТЕРАЛЬНЫМ именем: пропускаем имя и значение. */
+            /* Литерал с ЛИТЕРАЛЬНЫМ именем (RFC 9204 §4.5.6, 001N H xxx):
+               имя — 3-бит префикс длины, значение — 7-бит. Имя :status
+               разбираем, остальное пропускаем. */
             uint64_t nlen = 0;
             if (prefix_int_read(p + i, n - i, 3, &nlen, &w) != 0) { return -1; }
             i += w;
             if (nlen > n - i) { return -1; }
+            int name_status = !(b & 0x08) && nlen == 7 &&
+                              memcmp(p + i, ":status", 7) == 0;
             i += (size_t)nlen;
+            if (i >= n) { return -1; }
+            int huff = (p[i] & 0x80) != 0;
+            uint64_t vlen = 0;
+            if (prefix_int_read(p + i, n - i, 7, &vlen, &w) != 0) { return -1; }
+            i += w;
+            if (vlen > n - i) { return -1; }
+            if (name_status) {
+                if (huff) {
+                    if (huff_status(p + i, (size_t)vlen, status) == 0) { return 0; }
+                } else if (vlen == 3) {
+                    *status = (p[i] - '0') * 100 + (p[i + 1] - '0') * 10 + (p[i + 2] - '0');
+                    return 0;
+                }
+            }
+            i += (size_t)vlen;
+        } else if (b & 0x10) {
+            /* 0001xxxx: индексное поле после базы — динамическая таблица. */
+            if (prefix_int_read(p + i, n - i, 4, &v, &w) != 0) { return -1; }
+            i += w;
+        } else {
+            /* 0000Nxxx: литерал со ссылкой на имя после базы (3-бит индекс),
+               затем значение — пропускаем. */
+            if (prefix_int_read(p + i, n - i, 3, &v, &w) != 0) { return -1; }
+            i += w;
             if (i >= n) { return -1; }
             uint64_t vlen = 0;
             if (prefix_int_read(p + i, n - i, 7, &vlen, &w) != 0) { return -1; }
