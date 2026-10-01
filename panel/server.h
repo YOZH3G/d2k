@@ -26,7 +26,11 @@ typedef struct {
     int config_exists;
     int dirty;
     int control_enabled;
+    int listener_fd;
 } d2k_panel_config;
+
+/* Reap the bounded background service command without blocking HTTP. */
+void d2k_panel_control_tick(void);
 
 /* Serve one bounded HTTP/1.1 request on an already accepted socket. */
 int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg);

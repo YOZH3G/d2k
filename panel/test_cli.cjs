@@ -36,12 +36,15 @@ async function main() {
   const port = 38000 + (process.pid % 20000);
   const stateDir = path.join(temp, 'state');
   const configPath = path.join(temp, 'config');
+  const servicePath = path.join(temp, 'slow-service');
+  fs.writeFileSync(servicePath, '#!/bin/sh\nsleep 1\nexit 7\n', { mode: 0o700 });
   fs.writeFileSync(configPath,
     `MODE=apply\nPANEL_LISTEN=0.0.0.0:${port}\nSTATE_DIR=${stateDir}\nQUEUE_NUM=4321\nFUTURE_OPTION=preserve-me\n`);
   const child = spawn(exe, [
     'serve', '--config', configPath,
     '--live', '/tmp/d2k-panel-no-live-file',
     '--assets', '../internal/web/assets',
+    '--service', servicePath,
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
   let logs = '';
   child.stdout.on('data', (x) => { logs += x; });
@@ -86,6 +89,23 @@ async function main() {
     const page = await fetch(`http://127.0.0.1:${port}/`);
     assert.equal(page.status, 200);
     assert.match(await page.text(), /id="app"/);
+
+    const control = await fetch(`http://127.0.0.1:${port}/api/control/stop`, {
+      method: 'POST', headers: { Origin: `http://127.0.0.1:${port}` },
+      signal: AbortSignal.timeout(500),
+    });
+    assert.equal(control.status, 202, 'a slow service command must return promptly');
+    await control.text();
+    const during = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(500) });
+    assert.equal((await during.json()).snapshot.control_state, 'running');
+    let state;
+    for (let i = 0; i < 60; i++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      const r = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(500) });
+      state = (await r.json()).snapshot.control_state;
+      if (state !== 'running') break;
+    }
+    assert.equal(state, 'failed', 'accepted must not be presented as a successful service operation');
   } finally {
     child.kill('SIGTERM');
     await Promise.race([

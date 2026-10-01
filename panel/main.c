@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -68,7 +69,7 @@ static int known_key(const char *key) {
     static const char *const keys[] = {
         "SCHEMA", "MODE", "PANEL_LISTEN", "STATE_DIR", "QUEUE_NUM",
         "CONTROL_SOCKET", "DECOY_SNI", "MARK", "PROBE_MARK", "FLOWS",
-        "STATS_SEC", "HEAL_EVERY", "LOGMAX", "LOGKEEP", "PORTS",
+        "STATS_SEC", "HEAL_EVERY", "LOGMAX", "LOGKEEP", "LOG_EVERY", "D2K_RUNTIME_DIR", "PORTS",
         "CONNBYTES", "VOICE_PORTS", "VOICE_CONNBYTES", "TG_ENABLED",
         "TG_RELAY_URL", "TG_RELAY_SECRET", "TG_IDENTITY", "TG_CA_BUNDLE",
         "TG_STATUS", "TG_PORT", "TG_ENROLL_PORT"
@@ -302,16 +303,24 @@ static int serve(const char *listen_addr, const char *live_path, const char *ass
         /* The operator explicitly selected this panel bind address. Allow
          * same-origin controls there; server.c rejects cross-origin actions. */
         .control_enabled = 1,
+        .listener_fd = listener,
     };
     printf("d2kpanel %s\nhttp://%s/\n", D2K_PANEL_VERSION, listen_addr);
     fflush(stdout);
 
     while (!stop_requested) {
+        d2k_panel_control_tick();
+        struct pollfd ready = { .fd = listener, .events = POLLIN };
+        int pr = poll(&ready, 1, 1000);
+        if (pr == 0 || (pr < 0 && errno == EINTR)) continue;
+        if (pr < 0) { say("poll: %s", strerror(errno)); break; }
         int client = accept(listener, NULL, NULL);
         if (client < 0) {
             if (errno == EINTR) { continue; }
             if (stop_requested) { break; }
             say("accept: %s", strerror(errno));
+            struct timespec pause = { .tv_nsec = 100000000 };
+            (void)nanosleep(&pause, NULL);
             continue;
         }
         struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };

@@ -40,6 +40,9 @@ fi
 if [ -f "$DIR/run/d2k-http.pid" ]; then
     start-stop-daemon -K -q -p "$DIR/run/d2k-http.pid" 2>/dev/null || true
 fi
+if [ -f "$DIR/run/d2k-log-maintenance.pid" ]; then
+    start-stop-daemon -K -q -p "$DIR/run/d2k-log-maintenance.pid" 2>/dev/null || true
+fi
 [ ! -x "$DIR/d2k-tg-firewall.sh" ] || "$DIR/d2k-tg-firewall.sh" stop >/dev/null 2>&1 || true
 if command -v ipset >/dev/null 2>&1; then
     ipset destroy d2k_tg_dc 2>/dev/null || true
@@ -82,9 +85,50 @@ rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2kt
 # These were created during router development and are not user configuration.
 rm -f "$SBIN"/d2kc.before-d2k-* "$SBIN"/d2kc.pre-goal-* "$SBIN"/d2kc.pre-sched-*
 rm -f "$DIR/d2k-tg-firewall.sh" "$DIR/d2k-tg-watchdog.sh" "$DIR/d2k-instagram-dns.sh" \
-    "$DIR/d2k-instagram-dns-scheduler.sh" \
+    "$DIR/d2k-instagram-dns-scheduler.sh" "$DIR/d2k-log-maintenance.sh" \
     "$DIR/files/meta-ranges.txt" "$DIR/files/tg-roots.pem"
 rm -rf "$DIR/run" "$DIR/log" "$DIR/panel"
+
+cleanup_runtime() (
+    runtime=$1
+    # Only literal child paths in volatile runtime locations are eligible.
+    # Never source configuration or evaluate shell substitutions for cleanup.
+    case "$runtime" in
+        /tmp/?*) base=/tmp; relative=${runtime#/tmp/} ;;
+        /run/?*) base=/run; relative=${runtime#/run/} ;;
+        /var/run/?*) base=/var/run; relative=${runtime#/var/run/} ;;
+        *) return 0 ;;
+    esac
+    case "$runtime" in
+        *[!A-Za-z0-9_./-]*|*//*|*/../*|*/./*|*/..|*/.|*/) return 0 ;;
+    esac
+    # Do not follow a user-created symlink in any component below the anchor.
+    while [ -n "$relative" ]; do
+        component=${relative%%/*}
+        base=$base/$component
+        [ ! -L "$base" ] || return 0
+        case "$relative" in */*) relative=${relative#*/} ;; *) relative= ;; esac
+    done
+    [ -d "$runtime" ] || return 0
+    rm -f "$runtime/live.json"
+    # SIGKILL/power loss can leave an abandoned retained tail.
+    for stage in "$runtime"/log-tail.??????; do
+        [ -f "$stage" ] || [ -L "$stage" ] || continue
+        rm -f "$stage"
+    done
+    rmdir "$runtime" 2>/dev/null || true
+)
+
+custom_runtime=${D2K_RUNTIME_DIR:-}
+if [ -z "$custom_runtime" ] && [ -r "$DIR/config" ]; then
+    custom_runtime=$(sed -n 's/^[[:space:]]*D2K_RUNTIME_DIR=//p' "$DIR/config" | tail -n 1)
+    case "$custom_runtime" in
+        \"*\") custom_runtime=${custom_runtime#\"}; custom_runtime=${custom_runtime%\"} ;;
+        \'*\') custom_runtime=${custom_runtime#\'}; custom_runtime=${custom_runtime%\'} ;;
+    esac
+fi
+cleanup_runtime /tmp/d2k
+[ -z "$custom_runtime" ] || cleanup_runtime "$custom_runtime"
 
 if [ "$KEEP" = "1" ]; then
     say "сохраняю конфигурацию и каталог изученных коробок в $DIR"

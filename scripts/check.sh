@@ -67,6 +67,10 @@ echo "== скрипты =="
 find scripts spike -name '*.sh' -print0 | xargs -0 shellcheck -s sh
 sh scripts/test-instagram-dns.sh
 sh scripts/test-instagram-dns-scheduler.sh
+node scripts/test-runtime-files.cjs
+node scripts/test-log-maintenance.cjs
+node scripts/test-log-maintenance-process.cjs
+node scripts/test-runtime-install.cjs
 sh scripts/test-readme-commands.sh
 sh scripts/test-architecture.sh
 
@@ -79,6 +83,7 @@ sh scripts/test-architecture.sh
 shellcheck -s sh files/S99d2k
 shellcheck -s sh files/d2k-instagram-dns.sh
 shellcheck -s sh files/d2k-instagram-dns-scheduler.sh
+shellcheck -s sh files/d2k-log-maintenance.sh
 
 # Синтаксис files/S99d2k проверен строкой выше; ПОВЕДЕНИЕ его правил firewall
 # (что для UDP есть обе стороны, что на них --queue-bypass, что RETURN по

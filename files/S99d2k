@@ -56,6 +56,8 @@ PN_PID=$RUN/d2k-panel.pid
 HU_PID=$RUN/d2k-http.pid
 HL_PID=$RUN/d2k-heal.pid
 HEAL=$DIR/d2k-fw-heal.sh
+LM_PID=$RUN/d2k-log-maintenance.pid
+LOG_MAINTENANCE=$DIR/d2k-log-maintenance.sh
 SOCK=$RUN/d2kd.sock
 
 # Собственные цепочки, по одной на направление. Не одна на оба: правило,
@@ -110,6 +112,9 @@ STATS_SEC=60
 
 # shellcheck disable=SC1090  # путь к конфигурации задан выше и постоянен
 [ -r "$CONF" ] && . "$CONF"
+# Frequent live snapshots are volatile. The learned catalog stays on /opt.
+RUNTIME_DIR=${D2K_RUNTIME_DIR:-/tmp/d2k}
+LIVE=$RUNTIME_DIR/live.json
 # DNS and encrypted DNS are transport infrastructure, not strategy candidates.
 # Keep standard DNS/DoT/DoQ ports out of the packet classifier even when PORTS
 # is 0:65535; this does not alter resolver settings or DNS routing.
@@ -530,12 +535,29 @@ fastnat_restore() {
     rm -f "$FASTNAT_SAVED"
 }
 
+prepare_runtime() {
+    [ ! -L "$RUNTIME_DIR" ] || die "runtime directory must not be a symlink"
+    if ! (umask 077; mkdir -p "$RUNTIME_DIR") || ! chmod 0700 "$RUNTIME_DIR"; then
+        die "не создать приватный $RUNTIME_DIR"
+    fi
+}
+
+start_log_maintenance() {
+    mkdir -p "$RUN" "$LOG" || return 1
+    if [ -x "$LOG_MAINTENANCE" ] && ! running "$LM_PID"; then
+        start-stop-daemon -S -b -m -p "$LM_PID" -x "$LOG_MAINTENANCE" -- run \
+            || say "ротация журналов не запустилась"
+    fi
+}
+
 start_engine() {
     [ "$MODE" = "off" ] && { say "MODE=off — запуск запрещён"; return 1; }
     [ -x "$DPBIN" ] || die "нет $DPBIN"
     [ -x "$BIN" ] || die "нет $BIN"
 
     mkdir -p "$RUN" "$LOG" "$DIR/state" || die "не создать $RUN"
+    prepare_runtime
+    start_log_maintenance
 
     if running "$DP_PID"; then
         if running "$CT_PID" && fw_installed && \
@@ -600,7 +622,7 @@ start_engine() {
     # потоки потомка не наследует, и вывод уходил бы в никуда — проверено на
     # роутере, файл оставался нулевым при исправно работающем движке.
     start-stop-daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
-        --control "$SOCK" --catalog "$DIR/state/catalog.json" --mark "$PROBE_MARK" \
+        --control "$SOCK" --catalog "$DIR/state/catalog.json" --live "$LIVE" --mark "$PROBE_MARK" \
         --measure-mark "$MEASURE_MARK" \
         --log "$LOG/d2kc.log" || { engine_stop; die "контроллер не запустился"; }
     if ! running "$CT_PID"; then
@@ -608,31 +630,8 @@ start_engine() {
         die "контроллер завершился сразу после запуска"
     fi
 
-    # ЖУРНАЛ НЕ РАСТЁТ БЕЗ КОНЦА, и это про износ флешки, а не про место.
-    #
-    # Замерено на роутере 13.09.2026: датапат пишет блок счётчиков раз в
-    # минуту, около 30 строк — 2,5 КиБ в минуту, 3,6 МиБ в сутки, и так без
-    # остановки. Ротации не было вовсе: файл рос, пока хватало раздела.
-    #
-    # Потолок — четверо суток журнала, обрезка до двух: возвращаясь к сбою
-    # наутро или после выходных, человек обязан найти в файле то, что было
-    # ДО поломки, а не хвост после перезапуска. Числа из измеренной скорости,
-    # а не круглые сами по себе.
-    #
-    # Обрезка НА МЕСТЕ (`cat хвост > файл`), а не `mv`: движок держит файл
-    # открытым на дозапись, и подмена файла оставила бы его писать в
-    # отвязанный inode — журнал бы «замер» при живой службе.
-    LOGMAX=${LOGMAX:-14680064}
-    LOGKEEP=${LOGKEEP:-7340032}
     WATCHLOOP="while :; do
         \"$HEAL\" >/dev/null 2>&1
-        for f in \"$LOG/d2kd.log\" \"$LOG/d2kc.log\"; do
-            [ -f \"\$f\" ] || continue
-            [ \"\$(wc -c < \"\$f\")\" -gt $LOGMAX ] || continue
-            tail -c $LOGKEEP \"\$f\" > \"\$f.tail\" 2>/dev/null || continue
-            cat \"\$f.tail\" > \"\$f\"
-            rm -f \"\$f.tail\"
-        done
         sleep ${HEAL_EVERY:-60}
     done"
     # Сторож правил — отдельным процессом, и его отсутствие НЕ отменяет обход,
@@ -652,8 +651,10 @@ start_panel() {
     # Панель — отдельный процесс и не принадлежит жизненному циклу datapath:
     # команды engine-stop/engine-start оставляют её доступной для управления.
     if [ -x "$PANELBIN" ]; then
+        prepare_runtime
+        start_log_maintenance
         start-stop-daemon -S -b -m -p "$PN_PID" -x "$PANELBIN" -- serve \
-            --config "$CONF" --live "$STATE_DIR/live.json" --assets "$PANEL_ASSETS" \
+            --config "$CONF" --live "$LIVE" --assets "$PANEL_ASSETS" \
             --listen "$PANEL_LISTEN" --state-dir "$STATE_DIR" --mode "$MODE" \
             --queue "$QUEUE_NUM" --service /opt/etc/init.d/S99d2k \
             --engine-pid "$DP_PID" --controller-pid "$CT_PID" \
@@ -703,6 +704,7 @@ telegram_start() {
         return 1
     }
     mkdir -p "$RUN" "$LOG" "$(dirname "$TG_STATUS")" || return 1
+    start_log_maintenance
     if running "$TG_PID"; then
         [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" heal || true
         return 0
@@ -796,6 +798,8 @@ stop() {
     telegram_stop
     engine_stop
     stop_pidfile "$PN_PID"
+    stop_pidfile "$LM_PID"
+    rm -f "$LIVE"
     say "служба остановлена"
 }
 

@@ -1,0 +1,100 @@
+#!/usr/bin/env node
+// Full installer/uninstaller in a private filesystem with router boundaries
+// replaced by local commands. No /opt, firewall, or router state is touched.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const root = path.resolve(__dirname, '..');
+const tmp = fs.mkdtempSync('/tmp/runtime-install-test.');
+function fixture(name, contents, mode = 0o755) {
+  const target = path.join(tmp, 'source', name);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, contents, { mode });
+}
+try {
+  fs.mkdirSync(path.join(tmp, 'bin'));
+  for (const command of ['curl', 'ip', 'ipset', 'openssl']) {
+    fs.writeFileSync(path.join(tmp, 'bin', command), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  }
+  for (const command of ['iptables', 'ip6tables']) {
+    fs.writeFileSync(path.join(tmp, 'bin', command), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  }
+  fs.writeFileSync(path.join(tmp, 'bin/start-stop-daemon'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n', { mode: 0o755 });
+  fixture('scripts/architecture.sh', '#!/bin/sh\nprintf "amd64\\n"\n');
+  for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, '#!/bin/sh\nexit 0\n');
+  fixture('builds/d2kpanel-linux-amd64', '#!/bin/sh\necho features=telegram-control\n');
+  fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=per-install-enrollment,instagram-ip-probe\n');
+  fixture('builds/d2kd-linux-amd64', '#!/bin/sh\nexit 0\n');
+  for (const name of ['d2kc', 'd2khttp']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
+  fixture('files/S99d2k', '#!/bin/sh\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
+  fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
+  for (const name of ['d2k-fw-heal.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
+  fixture('files/d2k-log-maintenance.sh', fs.readFileSync(path.join(root, 'files/d2k-log-maintenance.sh')));
+  for (const name of ['meta-ranges.txt', 'tg-roots.pem', 'fake/stun.bin', 'fake/quic_initial_dbankcloud_ru.bin']) fixture(`files/${name}`, 'fixture\n');
+  for (const name of ['index.html', 'panel.css', 'panel.js', 'logo-d2k.png', 'mascot-d2k.png']) fixture(`internal/web/assets/${name}`, 'fixture\n');
+  fs.mkdirSync(path.join(tmp, 'proc/net/netfilter'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'proc/net/netfilter/nfnetlink_queue'), '');
+  fs.writeFileSync(path.join(tmp, 'proc/net/ip_tables_targets'), 'NFQUEUE\n');
+  fs.writeFileSync(path.join(tmp, 'proc/net/ip_tables_matches'), 'connbytes\n');
+  fs.mkdirSync(path.join(tmp, 'opt/etc/ndm/netfilter.d'), { recursive: true });
+  const runtime = path.join(tmp, 'runtime');
+  for (const name of ['install', 'uninstall']) {
+    const script = fs.readFileSync(path.join(root, `scripts/${name}.sh`), 'utf8')
+      .replaceAll('/opt', path.join(tmp, 'opt'))
+      .replaceAll('/proc', path.join(tmp, 'proc'))
+      .replaceAll('/tmp/d2k', runtime);
+    fs.writeFileSync(path.join(tmp, `${name}.sh`), script);
+  }
+  const env = { ...process.env, PATH: `${tmp}/bin:${process.env.PATH}`, D2K_LOCAL: `${tmp}/source`, CALLS: `${tmp}/calls`, D2K_KEEP_STATE: '1' };
+  function run(name, extraEnv = {}) {
+    const result = spawnSync('/bin/sh', [path.join(tmp, `${name}.sh`)], { env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 10000 });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  }
+  run('install');
+  const installed = path.join(tmp, 'opt/d2k/d2k-log-maintenance.sh');
+  assert.deepEqual(fs.readFileSync(installed), fs.readFileSync(path.join(root, 'files/d2k-log-maintenance.sh')), 'installer must fetch and install helper');
+  assert(fs.statSync(installed).mode & 0o111, 'installed helper must be executable');
+  const state = path.join(tmp, 'opt/d2k/state/catalog.json'); fs.writeFileSync(state, '{"learned":true}');
+  fs.writeFileSync(path.join(tmp, 'opt/d2k/run/d2k-log-maintenance.pid'), '123');
+  // Init may already be missing: uninstall still stops its owned helper.
+  fs.unlinkSync(path.join(tmp, 'opt/etc/init.d/S99d2k'));
+  fs.mkdirSync(runtime); fs.writeFileSync(path.join(runtime, 'live.json'), '{}');
+  fs.writeFileSync(path.join(runtime, 'log-tail.ABCDEF'), 'stale');
+  fs.writeFileSync(path.join(runtime, 'unrelated'), 'keep');
+  const customRuntime = path.join(tmp, 'custom-runtime');
+  fs.mkdirSync(customRuntime);
+  fs.writeFileSync(path.join(customRuntime, 'live.json'), '{}');
+  fs.writeFileSync(path.join(customRuntime, 'log-tail.QRSTUV'), 'stale');
+  fs.writeFileSync(path.join(customRuntime, 'unrelated'), 'keep');
+  fs.appendFileSync(path.join(tmp, 'opt/d2k/config'), `D2K_RUNTIME_DIR='${customRuntime}'\n`);
+  run('uninstall');
+  assert(!fs.existsSync(installed), 'uninstall must remove helper even when persistent state is kept');
+  assert(!fs.existsSync(path.join(runtime, 'live.json')), 'uninstall must remove volatile live snapshot');
+  assert(!fs.existsSync(path.join(runtime, 'log-tail.ABCDEF')), 'uninstall must remove owned abandoned stage');
+  assert.equal(fs.readFileSync(path.join(runtime, 'unrelated'), 'utf8'), 'keep');
+  assert(!fs.existsSync(path.join(customRuntime, 'live.json')), 'missing-init uninstall must remove configured custom snapshot');
+  assert(!fs.existsSync(path.join(customRuntime, 'log-tail.QRSTUV')), 'missing-init uninstall must remove custom abandoned stage');
+  assert.equal(fs.readFileSync(path.join(customRuntime, 'unrelated'), 'utf8'), 'keep');
+  assert.equal(fs.readFileSync(state, 'utf8'), '{"learned":true}', 'keep-state must preserve catalog');
+  assert(fs.readFileSync(path.join(tmp, 'calls'), 'utf8').includes('d2k-log-maintenance.pid'), 'uninstall fallback must stop owned helper');
+
+  const config = path.join(tmp, 'opt/d2k/config');
+  const protectedRuntime = path.join(tmp, 'protected-runtime'); fs.mkdirSync(protectedRuntime);
+  fs.writeFileSync(path.join(protectedRuntime, 'live.json'), 'keep');
+  const linkedRuntime = path.join(tmp, 'linked-runtime'); fs.symlinkSync(protectedRuntime, linkedRuntime);
+  fs.mkdirSync(path.join(protectedRuntime, 'child'));
+  for (const value of [linkedRuntime, `${protectedRuntime}/child/..`, `/tmp`, `$(touch ${tmp}/executed)`]) {
+    fs.appendFileSync(config, `D2K_RUNTIME_DIR=${value}\n`);
+    run('uninstall');
+    assert.equal(fs.readFileSync(path.join(protectedRuntime, 'live.json'), 'utf8'), 'keep', 'unsafe custom runtime must be preserved');
+    assert(!fs.existsSync(path.join(tmp, 'executed')), 'runtime cleanup must never evaluate configuration');
+  }
+  const envRuntime = path.join(tmp, 'env-runtime'); fs.mkdirSync(envRuntime);
+  fs.writeFileSync(path.join(envRuntime, 'live.json'), '{}');
+  run('uninstall', { D2K_RUNTIME_DIR: envRuntime });
+  assert(!fs.existsSync(envRuntime), 'explicit valid environment runtime must be cleaned and removed when empty');
+  console.log('local installer/helper and keep-state uninstall: PASS');
+} finally {
+  fs.rmSync(tmp, { recursive: true, force: true });
+}

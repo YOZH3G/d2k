@@ -5,6 +5,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -78,7 +79,70 @@ static void test_connect_limit_and_session_loss(void) {
     tg_stream_table_destroy(&table);
 }
 
+static void test_partial_head_retains_memory_budget(void) {
+    tg_stream_table table; tg_stream_table_init(&table,2,16u*1024u*1024u,0);
+    size_t table_storage=table.memory_bytes;
+    tg_stream *first=tg_stream_open(&table),*second=tg_stream_open(&table);
+    assert(first && second);
+    size_t stream_storage=table.memory_bytes;
+    size_t len=8u*1024u*1024u;
+    uint8_t *data=malloc(len),*out=malloc(len);assert(data && out);memset(data,7,len);
+    assert(tg_stream_queue_remote_data(first,data,len)==0);
+    size_t queued_storage=table.memory_bytes;
+    size_t written=0;
+    assert(tg_stream_pop_local(first,out,len-1,&written)==0 && written==len-1);
+    assert(memcmp(out,data,len-1)==0 && table.queued_bytes==1);
+    assert(table.memory_bytes==queued_storage);
+    assert(tg_stream_queue_remote_data(second,data,len)!=0);
+    assert(table.memory_bytes==queued_storage && second->recv_unacked==0);
+    assert(tg_stream_pop_local(first,out,1,&written)==0 && written==1 && out[0]==7);
+    assert(table.memory_bytes==stream_storage && table.queued_bytes==0);
+    assert(tg_stream_queue_remote_data(second,data,len)==0);
+    tg_stream_remove(&table,second);
+    assert(table.memory_bytes==table_storage+sizeof(*first) && table.queued_bytes==0);
+    assert(tg_stream_queue_remote_data(first,data,len)==0);
+    tg_stream_table_session_lost(&table);
+    assert(table.memory_bytes==table_storage && table.queued_bytes==0);
+    first=tg_stream_open(&table);assert(first);
+    assert(tg_stream_queue_remote_data(first,data,len)==0);
+    tg_stream_table_destroy(&table);free(data);free(out);
+}
+
+static void test_tiny_messages_charge_queue_nodes(void) {
+    tg_stream_table table; tg_stream_table_init(&table,1,16u*1024u*1024u,0);
+    tg_stream *s=tg_stream_open(&table);assert(s);
+    const uint8_t byte=42;size_t accepted=0;
+    while(accepted<1100000 && tg_stream_queue_remote_data(s,&byte,1)==0){
+        accepted++;assert(table.memory_bytes<=table.memory_cap);
+    }
+    assert(accepted>0 && accepted<1100000);
+    uint8_t out=0;size_t written=0;
+    assert(tg_stream_pop_local(s,&out,1,&written)==0 && written==1 && out==byte);
+    assert(tg_stream_queue_remote_data(s,&byte,1)==0);
+    size_t memory=table.memory_bytes;
+    assert(tg_stream_queue_remote_data(s,NULL,0)==0 && table.memory_bytes==memory);
+    assert(tg_stream_queue_remote_data(s,&byte,SIZE_MAX)!=0 && table.memory_bytes==memory);
+    tg_stream_table_destroy(&table);
+}
+
+static void test_idle_stream_storage_is_bounded(void) {
+    tg_stream_table table; tg_stream_table_init(&table,TG_STREAM_MAX,16u*1024u*1024u,0);
+    size_t accepted=0;tg_stream *first=NULL,*s;
+    while((s=tg_stream_open(&table))!=NULL){
+        if(!first)first=s;accepted++;assert(table.memory_bytes<=table.memory_cap);
+    }
+    assert(accepted>0 && accepted<TG_STREAM_MAX);
+    tg_stream_remove(&table,first);
+    assert(tg_stream_open(&table)!=NULL);
+    tg_stream_table_session_lost(&table);
+    assert(tg_stream_table_count(&table)==0 && tg_stream_open(&table)!=NULL);
+    tg_stream_table_destroy(&table);
+}
+
 int main(void) {
+    test_idle_stream_storage_is_bounded();
+    test_tiny_messages_charge_queue_nodes();
+    test_partial_head_retains_memory_budget();
     test_original_dst_and_self_dial(); test_queue_bounds_isolation_and_close_order();
     test_connect_slots_credit_and_window(); test_connect_limit_and_session_loss();
     puts("stream tests: ok"); return 0;

@@ -369,9 +369,77 @@ static void test_websocket_upgrade_binary_and_ping(void) {
         assert(tg_ws_pump_process(&pump,pfd.revents,capture_message,&capture)==0);
     }
     assert(capture.received && capture.len==2 && memcmp(capture.data,"ok",2)==0);
+    assert(pump.tx_bytes==0 && pump.tx_memory_bytes==0 && pump.tx_head==NULL);
     tg_ws_pump_destroy(&pump);
     SSL_free(ssl); SSL_CTX_free(client_ctx); pthread_join(thread,NULL); close(args.listener);
     unlink(key_path); unlink(cert_path); rmdir(dir);
+}
+
+static void test_websocket_tiny_frames_charge_allocations(void) {
+    tg_ws_pump pump={0};size_t accepted=0;
+    while(accepted<150000 && tg_ws_pump_queue_binary(&pump,NULL,0)==0){
+        accepted++;assert(pump.tx_memory_bytes<=4u*1024u*1024u);
+    }
+    assert(accepted>0 && accepted<150000);
+    assert(pump.tx_bytes<4u*1024u*1024u);
+    size_t memory=pump.tx_memory_bytes;
+    assert(tg_ws_pump_queue_binary(&pump,NULL,0)!=0 && pump.tx_memory_bytes==memory);
+    tg_ws_pump_destroy(&pump);
+    assert(pump.tx_memory_bytes==0 && pump.tx_bytes==0);
+    assert(tg_ws_pump_queue_binary(&pump,(const uint8_t *)"x",1)==0);
+    tg_ws_pump_destroy(&pump);
+}
+
+static void test_websocket_partial_write_retains_memory_budget(void) {
+    int sockets[2];assert(socketpair(AF_UNIX,SOCK_STREAM,0,sockets)==0);
+    for(size_t i=0;i<2;i++){
+        int flags=fcntl(sockets[i],F_GETFL,0);assert(flags>=0);
+        assert(fcntl(sockets[i],F_SETFL,flags|O_NONBLOCK)==0);
+    }
+    int sendbuf=65536;assert(setsockopt(sockets[0],SOL_SOCKET,SO_SNDBUF,&sendbuf,sizeof(sendbuf))==0);
+    SSL_CTX *server_ctx=SSL_CTX_new(TLS_server_method()),*client_ctx=SSL_CTX_new(TLS_client_method());
+    EVP_PKEY *key=make_key();X509 *cert=make_cert(key);assert(server_ctx && client_ctx);
+    assert(SSL_CTX_use_certificate(server_ctx,cert)==1 && SSL_CTX_use_PrivateKey(server_ctx,key)==1);
+    X509_free(cert);EVP_PKEY_free(key);
+    SSL *client=SSL_new(client_ctx),*server=SSL_new(server_ctx);assert(client && server);
+    assert(SSL_set_fd(client,sockets[0])==1 && SSL_set_fd(server,sockets[1])==1);
+    SSL_set_connect_state(client);SSL_set_accept_state(server);
+    for(unsigned i=0;i<1000 && (!SSL_is_init_finished(client)||!SSL_is_init_finished(server));i++){
+        SSL *peers[]={client,server};
+        for(size_t j=0;j<2;j++)if(!SSL_is_init_finished(peers[j])){
+            int rc=SSL_do_handshake(peers[j]);
+            if(rc!=1){int error=SSL_get_error(peers[j],rc);assert(error==SSL_ERROR_WANT_READ||error==SSL_ERROR_WANT_WRITE);}
+        }
+    }
+    assert(SSL_is_init_finished(client) && SSL_is_init_finished(server));
+    SSL_set_mode(client,SSL_MODE_ENABLE_PARTIAL_WRITE);
+    tg_ws_pump pump;assert(tg_ws_pump_init(&pump,client)==0);
+    uint8_t *payload=malloc(TG_WS_MAX_MESSAGE);assert(payload);memset(payload,1,TG_WS_MAX_MESSAGE);
+    assert(tg_ws_pump_queue_binary(&pump,payload,TG_WS_MAX_MESSAGE)==0);
+    size_t queued=pump.tx_bytes,memory=pump.tx_memory_bytes;
+    assert(memory>queued && memory<=4u*1024u*1024u);
+    assert(tg_ws_pump_process(&pump,POLLOUT,NULL,NULL)==0);
+    assert(pump.tx_bytes>0 && pump.tx_bytes<queued);
+    assert(pump.tx_memory_bytes==memory);
+    assert(tg_ws_pump_queue_binary(&pump,payload,TG_WS_MAX_MESSAGE)!=0);
+    assert(pump.tx_memory_bytes==memory);
+    uint8_t *wire=malloc(queued);assert(wire);size_t received=0;
+    for(unsigned i=0;i<1000 && (pump.tx_bytes||received<queued);i++){
+        assert(tg_ws_pump_process(&pump,POLLOUT,NULL,NULL)==0);
+        while(received<queued){
+            size_t n=0;int rc=SSL_read_ex(server,wire+received,queued-received,&n);
+            if(rc!=1){int error=SSL_get_error(server,rc);assert(error==SSL_ERROR_WANT_READ||error==SSL_ERROR_WANT_WRITE);break;}
+            assert(n>0);received+=n;
+        }
+    }
+    assert(received==queued && pump.tx_bytes==0 && pump.tx_memory_bytes==0);
+    uint8_t length[10]={0x82,0xff,0,0,0,0,0,0x20,0,0};
+    assert(memcmp(wire,length,sizeof(length))==0);
+    for(size_t i=0;i<TG_WS_MAX_MESSAGE;i++)assert((uint8_t)(wire[14+i]^wire[10+(i&3)])==1);
+    assert(tg_ws_pump_queue_binary(&pump,payload,TG_WS_MAX_MESSAGE)==0);
+    tg_ws_pump_destroy(&pump);free(payload);free(wire);
+    SSL_free(client);SSL_free(server);SSL_CTX_free(client_ctx);SSL_CTX_free(server_ctx);
+    close(sockets[0]);close(sockets[1]);
 }
 
 static void test_register_post_and_conflict(void) {
@@ -445,6 +513,8 @@ static void test_tunnel_local_echo_through_fake_relay(void) {
 }
 
 int main(void) {
+    test_websocket_partial_write_retains_memory_budget();
+    test_websocket_tiny_frames_charge_allocations();
     test_sni_and_certificate_validation();
     test_shipped_relay_trust_bundle_loads();
     test_websocket_upgrade_binary_and_ping();

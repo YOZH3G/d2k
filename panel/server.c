@@ -19,6 +19,29 @@
 
 #define REQUEST_MAX (32u * 1024u)
 #define BODY_MAX (1024u * 1024u)
+#ifndef D2K_PANEL_ACTION_TIMEOUT_MS
+#define D2K_PANEL_ACTION_TIMEOUT_MS 60000
+#endif
+
+static pid_t action_pid;
+static const char *action_state = "idle";
+
+static long long monotonic_ms(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+void d2k_panel_control_tick(void) {
+    if (!action_pid) return;
+    int status;
+    pid_t r = waitpid(action_pid, &status, WNOHANG);
+    if (r == 0 || (r < 0 && errno == EINTR)) return;
+    action_pid = 0;
+    action_state = r < 0 || !WIFEXITED(status) ? "failed" :
+        WEXITSTATUS(status) == 124 ? "timeout" :
+        WEXITSTATUS(status) == 0 ? "done" : "failed";
+}
 
 int d2k_panel_ignore_sigpipe(void) {
     struct sigaction action;
@@ -268,20 +291,51 @@ static int same_origin(const char *req) {
            memcmp(host, authority, host_len) == 0;
 }
 
-static int run_service_action(const d2k_panel_config *cfg, const char *action) {
+static int run_service_action(const d2k_panel_config *cfg, const char *action, int client) {
     if (!cfg || !cfg->service_path || !cfg->service_path[0]) { return -1; }
+    d2k_panel_control_tick();
+    if (action_pid) return 1;
     pid_t pid = fork();
     if (pid < 0) { return -1; }
     if (pid == 0) {
-        execl(cfg->service_path, cfg->service_path, action, (char *)NULL);
-        _exit(127);
+        close(client);
+        if (cfg->listener_fd > 2) close(cfg->listener_fd);
+        signal(SIGTERM, SIG_DFL); signal(SIGINT, SIG_DFL);
+        pid_t worker = fork();
+        if (worker < 0) _exit(125);
+        if (worker == 0) {
+            if (setpgid(0, 0) != 0) _exit(125);
+            execl(cfg->service_path, cfg->service_path, action, (char *)NULL);
+            _exit(127);
+        }
+        (void)setpgid(worker, worker);
+        long long deadline = monotonic_ms() + D2K_PANEL_ACTION_TIMEOUT_MS;
+        int status = 0, timed_out = 0;
+        for (;;) {
+            pid_t r = waitpid(worker, &status, WNOHANG);
+            if (r == worker) {
+                if (timed_out) { (void)kill(-worker, SIGKILL); _exit(124); }
+                _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 125);
+            }
+            if (r < 0 && errno != EINTR) _exit(125);
+            if (monotonic_ms() >= deadline) {
+                if (!timed_out) {
+                    timed_out = 1;
+                    (void)kill(-worker, SIGTERM);
+                    deadline = monotonic_ms() + 1000;
+                } else {
+                    (void)kill(-worker, SIGKILL);
+                    while (waitpid(worker, &status, 0) < 0 && errno == EINTR) {}
+                    _exit(124);
+                }
+            }
+            struct timespec pause = { .tv_nsec = 20000000 };
+            (void)nanosleep(&pause, NULL);
+        }
     }
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) { continue; }
-        return -1;
-    }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    action_pid = pid;
+    action_state = "running";
+    return 0;
 }
 
 static void telegram_config_flags(const d2k_panel_config *cfg,int *enabled,int *configured) {
@@ -385,15 +439,20 @@ static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
         return response(fd, 400, "Bad Request", "application/json; charset=utf-8",
                         body, sizeof body - 1);
     }
-    if (run_service_action(cfg, command) != 0) {
+    int started = run_service_action(cfg, command, fd);
+    if (started > 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Предыдущая команда ещё выполняется\"}";
+        return response(fd, 409, "Conflict", "application/json; charset=utf-8", body, sizeof body - 1);
+    }
+    if (started < 0) {
         static const char body[] = "{\"ok\":false,\"message\":\"Команда службы завершилась ошибкой\"}";
         return response(fd, 500, "Service Error", "application/json; charset=utf-8",
                         body, sizeof body - 1);
     }
     char body[256];
-    int n = snprintf(body, sizeof body, "{\"ok\":true,\"action\":\"%s\",\"message\":\"Готово\"}", label);
+    int n = snprintf(body, sizeof body, "{\"ok\":true,\"action\":\"%s\",\"message\":\"Команда запущена\"}", label);
     if (n < 0 || (size_t)n >= sizeof body) { return -1; }
-    return response(fd, 200, "OK", "application/json; charset=utf-8", body, (size_t)n);
+    return response(fd, 202, "Accepted", "application/json; charset=utf-8", body, (size_t)n);
 }
 
 static int read_request(int fd, char *buf, size_t cap, size_t *used) {
@@ -549,6 +608,8 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     buf_json_string(b, mode);
     buf_puts(b, ",\"panel_listen\":"); buf_json_string(b, panel_listen);
     buf_printf(b, ",\"controls_enabled\":%s", cfg && cfg->control_enabled ? "true" : "false");
+    d2k_panel_control_tick();
+    buf_puts(b, ",\"control_state\":"); buf_json_string(b, action_state);
     buf_printf(b, ",\"catalog_available\":%s", have_catalog ? "true" : "false");
     buf_printf(b, ",\"live_fresh\":%s", live_fresh ? "true" : "false");
     buf_printf(b, ",\"engine_running\":%s", engine_running ? "true" : "false");

@@ -10,13 +10,17 @@
 #define TG_STREAM_CONNECT_LIMITED (-3)
 #define TG_STREAM_MAX 1024
 #define TG_STREAM_IDLE_TIMEOUT_MS (15u*60u*1000u)
+#define TG_STREAM_MEMORY_LIMIT (16u*1024u*1024u)
 
 typedef struct tg_queue_node tg_queue_node;
-typedef struct { tg_queue_node *head,*tail; size_t bytes,cap; int closed,finished; } tg_byte_queue;
+typedef struct { tg_queue_node *head,*tail; size_t bytes,cap,memory_bytes; int closed,finished; } tg_byte_queue;
 typedef struct tg_stream tg_stream;
 typedef struct {
     tg_stream **items; size_t count,capacity,queue_cap,queued_bytes; uint32_t window;
     uint16_t next_id; size_t connecting;
+    /* Requested storage, including the table, items, streams and queue nodes.
+     * Separate from remaining payload; allocator metadata is not included. */
+    size_t memory_bytes,memory_cap;
 } tg_stream_table;
 
 struct tg_stream {

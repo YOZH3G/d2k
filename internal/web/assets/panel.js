@@ -4,6 +4,21 @@
   var currentFilter = "";
   var controlMessage = "";
   var controlInFlight = false;
+  var refreshInFlight = false;
+  var refreshTimer = null;
+  var refreshAbort = null;
+
+  async function requestJSON(url, options, timeout) {
+    var controller = new root.AbortController();
+    var timer = root.setTimeout(function () { controller.abort(); }, timeout);
+    options.signal = controller.signal;
+    try {
+      var response = await root.fetch(url, options);
+      var payload = await response.json();
+      if (!response.ok) throw new Error(payload.message || ("HTTP " + response.status));
+      return payload;
+    } finally { root.clearTimeout(timer); }
+  }
 
   function node(doc, tag, text, className) {
     var out = doc.createElement(tag);
@@ -111,6 +126,12 @@
       });
     }
     var snapshot = payload && payload.snapshot ? payload.snapshot : {};
+    var serverControlBusy = snapshot.control_state === "running";
+    if (snapshot.control_state && snapshot.control_state !== "idle") {
+      controlMessage = ({ running: "Выполняется команда службы…", done: "Команда выполнена.",
+        failed: "Команда завершилась ошибкой. Проверьте журнал панели.",
+        timeout: "Команда не завершилась вовремя и остановлена. Проверьте состояние служб." })[snapshot.control_state] || controlMessage;
+    }
     var knowledge = payload && payload.knowledge ? payload.knowledge : {};
     var linked = !!knowledge.linked && snapshot.live_fresh !== false &&
       snapshot.engine_running !== false && snapshot.controller_running !== false;
@@ -127,7 +148,6 @@
     var groups = Array.isArray(knowledge.groups) ? knowledge.groups.filter(function (g) {
       return g && typeof g.suffix === "string" && g.suffix;
     }) : [];
-    var familyEvidence = Object.create(null);
     rootNode.replaceChildren();
 
     var title = append(rootNode, node(doc, "header", undefined, "page-heading"));
@@ -197,10 +217,6 @@
       var familyList = append(families, node(doc, "div", undefined, "family-list"));
       groups.forEach(function (group) {
         renderFamily(doc, familyList, group, linked);
-        (Array.isArray(group.evidence) ? group.evidence : []).forEach(function (name) {
-          familyEvidence[bindingFamilyKey({ target: name, transport: group.transport,
-            family: group.family, shape: group.shape, plan_id: group.plan_id })] = true;
-        });
       });
     }
     var boxSection = section(doc, rootNode, "boxes", "Изученные коробки",
@@ -224,7 +240,7 @@
         snapshot.catalog_available === false ? "empty-state empty-warning" : "empty-state"));
     } else {
       var boxList = append(boxSection, node(doc, "div", undefined, "box-list"));
-      boxes.forEach(function (box, index) { renderBox(doc, boxList, box, index, familyEvidence); });
+      boxes.forEach(function (box, index) { renderBox(doc, boxList, box, index, groups); });
       filterBoxes(rootNode, currentFilter);
       if (rootNode.addEventListener && !rootNode.__d2kFilterBound) {
         rootNode.__d2kFilterBound = true;
@@ -320,7 +336,7 @@
       snapshot.telegram_enabled ? "Выключить" : "Включить", "control-button " + (snapshot.telegram_enabled ? "button-danger" : "button-primary")));
     tgButton.setAttribute("type", "button");
     tgButton.setAttribute("data-control", tgAction);
-    tgButton.disabled = !snapshot.controls_enabled || !snapshot.telegram_configured || controlInFlight;
+    tgButton.disabled = !snapshot.controls_enabled || !snapshot.telegram_configured || controlInFlight || serverControlBusy;
     append(controls, node(doc, "p", snapshot.controls_enabled
       ? (snapshot.mode === "off"
         ? "Подбор выключен в настройках. Включите его там, чтобы D2K снова искал обходы."
@@ -336,7 +352,7 @@
       var button = append(controlButtons, node(doc, "button", item[1], "control-button " + item[2]));
       button.setAttribute("type", "button");
       button.setAttribute("data-control", item[0]);
-      button.disabled = !snapshot.controls_enabled || controlInFlight ||
+      button.disabled = !snapshot.controls_enabled || controlInFlight || serverControlBusy ||
         ((item[0] === "start" || item[0] === "restart") && snapshot.mode === "off");
     });
     var result = append(controls, node(doc, "p", controlMessage, "control-result"));
@@ -405,9 +421,20 @@
     if (search.candidate) append(detail, node(doc, "p", "Текущий вариант: " + search.candidate));
   }
 
-  function bindingFamilyKey(binding) {
-    return JSON.stringify([String(binding.target || "").toLowerCase(),
-      binding.transport || 6, binding.family || 4, binding.shape || 0, binding.plan_id || ""]);
+  function coveredByFamily(binding, groups) {
+    if (binding.kind && binding.kind !== "name") return false;
+    var name = String(binding.target || "").toLowerCase().replace(/\.$/, "");
+    return groups.some(function (group) {
+      var suffix = group.suffix.toLowerCase().replace(/\.$/, "");
+      if (!group.active || (binding.transport || 6) !== group.transport ||
+          (binding.family || 4) !== group.family || (binding.shape || 0) !== group.shape ||
+          (binding.probe_path || "/") !== (group.probe_path || "/") ||
+          (binding.ech_origin || "") !== (group.ech_origin || "")) return false;
+      if (name !== suffix && !name.endsWith("." + suffix)) return false;
+      return !(Array.isArray(group.exceptions) ? group.exceptions : []).some(function (exception) {
+        return exception && String(exception.name || "").toLowerCase().replace(/\.$/, "") === name;
+      });
+    });
   }
 
   function renderFamily(doc, parent, group, linked) {
@@ -442,7 +469,7 @@
     }
   }
 
-  function renderBox(doc, parent, box, index, familyEvidence) {
+  function renderBox(doc, parent, box, index, groups) {
     var article = append(parent, node(doc, "article", undefined, "box-item"));
     var head = append(article, node(doc, "header", undefined, "box-header"));
     var identity = append(head, node(doc, "div"));
@@ -470,7 +497,7 @@
     var targets = append(article, node(doc, "div", undefined, "target-list"));
     heading(doc, targets, 4, "Адреса и обходы");
     (Array.isArray(box.bindings) ? box.bindings : []).filter(function (binding) {
-      return !familyEvidence || !familyEvidence[bindingFamilyKey(binding)];
+      return !coveredByFamily(binding, groups);
     }).forEach(function (binding) {
       var row = append(targets, node(doc, "div", undefined, "target-row" + (binding.enabled ? "" : " target-disabled")));
       var target = append(row, node(doc, "div", undefined, "target-identity"));
@@ -543,14 +570,14 @@
     controlMessage = "Выполняется команда службы…";
     if (result) result.textContent = controlMessage;
     try {
-      var response = await root.fetch("/api/control/" + encodeURIComponent(action), {
+      var payload = await requestJSON("/api/control/" + encodeURIComponent(action), {
         method: "POST", cache: "no-store",
-      });
-      var payload = await response.json();
-      if (!response.ok || !payload.ok) throw new Error(payload.message || ("HTTP " + response.status));
+      }, 10000);
+      if (!payload.ok) throw new Error(payload.message || "Ошибка команды");
       controlMessage = payload.message || "Команда выполнена.";
     } catch (err) {
-      controlMessage = "Не выполнено: " + (err && err.message ? err.message : "ошибка связи с панелью");
+      controlMessage = "Не удалось получить результат команды. Проверьте состояние службы: " +
+        (err && err.message ? err.message : "ошибка связи с панелью");
     } finally {
       controlInFlight = false;
       await refresh();
@@ -559,12 +586,18 @@
   }
 
   async function refresh() {
+    if (refreshInFlight || root.document.hidden) return;
+    root.clearTimeout(refreshTimer);
+    refreshInFlight = true;
+    refreshAbort = new root.AbortController();
+    var deadline = root.setTimeout(function () { refreshAbort.abort(); }, 10000);
     var app = root.document.getElementById("app");
     try {
-      var response = await root.fetch("/api/status", { cache: "no-store" });
+      var response = await root.fetch("/api/status", { cache: "no-store", signal: refreshAbort.signal });
       if (!response.ok) throw new Error("HTTP " + response.status);
       render(app, await response.json(), root.document);
     } catch (err) {
+      if (root.document.hidden) return;
       app.replaceChildren();
       var warning = node(root.document, "section", undefined, "connection-error");
       append(warning, node(root.document, "span", "×", "error-mark"));
@@ -582,6 +615,11 @@
       var updated = root.document.getElementById("rail-updated");
       if (rail) rail.textContent = "Нет связи с панелью";
       if (updated) updated.textContent = "состояние неизвестно";
+    } finally {
+      root.clearTimeout(deadline);
+      refreshAbort = null;
+      refreshInFlight = false;
+      if (!root.document.hidden) refreshTimer = root.setTimeout(refresh, 5000);
     }
   }
 
@@ -590,7 +628,11 @@
   if (root.document) {
     root.document.addEventListener("DOMContentLoaded", function () {
       refresh();
-      root.setInterval(refresh, 5000);
+    });
+    root.document.addEventListener("visibilitychange", function () {
+      root.clearTimeout(refreshTimer);
+      if (root.document.hidden) { if (refreshAbort) refreshAbort.abort(); }
+      else refresh();
     });
     root.addEventListener("hashchange", function () {
       var current = root.location.hash || "#overview";

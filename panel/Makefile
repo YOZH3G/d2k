@@ -27,17 +27,18 @@ release: main.c server.h server.c
 		-DD2K_PANEL_DIRTY=$(DIRTY) -o $(BUILDDIR)/d2kpanel-linux-$(ARCH) main.c server.c
 
 test_server: test_server.c server.h server.c
-	$(CC) $(CFLAGS) -pthread -o $@ test_server.c server.c
+	$(CC) $(CFLAGS) -DD2K_PANEL_ACTION_TIMEOUT_MS=1000 -pthread -o $@ test_server.c server.c
 
 test_server_san: test_server.c server.h server.c
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-		-pthread -o $@ test_server.c server.c
+		-DD2K_PANEL_ACTION_TIMEOUT_MS=1000 -pthread -o $@ test_server.c server.c
 
 san: test_server_san
 	ASAN_OPTIONS=detect_leaks=0 ./test_server_san
 
 test-js:
 	node test_ui.cjs
+	node test_poll.cjs
 
 test-cli: d2kpanel
 	node test_cli.cjs

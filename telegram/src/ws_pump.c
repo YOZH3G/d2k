@@ -10,8 +10,9 @@
 #define TG_WS_PUMP_TX_LIMIT (4u*1024u*1024u)
 struct tg_ws_tx_frame { struct tg_ws_tx_frame *next; uint8_t *bytes; size_t len,offset,allocated; };
 
-static void release_frames(tg_ws_tx_frame *frame) {
-    while(frame){tg_ws_tx_frame *next=frame->next;OPENSSL_clear_free(frame->bytes,frame->allocated);free(frame);frame=next;}
+static void release_frames(tg_ws_pump *p,tg_ws_tx_frame *frame) {
+    while(frame){tg_ws_tx_frame *next=frame->next;p->tx_memory_bytes-=frame->allocated+sizeof(*frame);
+        OPENSSL_clear_free(frame->bytes,frame->allocated);free(frame);frame=next;}
 }
 
 int tg_ws_pump_init(tg_ws_pump *p,SSL *ssl) {
@@ -25,18 +26,20 @@ int tg_ws_pump_init(tg_ws_pump *p,SSL *ssl) {
 }
 
 void tg_ws_pump_destroy(tg_ws_pump *p) {
-    if(!p)return;release_frames(p->tx_head);free(p->rx);memset(p,0,sizeof(*p));p->fd=-1;
+    if(!p)return;release_frames(p,p->tx_head);free(p->rx);memset(p,0,sizeof(*p));p->fd=-1;
 }
 
 static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,size_t len) {
     if(!p||p->failed||p->closed||(!data&&len)||len>TG_WS_MAX_MESSAGE)return -1;
     size_t alloc=len+14,written=0;
-    if(alloc>TG_WS_PUMP_TX_LIMIT-p->tx_bytes)return -1;
+    if(p->tx_memory_bytes>TG_WS_PUMP_TX_LIMIT||
+       alloc+sizeof(tg_ws_tx_frame)>TG_WS_PUMP_TX_LIMIT-p->tx_memory_bytes)return -1;
     tg_ws_tx_frame *f=calloc(1,sizeof(*f));if(!f)return -1;
     f->bytes=OPENSSL_malloc(alloc);if(!f->bytes){free(f);return -1;}
     if(tg_ws_encode_client_frame(f->bytes,alloc,opcode,data,len,&written)!=0){OPENSSL_clear_free(f->bytes,alloc);free(f);return -1;}
     f->len=written;f->allocated=alloc;
     if(p->tx_tail)p->tx_tail->next=f;else p->tx_head=f;p->tx_tail=f;p->tx_bytes+=written;
+    p->tx_memory_bytes+=alloc+sizeof(*f);
     return 0;
 }
 
@@ -87,7 +90,7 @@ static int flush_tx(tg_ws_pump *p) {
             p->failed=1;return -1;
         }
         if(!n){p->failed=1;return -1;}f->offset+=n;p->tx_bytes-=n;
-        if(f->offset==f->len){p->tx_head=f->next;if(!p->tx_head)p->tx_tail=NULL;f->next=NULL;release_frames(f);}
+        if(f->offset==f->len){p->tx_head=f->next;if(!p->tx_head)p->tx_tail=NULL;f->next=NULL;release_frames(p,f);}
     }
     return 0;
 }

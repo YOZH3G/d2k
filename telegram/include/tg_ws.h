@@ -25,7 +25,9 @@ int tg_ws_read_binary(SSL *ssl, uint8_t *dst, size_t cap, size_t *payload_len);
 
 typedef struct tg_ws_tx_frame tg_ws_tx_frame;
 typedef struct {
-    SSL *ssl; int fd; uint8_t *rx; size_t rx_len,rx_cap,tx_bytes;
+    /* tx_bytes is remaining wire data; tx_memory_bytes retains the full
+     * buffer and node charges until free, excluding allocator metadata. */
+    SSL *ssl; int fd; uint8_t *rx; size_t rx_len,rx_cap,tx_bytes,tx_memory_bytes;
     tg_ws_tx_frame *tx_head,*tx_tail; int failed,closed,read_wants_write,write_wants_read;
 } tg_ws_pump;
 typedef int (*tg_ws_message_cb)(void *ctx,const uint8_t *payload,size_t payload_len);

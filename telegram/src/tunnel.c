@@ -181,9 +181,9 @@ int tg_tunnel_run(const tg_tunnel_config *cfg) {
     tg_ws_pump pump;tg_stream_table streams;relay_ctx relay;
     if(!cfg||!cfg->relay_ssl||cfg->listener_fd<0||!cfg->stop)return -1;
     if(tg_ws_pump_init(&pump,cfg->relay_ssl)!=0)return -1;
-    /* The donor's v2 out-queue budget is 16 MiB across the relay session;
-     * enforce a shared cap so 1024 slow consumers cannot allocate GiBs. */
-    tg_stream_table_init(&streams,TG_STREAM_MAX,16u*1024u*1024u,cfg->window);
+    /* Keep the donor's 16 MiB payload cap and independently bound owned
+     * stream/table/queue storage, including each stream's local_pending. */
+    tg_stream_table_init(&streams,TG_STREAM_MAX,TG_STREAM_MEMORY_LIMIT,cfg->window);
     if(!streams.items){tg_ws_pump_destroy(&pump);return -1;}
     relay=(relay_ctx){.config=cfg,.streams=&streams,.pump=&pump};
     uint64_t last_rx=monotonic_ms(),last_ping=last_rx;

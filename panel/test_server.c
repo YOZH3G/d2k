@@ -211,6 +211,16 @@ static void test_unsupported_method_is_rejected(void) {
     assert(strstr(response, "HTTP/1.1 405 Method Not Allowed") != NULL);
 }
 
+static void wait_action_done(const d2k_panel_config *cfg) {
+    char result[8192];
+    for (int i=0; i<300; i++) {
+        request(cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n", result, sizeof result);
+        if (!strstr(result, "\"control_state\":\"running\"")) break;
+        struct timespec pause = { .tv_nsec=10000000 }; nanosleep(&pause, NULL);
+    }
+    assert(strstr(result, "\"control_state\":\"done\""));
+}
+
 static void test_panel_accepts_a_control_action_request(void) {
     char service[] = "/tmp/d2k-panel-service.XXXXXX";
     char marker[] = "/tmp/d2k-panel-action.XXXXXX";
@@ -237,7 +247,8 @@ static void test_panel_accepts_a_control_action_request(void) {
         "Origin: http://localhost:8090\r\n"
         "Content-Length: 0\r\n\r\n",
         response, sizeof response);
-    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "HTTP/1.1 202 Accepted") != NULL);
+    wait_action_done(&cfg);
     char action[64] = "";
     FILE *f = fopen(marker, "r");
     assert(f != NULL);
@@ -256,7 +267,8 @@ static void test_panel_accepts_a_control_action_request(void) {
             routes[i].path);
         assert(n > 0 && (size_t)n < sizeof req);
         (void)request(&cfg, req, response, sizeof response);
-        assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+        assert(strstr(response, "HTTP/1.1 202 Accepted") != NULL);
+        wait_action_done(&cfg);
         f = fopen(marker, "r");
         assert(f != NULL);
         strcpy(action, "");
@@ -276,7 +288,8 @@ static void test_panel_accepts_a_control_action_request(void) {
         "POST /api/control/telegram-enable HTTP/1.1\r\nHost: localhost:8090\r\n"
         "Origin: http://localhost:8090\r\nContent-Length: 0\r\n\r\n",
         response, sizeof response);
-    assert(strstr(response,"HTTP/1.1 200 OK")!=NULL);
+    assert(strstr(response,"HTTP/1.1 202 Accepted")!=NULL);
+    wait_action_done(&cfg);
     f=fopen(marker,"r");assert(f);strcpy(action,"");assert(fgets(action,sizeof action,f));fclose(f);
     assert(strcmp(action,"telegram-enable")==0);
     assert(strstr(response,"private")==NULL);unlink(tg_config);
@@ -286,7 +299,8 @@ static void test_panel_accepts_a_control_action_request(void) {
         "Origin: http://192.168.1.1:8090\r\n"
         "Content-Length: 0\r\n\r\n",
         response, sizeof response);
-    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "HTTP/1.1 202 Accepted") != NULL);
+    wait_action_done(&cfg);
     f = fopen(marker, "r");
     assert(f != NULL);
     strcpy(action, "");
@@ -338,6 +352,31 @@ static void test_panel_accepts_a_control_action_request(void) {
         response, sizeof response);
     assert(strstr(response, "HTTP/1.1 404 Not Found") != NULL);
     unlink(marker);
+    unlink(service);
+}
+
+static void test_slow_control_does_not_block_status(void) {
+    char service[] = "/tmp/d2k-panel-slow.XXXXXX";
+    write_temp_file(service, "#!/bin/sh\nsleep 2\n");
+    assert(chmod(service, 0700) == 0);
+    d2k_panel_config cfg = { .service_path = service, .control_enabled = 1 };
+    char result[8192];
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    request(&cfg, "POST /api/control/stop HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: 0\r\n\r\n", result, sizeof result);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    assert((b.tv_sec-a.tv_sec)*1000+(b.tv_nsec-a.tv_nsec)/1000000 < 500);
+    assert(strstr(result, "202 Accepted"));
+    request(&cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n", result, sizeof result);
+    assert(strstr(result, "\"control_state\":\"running\""));
+    request(&cfg, "POST /api/control/stop HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: 0\r\n\r\n", result, sizeof result);
+    assert(strstr(result, "409 Conflict"));
+    for (int i=0; i<300; i++) {
+        struct timespec pause = { .tv_nsec=10000000 }; nanosleep(&pause, NULL);
+        request(&cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n", result, sizeof result);
+        if (!strstr(result, "\"control_state\":\"running\"")) break;
+    }
+    assert(strstr(result, "\"control_state\":\"timeout\""));
     unlink(service);
 }
 
@@ -455,6 +494,7 @@ int main(void) {
     test_invalid_live_json_is_not_reported_as_empty_knowledge();
     test_telegram_status_is_dynamic_and_never_exposes_secret();
     test_unsupported_method_is_rejected();
+    test_slow_control_does_not_block_status();
     test_panel_accepts_a_control_action_request();
     test_unknown_and_traversal_paths_are_not_served();
     test_oversized_request_header_gets_431();

@@ -240,7 +240,43 @@ assert.match(families.textContent, /<img src=x onerror=alert\(1\)>/);
 assert.equal(families.walk().some(x => x.usedInnerHTML), false, 'group data is never HTML');
 assert.equal(families.walk().filter(x => x.attributes['data-control']).length, 5,
   'adding families preserves existing service actions');
+const coveredState = JSON.parse(JSON.stringify(familyState));
+const coveredGroup = coveredState.knowledge.groups[0];
+coveredGroup.exceptions.push({ name: 'excluded.googlevideo.com', reason: 'failed' });
+const baseBinding = { kind: 'name', transport: 6, family: 4, shape: 1, enabled: true };
+coveredState.knowledge.boxes[0].bindings = [
+  { ...baseBinding, target: 'rr1---sn-n8v7kne7.googlevideo.com' },
+  { ...baseBinding, target: 'nested.new.googlevideo.com' },
+  { ...baseBinding, target: 'excluded.googlevideo.com' },
+  { ...baseBinding, target: 'notgooglevideo.com' },
+  { ...baseBinding, target: 'googlevideo.com.evil.example' },
+  { ...baseBinding, target: 'v6.googlevideo.com', family: 6 },
+  { ...baseBinding, target: 'legacy.googlevideo.com', shape: 2 },
+  { ...baseBinding, target: 'quic.googlevideo.com', transport: 17, shape: 3 },
+];
+render(families, coveredState, document);
+assert.deepEqual(families.walk().filter(x => x.className === 'target-name').map(x => x.textContent),
+  ['excluded.googlevideo.com', 'notgooglevideo.com', 'googlevideo.com.evil.example',
+    'v6.googlevideo.com', 'legacy.googlevideo.com', 'quic.googlevideo.com'],
+  'covered non-evidence hosts disappear, exceptions and other protocol contexts remain');
+coveredGroup.active = false;
+render(families, coveredState, document);
+assert.equal(families.walk().filter(x => x.className === 'target-name').length, 8,
+  'inactive family must not hide individual hosts');
 render(families, { snapshot: {}, knowledge: { groups: { invalid: true }, boxes: [] } }, document);
 assert.equal(families.walk().filter(x => x.className === 'family-item').length, 0,
   'invalid/old group snapshots render safely');
 console.log('C panel DOM renderer: all checks passed');
+
+const busy = new Element('main');
+render(busy, {
+  snapshot: { controls_enabled: true, telegram_configured: true, control_state: 'running' },
+  knowledge: {},
+}, document);
+assert.ok(busy.walk().filter(x => x.attributes['data-control']).every(x => x.disabled),
+  'a running server-side command must remain locked after the POST has returned');
+assert.match(busy.textContent, /Выполняется команда/);
+render(busy, { snapshot: { controls_enabled: true, control_state: 'timeout' }, knowledge: {} }, document);
+assert.match(busy.textContent, /не завершилась вовремя/);
+assert.equal(busy.walk().find(x => x.attributes['data-control'] === 'stop').disabled, false,
+  'a timed-out command must release the controls');
