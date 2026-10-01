@@ -84,12 +84,6 @@ assert.match(root.textContent, /D2K на связи/,
   'the first screen must describe the connection in everyday language');
 assert.match(root.textContent, /Если что-то заблокировано, D2K подберёт обход/,
   'the first screen must explain what D2K does without protocol jargon');
-assert.equal(root.walk().some((node) => node.tagName === 'img' &&
-  node.className === 'mascot' && node.attributes.src === '/assets/mascot-d2k.png' && node.attributes.alt), true,
-  'the D2K mascot must be visibly included in the first screen');
-assert.match(fs.readFileSync(require.resolve('../internal/web/assets/index.html'), 'utf8'),
-  /<img[^>]+src="\/assets\/logo-d2k\.png"[^>]*>/,
-  'the D2K header must use the generated brand mark beside the live text wordmark');
 assert.equal(root.walk().some((node) => node.tagName === 'details' &&
   node.className === 'diagnostics' && !node.open), true,
   'technical diagnostics must be available but collapsed by default');
@@ -229,8 +223,8 @@ const familyState = {
     ] }], searches: [], targets: 2 },
 };
 render(families, familyState, document);
-assert.match(families.textContent, /Семейства доменов/);
-assert.match(families.textContent, /Новые поддомены сразу получают этот обход/);
+assert.match(families.textContent, /Сохранённые семейства/);
+assert.match(families.textContent, /Новые адреса используют найденное решение/);
 assert.match(families.textContent, /TLS 1\.3/);
 assert.equal(families.walk().filter(x => x.className === 'family-item').length, 1);
 assert.equal(families.walk().filter(x => x.className === 'target-name').length, 1,

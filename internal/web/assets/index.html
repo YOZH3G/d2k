@@ -4,8 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">
-<meta name="theme-color" content="#f3f5f2">
-<title>D2K — сетевой радар</title>
+<meta name="theme-color" content="#eab71f">
+<title>D2K — Слайдоскоп</title>
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <link rel="stylesheet" href="/assets/panel.css">
 <script src="/assets/panel.js" defer></script>
 </head>
@@ -13,27 +14,25 @@
 <div class="frame">
   <aside class="rail">
     <a class="brand" href="#overview" aria-label="D2K — на главную">
-      <img class="brand-mark" src="/assets/logo-d2k.png" alt="Знак D2K" width="48" height="48">
-      <span class="brand-name">D2K<span>Интернет под присмотром</span></span>
+      <svg class="brand-mark" aria-hidden="true" width="58" height="36" viewBox="0 0 58 36"><path fill="currentColor" d="M0 32 19 4h10L10 32zm19 0L38 4h10L29 32z"/><path fill="#82948c" d="m38 32 19-28h1v15l-9 13z"/></svg>
+      <span class="brand-name">D2K /<span>Слайдоскоп</span></span>
     </a>
-    <p class="rail-caption">Сетевой радар</p>
     <nav class="nav" aria-label="Разделы панели">
-      <a class="nav-link active" href="#overview"><span class="nav-glyph glyph-overview" aria-hidden="true"></span>Обзор</a>
-      <a class="nav-link" href="#searches"><span class="nav-glyph glyph-search" aria-hidden="true"></span>Подбор</a>
-      <a class="nav-link" href="#boxes"><span class="nav-glyph glyph-boxes" aria-hidden="true"></span>Результаты</a>
-      <a class="nav-link" href="#diagnostics"><span class="nav-glyph glyph-system" aria-hidden="true"></span>Диагностика</a>
-      <a class="nav-link" href="#controls"><span class="nav-glyph glyph-control" aria-hidden="true"></span>Управление</a>
+      <a class="nav-link active" href="#searches"><span>Подборы</span></a>
+      <a class="nav-link" href="#families"><span>Семейства</span></a>
+      <a class="nav-link" href="#boxes"><span>Результаты</span></a>
+      <a class="header-tool" href="#box-filter" aria-label="Поиск по результатам"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="m15 15 7 7"/></svg><span>Поиск</span></a>
+      <a class="header-tool" href="#diagnostics" aria-label="Диагностика и настройки"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 3 1-2h4l1 2 3 2 3 1v4l-2 2 2 2v4l-3 1-3 2-1 2h-4l-1-2-3-2-3-1v-4l2-2-2-2V6l3-1z"/><circle cx="12" cy="12" r="3"/></svg></a>
     </nav>
     <div class="rail-bottom">
       <span class="rail-dot" aria-hidden="true"></span>
       <span><b id="rail-state">Подключаемся</b><small id="rail-updated">к локальному движку</small></span>
     </div>
-    <span class="rail-version">D2K / Keenetic</span>
   </aside>
 
   <div class="workspace">
     <header class="topbar">
-      <span class="crumb">Локальная панель <i>/</i> <b>Состояние сети</b></span>
+      <span class="crumb">Keenetic <i>/</i> <b>Автоматический подбор обходов</b></span>
       <span class="live-indicator" id="live-indicator"><i></i><span>Получение данных</span></span>
     </header>
     <main id="app" class="content" aria-live="polite" aria-busy="true">

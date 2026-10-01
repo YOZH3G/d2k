@@ -98,6 +98,12 @@ make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
 cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/logo-d2k.png internal/web/assets/mascot-d2k.png "$REL/internal/web/assets/"
+cp internal/web/assets/favicon.svg "$REL/internal/web/assets/"
+mkdir -p "$REL/internal/web/assets/fonts"
+cp internal/web/assets/fonts/oswald.ttf internal/web/assets/fonts/OFL-oswald.txt "$REL/internal/web/assets/fonts/"
+cp internal/web/assets/slide-left.webp internal/web/assets/slide-center.webp internal/web/assets/slide-right.webp internal/web/assets/slide-holder.webp "$REL/internal/web/assets/"
+cp internal/web/assets/ground.webp "$REL/internal/web/assets/"
+cp internal/web/assets/rack.webp internal/web/assets/family-rack.webp "$REL/internal/web/assets/"
 cp files/S99d2k files/config files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
 cp files/d2k-tg-firewall.sh files/d2k-tg-watchdog.sh files/d2k-instagram-dns.sh \
     files/d2k-instagram-dns-scheduler.sh files/meta-ranges.txt files/tg-roots.pem "$REL/files/"

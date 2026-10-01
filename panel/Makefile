@@ -38,6 +38,7 @@ san: test_server_san
 
 test-js:
 	node test_ui.cjs
+	node test_slide_events.cjs
 	node test_poll.cjs
 
 test-cli: d2kpanel

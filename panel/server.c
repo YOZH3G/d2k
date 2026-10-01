@@ -246,7 +246,7 @@ static int response(int fd, int code, const char *reason, const char *type,
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
-        "Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self'; connect-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
+        "Content-Security-Policy: default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
         "X-Content-Type-Options: nosniff\r\n"
         "Referrer-Policy: no-referrer\r\n\r\n",
         code, reason, type, len);
@@ -775,11 +775,34 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     if (strcmp(path, "/") == 0) {
         return static_file(fd, cfg, "index.html", "text/html; charset=utf-8");
     }
+    if (strcmp(path, "/assets/favicon.svg") == 0) {
+        return static_file(fd, cfg, "favicon.svg", "image/svg+xml");
+    }
     if (strcmp(path, "/assets/panel.css") == 0) {
         return static_file(fd, cfg, "panel.css", "text/css; charset=utf-8");
     }
     if (strcmp(path, "/assets/panel.js") == 0) {
         return static_file(fd, cfg, "panel.js", "application/javascript; charset=utf-8");
+    }
+    if (strcmp(path, "/assets/oswald.ttf") == 0) {
+        return static_file(fd, cfg, "fonts/oswald.ttf", "font/ttf");
+    }
+    static const char *slide_layers[] = {
+        "slide-left.webp", "slide-center.webp", "slide-right.webp", "slide-holder.webp"
+    };
+    for (size_t i = 0; i < sizeof(slide_layers) / sizeof(slide_layers[0]); ++i) {
+        if (strncmp(path, "/assets/", 8) == 0 && strcmp(path + 8, slide_layers[i]) == 0) {
+            return static_file(fd, cfg, slide_layers[i], "image/webp");
+        }
+    }
+    if (strcmp(path, "/assets/ground.webp") == 0) {
+        return static_file(fd, cfg, "ground.webp", "image/webp");
+    }
+    if (strcmp(path, "/assets/rack.webp") == 0) {
+        return static_file(fd, cfg, "rack.webp", "image/webp");
+    }
+    if (strcmp(path, "/assets/family-rack.webp") == 0) {
+        return static_file(fd, cfg, "family-rack.webp", "image/webp");
     }
     if (strcmp(path, "/assets/mascot.svg") == 0) {
         return static_file(fd, cfg, "mascot.svg", "image/svg+xml; charset=utf-8");

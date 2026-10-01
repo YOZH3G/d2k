@@ -88,7 +88,23 @@ async function main() {
 
     const page = await fetch(`http://127.0.0.1:${port}/`);
     assert.equal(page.status, 200);
-    assert.match(await page.text(), /id="app"/);
+    assert.match(page.headers.get('content-security-policy'), /font-src 'self'/,
+      'The router must allow the offline display font without allowing remote fonts');
+    const pageText = await page.text();
+    assert.match(pageText, /id="app"/);
+    assert.match(pageText, /rel="icon"[^>]+href="\/assets\/favicon\.svg"/,
+      'The installed panel must declare its local Slidoscope favicon');
+    for (const [asset, mime] of [
+      ['favicon.svg', 'image/svg+xml'], ['ground.webp', 'image/webp'],
+      ['rack.webp', 'image/webp'], ['family-rack.webp', 'image/webp'],
+      ['oswald.ttf', 'font/ttf'], ['slide-left.webp', 'image/webp'],
+      ['slide-center.webp', 'image/webp'], ['slide-right.webp', 'image/webp'], ['slide-holder.webp', 'image/webp']
+    ]) {
+      const r = await fetch(`http://127.0.0.1:${port}/assets/${asset}`);
+      assert.equal(r.status, 200, asset + ' must be served by the real C panel');
+      assert.equal(r.headers.get('content-type'), mime);
+      assert.ok((await r.arrayBuffer()).byteLength > 100);
+    }
 
     const control = await fetch(`http://127.0.0.1:${port}/api/control/stop`, {
       method: 'POST', headers: { Origin: `http://127.0.0.1:${port}` },

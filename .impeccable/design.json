@@ -1,0 +1,479 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-01T22:49:45.136Z",
+  "title": "Design System: D2K — Слайдоскоп",
+  "extensions": {
+    "colorMeta": {
+      "paper": {
+        "role": "primary",
+        "displayName": "Goldenrod paper",
+        "tonalRamp": [
+          "oklch(15% 0.14 88)",
+          "oklch(26% 0.14 88)",
+          "oklch(38% 0.14 88)",
+          "oklch(49% 0.14 88)",
+          "oklch(61% 0.14 88)",
+          "oklch(72% 0.14 88)",
+          "oklch(84% 0.14 88)",
+          "oklch(95% 0.14 88)"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "tonalRamp": [
+          "oklch(15% 0.025 175)",
+          "oklch(26% 0.025 175)",
+          "oklch(38% 0.025 175)",
+          "oklch(49% 0.025 175)",
+          "oklch(61% 0.025 175)",
+          "oklch(72% 0.025 175)",
+          "oklch(84% 0.025 175)",
+          "oklch(95% 0.025 175)"
+        ]
+      },
+      "glass": {
+        "role": "primary",
+        "displayName": "Dark glass",
+        "tonalRamp": [
+          "oklch(15% 0.028 175)",
+          "oklch(26% 0.028 175)",
+          "oklch(38% 0.028 175)",
+          "oklch(49% 0.028 175)",
+          "oklch(61% 0.028 175)",
+          "oklch(72% 0.028 175)",
+          "oklch(84% 0.028 175)",
+          "oklch(95% 0.028 175)"
+        ]
+      },
+      "cream": {
+        "role": "neutral",
+        "displayName": "Cream",
+        "tonalRamp": [
+          "oklch(15% 0.035 95)",
+          "oklch(26% 0.035 95)",
+          "oklch(38% 0.035 95)",
+          "oklch(49% 0.035 95)",
+          "oklch(61% 0.035 95)",
+          "oklch(72% 0.035 95)",
+          "oklch(84% 0.035 95)",
+          "oklch(95% 0.035 95)"
+        ]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Olive line",
+        "tonalRamp": [
+          "oklch(15% 0.065 98)",
+          "oklch(26% 0.065 98)",
+          "oklch(38% 0.065 98)",
+          "oklch(49% 0.065 98)",
+          "oklch(61% 0.065 98)",
+          "oklch(72% 0.065 98)",
+          "oklch(84% 0.065 98)",
+          "oklch(95% 0.065 98)"
+        ]
+      },
+      "focus": {
+        "role": "secondary",
+        "displayName": "Rust focus",
+        "tonalRamp": [
+          "oklch(15% 0.14 35)",
+          "oklch(26% 0.14 35)",
+          "oklch(38% 0.14 35)",
+          "oklch(49% 0.14 35)",
+          "oklch(61% 0.14 35)",
+          "oklch(72% 0.14 35)",
+          "oklch(84% 0.14 35)",
+          "oklch(95% 0.14 35)"
+        ]
+      },
+      "connected": {
+        "role": "secondary",
+        "displayName": "Connected green",
+        "tonalRamp": [
+          "oklch(15% 0.12 160)",
+          "oklch(26% 0.12 160)",
+          "oklch(38% 0.12 160)",
+          "oklch(49% 0.12 160)",
+          "oklch(61% 0.12 160)",
+          "oklch(72% 0.12 160)",
+          "oklch(84% 0.12 160)",
+          "oklch(95% 0.12 160)"
+        ]
+      },
+      "confirmed": {
+        "role": "secondary",
+        "displayName": "Confirmed green",
+        "tonalRamp": [
+          "oklch(15% 0.08 142)",
+          "oklch(26% 0.08 142)",
+          "oklch(38% 0.08 142)",
+          "oklch(49% 0.08 142)",
+          "oklch(61% 0.08 142)",
+          "oklch(72% 0.08 142)",
+          "oklch(84% 0.08 142)",
+          "oklch(95% 0.08 142)"
+        ]
+      },
+      "evidence": {
+        "role": "secondary",
+        "displayName": "Evidence green",
+        "tonalRamp": [
+          "oklch(15% 0.05 155)",
+          "oklch(26% 0.05 155)",
+          "oklch(38% 0.05 155)",
+          "oklch(49% 0.05 155)",
+          "oklch(61% 0.05 155)",
+          "oklch(72% 0.05 155)",
+          "oklch(84% 0.05 155)",
+          "oklch(95% 0.05 155)"
+        ]
+      },
+      "divider": {
+        "role": "neutral",
+        "displayName": "Muted divider",
+        "tonalRamp": [
+          "oklch(15% 0.04 95)",
+          "oklch(26% 0.04 95)",
+          "oklch(38% 0.04 95)",
+          "oklch(49% 0.04 95)",
+          "oklch(61% 0.04 95)",
+          "oklch(72% 0.04 95)",
+          "oklch(84% 0.04 95)",
+          "oklch(95% 0.04 95)"
+        ]
+      },
+      "rail-base": {
+        "role": "neutral",
+        "displayName": "Rail black",
+        "tonalRamp": [
+          "oklch(15% 0.014 165)",
+          "oklch(26% 0.014 165)",
+          "oklch(38% 0.014 165)",
+          "oklch(49% 0.014 165)",
+          "oklch(61% 0.014 165)",
+          "oklch(72% 0.014 165)",
+          "oklch(84% 0.014 165)",
+          "oklch(95% 0.014 165)"
+        ]
+      },
+      "neighboring-phase": {
+        "role": "neutral",
+        "displayName": "Neighboring phase gray",
+        "tonalRamp": [
+          "oklch(15% 0.006 190)",
+          "oklch(26% 0.006 190)",
+          "oklch(38% 0.006 190)",
+          "oklch(49% 0.006 190)",
+          "oklch(61% 0.006 190)",
+          "oklch(72% 0.006 190)",
+          "oklch(84% 0.006 190)",
+          "oklch(95% 0.006 190)"
+        ]
+      },
+      "right-confirmed": {
+        "role": "secondary",
+        "displayName": "Right confirmation green",
+        "tonalRamp": [
+          "oklch(15% 0.08 160)",
+          "oklch(26% 0.08 160)",
+          "oklch(38% 0.08 160)",
+          "oklch(49% 0.08 160)",
+          "oklch(61% 0.08 160)",
+          "oklch(72% 0.08 160)",
+          "oklch(84% 0.08 160)",
+          "oklch(95% 0.08 160)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Selected target",
+        "purpose": "Desktop selected search target with line-height 1.03; length-dependent compression is local to the current hero. Compact targets use clamp(24px, calc(420px / var(--name-length, 9)), 44px), line-height 1.2."
+      },
+      "title": {
+        "displayName": "Result heading",
+        "purpose": "Result panel titles."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Readable operational text."
+      },
+      "detail": {
+        "displayName": "Detail",
+        "purpose": "Metadata, diagnostics, and result rows."
+      },
+      "control-desktop": {
+        "displayName": "Desktop service control",
+        "purpose": "D2K and Telegram action buttons."
+      },
+      "neighboring-phase-desktop": {
+        "displayName": "Neighboring phase",
+        "purpose": "Light desktop neighbor state labels; independent from selected slide emphasis."
+      },
+      "left-target-desktop": {
+        "displayName": "Left target",
+        "purpose": "Desktop left neighbor target; zero tracking preserves punctuation spacing."
+      }
+    },
+    "shadows": [
+      {
+        "name": "open-slide-detail",
+        "value": "0 12px 28px #14201c50",
+        "purpose": "Expanded desktop slide disclosure."
+      },
+      {
+        "name": "compact-controls",
+        "value": "0 -6px 20px #342b2615",
+        "purpose": "Fixed controls below desktop breakpoint; desktop removes this shadow."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease",
+        "value": "cubic-bezier(.16,1,.3,1)",
+        "purpose": "Selection, entry, stage and light transitions."
+      },
+      {
+        "name": "arrival-advance",
+        "value": "440ms",
+        "purpose": "New slide or changed stage after an existing snapshot."
+      },
+      {
+        "name": "selection",
+        "value": "520ms",
+        "purpose": "Explicit selected-plane lift."
+      },
+      {
+        "name": "confirmation-light",
+        "value": "620ms",
+        "purpose": "Confirmation lift and CSS light sweep."
+      },
+      {
+        "name": "family-transfer",
+        "value": "660ms cubic-bezier(.22,.7,.2,1)",
+        "purpose": "Inert visual clone to matching visible saved family."
+      },
+      {
+        "name": "reduced-update",
+        "value": "120ms",
+        "purpose": "Opacity-only event update for reduced motion."
+      },
+      {
+        "name": "control-hover",
+        "value": "120ms",
+        "purpose": "Button background and text inversion."
+      },
+      {
+        "name": "nav-hover",
+        "value": "140ms",
+        "purpose": "Navigation background and text."
+      },
+      {
+        "name": "refresh-visibility",
+        "value": "5000ms while visible",
+        "purpose": "Refresh pauses and its request aborts when hidden; changed snapshots animate only while visible. No first-snapshot arrival or idle loop."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "compact",
+        "value": "max-width: 1100px"
+      },
+      {
+        "name": "mobile",
+        "value": "max-width: 700px"
+      },
+      {
+        "name": "desktop",
+        "value": "min-width: 1101px"
+      },
+      {
+        "name": "tablet",
+        "value": "min-width: 701px and max-width: 1100px"
+      },
+      {
+        "name": "narrow-mobile",
+        "value": "max-width: 360px"
+      }
+    ],
+    "accessibility": {
+      "focus": "3px rust outline, 5px offset",
+      "minimumButtonHeight": "44px",
+      "semantics": "Native buttons and details; aria-pressed selection, aria-current step, polite main region, hidden slides inert.",
+      "reducedMotion": "No selection travel or CSS sweep; short opacity update remains.",
+      "status": "Implemented affordances; not a completed accessibility audit."
+    },
+    "review": {
+      "approvedReference": ".impeccable/mocks/decision/final-slides.png",
+      "captures": [
+        ".impeccable/review/integrated-desktop.png",
+        ".impeccable/review/integrated-mobile.png",
+        ".impeccable/review/integrated-tablet.png"
+      ],
+      "heroGate": "OPEN/FAILED; 81% (score 0.8146), unforced; prior named geometric hard vetoes cleared; authoritative .impeccable/build/state.json",
+      "finishReview": "Final scoped ship verdict: all four residual fixes resolved, no attributable regression. Whole hero remains failed/open at score 0.8146, unforced; no whole-interface pass.",
+      "goal": "active",
+      "preview": "Integrated captures use fixture data with production renderer; field captures record the installed router. Neither proves general internet availability.",
+      "fieldCaptures": [
+        ".impeccable/review/router-desktop.png",
+        ".impeccable/review/router-common.png",
+        ".impeccable/review/router-tablet.png",
+        ".impeccable/review/router-mobile.png"
+      ],
+      "deployment": "Installed panel at http://192.168.1.1:8090; field captures use real local C API and read-only GET requests.",
+      "wholeSurfaceFinish": "Hero fidelity and overall completion unresolved; no whole-surface pass.",
+      "fieldState": "Live searches changed naturally during GET captures: desktop zero searches/standby; mobile one search. No synthetic activity or general internet-success claim."
+    },
+    "tonalRampPolicy": "Synthetic OKLCH preview ramps only; not new runtime tokens or normative state colors.",
+    "materials": {
+      "rail": "Local /assets/ground.webp at 600px in a noninteractive pseudo-element; grayscale(1), soft-light blend over rail-base; visible neutral texture.",
+      "slides": "Independent alpha WebP planes and shared holder; real HTML content above decorative pseudo-elements",
+      "familyRack": "Local family-rack.webp with decorative outlined S index tabs",
+      "favicon": {
+        "asset": "/assets/favicon.svg",
+        "description": "Local declared SVG; three diagonal slashes in goldenrod, cream and muted slate on ink, 32×32 viewBox and 3px tile radius."
+      },
+      "desktopStandby": "Existing slide-center.webp and slide-holder.webp frame empty search text above 1100px; compact empty states stay in normal flow. Decorative planes do not intercept input or imply search activity."
+    },
+    "neighboringPhaseTypography": "Desktop role in frontmatter: Slide, weight 300, calc(var(--unit)*1.8), letter-spacing .025em; selected phase retains stronger emphasis.",
+    "icons": {
+      "telegram": "M2 10 22 2l-5 20-6-7-5 3 1-7z M7 11 22 2 M11 15 22 2",
+      "check": "M5 12l4 4L19 6",
+      "minus": "M5 12h14",
+      "error": "M6 6l12 12 M18 6 6 18",
+      "rendering": "Inline aria-hidden SVG, 24×24 viewBox, currentColor stroke 1.7, fill none; paired with explicit service/status text."
+    },
+    "heroCorrections": {
+      "scope": "Desktop hero only; actual CSS corrections, not global composition rules",
+      "brand": "translate(3px,4px) scale(.8,.91)",
+      "navigation": "min-width calc(var(--unit)*9.3); border-block 1px solid #82948c88; oblique frames and upright spans",
+      "tools": "Inner SVG and label translateX(13px); previous 6px vertical translation removed",
+      "leftTarget": "Independent search-top anchor: top calc(var(--unit)*2.79), left 18px; zero tracking; translateY(2px) rotate(-4deg) skew(4deg) scaleX(.62), origin left bottom",
+      "leftProtocol": "Independent top calc(var(--unit)*8.5), left 0",
+      "leftPhase": "Independent top calc(var(--unit)*13.86), left 20px; span translateY(5px) rotate(-4deg) scaleX(.93), origin left bottom",
+      "rightConfirmation": "Top calc(var(--unit)*13.55), left 22px; 34px icon; label scaleX(.78), no wrap",
+      "familyTitles": "Zero tracking; translateY(-12px) skew(5deg) scaleX(.7); first title scaleX(.68)",
+      "familyProtocols": "translateY(-9px) skew(8deg)"
+    }
+  },
+  "components": [
+    {
+      "name": "Desktop service control",
+      "kind": "button",
+      "refersTo": "control-desktop",
+      "description": "Outlined service action with hover inversion and keyboard focus.",
+      "html": "<button class=\"ds-control\">Запустить</button>",
+      "css": ".ds-control{min-height:44px;background:transparent;color:var(--ink,#152321);border:2px solid var(--ink,#152321);border-radius:4px;padding:10px 14px;font:500 21px/1.4 Slide,sans-serif;cursor:pointer;transition:background 120ms,color 120ms}.ds-control:hover:not(:disabled){background:var(--ink,#152321);color:var(--cream,#f3ebce)}.ds-control:focus-visible{outline:3px solid #ae321c;outline-offset:5px}.ds-control:disabled{opacity:.6;cursor:not-allowed}"
+    },
+    {
+      "name": "Service control hover",
+      "kind": "button",
+      "refersTo": "control-hover",
+      "description": "Ink-filled hover state of the same service action.",
+      "html": "<button class=\"ds-control-hover\">Остановить</button>",
+      "css": ".ds-control-hover{min-height:44px;background:var(--ink,#152321);color:var(--cream,#f3ebce);border:2px solid var(--ink,#152321);border-radius:4px;padding:10px 14px;font:500 21px/1.4 Slide,sans-serif}.ds-control-hover:focus-visible{outline:3px solid #ae321c;outline-offset:5px}"
+    },
+    {
+      "name": "Results filter",
+      "kind": "input",
+      "refersTo": "filter",
+      "description": "Square cream text field with a visible label.",
+      "html": "<label class=\"ds-filter-label\">Найти результат<input class=\"ds-filter\" type=\"search\" placeholder=\"Сайт или тип блокировки\"></label>",
+      "css": ".ds-filter-label{display:grid;gap:8px;font:14px/1.5 system-ui,sans-serif;color:var(--ink,#152321)}.ds-filter{background:var(--cream,#f3ebce);color:var(--ink,#152321);border:1px solid var(--ink,#152321);padding:12px 16px;width:min(420px,100%);border-radius:0;font:16px/1.5 system-ui,sans-serif}.ds-filter:focus-visible{outline:3px solid #ae321c;outline-offset:5px}"
+    },
+    {
+      "name": "Navigation",
+      "kind": "nav",
+      "refersTo": "navigation-active",
+      "description": "Oblique desktop destination frames with upright labels; goldenrod selected destination within a neutral textured rail.",
+      "html": "<nav class=\"ds-nav\" aria-label=\"Разделы панели\"><a class=\"ds-nav-link ds-active\" href=\"#searches\"><span>Подборы</span></a><a class=\"ds-nav-link\" href=\"#families\"><span>Семейства</span></a></nav>",
+      "css": ".ds-nav{display:flex;gap:3px;padding:14px;background:#0a110f;color:var(--cream,#f3ebce)}.ds-nav-link{transform:skew(-10deg);border-inline:1px solid #7f8c7955;border-block:1px solid #82948c88;min-width:calc(var(--unit,15.36px)*9.3);padding:9px 14px;text-decoration:none;font:700 21px/1.3 Slide,sans-serif;transition:background 140ms,color 140ms;color:inherit}.ds-nav-link:hover,.ds-nav-link.ds-active{background:var(--paper,#eab71f);color:var(--ink,#152321)}.ds-nav-link:focus-visible{outline:3px solid #ae321c;outline-offset:5px}.ds-nav-link>span{display:inline-block;transform:skew(10deg)}"
+    },
+    {
+      "name": "Result panel",
+      "kind": "card",
+      "refersTo": "result-card",
+      "description": "Cream container for structured result evidence.",
+      "html": "<article class=\"ds-result\"><h3>Сохранённый результат</h3><p>TLS 1.3 · IPv4</p></article>",
+      "css": ".ds-result{background:var(--cream,#f3ebce);color:var(--ink,#152321);padding:24px;overflow-wrap:anywhere}.ds-result h3{font:700 28px/1.15 Slide,sans-serif;margin:0 0 16px}.ds-result p{font:14px/1.5 system-ui,sans-serif;margin:0;padding-top:14px;border-top:1px solid #c4be9d}"
+    },
+    {
+      "name": "Search stages",
+      "kind": "custom",
+      "refersTo": "stage-current",
+      "description": "Ordered stage cells on the pale selected slide; these are indicators, not action chips.",
+      "html": "<ol class=\"ds-stages\" aria-label=\"Этапы подбора\"><li>Замер</li><li>Создание</li><li aria-current=\"step\">Проверка</li><li>Сохранено</li></ol>",
+      "css": ".ds-stages{display:flex;gap:3px;list-style:none;margin:0;padding:0;color:var(--ink,#152321);font:400 17px/1.3 Slide,sans-serif}.ds-stages li{padding:7px 5px;border:1px solid currentColor;flex:1;text-align:center}.ds-stages [aria-current=step]{background:var(--ink,#152321);color:var(--cream,#f3ebce)}"
+    },
+    {
+      "name": "Evidence disclosure",
+      "kind": "custom",
+      "description": "Native disclosure with an inline document icon.",
+      "html": "<details class=\"ds-detail\"><summary><svg aria-hidden=\"true\" viewBox=\"0 0 24 28\" width=\"20\" height=\"26\"><path d=\"M4 2h16v24H4zM8 8h8M8 13h8M8 18h6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"/></svg>Подробности</summary><p>Контекст и доказательства результата.</p></details>",
+      "css": ".ds-detail{color:var(--ink,#152321);background:var(--cream,#f3ebce);padding:12px}.ds-detail summary{display:flex;align-items:center;gap:12px;list-style:none;cursor:pointer;min-height:44px;font:400 20px/1.4 Slide,sans-serif}.ds-detail summary::-webkit-details-marker{display:none}.ds-detail summary:focus-visible{outline:3px solid #ae321c;outline-offset:5px}.ds-detail p{font:14px/1.6 system-ui,sans-serif;margin:12px 0}"
+    },
+    {
+      "name": "Slide selection tab",
+      "kind": "button",
+      "description": "Number and explicit selection label; selected number is goldenrod on ink.",
+      "html": "<button class=\"ds-select\" aria-pressed=\"true\"><span class=\"ds-number\">02</span><span>Выбранный подбор</span></button>",
+      "css": ".ds-select{display:inline-flex;align-items:center;gap:14px;min-height:44px;background:transparent;color:var(--ink,#152321);border:0;border-bottom:1px solid currentColor;padding:6px 0;font:400 18px/1.3 Slide,sans-serif}.ds-number{display:inline-flex;align-items:center;justify-content:center;min-width:40px;min-height:40px;border:1px solid currentColor;font:400 25px/1.2 Slide,sans-serif}.ds-select[aria-pressed=true] .ds-number{background:var(--ink,#152321);color:var(--paper,#eab71f);border-color:var(--ink,#152321)}.ds-select:focus-visible{outline:3px solid #ae321c;outline-offset:5px}"
+    },
+    {
+      "name": "Slide pager",
+      "kind": "button",
+      "description": "Previous and next native controls sit beside the compact search heading.",
+      "html": "<div class=\"ds-pager\"><button aria-label=\"Предыдущий подбор\"><svg aria-hidden=\"true\" viewBox=\"0 0 24 24\"><path d=\"M20 12H4m6-6-6 6 6 6\"/></svg></button><button aria-label=\"Следующий подбор\"><svg aria-hidden=\"true\" viewBox=\"0 0 24 24\"><path d=\"M4 12h16m-6-6 6 6-6 6\"/></svg></button></div>",
+      "css": ".ds-pager{display:flex;gap:8px;color:var(--ink,#152321)}.ds-pager button{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;padding:8px;background:transparent;color:inherit;border:1px solid currentColor;cursor:pointer}.ds-pager svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.5}.ds-pager button:focus-visible{outline:3px solid #ae321c;outline-offset:5px}"
+    },
+    {
+      "name": "Desktop standby text",
+      "kind": "custom",
+      "description": "Calm copy placed within the existing central plane and holder; compact version stays in normal flow. Material composition is documented in extensions.materials.",
+      "html": "<div class=\"ds-standby\"><h3>Сейчас всё спокойно</h3><p>Когда D2K заметит блокировку, проверка появится здесь автоматически.</p></div>",
+      "css": ".ds-standby{color:var(--ink,#152321);background:none;display:block;padding:0;max-width:28ch}.ds-standby h3{font:500 47.6px/1.15 Slide,sans-serif;margin:0}.ds-standby p{font:300 23px/1.5 Slide,sans-serif;max-width:28ch;margin:20px 0 0}"
+    }
+  ],
+  "narrative": {
+    "northStar": "Слайдоскоп",
+    "overview": "A goldenrod work surface holds overlapping dark glass slides and a pale selected slide. Condensed local Oswald lettering follows their oblique geometry; the shared gold holder gives the search objects a physical relationship. Saved families occupy a second rack. The feel is tactile and energetic while status language stays calm and exact.\n\nThis records the current implementation in `internal/web/assets/index.html`, `panel.css`, and `panel.js`, not a completion certificate. The user-approved visual authority is `.impeccable/mocks/decision/final-slides.png`. The current review captures are `.impeccable/review/integrated-desktop.png`, `integrated-mobile.png`, and `integrated-tablet.png`. The authoritative `.impeccable/build/state.json` keeps the hero fidelity gate OPEN/FAILED at 81% (score 0.8146), unforced. The user-authorized finite correction pass is implemented: left domain/phase rotation and offsets, first-family width, and tool vertical alignment now reflect the requested adjustments. The final scoped ship verdict resolves all four residual fixes with no attributable regression; prior named geometric hard vetoes cleared. No whole-interface pass or completion is claimed.\n\n`PRODUCT.md` owns product truth. Its older “style not yet approved” sentence predates the accepted Slidoscope direction and is recorded as context drift, not visual authority. The panel is deployed at `http://192.168.1.1:8090` and consumes the real local C API. Field captures `.impeccable/review/router-desktop.png`, `router-common.png`, `router-tablet.png`, and `router-mobile.png` record that installed panel using read-only GET requests. Live searches changed naturally during capture: desktop shows standby with zero searches, while mobile shows one search. The integrated preview captures use fixture data and remain composition evidence; neither set proves general internet availability. No whole-surface finish pass is claimed.",
+    "keyCharacteristics": [
+      "Goldenrod ground, dark glass planes, and a pale selected slide.",
+      "Condensed offline typography and oblique physical geometry.",
+      "Shared holders for active searches and saved families.",
+      "Event-driven motion and persistent, separate service controls."
+    ],
+    "rules": [
+      {
+        "name": "The Evidence Rule",
+        "body": "Color accompanies explicit state text; green is never a standalone claim that the internet works.",
+        "section": "colors"
+      },
+      {
+        "name": "The Offline Type Rule",
+        "body": "Keep the display font bundled locally; no remote font service is required to read or operate the panel.",
+        "section": "typography"
+      },
+      {
+        "name": "The Shared Holder Rule",
+        "body": "Preserve the physical relationship among slides and their common support rather than assigning each slide an unrelated floating panel.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do preserve goldenrod ground, pale selected slide, dark neighbors, and their shared holder.",
+      "Do use locally bundled Oswald and inline SVG icons.",
+      "Do retain explicit state text, native controls, visible focus, and reduced-motion behavior.",
+      "Do keep Telegram control and state distinct from D2K.",
+      "Do review the actual responsive composition against the approved reference before declaring fidelity passed."
+    ],
+    "donts": [
+      "Don't replace authored slide materials with generic rounded cards.",
+      "Don't describe fixture screenshots as live router or network evidence.",
+      "Don't promote unresolved hero compression, region proportions, or open fidelity findings into universal design rules.",
+      "Don't claim the scoped finish-review verdict closes the active goal or passes the whole interface."
+    ]
+  }
+}
