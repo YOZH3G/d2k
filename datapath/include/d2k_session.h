@@ -231,7 +231,9 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap,
                        d2k_result *out);
 /* Вариант для отправителя, который уже знает безопасную длину TCP payload
- * по MTU маршрута. Ограничение применяется только к TCP-плану с перекрытием. */
+ * по MTU маршрута. Ограничивает настоящие TCP-сегменты обычных операций;
+ * URG обрабатывается отдельно. Фальшивки, UDP и явная IP-фрагментация
+ * этим ограничением не меняются. */
 int d2k_session_packet_mtu(d2k_session *s, const uint8_t *pkt, size_t len,
                            uint64_t now_ns, size_t tcp_segment_cap,
                            uint8_t *buf, size_t bufcap, d2k_result *out);

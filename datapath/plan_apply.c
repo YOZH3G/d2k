@@ -596,14 +596,16 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     if (p->segment_size || in->segment_cap) {
         /* Match raw_send: split the concatenated prefix+body, preserving
          * bytes, sequence space, fooling and only the first chunk's delay.
-         * The route MTU cap is deliberately narrower than segment_size:
-         * it only splits overlapping TCP payload emits (pre_len != 0), and
-         * never changes fake packets or plans without a measured overlap. */
+         * Route MTU also bounds ordinary TCP payloads: a paced or split
+         * plan can own a reassembled ClientHello larger than one packet.
+         * The route cap does not segment fake packets, UDP, or explicit
+         * IP-fragment plans; an explicit segment_size keeps its semantics. */
         size_t count = 0;
         for (size_t i = 0; i < n; i++) {
             size_t bytes = v[i].pre_len + v[i].len;
             size_t limit = p->segment_size;
-            if (in->segment_cap && v[i].kind == D2K_EMIT_PAYLOAD && v[i].pre_len &&
+            if (in->segment_cap && (!p->transport || p->transport == 6) &&
+                !p->ipfrag && v[i].kind == D2K_EMIT_PAYLOAD &&
                 (!limit || in->segment_cap < limit)) {
                 limit = in->segment_cap;
             }
@@ -616,7 +618,8 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         size_t k = 0;
         for (size_t i = 0; i < n; i++) {
             size_t limit = p->segment_size;
-            if (in->segment_cap && v[i].kind == D2K_EMIT_PAYLOAD && v[i].pre_len &&
+            if (in->segment_cap && (!p->transport || p->transport == 6) &&
+                !p->ipfrag && v[i].kind == D2K_EMIT_PAYLOAD &&
                 (!limit || in->segment_cap < limit)) {
                 limit = in->segment_cap;
             }

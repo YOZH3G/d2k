@@ -317,6 +317,7 @@ static const uint8_t plan_reorder_by_name[] = {
 static uint8_t hello[64];
 
 static void init_pkt(d2k_pkt *in, int have_sni) {
+    memset(in, 0, sizeof *in);
     memset(hello, 0xCC, sizeof hello);
     in->payload = hello;
     in->payload_len = sizeof hello;
@@ -330,6 +331,7 @@ static void init_pkt(d2k_pkt *in, int have_sni) {
    have байт. record_total == have — запись пришла целиком. */
 static uint8_t frag[512];
 static void init_frag(d2k_pkt *in, size_t have, size_t record_total) {
+    memset(in, 0, sizeof *in);
     memset(frag, 0xCC, sizeof frag);
     frag[0] = 0x16; frag[1] = 3; frag[2] = 1;
     frag[3] = (uint8_t)((record_total - 5) >> 8);
@@ -355,6 +357,81 @@ int main(void) {
     d2k_pkt in;
 
     test_tls_fake_modifiers();
+
+    /* A TCP route hint must not turn one QUIC datagram into fragments. */
+    {
+        uint8_t plan[128], body[64]={0}, proto[2]={17,2};
+        memcpy(plan,plan_delay,sizeof plan_delay);
+        size_t n=sizeof plan_delay;
+        putrec(plan,&n,0x0002,proto,sizeof proto);
+        plan[11]=2;
+        d2k_plan *udp=NULL; d2k_pkt pkt={0}; d2k_actions actions={0};
+        CHECK(d2k_plan_load(plan,n,&udp,err,sizeof err)==0,
+              "UDP delay plan loads for TCP-cap isolation");
+        if(udp) {
+            pkt.payload=body; pkt.payload_len=sizeof body; pkt.segment_cap=32;
+            CHECK(d2k_plan_apply(udp,NULL,&pkt,&actions)==0,
+                  "UDP plan still applies with foreign TCP route hint");
+            CHECK(actions.n==1 && actions.v[0].len==64,
+                  "TCP route hint never segments a QUIC datagram");
+            d2k_actions_free(&actions); d2k_plan_free(udp);
+        }
+    }
+
+    /* Discord CDN: fake+pace owns an assembled 1760-byte ClientHello.
+       Unlike seqovl, this plan has no prefix and no explicit segmentation. */
+    {
+        uint8_t plan[512], client[1760] = {0};
+        size_t n = tls_fake_plan(plan);
+        uint8_t pace[4] = {0, 0, 0x3a, 0x98};
+        putrec(plan, &n, 0x0105, pace, sizeof pace);
+        plan[11] = 8;
+        client[0]=0x16; client[1]=3; client[2]=1;
+        client[3]=6; client[4]=0xdb; /* record total 1760 */
+        client[5]=1; client[7]=6; client[8]=0xd7;
+        client[43]=32;
+        for (size_t i=44; i<sizeof client; i++) client[i]=(uint8_t)i;
+        d2k_plan *paced=NULL;
+        CHECK(d2k_plan_load(plan,n,&paced,err,sizeof err)==0,
+              "paced fake plan loads for route-MTU regression");
+        if (paced) {
+            d2k_pkt pkt={0}; d2k_actions actions={0};
+            pkt.payload=client; pkt.payload_len=sizeof client; pkt.seq=1000;
+            pkt.have_sni=1; pkt.is_tls13=1; pkt.sni_off=20; pkt.sni_len=8;
+            pkt.segment_cap=1440;
+            CHECK(d2k_plan_apply(paced,NULL,&pkt,&actions)==0,
+                  "paced long ClientHello applies");
+            CHECK(actions.n==3,
+                  "paced ClientHello without overlap splits below route MTU");
+            CHECK(actions.fate==D2K_ORIG_DROP,"paced plan still owns original");
+            size_t offset=0;
+            for(size_t i=0;i<actions.n;i++) {
+                const d2k_emit *e=&actions.v[i];
+                if(e->kind==D2K_EMIT_FAKE) {
+                    CHECK(i==0 && e->len==87,"fake remains first and unsplit");
+                    continue;
+                }
+                CHECK(e->len<=1440,"real TCP emit fits route MTU");
+                CHECK(e->seq==1000+offset,"real TCP sequence remains contiguous");
+                CHECK(e->delay_us==(offset==0?15000u:0u),
+                      "pace occurs once before the real byte stream");
+                CHECK(offset+e->len<=sizeof client,"real bytes stay in bounds");
+                if(offset+e->len<=sizeof client)
+                    CHECK(memcmp(e->bytes,client+offset,e->len)==0,
+                          "segmentation preserves every real byte");
+                offset+=e->len;
+            }
+            CHECK(offset==sizeof client,"whole ClientHello emitted exactly once");
+            d2k_actions_free(&actions);
+            pkt.segment_cap=32;
+            CHECK(d2k_plan_apply(paced,NULL,&pkt,&actions)==0,
+                  "small route cap applies to real stream");
+            CHECK(actions.n && actions.v[0].kind==D2K_EMIT_FAKE &&
+                  actions.v[0].len==87,"route cap never splits a fake packet");
+            d2k_actions_free(&actions);
+            d2k_plan_free(paced);
+        }
+    }
 
     /* --- фальшивка перед кусками ------------------------------------- */
     CHECK(d2k_plan_load(plan_fake_before, sizeof plan_fake_before, &p, err, sizeof err) == 0,
