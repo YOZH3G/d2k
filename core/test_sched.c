@@ -1226,10 +1226,10 @@ int main(int argc, char **argv) {
               "fresh unplanned TLS13 family member inherits without starting a search");
         fresh.planned = D2K_LINK_PLANNED_YES;
         fresh.code = D2K_SUSPECT_SILENT;
-        d2k_sched_event(s, &fresh); spin(s, 2);
-        CHECK(tcp_calls > 0 || vol_calls > 0 || ver_calls > 0,
-              "silent flow after family plan execution remains eligible for recovery");
+        d2k_sched_event(s, &fresh);
         settle(s);
+        CHECK(ver_calls > 0 && tcp_calls == 0 && vol_calls == 0,
+              "inherited plan recovery verifies own family knowledge before full classification");
         char live_path[] = "/tmp/d2k-family-live-XXXXXX";
         int live_fd = mkstemp(live_path); CHECK(live_fd >= 0, "family live fixture");
         if (live_fd >= 0) {
@@ -1320,6 +1320,100 @@ int main(int argc, char **argv) {
               "retire only flow-proven TLS13 queue; preserve TLS12 and unknown after later same-name snapshot");
         tcp_block_until_stop=0;
         d2k_sched_free(s); d2k_catalog_free(&c);
+        /* Two historically working family plans. An applied first candidate
+           fails its own verifier; the second succeeds without classification. */
+        d2k_catalog recovery={0};
+        int recovery_sendbuf=256*1024;
+        CHECK(!setsockopt(sv[0],SOL_SOCKET,SO_SNDBUF,&recovery_sendbuf,sizeof recovery_sendbuf),
+              "family recovery socket must hold one bounded sync batch before test receiver drains it");
+        tcp_answer=D2K_V_PREFIX; tcp_found_arm=0; ver_fail_first=0;
+        confirm_once(&recovery,sv[0],"a.recovery.net",40501);
+        confirm_once(&recovery,sv[0],"b.recovery.net",40502);
+        confirm_once(&recovery,sv[0],"c.recovery.net",40503);
+        confirm_once(&recovery,sv[0],"d.recovery.net",40504);
+        char primary[40];
+        snprintf(primary,sizeof primary,"%s",binding_of(&recovery,"a.recovery.net",6)->plan_id);
+        d2k_catalog alternate_catalog={0};
+        tcp_found_arm=1; tcp_owns_search=1;
+        confirm_once(&alternate_catalog,sv[0],"e.recovery.net",40505);
+        confirm_once(&alternate_catalog,sv[0],"f.recovery.net",40506);
+        confirm_once(&alternate_catalog,sv[0],"g.recovery.net",40507);
+        char alternate[40];
+        snprintf(alternate,sizeof alternate,"%s",binding_of(&alternate_catalog,"g.recovery.net",6)->plan_id);
+        CHECK(strcmp(primary,alternate),"recovery fixture needs different own confirmed plans");
+        d2k_cat_box *merged=realloc(recovery.boxes,
+            (recovery.n_boxes+alternate_catalog.n_boxes)*sizeof *merged);
+        CHECK(merged!=NULL,"merge independently measured family alternatives");
+        if(!merged) return 1;
+        recovery.boxes=merged;
+        memcpy(recovery.boxes+recovery.n_boxes,alternate_catalog.boxes,
+               alternate_catalog.n_boxes*sizeof *merged);
+        recovery.n_boxes+=alternate_catalog.n_boxes;
+        for(size_t i=0;i<alternate_catalog.groups->n_observations;i++)
+            CHECK(d2k_group_learn(recovery.groups,&alternate_catalog.groups->observations[i])>0,
+                  "merge own independently confirmed sibling observations");
+        free(alternate_catalog.boxes); alternate_catalog.boxes=NULL; alternate_catalog.n_boxes=0;
+        d2k_catalog_free(&alternate_catalog);
+        tcp_found_arm=0; tcp_owns_search=0;
+        s=d2k_sched_new(&recovery,sv[0],0x2d);
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        ack.code=D2K_CMD_SET_SUFFIX; ack.num=1u<<8; area_ack_id(&ack);
+        d2k_sched_event(s,&ack); sync_out(s);
+        tcp_calls=vol_calls=ver_calls=0; ver_fail_first=1; ver_answer_port=40508;
+        h=ev_hello(6,40508,"new.recovery.net"); d2k_sched_event(s,&h);
+        su=ev_suspect(6,40508); su.planned=D2K_LINK_PLANNED_YES;
+        su.code=D2K_SUSPECT_SILENT; su.client_shape=D2K_SHAPE_MODERN;
+        d2k_sched_event(s,&su);
+        for(int i=0;i<800;i++) {
+            tick_once(s);
+            d2k_ev applied=ev_applied(6,40508); d2k_sched_event(s,&applied);
+        }
+        const d2k_cat_binding *recovered=binding_of(&recovery,"new.recovery.net",6);
+        CHECK(recovered && !strcmp(recovered->plan_id,alternate),
+              "failed inherited plan must recover under distinct confirmed sibling alternative");
+        CHECK(ver_calls==2 && !tcp_calls && !vol_calls,
+              "family recovery must not classify or synthesize before two saved alternatives");
+        g=d2k_group_match(recovery.groups,"next.recovery.net",&key);
+        CHECK(g && !strcmp(g->plan_id,alternate),
+              "actual applied verifier failure must change family election for future members");
+        CHECK(binding_of(&recovery,"a.recovery.net",6) &&
+              !strcmp(binding_of(&recovery,"a.recovery.net",6)->plan_id,primary),
+              "failure on new family member must preserve old individual successes");
+        d2k_sched_free(s); ver_fail_first=0;
+        s=d2k_sched_new(&recovery,sv[0],0x2d);
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        ack.code=D2K_CMD_SET_SUFFIX; ack.num=1u<<8; area_ack_id(&ack);
+        d2k_sched_event(s,&ack); sync_out(s);
+        tcp_calls=vol_calls=ver_calls=0; ver_answer_port=40509;
+        h=ev_hello(6,40509,"new.recovery.net"); d2k_sched_event(s,&h);
+        su=ev_suspect(6,40509); su.planned=D2K_LINK_PLANNED_YES;
+        su.code=D2K_SUSPECT_SILENT; su.client_shape=D2K_SHAPE_MODERN;
+        d2k_sched_event(s,&su); settle(s);
+        CHECK(ver_calls>0 && !tcp_calls && !vol_calls,
+              "existing individual family members must also recover from saved family plans first");
+        d2k_sched_free(s);
+        s=d2k_sched_new(&recovery,sv[0],0x2d);
+        d2k_sched_set_say(s,collect_say,NULL);
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        ack.code=D2K_CMD_SET_SUFFIX; ack.num=1u<<8; area_ack_id(&ack);
+        d2k_sched_event(s,&ack); sync_out(s);
+        tcp_answer=D2K_V_CLEAR; tcp_wait_until_stop=1; tcp_release_waiters=0;
+        for(uint16_t port=40511;port<40513;port++) {
+            h=ev_hello(6,port,port==40511?"busy-one.example":"busy-two.example");
+            d2k_sched_event(s,&h); su=ev_suspect(6,port); d2k_sched_event(s,&su);
+        }
+        h=ev_hello(6,40513,"fresh-research.example"); d2k_sched_event(s,&h);
+        su=ev_suspect(6,40513); d2k_sched_event(s,&su);
+        h=ev_hello(6,40514,"priority.recovery.net"); d2k_sched_event(s,&h);
+        su=ev_suspect(6,40514); su.planned=D2K_LINK_PLANNED_YES;
+        su.client_shape=D2K_SHAPE_MODERN; d2k_sched_event(s,&su);
+        tcp_release_waiters=1; spin(s,40); tcp_wait_until_stop=0;
+        saidbuf[0]=0;
+        skip_ahead(s,15000); spin(s,100);
+        CHECK(said("по priority.recovery.net ожидание в очереди") &&
+              !said("по fresh-research.example ожидание в очереди"),
+              "saved family recovery must precede older unrelated queued classification");
+        d2k_sched_free(s); d2k_catalog_free(&recovery); tcp_answer=D2K_V_PREFIX;
         d2k_catalog qc = {0};
         quic_answer = D2K_V_OPAQUE;
         confirm_transport(&qc, sv[0], "q-a.googlevideo.com", 40401, 17);

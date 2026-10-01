@@ -49,6 +49,17 @@ static unsigned votes(const d2k_group_state *s,const char *suffix,
     }
     return n;
 }
+static unsigned failures(const d2k_group_state *s,const char *suffix,
+                         const d2k_group_key *key,const char *plan) {
+    unsigned n=0;
+    for(size_t i=0;i<s->n_observations;i++) {
+        const d2k_group_observation *o=&s->observations[i];
+        if((o->evidence&D2K_GROUP_PLAN_FAILED) &&
+           d2k_group_key_same(&o->key,key) && member(o->name,suffix) &&
+           !strcmp(o->plan_id,plan)) n++;
+    }
+    return n;
+}
 static void add_group(d2k_group_state *s,const char *suffix,
                       const d2k_group_observation *seed,unsigned count,int64_t at) {
     for(size_t i=0;i<s->n_groups;i++) {
@@ -56,8 +67,11 @@ static void add_group(d2k_group_state *s,const char *suffix,
         if(!d2k_group_key_same(&g->key,&seed->key)) continue;
         if(!strcmp(g->suffix,suffix)) {
             /* Deterministic election, not catalog traversal order. */
-            if(count>g->evidence_count || (count==g->evidence_count &&
-               (at>g->at || (at==g->at && strcmp(seed->plan_id,g->plan_id)<0)))) {
+            unsigned candidate_fail=failures(s,suffix,&seed->key,seed->plan_id);
+            unsigned elected_fail=failures(s,suffix,&g->key,g->plan_id);
+            if(candidate_fail<elected_fail || (candidate_fail==elected_fail &&
+               (count>g->evidence_count || (count==g->evidence_count &&
+               (at>g->at || (at==g->at && strcmp(seed->plan_id,g->plan_id)<0)))))) {
                 strcpy(g->plan_id,seed->plan_id); g->evidence_count=count; g->at=at;
             }
             return;
@@ -103,9 +117,19 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
     int admitted_clear=o->evidence==D2K_GROUP_DIRECT_CLEAR &&
         d2k_group_match(s,name,&o->key)!=NULL;
     size_t slot=s->n_observations;
+    size_t replace=s->n_observations;
     for(size_t i=0;i<s->n_observations;i++)
         if(!strcmp(s->observations[i].name,name) &&
-           d2k_group_key_same(&s->observations[i].key,&o->key)) { slot=i; break; }
+           d2k_group_key_same(&s->observations[i].key,&o->key)) {
+            const d2k_group_observation *old=&s->observations[i];
+            if(!strcmp(old->plan_id,o->plan_id) ||
+               o->evidence==D2K_GROUP_DIRECT_CLEAR || o->evidence==D2K_GROUP_INCONCLUSIVE) {
+                slot=i; break;
+            }
+            if(o->evidence==D2K_GROUP_BLOCKED_CONFIRMED &&
+               !(old->evidence&D2K_GROUP_PLAN_FAILED) && replace==s->n_observations) replace=i;
+        }
+    if(slot==s->n_observations && replace<s->n_observations) slot=replace;
     if(slot==s->n_observations) {
         if(s->frozen || slot==D2K_GROUP_OBSERVATION_MAX) {
             int changed=!s->frozen; s->frozen=1;
@@ -151,6 +175,19 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
         } else { *old=*o; strcpy(old->name,name); }
     }
     if(admitted_clear) s->observations[slot].evidence |= D2K_GROUP_ADMITTED_EXCEPTION;
+    /* Keep one latest positive/clean observation per member, but preserve
+       independent failed Plan IDs: trying B must not erase the failure of A. */
+    if(o->evidence==D2K_GROUP_BLOCKED_CONFIRMED || o->evidence==D2K_GROUP_DIRECT_CLEAR)
+        for(size_t i=0;i<s->n_observations;) {
+            const d2k_group_observation *other=&s->observations[i];
+            if(i!=slot && !strcmp(other->name,name) &&
+               d2k_group_key_same(&other->key,&o->key) &&
+               !(other->evidence&D2K_GROUP_PLAN_FAILED)) {
+                size_t last=--s->n_observations;
+                s->observations[i]=s->observations[last];
+                if(slot==last) slot=i;
+            } else i++;
+        }
     if(o->evidence!=D2K_GROUP_INCONCLUSIVE) rebuild(s);
     return 1;
 }
@@ -170,7 +207,9 @@ int d2k_group_restore(d2k_group_state *s) {
         strcpy(o->name,norm);
         for(size_t j=0;j<i;j++)
             if(!strcmp(s->observations[j].name,o->name) &&
-               d2k_group_key_same(&s->observations[j].key,&o->key)) return -1;
+               d2k_group_key_same(&s->observations[j].key,&o->key) &&
+               (!strcmp(s->observations[j].plan_id,o->plan_id) ||
+                !((s->observations[j].evidence|o->evidence)&D2K_GROUP_PLAN_FAILED))) return -1;
     }
     rebuild(s); return 0;
 }

@@ -603,6 +603,7 @@ typedef struct {
     int        rx_bootstrap_only; /* measure an already confirmed target plan */
     int        family_reuse; /* 1 baseline pending, 2 isolated trial, 3 exhausted */
     int        group_block_proven;
+    int        family_fast; /* 1 own-family verifier queue, 2 exhausted */
     int        skip_volume_once; /* resume classifier with existing baseline */
     char       measure_path[512]; /* selected before worker start, never guessed from ciphertext */
     int        ech_offer;
@@ -2374,6 +2375,7 @@ static int install_next(d2k_sched *s, task *t) {
         if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
     }
         /* Запасной перебор — последний этап оригинального инструмента. */
+        if(t->family_fast==1) return -1;
         if (refill_from_fallback(s, t) == 0) { return -1; }
     }
 }
@@ -3158,6 +3160,22 @@ static int desired_area(const d2k_sched *s, size_t index, installed_area *a) {
     } else {
         const d2k_group_observation *v = &g->observations[index-g->n_groups];
         if (!(v->evidence & (D2K_GROUP_DIRECT_CLEAR | D2K_GROUP_PLAN_FAILED))) return 0;
+        if (!(v->evidence & D2K_GROUP_DIRECT_CLEAR)) {
+            for(size_t bi=0;bi<s->cat->n_boxes;bi++)
+                for(size_t j=0;j<s->cat->boxes[bi].n_binds;j++) {
+                    const d2k_cat_binding *bd=&s->cat->boxes[bi].binds[j];
+                    if(bd->enabled && bd->level>=3 && !strcmp(bd->kind,"name") &&
+                       !strcmp(bd->target,v->name) && bd->transport==v->key.transport &&
+                       bd->family==v->key.family && bd->shape==v->key.shape &&
+                       strcmp(bd->plan_id,v->plan_id)) return 0;
+                }
+            int still_elected=0;
+            for(size_t i=0;i<g->n_groups;i++)
+                if(d2k_group_key_same(&v->key,&g->groups[i].key) &&
+                   d2k_domain_member(v->name,g->groups[i].suffix) &&
+                   !strcmp(v->plan_id,g->groups[i].plan_id)) still_elected=1;
+            if(!still_elected) return 0;
+        }
         a->kind = 2; strcpy(a->name, v->name);
         a->transport = v->key.transport; a->shape = v->key.shape; a->family = v->key.family;
     }
@@ -3445,6 +3463,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
    запуск нужен ПОЗЖЕ — когда задача ждала форму приветствия и дождалась
    (on_shape ниже). Возвращает 1, если задача занята делом. */
 static int rx_saved_bootstrap(d2k_sched *s, task *t, int allow_other_family);
+static int family_recovery_start(d2k_sched *s, task *t);
 static int has_other_family_target_plan(const d2k_sched *s, const task *t) {
     if (t->transport != 6 || t->by_addr || t->port != 443 ||
         d2k_hello_shape(t->trig, t->trig_len) != D2K_SHAPE_MODERN) return 0;
@@ -3596,6 +3615,7 @@ static int start_search(d2k_sched *s, task *t) {
             }
         }
     }
+    if (family_recovery_start(s,t)) return 1;
     if (!t->rx_volume_only && !t->family_reuse && has_other_family_target_plan(s, t))
         t->family_reuse = 1;
     if (t->rx_volume_only) {
@@ -3816,12 +3836,13 @@ static size_t queued_measurements(const d2k_sched *s) {
 /* An unplanned flow queued BEFORE a compatible area was installed cannot
    testify against that new area. Let its next flow inherit without an old
    backlog probe. Applied-plan failures and exact overrides remain diagnostic. */
-static int installed_family_ready(const d2k_sched *s, const task *t, uint64_t after_event) {
+static int installed_family_ready(const d2k_sched *s, const task *t, uint64_t after_event,
+                                  int include_exact) {
     const d2k_group_state *state = s->cat->groups;
     if (!state || t->by_addr) return 0;
     uint8_t shape = t->trigger_shape;
     if (!shape) return 0;
-    for (size_t bi=0; bi<s->cat->n_boxes; bi++) {
+    for (size_t bi=0; !include_exact && bi<s->cat->n_boxes; bi++) {
         const d2k_cat_box *b=&s->cat->boxes[bi];
         for (size_t j=0; j<b->n_binds; j++) {
             const d2k_cat_binding *bd=&b->binds[j];
@@ -3848,7 +3869,68 @@ static int installed_family_ready(const d2k_sched *s, const task *t, uint64_t af
 
 static int queued_family_ready(const d2k_sched *s, const task *t) {
     return t->queued_ms && t->trigger_planned == D2K_LINK_PLANNED_NO &&
-        installed_family_ready(s, t, t->queued_event);
+        installed_family_ready(s, t, t->queued_event, 0);
+}
+
+static int family_recovery_eligible(const d2k_sched *s,const task *t) {
+    return !t->rx_volume_only && t->trigger_planned==D2K_LINK_PLANNED_YES &&
+        installed_family_ready(s,t,0,1);
+}
+
+static int family_recovery_start(d2k_sched *s, task *t) {
+    if(t->family_fast || t->trigger_planned!=D2K_LINK_PLANNED_YES ||
+       t->rx_volume_only || t->ech_offer || !installed_family_ready(s,t,0,1)) return 0;
+    if(t->transport==6 && d2k_hello_shape(t->trig,t->trig_len)!=t->trigger_shape) return 0;
+    d2k_group_key key;
+    if(d2k_group_key_make(&key,t->transport,t->family,t->trigger_shape,
+                         t->measure_path[0]?t->measure_path:"/","")) return 0;
+    const d2k_domain_group *g=d2k_group_match(s->cat->groups,t->name,&key);
+    if(!g) return 0;
+    t->n_plans=t->n_known=t->next_plan=0;
+    /* Verify the inherited plan once, then distinct OWN confirmed siblings.
+       No speculative candidate reaches user traffic; install_next reserves
+       an exact trial port and normal verifier/APPLIED gates remain in force. */
+    for(int pass=0;pass<2;pass++) {
+        for(size_t i=0;i<s->cat->groups->n_observations;i++) {
+            const d2k_group_observation *o=&s->cat->groups->observations[i];
+            if(!(o->evidence&D2K_GROUP_BLOCKED_CONFIRMED) ||
+               (o->evidence&(D2K_GROUP_DIRECT_CLEAR|D2K_GROUP_PLAN_FAILED)) ||
+               !d2k_group_key_same(&key,&o->key) || !d2k_domain_member(o->name,g->suffix) ||
+               (pass==0)!=(!strcmp(o->plan_id,g->plan_id))) continue;
+            for(size_t bi=0;bi<s->cat->n_boxes;bi++) {
+                const d2k_cat_box *box=&s->cat->boxes[bi];
+                const d2k_cat_plan *p=plan_by_id(box,o->plan_id);
+                if(!p || !p->enabled || !p->text ||
+                   strcmp(p->proto,t->transport==17?"quic":"tls") ||
+                   strlen(p->text)>=sizeof t->plans[0]) continue;
+                int confirmed=0;
+                for(size_t j=0;j<box->n_binds;j++) {
+                    const d2k_cat_binding *bd=&box->binds[j];
+                    if(bd->enabled && bd->level>=3 && !strcmp(bd->kind,"name") &&
+                       !strcmp(bd->target,o->name) && !strcmp(bd->plan_id,o->plan_id) &&
+                       (bd->transport?bd->transport:6)==key.transport &&
+                       (bd->family?bd->family:4)==key.family && bd->shape==key.shape &&
+                       !strcmp(bd->probe_path[0]?bd->probe_path:"/",key.probe_path) &&
+                       !strcmp(bd->ech_origin,key.ech_origin)) confirmed=1;
+                }
+                if(!confirmed) continue;
+                int duplicate=0;
+                for(size_t j=0;j<t->n_plans;j++)
+                    if(!strcmp(t->plans[j],p->text)) duplicate=1;
+                if(duplicate || t->n_plans>=sizeof t->plans/sizeof t->plans[0]) break;
+                snprintf(t->plans[t->n_plans],sizeof t->plans[0],"%s",p->text);
+                snprintf(t->plan_boxes[t->n_plans],sizeof t->plan_boxes[0],"%s",box->id);
+                t->n_plans++;
+                break;
+            }
+        }
+    }
+    if(!t->n_plans) return 0;
+    t->family_fast=1; t->n_known=t->n_plans; t->researched=1;
+    t->asked_shape=t->trigger_shape; t->state=T_PLANNING;
+    say(s,"по %s отказ семейного обхода: сначала проверяю %zu собственных планов семейства, без нового исследования",
+        t->name,t->n_plans);
+    return 1;
 }
 
 static int launch_task(d2k_sched *s, task *t) {
@@ -4156,7 +4238,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
                 D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(hello,len);
     }
     if (t->trigger_planned == D2K_LINK_PLANNED_NO &&
-        installed_family_ready(s, t, 0)) {
+        installed_family_ready(s, t, 0, 0)) {
         say(s, "по %s отдельный поиск не запускаю: совместимое семейство уже установлено; "
                "новый поток наследует его план (форма %u, IPv%u)",
             t->name, (unsigned)t->trigger_shape, (unsigned)t->family);
@@ -4218,6 +4300,7 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     t->reasked = 1;
     t->ctrl_len = 0;   /* контроль соберётся из новых байт */
     t->researched = 0;
+    t->family_fast = 0;
     t->n_plans = 0;
     t->next_plan = 0;
     say(s, "по %s привязка добыта заготовкой, а снимок клиента есть — "
@@ -5222,6 +5305,12 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                       "следующий поток наследует обход без отдельного замера",t->name);
                 task_done(t); moved++; continue;
             }
+            int recovery_waiting=0;
+            if(!family_recovery_eligible(s,t))
+                for(size_t j=0;j<SCHED_MAX_TASKS;j++)
+                    if(s->tasks[j].state==T_QUEUED && family_recovery_eligible(s,&s->tasks[j]))
+                        recovery_waiting=1;
+            if(recovery_waiting) continue;
             if (now_ms - t->queued_ms > SCHED_TASK_LIFE_MS) {
                 say(s, "по %s подозрение устарело в очереди — сетевой замер не запускал",
                     t->name);
@@ -5339,7 +5428,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
-            if (t->trigger_planned == D2K_LINK_PLANNED_NO && installed_family_ready(s, t, 0)) {
+            if (t->trigger_planned == D2K_LINK_PLANNED_NO && installed_family_ready(s, t, 0, 0)) {
                 say(s, "по %s снимок подтвердил совместимое установленное семейство; "
                        "отдельный поиск прекращаю без перебора", t->name);
                 task_done(t); moved++; continue;
@@ -5800,6 +5889,13 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            прикладного обмена, и в каталог не идёт ничего (§10). */
                         say(s, "по %s план %zu: зонд не дошёл до приложения (%s) — беру следующего кандидата",
                             t->name, t->next_plan, t->ver.reason);
+                        if(t->family_fast==1 && touched &&
+                           s->dropped_seen==t->ver_dropped0 &&
+                           t->ver.level>=D2K_VER_TRANSPORT) {
+                            char failed_id[40]; uint8_t wire_id[D2K_PLAN_ID_LEN];
+                            plan_ident(t->plans[t->next_plan-1],failed_id,sizeof failed_id,wire_id);
+                            group_record(s,t,D2K_GROUP_PLAN_FAILED,failed_id,t->asked_shape,now_ms);
+                        }
                         ver_close(t);
                         t->state = T_PLANNING;
                     }
@@ -5904,6 +6000,14 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 continue;
             }
             if (inst != 0) {
+                if(t->family_fast==1) {
+                    remove_trial_exact(s,t);
+                    t->family_fast=2; t->n_plans=t->n_known=t->next_plan=0;
+                    t->box_id[0]=0; t->state=T_ASKING;
+                    say(s,"по %s собственные планы семейства не подтвердились; теперь выполняю прямую диагностику",t->name);
+                    if(start_worker(s,t,JOB_CLASSIFY)!=0) task_fail(s,t,now_ms);
+                    moved++; continue;
+                }
                 if (t->rx_bootstrap_only && !t->vol.rx_cut) {
                     if (t->family_reuse == 2) {
                         remove_trial_exact(s, t);

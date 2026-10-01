@@ -71,6 +71,33 @@ int main(void) {
     observe(s,"b.mixed.net","plan-b",1,modern);
     observe(s,"c.mixed.net","plan-c",1,modern);
     CHECK(!d2k_group_match(s,"new.mixed.net",&modern));
+    /* A measured failure must outweigh a one-vote popularity advantage. */
+    observe(s,"a.recovery.net","plan-a",1,modern);
+    observe(s,"b.recovery.net","plan-a",1,modern);
+    observe(s,"c.recovery.net","plan-a",1,modern);
+    observe(s,"d.recovery.net","plan-a",1,modern);
+    observe(s,"e.recovery.net","plan-b",1,modern);
+    observe(s,"f.recovery.net","plan-b",1,modern);
+    observe(s,"g.recovery.net","plan-b",1,modern);
+    g=d2k_group_match(s,"new.recovery.net",&modern);
+    CHECK(g && !strcmp(g->plan_id,"plan-a"));
+    observe(s,"failed.recovery.net","plan-a",4,modern);
+    g=d2k_group_match(s,"new.recovery.net",&modern);
+    CHECK(g && !strcmp(g->plan_id,"plan-b"));
+    CHECK(d2k_group_restore(s)==0);
+    g=d2k_group_match(s,"new.recovery.net",&modern);
+    CHECK(g && !strcmp(g->plan_id,"plan-b"));
+    observe(s,"failed.recovery.net","plan-b",4,modern);
+    unsigned failed_plans=0;
+    for(size_t i=0;i<s->n_observations;i++)
+        if(!strcmp(s->observations[i].name,"failed.recovery.net") &&
+           (s->observations[i].evidence&D2K_GROUP_PLAN_FAILED)) failed_plans++;
+    CHECK(failed_plans==2);
+    CHECK(d2k_group_restore(s)==0);
+    observe(s,"failed.recovery.net","plan-b",1,modern);
+    CHECK(d2k_group_restore(s)==0);
+    observe(s,"failed.recovery.net","plan-a",1,modern);
+    CHECK(d2k_group_restore(s)==0);
     /* A proven clean member becomes an exception, not a family-wide outage. */
     observe(s,"clean.googlevideo.com","",2,modern);
     CHECK(d2k_group_match(s,"rr-new.googlevideo.com",&modern));
