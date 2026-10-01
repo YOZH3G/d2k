@@ -1227,8 +1227,9 @@ int main(int argc, char **argv) {
         fresh.planned = D2K_LINK_PLANNED_YES;
         fresh.code = D2K_SUSPECT_SILENT;
         d2k_sched_event(s, &fresh); spin(s, 2);
-        CHECK(!d2k_sched_active(s) && !tcp_calls && !vol_calls && !ver_calls,
-              "single silent inherited flow cannot start a full per-member search");
+        CHECK(tcp_calls > 0 || vol_calls > 0 || ver_calls > 0,
+              "silent flow after family plan execution remains eligible for recovery");
+        settle(s);
         char live_path[] = "/tmp/d2k-family-live-XXXXXX";
         int live_fd = mkstemp(live_path); CHECK(live_fd >= 0, "family live fixture");
         if (live_fd >= 0) {

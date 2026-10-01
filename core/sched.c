@@ -4155,8 +4155,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         t->trigger_shape = d2k_hello_ech_offer(hello,len,NULL)==1 ?
                 D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(hello,len);
     }
-    if ((t->trigger_planned == D2K_LINK_PLANNED_NO ||
-         (t->trigger_planned == D2K_LINK_PLANNED_YES && t->trigger_code == D2K_SUSPECT_SILENT)) &&
+    if (t->trigger_planned == D2K_LINK_PLANNED_NO &&
         installed_family_ready(s, t, 0)) {
         say(s, "по %s отдельный поиск не запускаю: совместимое семейство уже установлено; "
                "новый поток наследует его план (форма %u, IPv%u)",
