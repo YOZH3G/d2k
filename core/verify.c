@@ -280,7 +280,17 @@ typedef struct {
     char *err;
     size_t errcap;
     d2k_resource_scan *scan;
+    uint8_t prefix[4096];
+    size_t prefix_len;
 } body_stream;
+
+static void body_feed(body_stream *s, const uint8_t *p, size_t n) {
+    size_t take = sizeof s->prefix - s->prefix_len;
+    if (take > n) take = n;
+    memcpy(s->prefix + s->prefix_len, p, take);
+    s->prefix_len += take;
+    d2k_resource_feed(s->scan, p, n);
+}
 
 /* Следующий байт из уже прочитанной части ответа либо из TLS. */
 static int body_byte(body_stream *s, uint8_t *out) {
@@ -308,7 +318,7 @@ static int body_exact(body_stream *s, uint64_t n, uint64_t *bytes) {
         }
         size_t take = s->used - s->pos;
         if ((uint64_t)take > n) { take = (size_t)n; }
-        d2k_resource_feed(s->scan, s->buf + s->pos, take);
+        body_feed(s, s->buf + s->pos, take);
         s->pos += take;
         n -= take;
         *bytes += take;
@@ -346,7 +356,7 @@ static int read_http_body(body_stream *s, int status, int has_length,
     if (has_length) {
         uint64_t already = (uint64_t)(s->used - s->pos);
         if (already > length) { already = length; }
-        d2k_resource_feed(s->scan, s->buf + s->pos, (size_t)already);
+        body_feed(s, s->buf + s->pos, (size_t)already);
         s->pos += (size_t)already;
         *body_bytes = already;
         if (already < length && body_exact(s, length - already, body_bytes) != 0) { return 0; }
@@ -387,7 +397,7 @@ static int read_http_body(body_stream *s, int status, int has_length,
     /* Без явного framing RFC 9112 использует закрытие соединения как конец
        тела. Читаем до close_notify; timeout/RST — неполная страница. */
     *body_bytes = (uint64_t)(s->used - s->pos);
-    d2k_resource_feed(s->scan, s->buf + s->pos, s->used - s->pos);
+    body_feed(s, s->buf + s->pos, s->used - s->pos);
     s->pos = s->used;
     for (;;) {
         int64_t left = s->until - verify_now_ms();
@@ -396,7 +406,7 @@ static int read_http_body(body_stream *s, int status, int has_length,
         if (got == 0) { *body_expected = *body_bytes; return 1; }
         if (got < 0) { return 0; }
         if (UINT64_MAX - *body_bytes < (uint64_t)got) { return 0; }
-        d2k_resource_feed(s->scan, s->buf, (size_t)got);
+        body_feed(s, s->buf, (size_t)got);
         *body_bytes += (uint64_t)got;
     }
 }
@@ -408,9 +418,11 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
                           int *body_framing_valid, int *body_encoding,
                           char *location, size_t location_cap,
                           d2k_resource *resources, size_t *n_resources,
+                          d2k_http_reply_result *http_reply,
                           char *err, size_t errcap) {
     uint8_t buf[8193];
     size_t used = 0;
+    *http_reply = (d2k_http_reply_result){D2K_HTTP_NEUTRAL, ""};
     if (n_resources) *n_resources = 0;
     if (cloudflare_challenge) { *cloudflare_challenge = 0; }
     if (body_bytes) { *body_bytes = 0; }
@@ -445,6 +457,10 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
             }
             int code = (buf[9] - '0') * 100 + (buf[10] - '0') * 10 + buf[11] - '0';
             if (code >= 200) {
+                /* Legal denial is established by valid final headers/status,
+                   independently of malformed body framing below. */
+                if (code == 451)
+                    *http_reply = d2k_http_reply_classify(code, NULL, 0, NULL, 0, 0);
                 if (cloudflare_challenge) {
                     *cloudflare_challenge = has_cf_challenge(buf, hdr_len, eol);
                 }
@@ -452,6 +468,7 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
                 int transfer_encoding_seen = 0;
                 int encoding = 0;
                 int encoding_seen = 0;
+                int location_seen = 0;
                 int html = 0;
                 uint64_t length = 0;
                 size_t pos = (size_t)(eol - buf) + 2;
@@ -497,10 +514,12 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
                             else if (span_eq_ascii_ci(line + v, end - v, "identity")) { encoding = 0; }
                             else { encoding = 2; }
                         } else if (span_eq_ascii_ci(line, kn, "location") && location && location_cap) {
+                            int duplicate = location_seen++;
+                            if (duplicate) framing_valid = 0;
                             size_t end = ln;
                             while (end > v && (line[end - 1] == ' ' || line[end - 1] == '\t')) { end--; }
                             size_t value_len = end - v;
-                            if (value_len < location_cap) {
+                            if (!duplicate && value_len < location_cap) {
                                 int safe = 1;
                                 for (size_t k = v; k < end; k++) {
                                     if (line[k] < 0x21 || line[k] == 0x7f) { safe = 0; break; }
@@ -539,6 +558,8 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
                     *body_framing_valid = framing_valid && !(has_length && chunked);
                 }
                 if (body_encoding) { *body_encoding = encoding; }
+                *http_reply = d2k_http_reply_classify(code, location, encoding,
+                    bs.prefix, bs.prefix_len, got + (complete ? 0 : 1));
                 if (complete && bs.scan && resources && n_resources) {
                     memcpy(resources, scan.refs, sizeof scan.refs);
                     *n_resources = scan.count;
@@ -620,6 +641,25 @@ static int redirect_path(const char *location, const char *host,
     return 1;
 }
 
+/* A complete redirect is an application response from the measured host,
+   not proof that its destination loaded. Never follow a different origin. */
+static int https_redirect_response(int code, const char *location) {
+    if (code != 301 && code != 302 && code != 303 && code != 307 && code != 308) return 0;
+    if (!location || strlen(location) < 9 ||
+        !span_eq_ascii_ci((const uint8_t *)location, 8, "https://")) return 0;
+    const char *p = location + 8;
+    int host_chars = 0;
+    for (; *p && *p != '/' && *p != '?' && *p != '#'; p++) {
+        unsigned char c = (unsigned char)*p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9')) host_chars++;
+        else if (c != '.' && c != '-' && c != ':' && c != '[' && c != ']') return 0;
+    }
+    if (!host_chars) return 0;
+    for (; *p; p++) if ((unsigned char)*p <= 0x20 || (unsigned char)*p == 0x7f) return 0;
+    return 1;
+}
+
 static void request_complete_page(read_fn rd, write_fn wr, void *sess,
                                   const char *host, int encoding,
                                   const char *initial_path,
@@ -644,17 +684,29 @@ static void request_complete_page(read_fn rd, write_fn wr, void *sess,
             return;
         }
         r->location[0] = '\0';
+        d2k_http_reply_result http_reply;
         int code = read_status_rd(rd, sess, deadline_ms,
                                   &r->cloudflare_challenge, &r->body_bytes,
                                   &r->body_expected, &r->body_complete,
                                   &r->body_has_length, &r->body_chunked,
                                   &r->body_framing_valid, &r->body_encoding, r->location,
-                                  sizeof r->location, r->resources, &r->n_resources, err, errcap);
+                                  sizeof r->location, r->resources, &r->n_resources,
+                                  &http_reply, err, errcap);
         r->status = code;
+        r->http_outcome = http_reply.outcome;
+        snprintf(r->http_evidence, sizeof r->http_evidence, "%s", http_reply.evidence);
         if (r->cloudflare_challenge) { r->level = D2K_VER_CHALLENGE; return; }
+        if (http_reply.outcome == D2K_HTTP_BLOCKED ||
+            http_reply.outcome == D2K_HTTP_LEGAL_DENIAL) {
+            r->level = http_reply.outcome == D2K_HTTP_BLOCKED ?
+                D2K_VER_BLOCKPAGE : D2K_VER_DENIED;
+            snprintf(r->reason, sizeof r->reason, "HTTP отказ: %s", http_reply.evidence);
+            return;
+        }
         if (code >= 300 && code < 400) {
             char next[sizeof path];
-            if (redirects < 3 && redirect_path(r->location, host, next, sizeof next)) {
+            if (r->body_framing_valid && redirects < 3 &&
+                redirect_path(r->location, host, next, sizeof next)) {
                 if (initial_path && !d2k_resource_path_ok(next)) {
                     r->level = D2K_VER_HANDSHAKE;
                     snprintf(r->reason, sizeof r->reason, "stylesheet перенаправлен не на ресурс; не подтверждено");
@@ -662,6 +714,15 @@ static void request_complete_page(read_fn rd, write_fn wr, void *sess,
                 }
                 memcpy(path, next, strlen(next) + 1);
                 continue;
+            }
+            if (!initial_path && r->body_complete &&
+                https_redirect_response(code, r->location) &&
+                !redirect_path(r->location, host, next, sizeof next)) {
+                r->level = D2K_VER_APPLICATION;
+                snprintf(r->reason, sizeof r->reason,
+                         "HTTP %d, HTTPS redirect получен полностью (%llu байт); цель перехода не проверялась",
+                         code, (unsigned long long)r->body_bytes);
+                return;
             }
             r->level = D2K_VER_HANDSHAKE;
             snprintf(r->reason, sizeof r->reason,
@@ -778,6 +839,14 @@ static d2k_ver_result verify_probe13_on(int use_fd, const char *ip, uint16_t por
                                    hello_wire, encoding, mark, path, NULL);
 }
 
+static void ech_http_denial(d2k_ver_result *r) {
+    if (r->status >= 400 && r->level != D2K_VER_DENIED && r->level != D2K_VER_BLOCKPAGE) {
+        /* An origin refusal/rate limit is not permission to hammer it. */
+        r->level = D2K_VER_CHALLENGE;
+        snprintf(r->reason, sizeof r->reason, "ECH origin ответил HTTP %d; подбор не должен усиливать отказ сервера", r->status);
+    }
+}
+
 d2k_ver_result d2k_verify_probe_ech_on(int use_fd, const char *ip, uint16_t port,
     const char *origin, const d2k_ech_config *config, int deadline_ms,
     size_t hello_wire, uint32_t mark, const char *path) {
@@ -790,12 +859,7 @@ d2k_ver_result d2k_verify_probe_ech_on(int use_fd, const char *ip, uint16_t port
     }
     d2k_ver_result r = verify_probe13_internal(use_fd, ip, port, origin, deadline_ms,
                                                hello_wire, 0, mark, path, config);
-    if (r.status >= 400) {
-        /* A real origin denial/rate limit is not a reason to hammer it with
-         * more bypass candidates and not confirmation that its page works. */
-        r.level = D2K_VER_CHALLENGE;
-        snprintf(r.reason, sizeof r.reason, "ECH origin ответил HTTP %d; подбор не должен усиливать отказ сервера", r.status);
-    }
+    ech_http_denial(&r);
     return r;
 }
 
@@ -1045,10 +1109,16 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
             r.status = st;
             snprintf(r.reason, sizeof r.reason,
                      "заголовки HTTP/3 получены, статус %d", st);
+            if (st == 451) {
+                r.level = D2K_VER_DENIED;
+                r.http_outcome = D2K_HTTP_LEGAL_DENIAL;
+                snprintf(r.http_evidence, sizeof r.http_evidence, "HTTP 451");
+                snprintf(r.reason, sizeof r.reason, "HTTP отказ: HTTP 451");
+            }
             break;
         }
     }
-    if (r.level != D2K_VER_APPLICATION) {
+    if (r.level != D2K_VER_APPLICATION && r.level != D2K_VER_DENIED) {
         snprintf(r.reason, sizeof r.reason,
                  "кода ответа HTTP/3 нет: принято %zu байт", got);
     }

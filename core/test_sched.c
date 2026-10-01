@@ -6482,11 +6482,36 @@ voice_only_run:
         d2k_catalog_free(&cC);
     }
 
-    /* --- сервер представился ЧУЖИМ именем: это не обход ---------------- */
+    /* Explicit HTTP denial cannot promote a plan, even with APPLIED. */
+    for (int denied = 0; denied < 2; denied++) {
+        d2k_catalog cB = {0};
+        d2k_sched *s = d2k_sched_new(&cB, sv[0], 0x2d);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = denied ? D2K_VER_DENIED : D2K_VER_BLOCKPAGE;
+        ver_fail_first = 0; ver_calls = 0;
+        ver_answer_port = (uint16_t)(40178 + denied);
+        ver_name_ok = 1;
+        forget_sent(); saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev h = ev_hello(6, ver_answer_port, "blocked.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, ver_answer_port);
+        d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev ap = ev_applied(6, ver_answer_port);
+        d2k_sched_event(s, &ap);
+        run_out(s);
+        CHECK(binding_of(&cB, "blocked.example", 6) == NULL,
+              "явная заглушка/451 сохранены как подтверждённый обход");
+        if (denied) CHECK(ver_calls == 1 && said("юридический отказ"),
+              "HTTP 451 не остановил перебор после первого ответа");
+        d2k_sched_free(s); d2k_catalog_free(&cB);
+    }
+    ver_answer = D2K_VER_APPLICATION; ver_name_ok = -1;
+
+    /* --- mismatch alone is diagnostic, not evidence of a block page ---- */
     {
-        /* Коробка, терминирующая TLS, доводит зонд до приложения и отвечает
-           страницей блокировки. Уровень «приложение» при этом настоящий —
-           обманывает не он, а вывод из него. */
+        /* Complete ordinary response from a shared/default TLS frontend. */
         d2k_catalog cN;
         memset(&cN, 0, sizeof cN);
         d2k_sched *s = d2k_sched_new(&cN, sv[0], 0x2d);
@@ -6509,10 +6534,10 @@ voice_only_run:
         d2k_sched_event(s, &ap);
         run_out(s);
 
-        CHECK(said("представился ЧУЖИМ"),
-              "разговор с чужим сервером не назван своим именем");
-        CHECK(binding_of(&cN, "подмена.цель", 6) == NULL,
-              "страница блокировки записана обходом — каталог наполняется ложью");
+        CHECK(said("сертификат не совпал"),
+              "несовпадение сертификата потеряло диагностическое предупреждение");
+        CHECK(binding_of(&cN, "подмена.цель", 6) != NULL,
+              "полный ответ и исполненный план отвергнуты только из-за имени сертификата");
         ver_name_ok = -1;
         d2k_sched_free(s);
         d2k_catalog_free(&cN);

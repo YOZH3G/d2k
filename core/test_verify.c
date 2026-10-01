@@ -99,6 +99,19 @@ static const struct {
     {"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Encoding: identity\r\nContent-Length: 2\r\n\r\nok", 200, 0, 0, 1},
     {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4000\r\nshort", 200, 0, 0, 0},
     {"HTTP/1.1 302 Found\r\nLocation: https://other.example/\r\nContent-Length: 0\r\n\r\n", 302, 0, 0, 1},
+    {"HTTP/1.1 302 Found\r\nLocation: https://other.example/\r\nContent-Length: 20\r\n\r\nshort", 302, 0, 0, 0},
+    {"HTTP/1.1 302 Found\r\nLocation: http://other.example/\r\nContent-Length: 0\r\n\r\n", 302, 0, 0, 1},
+    {"HTTP/1.1 302 Found\r\nLocation: https:///\r\nContent-Length: 0\r\n\r\n", 302, 0, 0, 1},
+    {"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n", 302, 0, 0, 1},
+    {"HTTP/1.1 302 Found\r\nLocation: https://warning.rt.ru/\r\nContent-Length: 0\r\n\r\n", 302, 0, 0, 1},
+    {"HTTP/1.1 302 Found\r\nLocation: //eais.rkn.gov.ru/blocked\r\nContent-Length: 0\r\n\r\n", 302, 0, 0, 1},
+    {"HTTP/1.1 302 Found\r\nLocation: https://warning.rt.ru.evil.example/\r\nContent-Length: 0\r\n\r\n", 302, 0, 0, 1},
+    {"HTTP/1.1 451 Unavailable For Legal Reasons\r\nContent-Length: 0\r\n\r\n", 451, 0, 0, 1},
+    {"HTTP/1.1 403 Forbidden\r\nContent-Length: 21\r\n\r\naccess blocked by rkn", 403, 0, 0, 1},
+    {"HTTP/1.1 403 Forbidden\r\nContent-Length: 46\r\n\r\n<a href=\"https://eais.rkn.gov.ru/\">blocked</a>", 403, 0, 0, 1},
+    {"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n7\r\naccess \r\nE\r\nblocked by rkn\r\n0\r\n\r\n", 403, 0, 0, 1},
+    {"HTTP/1.1 403 Forbidden\r\nContent-Encoding: gzip\r\nContent-Length: 21\r\n\r\naccess blocked by rkn", 403, 0, 0, 1},
+    {"HTTP/1.1 403 Forbidden\r\nLink: <https://eais.rkn.gov.ru/>\r\nContent-Length: 0\r\n\r\n", 403, 0, 0, 1},
     {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n0\r\n\r\n", 200, 0, 0, 0},
 };
 
@@ -1044,10 +1057,23 @@ int main(void) {
         }
         CHECK(r.status == replies[i].status, "неверный статус HTTP на граничном ответе");
         int expected_application = replies[i].body_complete &&
-            !(replies[i].status >= 300 && replies[i].status < 400) &&
+            (!(replies[i].status >= 300 && replies[i].status < 400) ||
+             strstr(replies[i].text, "Location: https://other.example/\r\n") != NULL ||
+             strstr(replies[i].text, "Location: https://warning.rt.ru.evil.example/\r\n") != NULL) &&
             !replies[i].cloudflare_challenge;
+        int block_fixture = replies[i].status == 451 ||
+            strstr(replies[i].text, "Location: https://warning.rt.ru/\r\n") != NULL ||
+            strstr(replies[i].text, "Location: //eais.rkn.gov.ru/blocked\r\n") != NULL ||
+            (replies[i].status == 403 &&
+             strstr(replies[i].text, "Content-Encoding: gzip") == NULL &&
+             (strstr(replies[i].text, "\r\n\r\naccess blocked by rkn") != NULL ||
+              strstr(replies[i].text, "<a href=") != NULL ||
+              strstr(replies[i].text, "blocked by rkn\r\n0") != NULL));
+        if (block_fixture) expected_application = 0;
+        CHECK(!block_fixture || strstr(r.reason, "HTTP отказ:") != NULL,
+              "явная заглушка/451 не получили отдельную причину отказа");
         CHECK((r.level == D2K_VER_APPLICATION) == expected_application,
-              "неполное тело или непосещённый redirect засчитан как страница");
+              "полный HTTPS redirect потерян либо неполный/невалидный ответ засчитан");
         CHECK(r.body_complete == replies[i].body_complete,
               "ошибочный вывод о полноте HTTP-тела");
         CHECK(r.cloudflare_challenge == replies[i].cloudflare_challenge,
@@ -1081,6 +1107,17 @@ int main(void) {
         }
         d2k_verify_close(&r);
         stand_stop(&s);
+        if (replies[i].status == 302 && expected_application) {
+            port = stand_start(&s, ROLE_APP + (int)i);
+            CHECK(port != 0, "stylesheet redirect стенд не поднялся");
+            r = d2k_verify_probe_path_on(-1, "127.0.0.1", port,
+                "http.example", 600, 0, 0, 0, 0, "/assets/app.min.css");
+            CHECK(r.status == 302 && r.body_complete &&
+                  r.level != D2K_VER_APPLICATION,
+                  "redirect другого origin заменил подтверждение CSS");
+            d2k_verify_close(&r);
+            stand_stop(&s);
+        }
     }
     {
         d2k_ver_result r = d2k_verify_probe("127.0.0.1", 1, "a\r\nInjected: yes", 100, 0);

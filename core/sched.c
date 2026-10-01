@@ -4506,24 +4506,13 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        (лаборатория 13.09.2026, седьмая находка). Кандидат при этом не
        виноват и в каталог не идёт ничего — ни положительного, ни
        отрицательного (§10). Берём следующего: он может подойти обоим. */
-    /* СЕРВЕР ПРЕДСТАВИЛСЯ ЧУЖИМ ИМЕНЕМ.
-       Коробка, терминирующая TLS и отдающая страницу блокировки, выглядит для
-       зонда РОВНО как рабочий обход: рукопожатие сошлось, приложение ответило.
-       Разница видна только в сертификате, и она измерена (d2k_tls_peer_name).
-       Записать такое подтверждением значило бы наполнить каталог «обходами»,
-       которые ведут в страницу блокировки.
-
-       Ноль — это ИЗМЕРЕННОЕ несовпадение. «Не смотрели» (-1: сертификата не
-       было, SAN не нашлось, разбор не сошёлся) сюда не попадает и попадать не
-       должно: «не измерено» не превращается в «нет» (§2.4). */
+    /* Shared frontends may legitimately return a default certificate.
+       Explicit HTTP denial is rejected before confirmation; SAN mismatch
+       alone cannot distinguish that denial from a usable response. */
     if (t->ver.name_ok == 0) {
-        say(s, "по %s план %s довёл до приложения, но сервер представился ЧУЖИМ "
-               "именем — это не обход, а разговор с кем-то другим. "
-               "Подтверждать не буду, беру следующего кандидата",
+        say(s, "по %s план %s: сертификат не совпал с запрошенным именем; "
+               "это диагностический признак, не доказательство заглушки",
             t->name, plan_id);
-        ver_close(t);
-        t->state = T_PLANNING;
-        return;
     }
     int unfit_here = 0;
     for (size_t k = 0; k < t->unfit_seen; k++) {
@@ -5209,12 +5198,14 @@ static int layered_rx_result(d2k_sched *s, task *t, int64_t now_ms) {
     int applied = 0;
     for (size_t k = 0; k < t->ver_seen; k++)
         if (ev_matches_flow(&own, &t->ver_early[k])) { applied = 1; break; }
-    int partial = applied && !t->unsent_code && t->ver.name_ok != 0 &&
+    int partial = applied && !t->unsent_code &&
+        t->ver.http_outcome != D2K_HTTP_BLOCKED && t->ver.http_outcome != D2K_HTTP_LEGAL_DENIAL &&
         d2k_volume_rx_partial(&t->ver);
     if (!t->rx_phase && !partial) return 0;
 
     if (t->rx_phase == 2) {
-        int proven = applied && !t->unsent_code && t->ver.name_ok != 0 &&
+        int proven = applied && !t->unsent_code &&
+            t->ver.http_outcome != D2K_HTTP_BLOCKED && t->ver.http_outcome != D2K_HTTP_LEGAL_DENIAL &&
             d2k_volume_rx_evidence(&t->rx_identity[0], &t->rx_identity[1], &t->ver, &t->vol);
         ver_close(t); remove_trial_exact(s, t); t->rx_phase = 0;
         if (proven) {
@@ -5737,7 +5728,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (!ready) { continue; } /* зонд в сети; срок задачи считается выше */
             join_worker(t);
             if (t->transport == 6 && t->ver.body_complete &&
-                t->ver.status >= 200 && t->ver.status < 300 && t->ver.name_ok != 0)
+                t->ver.status >= 200 && t->ver.status < 300 &&
+                t->ver.http_outcome != D2K_HTTP_BLOCKED && t->ver.http_outcome != D2K_HTTP_LEGAL_DENIAL)
                 remember_resources(s, t->ver.resources, t->ver.n_resources);
             /* Если настоящий QUIC snapshot пришёл уже после установки этого
                trial, его результат относится к профилю, а не к байтам клиента.
@@ -5779,6 +5771,14 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 cooldown_record(s, t, 1);
                 say(s, "по %s антибот-ответ: активный замер этой цели поставлен на паузу на %lld мин",
                     t->name, (long long)(SCHED_CHALLENGE_BACKOFF_MS / 60000));
+                ver_close(t);
+                task_fail(s, t, now_ms);
+                moved++;
+                continue;
+            }
+            if (t->ver.level == D2K_VER_DENIED) {
+                say(s, "по %s HTTP 451: юридический отказ, не доказательство блокировки провайдера; перебор остановлен",
+                    t->name);
                 ver_close(t);
                 task_fail(s, t, now_ms);
                 moved++;

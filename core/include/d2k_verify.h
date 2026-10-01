@@ -47,14 +47,17 @@
 
 #include <stdint.h>
 #include "d2k_resource.h"
+#include "d2k_http_reply.h"
 #include "d2k_tls13core.h"
 
 typedef enum {
     D2K_VER_NOT_MEASURED = 0, /* обращение не состоялось — про линию не сказано ничего */
     D2K_VER_TRANSPORT,        /* TCP встал, рукопожатие не дошло до конца */
     D2K_VER_HANDSHAKE,        /* рукопожатие завершено, прикладного ответа нет */
-    D2K_VER_APPLICATION,      /* конечный HTTP-ответ и его тело полностью получены */
-    D2K_VER_CHALLENGE         /* Cloudflare cf-mitigated: challenge; не успех обхода */
+    D2K_VER_APPLICATION,      /* полный HTTP-ответ, включая HTTPS redirect другой цели */
+    D2K_VER_CHALLENGE,        /* Cloudflare cf-mitigated: challenge; не успех обхода */
+    D2K_VER_BLOCKPAGE,        /* явная сигнатура страницы блокировки */
+    D2K_VER_DENIED            /* HTTP 451: юридический отказ, не диагноз DPI */
 } d2k_ver_level;
 
 typedef struct {
@@ -67,8 +70,10 @@ typedef struct {
     int      body_chunked;   /* применён Transfer-Encoding: chunked */
     int      body_framing_valid; /* разбор framing однозначен, даже если тело оборвалось */
     int      body_encoding;  /* 0 identity/нет, 1 gzip, 2 другое/несколько */
-    char     location[512];  /* Location ответа; только для внутреннего redirect-follow */
+    char     location[512];  /* Location ответа; другая цель не посещается этим зондом */
     int      cloudflare_challenge; /* получен cf-mitigated: challenge */
+    d2k_http_outcome http_outcome;
+    char     http_evidence[64];
     uint16_t local_port;    /* местный порт обращения — ключ потока для привязки события */
     uint8_t  local_ip4[4];
     uint8_t  family;
@@ -79,11 +84,9 @@ typedef struct {
        1 — да, 0 — НЕТ, -1 — сказать нечего. Значимо только начиная с уровня
        рукопожатия: до него сертификата не бывает.
 
-       Это НЕ подлинность (цепочка не строится) и НЕ уровень доказательства:
-       зонд как был на третьем, так и остаётся. Поле нужно ровно затем, чтобы
-       коробка, ТЕРМИНИРУЮЩАЯ TLS и отдающая страницу блокировки, не
-       записалась успехом плана: зонду она выглядит как рабочий обход —
-       рукопожатие сошлось, HTTP ответил 200. */
+       Это НЕ подлинность (цепочка не строится) и НЕ доказательство заглушки.
+       Для обычного TLS несовпадение диагностическое; ECH требует отдельного
+       строгого подтверждения имени origin и принятия ECH. */
     int      name_ok;
     /* Зонд НЕ УМЕЕТ такой транспорт — и не научится сменой кандидата.
      *

@@ -62,6 +62,7 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 HDR += include/d2k_ip6frag_send.h
 HDR += profiles/rx_fake.h
 HDR += include/d2k_resource.h
+HDR += include/d2k_http_reply.h
 HDR += include/d2k_domain.h include/d2k_groups.h
 SRC += domain.c groups.c
 domain.o: domain.c include/d2k_domain.h profiles/psl_index.h
@@ -86,6 +87,20 @@ TESTS   = test_stun test_voice test_meas test_verdict test_crypto test_h3 test_q
 TESTS += test_ech
 TESTS += test_domain test_groups
 TESTS += test_groups_catalog
+TESTS += test_http_reply
+TESTS += test_verify_http
+check: test-verify-http
+.PHONY: test-verify-http
+test-verify-http: test_verify_http
+	./test_verify_http
+test_verify_http: test_verify_http.c verify.c tls12.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< tls12.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+check: test-http-reply
+.PHONY: test-http-reply
+test-http-reply: test_http_reply
+	./test_http_reply
+test_http_reply: test_http_reply.c include/d2k_http_reply.h
+	$(CC) $(CFLAGS) -o $@ test_http_reply.c $(LDFLAGS)
 check: test-domain test-groups
 check: test-groups-catalog
 .PHONY: test-groups-catalog
