@@ -57,6 +57,28 @@ int main(void) {
         CHECK(!loads(b,sizeof b-1), "empty fragment record accepted");
     }
 
+    /* REC_UDPLEN (0x010e): удлинение датаграммы, исполнитель 9, только UDP. */
+    {
+        uint8_t b[] = {'D','2','K','P',0,1,0,9,0,0,0,3,
+                       0,2,0,2,17,2, 1,3,0,1,0, 1,14,0,2,0,100};
+        CHECK(loads(b,sizeof b), "udplen plan rejected");
+        b[7]=8; CHECK(!loads(b,sizeof b), "udplen requires executor 9");
+        b[7]=9; b[28]=0; CHECK(!loads(b,sizeof b), "zero udplen accepted");
+        b[28]=100; b[16]=6; CHECK(!loads(b,sizeof b), "udplen accepted for TCP");
+        b[16]=0; CHECK(!loads(b,sizeof b), "udplen without transport accepted");
+        b[16]=17; b[22]=1; CHECK(!loads(b,sizeof b), "udplen with reverse order accepted");
+        b[22]=0;
+        uint8_t s[] = {'D','2','K','P',0,1,0,9,0,0,0,3,
+                       0,2,0,2,17,2, 1,3,0,1,0, 1,14,0,1,100};
+        CHECK(!loads(s,sizeof s), "one-byte udplen record accepted");
+        uint8_t d[] = {'D','2','K','P',0,1,0,9,0,0,0,4,
+                       0,2,0,2,17,2, 1,3,0,1,0, 1,14,0,2,0,100, 1,14,0,2,0,100};
+        CHECK(!loads(d,sizeof d), "repeated udplen accepted");
+        uint8_t f[] = {'D','2','K','P',0,1,0,9,0,0,0,4,
+                       0,2,0,2,17,2, 1,3,0,1,0, 1,14,0,2,0,100, 1,12,0,1,1};
+        CHECK(!loads(f,sizeof f), "udplen with ipfrag accepted (donor drop precedes udplen)");
+    }
+
     {
         uint8_t b[] = {'D','2','K','P',0,1,0,4,0,0,0,2,
                        0,2,0,2,6,1, 1,9,0,1,D2K_WIRE_DETECT_TCP};

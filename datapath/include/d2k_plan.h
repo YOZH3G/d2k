@@ -32,7 +32,9 @@
  * Initial в 40 мкс друг от друга, и коробка складывает имя из обоих. */
 /* Version 7: original IPv4/UDP fragment shapes, independently of fake.
  * Version 8 adds per-fake TLS random/session-ID runtime modifiers. */
-#define D2K_EXEC_VERSION 8
+/* Version 9 adds REC_UDPLEN: the whole UDP payload is re-emitted with N
+ * appended zero bytes (zapret udplen increment=N, donor QUIC compose). */
+#define D2K_EXEC_VERSION 9
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_WIRE_TCP_TEMPLATE 2
 #define D2K_SCHEMA_MAX   1

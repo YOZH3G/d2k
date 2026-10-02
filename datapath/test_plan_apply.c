@@ -13,6 +13,9 @@
 /* Потолок посылок в результате — проверяем, что самое длинное плечо донора
    в него помещается: число и плечо обязаны сходиться в одном месте. */
 #include "d2k_session.h"
+/* UDP length/checksum of the lengthened datagram are checked on the real
+   wire builder, not on the emit fields alone. */
+#include "d2k_wire.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -348,6 +351,103 @@ static void init_frag(d2k_pkt *in, size_t have, size_t record_total) {
     in->sni_len = 8;
 }
 
+/* udplen — donor compose `--lua-desync=udplen:payload=quic_initial:dir=out:
+ * increment=100` (questions.go:331-334). zapret udplen (lua/zapret-antidpi.lua
+ * function udplen) appends `increment` bytes of pattern, default "\x00", to
+ * the L4 payload: payload .. pattern("\x00", 1, 100). The first 1250 bytes
+ * stay byte-identical; only the tail is new, all zeros. */
+static uint32_t ones_sum(const uint8_t *b, size_t n, uint32_t acc) {
+    size_t i = 0;
+    for (; i + 1 < n; i += 2) acc += (uint32_t)b[i] << 8 | b[i + 1];
+    if (i < n) acc += (uint32_t)b[i] << 8;
+    return acc;
+}
+static int udp4_ok(const uint8_t *pkt, size_t total) {
+    uint32_t acc = 0;
+    size_t ulen = total - 20;
+    uint8_t ph[12];
+    memcpy(ph, pkt + 12, 8); ph[8] = 0; ph[9] = 17;
+    ph[10] = (uint8_t)(ulen >> 8); ph[11] = (uint8_t)ulen;
+    acc = ones_sum(ph, sizeof ph, 0);
+    acc = ones_sum(pkt + 20, ulen, acc);
+    while (acc >> 16) acc = (acc & 0xffff) + (acc >> 16);
+    return (uint16_t)~acc == 0;
+}
+
+static void test_udplen(void) {
+    static const uint8_t plan[] = {'D','2','K','P',0,1,0,9,0,0,0,3,
+        0,2,0,2,17,2, 1,3,0,1,0, 1,14,0,2,0,100};
+    static uint8_t initial[1250], before[1250];
+    char err[160];
+    for (size_t i = 0; i < sizeof initial; i++) initial[i] = (uint8_t)(0xc0 ^ (i * 7));
+    memcpy(before, initial, sizeof initial);
+    d2k_plan *p = NULL;
+    int rc = d2k_plan_load(plan, sizeof plan, &p, err, sizeof err);
+    if (rc) printf("udplen plan rejected: %s\n", err);
+    CHECK(rc == 0, "udplen plan loads");
+    if (!p) return;
+    CHECK(d2k_plan_max_emit(p) >= 20 + 8 + 1200 + 100,
+          "max_emit must count the 100 bytes the plan adds to a >=1200-byte Initial");
+    d2k_pkt in = {0};
+    d2k_actions a = {0};
+    in.payload = initial; in.payload_len = sizeof initial;
+    CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0, "udplen applies to a 1250-byte Initial");
+    CHECK(a.fate == D2K_ORIG_DROP, "lengthened datagram replaces the original");
+    CHECK(a.n == 1 && a.v[0].kind == D2K_EMIT_PAYLOAD, "udplen emits exactly one payload");
+    if (a.n == 1) {
+        const d2k_emit *e = &a.v[0];
+        CHECK(e->len == 1350, "1250 + increment 100 = 1350");
+        CHECK(e->bytes && memcmp(e->bytes, before, 1250) == 0, "original 1250 bytes unchanged");
+        int zeros = 1;
+        for (size_t i = 1250; e->bytes && i < e->len; i++) if (e->bytes[i]) zeros = 0;
+        CHECK(zeros, "appended tail is zero bytes (zapret pattern default \\x00)");
+        CHECK(memcmp(initial, before, sizeof before) == 0, "input packet not modified in place");
+        CHECK(e->ipfrag == 0 && e->pre_len == 0 && e->delay_us == 0, "no other action attached");
+        d2k_conn c;
+        memset(&c, 0, sizeof c);
+        uint8_t s4[4] = {192, 168, 1, 67}, d4[4] = {1, 2, 3, 4};
+        memcpy(&c.src_ip, s4, 4); memcpy(&c.dst_ip, d4, 4);
+        c.src_port = 0x3930; c.dst_port = 0xbb01; c.ttl = 64; c.family = 4;
+        static uint8_t wire[2048];
+        size_t made = d2k_wire_build_udp(&c, e, wire, sizeof wire);
+        CHECK(made == 20 + 8 + 1350, "wire datagram carries 1350 payload bytes");
+        if (made == 20 + 8 + 1350) {
+            CHECK(((size_t)wire[24] << 8 | wire[25]) == 8 + 1350, "UDP length field 1358");
+            CHECK(((size_t)wire[2] << 8 | wire[3]) == made, "IP total length matches");
+            CHECK(udp4_ok(wire, made), "UDP checksum valid over the lengthened payload");
+            CHECK(memcmp(wire + 28, before, 1250) == 0, "wire keeps original bytes first");
+        }
+    }
+    d2k_actions_free(&a);
+
+    /* Junk fake ahead + udplen: fakes untouched, then the lengthened truth. */
+    {
+        uint8_t combo[128];
+        size_t n = 0;
+        memcpy(combo, "D2KP\0\1\0\x09\0\0\0\x06", 12); n = 12;
+        uint8_t proto[2] = {17, 2}; putrec(combo, &n, 0x0002, proto, 2);
+        uint8_t pay[18] = {0, 1}; putrec(combo, &n, 0x0010, pay, sizeof pay);
+        uint8_t poi[8] = {0, 1}; putrec(combo, &n, 0x0011, poi, 8);
+        uint8_t fk[10] = {0, 1, 0, 1, 2, 0, 0, 0, 0, 0}; putrec(combo, &n, 0x0101, fk, 10);
+        uint8_t ord = 0; putrec(combo, &n, 0x0103, &ord, 1);
+        uint8_t inc[2] = {0, 100}; putrec(combo, &n, 0x010e, inc, 2);
+        d2k_plan *q = NULL;
+        CHECK(d2k_plan_load(combo, n, &q, err, sizeof err) == 0, "junk+udplen plan loads");
+        if (q) {
+            d2k_actions b = {0};
+            CHECK(d2k_plan_apply(q, NULL, &in, &b) == 0 && b.n == 3 &&
+                  b.v[0].kind == D2K_EMIT_FAKE && b.v[0].len == 16 &&
+                  b.v[1].kind == D2K_EMIT_FAKE && b.v[1].len == 16 &&
+                  b.v[2].kind == D2K_EMIT_PAYLOAD && b.v[2].len == 1350 &&
+                  b.fate == D2K_ORIG_DROP,
+                  "junk x2 ahead, then the lengthened Initial");
+            d2k_actions_free(&b);
+            d2k_plan_free(q);
+        }
+    }
+    d2k_plan_free(p);
+}
+
 int main(void) {
     d2k_plan *p = NULL;
     char err[160];
@@ -357,6 +457,7 @@ int main(void) {
     d2k_pkt in;
 
     test_tls_fake_modifiers();
+    test_udplen();
 
     /* A TCP route hint must not turn one QUIC datagram into fragments. */
     {

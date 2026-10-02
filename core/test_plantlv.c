@@ -206,6 +206,42 @@ int main(void) {
               out,sizeof out,&n,err,sizeof err)!=0,"fragment with TCP text");
     }
 
+    /* udplen — «удлинить датаграмму на N нулевых байт» (zapret udplen
+       increment=N, донор compose questions.go:331-334). Запись 0x010e, два
+       байта, исполнитель 9, только UDP. */
+    {
+        uint8_t out[256];size_t n=0;char err[200],text[256];
+        int rc=d2k_plan_text_to_tlv("d2k-plan 1 9\nproto udp quic\nudplen 100\n",
+                                    out,sizeof out,&n,err,sizeof err);
+        if(rc)printf("udplen: %s\n",err);
+        CHECK(rc==0,"udplen 100 не переведён");
+        static const uint8_t rec[]={0x01,0x0e,0x00,0x02,0x00,0x64};
+        int found=0;
+        for(size_t i=12;i+sizeof rec<=n;i++) if(!memcmp(out+i,rec,sizeof rec)) found=1;
+        CHECK(rc==0&&found,"udplen 100 не дал записи 010e 0002 0064");
+        CHECK(rc==0&&out[7]==9&&out[11]==4,"udplen: заголовок/число записей не те");
+        const char *bad[]={"udplen 0\n","udplen +100\n","udplen 100x\n","udplen\n",
+            "udplen 100 1\n","udplen 65536\n","udplen 100\nudplen 100\n","udplen -1\n",
+            "udplen 100\nipfrag 1\n","udplen 100\nsplit payload_start +1\n",
+            "udplen 100\norder reverse\n"};
+        for(size_t i=0;i<sizeof bad/sizeof bad[0];i++) {
+            snprintf(text,sizeof text,"d2k-plan 1 9\nproto udp quic\n%s",bad[i]);
+            CHECK(d2k_plan_text_to_tlv(text,out,sizeof out,&n,err,sizeof err)!=0,
+                  "invalid/conflicting udplen text accepted");
+        }
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 8\nproto udp quic\nudplen 100\n",
+              out,sizeof out,&n,err,sizeof err)!=0,"udplen with old executor");
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 9\nproto tcp tls\nudplen 100\n",
+              out,sizeof out,&n,err,sizeof err)!=0,"udplen with TCP text");
+        /* Комментарий провенанса не меняет байт плана. */
+        uint8_t a[256],b[256];size_t an=0,bn=0;
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 9\nproto udp quic\n# PROFILE\nudplen 100\n",
+              a,sizeof a,&an,err,sizeof err)==0 &&
+              d2k_plan_text_to_tlv("d2k-plan 1 9\nproto udp quic\nudplen 100\n",
+              b,sizeof b,&bn,err,sizeof err)==0 && an==bn && !memcmp(a,b,an),
+              "комментарий провенанса изменил TLV");
+    }
+
     /* Строгий разбор: усечённое слово и число вне ширины поля — отказ. */
     {
         uint8_t out[512]; size_t n=0; char err[200], text[512];

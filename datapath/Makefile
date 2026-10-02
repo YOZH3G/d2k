@@ -241,8 +241,8 @@ test_wire: test_wire.c wire.o $(HDR)
 test_wire_udp: test_wire_udp.c wire_udp.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_wire_udp.c wire_udp.o $(LDFLAGS)
 
-test_plan_apply: test_plan_apply.c plan_parse.o plan_apply.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_plan_apply.c plan_parse.o plan_apply.o $(LDFLAGS)
+test_plan_apply: test_plan_apply.c plan_parse.o plan_apply.o wire_udp.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_plan_apply.c plan_parse.o plan_apply.o wire_udp.o $(LDFLAGS)
 
 planlab: planlab.c plan_parse.o plan_apply.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ planlab.c plan_parse.o plan_apply.o $(LDFLAGS)

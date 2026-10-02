@@ -39,7 +39,8 @@ enum {
     REC_INPUT_TLS = 0x010a,
     REC_DELAY     = 0x010b,
     REC_IPFRAG    = 0x010c,
-    REC_OOB       = 0x010d
+    REC_OOB       = 0x010d,
+    REC_UDPLEN    = 0x010e
 };
 
 /* Якоря семантических позиций. */
@@ -110,6 +111,11 @@ struct d2k_plan {
     uint8_t oob_enabled;
     uint16_t oob_anchor;
     uint8_t oob_byte;
+    /* УДЛИНЕНИЕ ДАТАГРАММЫ, байт; 0 — записи нет. zapret udplen
+       increment=N: к UDP-нагрузке дописываются N нулевых байт, исходные
+       байты не меняются (донор compose, questions.go:331-334). План с ним
+       владеет нагрузкой: оригинал снимается, уходит удлинённая копия. */
+    uint16_t udplen;
 
     struct d2k_payload *payloads; size_t n_payloads;
     struct d2k_poison  *poisons;  size_t n_poisons;

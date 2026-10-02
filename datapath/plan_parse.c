@@ -71,6 +71,13 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
                 fail(err, errlen, "ipfrag требует minexec=7 и форму 1..4"); return -1;
             }
             break;
+        case REC_UDPLEN:
+            /* minexec=9: старый исполнитель удлинения не знает и выпустил бы
+               датаграмму короче измеренной. Ноль — не действие. */
+            if (rd16(b + 6) < 9 || ln != 2 || rd16(b + off) == 0) {
+                fail(err, errlen, "udplen требует minexec=9 и ненулевого прироста"); return -1;
+            }
+            break;
         case REC_OOB:
             if (rd16(b + 6) < 8 || ln != 3 || rd16(b + off) > ANCHOR_SNI_MIDDLE) {
                 fail(err, errlen, "oob требует minexec=8, якорь и один байт"); return -1;
@@ -188,6 +195,15 @@ static int check_refs(const d2k_plan *p, char *err, size_t errlen) {
         p->order || p->input_len || p->input_tls || p->settle_us ||
         p->segment_size || p->wire_profile || p->guards)) {
         fail(err, errlen, "ipfrag требует UDP без TCP-операций/перестановки");
+        return -1;
+    }
+    /* udplen с ipfrag не бывает и у донора: там udplen стоит после drop и на
+       провод не попадает (DROP в zapret липкий). Исполнять удлинённые
+       фрагменты значило бы исполнить то, чего никто не мерил. */
+    if (p->udplen && (p->transport != 17 || p->ipfrag || p->n_splits || p->n_seqovls ||
+        p->order || p->input_len || p->input_tls || p->settle_us ||
+        p->segment_size || p->wire_profile || p->guards || p->oob_enabled)) {
+        fail(err, errlen, "udplen требует UDP без фрагментации, разрезов и TCP-операций");
         return -1;
     }
     if (p->oob_enabled && (p->minexec < 8 || p->transport != 6 || p->proto != 1 ||
@@ -343,6 +359,12 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
                 d2k_plan_free(p); fail(err, errlen, "повторная запись ipfrag"); return -1;
             }
             p->ipfrag = v[0];
+            break;
+        case REC_UDPLEN:
+            if (p->udplen) {
+                d2k_plan_free(p); fail(err, errlen, "повторная запись udplen"); return -1;
+            }
+            p->udplen = rd16(v);
             break;
         case REC_OOB:
             p->oob_enabled = 1;

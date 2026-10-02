@@ -275,6 +275,17 @@ size_t d2k_plan_max_emit(const d2k_plan *p) {
         size_t n = emit_overhead(p, po) + body;
         if (n > max) { max = n; }
     }
+    if (p->udplen) {
+        /* Удлинённая датаграмма — посылка, которую план объявляет сам: к
+           любой пришедшей нагрузке он добавит udplen байт. Сама нагрузка
+           зависит от пакета, но у QUIC её нижняя граница задана стандартом:
+           клиентский Initial не короче 1200 байт (RFC 9000 §14.1). Без этого
+           способ отправки, не уносящий 1328 байт, узнал бы о том только
+           отказом ядра уже после APPLIED. */
+        size_t body = (p->proto == 2 ? 1200u : 1u) + p->udplen;
+        size_t n = emit_overhead(p, NULL) + body;
+        if (n > max) { max = n; }
+    }
     return max;
 }
 
@@ -374,7 +385,12 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
        перед правдой можно только тогда, когда правду выпускаем мы сами.
        Оригинал, отпущенный ядром, уходит когда ему угодно. */
     int owns_payload = (n_pts > 0) || (p->n_seqovls > 0) || (p->pace_us > 0) ||
-                       (p->settle_us > 0) || (p->delay_us > 0) || p->ipfrag;
+                       (p->settle_us > 0) || (p->delay_us > 0) || p->ipfrag ||
+                       p->udplen;
+    if (p->udplen && in->payload_len + (size_t)p->udplen > 65535u - 8u) {
+        free(pts);
+        return -1; /* удлинённая нагрузка не помещается в одну UDP-датаграмму */
+    }
 
     /* Верхняя оценка числа посылок: копии фальшивок плюс куски. Считаем
        заранее, чтобы выделить память один раз.
@@ -470,6 +486,19 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
             e->seq = in->seq + (uint32_t)start;
             e->bytes = in->payload + start;
             e->len = end - start;
+            if (p->udplen) {
+                /* zapret udplen: payload .. pattern("\x00", 1, increment).
+                   Копия, а не правка на месте: вход принадлежит пакету, и
+                   отмена обязана отпустить его нетронутым. Разрезов при
+                   udplen нет (plan_parse.c), кусок один и он весь пакет. */
+                uint8_t *grown = malloc(e->len + p->udplen);
+                if (!grown) { free(pts); emit_vec_free(v, n); return -1; }
+                memcpy(grown, e->bytes, e->len);
+                memset(grown + e->len, 0, p->udplen);
+                e->owned_bytes = grown;
+                e->bytes = grown;
+                e->len += p->udplen;
+            }
             if (i == 0 && ovl && ovl->len > 0) {
                 e->pre = ovl->bytes;
                 e->pre_len = ovl->len;

@@ -54,7 +54,8 @@ enum {
     REC_INPUT_TLS = 0x010a,
     REC_DELAY   = 0x010b,
     REC_IPFRAG  = 0x010c,
-    REC_OOB     = 0x010d
+    REC_OOB     = 0x010d,
+    REC_UDPLEN  = 0x010e
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -108,6 +109,7 @@ typedef struct {
     uint8_t    oob_enabled;
     uint16_t   oob_anchor;
     uint8_t    oob_byte;
+    uint16_t   udplen;    /* 0 — записи нет */
 } pl_plan;
 
 static int b64_value(unsigned char c) {
@@ -544,6 +546,16 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 say(err,errcap,"ipfrag ждёт одну форму 1..4"); goto bad;
             }
             p->ipfrag=(uint8_t)u;
+        } else if (strcmp(f[0], "udplen") == 0) {
+            /* УДЛИНИТЬ ДАТАГРАММУ на N нулевых байт — zapret udplen
+               increment=N (донор compose: increment=100). Только рост:
+               сокращение донор не ставит никогда. Ноль запрещён по той же
+               причине, что у pace. */
+            unsigned long u = 0;
+            if (nf != 2 || p->udplen || parse_uint(f[1], 65535, &u) != 0 || u == 0) {
+                say(err, errcap, "строка %zu: udplen ждёт одно число 1..65535", lineno); goto bad;
+            }
+            p->udplen = (uint16_t)u;
         } else if (strcmp(f[0], "delay") == 0) {
             /* ВЫДЕРЖКА ПЕРЕД ПЕРВОЙ ПОСЫЛКОЙ НАГРУЗКИ, микросекунды. Ни pace,
                ни settle её не выражают: первый задерживает посылки ПОСЛЕ
@@ -591,6 +603,11 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
         p->n_seqovls || p->order || p->input_len || p->input_tls ||
         p->settle_us || p->segment_size || p->wire_profile || p->guards)) {
         say(err,errcap,"ipfrag требует minexec=7 и UDP без TCP-операций"); goto bad;
+    }
+    if (p->udplen && (p->minexec < 9 || p->transport != 17 || p->ipfrag ||
+        p->n_splits || p->n_seqovls || p->order || p->input_len || p->input_tls ||
+        p->settle_us || p->segment_size || p->wire_profile || p->guards || p->oob_enabled)) {
+        say(err, errcap, "udplen требует minexec=9 и UDP без фрагментации и TCP-операций"); goto bad;
     }
     if (p->wire_profile && (p->minexec < 4 || p->transport != 6)) {
         say(err, errcap, "wire detect-tcp-v1 требует minexec=4 и proto tcp"); goto bad;
@@ -642,7 +659,8 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
                        (p.guards ? 1u : 0u) + (p.input_len ? 1u : 0u) + (p.settle_us ? 1u : 0u) +
                        (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u) +
                        (p.input_tls ? 1u : 0u) + (p.delay_us ? 1u : 0u) +
-                       (p.ipfrag ? 1u : 0u) + (p.oob_enabled ? 1u : 0u);
+                       (p.ipfrag ? 1u : 0u) + (p.oob_enabled ? 1u : 0u) +
+                       (p.udplen ? 1u : 0u);
     if (n_records > 0xFFFFu) {
         plan_free(&p);
         say(err, errcap, "слишком много записей (%zu)", n_records);
@@ -730,6 +748,7 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     }
     if (p.wire_profile) { put_rec(&w, REC_WIRE, &p.wire_profile, 1); }
     if (p.ipfrag) { put_rec(&w, REC_IPFRAG, &p.ipfrag, 1); }
+    if (p.udplen) { put_u16(&w, REC_UDPLEN); put_u16(&w, 2); put_u16(&w, p.udplen); }
     if (p.oob_enabled) {
         uint8_t v[3] = { (uint8_t)(p.oob_anchor >> 8), (uint8_t)p.oob_anchor, p.oob_byte };
         put_rec(&w, REC_OOB, v, sizeof v);
