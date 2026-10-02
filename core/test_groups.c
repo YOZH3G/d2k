@@ -118,6 +118,11 @@ int main(void) {
     invalid.key=modern;
     memset(invalid.name,'x',sizeof invalid.name);
     CHECK(d2k_group_learn(s,&invalid)==-1); /* no NUL */
+    /* §3.7: an exception keeps the family only while live voters outnumber
+       degraded ones; rr1 already failed, rr2/rr3 turn clear below. */
+    observe(s,"rr4.googlevideo.com","plan-a",1,modern);
+    observe(s,"rr5.googlevideo.com","plan-a",1,modern);
+    observe(s,"rr6.googlevideo.com","plan-a",1,modern);
     for(int i=0;s->n_observations<D2K_GROUP_OBSERVATION_MAX;i++) {
         char name[256]; snprintf(name,sizeof name,"h%d.fill.example.net",i);
         observe(s,name,"plan-z",8,modern);
@@ -135,6 +140,9 @@ int main(void) {
     CHECK(!d2k_group_match(s,"rr2.googlevideo.com",&modern));
     observe(s,"rr3.googlevideo.com","",2,modern);
     CHECK(d2k_group_match(s,"rr-new.googlevideo.com",&modern));
+    /* §3.7: once degraded voters are the majority, return to the direct path. */
+    observe(s,"rr4.googlevideo.com","",2,modern);
+    CHECK(!d2k_group_match(s,"rr-new.googlevideo.com",&modern));
     /* A full budget of exceptions can still contain historic positive votes.
        Never keep an area active when a new exclusion cannot be retained. */
     memset(s,0,sizeof *s);
@@ -150,7 +158,8 @@ int main(void) {
         char name[256]; snprintf(name,sizeof name,"clean%d.example.net",i);
         observe(s,name,"",2,modern);
     }
-    CHECK(d2k_group_match(s,"new.googlevideo.com",&modern));
+    /* §3.7: деградация всех голосующих → не наследуем непроверенный план. */
+    CHECK(!d2k_group_match(s,"new.googlevideo.com",&modern));
     observe(s,"unrecordable.googlevideo.com","",2,modern);
     CHECK(s->n_groups==0);
     CHECK(!d2k_group_match(s,"new.googlevideo.com",&modern));
@@ -174,6 +183,103 @@ int main(void) {
     observe(s,"a.example.com","",2,modern);
     observe(s,"a.example.com","P",4,modern);
     CHECK(d2k_group_restore(s)==0);
+    /* все голосующие провалили план → семейства нет */
+    memset(s,0,sizeof *s);
+    for(int i=0;i<3;i++){char n[64];snprintf(n,sizeof n,"v%d.example.com",i);observe(s,n,"P",1,modern);}
+    for(int i=0;i<3;i++){char n[64];snprintf(n,sizeof n,"v%d.example.com",i);observe(s,n,"P",4,modern);}
+    CHECK(!d2k_group_match(s,"new.example.com",&modern));
+    /* один из трёх провалил → семейство живо (исключение, не отключение) */
+    memset(s,0,sizeof *s);
+    for(int i=0;i<3;i++){char n[64];snprintf(n,sizeof n,"v%d.example.com",i);observe(s,n,"P",1,modern);}
+    observe(s,"v0.example.com","P",4,modern);
+    CHECK(d2k_group_match(s,"new.example.com",&modern));
+    /* §3.7: два из трёх деградировали (провал + чистый) → семейства нет */
+    memset(s,0,sizeof *s);
+    for(int i=0;i<3;i++){char n[64];snprintf(n,sizeof n,"v%d.example.com",i);observe(s,n,"P",1,modern);}
+    observe(s,"v0.example.com","P",4,modern);
+    CHECK(d2k_group_match(s,"new.example.com",&modern));
+    observe(s,"v1.example.com","",2,modern);
+    CHECK(!d2k_group_match(s,"new.example.com",&modern));
+    CHECK(d2k_group_restore(s)==0 && !d2k_group_match(s,"new.example.com",&modern));
+    /* все голосующие стали напрямую чистыми → прямой путь */
+    memset(s,0,sizeof *s);
+    for(int i=0;i<3;i++){char n[64];snprintf(n,sizeof n,"v%d.example.com",i);observe(s,n,"P",1,modern);}
+    for(int i=0;i<3;i++){char n[64];snprintf(n,sizeof n,"v%d.example.com",i);observe(s,n,"",2,modern);}
+    CHECK(!d2k_group_match(s,"new.example.com",&modern));
+    /* старение: журнал из старых голосов (at=0) не должен навсегда
+       отключать семейства; новое исключение спустя 31 сутки сохраняется. */
+    memset(s,0,sizeof *s);
+    for(size_t i=0;i<D2K_GROUP_OBSERVATION_MAX;i++) {
+        d2k_group_observation *o=&s->observations[i];
+        snprintf(o->name,sizeof o->name,"o%zu.old.example.net",i);
+        strcpy(o->plan_id,"Q"); o->key=modern; o->at=0;
+        o->evidence=D2K_GROUP_BLOCKED_CONFIRMED|D2K_GROUP_PLAN_FAILED;
+    }
+    s->n_observations=D2K_GROUP_OBSERVATION_MAX;
+    CHECK(d2k_group_restore(s)==0);
+    {
+        d2k_group_observation o={0};
+        o.key=modern; o.at=0;
+        strcpy(o.name,"lost.example.com"); o.evidence=2;
+        CHECK(d2k_group_learn(s,&o)>0);
+        CHECK(s->frozen && s->disabled); /* no room: fail closed */
+        CHECK(s->disabled_at==0);
+        /* indexes 1 and 2 become old pure votes, index 0 a fresh one */
+        strcpy(o.name,"o1.old.example.net"); strcpy(o.plan_id,"Q"); o.evidence=1; o.at=0;
+        CHECK(d2k_group_learn(s,&o)>=0);
+        strcpy(o.name,"o2.old.example.net");
+        CHECK(d2k_group_learn(s,&o)>=0);
+        strcpy(o.name,"o0.old.example.net"); o.at=31*86400;
+        CHECK(d2k_group_learn(s,&o)>=0);
+        strcpy(o.name,"fresh-clean.example.com"); o.plan_id[0]=0; o.evidence=2; o.at=31*86400;
+        CHECK(d2k_group_learn(s,&o)>0);
+        CHECK(s->disabled==0);
+        int kept=0,fresh=0,aged=0;
+        for(size_t i=0;i<s->n_observations;i++) {
+            const d2k_group_observation *v=&s->observations[i];
+            if(!strcmp(v->name,"fresh-clean.example.com") &&
+               (v->evidence&D2K_GROUP_DIRECT_CLEAR)) kept=1;
+            if(!strcmp(v->name,"o0.old.example.net")) fresh=1;
+            if(!strcmp(v->name,"o1.old.example.net")) aged=1;
+        }
+        CHECK(kept && fresh && !aged);
+        /* aging left room: the journal learns positive votes again */
+        CHECK(s->n_observations==D2K_GROUP_OBSERVATION_MAX-1 && !s->frozen);
+        strcpy(o.name,"after-room.example.org"); strcpy(o.plan_id,"Q"); o.evidence=1;
+        CHECK(d2k_group_learn(s,&o)>0 && s->n_observations==D2K_GROUP_OBSERVATION_MAX);
+        CHECK(d2k_group_restore(s)==0);
+    }
+    /* Re-enable after disabling: plain votes from before the lost exclusion
+       are dropped; an old family reappears only after 3 fresh votes. */
+    memset(s,0,sizeof *s);
+    for(size_t i=0;i<D2K_GROUP_OBSERVATION_MAX-1;i++) { /* frozen, one spare */
+        d2k_group_observation *o=&s->observations[i];
+        if(i<3) {
+            snprintf(o->name,sizeof o->name,"v%zu.fam.example.com",i);
+            strcpy(o->plan_id,"P"); o->evidence=D2K_GROUP_BLOCKED_CONFIRMED; o->at=50;
+        } else {
+            snprintf(o->name,sizeof o->name,"x%zu.fill.example.net",i);
+            strcpy(o->plan_id,"Q"); o->evidence=D2K_GROUP_BLOCKED_CONFIRMED|D2K_GROUP_PLAN_FAILED;
+        }
+        o->key=modern;
+    }
+    s->n_observations=D2K_GROUP_OBSERVATION_MAX-1;
+    s->frozen=1; s->disabled=1; s->disabled_at=100;
+    CHECK(d2k_group_restore(s)==0 && s->n_groups==0);
+    {
+        d2k_group_observation o={0};
+        o.key=modern; o.at=200; strcpy(o.name,"clean.example.org"); o.evidence=2;
+        CHECK(d2k_group_learn(s,&o)>0);
+        CHECK(!s->disabled && s->disabled_at==0 && !s->frozen);
+        CHECK(!d2k_group_match(s,"new.fam.example.com",&modern));
+        strcpy(o.plan_id,"P"); o.evidence=1; o.at=300;
+        for(int i=0;i<3;i++) {
+            snprintf(o.name,sizeof o.name,"v%d.fam.example.com",i);
+            CHECK(d2k_group_learn(s,&o)>0);
+            CHECK(!d2k_group_match(s,"new.fam.example.com",&modern)==(i<2));
+        }
+        CHECK(d2k_group_restore(s)==0 && d2k_group_match(s,"new.fam.example.com",&modern));
+    }
     /* (c) property: random learn chains always pass restore. */
     srand(7);
     for(int round=0;round<2000;round++) {

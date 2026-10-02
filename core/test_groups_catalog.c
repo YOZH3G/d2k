@@ -23,7 +23,9 @@ int main(void) {
     a.boxes[0].plans[0].text=strdup("opaque-test-plan");
     a.boxes[0].plans[0].enabled=1;
     d2k_group_key key={6,4,1,"",""};
-    for(int i=0;i<3;i++) {
+    /* §3.7: five voters, so the two exceptions below (rr0 failed, rr1
+       clear) stay a minority and the family legitimately survives. */
+    for(int i=0;i<5;i++) {
         d2k_group_observation o={0};
         snprintf(o.name,sizeof o.name,"rr%d.googlevideo.com",i);
         strcpy(o.plan_id,"plan-test"); o.key=key; o.evidence=1; o.at=123;
@@ -33,7 +35,7 @@ int main(void) {
     CHECK(d2k_group_learn(a.groups,&o)==1);
     CHECK(d2k_catalog_save(&a,path,err,sizeof err)==0);
     CHECK(d2k_catalog_load(path,&b,err,sizeof err)==0);
-    CHECK(b.groups && b.groups->n_observations==3 && b.groups->n_groups==1);
+    CHECK(b.groups && b.groups->n_observations==5 && b.groups->n_groups==1);
     CHECK(b.groups && d2k_group_match(b.groups,"new.googlevideo.com",&key));
     CHECK(b.groups && !d2k_group_match(b.groups,"rr0.googlevideo.com",&key));
     CHECK(b.n_boxes==1 && b.boxes[0].n_plans==1);
@@ -58,9 +60,27 @@ int main(void) {
     CHECK(d2k_catalog_load(path,&b,err,sizeof err)==0 && b.groups && b.groups->frozen);
     CHECK(b.groups && d2k_group_match(b.groups,"never-seen.googlevideo.com",&key));
     d2k_catalog_free(&b);
+    /* §3.7: a third degraded voter makes them the majority → retired,
+       also after save/load. */
+    memset(&o,0,sizeof o); strcpy(o.name,"rr2.googlevideo.com");
+    o.key=key; o.evidence=2; o.at=127;
+    CHECK(d2k_group_learn(a.groups,&o)==1);
+    CHECK(!d2k_group_match(a.groups,"new.googlevideo.com",&key));
+    CHECK(d2k_catalog_save(&a,path,err,sizeof err)==0);
+    CHECK(d2k_catalog_load(path,&b,err,sizeof err)==0);
+    CHECK(b.groups && b.groups->n_groups==0 &&
+          !d2k_group_match(b.groups,"new.googlevideo.com",&key));
+    d2k_catalog_free(&b);
+    /* Disabled without a stored moment (older catalogs) loads as 0. */
     a.groups->disabled=1;
     CHECK(d2k_catalog_save(&a,path,err,sizeof err)==0);
     CHECK(d2k_catalog_load(path,&b,err,sizeof err)==0);
+    CHECK(b.groups && b.groups->disabled && b.groups->disabled_at==0);
+    d2k_catalog_free(&b);
+    a.groups->disabled_at=1700000000;
+    CHECK(d2k_catalog_save(&a,path,err,sizeof err)==0);
+    CHECK(d2k_catalog_load(path,&b,err,sizeof err)==0);
+    CHECK(b.groups && b.groups->disabled_at==1700000000);
     CHECK(b.groups && b.groups->disabled && b.groups->n_groups==0);
     CHECK(b.n_boxes==1 && b.boxes[0].n_plans==1 && b.boxes[0].plans[0].enabled);
     d2k_catalog_free(&b);

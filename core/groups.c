@@ -2,6 +2,9 @@
 #include "include/d2k_domain.h"
 #include "include/d2k_groups.h"
 
+/* Seconds (observation `at` is wall-clock seconds, sched.c wall_s). */
+#define D2K_GROUP_VOTE_TTL_S (30*86400)
+
 int d2k_group_key_make(d2k_group_key *key,uint8_t transport,uint8_t family,
     uint8_t shape,const char *path,const char *origin) {
     if(!key || !path || !origin || strlen(path)>=sizeof key->probe_path ||
@@ -34,9 +37,12 @@ static int member(const char *name,const char *suffix) {
     size_t n=strlen(name),z=strlen(suffix);
     return n>=z && !strcmp(name+n-z,suffix) && (n==z || name[n-z-1]=='.');
 }
+/* Live votes for the seed plan. A vote that later failed this plan or
+   proved directly clear is stale: §3.7 returns a degraded family to the
+   direct path instead of inheriting an unverified plan. */
 static unsigned votes(const d2k_group_state *s,const char *suffix,
                        const d2k_group_observation *seed,int64_t *latest) {
-    unsigned n=0; *latest=0;
+    unsigned live=0,stale=0; *latest=0;
     for(size_t i=0;i<s->n_observations;i++) {
         const d2k_group_observation *o=&s->observations[i];
         if(!d2k_group_key_same(&o->key,&seed->key) || !member(o->name,suffix)) continue;
@@ -44,10 +50,11 @@ static unsigned votes(const d2k_group_state *s,const char *suffix,
            !(o->evidence&D2K_GROUP_ADMITTED_EXCEPTION)) return 0;
         if((o->evidence&D2K_GROUP_BLOCKED_CONFIRMED) && strcmp(o->name,suffix) &&
            !strcmp(o->plan_id,seed->plan_id)) {
-            n++; if(o->at>*latest) *latest=o->at;
+            if(o->evidence&(D2K_GROUP_PLAN_FAILED|D2K_GROUP_DIRECT_CLEAR)) { stale++; continue; }
+            live++; if(o->at>*latest) *latest=o->at;
         }
     }
-    return n;
+    return live>=2 && live>stale && live+stale>=3 ? live : 0;
 }
 static unsigned failures(const d2k_group_state *s,const char *suffix,
                          const d2k_group_key *key,const char *plan) {
@@ -103,7 +110,7 @@ static void rebuild(d2k_group_state *s) {
         unsigned best_count=0; int64_t best_at=0;
         while(suffix && strlen(++suffix)>=strlen(base)) {
             int64_t at=0; unsigned count=votes(s,suffix,o,&at);
-            if(count>=3) { strcpy(best,suffix); best_count=count; best_at=at; }
+            if(count) { strcpy(best,suffix); best_count=count; best_at=at; }
             suffix=strchr(suffix,'.');
         }
         if(best[0]) add_group(s,best,o,best_count,best_at);
@@ -149,24 +156,51 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
             if(o->evidence!=D2K_GROUP_DIRECT_CLEAR && o->evidence!=D2K_GROUP_PLAN_FAILED)
                 return changed;
             /* A bounded budget must never discard a new exclusion while
-             * retaining a broad rule. Reclaim unknown evidence first, then
+             * retaining a broad rule. Age out stale unknown evidence and
+             * stale positive votes first, then reclaim unknown evidence, then
              * a positive vote; never evict any negative evidence. Exact
              * confirmed catalog bindings are independent and untouched. */
+            for(unsigned pass=D2K_GROUP_INCONCLUSIVE;pass;
+                pass=pass==D2K_GROUP_INCONCLUSIVE?D2K_GROUP_BLOCKED_CONFIRMED:0)
+                for(size_t i=0;i<s->n_observations;) {
+                    const d2k_group_observation *v=&s->observations[i];
+                    if(v->evidence==pass && o->at-v->at>D2K_GROUP_VOTE_TTL_S)
+                        s->observations[i]=s->observations[--s->n_observations];
+                    else i++;
+                }
+            /* Re-enabling: families re-learn only from confirmations newer
+               than the moment the journal lost an exclusion. */
+            if(s->disabled)
+                for(size_t i=0;i<s->n_observations;) {
+                    const d2k_group_observation *v=&s->observations[i];
+                    if(v->evidence==D2K_GROUP_BLOCKED_CONFIRMED && v->at<=s->disabled_at)
+                        s->observations[i]=s->observations[--s->n_observations];
+                    else i++;
+                }
             size_t reclaim=s->n_observations;
-            for(size_t i=0;i<s->n_observations;i++) {
-                if(s->observations[i].evidence==D2K_GROUP_INCONCLUSIVE) { reclaim=i; break; }
-                if(reclaim==s->n_observations &&
-                   s->observations[i].evidence==D2K_GROUP_BLOCKED_CONFIRMED) reclaim=i;
-            }
-            if(reclaim==s->n_observations) {
+            if(reclaim==D2K_GROUP_OBSERVATION_MAX)
+                for(size_t i=0;i<s->n_observations;i++) {
+                    if(s->observations[i].evidence==D2K_GROUP_INCONCLUSIVE) { reclaim=i; break; }
+                    if(reclaim==s->n_observations &&
+                       s->observations[i].evidence==D2K_GROUP_BLOCKED_CONFIRMED) reclaim=i;
+                }
+            if(reclaim==D2K_GROUP_OBSERVATION_MAX) {
                 /* Historic votes may also carry negative evidence. Without
                    room for this exclusion, fail closed for areas, never
                    forget an exclusion or disturb exact catalog plans. */
                 changed |= !s->disabled; s->disabled=1; s->n_groups=0;
+                if(o->at>s->disabled_at) { s->disabled_at=o->at; changed=1; }
+                for(size_t i=0;i<s->n_observations;i++)
+                    if(s->observations[i].at>s->disabled_at) {
+                        s->disabled_at=s->observations[i].at; changed=1;
+                    }
                 return changed;
             }
             slot=reclaim;
+            if(slot==s->n_observations) s->n_observations++;
             s->observations[slot]=*o; strcpy(s->observations[slot].name,name);
+            s->disabled=0; s->disabled_at=0; /* the new exclusion is retained */
+            if(s->n_observations<D2K_GROUP_OBSERVATION_MAX) s->frozen=0; /* room again */
         } else {
             s->observations[slot]=*o; strcpy(s->observations[slot].name,name);
             s->n_observations++;
@@ -205,7 +239,7 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
     return 1;
 }
 int d2k_group_restore(d2k_group_state *s) {
-    if(!s || s->n_observations>D2K_GROUP_OBSERVATION_MAX) return -1;
+    if(!s || s->n_observations>D2K_GROUP_OBSERVATION_MAX || s->disabled_at<0) return -1;
     for(size_t i=0;i<s->n_observations;i++) {
         d2k_group_observation *o=&s->observations[i], test=*o;
         /* learn() writes masks; reduce them to the raw events they came from. */
