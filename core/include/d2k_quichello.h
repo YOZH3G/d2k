@@ -54,6 +54,12 @@
  * в quicconn.c. */
 int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
                            size_t *out_len);
+/* То же PROFILE-приветствие, но датаграммой ровно 1300 байт — собственный
+ * Initial донора для вопроса «длина» (questions.go:237). Запасной путь, когда
+ * приветствие снимка в 1300 не помещается; вызывающий обязан пометить такой
+ * опыт как PROFILE, а не выдавать за снимок клиента. */
+int d2k_quic_probe_initial_longer(const char *sni, uint8_t *out, size_t cap,
+                                  size_t *out_len);
 
 /* Prepare a QUIC measurement input from the latest captured client shape.
  * If that snapshot cannot be safely renamed for this target, fall back to the
@@ -100,7 +106,8 @@ typedef enum {
      * пакет, а не добавляет соседей: по RFC 9000 §12.2 приёмник разбирает
      * первый пакет по его полю длины, а неразобранный хвост отбрасывает.
      * Длина — ровно 1300 байт донора (questions.go:237), не «снимок плюс
-     * сто»; не помещается в 1300 — вопрос не собирается (-1). */
+     * сто»; не помещается в 1300 — -1, и вызывающий берёт
+     * d2k_quic_probe_initial_longer с пометкой PROFILE. */
     D2K_QASK_LONGER
 } d2k_quic_ask;
 

@@ -92,6 +92,57 @@ static size_t build_plain_initial(uint8_t dcid_byte, uint8_t *out, size_t cap) {
     return off;
 }
 
+/* Настоящий Initial с БОЛЬШИМ приветствием (как у браузеров с ML-KEM):
+ * ClientHello вектора RFC 9001 A.2, дополненный расширением padding (0x0015)
+ * на pad байт, запечатанный обычными ключами Initial. Датаграмма — ровно по
+ * содержимому, без добивки. 0 — не собралось. */
+static size_t build_large_snapshot(size_t pad, uint8_t *out, size_t cap) {
+    uint8_t ch[D2K_QW_MAX_DGRAM];
+    size_t ch_len = 0;
+    if (d2k_quic_client_hello(d2k_test_v1_initial, sizeof d2k_test_v1_initial,
+                              ch, sizeof ch, &ch_len) != 0 || ch_len < 4 + 2 + 32 + 1) {
+        return 0;
+    }
+    size_t o = 4 + 2 + 32;
+    o += 1 + ch[o];                               /* session id */
+    o += 2 + ((size_t)ch[o] << 8 | ch[o + 1]);    /* cipher suites */
+    o += 1 + ch[o];                               /* compression */
+    size_t ext_len_off = o;
+    size_t ext_len = (size_t)ch[o] << 8 | ch[o + 1];
+    if (ext_len_off + 2 + ext_len != ch_len || ch_len + 4 + pad > sizeof ch) {
+        return 0;
+    }
+    ch[ch_len++] = 0x00; ch[ch_len++] = 0x15;
+    ch[ch_len++] = (uint8_t)(pad >> 8); ch[ch_len++] = (uint8_t)pad;
+    memset(ch + ch_len, 0, pad);
+    ch_len += pad;
+    ext_len += 4 + pad;
+    ch[ext_len_off] = (uint8_t)(ext_len >> 8); ch[ext_len_off + 1] = (uint8_t)ext_len;
+    size_t hs = ch_len - 4;
+    ch[1] = (uint8_t)(hs >> 16); ch[2] = (uint8_t)(hs >> 8); ch[3] = (uint8_t)hs;
+
+    uint8_t body[D2K_QW_MAX_DGRAM];
+    size_t b = 0;
+    body[b++] = 0x06;                              /* CRYPTO */
+    body[b++] = 0x00;                              /* offset 0 */
+    b += d2k_qw_varint_write(body + b, sizeof body - b, ch_len);
+    if (b + ch_len > sizeof body) { return 0; }
+    memcpy(body + b, ch, ch_len);
+    b += ch_len;
+    static const uint8_t dcid[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t sec[32];
+    d2k_qw_keys k;
+    if (d2k_qw_initial_secret(D2K_QW_V1, dcid, sizeof dcid, D2K_QW_CLIENT, sec) != 0 ||
+        d2k_qw_keys_from_secret(D2K_QW_V1, sec, &k) != 0) {
+        return 0;
+    }
+    uint8_t hdr[64];
+    size_t hlen = d2k_qw_long_hdr(hdr, sizeof hdr, D2K_QW_V1, D2K_QW_LT_INITIAL,
+                                  dcid, sizeof dcid, NULL, 0, 4, b);
+    if (hlen == 0) { return 0; }
+    return d2k_qw_seal(&k, 1, hdr, hlen, 0, 4, body, b, out, cap);
+}
+
 #define QP_DCID_OFF 6
 #define QP_DCID_LEN 8
 
@@ -115,6 +166,8 @@ static int g_mock_garbage_defeats;
  * положено сработавшей коробке. 0 — нужен отдельному сценарию: коробка
  * молчит на триггер, но остаточной блокировки НЕТ. */
 static int g_mock_poison_on_trigger = 1;
+/* Сколько вопросов мок получил датаграммой ровно в 1300 байт. */
+static int g_mock_len_1300;
 /* Если не пустая строка — контроль молчит ИМЕННО на этом адресе (и только на
  * нём), остальные адреса отвечают как обычно. Раньше был глобальный
  * g_mock_ctl_dead (молчит контроль ВЕЗДЕ) — с появлением базовой живости
@@ -199,6 +252,9 @@ static d2k_tally mock_ask(const char *addr, uint16_t port,
        порождает refused>0). */
     if (sent_out) {
         *sent_out = repeats;
+    }
+    if (msg.len == 1300) {
+        g_mock_len_1300++;
     }
     d2k_tally t;
     if (g_mock_force_i < g_mock_force_n) {
@@ -1136,6 +1192,38 @@ int main(int argc, char **argv) {
               "свойство обязано быть записано, а не только упомянуто в тексте причины");
     }
 
+    /* --- «ДЛИНА» ДЛЯ БОЛЬШОГО ПРИВЕТСТВИЯ: запасной Initial донора ---------
+     * Приветствие снимка (≈1330 байт, как у браузеров с ML-KEM) в 1300 байт
+     * не помещается. Вопрос не пропадает: он задаётся собственным Initial
+     * донора ровно в 1300 байт (questions.go:237) и в трассе и причине
+     * помечен PROFILE — не выдан за форму клиента. */
+    {
+        static uint8_t big[D2K_QW_MAX_DGRAM];
+        size_t big_len = build_large_snapshot(1080, big, sizeof big);
+        uint8_t tmp[D2K_QW_MAX_DGRAM];
+        size_t tmp_len = 0;
+        CHECK(big_len > 1300 &&
+              d2k_quic_hello_ask(big, big_len, D2K_QASK_PLAIN, "www.example.com",
+                                 tmp, sizeof tmp, &tmp_len) == 0 &&
+              d2k_quic_hello_ask(big, big_len, D2K_QASK_LONGER, "www.example.com",
+                                 tmp, sizeof tmp, &tmp_len) != 0,
+              "стенд: большой снимок обязан быть целым, но не помещаться в 1300");
+        mock_reset();
+        g_mock_poison_on_trigger = 0;
+        g_extra_n = 0;
+        g_mock_len_1300 = 0;
+        d2k_hello snap = {big, big_len};
+        d2k_vres r = d2k_quic_classify("10.0.20.1", 443, "www.example.com", snap, ctl_hello(), 0);
+        CHECK(r.verdict == D2K_V_OPAQUE, "большой снимок: контроль жив, решает содержимое");
+        CHECK(r.qprops.longer != D2K_PROP_UNKNOWN,
+              "большое приветствие потеряло вопрос «длина» — запасной Initial донора не задан");
+        CHECK(strcmp(r.qtrace[6].label, "длина PROFILE") == 0 && r.qtrace[6].sent == D2K_QUIC_REPEATS,
+              "трасса обязана пометить «длина» как PROFILE");
+        CHECK(strstr(r.reason, "«длина» задана PROFILE") != NULL,
+              "причина обязана назвать подмену формы PROFILE, а не молчать");
+        CHECK(g_mock_len_1300 == 1, "запасной Initial «длины» обязан быть ровно 1300 байт");
+    }
+
     /* --- ВОПРОСНИК ЦЕЛИКОМ: СЕМЬ ВОПРОСОВ НА НАСТОЯЩЕМ СНИМКЕ -------------
      *
      * Прочие проверки этой части дают моку выдуманный снимок, и четыре
@@ -1161,6 +1249,8 @@ int main(int argc, char **argv) {
         CHECK(r.verdict == D2K_V_OPAQUE, "контроль жив до и после — решает содержимое");
         CHECK(strstr(r.reason, "не собралось") == NULL,
               "на настоящем снимке не собраться не может ни один вопрос");
+        CHECK(strcmp(r.qtrace[6].label, "длина") == 0 && strstr(r.reason, "PROFILE") == NULL,
+              "снимок помещается в 1300 — «длина» задаётся снимком, без PROFILE");
         CHECK(r.qprops.junk_ahead != D2K_PROP_UNKNOWN &&
               r.qprops.split_crypto != D2K_PROP_UNKNOWN &&
               r.qprops.split_datagrams != D2K_PROP_UNKNOWN &&

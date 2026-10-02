@@ -325,6 +325,17 @@ int main(int argc, char **argv) {
               "удлинённый из 1250 пакет не разбирается");
     }
 
+    /* Запасной Initial донора для «длины» (questions.go:237): ровно 1300,
+       разбирается, несёт имя. */
+    {
+        CHECK(d2k_quic_probe_initial_longer("www.microsoft.com", out, sizeof out, &out_len) == 0 &&
+              out_len == 1300,
+              "собственный Initial донора для «длины» не 1300 байт");
+        CHECK(d2k_quic_sni(out, out_len, name, sizeof name) == 0 &&
+              strcmp(name, "www.microsoft.com") == 0,
+              "собственный Initial «длины» не разбирается");
+    }
+
     /* --- круг: собрали, прочитали, вернули имя, сравнили побайтно ------- */
     {
         CHECK(d2k_quic_hello_rename(d2k_test_v1_initial, sizeof d2k_test_v1_initial,

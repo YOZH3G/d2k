@@ -1663,7 +1663,7 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
 
     char took[192];
     size_t tn = 0;
-    int n_budget = 0, n_addr = 0, n_unbuilt = 0;
+    int n_budget = 0, n_addr = 0, n_unbuilt = 0, n_profile = 0;
     uint8_t shaped[D2K_QW_MAX_DGRAM], scratch[D2K_QW_MAX_DGRAM];
 
     for (size_t qi = 0; qi < QP_N_QUESTIONS; qi++) {
@@ -1683,10 +1683,27 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
         d2k_hello msg = trigger;
         size_t slen = 0;
         int src_port = 0;
+        const char *label = q->label;
         if (q->kind == QK_RESHAPE) {
-            if (!trigger.bytes ||
+            int built = trigger.bytes &&
                 d2k_quic_hello_ask(trigger.bytes, trigger.len, q->ask, sni,
-                                   shaped, sizeof shaped, &slen) != 0) {
+                                   shaped, sizeof shaped, &slen) == 0;
+            /* «ДЛИНА» ДЛЯ БОЛЬШОГО ПРИВЕТСТВИЯ. Снимок цел (обычная
+               пересборка собирается), но в 1300 байт донора не помещается —
+               так у современных браузеров с ML-KEM. Вопрос тогда задаётся
+               собственным Initial донора ровно в 1300 байт (questions.go:237)
+               и ПОМЕЧАЕТСЯ как PROFILE в трассе и причине: это не форма
+               клиента, и выдавать его за неё нельзя (D2K_SPEC §4). Не
+               собрался и он — вопрос «не собралось», как прежде. */
+            if (!built && q->ask == D2K_QASK_LONGER && trigger.bytes &&
+                d2k_quic_hello_ask(trigger.bytes, trigger.len, D2K_QASK_PLAIN, sni,
+                                   scratch, sizeof scratch, &slen) == 0 &&
+                d2k_quic_probe_initial_longer(sni, shaped, sizeof shaped, &slen) == 0) {
+                built = 1;
+                label = "длина PROFILE";
+                n_profile++;
+            }
+            if (!built) {
                 n_unbuilt++;
                 continue;
             }
@@ -1742,15 +1759,15 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
         *slot = qp_outcome(t);
         if (qi < D2K_QTRACE_MAX) {
             d2k_quic_step *st = &r->qtrace[qi];
-            snprintf(st->label, sizeof st->label, "%s", q->label);
+            snprintf(st->label, sizeof st->label, "%s", label);
             st->sent = (uint8_t)(sent < 0 ? 0 : sent);
             st->answered = (uint8_t)t.pass;
             st->outcome = *slot;
         }
-        if (*slot == D2K_PROP_YES && tn + strlen(q->label) + 2 < sizeof took) {
+        if (*slot == D2K_PROP_YES && tn + strlen(label) + 2 < sizeof took) {
             if (tn) { took[tn++] = ','; }
-            memcpy(took + tn, q->label, strlen(q->label));
-            tn += strlen(q->label);
+            memcpy(took + tn, label, strlen(label));
+            tn += strlen(label);
         }
     }
     took[tn] = '\0';
@@ -1763,6 +1780,9 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
     if (n_budget) { reason_append(r, "; не задано %d (бюджет)", n_budget); }
     if (n_addr) { reason_append(r, "; не задано %d (адреса)", n_addr); }
     if (n_unbuilt) { reason_append(r, "; не задано %d (не собралось)", n_unbuilt); }
+    if (n_profile) {
+        reason_append(r, "; «длина» задана PROFILE (приветствие снимка не помещается в 1300)");
+    }
 }
 
 /* Находки — см. контракт в d2k_quicprobe.h. Тексты перенесены из оригинала

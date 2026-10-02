@@ -231,11 +231,11 @@ static int seal_one(const d2k_qw_keys *k, uint32_t ver,
  * похожим. Случайные поля обновляем ДО переименования: длина SNI сдвигает
  * последующие расширения. Закрытый X25519-ключ не нужен после построения
  * вопроса — этот опыт не продолжает TLS-рукопожатие. */
-int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
-                           size_t *out_len) {
+static int probe_initial_sized(const char *sni, size_t want, uint8_t *out,
+                               size_t cap, size_t *out_len) {
     if (!sni || !sni[0] || strlen(sni) > 253 || !out || !out_len) { return -1; }
     *out_len = 0;
-    if (cap < INITIAL_MIN) { return -1; }
+    if (cap < want) { return -1; }
     uint8_t profile[sizeof d2k_quic_probe_profile], ch[D2K_QW_MAX_DGRAM];
     uint8_t dcid[8], scid[8], priv[32], sec[32];
     select_probe_profile(profile, sizeof profile);
@@ -262,9 +262,25 @@ int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
     uint8_t body[D2K_QW_MAX_DGRAM];
     size_t b = 0;
     if (put_crypto(body, sizeof body, &b, 0, ch, ch_len) != 0) { return -1; }
-    /* buildInitial оригинала: PN=0, PNLen=4, один CRYPTO, 1200 байт. */
-    return seal_one(&k, D2K_QW_V1, dcid, sizeof dcid, scid, sizeof scid,
-                    body, b, 0, 4, INITIAL_MIN, 0, out, cap, out_len);
+    /* buildInitial оригинала: PN=0, PNLen=4, один CRYPTO, want байт. */
+    size_t made = 0;
+    if (seal_one(&k, D2K_QW_V1, dcid, sizeof dcid, scid, sizeof scid,
+                 body, b, 0, 4, want, 0, out, cap, &made) != 0 || made != want) {
+        return -1;
+    }
+    *out_len = made;
+    return 0;
+}
+
+int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
+                           size_t *out_len) {
+    return probe_initial_sized(sni, INITIAL_MIN, out, cap, out_len);
+}
+
+int d2k_quic_probe_initial_longer(const char *sni, uint8_t *out, size_t cap,
+                                  size_t *out_len) {
+    /* Донор questions.go:237 — buildInitial(sni, V1, 1300, 0). */
+    return probe_initial_sized(sni, INITIAL_LONGER, out, cap, out_len);
 }
 
 int d2k_quic_prepare_target(const uint8_t *sample, size_t sample_len,
@@ -339,7 +355,9 @@ int d2k_quic_hello_ask(const uint8_t *in, size_t n, d2k_quic_ask ask,
            задана числом, а не «снимок плюс сто» (снимок 1250 давал 1350 —
            другой вопрос под тем же именем). Форма приветствия остаётся
            снимочной (D2K_SPEC §4), донорская только длина. Не помещается
-           приветствие в 1300 — вопрос не выразим, а не «чуть длиннее». */
+           приветствие в 1300 — здесь -1, а вызывающий (qp_questions_step)
+           задаёт вопрос собственным Initial донора
+           (d2k_quic_probe_initial_longer) с пометкой PROFILE. */
         want = INITIAL_LONGER;
         size_t made = 0;
         if (seal_one(&k, ver, dcid, dcid_len, scid, scid_len, body, b, 0, 0, want,

@@ -919,6 +919,8 @@ int main(void) {
     real_ask_copies_hook = d2k_quic_ask_copies_hook;
     real_ask_frag_hook = d2k_quic_ask_frag_hook;
     real_resolve_hook = d2k_quic_resolve_hook;
+    /* mocks_reset/бюджетный тест ставят явные секунды — вернуть выведенный. */
+    uint32_t real_budget_s = d2k_quic_budget_s;
 
     d2k_quic_resolve_hook = mock_resolve;
 
@@ -945,6 +947,9 @@ int main(void) {
     d2k_quic_ask_ttl_hook = real_ask_ttl_hook;
     d2k_quic_ask_frag_hook = real_ask_frag_hook;
     d2k_quic_resolve_hook = real_resolve_hook;
+    d2k_quic_budget_s = real_budget_s;
+    CHECK(d2k_quic_budget_s == D2K_QUIC_BUDGET_DERIVED,
+          "тест не вернул выведенный бюджет после явных секунд");
 
     test_frag_builder_correctness();
     test_real_ttl_hook_on_wire();
