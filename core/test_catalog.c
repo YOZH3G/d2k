@@ -541,9 +541,10 @@ static void check_binding_family_persistence(void) {
     CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 2 &&
           c.boxes[0].binds[0].probe_path[0] == 0,
           "legacy binding invented resource witness");
-    if (c.n_boxes == 1 && c.boxes[0].n_binds == 2)
+    if (c.n_boxes == 1 && c.boxes[0].n_binds == 2) {
         strcpy(c.boxes[0].binds[1].probe_path, "/public/main.css");
         strcpy(c.boxes[0].binds[1].ech_origin, "witness.example");
+    }
     CHECK(d2k_catalog_save(&c, out, err, sizeof err) == 0, "save family fixture");
     d2k_catalog_free(&c);
     FILE *f = fopen(out, "r");

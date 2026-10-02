@@ -22,7 +22,12 @@ static int test_poll(struct pollfd *p, nfds_t n, int ms) {
     return (poll)(p, n, ms);
 }
 #define poll(p, n, ms) test_poll(p, n, ms)
+/* Only relay() is exercised; the accept-queue and connect helpers are unused here. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-variable"
 #include "httpup.c"
+#pragma GCC diagnostic pop
 
 #include <assert.h>
 

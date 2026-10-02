@@ -30,6 +30,7 @@
  * шлёт приветствие и лишь затем подозрение: тест, который клал бы имя прямо в
  * подозрение, проверял бы путь, которого на проводе не существует. */
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700 /* strptime under -std=c99 on glibc/musl */
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
 #include <stdio.h>
