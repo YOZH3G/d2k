@@ -117,7 +117,9 @@ int d2k_resp_scan12(const uint8_t *buf, size_t have, int *done)
 }
 
 /* Ждём ServerHelloDone, разбирая поток записей TLS. Возврат 1 — дошёл. */
-static int handshake12(const char *host, const char *port, const char *sni,
+/* 1 — ServerHelloDone; 0 — не завершилось (алерт, обрыв, тишина); -1 — НЕ ИЗМЕРЕНО:
+ * упёрлись в собственный предел буфера, про сервер это ничего не говорит. */
+int d2k_resp_handshake12(const char *host, const char *port, const char *sni,
                        const d2k_opts *opt)
 {
     d2k_trigger tr;
@@ -193,6 +195,7 @@ static int handshake12(const char *host, const char *port, const char *sni,
             goto out; /* ServerHelloDone, либо фатальный алерт */
         }
         if (have == RESPONSE_CAP) {
+            rc = -1; /* локальный предел, а не поведение сети */
             break;
         }
     }
@@ -209,12 +212,15 @@ out:
  * платит рантайм Go, а здесь пришлось бы заводить потоки ради одной функции.
  * Цена честная и названа: до полуминуты на заблокированной цели. */
 static int count_handshakes(const char *host, const char *port, const char *sni,
-                            const d2k_opts *opt)
+                            const d2k_opts *opt, int *unmeasured)
 {
     int i, done = 0;
     for (i = 0; i < opt->repeats; i++) {
-        if (handshake12(host, port, sni, opt)) {
+        int r = d2k_resp_handshake12(host, port, sni, opt);
+        if (r > 0) {
             done++;
+        } else if (r < 0) {
+            (*unmeasured)++;
         }
     }
     return done;
@@ -234,32 +240,25 @@ static void neutral_sni(char *out, size_t cap)
     snprintf(out, cap, "z%s.example.com", hex);
 }
 
-/* ProbeResponse проверяет, не режут ли ОТВЕТ сервера.
- *
- * Зовётся только там, где запрос уже признан проходящим: если режут запрос,
- * про ответ говорить рано. */
-void d2k_probe_response(const char *host, const char *port, const char *sni,
-                        const d2k_opts *opt, d2k_resp_result *res)
+/* Чистое решение по счётчикам. Неизмеренный прогон (локальный предел буфера) не
+ * есть ни «дошло», ни «не дошло»: любой такой прогон — НЕ ИЗМЕРЕНО, но не
+ * «режут ответ». */
+void d2k_resp_decide(int target, int control, int unmeasured, int repeats,
+                     d2k_resp_result *res)
 {
-    char neutral[64];
-    int target, control;
-
-    memset(res, 0, sizeof(*res));
-    target = count_handshakes(host, port, sni, opt);
-    /* Контроль ОБЯЗАН быть другим именем на том же адресе. Если бы мы взяли то
-     * же самое, молчали бы оба, и «режут ответ» получилось бы из собственной
-     * ошибки ввода. */
-    neutral_sni(neutral, sizeof(neutral));
-    control = count_handshakes(host, port, neutral, opt);
-
     res->target = target;
     res->control = control;
-    if (control == 0) {
+    if (unmeasured > 0) {
+        res->verdict = D2K_RESP_NOT_APPLICABLE;
+        snprintf(res->reason, sizeof(res->reason),
+                 "ответ сервера не поместился в локальный предел буфера (64 КБ) в %d прогонах — "
+                 "про ответное направление вывода нет", unmeasured);
+    } else if (control == 0) {
         res->verdict = D2K_RESP_NOT_APPLICABLE;
         snprintf(res->reason, sizeof(res->reason),
                  "контрольное рукопожатие по TLS 1.2 не завершается — сервер его не поддерживает "
                  "или мешает что-то ещё; про ответное направление вывода нет");
-    } else if (target == opt->repeats) {
+    } else if (target == repeats) {
         res->verdict = D2K_RESP_CLEAR;
         snprintf(res->reason, sizeof(res->reason),
                  "рукопожатие TLS 1.2 доходит до конца — сертификат не режут");
@@ -272,6 +271,26 @@ void d2k_probe_response(const char *host, const char *port, const char *sni,
     } else {
         res->verdict = D2K_RESP_FLAKY;
         snprintf(res->reason, sizeof(res->reason),
-                 "рукопожатий дошло %d из %d — не воспроизводится", target, opt->repeats);
+                 "рукопожатий дошло %d из %d — не воспроизводится", target, repeats);
     }
+}
+
+/* ProbeResponse проверяет, не режут ли ОТВЕТ сервера.
+ *
+ * Зовётся только там, где запрос уже признан проходящим: если режут запрос,
+ * про ответ говорить рано. */
+void d2k_probe_response(const char *host, const char *port, const char *sni,
+                        const d2k_opts *opt, d2k_resp_result *res)
+{
+    char neutral[64];
+    int target, control, unmeasured = 0;
+
+    memset(res, 0, sizeof(*res));
+    target = count_handshakes(host, port, sni, opt, &unmeasured);
+    /* Контроль ОБЯЗАН быть другим именем на том же адресе. Если бы мы взяли то
+     * же самое, молчали бы оба, и «режут ответ» получилось бы из собственной
+     * ошибки ввода. */
+    neutral_sni(neutral, sizeof(neutral));
+    control = count_handshakes(host, port, neutral, opt, &unmeasured);
+    d2k_resp_decide(target, control, unmeasured, opt->repeats, res);
 }
