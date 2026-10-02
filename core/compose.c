@@ -1459,8 +1459,7 @@ static int quic_arm_found(const d2k_quic_arm *a) {
    — та же склейка, что у compose донора, а не два похожих сборщика.
    arm == NULL — плеча нет; junk/udplen — подтверждённые свойства. */
 static int quic_plan_text(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
-                          int junk, unsigned udplen, int udplen_profile,
-                          char *buf, size_t cap) {
+                          int junk, unsigned udplen, char *buf, size_t cap) {
     static const uint8_t junk_bytes[QUIC_JUNK_LEN];
     unsigned repeats = 1;
     int ttl = 0, frag = 0, has_fake = 0;
@@ -1552,12 +1551,10 @@ static int quic_plan_text(const d2k_quic_arm *arm, const uint8_t *blob, size_t b
            датаграмму в 1300 байт с PADDING внутри Initial; строка донора
            исполняет хвост ПОСЛЕ пакета (RFC 9000 §12.2: сервер его
            отбрасывает). Переносится действие донора, а не измерение. */
-        if (udplen_profile &&
-            append_fmt(buf, cap, &pos,
-                       "# длина измерена PROFILE: собственным Initial донора в 1300 байт, "
-                       "не формой приветствия клиента\n") != 0) {
-            return -1;
-        }
+        /* ПРОВЕНАНС ИЗМЕРЕНИЯ (PROFILE) СЮДА НЕ ПИШЕТСЯ: идентичность плана —
+           хэш всего текста (sched.c plan_ident), и одинаковый на проводе план
+           получил бы разные имена в зависимости от того, чем мерили. Провенанс
+           живёт в трассе вопросника и журнале планировщика. */
         if (append_fmt(buf, cap, &pos, "udplen %u\n", udplen) != 0) { return -1; }
     }
     if (append_fmt(buf, cap, &pos, "order forward\n") != 0) { return -1; }
@@ -1571,7 +1568,7 @@ static int quic_plan_text(const d2k_quic_arm *arm, const uint8_t *blob, size_t b
 int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
                       char *buf, size_t cap) {
     if (!arm || !buf || cap == 0 || !quic_arm_found(arm)) { return -1; }
-    return quic_plan_text(arm, blob, blen, 0, 0, 0, buf, cap);
+    return quic_plan_text(arm, blob, blen, 0, 0, buf, cap);
 }
 
 int d2k_quic_compose_plan(const d2k_quic_arm *arm, const d2k_quic_props *p,
@@ -1584,7 +1581,6 @@ int d2k_quic_compose_plan(const d2k_quic_arm *arm, const d2k_quic_props *p,
     return quic_plan_text(use, use ? use->bytes : NULL, use ? use->len : 0,
                           p->junk_ahead == D2K_PROP_YES,
                           p->longer == D2K_PROP_YES ? QUIC_UDPLEN_INCREMENT : 0u,
-                          p->longer == D2K_PROP_YES && p->longer_profile == 1,
                           buf, cap);
 }
 

@@ -463,7 +463,9 @@ int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
  *     после drop и на провод не попадает.
  * arm может быть NULL или NOT_FOUND — тогда план собирается из одних свойств.
  * FLAKY — отказ: прогону с неподтверждёнными метками верить нельзя.
- * «Длина», измеренная PROFILE (p->longer_profile), помечается в тексте плана.
+ * Провенанс «длины» (p->longer_profile) в текст плана НЕ входит: текст —
+ * идентичность плана (plan-<fnv1a>), и одинаковый на проводе план обязан
+ * получить одно имя. Провенанс — в трассе вопросника и журнале.
  * 0 — план в buf; -1 — исполнимого нет либо найденное плечо не выразимо. */
 int d2k_quic_compose_plan(const d2k_quic_arm *arm, const d2k_quic_props *p,
                           char *buf, size_t cap);

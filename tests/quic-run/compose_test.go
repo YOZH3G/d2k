@@ -53,6 +53,7 @@ func TestD2KComposeParity(t *testing.T) {
 		if res.Strategy != c.want {
 			t.Fatalf("donor compose %+v = %q, baseline %q", c, res.Strategy, c.want)
 		}
+		plain := ""
 		for _, profile := range []int{0, 1} {
 			out, err := exec.Command(os.Getenv("D2K_QUIC_RUN_BIN"), "--compose",
 				b01(c.junk), b01(c.longer), strconv.Itoa(profile), strconv.Itoa(c.frag)).CombinedOutput()
@@ -64,9 +65,12 @@ func TestD2KComposeParity(t *testing.T) {
 			if got != want {
 				t.Fatalf("compose %+v profile=%d: donor wire %q, C wire %q\nC plan:\n%s", c, profile, want, got, out)
 			}
-			hasProfile := strings.Contains(string(out), "PROFILE")
-			if hasProfile != (profile == 1 && c.longer && c.frag == 0) {
-				t.Fatalf("compose %+v profile=%d: PROFILE provenance=%v\n%s", c, profile, hasProfile, out)
+			// Provenance is journal/trace data, never plan text: the plan ID
+			// is a hash of the whole text.
+			if profile == 0 {
+				plain = string(out)
+			} else if string(out) != plain || strings.Contains(plain, "PROFILE") {
+				t.Fatalf("compose %+v: PROFILE provenance changed plan text\n%s\n---\n%s", c, plain, out)
 			}
 		}
 	}

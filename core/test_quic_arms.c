@@ -965,10 +965,16 @@ static void quic_props_compose_checks(void) {
     CHECK(strstr(plan, "PROFILE") == NULL, "QUIC длина: PROFILE без основания");
 
     /* Длина измерена собственным Initial донора — провенанс в тексте плана. */
-    p.longer_profile = 1;
-    CHECK(d2k_quic_compose_plan(&nf, &p, plan, sizeof plan) == 0 &&
-          strstr(plan, "PROFILE") != NULL && strstr(plan, "udplen 100\n") != NULL,
-          "QUIC длина PROFILE: план не назвал происхождение измерения");
+    /* Провенанс измерения — не часть плана: текст (а значит и имя
+       plan-<fnv1a>) одинаков при «длине», измеренной PROFILE и снимком. */
+    {
+        char plain[4096];
+        memcpy(plain, plan, sizeof plain);
+        p.longer_profile = 1;
+        CHECK(d2k_quic_compose_plan(&nf, &p, plan, sizeof plan) == 0 &&
+              strcmp(plan, plain) == 0 && strstr(plan, "PROFILE") == NULL,
+              "QUIC длина PROFILE: провенанс изменил текст/идентичность плана");
+    }
 
     /* Оба свойства — одна строка донора, один план. */
     memset(&p, 0, sizeof p);

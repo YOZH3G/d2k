@@ -2695,7 +2695,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
         const d2k_quic_props *qp = &r->qprops;
         int arm_found = t->arm.kind != D2K_QA_NOT_FOUND;
         char text[sizeof t->plans[0]];
-        if (d2k_quic_compose_plan(&t->arm, qp, text, sizeof text) == 0) {
+        if (t->arm.original && d2k_quic_compose_plan(&t->arm, qp, text, sizeof text) == 0) {
             if (t->n_plans < cap) {
                 memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
                 t->n_plans++;

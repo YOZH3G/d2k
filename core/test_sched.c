@@ -6502,7 +6502,10 @@ voice_only_run:
      * 16 нулей ×2, UDPLen — в udplen increment=100, без всякого плеча
      * askArms. Прежде планировщик строил QUIC-план только из плеча и
      * отчитывался «плечо не нашлось» при измеренном ответе. */
-    for (int which = 0; which < 2; which++) {
+    /* which 1 и 2 — одна и та же «длина», измеренная PROFILE и снимком:
+       провенанс обязан остаться в журнале и НЕ менять текст/имя плана. */
+    char len_text[2][4096] = {{0}}, len_id[2][40] = {{0}};
+    for (int which = 0; which < 3; which++) {
         d2k_catalog cJ;
         memset(&cJ, 0, sizeof cJ);
         d2k_sched *s = d2k_sched_new(&cJ, sv[0], 0x2d);
@@ -6515,9 +6518,12 @@ voice_only_run:
         arm_kind = D2K_QA_NOT_FOUND;
         memset(&quic_props_answer, 0, sizeof quic_props_answer);
         if (which == 0) { quic_props_answer.junk_ahead = D2K_PROP_YES; }
-        else { quic_props_answer.longer = D2K_PROP_YES; quic_props_answer.longer_profile = 1; }
+        else {
+            quic_props_answer.longer = D2K_PROP_YES;
+            quic_props_answer.longer_profile = which == 1;
+        }
         forget_sent();
-        const char *nm = which == 0 ? "мусор.квик" : "длина.квик";
+        const char *nm = which == 0 ? "мусор.квик" : which == 1 ? "длина.квик" : "длина2.квик";
         d2k_ev h = ev_hello(17, ver_answer_port, nm);
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(17, ver_answer_port);
@@ -6546,14 +6552,23 @@ voice_only_run:
                           strstr(txt, "repeats=2 gap_us=0 place=before"),
                           "мусор: не 16 нулей донора ×2 перед Initial");
                 } else {
-                    CHECK(strstr(txt, "udplen 100\n") && strstr(txt, "PROFILE"),
-                          "длина: нет udplen 100 либо потерян провенанс PROFILE");
+                    CHECK(strstr(txt, "udplen 100\n") && !strstr(txt, "PROFILE"),
+                          "длина: нет udplen 100 либо провенанс попал в текст плана");
+                    snprintf(len_text[which - 1], sizeof len_text[0], "%s", txt);
+                    snprintf(len_id[which - 1], sizeof len_id[0], "%s", cJ.boxes[bi].plans[pj].id);
                 }
             }
         }
         CHECK(found, "в каталоге нет QUIC-плана из свойств");
         if (which == 1) {
-            CHECK(said("PROFILE"), "журнал не назвал, что «длина» измерена PROFILE");
+            CHECK(said("измерено PROFILE"), "журнал не назвал, что «длина» измерена PROFILE");
+        }
+        if (which == 2) {
+            CHECK(!said("измерено PROFILE"), "журнал назвал PROFILE у «длины», измеренной снимком");
+            CHECK(len_text[0][0] && !strcmp(len_text[0], len_text[1]),
+                  "одна и та же «длина» с PROFILE и без дала разный текст плана");
+            CHECK(len_id[0][0] && !strcmp(len_id[0], len_id[1]),
+                  "одна и та же «длина» с PROFILE и без дала разное имя плана");
         }
         memset(&quic_props_answer, 0, sizeof quic_props_answer);
         arm_kind = D2K_QA_BLOB;

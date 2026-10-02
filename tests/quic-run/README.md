@@ -102,8 +102,8 @@ donor strategy strings and compares their wire actions with the C plan from
 `d2k_quic_compose_plan` (`d2k-run --compose`). Both sides are reduced to wire
 actions; `udplen` after `send:ipfrag … drop` is dropped from the donor side
 because a zapret DROP verdict is sticky (`nfq2/desync.c` verdict_aggregate).
-It also requires the PROFILE provenance comment exactly when «длина» was
-measured with the donor's own 1300-byte Initial. Plan execution of `udplen` is
+It also requires identical C plan text with and without PROFILE provenance:
+the plan ID hashes the whole text, so provenance stays in the trace/journal. Plan execution of `udplen` is
 covered by `datapath/test_plan_apply.c`, not here.
 
 Scope is still not complete Run/wire parity. Fragment Plan execution is covered
