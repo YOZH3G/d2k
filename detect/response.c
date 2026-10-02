@@ -68,6 +68,54 @@ static int resp_timeout(const d2k_opts *opt)
     return 3000;
 }
 
+/* Разбор потока записей TLS 1.2 по всему накопленному буферу.
+ *
+ * Сообщения рукопожатия тип(1) длина(3) могут быть разорваны между записями
+ * (Certificate больше 16 КБ), поэтому границы сообщений ищем в СКЛЕЕННОМ потоке
+ * payload записей типа 22, а не внутри каждой записи. Поток не копируем:
+ * держим только счётчик байтов заголовка и остаток тела текущего сообщения, так
+ * что память ограничена входным буфером (64 КБ), а байт 0x0e внутри тела
+ * сертификата за ServerHelloDone не принимается.
+ *
+ * Возврат: 0 — продолжать читать; 1 — конец (*done=1: ServerHelloDone,
+ * *done=0: фатальный алерт). Недочитанная запись — это 0, не «дошло». */
+int d2k_resp_scan12(const uint8_t *buf, size_t have, int *done)
+{
+    size_t pos = 0, i;
+    uint8_t hdr[4];
+    size_t hgot = 0, body = 0;
+
+    *done = 0;
+    while (have - pos >= 5) {
+        size_t rlen = ((size_t)buf[pos + 3] << 8) | buf[pos + 4];
+        if (have - pos < 5 + rlen) {
+            break;
+        }
+        if (buf[pos] == 0x15) {
+            return 1;
+        }
+        if (buf[pos] == 0x16) {
+            for (i = pos + 5; i < pos + 5 + rlen; i++) {
+                if (body > 0) {
+                    body--;
+                    continue;
+                }
+                hdr[hgot++] = buf[i];
+                if (hgot == 4) {
+                    hgot = 0;
+                    body = ((size_t)hdr[1] << 16) | ((size_t)hdr[2] << 8) | hdr[3];
+                    if (hdr[0] == 14 && body == 0) {
+                        *done = 1;
+                        return 1;
+                    }
+                }
+            }
+        }
+        pos += 5 + rlen;
+    }
+    return 0;
+}
+
 /* Ждём ServerHelloDone, разбирая поток записей TLS. Возврат 1 — дошёл. */
 static int handshake12(const char *host, const char *port, const char *sni,
                        const d2k_opts *opt)
@@ -81,7 +129,6 @@ static int handshake12(const char *host, const char *port, const char *sni,
     enum { RESPONSE_CAP = 65536 };
     uint8_t *buf; /* heap-owned: each handshake has its own partial records */
     size_t have = 0;
-    size_t pos = 0;
 
     if (d2k_trigger_tls(sni, 1 /* legacy: без supported_versions, сервер пойдёт на 1.2 */,
                         &tr, err, sizeof(err)) != 0) {
@@ -142,39 +189,8 @@ static int handshake12(const char *host, const char *port, const char *sni,
         }
         have += (size_t)n;
 
-        /* Разбираем записи TLS по заголовкам: тип(1) версия(2) длина(2).
-         * Внутри записей типа handshake (0x16) идут сообщения: тип(1)
-         * длина(3). Ищем ServerHelloDone (14). Алерт (0x15) — конец. */
-        for (;;) {
-            size_t rlen, off;
-            if (have - pos < 5) {
-                break;
-            }
-            rlen = ((size_t)buf[pos + 3] << 8) | buf[pos + 4];
-            if (have - pos < 5 + rlen) {
-                break;
-            }
-            if (buf[pos] == 0x15) {
-                goto out; /* фатальный алерт — рукопожатия не будет */
-            }
-            if (buf[pos] == 0x16) {
-                off = pos + 5;
-                while (off + 4 <= pos + 5 + rlen) {
-                    size_t hlen = ((size_t)buf[off + 1] << 16) |
-                                  ((size_t)buf[off + 2] << 8) | buf[off + 3];
-                    if (buf[off] == 14) { /* ServerHelloDone */
-                        rc = 1;
-                        goto out;
-                    }
-                    if (off + 4 + hlen > pos + 5 + rlen) {
-                        /* Сообщение разорвано между записями — дочитываем
-                         * следующую запись, а не гадаем о его содержимом. */
-                        break;
-                    }
-                    off += 4 + hlen;
-                }
-            }
-            pos += 5 + rlen;
+        if (d2k_resp_scan12(buf, have, &rc) != 0) {
+            goto out; /* ServerHelloDone, либо фатальный алерт */
         }
         if (have == RESPONSE_CAP) {
             break;

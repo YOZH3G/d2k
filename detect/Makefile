@@ -52,6 +52,9 @@ test_tree: test_tree.c $(OBJ) ../core/hello.o $(HDR)
 test_bridge: test_bridge.c bridge.o poison.o ../core/hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_bridge.c bridge.o poison.o ../core/hello.o $(LDFLAGS) -lpthread
 
+test_response: test_response.c response.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_response.c $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
+
 test_threads: test_threads.c poison.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_threads.c poison.o $(LDFLAGS) -lpthread
 
@@ -64,12 +67,13 @@ bridge.o: bridge.c $(HDR) ../core/include/d2k_arm.h ../core/include/d2k_verdict.
 test_raw6_live: test_raw6_live.c $(OBJ) ../core/hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
 
-check: d2k-detect test_port test_tree test_bridge test_threads test_raw
+check: d2k-detect test_port test_tree test_bridge test_threads test_raw test_response
 	./test_port
 	./test_tree
 	./test_bridge
 	./test_threads
 	./test_raw
+	./test_response
 
 # Кросс-проверка: Linux-ветка сырого слоя на маке не компилируется вовсе,
 # и без неё опечатка там доехала бы до роутера незамеченной.
