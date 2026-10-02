@@ -291,3 +291,56 @@ d2k_tally d2k_meas(const char *ip, uint16_t port, d2k_hello h,
     }
     return t;
 }
+
+/* --- свежая четвёрка UDP (см. d2k_udp_port_claim в d2k_meas.h) ----------- */
+
+/* Сколько недавних портов помним. Больше, чем зондов за окно у самой
+   нагруженной цели: вытеснение ещё живой записи значило бы разрешить повтор,
+   поэтому кольцо с запасом, а вытесняется всегда самая старая. */
+#define UDP_RECENT_CAP 4096
+
+static struct { uint16_t port; int64_t at_ms; } udp_recent[UDP_RECENT_CAP];
+static size_t udp_recent_next;
+/* Замок без pthread: meas.o линкуется и туда, где потоков нет. */
+static volatile char udp_recent_lock;
+
+static int64_t udp_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
+}
+
+int d2k_udp_port_claim(int fd) {
+    struct sockaddr_storage me;
+    socklen_t ml = sizeof me;
+    memset(&me, 0, sizeof me);
+    if (fd < 0 || getsockname(fd, (struct sockaddr *)&me, &ml) != 0) { return -1; }
+    uint16_t port = me.ss_family == AF_INET6
+        ? ntohs(((struct sockaddr_in6 *)&me)->sin6_port)
+        : ntohs(((struct sockaddr_in *)&me)->sin_port);
+    if (port == 0) { return -1; }
+    int64_t now = udp_now_ms();
+    int recent = 0;
+    while (__atomic_test_and_set(&udp_recent_lock, __ATOMIC_ACQUIRE)) { }
+    for (size_t i = 0; i < UDP_RECENT_CAP; i++) {
+        if (udp_recent[i].port == port && udp_recent[i].at_ms != 0 &&
+            now - udp_recent[i].at_ms < (int64_t)D2K_UDP_RESIDUAL_MS) {
+            recent = 1;
+            break;
+        }
+    }
+    if (!recent) {
+        udp_recent[udp_recent_next].port = port;
+        udp_recent[udp_recent_next].at_ms = now ? now : 1;
+        udp_recent_next = (udp_recent_next + 1) % UDP_RECENT_CAP;
+    }
+    __atomic_clear(&udp_recent_lock, __ATOMIC_RELEASE);
+    return recent;
+}
+
+void d2k_udp_port_forget_all(void) {
+    while (__atomic_test_and_set(&udp_recent_lock, __ATOMIC_ACQUIRE)) { }
+    memset(udp_recent, 0, sizeof udp_recent);
+    udp_recent_next = 0;
+    __atomic_clear(&udp_recent_lock, __ATOMIC_RELEASE);
+}

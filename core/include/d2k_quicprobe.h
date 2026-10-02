@@ -381,6 +381,31 @@ typedef enum {
     D2K_QA_FLAKY      /* измерению верить нельзя — расхождение повторов, см. reason */
 } d2k_quic_arm_kind;
 
+/* ЧЕСТНЫЙ ЗАМЕР ПЛЕЧА (задача 39). Вопрос оригинала — «ответил ли сервер на
+ * наш Initial» — остаётся дешёвым первым фильтром: не прошедшее его плечо
+ * стоит три датаграммы. Но поле 02.10.2026 (задача 33) показало, что этого
+ * мало: на discord.com и www.cloudflare.com фальшивка пропускает рукопожатие,
+ * а линия обрывает поток через 5–7 КБ, и фильтр засчитывал плечо 3/3. Плечо,
+ * прошедшее фильтр, поэтому доводится до настоящего соединения с тем же
+ * воздействием на свежей четвёрке: рукопожатие, запрос HTTP/3 и не меньше
+ * D2K_QUIC_ARM_DATA_BYTES данных ответа.
+ *
+ * ПОРОГ 32 КБ. Выше всех наблюдавшихся обрывов с запасом: QUIC после
+ * фальшивки — 0–2,3 КБ данных (7,2 КБ всего вниз, задача 33), TCP-тело у
+ * RuTracker — около 23,9 КБ (d2k_volume.h); ниже 1 МБ окна потока, которое
+ * объявляет d2k_qc, и ниже размера главной страницы у типичной цели. Меньший
+ * порог (16 КБ) пропустил бы обрыв класса 23,9 КБ. */
+#define D2K_QUIC_ARM_DATA_BYTES 32768u
+
+typedef enum {
+    D2K_QAD_NOT_RUN = 0,  /* этап не проводился (локальный отказ, не сеть) */
+    D2K_QAD_PASS,         /* рукопожатие + не меньше порога данных: плечо прошло */
+    D2K_QAD_NO_HANDSHAKE, /* фильтр прошёл, а рукопожатия нет: не прошло */
+    D2K_QAD_CUT,          /* рукопожатие есть, данные оборвались до порога: не прошло */
+    D2K_QAD_SHORT         /* рукопожатие есть, ответ ЗАКОНЧИЛСЯ до порога: данных
+                             не измерить — не успех плеча и не провал коробки */
+} d2k_quic_arm_data_verdict;
+
 /* Longest original askArms ladder (quicarms.c, donor arms.go): 5 intrinsic
  * fakes + 2 candidates x 2 copy counts + 4 TTLs + fragment survival + 4
  * fragment shapes = 18 questions. The Run budget is derived from it. */
@@ -392,6 +417,10 @@ typedef struct {
     int sent, answered;
     /* 0 measured, 1 pool exhausted, 2 budget exhausted, 3 not built/local error */
     int not_measured;
+    /* Этап данных после фильтра (задача 39), d2k_quic_arm_data_verdict:
+       0 — не проводился. data_bytes — данные ответа после рукопожатия. */
+    int data;
+    uint64_t data_bytes;
 } d2k_quic_arm_step;
 
 typedef struct {
@@ -419,6 +448,10 @@ typedef struct {
      * D2K_PROP_NO закрывает ВСЁ семейство ipfrag на этой линии, включая
      * TCP-ветку: канал общий. */
     int8_t            frag_survives;
+    /* Сколько плеч прошли фильтр и рукопожатие, но ответ цели кончился до
+       порога данных (D2K_QAD_SHORT): плечо не засчитано, коробка не
+       обвинена, поиск помечен незавершённым. */
+    int               data_short;
     char              reason[256];
 } d2k_quic_arm;
 
@@ -666,6 +699,11 @@ size_t d2k_quic_build_frag2(const uint8_t *udp_payload, size_t udp_payload_len, 
  * датаграмма (её DCID), что ушла на провод, как у qp_verify_fn. Возвращает
  * 0 — ответ подтверждён, -1 — нет. */
 int d2k_quic_verify_response(const uint8_t *p, size_t n, d2k_hello msg);
+
+/* Ответ, засчитываемый ПЛЕЧУ (задача 39): только Initial нашей версии,
+ * раскрытый серверными ключами из DCID msg и адресованный SCID msg. VN,
+ * Retry и ответ на чужой DCID (приманку) — -1. */
+int d2k_quic_verify_bound(const uint8_t *p, size_t n, d2k_hello msg);
 
 /* Шов для тестов: если задан и возвращает ненулевой errno, чтение ответа
  * оракула (quic_ask_ex) считается провалившимся с этим errno. По умолчанию

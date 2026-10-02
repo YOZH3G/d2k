@@ -13,6 +13,29 @@ typedef struct {
     int copies, ttl, frag, control;
 } d2k_quic_arm_question;
 typedef d2k_tally (*d2k_quic_arm_probe_fn)(const d2k_quic_arm_question *, void *, int *);
+
+/* Порог и вердикты этапа данных — d2k_quicprobe.h (D2K_QUIC_ARM_DATA_BYTES). */
+typedef struct {
+    d2k_quic_arm_data_verdict verdict;
+    uint64_t app_bytes;   /* данные ответа на запрос, прошедшие после рукопожатия */
+    uint16_t local_port;  /* местный порт соединения — свежая четвёрка */
+    char reason[256];
+} d2k_quic_arm_data;
+
+/* Вердикт по наблюдениям одного соединения — без сети, ради тестов и одного
+ * правила для всех: handshake — рукопожатие дошло до прикладных ключей,
+ * app_bytes — данные ответа, fin — сервер закрыл поток ответа. */
+d2k_quic_arm_data_verdict d2k_quic_arm_data_judge(int handshake, uint64_t app_bytes, int fin);
+
+/* Данные плеча, прошедшего фильтр: user — из контекста. */
+typedef d2k_quic_arm_data (*d2k_quic_arm_data_fn)(const d2k_quic_arm_question *, void *user);
+
+/* Сетевой этап данных (quicprobe.c): d2k_qc с воздействием вопроса перед
+ * первым Initial, запрос HTTP/3 к sni. Подменяем в тестах. */
+typedef d2k_quic_arm_data (*d2k_quic_arm_data_wire_fn)(const d2k_quic_arm_question *,
+    const char *sni, uint16_t port, uint32_t wait_ms, uint32_t mark);
+extern d2k_quic_arm_data_wire_fn d2k_quic_arm_data_hook;
+
 typedef struct {
     const char (*pool)[D2K_QUIC_ADDR_LEN];
     size_t n_pool, next;
@@ -22,6 +45,13 @@ typedef struct {
     int marked;
     int (*can_ask)(void *); /* shared Run budget; NULL for unbounded unit oracle */
     void *limit_user;
+    /* Этап данных (задача 39). NULL — только фильтр: юнит-оракул порядка
+       лестницы. Рабочий путь (d2k_quic_original_measure) ставит его всегда. */
+    d2k_quic_arm_data_fn data;
+    void *data_user;
+    /* Время этапа данных — цена уже заданного вопроса, а не следующих:
+       бюджет Run продлевается на него (NULL — не продлевать). */
+    void (*spent)(void *limit_user, uint32_t ms);
 } d2k_quic_arm_context;
 
 /* Runtime transport for one original askArms question. It receives the SNI

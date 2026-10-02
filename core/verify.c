@@ -35,6 +35,7 @@
 #include "d2k_compose_internal.h" /* d2k_props_contact — общее обращение к цели */
 #include "d2k_h3.h"
 #include "d2k_quicconn.h"
+#include "d2k_quicprobe.h" /* D2K_QUIC_ARM_DATA_BYTES */
 #include "d2k_tls13.h"
 #include "d2k_tls12.h"
 #include "d2k_verify.h"
@@ -1177,10 +1178,7 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
         if (n > 0) { got += (size_t)n; }
         int st = 0;
         if (got > 0 && d2k_h3_status(rx, got, &st) == 0) {
-            r.level = D2K_VER_APPLICATION;
             r.status = st;
-            snprintf(r.reason, sizeof r.reason,
-                     "заголовки HTTP/3 получены, статус %d", st);
             if (st == 451) {
                 r.level = D2K_VER_DENIED;
                 r.http_outcome = D2K_HTTP_LEGAL_DENIAL;
@@ -1190,7 +1188,39 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
             break;
         }
     }
-    if (r.level != D2K_VER_APPLICATION && r.level != D2K_VER_DENIED) {
+    /* ЗАГОЛОВКИ — ЕЩЁ НЕ ПРИЛОЖЕНИЕ (задача 39). Поле 02.10.2026 (задача 33):
+       после фальшивки линия пропускает рукопожатие и первые килобайты, а
+       дальше поток обрывается. Приложение доказано, когда ответ пришёл
+       ЦЕЛИКОМ (сервер закрыл поток — как полный ответ у TCP-зонда) или когда
+       через линию прошло не меньше D2K_QUIC_ARM_DATA_BYTES данных ответа.
+       Чтение продолжается в том же сроке; лишние байты не храним. */
+    if (r.status != 0 && r.level != D2K_VER_DENIED) {
+        uint64_t bytes = 0;
+        int fin = 0;
+        d2k_qc_app_progress(c, &bytes, &fin);
+        while (!closed && !fin && bytes < D2K_QUIC_ARM_DATA_BYTES &&
+               verify_now_ms() < until) {
+            uint64_t sid = 0;
+            uint8_t sink[4096];
+            if (d2k_qc_stream_recv(c, &sid, sink, sizeof sink, 200, err, sizeof err) < 0) {
+                closed = 1;
+            }
+            d2k_qc_app_progress(c, &bytes, &fin);
+        }
+        r.body_bytes = bytes;
+        r.body_complete = fin;
+        if (fin || bytes >= D2K_QUIC_ARM_DATA_BYTES) {
+            r.level = D2K_VER_APPLICATION;
+            snprintf(r.reason, sizeof r.reason,
+                     "заголовки HTTP/3 получены, статус %d, данных %llu байт%s", r.status,
+                     (unsigned long long)bytes, fin ? ", ответ целиком" : "");
+        } else {
+            snprintf(r.reason, sizeof r.reason,
+                     "заголовки HTTP/3 получены (статус %d), поток оборван на %llu байт "
+                     "до %u и до конца ответа%s%.60s", r.status, (unsigned long long)bytes,
+                     D2K_QUIC_ARM_DATA_BYTES, closed ? ": " : "", closed ? err : "");
+        }
+    } else if (r.level != D2K_VER_DENIED) {
         quic_app_silent(&r, got, d2k_qc_rx_wire_bytes(c) - wire_before,
                         closed ? err : NULL);
     }

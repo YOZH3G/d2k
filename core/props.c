@@ -39,6 +39,12 @@ static d2k_tally original_probe(const d2k_quic_arm_question *q, void *user, int 
     return d2k_quic_ask_arm_hook(q,sni,w->port,w->wait_ms,w->mark,sent);
 }
 
+/* Task 39: the arm's data stage on the same address, name and action. */
+static d2k_quic_arm_data original_data(const d2k_quic_arm_question *q, void *user) {
+    original_wire *w=user;
+    return d2k_quic_arm_data_hook(q,w->target_sni,w->port,w->wait_ms,w->mark);
+}
+
 d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
     d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark) {
     original_wire wire={.port=port,.wait_ms=wait_ms,.mark=mark};
@@ -59,6 +65,7 @@ d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
     (void)control;
     d2k_quic_arm_context local=*ctx;
     local.probe=original_probe; local.user=&wire;
+    local.data=original_data; local.data_user=&wire;
     d2k_quic_arm r=d2k_quic_original_arms(&local);
     ctx->next=local.next; ctx->marked=local.marked;
     return r;

@@ -121,6 +121,12 @@ struct d2k_qc {
     uint8_t  rx_data[STREAM_BUF];
     size_t   rx_len, rx_taken;
     int      rx_fin;
+    /* Сколько данных ответа на НАШ запрос прошло через линию: наибольший
+       конец кадра STREAM этого потока, принятого ПРИКЛАДНЫМИ ключами, — не
+       только то, что влезло в rx_data. Задача 39: коробка рвёт поток через
+       несколько килобайт после рукопожатия, и «пришли заголовки» этого не
+       видит. Повтор сервером уже принятого кадра конец не сдвигает. */
+    uint64_t rx_app_end;
 
     /* Последняя прикладная посылка — для повтора по таймеру. Обнаружения
        потерь у нас нет и не нужно (см. шапку), но ОДИН повтор обязателен:
@@ -491,6 +497,10 @@ static int frames_in(d2k_qc *c, d2k_qw_level lvl, const uint8_t *p, size_t n,
                         if (off + take > c->rx_len) { c->rx_len = (size_t)off + take; }
                     }
                     if (t & 0x01) { c->rx_fin = 1; }
+                    if (lvl == D2K_QW_LEVEL_APP && c->have_want &&
+                        off + len > c->rx_app_end) {
+                        c->rx_app_end = off + len;
+                    }
                 }
                 i += (size_t)len;
                 break;
@@ -758,9 +768,7 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
 
     int af = strchr(o->ip, ':') ? AF_INET6 : AF_INET;
     c->family = af == AF_INET6 ? 6 : 4;
-    c->fd = (o->use_fd > 0) ? o->use_fd : socket(af, SOCK_DGRAM, 0);
-    if (c->fd < 0) { say(err, errcap, "сокет: %s", strerror(errno)); free(c); return -1; }
-    if (o->mark) { (void)d2k_mark_hook(c->fd, o->mark); }
+    c->fd = (o->use_fd > 0) ? o->use_fd : -1;
 
     struct sockaddr_storage to;
     memset(&to, 0, sizeof to);
@@ -778,12 +786,39 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
         dst = &v4->sin_addr; tolen = sizeof *v4;
     }
     if (strchr(o->ip, '%') || inet_pton(af, o->ip, dst) != 1) {
-        say(err, errcap, "адрес не разбирается"); d2k_qc_close(c); return -1;
+        say(err, errcap, "адрес не разбирается");
+        if (c->fd < 0) { free(c); return -1; }
+        d2k_qc_close(c); return -1;
     }
-    /* connect на UDP не шлёт ни байта: он привязывает сокет к направлению,
-       чтобы приходили ошибки ICMP и чтобы recv не принимал чужое. */
-    if (connect(c->fd, (struct sockaddr *)&to, tolen) != 0) {
-        say(err, errcap, "connect: %s", strerror(errno)); d2k_qc_close(c); return -1;
+    if (c->fd >= 0) {
+        if (o->mark) { (void)d2k_mark_hook(c->fd, o->mark); }
+        /* connect на UDP не шлёт ни байта: он привязывает сокет к направлению,
+           чтобы приходили ошибки ICMP и чтобы recv не принимал чужое. */
+        if (connect(c->fd, (struct sockaddr *)&to, tolen) != 0) {
+            say(err, errcap, "connect: %s", strerror(errno)); d2k_qc_close(c); return -1;
+        }
+    } else {
+        /* СВОЙ СОКЕТ — СО СВЕЖЕЙ ЧЕТВЁРКОЙ (задача 39): местный порт, бывший
+           у нашего зонда за окно остаточной блокировки, отвергается, и сокет
+           с ним держится открытым, пока ищется следующий. Занятый вызывающим
+           сокет (use_fd) проверен там, где его заняли. */
+        int held[D2K_UDP_FRESH_TRIES];
+        int n_held = 0;
+        for (;;) {
+            int fd = socket(af, SOCK_DGRAM, 0);
+            if (fd < 0) { say(err, errcap, "сокет: %s", strerror(errno)); break; }
+            if (o->mark) { (void)d2k_mark_hook(fd, o->mark); }
+            if (connect(fd, (struct sockaddr *)&to, tolen) != 0) {
+                say(err, errcap, "connect: %s", strerror(errno)); close(fd); break;
+            }
+            if (d2k_udp_port_claim(fd) <= 0) { c->fd = fd; break; }
+            if (n_held == D2K_UDP_FRESH_TRIES) {
+                say(err, errcap, "свежего местного порта нет"); close(fd); break;
+            }
+            held[n_held++] = fd;
+        }
+        for (int i = 0; i < n_held; i++) { close(held[i]); }
+        if (c->fd < 0) { free(c); return -1; }
     }
     struct sockaddr_storage me;
     socklen_t ml = sizeof me;
@@ -800,8 +835,27 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
     }
     /* Первая датаграмма клиента обязана быть не короче 1200 байт
        (RFC 9000 §14.1): иначе сервер вправе её не обслуживать. */
-    if (send_level(c, D2K_QW_LEVEL_INITIAL, frame, flen, 1200, err, errcap) != 0) {
-        d2k_qc_close(c); return -1;
+    if (!o->first_send) {
+        if (send_level(c, D2K_QW_LEVEL_INITIAL, frame, flen, 1200, err, errcap) != 0) {
+            d2k_qc_close(c); return -1;
+        }
+    } else {
+        /* Замер плеча (задача 39): воздействие плеча идёт ПЕРЕД первым
+           Initial на той же четвёрке, ровно как в вопросе-фильтре. Повторы
+           по таймеру уходят как есть — так же их пропускает датапат. */
+        uint8_t pkt[DGRAM_OUT];
+        size_t n = seal_level(c, D2K_QW_LEVEL_INITIAL, frame, flen, 1200,
+                              pkt, sizeof pkt, err, errcap);
+        if (n == 0) { d2k_qc_close(c); return -1; }
+        int sent = o->first_send(c->fd, pkt, n, o->first_send_user);
+        if (sent < 0) {
+            say(err, errcap, "воздействие перед первым Initial не ушло");
+            d2k_qc_close(c); return -1;
+        }
+        if (sent == 0 && send(c->fd, pkt, n, 0) != (ssize_t)n) {
+            say(err, errcap, "датаграмма не ушла: %s", strerror(errno));
+            d2k_qc_close(c); return -1;
+        }
     }
 
     int64_t deadline = now_ms() + (o->deadline_ms > 0 ? o->deadline_ms : 5000);
@@ -954,6 +1008,7 @@ int d2k_qc_stream_send(d2k_qc *c, uint64_t stream_id, const uint8_t *data, size_
            байты двух разных потоков как один. */
         c->rx_len = c->rx_taken = 0;
         c->rx_fin = 0;
+        c->rx_app_end = 0;
     }
     uint8_t fr[DGRAM_OUT];
     size_t o = 0;
@@ -1011,6 +1066,11 @@ long d2k_qc_stream_recv(d2k_qc *c, uint64_t *stream_out, uint8_t *buf, size_t ca
             }
         }
     }
+}
+
+void d2k_qc_app_progress(const d2k_qc *c, uint64_t *bytes, int *fin) {
+    if (bytes) { *bytes = c ? c->rx_app_end : 0; }
+    if (fin) { *fin = c ? c->rx_fin : 0; }
 }
 
 int d2k_qc_peer_name(const d2k_qc *c) { return c ? c->peer_name : -1; }

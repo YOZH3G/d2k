@@ -83,7 +83,7 @@ TESTHDR = test_stand.h
 # по себе, а настоящий бинарник d2kask, запущенный подпроцессом, плюс
 # настоящий ctlprobe (как и test_compose/test_link) — но stand ей тоже нужен
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
-TESTS   = test_stun test_voice test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_fresh_repeats test_quic_arms test_ipfrag test_quic_original_arms test_quic_run_order test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify test_measured
+TESTS   = test_stun test_voice test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_fresh_repeats test_quic_arm_data test_quic_arms test_ipfrag test_quic_original_arms test_quic_run_order test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify test_measured
 TESTS += test_ech
 TESTS += test_domain test_groups
 TESTS += test_groups_catalog
@@ -118,7 +118,7 @@ test-ech: test_ech
 
 check: test-ech
 
-.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-rst-trigger test-voice-sched test-verify FORCE
+.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-rst-trigger test-voice-sched test-verify FORCE
 
 all: meas.o verdict.o crypto.o quic.o quicprobe.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o groups.o domain.o match.o compose.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o quicconn.o quicwire.o h3.o d2kask d2kc d2kvoice
 
@@ -333,11 +333,11 @@ test_quicwire: test_quicwire.c quicwire.o crypto.o $(HDR)
 test_quic: test_quic.c quic.o quicwire.o crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quic.c quic.o quicwire.o crypto.o $(TEST_LDFLAGS)
 
-test_quicprobe: test_quicprobe.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quicprobe.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o $(TEST_LDFLAGS)
+test_quicprobe: test_quicprobe.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quicprobe.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(TEST_LDFLAGS)
 
-test_quic_arms: test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o hello.o plantlv.o link.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o hello.o plantlv.o link.o $(TEST_LDFLAGS)
+test_quic_arms: test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o hello.o plantlv.o link.o quicconn.o h3.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o hello.o plantlv.o link.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 test_tls12: test_tls12.c tls12.o tls13core.o crypto.o x25519.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_tls12.c tls12.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
@@ -436,11 +436,19 @@ test-quichello: test_quichello
 test-quicprobe: test_quicprobe
 	./test_quicprobe
 
-test_quic_fresh_repeats: test_quic_fresh_repeats.c props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic_fresh_repeats.c props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o $(TEST_LDFLAGS)
+test_quic_fresh_repeats: test_quic_fresh_repeats.c props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_fresh_repeats.c props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 test-quic-fresh-repeats: test_quic_fresh_repeats
 	./test_quic_fresh_repeats
+
+# Задача 39: честный замер плеча QUIC — ответ только на наш Initial, данные
+# после рукопожатия, свежая четвёрка. Свой стенд на 127.0.0.1.
+test_quic_arm_data: test_quic_arm_data.c props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_arm_data.c props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(TEST_LDFLAGS)
+
+test-quic-arm-data: test_quic_arm_data
+	./test_quic_arm_data
 
 test-quic-arms: test_quic_arms
 	./test_quic_arms
@@ -486,7 +494,7 @@ test-d2kc-proto: test_d2kc_proto d2kc
 test_d2kc_proto: test_d2kc_proto.c $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_d2kc_proto.c $(TEST_LDFLAGS)
 
-check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify test-volume test-httpup-logic test-measured
+check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify test-volume test-httpup-logic test-measured
 
 test_measured: test_measured.c compose.o plantlv.o hello.o meas.o link.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h ../datapath/wire.c ../datapath/include/d2k_session.h
 	$(CC) $(CFLAGS) -o $@ test_measured.c compose.o plantlv.o hello.o meas.o link.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
@@ -586,19 +594,19 @@ cross: hello_profiles.inc
 		d2kvoice.c voice.c stun.c net4.c tls13core.c crypto.c x25519.c meas.c -lpthread || exit 1
 	@echo "== test_quicprobe целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quicprobe-a64 \
-		test_quicprobe.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c -lpthread || exit 1
+		test_quicprobe.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c quicconn.c h3.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quicprobe-mipsel \
-		test_quicprobe.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c -lpthread || exit 1
+		test_quicprobe.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c quicconn.c h3.c -lpthread || exit 1
 	@echo "== original QUIC arm regressions целиком =="
-	@set -e; for t in test_ipfrag test_quic_original_arms test_quic_run_order test_quic_fresh_repeats; do \
+	@set -e; for t in test_ipfrag test_quic_original_arms test_quic_run_order test_quic_fresh_repeats test_quic_arm_data; do \
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-$$t-a64 $$t.c $(SRC) -lpthread; \
 		$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-$$t-mipsel $$t.c $(SRC) -lpthread; \
 	done
 	@echo "== test_quic_arms целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-a64 \
-		test_quic_arms.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c hello.c plantlv.c link.c -lpthread || exit 1
+		test_quic_arms.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c hello.c plantlv.c link.c quicconn.c h3.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-mipsel \
-		test_quic_arms.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c hello.c plantlv.c link.c -lpthread || exit 1
+		test_quic_arms.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c hello.c plantlv.c link.c quicconn.c h3.c -lpthread || exit 1
 	@echo "== test_hello целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_hello-a64 \
 		test_hello.c hello.c -lpthread || exit 1

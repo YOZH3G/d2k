@@ -148,6 +148,9 @@
 #include "d2k_quic_arms.h"
 #include "d2k_ipfrag.h"
 #include "d2k_tls13core.h"
+#include "d2k_quicconn.h"
+#include "d2k_h3.h"
+#include "d2k_meas.h"
 
 /* ---------------------------------------------------------------------
  * Умолчание и тестовый шов. См. шапку d2k_quicprobe.h про то, почему
@@ -614,6 +617,112 @@ static void nap_us(uint32_t us) {
     (void)nanosleep(&ts, NULL);
 }
 
+/* Сокет одной попытки: открыт, помечен, при необходимости привязан к
+   спрошенному исходному порту и подключён к цели — и с МЕСТНЫМ ПОРТОМ,
+   которого не было у наших зондов за окно остаточной блокировки
+   (d2k_udp_port_claim, задача 39). Отвергнутые сокеты держатся открытыми до
+   конца поиска, чтобы ядро не выдало тот же порт снова. Спрошенный исходный
+   порт (вопрос 7 оригинала) не подменяется: его выбирает вопрос, а не ядро,
+   — он только записывается. *marked — как у qp_send_one. */
+static int qp_open_fresh(int family, const struct sockaddr *a, socklen_t alen,
+                         int src_port, uint32_t mark, int *marked) {
+    int held[D2K_UDP_FRESH_TRIES];
+    int n_held = 0, fd = -1;
+    for (;;) {
+        *marked = (mark == 0);
+        fd = socket(family, SOCK_DGRAM, 0);
+        if (fd < 0) { break; }
+        if (mark != 0 && d2k_mark_hook(fd, mark) == 0) {
+            *marked = 1;
+        }
+        /* ИСХОДНЫЙ ПОРТ — ТОЛЬКО когда его СПРОСИЛИ (вопрос 7 оригинала: коробка
+           экономит на разборе и не смотрит на датаграммы, у которых исходный порт
+           не больше порта назначения; у GFW подтверждено перебором пар портов).
+           Во всех прочих вопросах bind'а нет намеренно: свой эфемерный порт на
+           каждую попытку — это и есть то, чем шаг 2 доказывает независимость
+           остаточной блокировки от исходного порта.
+
+           Порт ниже 1024 требует прав, и отказ bind'а — это НЕ сетевой факт:
+           попытка не отправляется вовсе (-1, «наша сторона»), и вопрос честно
+           остаётся незаданным, а не «не помог». */
+        if (src_port > 0 && src_port < 65536) {
+            struct sockaddr_storage src;
+            memset(&src, 0, sizeof src);
+            socklen_t slen;
+            if (family == AF_INET6) {
+                struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&src;
+                v6->sin6_family = AF_INET6; v6->sin6_port = htons((uint16_t)src_port);
+                slen = sizeof *v6;
+            } else {
+                struct sockaddr_in *v4 = (struct sockaddr_in *)&src;
+                v4->sin_family = AF_INET; v4->sin_port = htons((uint16_t)src_port);
+                slen = sizeof *v4;
+            }
+            if (bind(fd, (struct sockaddr *)&src, slen) != 0) {
+                close(fd); fd = -1; break;
+            }
+        }
+        /* "Подключенный" UDP-сокет — не ради семантики соединения (её у UDP
+           нет), а чтобы ICMP-отказ (порт/хост недоступен) дошёл до нас через
+           POLLERR/код ошибки, а не неотличимой тишиной. Местный порт ядро
+           выдаёт здесь же. */
+        if (connect(fd, a, alen) != 0) {
+            close(fd); fd = -1; break;
+        }
+        int recent = d2k_udp_port_claim(fd);
+        if (recent <= 0 || src_port > 0) { break; }
+        if (n_held == D2K_UDP_FRESH_TRIES) { close(fd); fd = -1; break; }
+        held[n_held++] = fd;
+        fd = -1;
+    }
+    for (int i = 0; i < n_held; i++) { close(held[i]); }
+    return fd;
+}
+
+/* Датаграммы воздействия перед Initial на УЖЕ подключённом сокете fd:
+   prefix_copies отдельных датаграмм prefix, при prefix_ttl>0 — с этим TTL, и
+   исходный TTL возвращается ДО Initial. Общая для вопроса (qp_send_one) и
+   этапа данных плеча (задача 39): воздействие одно и то же в обоих.
+   0 — ушло, -1 — не ушло (наша сторона), -2 — ECONNREFUSED. Сокет не
+   закрывает. */
+static int qp_send_prefix(int fd, int family, const uint8_t *prefix, size_t prefix_len,
+                          int prefix_ttl, int prefix_copies) {
+    int hop_level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+    int hop_option = family == AF_INET6 ? IPV6_UNICAST_HOPS : IP_TTL;
+    int orig_ttl = -1;
+    if (prefix_ttl > 0) {
+        socklen_t ttl_len = sizeof orig_ttl;
+        if (getsockopt(fd, hop_level, hop_option, &orig_ttl, &ttl_len) != 0) {
+            return -1;
+        }
+        int want = prefix_ttl;
+        if (setsockopt(fd, hop_level, hop_option, &want, sizeof want) != 0) {
+            return -1;
+        }
+    }
+    /* КОПИЙ СТОЛЬКО, СКОЛЬКО ПРОСИЛИ, И КАЖДАЯ — СВОЯ ДАТАГРАММА.
+       Донор кладёт N отдельных датаграмм перед Initial
+       (z2k-detect/internal/quicprobe/arms.go:140-150), а не одну длинную
+       из N склеенных копий: коробка считает ДАТАГРАММЫ, и склейка
+       измеряла бы не то. Ноль и единица означают одну копию — прежнее
+       поведение. */
+    int copies = prefix_copies > 0 ? prefix_copies : 1;
+    for (int c = 0; c < copies; c++) {
+        if (send(fd, prefix, prefix_len, 0) < 0) {
+            return errno == ECONNREFUSED ? -2 : -1;
+        }
+    }
+    if (prefix_ttl > 0 && orig_ttl >= 0) {
+        /* Восстановить ДО отправки trigger — иначе он тоже уйдёт с
+           укороченным TTL и рискует не дойти до настоящего сервера
+           (см. doc-комментарий d2k_quic_ask_ttl_fn). */
+        if (setsockopt(fd, hop_level, hop_option, &orig_ttl, sizeof orig_ttl) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* Открывает, метит, подключает и отправляет ОДНУ попытку (включая
    необязательный мусор-приманку перед основным куском); НЕ ждёт ответа —
    ожидание общее для всех попыток серии, см. quic_ask_ex. Возвращает fd
@@ -642,41 +751,6 @@ static int qp_send_one(const char *addr, uint16_t port,
     uint8_t dst[16];
     int family = qp_addr_parse(addr, dst);
     if (!family) return -1;
-    int fd = socket(family, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        return -1;
-    }
-    if (mark != 0 && d2k_mark_hook(fd, mark) == 0) {
-        *marked = 1;
-    }
-    /* ИСХОДНЫЙ ПОРТ — ТОЛЬКО когда его СПРОСИЛИ (вопрос 7 оригинала: коробка
-       экономит на разборе и не смотрит на датаграммы, у которых исходный порт
-       не больше порта назначения; у GFW подтверждено перебором пар портов).
-       Во всех прочих вопросах bind'а нет намеренно: свой эфемерный порт на
-       каждую попытку — это и есть то, чем шаг 2 доказывает независимость
-       остаточной блокировки от исходного порта.
-
-       Порт ниже 1024 требует прав, и отказ bind'а — это НЕ сетевой факт:
-       попытка не отправляется вовсе (-1, «наша сторона»), и вопрос честно
-       остаётся незаданным, а не «не помог». */
-    if (src_port > 0 && src_port < 65536) {
-        struct sockaddr_storage src;
-        memset(&src, 0, sizeof src);
-        socklen_t slen;
-        if (family == AF_INET6) {
-            struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&src;
-            v6->sin6_family = AF_INET6; v6->sin6_port = htons((uint16_t)src_port);
-            slen = sizeof *v6;
-        } else {
-            struct sockaddr_in *v4 = (struct sockaddr_in *)&src;
-            v4->sin_family = AF_INET; v4->sin_port = htons((uint16_t)src_port);
-            slen = sizeof *v4;
-        }
-        if (bind(fd, (struct sockaddr *)&src, slen) != 0) {
-            close(fd);
-            return -1;
-        }
-    }
     struct sockaddr_storage a;
     memset(&a, 0, sizeof a);
     socklen_t alen;
@@ -689,11 +763,8 @@ static int qp_send_one(const char *addr, uint16_t port,
         v4->sin_family = AF_INET; v4->sin_port = htons(port);
         memcpy(&v4->sin_addr, dst, 4); alen = sizeof *v4;
     }
-    /* "Подключенный" UDP-сокет — не ради семантики соединения (её у UDP
-       нет), а чтобы ICMP-отказ (порт/хост недоступен) дошёл до нас через
-       POLLERR/код ошибки, а не неотличимой тишиной. */
-    if (connect(fd, (struct sockaddr *)&a, alen) != 0) {
-        close(fd);
+    int fd = qp_open_fresh(family, (struct sockaddr *)&a, alen, src_port, mark, marked);
+    if (fd < 0) {
         return -1;
     }
 #ifdef IP_RECVTTL
@@ -710,41 +781,11 @@ static int qp_send_one(const char *addr, uint16_t port,
         int on = 1;
         (void)setsockopt(fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on, sizeof on);
     }
-    int hop_level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
-    int hop_option = family == AF_INET6 ? IPV6_UNICAST_HOPS : IP_TTL;
     if (prefix && prefix_len > 0) {
-        int orig_ttl = -1;
-        if (prefix_ttl > 0) {
-            socklen_t ttl_len = sizeof orig_ttl;
-            if (getsockopt(fd, hop_level, hop_option, &orig_ttl, &ttl_len) != 0) {
-                close(fd); return -1;
-            }
-            int want = prefix_ttl;
-            if (setsockopt(fd, hop_level, hop_option, &want, sizeof want) != 0) {
-                close(fd); return -1;
-            }
-        }
-        /* КОПИЙ СТОЛЬКО, СКОЛЬКО ПРОСИЛИ, И КАЖДАЯ — СВОЯ ДАТАГРАММА.
-           Донор кладёт N отдельных датаграмм перед Initial
-           (z2k-detect/internal/quicprobe/arms.go:140-150), а не одну длинную
-           из N склеенных копий: коробка считает ДАТАГРАММЫ, и склейка
-           измеряла бы не то. Ноль и единица означают одну копию — прежнее
-           поведение. */
-        int copies = prefix_copies > 0 ? prefix_copies : 1;
-        for (int c = 0; c < copies; c++) {
-            if (send(fd, prefix, prefix_len, 0) < 0) {
-                int refused = errno == ECONNREFUSED;
-                close(fd);
-                return refused ? -2 : -1;
-            }
-        }
-        if (prefix_ttl > 0 && orig_ttl >= 0) {
-            /* Восстановить ДО отправки trigger — иначе он тоже уйдёт с
-               укороченным TTL и рискует не дойти до настоящего сервера
-               (см. doc-комментарий d2k_quic_ask_ttl_fn). */
-            if (setsockopt(fd, hop_level, hop_option, &orig_ttl, sizeof orig_ttl) != 0) {
-                close(fd); return -1;
-            }
+        int pr = qp_send_prefix(fd, family, prefix, prefix_len, prefix_ttl, prefix_copies);
+        if (pr != 0) {
+            close(fd);
+            return pr;
         }
         /* Original exchange writes prefix datagrams and Initial back-to-back.
            An inserted settle delay changes the measured hypothesis. */
@@ -776,6 +817,41 @@ static int qp_verify_aead(const uint8_t *p, size_t n, d2k_hello msg) {
         return -1; /* свой же снимок не разобрать как Initial — подлинность проверить нечем */
     }
     return qp_verify_server_response(p, n, msg.bytes + dcid_off, dcid_len, version);
+}
+
+/* ОТВЕТ ПЛЕЧУ — ТОЛЬКО ПРИВЯЗАННЫЙ К НАШЕМУ INITIAL (задача 39).
+   Ответ донора (qp_verify_aead) засчитывает и Version Negotiation, и Retry
+   без проверки тега: оба не аутентифицированы, и на линии, где коробка
+   отвечает за сервер или сервер отвечает на приманку (Heitmann et al.,
+   FOCI 2026), они не доказывают, что НАШ Initial дошёл. Для плеча годится
+   только Initial нашей версии, который раскрывается серверными ключами из
+   НАШЕГО DCID и адресован НАШЕМУ SCID (RFC 9000 §7.2: DCID ответа — SCID
+   клиента). Ответ на приманку несёт её собственный DCID и сюда не проходит.
+   Retry и VN остаются тишиной этого вопроса, а не его успехом. */
+static int qp_verify_bound(const uint8_t *p, size_t n, d2k_hello msg) {
+    uint32_t version;
+    size_t dcid_off, dcid_len;
+    if (qp_dcid_of(msg.bytes, msg.len, &version, &dcid_off, &dcid_len) != 0) {
+        return -1;
+    }
+    size_t so = dcid_off + dcid_len;
+    if (so >= msg.len) return -1;
+    size_t scid_len = msg.bytes[so];
+    if (so + 1 + scid_len > msg.len) return -1;
+    if (qp_donor_unauth_reply(p, n, version) != 0) {
+        return -1; /* VN, Retry или чужое — не успех плеча */
+    }
+    qp_hdr h;
+    if (qp_parse_hdr(p, n, &h) != 0) return -1;
+    if (h.dcid_len != scid_len ||
+        (scid_len && memcmp(p + h.dcid_off, msg.bytes + so + 1, scid_len) != 0)) {
+        return -1; /* адресован не нашему соединению */
+    }
+    return qp_verify_server_response(p, n, msg.bytes + dcid_off, dcid_len, version);
+}
+
+int d2k_quic_verify_bound(const uint8_t *p, size_t n, d2k_hello msg) {
+    return qp_verify_bound(p, n, msg);
 }
 
 /* Тонкая публичная обёртка над qp_verify_aead — задаче 6 (props.c, реальный
@@ -915,6 +991,78 @@ done:
 }
 #endif
 
+#ifdef __linux__
+/* Emits msg as the plan's raw IP fragments FROM rx's local address and port:
+   the reply comes back on rx. Shared by the question (qp_send_fragmented)
+   and by the arm's data stage (task 39), which fragments the first Initial
+   of a real connection. 0 sent, -1 not sent; rx stays open either way. */
+static int qp_emit_fragments(int rx,int family,const uint8_t target[16],uint16_t port,
+    d2k_hello msg,const d2k_ipfrag_plan *plan,uint32_t mark,int *marked) {
+    if(!msg.bytes || !msg.len || msg.len>D2K_QW_MAX_DGRAM)return -1;
+    int raw=-1,rc=-1;
+    d2k_ip6frag_sender sender6;
+    d2k_ip6frag_sender_init(&sender6);
+    struct sockaddr_storage dst,local;
+    memset(&dst,0,sizeof dst);
+    socklen_t dst_len;
+    if(family==AF_INET6) {
+        struct sockaddr_in6 *v6=(struct sockaddr_in6 *)&dst;
+        v6->sin6_family=AF_INET6;v6->sin6_port=0;
+        memcpy(&v6->sin6_addr,target,16);dst_len=sizeof *v6;
+    } else {
+        struct sockaddr_in *v4=(struct sockaddr_in *)&dst;
+        v4->sin_family=AF_INET;v4->sin_port=htons(port);
+        memcpy(&v4->sin_addr,target,4);dst_len=sizeof *v4;
+    }
+    socklen_t local_len=sizeof local;
+    if(getsockname(rx,(struct sockaddr *)&local,&local_len)!=0)goto out;
+    if(family==AF_INET) {
+        raw=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
+        if(raw<0)goto out;
+        int one=1;
+        if(setsockopt(raw,IPPROTO_IP,IP_HDRINCL,&one,sizeof one)!=0)goto out;
+    /* Proven donor/platform limitation: local conntrack can reorder pos8
+       and discard overlaps BEFORE the probe reaches the wire. Preserve the
+       donor's requested fragments, not that accidental kernel rewrite.
+       No fallback: unavailable NODEFRAG is unsent/local error (SPEC §7). */
+#ifdef IP_NODEFRAG
+    if(setsockopt(raw,IPPROTO_IP,IP_NODEFRAG,&one,sizeof one)!=0)goto out;
+#else
+    goto out;
+#endif
+    /* Unlike the donor's EPERM fallback, D2K refuses to send an unisolated
+       raw probe through its own candidate. SPEC §7, tested explicitly. */
+    if(mark && d2k_mark_hook(raw,mark)!=0){*marked=0;goto out;}
+    }
+    uint8_t wire[3*(D2K_QW_MAX_DGRAM+48)];d2k_ipfrag_span spans[3];
+    uint32_t id=fragment_id();
+    size_t n;
+    if(family==AF_INET6) {
+        struct sockaddr_in6 *v6=(struct sockaddr_in6 *)&local;
+        n=d2k_udpfrag6_build_ex((const uint8_t *)&v6->sin6_addr,target,
+            ntohs(v6->sin6_port),port,msg.bytes,msg.len,plan,id,64,0,0,
+            wire,sizeof wire,spans);
+    } else {
+        struct sockaddr_in *v4=(struct sockaddr_in *)&local;
+        n=d2k_udpfrag_build((const uint8_t *)&v4->sin_addr,target,
+            ntohs(v4->sin_port),port,msg.bytes,msg.len,plan,(uint16_t)id,
+            wire,sizeof wire,spans);
+    }
+    if(!n)goto out;
+    for(size_t i=0;i<n;i++) {
+        ssize_t sent = family==AF_INET6
+            ? d2k_ip6frag_send(&sender6,wire+spans[i].off,spans[i].len,mark)
+            : sendto(raw,wire+spans[i].off,spans[i].len,0,(struct sockaddr *)&dst,dst_len);
+        if(sent!=(ssize_t)spans[i].len)goto out;
+    }
+    rc=0;
+out:
+    if(raw>=0)close(raw);
+    d2k_ip6frag_sender_close(&sender6);
+    return rc;
+}
+#endif
+
 /* Port of exchangeFragmented: the connected receive socket remains owned
    until the common authenticated-response loop closes it. No close/rebind
    race, no repeated packet/port/ID for independent attempts. */
@@ -926,16 +1074,10 @@ static int qp_send_fragmented(const char *addr,uint16_t port,d2k_hello msg,
     return -1; /* original frag_other.go: not built, not negative evidence */
 #else
     if(!addr || !msg.bytes || !msg.len || msg.len>D2K_QW_MAX_DGRAM)return -1;
-    int rx=-1,raw=-1;
-    d2k_ip6frag_sender sender6;
-    d2k_ip6frag_sender_init(&sender6);
     uint8_t target[16];
     int family=qp_addr_parse(addr,target);
     if(!family)return -1;
-    rx=socket(family,SOCK_DGRAM,0);
-    if(rx<0)return -1;
-    if(mark && d2k_mark_hook(rx,mark)!=0){*marked=0;goto fail;}
-    struct sockaddr_storage dst,local;
+    struct sockaddr_storage dst;
     memset(&dst,0,sizeof dst);
     socklen_t dst_len;
     if(family==AF_INET6) {
@@ -947,56 +1089,13 @@ static int qp_send_fragmented(const char *addr,uint16_t port,d2k_hello msg,
         v4->sin_family=AF_INET;v4->sin_port=htons(port);
         memcpy(&v4->sin_addr,target,4);dst_len=sizeof *v4;
     }
-    if(connect(rx,(struct sockaddr *)&dst,dst_len)!=0)goto fail;
-    socklen_t local_len=sizeof local;
-    if(getsockname(rx,(struct sockaddr *)&local,&local_len)!=0)goto fail;
-    if(family==AF_INET) {
-        raw=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
-        if(raw<0)goto fail;
-        int one=1;
-        if(setsockopt(raw,IPPROTO_IP,IP_HDRINCL,&one,sizeof one)!=0)goto fail;
-    /* Proven donor/platform limitation: local conntrack can reorder pos8
-       and discard overlaps BEFORE the probe reaches the wire. Preserve the
-       donor's requested fragments, not that accidental kernel rewrite.
-       No fallback: unavailable NODEFRAG is unsent/local error (SPEC §7). */
-#ifdef IP_NODEFRAG
-    if(setsockopt(raw,IPPROTO_IP,IP_NODEFRAG,&one,sizeof one)!=0)goto fail;
-#else
-    goto fail;
-#endif
-    /* Unlike the donor's EPERM fallback, D2K refuses to send an unisolated
-       raw probe through its own candidate. SPEC §7, tested explicitly. */
-    if(mark && d2k_mark_hook(raw,mark)!=0){*marked=0;goto fail;}
-    }
-    uint8_t wire[3*(D2K_QW_MAX_DGRAM+48)];d2k_ipfrag_span spans[3];
-    uint32_t id=fragment_id();
-    size_t n;
-    if(family==AF_INET6) {
-        struct sockaddr_in6 *v6=(struct sockaddr_in6 *)&local;
-        n=d2k_udpfrag6_build_ex((const uint8_t *)&v6->sin6_addr,target,
-            ntohs(v6->sin6_port),port,msg.bytes,msg.len,plan,id,64,0,0,
-            wire,sizeof wire,spans);
-        ((struct sockaddr_in6 *)&dst)->sin6_port=0;
-    } else {
-        struct sockaddr_in *v4=(struct sockaddr_in *)&local;
-        n=d2k_udpfrag_build((const uint8_t *)&v4->sin_addr,target,
-            ntohs(v4->sin_port),port,msg.bytes,msg.len,plan,(uint16_t)id,
-            wire,sizeof wire,spans);
-    }
-    if(!n)goto fail;
-    for(size_t i=0;i<n;i++) {
-        ssize_t sent = family==AF_INET6
-            ? d2k_ip6frag_send(&sender6,wire+spans[i].off,spans[i].len,mark)
-            : sendto(raw,wire+spans[i].off,spans[i].len,0,(struct sockaddr *)&dst,dst_len);
-        if(sent!=(ssize_t)spans[i].len)goto fail;
-    }
-    if(raw>=0)close(raw);
-    d2k_ip6frag_sender_close(&sender6);
+    /* Fresh local port (task 39): same discipline as every other attempt. */
+    int rx_marked=1;
+    int rx=qp_open_fresh(family,(struct sockaddr *)&dst,dst_len,0,mark,&rx_marked);
+    if(rx<0)return -1;
+    if(mark && !rx_marked){*marked=0;close(rx);return -1;}
+    if(qp_emit_fragments(rx,family,target,port,msg,plan,mark,marked)!=0){close(rx);return -1;}
     return rx;
-fail:
-    if(raw>=0)close(raw);
-    d2k_ip6frag_sender_close(&sender6);
-    close(rx);return -1;
 #endif
 }
 
@@ -1385,11 +1484,166 @@ static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
         fragment=&plan;
     }
     d2k_hello no_snapshot={NULL,0};
+    /* Arm answers are bound to our Initial only (qp_verify_bound, task 39);
+       the fragment-survival control keeps the donor's reply criterion. */
     return quic_ask_ex(q->addr,port,prefix,prefix_len,ttl,copies,0,NULL,
         no_snapshot,wait_ms,mark,D2K_QUIC_REPEATS,NULL,NULL,sent_out,NULL,
-        qp_verify_aead,fragment,neutral?NULL:sni,neutral);
+        neutral?qp_verify_aead:qp_verify_bound,fragment,neutral?NULL:sni,neutral);
 }
 d2k_quic_ask_arm_fn d2k_quic_ask_arm_hook=quic_ask_arm;
+
+/* ---------------------------------------------------------------------
+ * ЭТАП ДАННЫХ ПЛЕЧА (задача 39, см. D2K_QUIC_ARM_DATA_BYTES).
+ * Одно настоящее соединение d2k_qc на СВЕЖЕЙ четвёрке, тот же адрес, что у
+ * фильтра, и то же воздействие перед первым Initial: фальшивки с копиями и
+ * TTL — qp_send_prefix, фрагменты — qp_emit_fragments. Затем управляющий
+ * поток HTTP/3 и GET / к имени цели; засчитываются данные ответа,
+ * прошедшие линию после рукопожатия (d2k_qc_app_progress).
+ * --------------------------------------------------------------------- */
+
+typedef struct {
+    const d2k_quic_arm_question *q;
+    int family;
+    uint8_t target[16];
+    uint16_t port;
+    uint32_t mark;
+    d2k_ipfrag_plan plan;
+    int initial_out; /* первый Initial ушёл на провод: дальше отказ — сеть */
+    uint16_t local_port;
+} qp_arm_action;
+
+static int qp_arm_first_send(int fd, const uint8_t *initial, size_t len, void *user) {
+    qp_arm_action *a = user;
+    struct sockaddr_storage me;
+    socklen_t ml = sizeof me;
+    if (getsockname(fd, (struct sockaddr *)&me, &ml) == 0) {
+        a->local_port = me.ss_family == AF_INET6
+            ? ntohs(((struct sockaddr_in6 *)&me)->sin6_port)
+            : ntohs(((struct sockaddr_in *)&me)->sin_port);
+    }
+    if (a->q->frag) {
+#ifdef __linux__
+        int marked = 1;
+        if (qp_emit_fragments(fd, a->family, a->target, a->port,
+                              (d2k_hello){initial, len}, &a->plan, a->mark, &marked) != 0) {
+            return -1;
+        }
+        a->initial_out = 1;
+        return 1;
+#else
+        (void)fd; (void)initial; (void)len;
+        return -1; /* frag_other.go: not built */
+#endif
+    }
+    if (a->q->blob && a->q->blob_len &&
+        qp_send_prefix(fd, a->family, a->q->blob, a->q->blob_len, a->q->ttl,
+                       a->q->copies > 1 ? a->q->copies : 1) != 0) {
+        return -1;
+    }
+    if (send(fd, initial, len, 0) != (ssize_t)len) {
+        return -1;
+    }
+    a->initial_out = 1;
+    return 1;
+}
+
+static int64_t qp_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
+}
+
+static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const char *sni,
+    uint16_t port, uint32_t wait_ms, uint32_t mark) {
+    d2k_quic_arm_data d;
+    memset(&d, 0, sizeof d);
+    d.verdict = D2K_QAD_NOT_RUN;
+    snprintf(d.reason, sizeof d.reason, "этап данных не начат");
+    if (!q || q->control || !q->addr || !sni || !sni[0]) return d;
+    qp_arm_action a;
+    memset(&a, 0, sizeof a);
+    a.q = q;
+    a.port = port;
+    a.mark = mark;
+    a.family = qp_addr_parse(q->addr, a.target);
+    if (!a.family) return d;
+    if (q->frag && (q->blob_len || d2k_ipfrag_shape(q->frag, &a.plan) != 0)) return d;
+    /* Сроки — из того же измеренного ожидания, что у фильтра (3×RTT в
+       [пол; потолок]): рукопожатию — два таких срока, тишине потока после
+       последнего прироста — один, всему чтению — четыре. */
+    uint32_t step = wait_ms ? wait_ms : D2K_QUIC_RTT_WAIT_FLOOR_MS;
+    d2k_qc_opts o;
+    memset(&o, 0, sizeof o);
+    o.ip = q->addr;
+    o.port = port;
+    o.sni = sni;
+    o.alpn = "h3";
+    o.deadline_ms = (int)(2u * step);
+    o.mark = mark;
+    o.first_send = qp_arm_first_send;
+    o.first_send_user = &a;
+    d2k_qc *c = NULL;
+    char err[200];
+    err[0] = '\0';
+    int connected = d2k_qc_connect(&o, &c, err, sizeof err) == 0;
+    d.local_port = a.local_port;
+    if (!connected) {
+        if (!a.initial_out) {
+            snprintf(d.reason, sizeof d.reason, "этап данных не состоялся: %.120s", err);
+            return d;
+        }
+        d.verdict = d2k_quic_arm_data_judge(0, 0, 0);
+        snprintf(d.reason, sizeof d.reason, "фильтр прошёл, рукопожатия нет: %.120s", err);
+        return d;
+    }
+    uint8_t buf[4096];
+    uint64_t sid = 0;
+    size_t cn = d2k_h3_control(buf, sizeof buf);
+    if (cn == 0 || d2k_qc_stream_send(c, 2, buf, cn, 0, err, sizeof err) != 0) {
+        d.verdict = D2K_QAD_NOT_RUN;
+        snprintf(d.reason, sizeof d.reason, "управляющий поток не ушёл: %.120s", err);
+        d2k_qc_close(c);
+        return d;
+    }
+    /* Та же пауза до вопроса, что у проверки плана (verify.c): сервер обязан
+       увидеть SETTINGS раньше запроса. */
+    (void)d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 400, err, sizeof err);
+    size_t rn = d2k_h3_request(sni, "/", buf, sizeof buf);
+    if (rn == 0 || d2k_qc_stream_send(c, 0, buf, rn, 1, err, sizeof err) != 0) {
+        snprintf(d.reason, sizeof d.reason, "запрос не ушёл: %.120s", err);
+        d2k_qc_close(c);
+        return d;
+    }
+    uint64_t bytes = 0, last = 0;
+    int fin = 0, closed = 0;
+    int64_t start = qp_now_ms(), progress_at = start;
+    while (!fin && bytes < D2K_QUIC_ARM_DATA_BYTES) {
+        int64_t now = qp_now_ms();
+        if (now - progress_at >= (int64_t)step || now - start >= (int64_t)(4u * step)) break;
+        long n = d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 200, err, sizeof err);
+        if (n < 0) { closed = 1; }
+        d2k_qc_app_progress(c, &bytes, &fin);
+        if (bytes > last) { last = bytes; progress_at = qp_now_ms(); }
+        if (closed) break;
+    }
+    d2k_qc_app_progress(c, &bytes, &fin);
+    d.app_bytes = bytes;
+    d.verdict = d2k_quic_arm_data_judge(1, bytes, fin);
+    if (d.verdict == D2K_QAD_PASS) {
+        snprintf(d.reason, sizeof d.reason, "рукопожатие и %llu байт данных",
+                 (unsigned long long)bytes);
+    } else if (d.verdict == D2K_QAD_SHORT) {
+        snprintf(d.reason, sizeof d.reason,
+                 "рукопожатие доказано, ответ кончился на %llu байт — данные не измерены",
+                 (unsigned long long)bytes);
+    } else {
+        snprintf(d.reason, sizeof d.reason, "рукопожатие есть, поток оборван на %llu байт%s%.80s",
+                 (unsigned long long)bytes, closed ? ": " : "", closed ? err : "");
+    }
+    d2k_qc_close(c);
+    return d;
+}
+d2k_quic_arm_data_wire_fn d2k_quic_arm_data_hook=quic_arm_data;
 
 static d2k_tally quic_ask(const char *addr, uint16_t port,
                            const uint8_t *prefix, size_t prefix_len,
@@ -1843,6 +2097,12 @@ int d2k_quic_props_findings(const d2k_quic_props *p, char *out, size_t cap) {
 }
 
 static int arm_budget_left(void *budget) { return budget_left(budget); }
+/* The arm data stage belongs to an already asked question (task 39): the Run
+   budget grows by its measured time instead of starving later questions. */
+static void arm_budget_spent(void *budget, uint32_t ms) {
+    qp_budget *b = budget;
+    b->limit_ms = UINT32_MAX - b->limit_ms < ms ? UINT32_MAX : b->limit_ms + ms;
+}
 
 /* base_only — только базовый вопрос (шаги 0 и 1: контроль живости и прямой
    зонд), задача 32; seed — исход этих двух шагов, уже снятый этим же входом:
@@ -2169,7 +2429,8 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                         if (arm) {
                             d2k_quic_arm_context context = {.pool=pool, .n_pool=n_pool,
                                 .next=next_addr, .residual=residual, .marked=all_marked,
-                                .can_ask=arm_budget_left, .limit_user=&start};
+                                .can_ask=arm_budget_left, .limit_user=&start,
+                                .spent=arm_budget_spent};
                             if (budget_left(&start)) {
                                 *arm = d2k_quic_original_measure(&context, port, trigger, control, dyn_wait, mark);
                                 next_addr = context.next;

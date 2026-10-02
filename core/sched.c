@@ -3471,6 +3471,10 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
             const char *note=step->not_measured==1 ? "не задано: адреса" :
                 step->not_measured==2 ? "не задано: бюджет" :
                 step->not_measured==3 ? "не измерено: не собрано/локальный отказ" :
+                /* Task 39: the filter alone is not an arm's pass. */
+                step->data==D2K_QAD_NO_HANDSHAKE ? "ответ есть, рукопожатия нет: не прошло" :
+                step->data==D2K_QAD_CUT ? "рукопожатие есть, поток оборван до порога данных: не прошло" :
+                step->data==D2K_QAD_SHORT ? "рукопожатие доказано, данные не измерены: ответ цели короче порога" :
                 step->answered==D2K_QUIC_REPEATS ? "прошло" :
                 step->answered>0 ? "неустойчиво, не засчитано" : "не прошло";
             say(s, "по %s (QUIC) %s, адрес %s: %d/%d, %s", t->name,

@@ -78,7 +78,20 @@ static d2k_tally arm_probe(const d2k_quic_arm_question *q,const char *sni,
     if(q->copies>1)return d2k_quic_ask_copies_hook(q->addr,port,q->blob,q->blob_len,q->copies,msg,wait,mark,D2K_QUIC_REPEATS,sent);
     return d2k_quic_ask_hook(q->addr,port,q->blob,q->blob_len,msg,wait,mark,D2K_QUIC_REPEATS,NULL,NULL,sent,NULL);
 }
+/* Task 39: this test pins the ladder ORDER; the arm data stage (handshake
+   plus application data) is stubbed as passed, and counted. */
+static int data_calls;
+static d2k_quic_arm_data data_pass(const d2k_quic_arm_question *q,const char *sni,
+    uint16_t port,uint32_t wait,uint32_t mark) {
+    (void)port;(void)wait;(void)mark;
+    CHECK(!q->control && sni && !strcmp(sni,"target.example"));
+    data_calls++;
+    d2k_quic_arm_data d; memset(&d,0,sizeof d);
+    d.verdict=D2K_QAD_PASS; d.app_bytes=D2K_QUIC_ARM_DATA_BYTES;
+    return d;
+}
 int main(void) {
+    d2k_quic_arm_data_hook=data_pass;
     d2k_quic_allow_local=1; d2k_quic_resolve_hook=resolve;
     d2k_quic_ask_hook=ask; d2k_quic_ask_control_hook=ask;
     d2k_quic_ask_copies_hook=copies; d2k_quic_ask_ttl_hook=copies;
@@ -96,6 +109,7 @@ int main(void) {
     CHECK(arm_hello_count>=2 && arm_hello_changed>0);
     CHECK(arm.original && arm.len==1200 && arm.ttl==3 && arm.copies==6);
     CHECK(fragment_calls==2 && arm.frag_kind==1 && arm.frag_survives==D2K_PROP_YES);
+    CHECK(data_calls==4); /* quic5, copies 6, ttl 3, frag pos8; never the survival control */
     calls=0;first_prefix=0;lose_base_mark=1;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},99,&arm);
