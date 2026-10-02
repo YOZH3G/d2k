@@ -1754,6 +1754,64 @@ int main(int argc, char **argv) {
               "объявленный широкий канал изменил тело фальшивки");
     }
 
+    /* --- ПРИСТАВКА ПЕРЕКРЫТИЯ ПОМЕЩАЕТСЯ В КАНАЛ (задача 37, F4) ----------
+     *
+     * Поле 02.10.2026: «seqovl-hello» и «seqovl-hello+disorder» дважды
+     * получили BAD_PLAN — приставка перекрытия есть ЦЕЛОЕ приветствие-приманка
+     * (1534 байта у MODERN), посылка 1574 при пределе 1500 (ctlsrv.c). Урезать
+     * приставку нельзя: смысл плеча донора — целое правильное приветствие
+     * (seqovlExact, classify.go), огрызок коробка отбрасывает — это ДРУГОЕ
+     * воздействие. Поэтому при объявленном канале такое плечо не
+     * предлагается; без предела — прежнее поведение. */
+    {
+        static const size_t caps[] = { 1500, 1492 };
+        for (size_t ci = 0; ci < 2; ci++) {
+            for (size_t i = 0; i <= (size_t)D2K_FALLBACK_MAX; i++) {
+                char text[8192];
+                if (d2k_fallback_plan(i, D2K_SHAPE_MODERN, "control.example",
+                                      caps[ci], text, sizeof text) != 0) {
+                    continue;
+                }
+                const char *line = strstr(text, "payload 2 ");
+                if (!line) { continue; }
+                line += strlen("payload 2 ");
+                const char *end = strchr(line, '\n');
+                size_t bytes = (end ? (size_t)(end - line) : strlen(line)) / 2;
+                /* Приставка + первый байт нагрузки (split payload_start +1) +
+                   заголовки не длиннее 60+60. */
+                CHECK(bytes + 1 + 120 <= caps[ci],
+                      "приставка перекрытия не помещается в объявленный канал — "
+                      "датапат отвергнет план (BAD_PLAN), опыта не будет");
+            }
+        }
+        /* Без предела плечо с целым приветствием остаётся в списке. */
+        int whole = 0;
+        for (size_t i = 0; i <= (size_t)D2K_FALLBACK_MAX && !whole; i++) {
+            char text[8192];
+            if (d2k_fallback_plan(i, D2K_SHAPE_MODERN, "control.example", 0,
+                                  text, sizeof text) != 0) { continue; }
+            const char *line = strstr(text, "payload 2 ");
+            if (!line) { continue; }
+            line += strlen("payload 2 ");
+            const char *end = strchr(line, '\n');
+            if ((end ? (size_t)(end - line) : strlen(line)) / 2 > 1400) { whole = 1; }
+        }
+        CHECK(whole, "без объявленного предела перекрытие целым приветствием пропало");
+        /* LEGACY-приманка короткая — её плечо в канал помещается и остаётся. */
+        int legacy = 0;
+        for (size_t i = 0; i <= (size_t)D2K_FALLBACK_MAX && !legacy; i++) {
+            char text[8192];
+            if (d2k_fallback_plan(i, D2K_SHAPE_LEGACY, "control.example", 1500,
+                                  text, sizeof text) != 0) { continue; }
+            const char *line = strstr(text, "payload 2 ");
+            if (!line) { continue; }
+            line += strlen("payload 2 ");
+            const char *end = strchr(line, '\n');
+            if ((end ? (size_t)(end - line) : strlen(line)) / 2 > 100) { legacy = 1; }
+        }
+        CHECK(legacy, "LEGACY: помещающееся перекрытие целым приветствием выброшено");
+    }
+
     /* --- ЧИСЛО ПЛЕЧ СХОДИТСЯ С ДЛИНОЙ СПИСКА -----------------------------
      *
      * Из этого числа выводится бюджет зондов (SCHED_MAX_PROBES): он обязан

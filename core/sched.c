@@ -783,7 +783,10 @@ typedef struct {
        Until that probe proves a repeatable identity cut with complete gzip,
        the ordinary classifier and candidate queue must remain untouched. */
     int        rx_volume_only;
-    int        rx_volume_candidate_pending; /* special candidate after a full saved-plan queue */
+    int        rx_volume_candidate_pending; /* special candidate after a measured RX-volume cut */
+    /* Очередь долита из запасного перебора (refill_from_fallback), а не
+       выведена из замера: панель и журнал называют её своим именем (задача 37). */
+    int        fb_queue;
     unsigned   rx_volume_next_variant;
     int        res_ready;   /* пишется потоком под мьютексом планировщика */
     /* Подобранное плечо QUIC и признак того, что подбор состоялся. Отдельно
@@ -2452,6 +2455,7 @@ static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     t->rest_until_ms = now_ms + SCHED_REST_MS;
     t->n_plans = 0;
     t->next_plan = 0;
+    t->fb_queue = 0;
 }
 
 static void task_done(task *t) {
@@ -2502,12 +2506,17 @@ static size_t refill_from_fallback(d2k_sched *s, task *t) {
         snprintf(t->plans[added], sizeof t->plans[added], "%s", text);
         t->plan_boxes[added][0] = '\0';
         added++;
-        say(s, "по %s исчерпаны сохранённые планы коробки — "
-            "теперь проверяю измеренную fake-SNI + split-лестницу (%u/%u)",
-            t->name, t->rx_volume_next_variant,
+        say(s, "по %s очередь кандидатов исчерпана — по замеренному обрыву входящего "
+            "объёма около %d КБ проверяю fake-SNI + split-лестницу (%u/%u)",
+            t->name, t->vol.rx_at_kb, t->rx_volume_next_variant,
             (unsigned)D2K_RX_VOLUME_PLAN_VARIANTS);
     }
-    t->rx_volume_candidate_pending =
+    /* ЛЕСТНИЦА — ТОЛЬКО ПО ЗАМЕРЕННОМУ RX-ОБРЫВУ (задача 37). Прежде флаг
+       взводился здесь безусловно, и любая цель на втором доливе получала
+       все пять hcaptcha-планов: поле 02.10.2026, edge-mqtt-fallback, у
+       коробки — только «rst», vol.rx_cut = 0. Условие лестницы — парный
+       RX-volume-профиль (verdict_to_plans), а не исчерпание очереди. */
+    t->rx_volume_candidate_pending = t->vol.rx_cut &&
         t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS;
     while (added < cap) {
         char text[sizeof t->plans[0]];
@@ -2535,6 +2544,9 @@ static size_t refill_from_fallback(d2k_sched *s, task *t) {
         t->n_plans = added;
         t->next_plan = 0;
         t->n_known = 0;
+        t->fb_queue = 1;
+        say(s, "по %s кандидаты замера исчерпаны — %zu планов из запасного перебора "
+               "донора (это не находка замера)", t->name, added);
     }
     return added;
 }
@@ -2863,6 +2875,14 @@ static int install_next(d2k_sched *s, task *t) {
     }
         /* Запасной перебор — последний этап оригинального инструмента. */
         if(t->family_fast==1 || t->own_first == 2) return -1;
+        /* ЗАМЕР УЖЕ СДЕЛАН И ЕГО КАНДИДАТЫ ЕЩЁ НЕ ИСПЫТАНЫ (задача 37).
+           Очередь узнанной коробки кончилась, а результат прямого замера
+           лежит в t->res: следующими идут ЕГО кандидаты (ветка «проверяю
+           кандидаты из уже выполненного прямого замера»), а не запасной
+           список. Долив здесь обнулял n_known и делал ту ветку недостижимой:
+           поле 02.10.2026, edge-mqtt-fallback — один план коробки, затем
+           весь список донора и лестница, приём замера так и не испытан. */
+        if (t->cached_measure_valid && t->n_known > 0) return -1;
         if (refill_from_fallback(s, t) == 0) { return -1; }
     }
 }
@@ -2893,6 +2913,7 @@ static const d2k_cat_binding *binding_for(const d2k_sched *s, const char *name,
 }
 
 static size_t known_plans(d2k_sched *s, task *t) {
+    t->fb_queue = 0;
     if (t->fp.n_sig == 0) { return 0; }
     /* Ambiguity yields candidates, not the identity of the first catalog
        entry. Order globally by positive evidence; retain each plan's owner. */
@@ -3048,6 +3069,7 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
         }
     }
     if (!fill) return n;
+    t->fb_queue = 0;
     for (size_t k = 0; k < n; k++) {
         snprintf(t->plans[k], sizeof t->plans[k], "%s", pick[k]->text);
         snprintf(t->plan_boxes[k], sizeof t->plan_boxes[k], "%s", owner[k]->id);
@@ -3214,6 +3236,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
     t->next_plan = 0;
     t->n_known = 0;
     t->n_plans = 0;
+    t->fb_queue = 0;
     t->search_owned = r->owns_search;
     memset(t->plan_boxes, 0, sizeof t->plan_boxes);
     /* Failed reuse does not prove this is the same box. A newly synthesized
@@ -3679,7 +3702,8 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         json_str(f, t->next_plan > 0 ? "план поставлен" : "");
         fputs(", \"source\": ", f);
         json_str(f, t->n_known > 0 && t->next_plan <= t->n_known
-                        ? "готовый план узнанной коробки" : "выведен из замера");
+                        ? "готовый план узнанной коробки"
+                        : t->fb_queue ? "запасной перебор" : "выведен из замера");
         fputc('}', f);
     }
     fputs(first ? "],\n" : "\n  ],\n", f);
@@ -4616,6 +4640,7 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
     t->n_plans = 1;
     t->next_plan = 1;
     t->n_known = 0;
+    t->fb_queue = 0;
     char wire[sizeof t->plans[0]], cat_id[40], err[160];
     plan_ident(t->plans[0], cat_id, sizeof cat_id, t->ver_plan_id);
     snprintf(wire, sizeof wire, "%s", t->plans[0]);
@@ -4849,7 +4874,7 @@ static int family_recovery_start(d2k_sched *s, task *t) {
                          t->measure_path[0]?t->measure_path:"/","")) return 0;
     const d2k_domain_group *g=d2k_group_match(s->cat->groups,t->name,&key);
     if(!g) return 0;
-    t->n_plans=t->n_known=t->next_plan=0;
+    t->n_plans=t->n_known=t->next_plan=0; t->fb_queue=0;
     /* Verify the inherited plan once, then distinct OWN confirmed siblings.
        No speculative candidate reaches user traffic; install_next reserves
        an exact trial port and normal verifier/APPLIED gates remain in force. */
@@ -6401,7 +6426,7 @@ static int rx_saved_bootstrap(d2k_sched *s, task *t, int allow_other_family) {
     snprintf(t->plans[0], sizeof t->plans[0], "%s", plan->text);
     int same_family = (best->family ? best->family : 4) == t->family;
     snprintf(t->plan_boxes[0], sizeof t->plan_boxes[0], "%s", same_family ? owner->id : "");
-    t->next_plan = 0; t->n_plans = 1; t->n_known = same_family ? 1 : 0;
+    t->next_plan = 0; t->n_plans = 1; t->n_known = same_family ? 1 : 0; t->fb_queue = 0;
     t->researched = 1; t->rx_bootstrap_only = 1;
     t->state = T_PLANNING;
     say(s, "по %s прямой RX-зонд не дошёл до TLS; измеряю identity под уже "
@@ -6931,14 +6956,20 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 size_t known = volume_proven || t->ech_trial ? 0 : known_plans(s, t);
                 if (known > 0) {
                     t->res = r;
+                    /* Поиск принадлежит замеру и в этой ветке (задача 37):
+                       verdict_to_plans здесь не зовётся, а владение ставит
+                       только он. Без этого провал плана коробки уводил в
+                       запасной список, которого донор после вердикта не
+                       перебирает. */
+                    t->search_owned = r.owns_search;
                     t->cached_measure_valid = 1;
                     t->n_known = known;
                     t->n_plans = known;
                     t->next_plan = 0;
                     t->state = T_PLANNING;
-                    say(s, "по %s прямой замер подтвердил блокировку (%s) — "
-                           "сначала проверяю %zu готовых планов узнанной коробки",
-                        t->name, verdict_name(r.verdict), known);
+                    say(s, "по %s прямой замер подтвердил блокировку (%s: %s) за %d зондов "
+                           "замера — сначала проверяю %zu готовых планов узнанной коробки",
+                        t->name, verdict_name(r.verdict), r.reason, r.probes, known);
                     moved++;
                     continue;
                 }
@@ -7569,10 +7600,15 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     moved++;
                     continue;
                 }
-                say(s, "по %s выведенные планы исчерпаны (зондов %d) — цель отдыхает. "
-                       "Это не «перебор кончился»: планы выводятся из замера, и если "
-                       "измерить было нечем, их и нет",
-                    t->name, t->probes);
+                if (t->fb_queue) {
+                    say(s, "по %s выведенные из замера и запасные планы исчерпаны "
+                           "(зондов %d) — цель отдыхает", t->name, t->probes);
+                } else {
+                    say(s, "по %s выведенные планы исчерпаны (зондов %d) — цель отдыхает. "
+                           "Это не «перебор кончился»: планы выводятся из замера, и если "
+                           "измерить было нечем, их и нет",
+                        t->name, t->probes);
+                }
                 cooldown_record(s, t, 2);
                 say(s, "по %s после исчерпания кандидатов новый поиск отложен на 10 мин",
                     t->name);

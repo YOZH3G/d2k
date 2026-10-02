@@ -1611,8 +1611,9 @@ int main(int argc, char **argv) {
     int recheck_only = argc == 2 && strcmp(argv[1], "--recheck-only") == 0;
     int lifecycle_only = argc == 2 && strcmp(argv[1], "--lifecycle-only") == 0;
     int own_first_only = argc == 2 && strcmp(argv[1], "--own-first-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only) {
-        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only]\n");
+    int measured_only = argc == 2 && strcmp(argv[1], "--measured-only") == 0;
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !measured_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only|--measured-only]\n");
         return 2;
     }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
@@ -2049,6 +2050,7 @@ int main(int argc, char **argv) {
     if (recheck_only) { goto recheck_test; }
     if (lifecycle_only) { goto lifecycle_test; }
     if (own_first_only) { goto own_first_test; }
+    if (measured_only) { goto measured_test; }
     if (shape_only) { goto shape_test; }
     {
         d2k_catalog empty = {0};
@@ -9932,6 +9934,110 @@ voice_only_run:
               "наблюдение подменило источник проверки");
         d2k_sched_free(s);
         d2k_catalog_free(&cF);
+    }
+
+measured_test:
+    /* --- ЗАДАЧА 37: после сохранённого плана — стратегия замера ------------
+       Поле 02.10.2026, edge-mqtt-fallback.facebook.com: «решает содержимое»,
+       узнанная коробка с одним сохранённым планом. План не подошёл — и вместо
+       приёма, найденного замером, планировщик прогнал запасной список донора
+       и fake-SNI-лестницу: 45 опытов. Донор после вердикта списка не
+       перебирает: находка — ОДНА стратегия, промах — ни одной. */
+    {
+        tcp_wait_until_stop = 0; tcp_block_until_stop = 0;
+        ver_fail_first = 0; ver_unsupported = 0; ver_cloudflare_challenge = 0;
+        ver_app_after_tcp_search = 0;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0; vol_rx_tls_unavailable = 0;
+        snapshot_enabled = 0;
+        for (int mode = 0; mode < 3; mode++) {
+            /* 0 — замер нашёл приём (disorder у донора; здесь плечо badsum);
+               1 — замер владеет поиском и приёма не нашёл;
+               2 — прежний провайдер без владения поиском: запасной список
+                   законен, но RX-лестница без RX-обрыва — нет. */
+            d2k_catalog c = {0};
+            c.boxes = calloc(1, sizeof *c.boxes);
+            CHECK(c.boxes != NULL, "t37: коробка не создалась");
+            if (!c.boxes) break;
+            c.n_boxes = 1;
+            d2k_cat_box *b = &c.boxes[0];
+            snprintf(b->id, sizeof b->id, "box-mqtt-%d", mode);
+            b->fp.method = D2K_FP_METHOD;
+            b->fp.n_sig = 1;
+            snprintf(b->fp.sig[0].kind, sizeof b->fp.sig[0].kind, "rst");
+            b->fp.sig[0].ttl = 127;
+            b->fp.sig[0].tos = 0x88;
+            b->fp.sig[0].ipid = 54321;
+            b->plans = calloc(1, sizeof *b->plans);
+            CHECK(b->plans != NULL, "t37: план коробки не создался");
+            if (!b->plans) { d2k_catalog_free(&c); break; }
+            b->n_plans = 1;
+            snprintf(b->plans[0].id, sizeof b->plans[0].id, "plan-mqtt-saved");
+            snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "tls");
+            b->plans[0].enabled = 1;
+            b->plans[0].successes = 2;
+            b->plans[0].text = strdup(
+                "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                "proto tcp tls\nsplit payload_start +7\norder forward\n");
+            tcp_answer = mode == 2 ? D2K_V_PREFIX : D2K_V_OPAQUE;
+            tcp_owns_search = mode != 2;
+            tcp_found_arm = mode == 0;
+            ver_answer = D2K_VER_HANDSHAKE;   /* ни один кандидат не помогает */
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            tcp_calls = ver_calls = vol_calls = 0;
+            uint16_t cport = (uint16_t)(42401 + mode);
+            ver_answer_port = cport;
+            drain(); forget_sent();
+            const char *name = mode == 0 ? "edge-mqtt-fallback.facebook.example" :
+                               mode == 1 ? "edge-mqtt-miss.facebook.example" :
+                                           "edge-legacy.facebook.example";
+            d2k_ev h = ev_hello(6, cport, name); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, cport); d2k_sched_event(s, &su);
+            int used = 0;
+            for (int i = 0; i < 1500 && !said("отложен"); i++) {
+                spin(s, 120);
+                drain();
+                d2k_ev ap = ev_applied(6, cport); d2k_sched_event(s, &ap);
+                spin(s, 5);
+                int u = live_probes_used(s);
+                if (u > used) used = u;
+            }
+            drain();
+            {
+                int u = live_probes_used(s);
+                if (u > used) used = u;
+            }
+            printf("t37 mode %d: опытов планировщика %d, вызовов зонда %d\n", mode, used, ver_calls);
+            CHECK(tcp_calls == 1, "t37: прямой замер выполнен не ровно один раз");
+            CHECK(said("готовых планов узнанной коробки"),
+                  "t37: сохранённый план узнанной коробки не испытан первым");
+            CHECK(!sent_contains_plan_payload("hcaptcha.com") && !said("fake-SNI"),
+                  "t37: RX fake-SNI-лестница пошла без замеренного RX-обрыва");
+            if (mode == 0) {
+                CHECK(said("НАЙДЕН замером"),
+                      "t37: после неудачи сохранённого плана не испытан приём, найденный замером");
+                CHECK(said("проверяю кандидаты из уже выполненного прямого замера"),
+                      "t37: возврат к результату замера не назван");
+                CHECK(used == 2,
+                      "t37: найденный замером приём — второй и последний опыт; запасной список не перебирается");
+            } else if (mode == 1) {
+                CHECK(said("не дало новых кандидатов"),
+                      "t37: промах замера, владеющего поиском, не назван");
+                CHECK(used == 1,
+                      "t37: замер, владеющий поиском, ничего не нашёл — запасной список не перебирается");
+            } else {
+                CHECK(said("проверяю кандидаты из уже выполненного прямого замера"),
+                      "t37: прежний провайдер — кандидаты замера не испытаны раньше запасного списка");
+                CHECK(said("запасного перебора"),
+                      "t37: запасной перебор не назван своим именем");
+            }
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+        tcp_answer = D2K_V_OPAQUE; tcp_owns_search = tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION;
+        if (measured_only) { goto voice_only_done; }
     }
 
 own_first_test:
