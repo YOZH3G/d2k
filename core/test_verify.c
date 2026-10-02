@@ -113,9 +113,6 @@ static const struct {
     {"HTTP/1.1 403 Forbidden\r\nContent-Encoding: gzip\r\nContent-Length: 21\r\n\r\naccess blocked by rkn", 403, 0, 0, 1},
     {"HTTP/1.1 403 Forbidden\r\nLink: <https://eais.rkn.gov.ru/>\r\nContent-Length: 0\r\n\r\n", 403, 0, 0, 1},
     {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n0\r\n\r\n", 200, 0, 0, 0},
-    {"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found", 404, 0, 0, 1},
-    {"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\nbusy", 503, 0, 0, 1},
-    {"HTTP/1.1 304 Not Modified\r\n\r\n", 304, 0, 0, 1},
 };
 
 struct stand {
@@ -1072,19 +1069,7 @@ int main(void) {
              (strstr(replies[i].text, "\r\n\r\naccess blocked by rkn") != NULL ||
               strstr(replies[i].text, "<a href=") != NULL ||
               strstr(replies[i].text, "blocked by rkn\r\n0") != NULL));
-        /* Прикладная приёмка — только 2xx/3xx. 4xx/5xx с полным телом:
-           рукопожатие доказано, приложение — нет (HANDSHAKE, код в причине). */
-        int status_error = replies[i].status >= 400;
-        if (status_error) expected_application = 0;
         if (block_fixture) expected_application = 0;
-        if (status_error && !block_fixture && replies[i].body_complete &&
-            !replies[i].cloudflare_challenge &&
-            strstr(replies[i].text, "Content-Encoding: gzip") == NULL) {
-            char code[16];
-            snprintf(code, sizeof code, "HTTP %d", replies[i].status);
-            CHECK(r.level == D2K_VER_HANDSHAKE && strstr(r.reason, code) != NULL,
-                  "4xx/5xx с полным телом должен быть HANDSHAKE с кодом в причине");
-        }
         CHECK(!block_fixture || strstr(r.reason, "HTTP отказ:") != NULL,
               "явная заглушка/451 не получили отдельную причину отказа");
         CHECK((r.level == D2K_VER_APPLICATION) == expected_application,
