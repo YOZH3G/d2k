@@ -583,6 +583,9 @@ typedef struct {
        закончился местным отказом, а не исчерпанием выведенных планов. */
     unsigned   exec_refused;
     unsigned   exec_probed;
+    /* Отказ исполнителя, пришедший, когда зонд уже в сети (T_VERIFY):
+       0x100|код; разбирается по возвращении потока раньше любого вердикта. */
+    unsigned   exec_nak;
     /* СОКЕТ ЗОНДА, ЗАНЯТЫЙ ЗАРАНЕЕ. Пробный план ставится только для его
        местного порта, поэтому порт обязан быть известен ДО подключения:
        после connect ставить поздно. Минус один — порт занять не удалось, и
@@ -2266,6 +2269,51 @@ static const char *ack_reason_text(unsigned code) {
     }
 }
 
+/* Пробная установка ЭТОГО кандидата: имя — по trial ID хвоста
+   SET_NAME_PROBE, адрес (QUIC) — по trial ID SET_ADDR_PROBE. Голосовые
+   опыты разбираются отдельно (их состояния другие). */
+static int candidate_trial_matches(const task *t, uint16_t cmd,
+                                   const uint8_t id[D2K_TRIAL_ID_LEN]) {
+    if (cmd == D2K_CMD_SET_NAME_PROBE) {
+        return !t->by_addr && !memcmp(id, t->trial_ack_id, D2K_TRIAL_ID_LEN);
+    }
+    return cmd == D2K_CMD_SET_ADDR_PROBE && t->by_addr &&
+           !memcmp(id, t->addr_probe_trial_id, D2K_TRIAL_ID_LEN);
+}
+
+/* ИСПОЛНИТЕЛЬ ОТВЕРГ ПРОБНЫЙ ПЛАН (ACK ok=0, задача 19). План в таблицу не
+   встал — снимать нечего; опыта не было, кандидат не судим. Бюджет зондов
+   возвращается; поздний отказ (зонд уже сходил по сроку ожидания) не
+   считается и испытанием. Дальше — следующий кандидат. */
+static void exec_refusal(d2k_sched *s, task *t, unsigned code, int late) {
+    if (late) {
+        say(s, "по %s план отвергнут исполнителем: %s (код %u) — отказ пришёл, когда "
+               "зонд уже ушёл без плана; местный отказ, кандидат не судим; беру следующего",
+            t->name, ack_reason_text(code), code);
+        ver_close(t);
+        t->ver_seen = 0;
+        t->ver_ok = 0;
+        t->ver_unsent_seen = 0;
+        t->unsent_code = 0;
+        if (t->exec_probed > 0) { t->exec_probed--; }
+    } else {
+        say(s, "по %s план отвергнут исполнителем: %s (код %u) — местный отказ, "
+               "опыта не было, кандидат не судим; беру следующего без сетевого зонда",
+            t->name, ack_reason_text(code), code);
+    }
+    if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
+    t->probe_sport_be = 0;
+    t->trial_installed = 0;
+    t->trial_acked = 0;
+    t->exec_nak = 0;
+    memset(t->trial_ack_id, 0, sizeof t->trial_ack_id);
+    if (t->by_addr) { t->addr_probe_identity_valid = 0; }
+    if (t->probes > 0) { t->probes--; }
+    if (s->probes_used > 0) { s->probes_used--; }
+    t->exec_refused++;
+    t->state = T_PLANNING;
+}
+
 static int local_refusal_verdict(d2k_sched *s, task *t) {
     if (t->unsent_code == 0) { return 0; }
     if (refuse_is_permanent(t->unsent_code)) {
@@ -2324,6 +2372,7 @@ static int install_next(d2k_sched *s, task *t) {
        план вернётся из другого источника, отказ клиента про него остаётся
        правдой. */
     t->ver_unsent_seen = 0;
+    t->exec_nak = 0;
     for (;;) {
     while (t->next_plan < t->n_plans) {
         if (t->probes >= SCHED_MAX_PROBES) { return -1; }
@@ -5402,56 +5451,33 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
            зонд снова обгонял план.
            Датапат шлёт ack ПОСЛЕ установки плана в таблицу (ctlsrv.c), значит
            этот ack и есть «план на месте». */
-        if (ev->code == D2K_CMD_SET_NAME_PROBE) {
-            /* v8: ack несёт trial ID опыта (задача 19). Нулевой — чужой
-               (диагностический вопрос, d2kask): ожидание кандидата им не
-               отпускается. Отказ (ok=0) — местный отказ исполнителя:
-               кандидат не судим, сетевого зонда нет, берём следующего. */
+        if (ev->code == D2K_CMD_SET_NAME_PROBE || ev->code == D2K_CMD_SET_ADDR_PROBE) {
+            /* v8: ack пробной установки несёт trial ID опыта (задача 19).
+               Нулевой — чужой (диагностический вопрос, d2kask): ожидание
+               кандидата им не отпускается. Отказ (ok=0) — местный отказ
+               исполнителя: кандидат не судим, сетевого зонда нет, берём
+               следующего. Поздний отказ (зонд уже ушёл по сроку ожидания)
+               — то же: зонд шёл без плана, его исход не про кандидата. */
             uint8_t any = 0;
             for (size_t k = 0; k < D2K_TRIAL_ID_LEN; k++) { any |= ev->trial_id[k]; }
             if (!any) { return 0; }
+            int ok = ((ev->num >> 8) & 0xffu) == 1u;
+            unsigned code = ev->num & 0xffu;
             for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
                 task *t = &s->tasks[i];
-                if (t->state != T_TRIAL_SETTLE || t->by_addr ||
-                    memcmp(ev->trial_id, t->trial_ack_id, D2K_TRIAL_ID_LEN) != 0) {
-                    continue;
-                }
-                if (((ev->num >> 8) & 0xffu) == 1u) {
-                    t->trial_acked = 1;
-                    continue;
-                }
-                unsigned code = ev->num & 0xffu;
-                say(s, "по %s план отвергнут исполнителем: %s (код %u) — местный отказ, "
-                       "опыта не было, кандидат не судим; беру следующего без сетевого зонда",
-                    t->name, ack_reason_text(code), code);
-                /* План в таблицу не встал: снимать нечего, порт зонда
-                   освобождаем. Бюджет зондов не тратился — возвращаем. */
-                if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
-                t->probe_sport_be = 0;
-                t->trial_installed = 0;
-                t->trial_acked = 0;
-                memset(t->trial_ack_id, 0, sizeof t->trial_ack_id);
-                if (t->probes > 0) { t->probes--; }
-                if (s->probes_used > 0) { s->probes_used--; }
-                t->exec_refused++;
-                t->state = T_PLANNING;
-            }
-        } else if (ev->code == D2K_CMD_SET_ADDR_PROBE &&
-                   ((ev->num >> 8) & 0xffu) == 1u &&
-                   (ev->trial_id[0] || ev->trial_id[1] || ev->trial_id[2] ||
-                    ev->trial_id[3] || ev->trial_id[4] || ev->trial_id[5] ||
-                    ev->trial_id[6] || ev->trial_id[7] || ev->trial_id[8] ||
-                    ev->trial_id[9] || ev->trial_id[10] || ev->trial_id[11] ||
-                    ev->trial_id[12] || ev->trial_id[13] || ev->trial_id[14] ||
-                    ev->trial_id[15])) {
-            for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-                task *t = &s->tasks[i];
-                if (t->state == T_TRIAL_SETTLE && t->by_addr &&
-                    memcmp(ev->trial_id, t->addr_probe_trial_id, D2K_TRIAL_ID_LEN) == 0) {
-                    t->trial_acked = 1;
+                if (!candidate_trial_matches(t, ev->code, ev->trial_id)) { continue; }
+                if (t->state == T_TRIAL_SETTLE) {
+                    if (ok) { t->trial_acked = 1; }
+                    else { exec_refusal(s, t, code, 0); }
+                } else if (!ok && t->state == T_VERIFY) {
+                    /* Рабочий поток зонда ещё в сети: разбор — когда вернётся. */
+                    t->exec_nak = 0x100u | code;
+                } else if (!ok && t->state == T_VERIFY_WAIT) {
+                    exec_refusal(s, t, code, 1);
                 }
             }
-        } else if (ev->code == D2K_CMD_SET_ADDR_PROBE &&
+        }
+        if (ev->code == D2K_CMD_SET_ADDR_PROBE &&
                    ((ev->num >> 8) & 0xffu) != 1u) {
             /* ДАТАПАТ ОТВЕРГ ГОЛОСОВОЙ ОПЫТ (нет места, план не принят) —
                это местный отказ: опыта не было, кандидат не судим. */
@@ -5899,6 +5925,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 t->family_reuse = 2;
                 if (rx_saved_bootstrap(s, t, 1)) { moved++; continue; }
                 t->family_reuse = 3; t->skip_volume_once = 1;
+                t->exec_refused = t->exec_probed = 0;
                 t->state = T_ASKING;
                 if (start_worker(s, t, JOB_CLASSIFY) != 0) task_fail(s, t, now_ms);
                 moved++; continue;
@@ -6116,6 +6143,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; } /* зонд в сети; срок задачи считается выше */
             join_worker(t);
+            if (t->exec_nak) {
+                exec_refusal(s, t, t->exec_nak & 0xffu, 1);
+                moved++;
+                continue;
+            }
             if (t->transport == 6 && t->ver.body_complete &&
                 t->ver.status >= 200 && t->ver.status < 300 &&
                 t->ver.http_outcome != D2K_HTTP_BLOCKED && t->ver.http_outcome != D2K_HTTP_LEGAL_DENIAL)
@@ -6409,6 +6441,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 if(t->family_fast==1) {
                     remove_trial_exact(s,t);
                     t->family_fast=2; t->n_plans=t->n_known=t->next_plan=0;
+                    t->exec_refused=t->exec_probed=0;
                     t->box_id[0]=0; t->state=T_ASKING;
                     say(s,"по %s собственные планы семейства не подтвердились; теперь выполняю прямую диагностику",t->name);
                     if(start_worker(s,t,JOB_CLASSIFY)!=0) task_fail(s,t,now_ms);
@@ -6418,6 +6451,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     if (t->family_reuse == 2) {
                         remove_trial_exact(s, t);
                         t->family_reuse = 3; t->rx_bootstrap_only = 0;
+                        t->exec_refused = t->exec_probed = 0;
                         t->skip_volume_once = 1;
                         t->n_plans = t->n_known = t->next_plan = 0;
                         t->box_id[0] = '\0';

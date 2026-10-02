@@ -477,6 +477,15 @@ test-link: test_link ../datapath/ctlprobe
 test-d2kask: test_d2kask d2kask ../datapath/ctlprobe
 	./test_d2kask
 
+# d2kc обязан останавливаться на чужой версии провода (точное совпадение,
+# задача 19: v8 — SET_NAME_PROBE с trial ID). Запускает "./d2kc" подпроцессом.
+check: test-d2kc-proto
+.PHONY: test-d2kc-proto
+test-d2kc-proto: test_d2kc_proto d2kc
+	./test_d2kc_proto
+test_d2kc_proto: test_d2kc_proto.c $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_d2kc_proto.c $(TEST_LDFLAGS)
+
 check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify test-volume test-httpup-logic test-measured
 
 test_measured: test_measured.c compose.o plantlv.o hello.o meas.o link.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h ../datapath/wire.c ../datapath/include/d2k_session.h

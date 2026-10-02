@@ -681,6 +681,61 @@ static d2k_ev name_probe_ack(const uint8_t id[D2K_TRIAL_ID_LEN], int ok, uint8_t
     return e;
 }
 
+/* trial ID последней SET_ADDR_PROBE (адресный QUIC-опыт). 1 — найден. */
+static int last_addr_probe_trial(uint8_t out[D2K_TRIAL_ID_LEN]) {
+    int found = 0;
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+                     (uint32_t)p[2] << 8 | p[3];
+        if (n < 2 || n > sent_len - off - 4) break;
+        uint16_t cmd = (uint16_t)((uint16_t)p[4] << 8 | p[5]);
+        if (cmd == D2K_CMD_SET_ADDR_PROBE && n >= 2 + 38 + D2K_TRIAL_ID_LEN) {
+            memcpy(out, p + 6 + 38, D2K_TRIAL_ID_LEN);
+            found = 1;
+        }
+        off += 4 + n;
+    }
+    return found;
+}
+
+static d2k_ev addr_probe_ack(const uint8_t id[D2K_TRIAL_ID_LEN], int ok, uint8_t reason) {
+    d2k_ev e;
+    memset(&e, 0, sizeof e);
+    e.kind = D2K_EV_ACK;
+    e.code = D2K_CMD_SET_ADDR_PROBE;
+    e.num = (uint32_t)(ok ? 1u : 0u) << 8 | reason;
+    memcpy(e.trial_id, id, D2K_TRIAL_ID_LEN);
+    return e;
+}
+
+/* Бюджет зондов планировщика — из его живого файла (probes_used). */
+static int live_probes_used(d2k_sched *s) {
+    char path[] = "/tmp/d2k-probes-live-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return -1;
+    close(fd);
+    int v = -1;
+    if (d2k_sched_write_live(s, path, "catalog.json") == 0) {
+        FILE *f = fopen(path, "r");
+        char body[65536] = {0};
+        if (f) { size_t got = fread(body, 1, sizeof body - 1, f); body[got] = 0; fclose(f); }
+        const char *at = strstr(body, "\"probes_used\":");
+        if (at) v = atoi(at + strlen("\"probes_used\":"));
+    }
+    unlink(path);
+    return v;
+}
+
+/* Безымянный QUIC по IPv6: задача by_addr, опыт — SET_ADDR_PROBE. */
+static d2k_ev addr_quic_suspect(uint16_t port) {
+    d2k_ev su = ev_suspect(17, port);
+    su.family = 6;
+    CHECK(inet_pton(AF_INET6, "::1", su.low_ip) == 1, "address trial destination");
+    CHECK(inet_pton(AF_INET6, "2001:db8::2", su.high_ip) == 1, "address trial client");
+    return su;
+}
+
 static uint16_t last_area_command(void) {
     uint16_t found=0;
     for(size_t off=0;off+6<=sent_len;) {
@@ -3301,6 +3356,8 @@ admission_only_run:
         spin_until_installed(s);
         CHECK(said("поставил план 1 из"), "первый кандидат не поставлен");
         int base = ver_calls;
+        int budget0 = live_probes_used(s);
+        CHECK(budget0 > 0, "бюджет зондов не прочитан из живого файла");
         int seen_refused = 0, seen_second = 0, seen_miss = 0, seen_final = 0;
         int seen_exhausted = 0, naks = 0;
         uint8_t last[D2K_TRIAL_ID_LEN] = {0};
@@ -3328,8 +3385,134 @@ admission_only_run:
         CHECK(!seen_miss, "отказ исполнителя записан кандидату промахом");
         CHECK(seen_final, "все отказы исполнителя не завершились местным отказом");
         CHECK(!seen_exhausted, "местный отказ выдан за исчерпание выведенных планов");
+        CHECK(live_probes_used(s) == budget0 - 1,
+              "отвергнутые исполнителем кандидаты съели бюджет зондов");
+        /* Отдых — как у неполного поиска (cooldown kind 2), не CLEAR. */
+        saidbuf[0] = '\0';
+        d2k_ev su2 = ev_suspect(6, 40622);
+        d2k_ev h2 = ev_hello(6, 40622, "отказ.исполнителя");
+        d2k_sched_event(s, &h2);
+        d2k_sched_event(s, &su2);
+        CHECK(said("замер отложен после неподтверждённого прошлого замера"),
+              "местный отказ не дал отдыха неполного поиска (kind 2)");
         d2k_sched_free(s);
         d2k_catalog_free(&cR);
+    }
+
+    /* --- ОТКАЗ ИСПОЛНИТЕЛЯ ДЛЯ АДРЕСНОГО QUIC-ОПЫТА ------------------------
+     *
+     * Задача 19, раунд 1. NAK SET_ADDR_PROBE раньше разбирался только для
+     * голоса: QUIC by_addr ждал срок, шёл зондом без плана и выбрасывал
+     * кандидата «зонд не дошёл до приложения». */
+    {
+        d2k_catalog cA;
+        memset(&cA, 0, sizeof cA);
+        d2k_sched *s = d2k_sched_new(&cA, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        quic_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_TRANSPORT;
+        ver_fail_first = 0;
+        ver_calls = 0;
+        drain(); forget_sent();
+        d2k_ev su = addr_quic_suspect(41031);
+        d2k_sched_event(s, &su);
+        spin_until_installed(s);
+        CHECK(said("поставил план 1 из"), "адресный кандидат не поставлен");
+        int base = ver_calls;
+        int budget0 = live_probes_used(s);
+        int seen_refused = 0, seen_miss = 0, seen_final = 0, seen_exhausted = 0, naks = 0;
+        uint8_t last[D2K_TRIAL_ID_LEN] = {0};
+        for (int round = 0; round < 400 && !seen_final; round++) {
+            uint8_t id[D2K_TRIAL_ID_LEN];
+            if (last_addr_probe_trial(id) && memcmp(id, last, sizeof id) != 0) {
+                memcpy(last, id, sizeof last);
+                d2k_ev nak = addr_probe_ack(id, 0, D2K_ACK_BAD_PLAN);
+                d2k_sched_event(s, &nak);
+                naks++;
+            }
+            tick_frozen(s);
+            seen_refused |= said("план отвергнут исполнителем");
+            seen_miss |= said("зонд не дошёл");
+            seen_exhausted |= said("выведенные планы исчерпаны");
+            seen_final |= said("все кандидаты отвергнуты исполнителем");
+            saidbuf[0] = '\0';
+        }
+        CHECK(seen_refused && naks >= 1, "NAK адресного опыта не назван отказом исполнителя");
+        CHECK(ver_calls == base, "отвергнутый адресный кандидат испытан сетевым зондом");
+        CHECK(!seen_miss, "NAK адресного опыта записан кандидату промахом");
+        CHECK(seen_final && !seen_exhausted,
+              "все отказы адресного опыта не завершились местным отказом");
+        CHECK(live_probes_used(s) == budget0 - 1,
+              "отвергнутые адресные кандидаты съели бюджет зондов");
+        saidbuf[0] = '\0';
+        d2k_ev again = addr_quic_suspect(41031);
+        d2k_sched_event(s, &again);
+        CHECK(said("замер отложен после неподтверждённого прошлого замера"),
+              "местный отказ адресного опыта не дал отдыха неполного поиска (kind 2)");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cA);
+        quic_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
+    }
+
+    /* --- ПОЗДНИЙ ОТКАЗ: ЗОНД УЖЕ УШЁЛ ПО СРОКУ ОЖИДАНИЯ -------------------
+     *
+     * ACK ok=0 пришёл, когда ожидание приёма плана истекло и зонд уже в
+     * сети. Зонд шёл без плана — его исход не про кандидата: ни промаха,
+     * ни повтора «того же кандидата заново». */
+    {
+        d2k_catalog cL;
+        memset(&cL, 0, sizeof cL);
+        d2k_sched *s = d2k_sched_new(&cL, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        quic_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_TRANSPORT;
+        ver_fail_first = 0;
+        ver_calls = 0;
+        drain(); forget_sent();
+        d2k_ev su = addr_quic_suspect(41032);
+        d2k_sched_event(s, &su);
+        spin_until_installed(s);
+        uint8_t id[D2K_TRIAL_ID_LEN];
+        CHECK(last_addr_probe_trial(id), "адресный опыт без trial ID");
+        int budget0 = live_probes_used(s);
+        ver_snapshot_enabled = 1;
+        ver_snapshot_entered = ver_snapshot_release = 0;
+        skip_ahead(s, 60); /* срок SCHED_TRIAL_SETTLE_MS истёк — зонд пошёл */
+        pthread_mutex_lock(&snapshot_mu);
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += 2;
+        int rc = 0;
+        while (!ver_snapshot_entered && rc == 0) {
+            rc = pthread_cond_timedwait(&snapshot_cv, &snapshot_mu, &dl);
+        }
+        pthread_mutex_unlock(&snapshot_mu);
+        CHECK(ver_snapshot_entered, "адресный зонд не дошёл до барьера");
+        d2k_ev nak = addr_probe_ack(id, 0, D2K_ACK_BAD_PLAN);
+        d2k_sched_event(s, &nak);
+        pthread_mutex_lock(&snapshot_mu);
+        ver_snapshot_release = 1;
+        pthread_cond_broadcast(&snapshot_cv);
+        pthread_mutex_unlock(&snapshot_mu);
+        int seen_late = 0, seen_miss = 0, seen_retry = 0;
+        for (int i = 0; i < 400 && !seen_late; i++) {
+            tick_frozen(s);
+            seen_late |= said("зонд уже ушёл без плана");
+            seen_miss |= said("зонд не дошёл");
+            seen_retry |= said("ставлю того же кандидата заново");
+        }
+        ver_snapshot_enabled = 0;
+        CHECK(seen_late, "поздний отказ исполнителя не разобран как местный отказ");
+        CHECK(!seen_miss && !seen_retry, "поздний отказ исполнителя засужен кандидату");
+        CHECK(live_probes_used(s) <= budget0,
+              "поздний отказ исполнителя не вернул бюджет зонда");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cL);
+        quic_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
     }
 
     /* --- ПРОБНЫЙ ПЛАН СТАВИТСЯ ПОД ФОРМУ ЗОНДА, А НЕ КЛИЕНТА -------------
