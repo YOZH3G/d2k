@@ -729,7 +729,14 @@ static void request_complete_page(read_fn rd, write_fn wr, void *sess,
                      "HTTP %d redirect не является подтверждением страницы этой цели", code);
             return;
         }
-        if (code && r->body_complete) {
+        if (code >= 400 && r->body_complete) {
+            /* Рукопожатие и ответ сервера доказаны, приложение — нет:
+               прикладная приёмка только для 2xx/3xx. */
+            r->level = D2K_VER_HANDSHAKE;
+            snprintf(r->reason, sizeof r->reason,
+                     "HTTP %d, тело получено (%llu байт), но код не успех: приложение не подтверждено%s",
+                     code, (unsigned long long)r->body_bytes, tls12 ? " по TLS 1.2" : "");
+        } else if (code && r->body_complete) {
             r->level = D2K_VER_APPLICATION;
             snprintf(r->reason, sizeof r->reason,
                      "HTTP %d, тело загружено полностью (%llu байт)%s", code,
@@ -1105,10 +1112,11 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
         if (n > 0) { got += (size_t)n; }
         int st = 0;
         if (got > 0 && d2k_h3_status(rx, got, &st) == 0) {
-            r.level = D2K_VER_APPLICATION;
+            r.level = st >= 400 ? D2K_VER_HANDSHAKE : D2K_VER_APPLICATION;
             r.status = st;
             snprintf(r.reason, sizeof r.reason,
-                     "заголовки HTTP/3 получены, статус %d", st);
+                     "заголовки HTTP/3 получены, статус %d%s", st,
+                     st >= 400 ? ": код не успех, приложение не подтверждено" : "");
             if (st == 451) {
                 r.level = D2K_VER_DENIED;
                 r.http_outcome = D2K_HTTP_LEGAL_DENIAL;
@@ -1118,7 +1126,7 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
             break;
         }
     }
-    if (r.level != D2K_VER_APPLICATION && r.level != D2K_VER_DENIED) {
+    if (r.level != D2K_VER_APPLICATION && r.level != D2K_VER_DENIED && r.status == 0) {
         snprintf(r.reason, sizeof r.reason,
                  "кода ответа HTTP/3 нет: принято %zu байт", got);
     }
