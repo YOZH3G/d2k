@@ -553,8 +553,31 @@ static void test_loopback_guard_rejects_misresolved_target(void)
     }
 }
 
+static void test_epipe_and_fresh_neutral(void)
+{
+    int sv[2];
+    char a[64], b[64];
+    ssize_t w;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+        fail("socketpair");
+    close(sv[1]);
+    /* без SIG_IGN в тесте: гибель процесса от SIGPIPE и есть провал */
+    w = d2k_send_nosig(sv[0], "x", 1);
+    w = d2k_send_nosig(sv[0], "x", 1);
+    if (w >= 0)
+        fail("send на закрытый пир обязан вернуть ошибку");
+    close(sv[0]);
+    d2k_neutral_sni(a, sizeof a);
+    d2k_neutral_sni(b, sizeof b);
+    if (strcmp(a, b) == 0)
+        fail("нейтральное имя обязано быть свежим: %s", a);
+    if (strlen(a) != strlen("z0123456789.example.com") || a[0] != 'z')
+        fail("формат нейтрального имени: %s", a);
+}
+
 int main(void)
 {
+    test_epipe_and_fresh_neutral();
     {
         fake_dpi d;
         char addr[64];

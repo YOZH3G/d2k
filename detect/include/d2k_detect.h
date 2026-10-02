@@ -17,6 +17,7 @@
 #define D2K_DETECT_H
 
 #include <stddef.h>
+#include <sys/types.h>
 #include <stdint.h>
 
 /* Метка, по которой правила NFQUEUE пропускают пакет мимо нашего десинка.
@@ -339,5 +340,9 @@ long d2k_now_ms(void);
 void d2k_sleep_ms(int ms);
 d2k_obs *d2k_trace_add(d2k_result *res, const char *probe);
 void d2k_note(d2k_result *res, const char *fmt, ...);
+/* send без SIGPIPE: мёртвый пир даёт -1/EPIPE, а не гибель процесса. */
+ssize_t d2k_send_nosig(int fd, const void *buf, size_t len);
+/* Нейтральное имя контроля: свежая случайная метка из ОС-ГСЧ. */
+void d2k_neutral_sni(char *out, size_t cap);
 
 #endif /* D2K_DETECT_H */

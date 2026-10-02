@@ -365,7 +365,7 @@ static int once_probe(const char *host, const char *port, const d2k_trigger *tr,
         size_t off = (size_t)sp[i].from;
         size_t want = (size_t)(sp[i].to - sp[i].from);
         while (want > 0) {
-            ssize_t w = send(fd, tr->payload + off, want, 0);
+            ssize_t w = d2k_send_nosig(fd, tr->payload + off, want);
             if (w <= 0) {
                 snprintf(err, errcap, "write: %s", strerror(errno));
                 close(fd);
@@ -948,4 +948,22 @@ done:
         res->stopped = 1;
     }
     res->duration_ms = d2k_now_ms() - start;
+}
+
+/* Linux глушит SIGPIPE флагом на вызов; на macOS его нет — там опция сокета.
+ * В main дополнительно стоит SIG_IGN, но библиотечный код не должен зависеть
+ * от того, кто его вызвал. */
+ssize_t d2k_send_nosig(int fd, const void *buf, size_t len)
+{
+    int flags = 0;
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+#ifdef SO_NOSIGPIPE
+    {
+        int one = 1;
+        (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+    }
+#endif
+    return send(fd, buf, len, flags);
 }

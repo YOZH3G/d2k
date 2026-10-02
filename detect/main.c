@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <string.h>
 
 static void usage(void)
@@ -274,6 +275,8 @@ int main(int argc, char **argv)
     d2k_result res;
     char err[256];
     const char *addr = NULL;
+
+    signal(SIGPIPE, SIG_IGN); /* мёртвый пир — исход «убито», не выход 141 */
     const char *sni = NULL, *raw = NULL, *ctl_sni = NULL, *ctl_raw = NULL, *hello = "modern";
     int as_json = 0;
     int dump_trigger = 0;

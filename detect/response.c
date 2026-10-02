@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -166,7 +167,7 @@ int d2k_resp_handshake12(const char *host, const char *port, const char *sni,
     }
     freeaddrinfo(ai);
 
-    if (send(fd, tr.payload, tr.len, 0) != (ssize_t)tr.len) {
+    if (d2k_send_nosig(fd, tr.payload, tr.len) != (ssize_t)tr.len) {
         close(fd);
         return 0;
     }
@@ -229,12 +230,26 @@ static int count_handshakes(const char *host, const char *port, const char *sni,
 /* neutralSNI — имя для контроля. Домен example.com зарезервирован IANA
  * (RFC 2606) и в списках не встречается; случайная метка спереди убирает
  * попадание в кэши и в состояние коробки. */
-static void neutral_sni(char *out, size_t cap)
+void d2k_neutral_sni(char *out, size_t cap)
 {
     unsigned i;
     char hex[11];
+    unsigned char rnd[10];
+    size_t got = 0;
+    FILE *f = fopen("/dev/urandom", "rb");
+    /* crypto/rand у донора; random() без srandom давал одно и то же имя. */
+    if (f) {
+        got = fread(rnd, 1, sizeof rnd, f);
+        fclose(f);
+    }
+    if (got != sizeof rnd) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        srandom((unsigned)(ts.tv_nsec ^ ts.tv_sec ^ (long)getpid()));
+        for (i = 0; i < sizeof rnd; i++) rnd[i] = (unsigned char)random();
+    }
     for (i = 0; i < 10; i++) {
-        hex[i] = "0123456789abcdef"[random() & 0xf];
+        hex[i] = "0123456789abcdef"[rnd[i] & 0xf];
     }
     hex[10] = '\0';
     snprintf(out, cap, "z%s.example.com", hex);
@@ -290,7 +305,7 @@ void d2k_probe_response(const char *host, const char *port, const char *sni,
     /* Контроль ОБЯЗАН быть другим именем на том же адресе. Если бы мы взяли то
      * же самое, молчали бы оба, и «режут ответ» получилось бы из собственной
      * ошибки ввода. */
-    neutral_sni(neutral, sizeof(neutral));
+    d2k_neutral_sni(neutral, sizeof(neutral));
     control = count_handshakes(host, port, neutral, opt, &unmeasured);
     d2k_resp_decide(target, control, unmeasured, opt->repeats, res);
 }
