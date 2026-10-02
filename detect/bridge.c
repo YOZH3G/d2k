@@ -161,10 +161,17 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
     memcpy(tr.payload, trigger.bytes, trigger.len);
     tr.len = trigger.len;
     tr.accept = D2K_ACCEPT_SERVERHELLO;
-    snprintf(tr.name, sizeof(tr.name), "tls:%s", ip);
     if (d2k_hello_sni(tr.payload, tr.len, &off, &len) == 0) {
         tr.sni_off = (int)off;
         tr.sni_len = (int)len;
+        /* Имя триггера = настоящее SNI клиента (как у донора: "tls:"+sni):
+         * по нему проверяется ОТВЕТНОЕ направление. IP вместо имени дал бы
+         * ложное «чисто». Без SNI имени нет — ответ не проверяется. */
+        if (len > 0 && len <= sizeof(tr.name) - 5 && !memchr(tr.payload + off, 0, len)) {
+            memcpy(tr.name, "tls:", 4);
+            memcpy(tr.name + 4, tr.payload + off, len);
+            tr.name[4 + len] = '\0';
+        }
     }
 
     if (control.bytes && control.len >= 2 && control.len <= D2K_TRIGGER_MAX) {

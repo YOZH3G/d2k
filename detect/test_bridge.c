@@ -13,6 +13,7 @@ int d2k_arm_from_poison(const d2k_poison *, d2k_arm *, char *, size_t);
 static d2k_opts seen;
 static d2k_result answer;
 static int failures;
+static char seen_name[96];
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "bridge:%d: %s\n", __LINE__, #c); failures++; \
 } } while (0)
@@ -21,7 +22,8 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
                       d2k_opts *opt, d2k_result *res)
 {
     CHECK(strcmp(addr, "192.0.2.1:443") == 0);
-    CHECK(tr->len == 2 && tr->payload[0] == 0x16);
+    CHECK(tr->len >= 2 && tr->payload[0] == 0x16);
+    snprintf(seen_name, sizeof seen_name, "%s", tr->name);
     seen = *opt;
     *res = answer;
 }
@@ -35,6 +37,26 @@ static d2k_vres measure(void)
                                 0x2d, 2, 12000, 321);
 }
 
+static size_t build_hello(uint8_t *o, const char *sni)
+{
+    size_t n = strlen(sni), p = 0, ext = 9 + n, body = 2 + 32 + 1 + 4 + 2 + 2 + ext;
+    const uint8_t a[] = {0x16, 0x03, 0x01};
+    memcpy(o, a, 3); p = 3;
+    o[p++] = (body + 4) >> 8; o[p++] = (body + 4) & 255;
+    o[p++] = 1; o[p++] = 0; o[p++] = body >> 8; o[p++] = body & 255;
+    o[p++] = 3; o[p++] = 3;
+    memset(o + p, 7, 32); p += 32;
+    o[p++] = 0;
+    o[p++] = 0; o[p++] = 2; o[p++] = 0; o[p++] = 0x2f;
+    o[p++] = 1; o[p++] = 0;
+    o[p++] = ext >> 8; o[p++] = ext & 255;
+    o[p++] = 0; o[p++] = 0; o[p++] = (n + 5) >> 8; o[p++] = (n + 5) & 255;
+    o[p++] = (n + 3) >> 8; o[p++] = (n + 3) & 255;
+    o[p++] = 0; o[p++] = n >> 8; o[p++] = n & 255;
+    memcpy(o + p, sni, n); p += n;
+    return p;
+}
+
 int main(void)
 {
     d2k_vres r;
@@ -45,6 +67,21 @@ int main(void)
         d2k_hello empty = {0};
         r = d2k_detect_sched_tcp("192.0.2.1", 443, empty, empty, 0x2d, 2, 12000, 321);
         CHECK(r.owns_search && !r.have_arm && r.verdict == D2K_V_FLAKY);
+    }
+    {
+        /* The response-direction probe takes its SNI from tr.name; it must be
+         * the client's name, never the address being measured. */
+        uint8_t h[300], c[] = {0x16, 0x03, 0x01};
+        d2k_hello tr, ctl = {c, sizeof c};
+        tr.bytes = h;
+        tr.len = build_hello(h, "blocked.example");
+        answer.verdict = D2K_DV_INCONCLUSIVE; answer.has_hit = 0;
+        d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        CHECK(strcmp(seen_name, "tls:blocked.example") == 0);
+        /* No SNI in the capture: no name, so no response probe on an IP. */
+        tr.bytes = (uint8_t *)"\x16\x03"; tr.len = 2;
+        d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        CHECK(seen_name[0] == '\0');
     }
     answer.verdict = D2K_DV_INCONCLUSIVE;
     r = measure();
