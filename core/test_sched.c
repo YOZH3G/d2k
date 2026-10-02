@@ -5960,9 +5960,19 @@ voice_only_run:
                   "voice Plan не сохранил точные байты найденного arm и его число повторов");
             CHECK(said("найденный исходным перебором arm"),
                   "результат C voice-измерителя не отражён в журнале");
-            CHECK(sent_has(D2K_LINK_VOICE_CLASS), "кандидат голоса не поставлен на класс");
-            CHECK(sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0) == 1,
-                  "voice Plan не ограничен портом измеренного потока");
+            /* Кандидат голоса ставится не на класс, а на точную пятёрку (ниже):
+               класс получает только подтверждённый план (voice_confirm). */
+            /* Задача 15: опыт — точная пятёрка живого разговора с trial ID.
+               Портовая запись имени пользовательскому трафику не видна, и
+               разговор её не получил бы никогда. */
+            uint8_t vsrc[4], vtrial[D2K_TRIAL_ID_LEN];
+            uint16_t vsport = 0;
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR_PROBE, NULL, 0) == 1 &&
+                  sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0) == 0 &&
+                  last_addr_probe_endpoint(vsrc, &vsport, vtrial) &&
+                  memcmp(vsrc, "\xc0\xa8\x01\x43", 4) == 0 &&
+                  vsport == htons(40200),
+                  "voice Plan не ограничен точной пятёркой измеренного разговора");
             CHECK(tcp_calls == 0 && quic_calls == 0 && ver_calls == 0,
                   "по голосу пошёл замер или зонд, которые мерить его не могут");
             CHECK(!said("жду форму приветствия"),
@@ -5970,14 +5980,26 @@ voice_only_run:
             /* Посторонний голосовой поток не должен забрать план, найденный
                измерением конкретной conntrack-пятёрки. */
             d2k_ev ap = ev_applied(17, 40201);
+            memcpy(ap.trial_id, vtrial, sizeof vtrial);
             d2k_sched_event(s, &ap);
             d2k_ev ex = ev_exchange(17, 40201, 0);
             d2k_sched_event(s, &ex);
             spin(s, 20);
             CHECK(!said("UDP-ответ наблюдался"),
                   "посторонний голосовой поток выбран для измеренного arm");
-            /* Только исходный поток, с которого снята цель, становится WATCH. */
+            /* Та же пятёрка, тот же Plan ID, но без trial ID опыта — это не
+               наш опыт: один plan hash опыта не называет. */
             ap = ev_applied(17, 40200);
+            d2k_sched_event(s, &ap);
+            ex = ev_exchange(17, 40200, 0);
+            d2k_sched_event(s, &ex);
+            spin(s, 20);
+            CHECK(!said("UDP-ответ наблюдался"),
+                  "APPLIED без trial ID опыта признан применением голосового опыта");
+            /* Только исходный поток, с которого снята цель, становится WATCH:
+               новый пакет живого разговора с trial ID опыта. */
+            ap = ev_applied(17, 40200);
+            memcpy(ap.trial_id, vtrial, sizeof vtrial);
             d2k_sched_event(s, &ap);
             ex = ev_exchange(17, 40200, 0);
             d2k_sched_event(s, &ex);
@@ -5989,7 +6011,9 @@ voice_only_run:
                   "UDP-наблюдение голоса потеряно либо названо подтверждением");
             forget_sent();
             skip_ahead(s, 10 * 60 * 1000 + 1);
-            CHECK(sent_command_count(D2K_CMD_DEL_NAME_PROBE, NULL, 0) == 1,
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1 &&
+                  sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0 &&
+                  sent_command_count(D2K_CMD_DEL_NAME_PROBE, NULL, 0) == 0,
                   "UDP-ответ оставил неподтверждённый голосовой кандидат навсегда");
             d2k_sched_free(s);
         }
@@ -6010,7 +6034,12 @@ voice_only_run:
             d2k_sched_event(s, &su);
             spin(s, 20);
             drain();
+            uint8_t ssrc_ip[4], strial[D2K_TRIAL_ID_LEN];
+            uint16_t ssport = 0;
+            CHECK(last_addr_probe_endpoint(ssrc_ip, &ssport, strial),
+                  "STUN-опыт не поставлен на точную пятёрку");
             d2k_ev ap = ev_applied(17, 52005);
+            memcpy(ap.trial_id, strial, sizeof strial);
             d2k_sched_event(s, &ap);
             d2k_ev ex = ev_exchange(17, 52005, 0);
             ex.code = D2K_UDP_PROOF_STUN;
@@ -6024,9 +6053,49 @@ voice_only_run:
             CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 1 &&
                   sent_command_count(D2K_CMD_SET_NAME, NULL, 0) == 0,
                   "STUN proof записал общий voice class вместо IP цели");
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1,
+                  "подтверждённый STUN оставил временный опыт пятёрки");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cS);
+
+        /* Задача 15, сквозной путь Дискорда: опыт на пятёрке разговора →
+           APPLIED с trial ID → настоящий IP Discovery response → постоянная
+           привязка класса; временный опыт снят точно, своим trial ID. */
+        d2k_catalog cD;
+        memset(&cD, 0, sizeof cD);
+        saidbuf[0] = '\0';
+        s = d2k_sched_new(&cD, sv[0], 0x2d);
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            forget_sent();
+            d2k_ev h = ev_hello(17, 52006, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 52006);
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            drain();
+            uint8_t dsrc[4], dtrial[D2K_TRIAL_ID_LEN];
+            uint16_t dsport = 0;
+            CHECK(last_addr_probe_endpoint(dsrc, &dsport, dtrial) &&
+                  dsport == htons(52006),
+                  "голосовой опыт Дискорда не поставлен на пятёрку разговора");
+            d2k_ev ap = ev_applied(17, 52006);
+            memcpy(ap.trial_id, dtrial, sizeof dtrial);
+            d2k_sched_event(s, &ap);
+            d2k_ev ex = ev_exchange(17, 52006, 0);
+            ex.code = D2K_UDP_PROOF_VOICE_DISCOVERY;
+            d2k_sched_event(s, &ex);
+            spin(s, 20);
+            const d2k_cat_binding *bd = binding_of(&cD, D2K_LINK_VOICE_CLASS, 17);
+            CHECK(bd != NULL && strcmp(bd->kind, "name") == 0 && said("ПОДТВЕРЖДЕНО"),
+                  "IP Discovery response после APPLIED опыта не подтвердил голос");
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1 &&
+                  sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0,
+                  "подтверждённый голос оставил временный опыт или задел имя");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cD);
 
         /* Тот же путь, но поток разговора с приёмом МОЛЧИТ. */
         d2k_catalog cW;
@@ -6044,7 +6113,11 @@ voice_only_run:
             drain();
             d2k_ev h2 = ev_hello(17, 40210, D2K_LINK_VOICE_CLASS);
             d2k_sched_event(s, &h2);
+            uint8_t wsrc[4], wtrial[D2K_TRIAL_ID_LEN];
+            uint16_t wsport = 0;
+            (void)last_addr_probe_endpoint(wsrc, &wsport, wtrial);
             d2k_ev ap = ev_applied(17, 40210);
+            memcpy(ap.trial_id, wtrial, sizeof wtrial);
             d2k_sched_event(s, &ap);
             d2k_ev su2 = ev_suspect(17, 40210);
             d2k_sched_event(s, &su2);

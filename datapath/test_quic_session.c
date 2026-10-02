@@ -1052,6 +1052,91 @@ static void test_discord_voice(void) {
     }
 }
 
+/* ВРЕМЕННЫЙ ГОЛОСОВОЙ ПЛАН ДОХОДИТ ДО ЖИВОГО РАЗГОВОРА (задача 15).
+ *
+ * Голосовой опыт ставится контроллером ПОСЛЕ замера — к этому времени живой
+ * разговор давно за окном поиска (D2K_HELLO_WINDOW). Опыт привязан к точной
+ * пятёрке разговора и к trial ID поколения; новый IP Discovery этой самой
+ * пятёрки обязан получить план и сообщить APPLIED с этим trial ID. Другой
+ * клиентский порт, другой клиент и портовая запись имени (пробы контроллера)
+ * пользовательскому голосу не достаются. */
+static void voice_trial_flow(d2k_addr_probe_flow *f, uint16_t client_port) {
+    memset(f, 0, sizeof *f);
+    f->family = 4;
+    memcpy(f->src_ip4, "\xc0\xa8\x01\x43", 4);   /* 192.168.1.67 — клиент LAN */
+    memcpy(f->dst_ip4, "\x01\x02\x03\x04", 4);
+    f->src_port_be = htons(client_port);
+    f->dst_port_be = htons(50004);
+    f->transport = 17;
+}
+
+static void test_voice_trial_live_flow(void) {
+    const uint8_t trial[D2K_TRIAL_ID_LEN] = {
+        0x15, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0x15
+    };
+    d2k_session *s = d2k_session_new(64, 32);
+    CHECK(s != NULL, "сессия голосового опыта не завелась");
+    if (!s) { return; }
+    d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+    uint8_t pkt[256], buf[4096], disc[74], rtp[48];
+    d2k_result r;
+    memset(rtp, 0x90, sizeof rtp);
+    /* Живой разговор: IP Discovery без плана, затем голос за окно поиска. */
+    for (uint16_t port = 64060; port <= 64061; port++) {
+        size_t n = build_udp_pkt(pkt, port, 50004, disc, build_ip_discovery(disc, 0x4242));
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(!r.applied, "голос без плана получил план");
+        for (int i = 0; i < 12; i++) {
+            n = build_udp_pkt(pkt, port, 50004, rtp, sizeof rtp);
+            d2k_session_packet(s, pkt, n, 1100 + (uint64_t)i, buf, sizeof buf, &r);
+        }
+    }
+    /* Опыт контроллера: точная пятёрка 64060 + trial ID. */
+    d2k_plan *p = NULL;
+    char err[160];
+    d2k_addr_probe_flow f;
+    voice_trial_flow(&f, 64060);
+    CHECK(d2k_plan_load(plan_voice_declared, sizeof plan_voice_declared, &p,
+                        err, sizeof err) == 0 &&
+          d2k_plantab_set_addr_probe(d2k_session_plans(s), &f, trial, 2000,
+                                     2000 + 120000000000ull, p) == 0,
+          "голосовой опыт не поставился на точную пятёрку");
+    /* Портовая запись имени — проба контроллера — для пользователя невидима. */
+    p = NULL;
+    CHECK(d2k_plan_load(plan_voice_declared, sizeof plan_voice_declared, &p,
+                        err, sizeof err) == 0 &&
+          d2k_plantab_set_name_probe(d2k_session_plans(s), (const uint8_t *)D2K_VOICE_CLASS,
+                                     strlen(D2K_VOICE_CLASS), 2000, p,
+                                     D2K_PLAN_SHAPE_VOICE, htons(64062)) == 0,
+          "портовая запись голоса не поставилась");
+    size_t n = build_udp_pkt(pkt, 64062, 50004, disc, build_ip_discovery(disc, 0x4545));
+    d2k_session_packet(s, pkt, n, 2900, buf, sizeof buf, &r);
+    CHECK(!r.applied, "портовая проба контроллера досталась пользовательскому голосу");
+
+    n = build_udp_pkt(pkt, 64061, 50004, disc, build_ip_discovery(disc, 0x4343));
+    d2k_session_packet(s, pkt, n, 3000, buf, sizeof buf, &r);
+    CHECK(!r.applied, "опыт чужого клиентского порта достался живому разговору");
+
+    n = build_udp_pkt(pkt, 64060, 50004, rtp, sizeof rtp);
+    d2k_session_packet(s, pkt, n, 3100, buf, sizeof buf, &r);
+    CHECK(!r.applied, "голосовой опыт применён к пакету, который не IP Discovery");
+
+    size_t hellos_before = count_kind_name(s, D2K_JRN_HELLO_SNI, D2K_VOICE_CLASS);
+    n = build_udp_pkt(pkt, 64060, 50004, disc, build_ip_discovery(disc, 0x4242));
+    d2k_session_packet(s, pkt, n, 3200, buf, sizeof buf, &r);
+    CHECK(r.applied && memcmp(r.trial_id, trial, sizeof trial) == 0,
+          "голосовой опыт не дошёл до живого разговора за окном поиска с trial ID");
+    CHECK(count_kind_name(s, D2K_JRN_HELLO_SNI, D2K_VOICE_CLASS) == hellos_before,
+          "повтор IP Discovery живого разговора посчитан новым приветствием");
+
+    /* Тот же порт, другой клиент LAN — не тот опыт. */
+    n = build_udp_pkt(pkt, 64060, 50004, disc, build_ip_discovery(disc, 0x4444));
+    pkt[15] = 68;
+    d2k_session_packet(s, pkt, n, 3300, buf, sizeof buf, &r);
+    CHECK(!r.applied, "опыт достался другому клиенту с тем же портом");
+    d2k_session_free(s);
+}
+
 static int frag_nat_missing;
 static int frag_nat(const char *path,uint8_t proto,uint32_t src,uint16_t sp,
                     uint32_t dst,uint16_t dp,uint32_t *os,uint16_t *op) {
@@ -1294,6 +1379,7 @@ int main(void) {
     test_quic_held_initial_replay_is_first_packet();
     test_quic_retry_resets_assembly();
     test_discord_voice();
+    test_voice_trial_live_flow();
     test_nameless_initial();
     test_nameless_silence();
     test_nameless_exchange();

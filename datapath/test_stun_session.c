@@ -1,6 +1,7 @@
 /* STUN-only regression: intentionally contains no QUIC vectors or assertions. */
 #include <stdio.h>
 #include <string.h>
+#include <arpa/inet.h>
 #include "d2k_journal.h"
 #include "d2k_session.h"
 
@@ -57,6 +58,64 @@ static size_t journal_kind(const d2k_session *s, uint8_t kind, uint8_t code) {
     return found;
 }
 
+/* Объявленный голосом план (тот же, что plan_voice_declared в
+   test_quic_session.c): REC_PROTO транспорт 17, протокол voice. */
+static const uint8_t plan_voice[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 5,
+    0x00, 0x02, 0x00, 0x02, 0x11, 0x03,
+    0x00, 0x10, 0x00, 0x05, 0x00, 0x01, 0xDE, 0xAD, 0xBE,
+    0x00, 0x11, 0x00, 0x08, 0x00, 0x01, 0x03, 0x00, 0, 0, 0, 0,
+    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00,
+                            0x00, 0x01, 0x30, 0xB0,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
+/* Задача 15: временный голосовой опыт на точной пятёрке живого STUN-потока
+   доходит до его повторного Binding Request за окном поиска и несёт trial ID;
+   соседний клиентский порт опыта не получает. */
+static void live_trial(void) {
+    const uint8_t txid[12] = {9,9,9,9,9,9,9,9,9,9,9,9};
+    const uint8_t trial[D2K_TRIAL_ID_LEN] = {0x51,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+    uint8_t req[20], junk[40], pkt[96], outbuf[1024];
+    d2k_result result;
+    binding(req, 0x0001, txid);
+    memset(junk, 0x80, sizeof junk);
+    d2k_session *s = d2k_session_new(8, 32);
+    CHECK(s != NULL, "live-trial session allocation");
+    if (!s) { return; }
+    d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+    for (uint16_t port = 64050; port <= 64051; port++) {
+        size_t n = udp_packet(pkt, 0, port, req, sizeof req);
+        d2k_session_packet(s, pkt, n, 1000, outbuf, sizeof outbuf, &result);
+        for (int i = 0; i < 12; i++) {
+            n = udp_packet(pkt, 0, port, junk, sizeof junk);
+            d2k_session_packet(s, pkt, n, 1100, outbuf, sizeof outbuf, &result);
+        }
+    }
+    d2k_addr_probe_flow f;
+    memset(&f, 0, sizeof f);
+    f.family = 4;
+    memcpy(f.src_ip4, "\xc0\xa8\x01\x43", 4);
+    memcpy(f.dst_ip4, "\x01\x02\x03\x04", 4);
+    f.src_port_be = htons(64050);
+    f.dst_port_be = htons(3478);
+    f.transport = 17;
+    d2k_plan *p = NULL;
+    char err[160];
+    CHECK(d2k_plan_load(plan_voice, sizeof plan_voice, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_addr_probe(d2k_session_plans(s), &f, trial, 2000,
+                                     2000 + 120000000000ull, p) == 0,
+          "voice trial installs on the exact STUN flow");
+    size_t n = udp_packet(pkt, 0, 64051, req, sizeof req);
+    d2k_session_packet(s, pkt, n, 3000, outbuf, sizeof outbuf, &result);
+    CHECK(!result.applied, "another client port does not get the voice trial");
+    n = udp_packet(pkt, 0, 64050, req, sizeof req);
+    d2k_session_packet(s, pkt, n, 3100, outbuf, sizeof outbuf, &result);
+    CHECK(result.applied && memcmp(result.trial_id, trial, sizeof trial) == 0,
+          "live STUN flow past the hello window gets the trial with its trial ID");
+    d2k_session_free(s);
+}
+
 int main(void) {
     const uint8_t txid[12] = {0,1,2,3,4,5,6,7,8,9,10,11};
     uint8_t req[20], resp[20], alien[12], pkt[64], outbuf[512];
@@ -101,6 +160,8 @@ int main(void) {
         CHECK(d2k_session_hellos(s) == 0, "malformed STUN is not a voice request");
         d2k_session_free(s);
     }
+
+    live_trial();
 
     if (fails) { return 1; }
     puts("STUN datapath proof: all checks passed");

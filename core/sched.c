@@ -421,6 +421,11 @@ typedef struct {
     uint16_t    addr_probe_src_port_be;
     uint8_t     addr_probe_trial_id[D2K_TRIAL_ID_LEN];
     int         addr_probe_identity_valid;
+    /* Точный сервер голосового опыта (задача 15): берётся из замера, а не из
+       server_of — у голоса оба порта эфемерные, и догадка по портам может
+       назвать сервером клиента. Ноль — адресат по-старому, t->ip/t->port. */
+    uint8_t     addr_probe_dst_ip[16];
+    uint16_t    addr_probe_dst_port_be;
     d2k_flowkey voice_flow;
     int         voice_flow_bound;
     int         voice_answered;
@@ -820,10 +825,16 @@ struct d2k_sched {
 static int addr_probe_remove(d2k_sched *s, task *t, char *err, size_t errcap) {
     if (!t->addr_probe_identity_valid) { return 0; }
     uint8_t dst[16] = {0};
-    if (inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, dst) != 1) { return -1; }
+    uint16_t dst_port_be = t->addr_probe_dst_port_be;
+    if (dst_port_be) {
+        memcpy(dst, t->addr_probe_dst_ip, sizeof dst);
+    } else {
+        if (inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, dst) != 1) { return -1; }
+        dst_port_be = htons(t->port ? t->port : 443);
+    }
     int rc = d2k_link_del_addr_probe_family(s->link_fd, t->addr_probe_src_ip,
                                      t->addr_probe_src_port_be, dst,
-                                     htons(t->port ? t->port : 443), 17, t->family,
+                                     dst_port_be, 17, t->family,
                                      t->addr_probe_trial_id, err, errcap);
     t->addr_probe_identity_valid = 0;
     return rc;
@@ -838,7 +849,7 @@ static uint8_t question_shape(const task *t);
 static void remove_trial_exact(d2k_sched *s, task *t) {
     if (!t->trial_installed) { return; }
     char err[160];
-    if (t->by_addr) {
+    if (t->by_addr || t->addr_probe_identity_valid) {
         (void)addr_probe_remove(s, t, err, sizeof err);
     } else if (t->probe_sport_be != 0 && t->trial_shape != 0) {
         (void)d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
@@ -2008,7 +2019,7 @@ static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     if (t->trial_installed) {
         char err[160];
         int rc;
-        if (t->by_addr) {
+        if (t->by_addr || t->addr_probe_identity_valid) {
             rc = addr_probe_remove(s, t, err, sizeof err);
         } else if (t->prop_sport_be != 0) {
             rc = d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
@@ -3815,17 +3826,39 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
         task_fail(s, t, now_ms);
         return;
     }
+    /* ОПЫТ — ТОЧНАЯ ПЯТЁРКА ЖИВОГО РАЗГОВОРА С TRIAL ID (задача 15).
+       Портовая запись имени (SET_NAME_PROBE) пользовательскому трафику не
+       видна — она для собственных проб контроллера, — и разговор, ради
+       которого опыт ставится, его не получал. Адресный опыт держит клиента
+       LAN (адрес и порт), сервер и поколение; APPLIED несёт этот trial ID,
+       и только им опыт признаётся (on_applied). Срок — lease датапата. */
     char hex[2 * D2K_PLAN_TLV_MAX + 1];
+    uint8_t client_ip[16] = {0}, server_ip[16] = {0};
+    memcpy(client_ip, &r.client_ip, sizeof r.client_ip);
+    memcpy(server_ip, &r.ip, sizeof r.ip);
+    if (t->family != 4 || fresh_trial_id(t->addr_probe_trial_id) != 0) {
+        say(s, "по %s (голос) опыт на точной пятёрке не завести", t->name);
+        task_fail(s, t, now_ms);
+        return;
+    }
     if (d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0 ||
-        d2k_link_set_name_family(s->link_fd, t->name, 17, hex, D2K_LINK_SHAPE_VOICE,
-                                htons(r.client_port), t->family, err, sizeof err) != 0) {
+        d2k_link_set_addr_probe_family(s->link_fd, client_ip, htons(r.client_port),
+                                       server_ip, htons(r.port), 17, 4,
+                                       t->addr_probe_trial_id,
+                                       D2K_ADDR_PROBE_LEASE_MAX_MS, hex,
+                                       err, sizeof err) != 0) {
         say(s, "по %s (голос) измеренный Plan не поставился: %s", t->name, err);
         task_fail(s, t, now_ms);
         return;
     }
+    memcpy(t->addr_probe_src_ip, client_ip, sizeof t->addr_probe_src_ip);
+    t->addr_probe_src_port_be = htons(r.client_port);
+    memcpy(t->addr_probe_dst_ip, server_ip, sizeof t->addr_probe_dst_ip);
+    t->addr_probe_dst_port_be = htons(r.port);
+    t->addr_probe_identity_valid = 1;
     t->trial_installed = 1;
     t->trial_shape = D2K_LINK_SHAPE_VOICE;
-    t->probe_sport_be = htons(r.client_port);
+    t->probe_sport_be = 0;
     t->probes += r.probes;
     s->probes_used += r.probes;
     t->state = T_VOICE_TRIAL;
@@ -4083,10 +4116,10 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         task_fail(s, t, now_ms);
         return;
     }
-    if (is_stun) {
-        (void)d2k_link_del_name_probe_family(s->link_fd, t->name, 17,
-                                      D2K_LINK_SHAPE_VOICE,
-                                      t->probe_sport_be, t->family, err, sizeof err);
+    /* Постоянная привязка стоит — временный опыт этой пятёрки снимается
+       точно, по своему trial ID; подтверждённое он задеть не может. */
+    if (t->addr_probe_identity_valid) {
+        (void)addr_probe_remove(s, t, err, sizeof err);
     }
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          is_stun ? "stun" : "voice",
@@ -4787,8 +4820,14 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
                последующий EXCHANGE иначе подтвердит не ту цель.
                Голосовой Plan тоже ограничен точной conntrack-пятёркой. */
             if (t->by_addr && !applied_of_candidate(t, ev)) { continue; }
+            /* Голос: та же пятёрка разговора И trial ID этого опыта. Новый
+               пакет живого разговора приходит за окном приветствия, и
+               признать его можно только по поколению опыта — один Plan ID
+               опыта не называет (задача 15). */
             if (!t->by_addr &&
-                (!t->voice_flow_bound || !ev_matches_flow(ev, &t->voice_flow))) {
+                (!t->voice_flow_bound || !ev_matches_flow(ev, &t->voice_flow) ||
+                 !t->addr_probe_identity_valid ||
+                 memcmp(ev->trial_id, t->addr_probe_trial_id, D2K_TRIAL_ID_LEN) != 0)) {
                 continue;
             }
             if (t->by_addr) {
