@@ -95,7 +95,8 @@ static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
     }
     if (cx->ctl) {
         size_t len = D2K_KEY_WIRE_LEN+4;
-        if (type >= D2K_CMD_SET_SUFFIX && type <= D2K_CMD_DEL_BYPASS) {
+        if ((type >= D2K_CMD_SET_SUFFIX && type <= D2K_CMD_DEL_BYPASS) ||
+            type == D2K_CMD_SET_NAME_PROBE) {
             memcpy(body+len, cx->area_id, D2K_TRIAL_ID_LEN); len += D2K_TRIAL_ID_LEN;
         }
         d2k_ctl_event(cx->ctl, D2K_EV_ACK, body, len);
@@ -182,7 +183,11 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
     char why[200];
     d2k_plantab *tab = d2k_session_plans(cx->sess);
 
-    if (type >= D2K_CMD_SET_SUFFIX && type <= D2K_CMD_DEL_BYPASS) {
+    /* v8: SET_NAME_PROBE тоже несёт хвостом trial ID опыта. ACK возвращает
+       его — и на отказ тоже: контроллер обязан отличить СВОЙ отказ
+       исполнителя от чужого подтверждения (задача 19). */
+    if ((type >= D2K_CMD_SET_SUFFIX && type <= D2K_CMD_DEL_BYPASS) ||
+        type == D2K_CMD_SET_NAME_PROBE) {
         memset(cx->area_id, 0, sizeof cx->area_id);
         if (len < D2K_TRIAL_ID_LEN) { ack(cx, type, 0, D2K_ACK_BAD_ARGS); return; }
         len -= D2K_TRIAL_ID_LEN;

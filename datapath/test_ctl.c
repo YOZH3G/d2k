@@ -315,6 +315,8 @@ static void check_proto_greeting(void) {
         unsigned v = (unsigned)ev[D2K_KEY_WIRE_LEN] << 8 | ev[D2K_KEY_WIRE_LEN + 1];
         CHECK(v == (unsigned)D2K_CTL_PROTO_VERSION,
               "объявлена не та версия протокола, что собрана");
+        /* v8: SET_NAME_PROBE несёт trial ID опыта, ACK возвращает его (задача 19). */
+        CHECK(v >= 8u, "SET_NAME_PROBE с trial ID требует провода v8");
         /* Предел отправки едет ТЕМ ЖЕ событием: без него контроллер собирает
            планы, не зная, что унесёт канал (см. D2K_EV_PROTO в d2k_ctl.h). */
         unsigned long lim = (unsigned long)ev[D2K_KEY_WIRE_LEN + 2] << 24 |
@@ -366,6 +368,8 @@ static void test_probe_owner_disconnect(void) {
                 memmove(body + nl + 5, body + nl + 3, sizeof tiny);
                 memcpy(body + nl + 3, port, 2);
                 len += 2;
+                memset(body + len, 0x31, D2K_TRIAL_ID_LEN); /* v8: trial ID */
+                len += D2K_TRIAL_ID_LEN;
             }
         } else {
             memset(body, 0, 58);
@@ -703,6 +707,8 @@ int main(void) {
             body[o++] = 4;
             body[o++] = 0x9c; body[o++] = 0x40; /* port 40000 */
             memcpy(body + o, tiny, sizeof tiny); o += sizeof tiny;
+            /* v8: хвост — trial ID опыта; ACK обязан вернуть его же. */
+            memset(body + o, 0x5a, D2K_TRIAL_ID_LEN); o += D2K_TRIAL_ID_LEN;
             frame(f, D2K_CMD_SET_NAME_PROBE, body, o);
             CHECK(write(cli, f, 6 + o) == (ssize_t)(6 + o), "SET_NAME_PROBE для удаления не отправилась");
             CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "SET_NAME_PROBE для удаления не разобралась");
@@ -710,6 +716,9 @@ int main(void) {
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
                   "SET_NAME_PROBE для удаления не принялась");
+            CHECK(cmd == D2K_CMD_SET_NAME_PROBE &&
+                  last_ack_id[0] == 0x5a && last_ack_id[15] == 0x5a,
+                  "ACK SET_NAME_PROBE не вернул trial ID опыта");
             o = 0; body[o++] = (uint8_t)nl; memcpy(body + o, nm, nl); o += nl;
             body[o++] = D2K_PLAN_SHAPE_QUIC; body[o++] = 4;
             body[o++] = 0x9c; body[o++] = 0x40;
@@ -1494,6 +1503,36 @@ int main(void) {
         CHECK(reason == D2K_ACK_BAD_PLAN, "отказ по длине назван не негодностью плана");
         CHECK(d2k_session_plan_count(sess) == 0,
               "отвергнутый по длине план всё-таки встал в таблицу");
+
+        /* Тот же негодный план ПРОБНОЙ командой: отказ обязан нести trial ID
+           опыта, иначе контроллер не отличит свой отказ от чужого и не
+           сможет отделить местный отказ исполнителя от промаха кандидата
+           (задача 19). */
+        {
+            size_t nl = strlen("toolong.example"), po = 0;
+            body[po++] = (uint8_t)nl;
+            memcpy(body + po, "toolong.example", nl); po += nl;
+            body[po++] = D2K_PLAN_SHAPE_MODERN;
+            body[po++] = 4;
+            body[po++] = 0x9c; body[po++] = 0x41;
+            memcpy(body + po, longplan, o); po += o;
+            for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) body[po++] = (uint8_t)(0xc0 + i);
+            frame(f, D2K_CMD_SET_NAME_PROBE, body, po);
+            CHECK(write(cli, f, 6 + po) == (ssize_t)(6 + po),
+                  "пробная команда с длинной посылкой не отправилась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
+                  "пробная команда с длинной посылкой не разобралась");
+            d2k_ctl_flush(c);
+            ok = 1; cmd = 0; reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 &&
+                  cmd == D2K_CMD_SET_NAME_PROBE && ok == 0 &&
+                  reason == D2K_ACK_BAD_PLAN,
+                  "негодный пробный план не получил BAD_PLAN");
+            CHECK(last_ack_id[0] == 0xc0 && last_ack_id[15] == 0xcf,
+                  "отказ SET_NAME_PROBE не несёт trial ID опыта");
+            CHECK(d2k_session_plan_count(sess) == 0,
+                  "отвергнутый пробный план встал в таблицу");
+        }
 
         close(cli);
         d2k_session_free(sess);

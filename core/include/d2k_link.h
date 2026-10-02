@@ -309,6 +309,15 @@ int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
                              const char *plan_text, uint8_t shape,
                              uint16_t sport_be, uint8_t family,
                              char *err, size_t errcap);
+/* То же для пробной установки, но с trial ID опыта (v8): датапат возвращает
+ * его в D2K_EV_ACK (trial_id) и на успех, и на отказ — подтверждение
+ * установки связывается со своим опытом, а не с любым ждущим (задача 19).
+ * d2k_link_set_name_family с ненулевым портом шлёт нулевой trial ID. */
+int d2k_link_set_name_probe_trial(int fd, const char *name, uint8_t transport,
+                                  const char *plan_text, uint8_t shape,
+                                  uint16_t sport_be, uint8_t family,
+                                  const uint8_t trial_id[D2K_TRIAL_ID_LEN],
+                                  char *err, size_t errcap);
 int  d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
                         char *err, size_t errcap);
 int d2k_link_arm_shape_family(int fd, const char *name, uint8_t transport,

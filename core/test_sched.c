@@ -646,6 +646,41 @@ static void area_ack_id(d2k_ev *ack) {
     }
 }
 
+/* Trial ID последней пробной установки ИМЕНИ name (v8: хвост
+   SET_NAME_PROBE). Нулевой хвост — диагностический вопрос, не опыт
+   кандидата: такие пропускаются. 1 — найден. */
+static int name_probe_trial(const char *name, uint8_t out[D2K_TRIAL_ID_LEN]) {
+    int found = 0;
+    size_t nl = strlen(name);
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+                     (uint32_t)p[2] << 8 | p[3];
+        if (n < 2 || n > sent_len - off - 4) break;
+        uint16_t cmd = (uint16_t)((uint16_t)p[4] << 8 | p[5]);
+        const uint8_t *body = p + 6;
+        if (cmd == D2K_CMD_SET_NAME_PROBE && n >= 2 + 1 + nl + D2K_TRIAL_ID_LEN &&
+            body[0] == nl && !memcmp(body + 1, name, nl)) {
+            const uint8_t *id = p + 4 + n - D2K_TRIAL_ID_LEN;
+            uint8_t any = 0;
+            for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) any |= id[i];
+            if (any) { memcpy(out, id, D2K_TRIAL_ID_LEN); found = 1; }
+        }
+        off += 4 + n;
+    }
+    return found;
+}
+
+static d2k_ev name_probe_ack(const uint8_t id[D2K_TRIAL_ID_LEN], int ok, uint8_t reason) {
+    d2k_ev e;
+    memset(&e, 0, sizeof e);
+    e.kind = D2K_EV_ACK;
+    e.code = D2K_CMD_SET_NAME_PROBE;
+    e.num = (uint32_t)(ok ? 1u : 0u) << 8 | reason;
+    memcpy(e.trial_id, id, D2K_TRIAL_ID_LEN);
+    return e;
+}
+
 static uint16_t last_area_command(void) {
     uint16_t found=0;
     for(size_t off=0;off+6<=sent_len;) {
@@ -754,6 +789,9 @@ static int last_plan_id(uint8_t out[16]) {
         uint16_t type = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
         const uint8_t *body = p + 6;
         size_t len = n - 2, start = len;
+        if (type == D2K_CMD_SET_NAME_PROBE && len >= D2K_TRIAL_ID_LEN) {
+            len -= D2K_TRIAL_ID_LEN; /* v8: хвост — trial ID, не план */
+        }
         if ((type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) && len) {
             start = 3u + body[0] + (type == D2K_CMD_SET_NAME_PROBE ? 2u : 0u);
         } else if (type == D2K_CMD_SET_ADDR) {
@@ -871,6 +909,9 @@ static int sent_first_split_index(unsigned wanted_offset) {
         if (type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) {
             const uint8_t *body = frame + 6;
             size_t body_len = n - 2;
+            if (type == D2K_CMD_SET_NAME_PROBE && body_len >= D2K_TRIAL_ID_LEN) {
+                body_len -= D2K_TRIAL_ID_LEN; /* v8: хвост — trial ID */
+            }
             size_t nl = body_len ? body[0] : body_len;
             size_t prefix = 1 + nl + 2 + (type == D2K_CMD_SET_NAME_PROBE ? 2 : 0);
             int found = 0;
@@ -966,6 +1007,16 @@ static void tick_once(d2k_sched *s) {
     pfd.fd = d2k_sched_wake_fd(s); pfd.events = POLLIN; pfd.revents = 0;
     (void)poll(&pfd, 1, 1);
     g_now_ms += 5;
+    d2k_sched_tick(s, g_now_ms);
+    drain();
+}
+
+/* Круг БЕЗ хода часов: срок ожидания приёма плана (SCHED_TRIAL_SETTLE_MS)
+   не истекает, и отпустить ожидание может только подтверждение. */
+static void tick_frozen(d2k_sched *s) {
+    struct pollfd pfd;
+    pfd.fd = d2k_sched_wake_fd(s); pfd.events = POLLIN; pfd.revents = 0;
+    (void)poll(&pfd, 1, 1);
     d2k_sched_tick(s, g_now_ms);
     drain();
 }
@@ -3161,6 +3212,124 @@ admission_only_run:
               "зонду QUIC достался пустой сокет — испытание по QUIC действует на всех");
         d2k_sched_free(s);
         d2k_catalog_free(&cQ2);
+    }
+
+    /* --- ПОДТВЕРЖДЕНИЕ УСТАНОВКИ ПРОБЫ ПРИВЯЗАНО К СВОЕМУ ОПЫТУ ---------
+     *
+     * Задача 19. ACK SET_NAME_PROBE раньше отпускал ВСЕ задачи в ожидании
+     * приёма плана, не глядя ни на опыт, ни на признак успеха. Теперь ack
+     * несёт trial ID: чужое подтверждение никого не отпускает, своё —
+     * только свою задачу. */
+    {
+        d2k_catalog cT;
+        memset(&cT, 0, sizeof cT);
+        d2k_sched *s = d2k_sched_new(&cT, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_calls = 0;
+        ver_answer_port = 40611;
+        forget_sent();
+        d2k_ev h1 = ev_hello(6, 40611, "первая.проба");
+        d2k_sched_event(s, &h1);
+        d2k_ev su1 = ev_suspect(6, 40611);
+        d2k_sched_event(s, &su1);
+        d2k_ev h2 = ev_hello(6, 40612, "вторая.проба");
+        d2k_sched_event(s, &h2);
+        d2k_ev su2 = ev_suspect(6, 40612);
+        d2k_sched_event(s, &su2);
+        for (int i = 0; i < 4000 && !(said("по первая.проба поставил план") &&
+                                      said("по вторая.проба поставил план")); i++) {
+            tick_frozen(s);
+        }
+        CHECK(said("по первая.проба поставил план") && said("по вторая.проба поставил план"),
+              "обе задачи не дошли до ожидания приёма пробного плана");
+        uint8_t id1[D2K_TRIAL_ID_LEN], id2[D2K_TRIAL_ID_LEN];
+        CHECK(name_probe_trial("первая.проба", id1) && name_probe_trial("вторая.проба", id2),
+              "SET_NAME_PROBE опыта ушла без trial ID");
+        CHECK(memcmp(id1, id2, D2K_TRIAL_ID_LEN) != 0, "у двух опытов один trial ID");
+        int base = ver_calls;
+        uint8_t foreign[D2K_TRIAL_ID_LEN];
+        memset(foreign, 0x77, sizeof foreign);
+        d2k_ev a = name_probe_ack(foreign, 1, D2K_ACK_OK);
+        d2k_sched_event(s, &a);
+        uint8_t zero[D2K_TRIAL_ID_LEN] = {0};
+        a = name_probe_ack(zero, 1, D2K_ACK_OK);
+        d2k_sched_event(s, &a);
+        for (int i = 0; i < 40; i++) { tick_frozen(s); }
+        CHECK(ver_calls == base, "чужое подтверждение установки отпустило ожидание опыта");
+        a = name_probe_ack(id1, 1, D2K_ACK_OK);
+        d2k_sched_event(s, &a);
+        for (int i = 0; i < 400 && ver_calls == base; i++) { tick_frozen(s); }
+        for (int i = 0; i < 40; i++) { tick_frozen(s); }
+        CHECK(ver_calls == base + 1,
+              "подтверждение первой задачи отпустило не ровно её одну");
+        a = name_probe_ack(id2, 1, D2K_ACK_OK);
+        d2k_sched_event(s, &a);
+        for (int i = 0; i < 400 && ver_calls == base + 1; i++) { tick_frozen(s); }
+        CHECK(ver_calls == base + 2, "своё подтверждение второй задачи её не отпустило");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cT);
+    }
+
+    /* --- ОТКАЗ ИСПОЛНИТЕЛЯ — НЕ ПРОМАХ КАНДИДАТА -------------------------
+     *
+     * Задача 19. Датапат ответил ok=0/BAD_PLAN (план не годится способу
+     * отправки). Раньше ack засчитывался как «план на месте», зонд шёл
+     * голым, и местный отказ записывался кандидату промахом. Теперь:
+     * «план отвергнут исполнителем», следующий кандидат без сетевого зонда,
+     * а когда отвергнуты все — местный отказ, не «выведенные планы
+     * исчерпаны». */
+    {
+        d2k_catalog cR;
+        memset(&cR, 0, sizeof cR);
+        d2k_sched *s = d2k_sched_new(&cR, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_calls = 0;
+        ver_answer_port = 40621;
+        forget_sent();
+        d2k_ev h = ev_hello(6, 40621, "отказ.исполнителя");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40621);
+        d2k_sched_event(s, &su);
+        spin_until_installed(s);
+        CHECK(said("поставил план 1 из"), "первый кандидат не поставлен");
+        int base = ver_calls;
+        int seen_refused = 0, seen_second = 0, seen_miss = 0, seen_final = 0;
+        int seen_exhausted = 0, naks = 0;
+        uint8_t last[D2K_TRIAL_ID_LEN] = {0};
+        for (int round = 0; round < 400 && !seen_final; round++) {
+            uint8_t id[D2K_TRIAL_ID_LEN];
+            if (name_probe_trial("отказ.исполнителя", id) &&
+                memcmp(id, last, sizeof id) != 0) {
+                memcpy(last, id, sizeof last);
+                d2k_ev nak = name_probe_ack(id, 0, D2K_ACK_BAD_PLAN);
+                d2k_sched_event(s, &nak);
+                naks++;
+            }
+            tick_frozen(s);
+            seen_refused |= said("план отвергнут исполнителем");
+            seen_second |= said("поставил план 2 из");
+            seen_miss |= said("зонд не дошёл до приложения");
+            seen_exhausted |= said("выведенные планы исчерпаны");
+            seen_final |= said("все кандидаты отвергнуты исполнителем");
+            saidbuf[0] = '\0';
+        }
+        CHECK(seen_refused, "отказ исполнителя не назван «план отвергнут исполнителем»");
+        CHECK(seen_second && naks >= 2,
+              "после отказа исполнителя не взят следующий кандидат");
+        CHECK(ver_calls == base, "отвергнутый исполнителем кандидат испытан сетевым зондом");
+        CHECK(!seen_miss, "отказ исполнителя записан кандидату промахом");
+        CHECK(seen_final, "все отказы исполнителя не завершились местным отказом");
+        CHECK(!seen_exhausted, "местный отказ выдан за исчерпание выведенных планов");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cR);
     }
 
     /* --- ПРОБНЫЙ ПЛАН СТАВИТСЯ ПОД ФОРМУ ЗОНДА, А НЕ КЛИЕНТА -------------

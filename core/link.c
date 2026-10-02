@@ -472,7 +472,8 @@ static int send_name_plan(int fd, const char *name, uint8_t transport,
         return -1;
     }
     size_t extra = sport_be ? 2u : 0u;                  /* местный порт, если пробный */
-    size_t seq_len = cmd == D2K_CMD_SET_SUFFIX ? D2K_TRIAL_ID_LEN : 0;
+    size_t seq_len = (cmd == D2K_CMD_SET_SUFFIX || cmd == D2K_CMD_SET_NAME_PROBE)
+                         ? D2K_TRIAL_ID_LEN : 0;
     size_t plan_cap = sizeof g_scratch - HDR - 3 - nl - extra - seq_len;
     if (hexlen / 2 > plan_cap) {
         say(err, errcap, "план длиннее предела кадра");
@@ -532,6 +533,17 @@ int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
     char *err, size_t errcap) {
     return send_name_plan(fd, name, transport, plan_text, shape, sport_be, family,
         err, errcap, sport_be ? D2K_CMD_SET_NAME_PROBE : D2K_CMD_SET_NAME, NULL);
+}
+
+int d2k_link_set_name_probe_trial(int fd, const char *name, uint8_t transport,
+    const char *plan_text, uint8_t shape, uint16_t sport_be, uint8_t family,
+    const uint8_t trial_id[D2K_TRIAL_ID_LEN], char *err, size_t errcap) {
+    if (!sport_be) {
+        say(err, errcap, "пробная установка без местного порта");
+        return -1;
+    }
+    return send_name_plan(fd, name, transport, plan_text, shape, sport_be, family,
+        err, errcap, D2K_CMD_SET_NAME_PROBE, trial_id);
 }
 
 static int area_context_valid(uint8_t transport, uint8_t shape, uint8_t family) {
