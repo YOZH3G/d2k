@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "d2k_udp_release.h"
+#include "d2k_nl.h"
 
 typedef struct {
     int used;
@@ -127,4 +128,22 @@ uint64_t d2k_udp_release_next_ns(const d2k_udp_release *q) {
         if (next == 0 || s->due_ns < next) next = s->due_ns;
     }
     return next;
+}
+
+size_t d2k_udp_replay_fates(size_t count, uint32_t head_verdict, int owned,
+                            uint32_t *verdicts, uint8_t *resend) {
+    size_t again = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (owned) {
+            /* The head is already the plan's last emit; the tails follow it
+               through the same raw path and the same conntrack entry. */
+            verdicts[i] = D2K_NF_DROP;
+            resend[i] = i > 0;
+            again += i > 0;
+        } else {
+            verdicts[i] = i == 0 ? head_verdict : D2K_NF_ACCEPT;
+            resend[i] = 0;
+        }
+    }
+    return again;
 }

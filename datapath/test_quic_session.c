@@ -583,6 +583,94 @@ static void test_quic_held_initial_replay_is_first_packet(void) {
     d2k_nat_hook = saved_nat;
 }
 
+/* ЗАДАЧА 42: ОРИГИНАЛ ПОСЛЕ ФАЛЬШИВОК УХОДИТ НАШЕЙ ПОСЫЛКОЙ.
+ *
+ * Поле 02.10.2026 (задача 33): сырые фальшивки создают и подтверждают запись
+ * conntrack первой датаграммы, пока оригинал ещё в NFQUEUE со своей
+ * неподтверждённой записью; после ACCEPT ядро снимает его как дубль
+ * (insert_failed/drop), и настоящий Initial не уходит вовсе. Значит оригинал
+ * — последняя посылка самого плана, а копия в очереди снимается. */
+static void test_quic_original_after_fakes(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    d2k_plan *p = NULL;
+    char err[160];
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    CHECK(s && d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, 1, p) == 0,
+          "original-after-fakes fixture");
+    if (!s) { return; }
+
+    /* 1. Порядок на проводе: фальшивки, затем оригинал целиком; копия снята. */
+    size_t n = build_udp_pkt(pkt, 51700, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(r.applied && r.n_out == 3 && r.verdict == D2K_VERDICT_DROP,
+          "fakes then our own original; the queued copy is dropped");
+    CHECK(r.first_payload == 2, "the original is the last emit, after every fake");
+    if (r.n_out == 3) {
+        const uint8_t *o = buf + r.out[2].off;
+        CHECK(r.out[2].len == n && r.out[2].delay_us == 0,
+              "original whole, right after the last fake");
+        CHECK(!memcmp(o + 12, pkt + 12, 8) && !memcmp(o + 20, pkt + 20, 4),
+              "original keeps the client tuple (kernel NAT follows the fakes' entry)");
+        CHECK(o[8] == pkt[8], "original keeps the client TTL");
+        CHECK(!memcmp(o + 28, v1_initial, sizeof v1_initial), "original bytes unchanged");
+        CHECK(r.out[0].len == 31 && r.out[1].len == 31, "fakes unchanged");
+    }
+    /* Всё ушло — исполнение доведено, повтор Initial плана не получает. */
+    for (size_t i = 0; i <= r.n_out; i++) d2k_session_sent(s, 1001 + i, &r.key, r.execution_id);
+    CHECK(d2k_session_done(s) == 1, "fakes + original + verdict complete the execution");
+    d2k_session_packet(s, pkt, n, 1300000000ull, buf, sizeof buf, &r);
+    CHECK(!r.applied && r.n_out == 0 && r.verdict == D2K_VERDICT_ACCEPT,
+          "a retransmit after a completed execution passes untouched");
+
+    /* 2. Фальшивка ушла, дальше отказ — оригинал отдан ядру после неё и
+          снят conntrack. Повтор Initial того же потока обязан получить план. */
+    n = build_udp_pkt(pkt, 51701, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+    CHECK(r.applied && r.n_out == 3, "second flow applied");
+    d2k_session_sent(s, 2001, &r.key, r.execution_id);
+    CHECK(d2k_session_exec_failed(s, 2002, &r.key, r.plan_id, D2K_REFUSE_SEND,
+                                  r.execution_id, 0, 0) == 1,
+          "nothing of the payload left: the original is still released");
+    uint64_t first_exec = r.execution_id;
+    d2k_session_packet(s, pkt, n, 300002000ull, buf, sizeof buf, &r);
+    CHECK(r.applied && r.n_out == 3 && r.verdict == D2K_VERDICT_DROP,
+          "the client's Initial retransmit gets the plan when the original was lost");
+    CHECK(r.execution_id != first_exec, "the retransmit is a new execution");
+    CHECK(d2k_session_applied(s) == 3, "applied counts each real execution");
+    d2k_session_packet(s, pkt, n, 600002000ull, buf, sizeof buf, &r);
+    CHECK(!r.applied, "the plan is not reapplied once the retransmit got it");
+
+    /* 3. Отложенная посылка не ушла после вердикта DROP: оригинала нет ни в
+          очереди, ни на проводе. Датаграмма атомарна — поток не испорчен,
+          повтор Initial получает план. */
+    n = build_udp_pkt(pkt, 51702, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 3000, buf, sizeof buf, &r);
+    CHECK(r.applied && r.verdict == D2K_VERDICT_DROP, "third flow applied");
+    d2k_session_sent(s, 3001, &r.key, r.execution_id); /* first fake */
+    d2k_session_sent(s, 3002, &r.key, r.execution_id); /* verdict */
+    size_t damaged_before = d2k_session_damaged_count(s);
+    (void)d2k_session_exec_failed(s, 3003, &r.key, NULL, D2K_REFUSE_SEND,
+                                  r.execution_id, 0, 1);
+    CHECK(d2k_session_damaged_count(s) == damaged_before,
+          "a lost QUIC original is not a damaged stream: the client retransmits it whole");
+    d2k_session_packet(s, pkt, n, 300003000ull, buf, sizeof buf, &r);
+    CHECK(r.applied && r.n_out == 3,
+          "the retransmit gets the plan after a deferred send failed");
+
+    /* 4. Отказ до единой посылки: оригинал ушёл ядром как обычно, гонки не
+          было — повтор плана не получает. */
+    n = build_udp_pkt(pkt, 51703, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 4000, buf, sizeof buf, &r);
+    CHECK(r.applied, "fourth flow applied");
+    CHECK(d2k_session_exec_failed(s, 4001, &r.key, r.plan_id, D2K_REFUSE_TOO_LONG,
+                                  r.execution_id, 0, 0) == 1, "clean refusal");
+    d2k_session_packet(s, pkt, n, 300004000ull, buf, sizeof buf, &r);
+    CHECK(!r.applied, "nothing raced the original: no second execution");
+    d2k_session_free(s);
+}
+
 /* После QUIC Retry клиент начинает новый Initial с новым DCID. Старый
  * stateful-контекст не должен отбрасывать такой пакет как «чужой» и оставлять
  * поток без имени навсегда. */
@@ -1416,6 +1504,7 @@ int main(void) {
     test_quic_split_hold_handshake();
     test_quic_held_initial_replay_is_first_packet();
     test_quic_retry_resets_assembly();
+    test_quic_original_after_fakes();
     test_discord_voice();
     test_voice_trial_live_flow();
     test_nameless_initial();
@@ -1513,10 +1602,12 @@ int main(void) {
         d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
 
         CHECK(r.skipped == NULL, "план по имени не применился к UDP-потоку");
-        CHECK(r.n_out == 2, "ожидались две копии фальшивки");
-        CHECK(r.verdict == D2K_VERDICT_ACCEPT,
-              "оригинальная датаграмма обязана пройти: план только добавляет фальшивку");
-        if (r.n_out == 2) {
+        /* Две копии фальшивки и оригинал СВОЕЙ посылкой следом (задача 42):
+           отданный ядру после сырой фальшивки, он снимается conntrack. */
+        CHECK(r.n_out == 3, "ожидались две копии фальшивки и оригинал");
+        CHECK(r.verdict == D2K_VERDICT_DROP,
+              "удержанная копия снимается: оригинал уходит посылкой плана");
+        if (r.n_out == 3) {
             CHECK(r.out[0].delay_us == 0, "первая копия не должна ждать");
             CHECK(r.out[1].delay_us == 78000, "пауза между копиями потеряна");
             CHECK(r.out[0].len == 20 + 8 + 3, "длина собранной датаграммы неверна");
@@ -1697,7 +1788,7 @@ int main(void) {
               "настоящий клиентский Initial не разобран после фикса направления по порту");
         CHECK(d2k_session_with_sni(s) == 1, "имя настоящего клиентского Initial не найдено");
         CHECK(d2k_session_applied(s) == 1, "план не применился к настоящему клиентскому Initial");
-        CHECK(r.n_out == 2, "план не дал ожидаемых двух посылок на настоящем клиентском Initial");
+        CHECK(r.n_out == 3, "план не дал ожидаемых двух фальшивок и оригинала на настоящем клиентском Initial");
 
         d2k_session_free(s);
     }

@@ -289,6 +289,8 @@ static void plan_handed_off(d2k_session *s, d2k_result *out, d2k_flow *fl, const
     fl->orig_taken = (out->verdict == D2K_VERDICT_DROP);
     fl->sends_left = (uint8_t)(out->n_out + 1);
     fl->sends_failed = 0;
+    fl->sends_done = 0;
+    fl->udp_replan = 0;
     if (++s->next_execution == 0) { ++s->next_execution; }
     out->execution_id = fl->execution_id = s->next_execution;
     memcpy(fl->execution_plan_id, out->plan_id, D2K_PLAN_ID_LEN);
@@ -558,8 +560,12 @@ static int flow_tracked(d2k_flow *fl, const d2k_conn *c, uint8_t proto,
             /* ПЕРВЫЙ ПАКЕТ ПОТОКА — исключение, и оно не поблажка. Запись
                подтверждается в конце прохода ЭТОГО САМОГО пакета, поэтому в
                таблице её ещё нет ни при каком исправном ядре. Наши посылки
-               несут ТОТ ЖЕ кортеж, что и он, — значит попадут в ту же запись
-               и получат ту же трансляцию, кто бы из них ни создал её первым.
+               несут ТОТ ЖЕ кортеж, что и он; запись создаёт и подтверждает
+               первая из них, и все последующие наши посылки получают её
+               трансляцию. Сам удержанный оригинал в неё НЕ попадает — его
+               неподтверждённая запись проигрывает вставку, и ядро его снимает
+               (поле 02.10.2026), поэтому после фальшивок он уходит нашей же
+               посылкой (own_after_fakes в handle_udp).
                Отказать здесь значило бы никогда не трогать первую датаграмму
                QUIC, а у QUIC первая датаграмма и есть приветствие. */
             return first_packet ? 0 : -1;
@@ -773,7 +779,8 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
 
        Окно поиска по-прежнему держит цену: попыток не больше
        D2K_HELLO_WINDOW на поток. */
-    if ((fl->saw_hello && fl->plan_done) || fl->fwd_pkts > D2K_HELLO_WINDOW) {
+    if ((fl->saw_hello && fl->plan_done && !fl->udp_replan) ||
+        fl->fwd_pkts > D2K_HELLO_WINDOW) {
         out->skipped = fl->saw_hello ? "поток уже показывал приветствие"
                                       : "за окном поиска";
         return;
@@ -1021,7 +1028,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        поток портится ровно тогда, когда план к нему уже применялся, и при
        обратном порядке ветка повреждения недостижима — флаг был бы
        write-only, а контроллер не получал бы о нём ни слова. */
-    if (fl->plan_done) {
+    if (fl->plan_done && !fl->udp_replan) {
         out->skipped = "план уже применён к этому потоку";
         return;
     }
@@ -1046,6 +1053,16 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     in.have_sni = 0;
     in.sni_off = 0;
     in.sni_len = 0;
+    /* ОРИГИНАЛ ПОСЛЕ ФАЛЬШИВОК — СВОЕЙ ПОСЫЛКОЙ (задача 42). Наши сырые
+       фальшивки несут тот же кортеж, создают и ПОДТВЕРЖДАЮТ запись conntrack
+       первыми (у транзита — с трансляцией по метке, S99d2k), а удержанный в
+       NFQUEUE оригинал несёт свою неподтверждённую запись, и после ACCEPT ядро
+       снимает его как дубль: insert_failed/drop росли на роутере ровно на
+       число прогонов, настоящий Initial на ppp0 не появлялся, уходил только
+       повтор клиента через ~300 мс без плана. Свой оригинал проходит через
+       ту же подтверждённую запись — с той же трансляцией, что у фальшивок, —
+       а копия в очереди снимается. */
+    in.own_after_fakes = 1;
 
     d2k_actions acts;
     memset(&acts, 0, sizeof acts);
@@ -2501,6 +2518,7 @@ void d2k_session_sent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
         return;
     }
     fl->sends_left--;
+    if (fl->sends_done < 0xFF) { fl->sends_done++; }
     if (fl->sends_left == 0 && !fl->sends_failed) {
         s->done++;
         d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_DONE,
@@ -2542,6 +2560,18 @@ int d2k_session_exec_failed(d2k_session *s, uint64_t at_ns, const d2k_key *k,
        вердикта» это один несостоявшийся опыт, а не два. */
     if (!fl->sends_failed) {
         d2k_session_unsent(s, at_ns, k, plan_id, code, execution);
+    }
+    /* UDP: ОРИГИНАЛ ПОТЕРЯН — НЕ ПОТОК ИСПОРЧЕН (задача 42).
+       Нагрузка не ушла, а оригинала больше нет: либо его копию сняли вердиктом
+       DROP, а наша посылка с ним не ушла, либо его отпустят ядру ПОСЛЕ уже
+       ушедших сырых фальшивок — и conntrack снимет его как дубль их записи.
+       Байты не разорваны: датаграмма атомарна, клиент повторит Initial
+       целиком, и этот повтор получает план. Отказ до единой посылки сюда не
+       относится: тогда гонки не было, и оригинал уходит ядром как обычно. */
+    if (k->proto == 17 && !payload_on_wire) {
+        int lost = orig_spent ? fl->orig_taken : fl->sends_done > 0;
+        if (lost) { fl->udp_replan = 1; }
+        return (orig_spent && fl->orig_taken) ? 0 : 1;
     }
     if (payload_on_wire || (orig_spent && fl->orig_taken)) {
         if (!fl->damaged) { s->damaged_flows++; }

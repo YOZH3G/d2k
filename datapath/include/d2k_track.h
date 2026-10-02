@@ -301,6 +301,14 @@ struct d2k_flow {
      * на провод не целиком. */
     uint8_t sends_left;
     uint8_t sends_failed;
+    /* Сколько посылок этой попытки уже покинуло машину (вердикт тоже). */
+    uint8_t sends_done;
+    /* UDP: попытка сорвалась, а оригинал так и не ушёл — ядро сняло его как
+       дубль записи, созданной нашими фальшивками, либо наша посылка с ним не
+       ушла после DROP. Датаграмма атомарна, и клиент сам повторит Initial
+       целиком: этот повтор получает план (задача 42). Сбрасывается новой
+       попыткой. */
+    uint8_t udp_replan;
     uint64_t execution_id; /* distinguishes reuse of the same 5-tuple */
     uint8_t execution_plan_id[16];
     uint8_t execution_trial_id[16]; /* nonzero only for ephemeral address probe */

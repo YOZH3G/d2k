@@ -1165,8 +1165,56 @@ int main(int argc, char **argv) {
                         }
                     }
 
+                    /* ХВОСТЫ СОСТАВНОГО INITIAL — ТОЖЕ НАШИ (задача 42).
+                     *
+                     * План забрал первый оригинал и выпустил его последней
+                     * своей посылкой. Остальные удержанные датаграммы пришли в
+                     * conntrack, пока голова ещё стояла в очереди, и каждая
+                     * несёт свою неподтверждённую запись; отпущенные ядру
+                     * после наших сырых посылок, они снимаются как дубль
+                     * (insert_failed/drop). Поэтому они уходят тем же сырым
+                     * путём следом за планом — побайтно как пришли (суммы
+                     * ядро досчитало до выдачи: GSO в очереди выключен, см.
+                     * nfq.c), — а копии в очереди снимаются. Не вышло
+                     * переиздать — хвост отдаётся ядру, как раньше. */
+                    uint32_t batch_verdicts[D2K_UDP_HOLD_PACKETS];
+                    uint8_t batch_resend[D2K_UDP_HOLD_PACKETS];
+                    int owned_batch = 0;
+                    if (udp_replay) {
+                        owned_batch = mode == MODE_APPLY && raw && res.applied &&
+                                      !output_failed && verdict == D2K_NF_DROP;
+                        (void)d2k_udp_replay_fates(udp_batch.count, verdict, owned_batch,
+                                                   batch_verdicts, batch_resend);
+                        for (size_t i = 1; i < udp_batch.count; i++) {
+                            if (!batch_resend[i]) { continue; }
+                            const uint8_t *tp = udp_batch.packets[i];
+                            size_t tl = udp_batch.len[i];
+                            int ok = d2k_raw_prepare(raw, tp, tl, err, sizeof err) == 0;
+                            if (ok && at <= t) {
+                                ok = d2k_raw_send(raw, tp, tl, err, sizeof err) == 0;
+                                if (ok) { st.emitted++; st.emitted_now++; }
+                            } else if (ok) {
+                                /* Без ключа: это байты клиента, а не посылка
+                                   плана, и уйти они обязаны при любом исходе
+                                   его исполнения. */
+                                ok = d2k_sched_push_serial(sched, at, tp, tl, NULL, 0) == 0;
+                                if (ok) {
+                                    st.deferred++;
+                                } else {
+                                    snprintf(err, sizeof err, "очередь отложенных полна");
+                                }
+                            }
+                            if (!ok) {
+                                st.send_fail++;
+                                fprintf(stderr, "d2kd: хвост QUIC Initial не переиздан, "
+                                                "отдаю ядру: %s\n", err);
+                                batch_verdicts[i] = D2K_NF_ACCEPT;
+                            }
+                        }
+                    }
+
                     int delayed_originals = 0;
-                    if (udp_replay && res.applied && !output_failed &&
+                    if (udp_replay && !owned_batch && res.applied && !output_failed &&
                         udp_batch.count > 1 && at > t && udp_releases) {
                         uint32_t ids[D2K_UDP_HOLD_PACKETS];
                         uint32_t verdicts[D2K_UDP_HOLD_PACKETS];
@@ -1197,9 +1245,12 @@ int main(int argc, char **argv) {
                     if (udp_replay && !delayed_originals) {
                         /* Only the first original was replaced by the
                            strategy.  Later QUIC datagrams are real client
-                           input and must remain in the stream. */
+                           input and must remain in the stream: re-sent by us
+                           above when the plan owns the batch, otherwise
+                           released by the kernel. */
                         for (size_t i = 0; i < udp_batch.count; i++) {
-                            uint32_t v = (i == 0) ? verdict : D2K_NF_ACCEPT;
+                            uint32_t v = owned_batch ? batch_verdicts[i]
+                                       : (i == 0) ? verdict : D2K_NF_ACCEPT;
                             if (send_original_verdict(&hc, udp_batch.ids[i], v) != 0) {
                                 original_failed = 1;
                             }

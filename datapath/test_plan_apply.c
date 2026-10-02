@@ -448,6 +448,60 @@ static void test_udplen(void) {
     d2k_plan_free(p);
 }
 
+/* ОРИГИНАЛ ПОСЛЕ ФАЛЬШИВОК — СВОЕЙ ПОСЫЛКОЙ, если вызывающий не может отдать
+   его ядру (задача 42: первая датаграмма QUIC, conntrack). Порядок: все
+   фальшивки, затем оригинал целиком без собственной паузы; судьба — снять
+   удерживаемую копию. Без фальшивок владеть нечем: оригинал проходит. */
+static void test_own_after_fakes(void) {
+    d2k_plan *p = NULL; char err[160]; d2k_flow f; d2k_actions a; d2k_pkt in;
+    memset(&f, 0, sizeof f);
+    CHECK(d2k_plan_load(plan_fake_before, sizeof plan_fake_before, &p, err, sizeof err) == 0,
+          "fake-before plan loads for owned original");
+    if (!p) { return; }
+    init_pkt(&in, 0);
+    in.own_after_fakes = 1;
+    memset(&a, 0, sizeof a);
+    CHECK(d2k_plan_apply(p, &f, &in, &a) == 0, "owned-original plan applies");
+    CHECK(a.n == 3, "two fakes and then the original itself");
+    CHECK(a.fate == D2K_ORIG_DROP, "the held copy is dropped: the original is ours");
+    if (a.n == 3) {
+        CHECK(a.v[0].kind == D2K_EMIT_FAKE && a.v[1].kind == D2K_EMIT_FAKE,
+              "fakes keep their place before the original");
+        CHECK(a.v[1].delay_us == 78000, "gap between fake copies kept");
+        CHECK(a.v[2].kind == D2K_EMIT_PAYLOAD && a.v[2].len == in.payload_len &&
+              a.v[2].bytes == in.payload && !a.v[2].pre_len,
+              "original goes whole and unchanged");
+        CHECK(a.v[2].delay_us == 0 && a.v[2].ttl == 0 && a.v[2].poison == 0,
+              "original right after the last fake, without fooling");
+    }
+    d2k_actions_free(&a);
+
+    /* Не просили — прежнее поведение: оригинал отпускает ядро. */
+    init_pkt(&in, 0);
+    memset(&a, 0, sizeof a);
+    CHECK(d2k_plan_apply(p, &f, &in, &a) == 0 && a.n == 2 && a.fate == D2K_ORIG_PASS,
+          "without the request fakes-only plans still pass the original");
+    d2k_actions_free(&a);
+    d2k_plan_free(p);
+
+    /* План без фальшивок (только разрез) владеет нагрузкой по своей причине;
+       просьба ничего к нему не добавляет. План вообще без посылок — пропуск. */
+    p = NULL;
+    static const uint8_t empty_plan[] = {'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 1,
+                                         0x01, 0x03, 0x00, 0x01, 0x00};
+    CHECK(d2k_plan_load(empty_plan, sizeof empty_plan, &p, err, sizeof err) == 0,
+          "order-only plan loads");
+    if (p) {
+        init_pkt(&in, 0);
+        in.own_after_fakes = 1;
+        memset(&a, 0, sizeof a);
+        CHECK(d2k_plan_apply(p, &f, &in, &a) == 0 && a.n == 0 && a.fate == D2K_ORIG_PASS,
+              "no fakes: nothing races the original, the kernel releases it");
+        d2k_actions_free(&a);
+        d2k_plan_free(p);
+    }
+}
+
 int main(void) {
     d2k_plan *p = NULL;
     char err[160];
@@ -458,6 +512,7 @@ int main(void) {
 
     test_tls_fake_modifiers();
     test_udplen();
+    test_own_after_fakes();
 
     /* A TCP route hint must not turn one QUIC datagram into fragments. */
     {

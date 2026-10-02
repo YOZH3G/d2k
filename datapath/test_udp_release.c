@@ -2,6 +2,7 @@
 #include <stdio.h>
 
 #include "d2k_udp_release.h"
+#include "d2k_nl.h"
 
 static int fails;
 #define CHECK(x, m) do { if (!(x)) { fprintf(stderr, "udp_release:%d: %s\n", __LINE__, m); fails++; } } while (0)
@@ -96,6 +97,26 @@ int main(void) {
     CHECK(d2k_udp_release_enqueue(q, 302, ids, verdicts, 2, &key, 82) != 0,
           "queue overflow accepted silently");
     d2k_udp_release_free(q);
+
+    /* Задача 42: план забрал первый оригинал — ни одна копия из очереди не
+       уходит, хвосты повторно шлёт сам датапат следом за посылками плана. */
+    {
+        uint32_t v[3] = {9, 9, 9};
+        uint8_t again[3] = {9, 9, 9};
+        CHECK(d2k_udp_replay_fates(3, D2K_NF_DROP, 1, v, again) == 2,
+              "owned batch: both tails are re-sent by the datapath");
+        CHECK(v[0] == D2K_NF_DROP && v[1] == D2K_NF_DROP && v[2] == D2K_NF_DROP,
+              "owned batch: every queued copy is dropped");
+        CHECK(!again[0] && again[1] && again[2],
+              "the head is the plan's own emit, only tails are re-sent");
+        CHECK(d2k_udp_replay_fates(3, D2K_NF_ACCEPT, 0, v, again) == 0,
+              "not owned: the kernel releases everything");
+        CHECK(v[0] == D2K_NF_ACCEPT && v[1] == D2K_NF_ACCEPT && v[2] == D2K_NF_ACCEPT &&
+              !again[0] && !again[1] && !again[2], "not owned: plain ACCEPT");
+        CHECK(d2k_udp_replay_fates(2, D2K_NF_DROP, 0, v, again) == 0 &&
+              v[0] == D2K_NF_DROP && v[1] == D2K_NF_ACCEPT,
+              "a failed owner keeps the old verdict split");
+    }
     if (!fails) puts("UDP release: due ordering and bounded ownership passed");
     return fails != 0;
 }

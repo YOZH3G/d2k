@@ -387,6 +387,14 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     int owns_payload = (n_pts > 0) || (p->n_seqovls > 0) || (p->pace_us > 0) ||
                        (p->settle_us > 0) || (p->delay_us > 0) || p->ipfrag ||
                        p->udplen;
+    /* Оригинал, отданный ядру после наших сырых фальшивок, может не уйти
+       вовсе (см. own_after_fakes в d2k_plan.h). Тогда правда — последняя
+       посылка плана, сразу за фальшивками, без собственной паузы. */
+    if (in->own_after_fakes) {
+        for (size_t i = 0; i < p->n_fakes; i++) {
+            if (p->fakes[i].placement == PLACE_BEFORE) { owns_payload = 1; break; }
+        }
+    }
     if (p->udplen && in->payload_len + (size_t)p->udplen > 65535u - 8u) {
         free(pts);
         return -1; /* удлинённая нагрузка не помещается в одну UDP-датаграмму */
