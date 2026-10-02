@@ -1757,6 +1757,9 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
             *all_marked = 0;
         }
         *slot = qp_outcome(t);
+        if (q->ask == D2K_QASK_LONGER && q->kind == QK_RESHAPE) {
+            r->qprops.longer_profile = (label != q->label) ? 1 : 0;
+        }
         if (qi < D2K_QTRACE_MAX) {
             d2k_quic_step *st = &r->qtrace[qi];
             snprintf(st->label, sizeof st->label, "%s", label);

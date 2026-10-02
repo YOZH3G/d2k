@@ -1440,70 +1440,152 @@ static int fb_arm_at(size_t idx, fb_arm *a) {
  * исходными разрезами/перекрытиями/порядком. Fake идёт ПЕРЕД фрагментами,
  * целый оригинал снимается. NOT_FOUND/FLAKY и неизвестная форма — отказ.
  * -------------------------------------------------------------------- */
-int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
-                      char *buf, size_t cap) {
-    if (!arm || !buf || cap == 0) { return -1; }
-    unsigned repeats = 1;
-    int ttl = 0;
-    switch (arm->kind) {
-    case D2K_QA_BLOB:   break;
-    case D2K_QA_COPIES:
-        if (arm->copies <= 0 || arm->copies > 255) { return -1; }
-        repeats = (unsigned)arm->copies;
-        break;
-    case D2K_QA_TTL:
-        if (arm->ttl <= 0 || arm->ttl > 255) { return -1; }
-        ttl = arm->ttl;
-        break;
-    case D2K_QA_FRAG:
-        if (!arm->original || arm->len || blen || !arm->frag_kind) return -1;
-        break;
-    default:
-        return -1;
-    }
+/* МУСОР ПЕРЕД INITIAL — ровно байты донора: 16 нулей
+   (questions.go:97 мерит `make([]byte, 16)`, compose questions.go:317-319
+   ставит `blob=0x00000000000000000000000000000000:repeats=2`). Без TTL и без
+   порчи: у донора их нет. */
+#define QUIC_JUNK_LEN     16u
+#define QUIC_JUNK_REPEATS 2u
+/* Донор: apply «датаграмма длиннее обычной» пишет UDPLen = 100
+   (questions.go:239-243), compose — `udplen:...:increment=100`. */
+#define QUIC_UDPLEN_INCREMENT 100u
 
-    /* Original compose combines fake and fragment; no invented fake for a
-       fragment-only result. Survival on the neutral control is mandatory. */
-    int frag=arm->frag_kind;
-    int has_fake=arm->kind!=D2K_QA_FRAG;
-    if (frag && (!arm->original || frag<1 || frag>4 ||
-                 arm->frag_survives!=D2K_PROP_YES)) return -1;
-    if (arm->original) {
-        if (has_fake && (arm->copies <= 0 || arm->copies > 255 ||
-            arm->len == 0 || arm->len > sizeof arm->bytes || !blob ||
-            blen != arm->len || memcmp(blob, arm->bytes, blen) != 0)) return -1;
-        repeats = (unsigned)arm->copies;
+static int quic_arm_found(const d2k_quic_arm *a) {
+    return a && (a->kind == D2K_QA_BLOB || a->kind == D2K_QA_COPIES ||
+                 a->kind == D2K_QA_TTL || a->kind == D2K_QA_FRAG);
+}
+
+/* Один сборщик QUIC-плана на оба входа (плечо askArms и свойства вопросника)
+   — та же склейка, что у compose донора, а не два похожих сборщика.
+   arm == NULL — плеча нет; junk/udplen — подтверждённые свойства. */
+static int quic_plan_text(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
+                          int junk, unsigned udplen, int udplen_profile,
+                          char *buf, size_t cap) {
+    static const uint8_t junk_bytes[QUIC_JUNK_LEN];
+    unsigned repeats = 1;
+    int ttl = 0, frag = 0, has_fake = 0;
+    const uint8_t *fake = NULL;
+    size_t flen = 0;
+
+    if (arm) {
+        switch (arm->kind) {
+        case D2K_QA_BLOB:   break;
+        case D2K_QA_COPIES:
+            if (arm->copies <= 0 || arm->copies > 255) { return -1; }
+            repeats = (unsigned)arm->copies;
+            break;
+        case D2K_QA_TTL:
+            if (arm->ttl <= 0 || arm->ttl > 255) { return -1; }
+            ttl = arm->ttl;
+            break;
+        case D2K_QA_FRAG:
+            if (!arm->original || arm->len || blen || !arm->frag_kind) return -1;
+            break;
+        default:
+            return -1;
+        }
+        /* Original compose combines fake and fragment; no invented fake for a
+           fragment-only result. Survival on the neutral control is mandatory. */
+        frag = arm->frag_kind;
+        has_fake = arm->kind != D2K_QA_FRAG;
+        if (frag && (!arm->original || frag < 1 || frag > 4 ||
+                     arm->frag_survives != D2K_PROP_YES)) return -1;
+        if (arm->original) {
+            if (has_fake && (arm->copies <= 0 || arm->copies > 255 ||
+                arm->len == 0 || arm->len > sizeof arm->bytes || !blob ||
+                blen != arm->len || memcmp(blob, arm->bytes, blen) != 0)) return -1;
+            repeats = (unsigned)arm->copies;
+        }
+        if (has_fake && (!blob || blen == 0)) { return -1; }
+        if (has_fake) { fake = blob; flen = blen; }
     }
-    if (has_fake && (!blob || blen == 0)) { return -1; }
+    /* switch донора (questions.go:301-320): фальшивка плеча, а если её нет —
+       мусор. Фрагментация от этого не зависит и склеивается с любым. */
+    if (!has_fake && junk) {
+        has_fake = 1;
+        fake = junk_bytes;
+        flen = sizeof junk_bytes;
+        repeats = QUIC_JUNK_REPEATS;
+        ttl = 0;
+    }
+    /* ФРАГМЕНТАЦИЯ ГАСИТ ДЛИНУ. У донора строка идёт
+       `fake … send:ipfrag … drop udplen:increment=100`: send уже выпустил
+       фрагменты НЕизменённой датаграммы, drop снял оригинал, и udplen правит
+       пакет, которого на проводе не будет — DROP в zapret липкий
+       (nfq2/desync.c, verdict_aggregate: MODIFY после DROP остаётся DROP).
+       План описывает провод, поэтому длины в нём нет. */
+    if (frag) { udplen = 0; }
+    if (!has_fake && !frag && !udplen) { return -1; }
 
     size_t pos = 0;
     if (frag) {
         if (append_fmt(buf,cap,&pos,"d2k-plan 1 7\nid 00000000000000000000000000000000\n"
                                    "proto udp quic\nipfrag %d\n",frag)!=0) return -1;
+    } else if (udplen) {
+        /* minexec=9: старый исполнитель записи udplen не знает и откажет
+           громко, а не выпустит датаграмму без удлинения. */
+        if (append_fmt(buf, cap, &pos, "d2k-plan 1 9\nid 00000000000000000000000000000000\n"
+                                       "proto udp quic\n") != 0) return -1;
     } else if (emit_header_proto(buf, cap, &pos, "udp quic") != 0) { return -1; }
     if (has_fake) {
-    if (append_fmt(buf, cap, &pos, "payload 1 ") != 0) { return -1; }
-    if (append_hex(buf, cap, &pos, blob, blen) != 0) { return -1; }
-    if (append_fmt(buf, cap, &pos, "\n") != 0) { return -1; }
-    if (ttl) {
-        if (append_fmt(buf, cap, &pos, "poison 1 ttl=%d\n", ttl) != 0) { return -1; }
-    } else {
-        if (append_fmt(buf, cap, &pos, "poison 1\n") != 0) { return -1; }
+        if (append_fmt(buf, cap, &pos, "payload 1 ") != 0) { return -1; }
+        if (append_hex(buf, cap, &pos, fake, flen) != 0) { return -1; }
+        if (append_fmt(buf, cap, &pos, "\n") != 0) { return -1; }
+        if (ttl) {
+            if (append_fmt(buf, cap, &pos, "poison 1 ttl=%d\n", ttl) != 0) { return -1; }
+        } else {
+            if (append_fmt(buf, cap, &pos, "poison 1\n") != 0) { return -1; }
+        }
+        /* place=before и никакого «между»: между чем? Кусков у датаграммы нет.
+           gap_us нулевой — паузы МЕЖДУ копиями донор не задаёт. У оригинального
+           askArms нет дополнительной паузы перед правдой; pace только legacy. */
+        if (append_fmt(buf, cap, &pos,
+                       "fake payload=1 poison=1 repeats=%u gap_us=0 place=before\n",
+                       repeats) != 0) {
+            return -1;
+        }
     }
-    /* place=before и никакого «между»: между чем? Кусков у датаграммы нет.
-       gap_us нулевой — паузы МЕЖДУ копиями донор не задаёт. У оригинального
-       askArms нет дополнительной паузы перед правдой; pace только legacy. */
-    if (append_fmt(buf, cap, &pos,
-                   "fake payload=1 poison=1 repeats=%u gap_us=0 place=before\n",
-                   repeats) != 0) {
-        return -1;
-    }
+    if (udplen) {
+        /* zapret udplen (lua/zapret-antidpi.lua): payload .. pattern("\x00",
+           1, increment) — к UDP-нагрузке Initial дописываются `increment`
+           нулевых байт, исходные байты не меняются. Вопрос донора мерил
+           датаграмму в 1300 байт с PADDING внутри Initial; строка донора
+           исполняет хвост ПОСЛЕ пакета (RFC 9000 §12.2: сервер его
+           отбрасывает). Переносится действие донора, а не измерение. */
+        if (udplen_profile &&
+            append_fmt(buf, cap, &pos,
+                       "# длина измерена PROFILE: собственным Initial донора в 1300 байт, "
+                       "не формой приветствия клиента\n") != 0) {
+            return -1;
+        }
+        if (append_fmt(buf, cap, &pos, "udplen %u\n", udplen) != 0) { return -1; }
     }
     if (append_fmt(buf, cap, &pos, "order forward\n") != 0) { return -1; }
-    if (!arm->original && append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_SETTLE_US) != 0) {
+    if (arm && !arm->original &&
+        append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_SETTLE_US) != 0) {
         return -1;
     }
     return 0;
+}
+
+int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
+                      char *buf, size_t cap) {
+    if (!arm || !buf || cap == 0 || !quic_arm_found(arm)) { return -1; }
+    return quic_plan_text(arm, blob, blen, 0, 0, 0, buf, cap);
+}
+
+int d2k_quic_compose_plan(const d2k_quic_arm *arm, const d2k_quic_props *p,
+                          char *buf, size_t cap) {
+    if (!p || !buf || cap == 0) { return -1; }
+    /* Метки опытов не подтверждены — верить нельзя ни плечу, ни свойствам
+       того же прогона. */
+    if (arm && arm->kind == D2K_QA_FLAKY) { return -1; }
+    const d2k_quic_arm *use = quic_arm_found(arm) ? arm : NULL;
+    return quic_plan_text(use, use ? use->bytes : NULL, use ? use->len : 0,
+                          p->junk_ahead == D2K_PROP_YES,
+                          p->longer == D2K_PROP_YES ? QUIC_UDPLEN_INCREMENT : 0u,
+                          p->longer == D2K_PROP_YES && p->longer_profile == 1,
+                          buf, cap);
 }
 
 int d2k_quic_delay_plan(char *buf, size_t cap) {

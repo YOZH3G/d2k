@@ -5,7 +5,7 @@ D2K_REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 D2K_DONOR=${D2K_REF_ROOT:-"$D2K_REPO/../z2k"}
 D2K_GO=${D2K_REF_GO:-go}
 D2K_PIN=e9a391347671cbb07663d2bee5b3d92f016c789e
-D2K_QUIC_TESTS=${D2K_QUIC_TESTS:-'TestD2K(RunTerminal|Reply|Arms|Blob|Residual|Fragments)Parity'}
+D2K_QUIC_TESTS=${D2K_QUIC_TESTS:-'TestD2K(RunTerminal|Reply|Arms|Blob|Residual|Fragments|Compose)Parity'}
 case "${1:-}" in
     '') D2K_LINUX=0 ;;
     --linux) D2K_LINUX=1 ;;
@@ -30,6 +30,7 @@ cp -R "$D2K_DONOR/z2k-detect/internal/quicprobe" "$D2K_TMP/quicprobe"
 cp "$D2K_REPO/tests/quic-run/compare_test.go" "$D2K_TMP/quicprobe/d2k_compare_test.go"
 cp "$D2K_REPO/tests/quic-run/arms_test.go" "$D2K_TMP/quicprobe/d2k_arms_test.go"
 cp "$D2K_REPO/tests/quic-run/fragments_test.go" "$D2K_TMP/quicprobe/d2k_fragments_test.go"
+cp "$D2K_REPO/tests/quic-run/compose_test.go" "$D2K_TMP/quicprobe/d2k_compose_test.go"
 cp "$D2K_REPO/tests/quic-run/fragments_linux_test.go" "$D2K_TMP/quicprobe/d2k_fragments_linux_test.go"
 mkdir "$D2K_TMP/blobs"
 for b in quic_5.bin quic_initial_www_google_com.bin quic_initial_rutracker_org.bin; do
@@ -42,7 +43,8 @@ build_c() {
         -Dsetsockopt=d2k_test_setsockopt -c quicprobe.c -o "$D2K_TMP/quicprobe.o"
     "$@" -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../datapath/include \
         -o "$D2K_TMP/d2k-run" ../tests/quic-run/main.c "$D2K_TMP/quicprobe.o" quicarms.c ipfrag.c props.c net4.c \
-        quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c -lpthread
+        quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c \
+        compose.c link.c -lpthread
 }
 if [ "$D2K_LINUX" != 0 ]; then
     [ "$(docker image inspect gcc:14 --format '{{.Architecture}} {{.Os}}')" = 'arm64 linux' ] || {

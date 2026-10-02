@@ -1222,6 +1222,8 @@ int main(int argc, char **argv) {
         CHECK(strstr(r.reason, "«длина» задана PROFILE") != NULL,
               "причина обязана назвать подмену формы PROFILE, а не молчать");
         CHECK(g_mock_len_1300 == 1, "запасной Initial «длины» обязан быть ровно 1300 байт");
+        CHECK(r.qprops.longer_profile == 1,
+              "свойство «длина» не несёт пометки PROFILE — план выдаст его за форму клиента");
     }
 
     /* --- ВОПРОСНИК ЦЕЛИКОМ: СЕМЬ ВОПРОСОВ НА НАСТОЯЩЕМ СНИМКЕ -------------
@@ -1251,6 +1253,7 @@ int main(int argc, char **argv) {
               "на настоящем снимке не собраться не может ни один вопрос");
         CHECK(strcmp(r.qtrace[6].label, "длина") == 0 && strstr(r.reason, "PROFILE") == NULL,
               "снимок помещается в 1300 — «длина» задаётся снимком, без PROFILE");
+        CHECK(r.qprops.longer_profile == 0, "«длина» снимком помечена PROFILE");
         CHECK(r.qprops.junk_ahead != D2K_PROP_UNKNOWN &&
               r.qprops.split_crypto != D2K_PROP_UNKNOWN &&
               r.qprops.split_datagrams != D2K_PROP_UNKNOWN &&

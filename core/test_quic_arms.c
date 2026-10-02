@@ -910,7 +910,129 @@ static void test_quic_delay_plan(void) {
     CHECK(d2k_quic_delay_plan(plan, 10) != 0, "план собрался в буфер на десять байт");
 }
 
+/* --- QUIC: «мусор перед Initial» и «длина» становятся планом -------------
+ *
+ * Донор compose (z2k-detect/internal/quicprobe/questions.go:296-345) склеивает
+ * ВСЕ исполнимые приёмы в одну строку:
+ *   FakeAhead (плечо askArms) ИЛИ, если его нет, JunkAheadHelps →
+ *     --lua-desync=fake:payload=quic_initial:dir=out:
+ *                 blob=0x00000000000000000000000000000000:repeats=2
+ *   FragArm+FragSurvives → send:ipfrag… + drop
+ *   UDPLen → --lua-desync=udplen:payload=quic_initial:dir=out:increment=100
+ * Здесь проверяется ровно эта склейка на языке плана D2K. */
+static d2k_quic_arm quic_arm_of(d2k_quic_arm_kind kind) {
+    d2k_quic_arm a;
+    memset(&a, 0, sizeof a);
+    a.kind = kind;
+    a.original = 1;
+    if (kind == D2K_QA_COPIES || kind == D2K_QA_TTL || kind == D2K_QA_BLOB) {
+        a.len = 4;
+        memcpy(a.bytes, "\x41\x42\x43\x44", 4);
+        a.copies = 6;
+        if (kind == D2K_QA_TTL) { a.ttl = 5; }
+    }
+    return a;
+}
+
+static void quic_props_compose_checks(void) {
+    static const char zero16[] = "payload 1 00000000000000000000000000000000\n";
+    static const char junk_fake[] = "fake payload=1 poison=1 repeats=2 gap_us=0 place=before\n";
+    char plan[4096];
+    d2k_quic_props p;
+    d2k_quic_arm nf = quic_arm_of(D2K_QA_NOT_FOUND);
+
+    /* Мусор подтверждён, плеча нет — план всё равно есть (прежде: «плечо не
+       нашлось»). Ровно 16 нулей, две копии, без TTL, перед Initial. */
+    memset(&p, 0, sizeof p);
+    p.junk_ahead = D2K_PROP_YES;
+    CHECK(d2k_quic_compose_plan(&nf, &p, plan, sizeof plan) == 0,
+          "QUIC: «мусор» без плеча не стал планом");
+    CHECK(strstr(plan, "proto udp quic\n") != NULL, "QUIC мусор: план не объявил udp/quic");
+    CHECK(strstr(plan, zero16) != NULL, "QUIC мусор: не 16 нулевых байт донора");
+    CHECK(strstr(plan, junk_fake) != NULL, "QUIC мусор: не две копии перед Initial");
+    CHECK(strstr(plan, "ttl=") == NULL, "QUIC мусор: донор TTL мусору не задаёт");
+    CHECK(strstr(plan, "udplen") == NULL && strstr(plan, "ipfrag") == NULL,
+          "QUIC мусор: в план попало неизмеренное");
+
+    /* Длина подтверждена — действие «удлинить на 100». Executor 9. */
+    memset(&p, 0, sizeof p);
+    p.longer = D2K_PROP_YES;
+    CHECK(d2k_quic_compose_plan(&nf, &p, plan, sizeof plan) == 0,
+          "QUIC: «длина» без плеча не стала планом");
+    CHECK(strncmp(plan, "d2k-plan 1 9\n", 13) == 0, "QUIC длина: план не требует исполнителя 9");
+    CHECK(strstr(plan, "udplen 100\n") != NULL, "QUIC длина: нет действия udplen 100");
+    CHECK(strstr(plan, "fake ") == NULL, "QUIC длина: выдумана фальшивка");
+    CHECK(strstr(plan, "PROFILE") == NULL, "QUIC длина: PROFILE без основания");
+
+    /* Длина измерена собственным Initial донора — провенанс в тексте плана. */
+    p.longer_profile = 1;
+    CHECK(d2k_quic_compose_plan(&nf, &p, plan, sizeof plan) == 0 &&
+          strstr(plan, "PROFILE") != NULL && strstr(plan, "udplen 100\n") != NULL,
+          "QUIC длина PROFILE: план не назвал происхождение измерения");
+
+    /* Оба свойства — одна строка донора, один план. */
+    memset(&p, 0, sizeof p);
+    p.junk_ahead = D2K_PROP_YES;
+    p.longer = D2K_PROP_YES;
+    CHECK(d2k_quic_compose_plan(&nf, &p, plan, sizeof plan) == 0 &&
+          strstr(plan, zero16) && strstr(plan, junk_fake) && strstr(plan, "udplen 100\n"),
+          "QUIC мусор+длина: донор склеивает оба приёма");
+
+    /* Плечо askArms с фальшивкой ВЫТЕСНЯЕТ мусор (switch донора), длина
+       добавляется. */
+    d2k_quic_arm cp = quic_arm_of(D2K_QA_COPIES);
+    CHECK(d2k_quic_compose_plan(&cp, &p, plan, sizeof plan) == 0 &&
+          strstr(plan, "payload 1 41424344\n") && strstr(plan, "repeats=6") &&
+          !strstr(plan, zero16) && strstr(plan, "udplen 100\n"),
+          "QUIC плечо+мусор+длина: не fake плеча + udplen");
+
+    /* Фрагментация + мусор: мусор заменяет отсутствующую фальшивку. */
+    d2k_quic_arm fr = quic_arm_of(D2K_QA_FRAG);
+    fr.frag_kind = 2;
+    fr.frag_survives = D2K_PROP_YES;
+    memset(&p, 0, sizeof p);
+    p.junk_ahead = D2K_PROP_YES;
+    CHECK(d2k_quic_compose_plan(&fr, &p, plan, sizeof plan) == 0 &&
+          strstr(plan, "ipfrag 2\n") && strstr(plan, zero16) && strstr(plan, junk_fake),
+          "QUIC фрагменты+мусор: донор ставит мусор перед фрагментами");
+
+    /* Фрагментация + длина: у донора udplen идёт ПОСЛЕ drop, а DROP в
+       zapret липкий (nfq2/desync.c verdict_aggregate) — на провод длина не
+       попадает. План обязан описывать провод, а не строку. */
+    memset(&p, 0, sizeof p);
+    p.longer = D2K_PROP_YES;
+    CHECK(d2k_quic_compose_plan(&fr, &p, plan, sizeof plan) == 0 &&
+          strstr(plan, "ipfrag 2\n") && !strstr(plan, "udplen"),
+          "QUIC фрагменты+длина: udplen после drop на провод не попадает");
+
+    /* Ничего не подтверждено / не измерено / измерению не верить. */
+    memset(&p, 0, sizeof p);
+    p.junk_ahead = D2K_PROP_NO;
+    p.longer = D2K_PROP_UNKNOWN;
+    CHECK(d2k_quic_compose_plan(&nf, &p, plan, sizeof plan) != 0,
+          "QUIC: план без единого подтверждённого приёма");
+    d2k_quic_arm fl = quic_arm_of(D2K_QA_FLAKY);
+    p.junk_ahead = D2K_PROP_YES;
+    CHECK(d2k_quic_compose_plan(&fl, &p, plan, sizeof plan) != 0,
+          "QUIC: план из прогона, которому верить нельзя");
+
+    /* Каждый собранный план обязан переводиться в TLV (тот же мост, что
+       ставит его в датапат). */
+    memset(&p, 0, sizeof p);
+    p.junk_ahead = D2K_PROP_YES; p.longer = D2K_PROP_YES; p.longer_profile = 1;
+    {
+        uint8_t tlv[8192]; size_t n = 0; char err[200];
+        int rc = d2k_quic_compose_plan(&nf, &p, plan, sizeof plan);
+        CHECK(rc == 0 && d2k_plan_text_to_tlv(plan, tlv, sizeof tlv, &n, err, sizeof err) == 0,
+              "QUIC мусор+длина: план не переводится в TLV");
+        rc = d2k_quic_compose_plan(&fr, &p, plan, sizeof plan);
+        CHECK(rc == 0 && d2k_plan_text_to_tlv(plan, tlv, sizeof tlv, &n, err, sizeof err) == 0,
+              "QUIC фрагменты+мусор: план не переводится в TLV");
+    }
+}
+
 int main(void) {
+    quic_props_compose_checks();
     /* Сохраняем боевые крючки — они же используются другими тестами при
        линковке в один процесс (см. Makefile: test_quic_arms собирает
        quicprobe.o целиком) — подмена обязана быть временной. */

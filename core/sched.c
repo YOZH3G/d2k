@@ -2680,39 +2680,64 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
            «не выразимо», и лаборатория 13.09 на коробке без состояния
            отчиталась пробелом реализации там, где на деле кончился бюджет
            развёртки TTL. */
-        if (t->arm.kind == D2K_QA_NOT_FOUND) {
-            if (t->arm.incomplete) {
-                say(s, "по %s (QUIC) поиск не завершён, кандидат не найден: %s",
-                    t->name,t->arm.reason);
-                return;
-            }
-            say(s, "по %s (QUIC) плечо не нашлось за %d %s: %s",
-                t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
-            return;
-        }
         if (t->arm.kind == D2K_QA_FLAKY) {
             say(s, "по %s (QUIC) подбору плеча верить нельзя: %s",
                 t->name, t->arm.reason);
             return;
         }
-        /* The result owns the EXACT fake measured by original askArms.
-           Rebuilding a similar ClientHello would install another hypothesis. */
+        /* compose ДОНОРА ЦЕЛИКОМ (questions.go:296-345): плечо askArms И
+           подтверждённые свойства вопросника — один план. «Мусор перед
+           Initial» и «длина» без плеча — тоже план, а не «плечо не нашлось»:
+           ответ измерен, и выбрасывать его значило бы терять находку
+           оригинала. The result owns the EXACT fake measured by original
+           askArms; rebuilding a similar ClientHello would install another
+           hypothesis. */
+        const d2k_quic_props *qp = &r->qprops;
+        int arm_found = t->arm.kind != D2K_QA_NOT_FOUND;
         char text[sizeof t->plans[0]];
-        if (t->arm.original && (t->arm.len > 0 || t->arm.frag_kind) &&
-            d2k_quic_arm_plan(&t->arm, t->arm.bytes, t->arm.len, text, sizeof text) == 0) {
+        if (d2k_quic_compose_plan(&t->arm, qp, text, sizeof text) == 0) {
             if (t->n_plans < cap) {
                 memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
                 t->n_plans++;
             }
-            say(s, "по %s (QUIC) плечо подобрано за %d %s: %s",
-                t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
-        } else {
+            if (arm_found) {
+                say(s, "по %s (QUIC) плечо подобрано за %d %s: %s",
+                    t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
+            } else {
+                say(s, "по %s (QUIC) плечо не подобрано (%s), план собран из свойств коробки",
+                    t->name, t->arm.incomplete ? "поиск не завершён" : "перебор исчерпан");
+            }
+            int fake_from_arm = arm_found && t->arm.kind != D2K_QA_FRAG;
+            if (qp->junk_ahead == D2K_PROP_YES) {
+                say(s, fake_from_arm
+                    ? "по %s (QUIC) «мусор перед Initial» взял, но у донора его вытесняет фальшивка плеча"
+                    : "по %s (QUIC) в план: «мусор перед Initial» — 16 нулевых байт ×2 перед Initial",
+                    t->name);
+            }
+            if (qp->longer == D2K_PROP_YES) {
+                if (t->arm.frag_kind) {
+                    say(s, "по %s (QUIC) «длина» взяла, но у донора udplen стоит после drop "
+                           "фрагментации и на провод не попадает — в план не входит", t->name);
+                } else {
+                    say(s, "по %s (QUIC) в план: «длина» — к Initial дописывается 100 нулевых байт%s",
+                        t->name, qp->longer_profile == 1
+                        ? " (свойство измерено PROFILE: собственным Initial донора в 1300 байт, "
+                          "не формой клиента)" : "");
+                }
+            }
+        } else if (arm_found) {
             /* Сюда доходят только НАЙДЕННЫЕ, но неполные/невыразимые плечи:
                неизвестная форма фрагментации или потерянный блоб. Это пробел
                РЕАЛИЗАЦИИ, а не свойство коробки (0007 п.3), и подменять его
                похожим запрещено. */
             say(s, "по %s (QUIC) плечо не выразимо сегодняшним языком плана: %s",
                 t->name, t->arm.reason);
+        } else if (t->arm.incomplete) {
+            say(s, "по %s (QUIC) поиск не завершён, кандидат не найден: %s",
+                t->name,t->arm.reason);
+        } else {
+            say(s, "по %s (QUIC) плечо не нашлось за %d %s: %s",
+                t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
         }
         return;
     }

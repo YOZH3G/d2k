@@ -228,6 +228,8 @@ static int stub_mark(int fd, uint32_t mark) {
 /* Подменённый подбор плеча QUIC: настоящий ходит в сеть десятками опытов, а
    тест обязан утверждать поведение планировщика, не выходя наружу. */
 static d2k_quic_arm_kind arm_kind = D2K_QA_BLOB;
+/* Свойства коробки, которые подменённый вопросник «измерил» (d2k_vres.qprops). */
+static d2k_quic_props quic_props_answer;
 static int arm_calls;
 static int arm_fragment_shape;
 
@@ -459,6 +461,7 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
     arm->kind = D2K_QA_NOT_FOUND;
     if (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX || r.verdict == D2K_V_WHOLE)
         *arm = stub_arm(ip, port, sni, NULL, trigger, mark);
+    r.qprops = quic_props_answer;
     snprintf(r.reason, sizeof r.reason, "подменённый вопросник QUIC");
     return r;
 }
@@ -6492,6 +6495,108 @@ voice_only_run:
         quic_answer = D2K_V_CLEAR;
         d2k_sched_free(s);
         d2k_catalog_free(&cNF);
+    }
+
+    /* --- ПЛЕЧА НЕТ, А «МУСОР»/«ДЛИНА» ПОДТВЕРЖДЕНЫ — ЭТО ПЛАН ------------
+     * Донор compose (questions.go:317-334) превращает JunkAheadHelps в fake
+     * 16 нулей ×2, UDPLen — в udplen increment=100, без всякого плеча
+     * askArms. Прежде планировщик строил QUIC-план только из плеча и
+     * отчитывался «плечо не нашлось» при измеренном ответе. */
+    for (int which = 0; which < 2; which++) {
+        d2k_catalog cJ;
+        memset(&cJ, 0, sizeof cJ);
+        d2k_sched *s = d2k_sched_new(&cJ, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        quic_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = (uint16_t)(40223 + which);
+        arm_kind = D2K_QA_NOT_FOUND;
+        memset(&quic_props_answer, 0, sizeof quic_props_answer);
+        if (which == 0) { quic_props_answer.junk_ahead = D2K_PROP_YES; }
+        else { quic_props_answer.longer = D2K_PROP_YES; quic_props_answer.longer_profile = 1; }
+        forget_sent();
+        const char *nm = which == 0 ? "мусор.квик" : "длина.квик";
+        d2k_ev h = ev_hello(17, ver_answer_port, nm);
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, ver_answer_port);
+        d2k_sched_event(s, &su);
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, nm) == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
+        settle(s);
+        CHECK(!said("плечо не нашлось за"),
+              "подтверждённое свойство коробки выдано за «плечо не нашлось»");
+        d2k_ev ap = ev_applied(17, ver_answer_port);
+        d2k_sched_event(s, &ap);
+        spin(s, 40);
+        CHECK(binding_of(&cJ, nm, 17) != NULL,
+              "план из свойств «мусор»/«длина» не дошёл до подтверждённой привязки");
+        int found = 0;
+        for (size_t bi = 0; bi < cJ.n_boxes; bi++) {
+            for (size_t pj = 0; pj < cJ.boxes[bi].n_plans; pj++) {
+                const char *txt = cJ.boxes[bi].plans[pj].text;
+                if (!txt || !strstr(txt, "proto udp quic")) { continue; }
+                found = 1;
+                if (which == 0) {
+                    CHECK(strstr(txt, "payload 1 00000000000000000000000000000000\n") &&
+                          strstr(txt, "repeats=2 gap_us=0 place=before"),
+                          "мусор: не 16 нулей донора ×2 перед Initial");
+                } else {
+                    CHECK(strstr(txt, "udplen 100\n") && strstr(txt, "PROFILE"),
+                          "длина: нет udplen 100 либо потерян провенанс PROFILE");
+                }
+            }
+        }
+        CHECK(found, "в каталоге нет QUIC-плана из свойств");
+        if (which == 1) {
+            CHECK(said("PROFILE"), "журнал не назвал, что «длина» измерена PROFILE");
+        }
+        memset(&quic_props_answer, 0, sizeof quic_props_answer);
+        arm_kind = D2K_QA_BLOB;
+        quic_answer = D2K_V_CLEAR;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cJ);
+    }
+    /* План из свойств — такая же гипотеза, как любой другой: ответ UDP и
+       даже завершённое рукопожатие без прикладного ответа его не
+       подтверждают. */
+    {
+        d2k_catalog cH;
+        memset(&cH, 0, sizeof cH);
+        d2k_sched *s = d2k_sched_new(&cH, sv[0], 0x2d);
+        quic_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_HANDSHAKE;
+        ver_fail_first = 0;
+        ver_answer_port = 40227;
+        arm_kind = D2K_QA_NOT_FOUND;
+        memset(&quic_props_answer, 0, sizeof quic_props_answer);
+        quic_props_answer.junk_ahead = D2K_PROP_YES;
+        forget_sent();
+        d2k_ev h = ev_hello(17, 40227, "рукопожатие.квик");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40227);
+        d2k_sched_event(s, &su);
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, "рукопожатие.квик") == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
+        settle(s);
+        d2k_ev ap = ev_applied(17, 40227);
+        d2k_sched_event(s, &ap);
+        spin(s, 40);
+        CHECK(binding_of(&cH, "рукопожатие.квик", 17) == NULL,
+              "план из свойств подтверждён без прикладного ответа QUIC");
+        memset(&quic_props_answer, 0, sizeof quic_props_answer);
+        ver_answer = D2K_VER_APPLICATION;
+        arm_kind = D2K_QA_BLOB;
+        quic_answer = D2K_V_CLEAR;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cH);
     }
 
     /* Терминальные исходы QUIC не превращаются обратно в подбор обвязкой.

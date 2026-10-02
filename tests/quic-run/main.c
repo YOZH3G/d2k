@@ -72,6 +72,27 @@ int main(int argc, char **argv) {
         }
         free(payload);free(out);return 0;
     }
+    if (argc == 6 && !strcmp(argv[1], "--compose")) {
+        /* --compose <junk 0|1> <longer 0|1> <profile 0|1> <frag 0..4>:
+           the C plan composed from the same properties as donor compose. */
+        long v[4];
+        for (int i = 0; i < 4; i++) {
+            char *e; v[i] = strtol(argv[i + 2], &e, 10);
+            if (*e || v[i] < 0 || v[i] > (i == 3 ? 4 : 1)) return 2;
+        }
+        d2k_quic_props p; memset(&p, 0, sizeof p);
+        p.junk_ahead = v[0] ? D2K_PROP_YES : D2K_PROP_NO;
+        p.longer = v[1] ? D2K_PROP_YES : D2K_PROP_NO;
+        p.longer_profile = (int8_t)v[2];
+        d2k_quic_arm a; memset(&a, 0, sizeof a);
+        a.original = 1;
+        a.kind = v[3] ? D2K_QA_FRAG : D2K_QA_NOT_FOUND;
+        if (v[3]) { a.frag_kind = (int)v[3]; a.frag_survives = D2K_PROP_YES; }
+        static char plan[8192];
+        if (d2k_quic_compose_plan(&a, &p, plan, sizeof plan) != 0) { puts("none"); return 0; }
+        fputs(plan, stdout);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--blobs")) {
         for (size_t i=0;i<5;i++) {
             size_t len; const char *name;
