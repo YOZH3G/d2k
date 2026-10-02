@@ -41,6 +41,13 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
                               uint32_t mark, int repeats,
                               uint32_t gap_us, uint32_t wait_ms,
                               const volatile sig_atomic_t *stop);
+/* Только базовый вопрос того же измерителя (задача 32): им планировщик
+ * подтверждает блокировку на рукопожатии, прежде чем пробовать свои планы. */
+d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
+                                   d2k_hello trigger, d2k_hello control,
+                                   uint32_t mark, int repeats,
+                                   uint32_t gap_us, uint32_t wait_ms,
+                                   const volatile sig_atomic_t *stop);
 
 /* Период тика. Унаследован с Go-стороны (controller.go: time.NewTicker(3 *
    time.Second)) и там же обоснован: счётчики ядра опрашиваются по часам, а не
@@ -236,6 +243,9 @@ int main(int argc, char **argv) {
      * Крючок, а не правка планировщика: тесты подменяют эту же точку, чтобы
      * утверждать развилку по транспорту, не выходя в сеть. */
     d2k_sched_tcp_hook = d2k_detect_sched_tcp;
+    /* Свои подтверждённые планы — до полного замера (задача 32, ТЗ §3.4):
+     * базовый вопрос донора отдельно, тем же измерителем. */
+    d2k_sched_tcp_base_hook = d2k_detect_sched_tcp_base;
 
     /* Знание из каталога — датапату СРАЗУ: он состояния между запусками не
        хранит, и без этого прохода каждая уже изученная цель начинала бы поиск

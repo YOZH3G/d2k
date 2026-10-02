@@ -1467,6 +1467,92 @@ static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
     confirm_transport(cat, link_fd, target, cport, 6);
 }
 
+/* ЗАДАЧА 32: базовый вопрос донора отдельно от полного прогона. base_blocked —
+   «триггер целиком не прошёл ни разу», это и есть подтверждённая блокировка на
+   рукопожатии, после которой планировщик сначала пробует свои планы. */
+static int base_calls;
+static int base_blocked_answer = 1;
+static int base_wait_until_stop;
+static d2k_vres stub_base(const char *ip, uint16_t port, d2k_hello trigger,
+                          d2k_hello control, uint32_t mark, int repeats,
+                          uint32_t gap_us, uint32_t wait_ms,
+                          const volatile sig_atomic_t *stop) {
+    (void)ip; (void)port; (void)control; (void)mark; (void)repeats;
+    (void)gap_us; (void)wait_ms;
+    base_calls++;
+    tcp_last_wire = trigger.len;
+    d2k_vres r;
+    memset(&r, 0, sizeof r);
+    if (base_wait_until_stop && base_calls == 1) {
+        /* Как настоящий: в сети, бросить может только просьба. */
+        while (!(stop && *stop)) usleep(1000);
+        r.verdict = D2K_V_INCONCLUSIVE;
+        snprintf(r.reason, sizeof r.reason, "базовый вопрос брошен");
+        return r;
+    }
+    r.owns_search = 1;
+    r.probes = 3;
+    r.base_blocked = base_blocked_answer;
+    r.verdict = base_blocked_answer ? D2K_V_INCONCLUSIVE : D2K_V_CLEAR;
+    snprintf(r.reason, sizeof r.reason, "%s", base_blocked_answer
+             ? "подменённая база: 0 из 3" : "подменённая база: 3 из 3");
+    return r;
+}
+
+/* Коробка с одним планом и одной подтверждённой привязкой — фикстура своего
+   найденного решения другой цели. split различает тексты планов. */
+static void own_box(d2k_catalog *c, const char *box, char plan_id[40], unsigned split,
+                    int successes, const char *target, uint8_t transport, uint8_t shape,
+                    uint8_t family, int64_t confirmed, int64_t recheck) {
+    char plan[256];
+    snprintf(plan, sizeof plan,
+             "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+             "proto tcp tls\nsplit payload_start +%u\norder forward\n", split);
+    /* Идентификатор — из текста, тем же FNV-1a, что plan_ident планировщика:
+       каталог роутера иначе не бывает. */
+    uint64_t h = 1469598103934665603ULL;
+    for (const char *q = plan; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ULL; }
+    snprintf(plan_id, 40, "plan-%08x", (unsigned)(h & 0xFFFFFFFFu));
+    d2k_cat_box *nb = realloc(c->boxes, (c->n_boxes + 1) * sizeof *nb);
+    CHECK(nb != NULL, "own_box: realloc");
+    if (!nb) return;
+    c->boxes = nb;
+    d2k_cat_box *b = &c->boxes[c->n_boxes++];
+    memset(b, 0, sizeof *b);
+    snprintf(b->id, sizeof b->id, "%s", box);
+    b->fp.method = D2K_FP_METHOD;
+    b->fp.n_sig = 1;
+    snprintf(b->fp.sig[0].kind, sizeof b->fp.sig[0].kind, "rst");
+    b->fp.sig[0].ttl = (uint8_t)(60 + c->n_boxes);
+    b->fp.sig[0].seen = 1;
+    b->plans = calloc(1, sizeof *b->plans);
+    b->binds = calloc(1, sizeof *b->binds);
+    CHECK(b->plans && b->binds, "own_box: calloc");
+    if (!b->plans || !b->binds) return;
+    b->n_plans = 1;
+    b->plans[0].enabled = 1;
+    b->plans[0].successes = successes;
+    snprintf(b->plans[0].id, sizeof b->plans[0].id, "%s", plan_id);
+    snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "%s", transport == 17 ? "quic" : "tls");
+    b->plans[0].text = strdup(plan);
+    b->n_binds = 1;
+    d2k_cat_binding *bd = &b->binds[0];
+    snprintf(bd->kind, sizeof bd->kind, "name");
+    snprintf(bd->target, sizeof bd->target, "%s", target);
+    snprintf(bd->plan_id, sizeof bd->plan_id, "%s", plan_id);
+    bd->level = 3; bd->enabled = 1; bd->successes = successes;
+    bd->confirmed = confirmed; bd->transport = transport; bd->family = family;
+    bd->shape = shape; bd->verified_by = D2K_VERBY_PROBE; bd->input = D2K_INPUT_CLIENT;
+    bd->recheck_since = recheck;
+}
+
+/* Сколько раз подстрока встречается в сказанном. */
+static int said_count(const char *needle) {
+    int n = 0;
+    for (const char *p = saidbuf; (p = strstr(p, needle)) != NULL; p += strlen(needle)) n++;
+    return n;
+}
+
 int main(int argc, char **argv) {
     d2k_sched_mark_fn saved_mark = d2k_sched_mark_hook;
     int voice_only = argc == 2 && strcmp(argv[1], "--voice-only") == 0;
@@ -1479,8 +1565,9 @@ int main(int argc, char **argv) {
     int retire_only = argc == 2 && strcmp(argv[1], "--retire-only") == 0;
     int recheck_only = argc == 2 && strcmp(argv[1], "--recheck-only") == 0;
     int lifecycle_only = argc == 2 && strcmp(argv[1], "--lifecycle-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only) {
-        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only]\n");
+    int own_first_only = argc == 2 && strcmp(argv[1], "--own-first-only") == 0;
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only]\n");
         return 2;
     }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
@@ -1916,6 +2003,7 @@ int main(int argc, char **argv) {
     if (retire_only) { goto retire_test; }
     if (recheck_only) { goto recheck_test; }
     if (lifecycle_only) { goto lifecycle_test; }
+    if (own_first_only) { goto own_first_test; }
     if (shape_only) { goto shape_test; }
     {
         d2k_catalog empty = {0};
@@ -9799,6 +9887,327 @@ voice_only_run:
               "наблюдение подменило источник проверки");
         d2k_sched_free(s);
         d2k_catalog_free(&cF);
+    }
+
+own_first_test:
+    /* --- ЗАДАЧА 32: свои подтверждённые планы — до полного замера ----------
+       Поле 02.10.2026: static.rutracker.cc классифицировался 338 с, хотя
+       plan-680fbe00 той же коробки был подтверждён для rutracker.org за 28 с
+       до начала и подтвердился для static.rutracker.cc через 30 с после
+       классификации. ТЗ §3.4/§5: для подходящей коробки сначала проверить
+       своё найденное решение; применимость доказывает собственный зонд.
+       Базовый вопрос донора (триггер целиком) подтвердил блокировку на
+       рукопожатии — и до продолжения классификации пробуются не больше трёх
+       своих подтверждённых планов той же формы. */
+    {
+        d2k_sched_tcp_fn saved_base = d2k_sched_tcp_base_hook;
+        d2k_sched_ver_fn saved_rx = d2k_sched_rx_ver_hook;
+        d2k_sched_ver_fn saved_gzip = d2k_sched_rx_gzip_ver_hook;
+        d2k_sched_tcp_base_hook = stub_base;
+        tcp_found_arm = 0; tcp_owns_search = 0;
+        tcp_wait_until_stop = 0; tcp_block_until_stop = 0;
+        ver_fail_first = 0; ver_unsupported = 0; ver_cloudflare_challenge = 0;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0; vol_rx_tls_unavailable = 0;
+        snapshot_enabled = 0;
+
+        /* (a) Свой план другой цели подтверждается собственным зондом раньше
+           полного замера: классификатор не зовётся, привязка ложится под
+           коробку плана с происхождением «перенесено, проверено зондом». */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-cf-own", pid, 2, 3, "rutracker.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched_rx_ver_hook = stub_rx_counting;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = vol_calls = layered_identity_calls = 0;
+            ver_answer_port = 42101;
+            d2k_ev h = ev_hello(6, 42101, "static.rutracker.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42101); d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 42101); d2k_sched_event(s, &ap);
+            spin(s, 40);
+            CHECK(base_calls == 1, "own-first: базовый вопрос донора не задан один раз");
+            CHECK(said("пробую свои подтверждённые планы до полного замера: 1"),
+                  "own-first: шаг своих планов не виден в журнале");
+            CHECK(tcp_calls == 0 && vol_calls == 0,
+                  "own-first: подтверждённый свой план не остановил полный замер");
+            CHECK(layered_identity_calls >= 1,
+                  "own-first: свой план испытан не RX-путём (identity) при закрытом рукопожатии");
+            const d2k_cat_binding *bd = binding_of(&c, "static.rutracker.own", 6);
+            CHECK(bd != NULL && !strcmp(bd->plan_id, pid),
+                  "own-first: цель не привязана к своему подтверждённому плану");
+            const char *owner = NULL;
+            for (size_t i = 0; i < c.n_boxes; i++)
+                for (size_t j = 0; j < c.boxes[i].n_binds; j++)
+                    if (!strcmp(c.boxes[i].binds[j].target, "static.rutracker.own"))
+                        owner = c.boxes[i].id;
+            CHECK(owner && !strcmp(owner, "box-cf-own"),
+                  "own-first: привязка легла не под коробку плана");
+            CHECK(bd && bd->verified_by == D2K_VERBY_PROBE && bd->input == D2K_INPUT_TRANSFER &&
+                  bd->level >= 3 && bd->shape == D2K_SHAPE_MODERN && bd->family == 4,
+                  "own-first: происхождение не «перенесено, проверено зондом»");
+            CHECK(said("ПОДТВЕРЖДЕНО собственным зондом"),
+                  "own-first: подтверждение не сказано");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_rx_ver_hook = saved_rx;
+        }
+
+        /* (b) Свой план не подтвердился: классификация продолжается как
+           прежде, её вердикт и её кандидаты — те же, что без этого шага. */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-cf-miss", pid, 2, 3, "miss-first.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 1; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42111;
+            d2k_ev h = ev_hello(6, 42111, "miss-second.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42111); d2k_sched_event(s, &su);
+            for (int i = 0; i < 40 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 200);
+                d2k_ev ap = ev_applied(6, 42111); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            CHECK(base_calls == 1 && tcp_calls == 1,
+                  "own-first: после неудачи своих планов полный замер не выполнен ровно раз");
+            CHECK(said("пробую свои подтверждённые планы до полного замера: 1") &&
+                  said("свои подтверждённые планы не подтвердились"),
+                  "own-first: неудача своих планов не видна в журнале");
+            const char *own_at = strstr(saidbuf, "пробую свои подтверждённые планы");
+            const char *verdict_at = strstr(saidbuf, "вердикт: помогает разрез");
+            CHECK(own_at && verdict_at && own_at < verdict_at,
+                  "own-first: вердикт донора не тот или пришёл раньше своих планов");
+            const d2k_cat_binding *bd = binding_of(&c, "miss-second.own", 6);
+            CHECK(bd != NULL && bd->input != D2K_INPUT_TRANSFER,
+                  "own-first: после полного замера подтверждение записано как перенос");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_app_after_tcp_search = 0;
+        }
+
+        /* (c) Не больше трёх своих планов; порядок — по числу успехов, затем
+           по свежести подтверждения. */
+        {
+            d2k_catalog c = {0};
+            char p1[40], p5[40], p3[40], p4a[40], p4b[40];
+            own_box(&c, "box-s1", p1, 11, 1, "s1.limit.own", 6, D2K_SHAPE_MODERN, 4, 1790000300, 0);
+            own_box(&c, "box-s5", p5, 15, 5, "s5.limit.own", 6, D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            own_box(&c, "box-s3", p3, 13, 3, "s3.limit.own", 6, D2K_SHAPE_MODERN, 4, 1790000400, 0);
+            own_box(&c, "box-s4a", p4a, 14, 4, "s4a.limit.own", 6, D2K_SHAPE_MODERN, 4, 1790000100, 0);
+            own_box(&c, "box-s4b", p4b, 16, 4, "s4b.limit.own", 6, D2K_SHAPE_MODERN, 4, 1790000200, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_HANDSHAKE;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5);
+            forget_sent();
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42121;
+            d2k_ev h = ev_hello(6, 42121, "new.limit-target.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42121); d2k_sched_event(s, &su);
+            for (int i = 0; i < 30 && tcp_calls == 0; i++) { skip_ahead(s, 6000); spin(s, 40); }
+            settle(s);
+            CHECK(said("пробую свои подтверждённые планы до полного замера: 3"),
+                  "own-first: своих планов взято не три");
+            CHECK(said_count("поставил план") == 3 && ver_calls == 3,
+                  "own-first: лишних зондов своих планов больше трёх");
+            CHECK(sent_first_split_index(15) == 0 && sent_first_split_index(16) == 1 &&
+                  sent_first_split_index(14) == 2,
+                  "own-first: порядок не «успехи, затем свежесть»");
+            CHECK(sent_first_split_index(13) < 0 && sent_first_split_index(11) < 0,
+                  "own-first: испытан четвёртый свой план");
+            CHECK(tcp_calls == 1, "own-first: полный замер не продолжился после трёх неудач");
+            CHECK(!binding_of(&c, "new.limit-target.own", 6),
+                  "own-first: неподтверждённый план привязан");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+
+        /* (d) Формы, транспорты и семейства не смешиваются; помеченная к
+           перепроверке и выключенная привязка — не подтверждённое знание. */
+        {
+            d2k_catalog c = {0};
+            char pl[40], pq[40], pr[40], p6[40], pd[40];
+            own_box(&c, "box-legacy", pl, 21, 9, "legacy.mix.own", 6, D2K_SHAPE_LEGACY, 4, 1790000000, 0);
+            own_box(&c, "box-quic", pq, 22, 9, "quic.mix.own", 17, D2K_LINK_SHAPE_QUIC, 4, 1790000000, 0);
+            own_box(&c, "box-recheck", pr, 23, 9, "recheck.mix.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 1790000500);
+            own_box(&c, "box-v6", p6, 24, 9, "v6.mix.own", 6, D2K_SHAPE_MODERN, 6, 1790000000, 0);
+            own_box(&c, "box-disabled", pd, 25, 9, "disabled.mix.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            c.boxes[c.n_boxes - 1].binds[0].enabled = 0;
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_HANDSHAKE;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = 0;
+            d2k_ev h = ev_hello(6, 42131, "modern.mix-target.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42131); d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(base_calls == 0 && tcp_calls == 1 && ver_calls == 0 &&
+                  !said("пробую свои подтверждённые"),
+                  "own-first: TLS 1.3-цели предложены планы другой формы/транспорта/семейства "
+                  "или помеченные к перепроверке");
+            /* Тот же каталог, клиент TLS 1.2: берётся только план формы 1.2. */
+            saidbuf[0] = '\0';
+            spin(s, 5);
+            forget_sent();
+            base_calls = tcp_calls = ver_calls = 0;
+            ver_answer_port = 42132;
+            d2k_ev sh;
+            CHECK(tls_shape_event(&sh, "legacy.mix-target.own", D2K_SHAPE_LEGACY) == 0,
+                  "own-first: снимок TLS 1.2 не собран");
+            d2k_sched_event(s, &sh);
+            d2k_ev h2 = ev_hello(6, 42132, "legacy.mix-target.own"); d2k_sched_event(s, &h2);
+            d2k_ev su2 = ev_suspect(6, 42132); d2k_sched_event(s, &su2);
+            for (int i = 0; i < 30 && tcp_calls == 0; i++) { skip_ahead(s, 6000); spin(s, 40); }
+            CHECK(base_calls == 1 && said("пробую свои подтверждённые планы до полного замера: 1"),
+                  "own-first: TLS 1.2-клиенту не предложен свой план формы 1.2");
+            CHECK(sent_first_split_index(21) == 0 && said_count("поставил план") == 1,
+                  "own-first: TLS 1.2-клиенту испытан план другой формы");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            /* QUIC: этот шаг только для TCP (QUIC — своим путём оригинала). */
+            d2k_catalog cq = {0};
+            own_box(&cq, "box-quic-only", pq, 26, 9, "quic.only.own", 17, D2K_LINK_SHAPE_QUIC, 4,
+                    1790000000, 0);
+            s = d2k_sched_new(&cq, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = 0;
+            d2k_ev hq = ev_hello(17, 42133, "quic.target.own"); d2k_sched_event(s, &hq);
+            d2k_ev sq = ev_suspect(17, 42133); d2k_sched_event(s, &sq);
+            settle(s);
+            CHECK(base_calls == 0 && !said("пробую свои подтверждённые"),
+                  "own-first: QUIC-цели задан TCP-базовый вопрос");
+            d2k_sched_free(s); d2k_catalog_free(&cq);
+        }
+
+        /* (e) База донора не показала блокировки рукопожатия — своих планов
+           не пробуем, идёт полный замер как прежде (рабочий трафик не
+           подбирается, подозрение не равно блокировке). */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-clear", pid, 31, 3, "clear-first.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_CLEAR; ver_answer = D2K_VER_APPLICATION;
+            base_blocked_answer = 0;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = 0;
+            d2k_ev h = ev_hello(6, 42141, "clear-second.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42141); d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(base_calls == 1 && tcp_calls == 1 && ver_calls == 0 &&
+                  !said("пробую свои подтверждённые"),
+                  "own-first: свои планы испытаны без блокировки на рукопожатии");
+            CHECK(said("напрямую проходит"), "own-first: вердикт CLEAR полного замера потерян");
+            CHECK(!binding_of(&c, "clear-second.own", 6), "own-first: рабочей цели привязан план");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            base_blocked_answer = 1;
+        }
+
+        /* (f) Под своим планом рукопожатие проходит, а identity-тело дважды
+           обрывается при полном gzip: план не подтверждается, полный замер
+           продолжается (многоэтапный RX-путь испытания). */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-rx", pid, 41, 3, "rx-first.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
+            base_blocked_answer = 1; layered_bad_control = 0;
+            d2k_sched_rx_ver_hook = stub_layered_identity;
+            d2k_sched_rx_gzip_ver_hook = stub_layered_gzip;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = 0;
+            layered_identity_calls = layered_gzip_calls = 0;
+            ver_answer_port = 42151;
+            d2k_ev h = ev_hello(6, 42151, "rx-second.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42151); d2k_sched_event(s, &su);
+            forget_sent();
+            int installed = 0;
+            for (int i = 0; i < 4000 && tcp_calls == 0; i++) {
+                tick_once(s);
+                int n = (int)sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+                if (n > installed) {
+                    installed = n;
+                    d2k_ev ap = ev_applied(6, 42151); d2k_sched_event(s, &ap);
+                }
+            }
+            settle(s);
+            CHECK(layered_identity_calls == 2 && layered_gzip_calls == 1,
+                  "own-first: свой план испытан не многоэтапным RX-путём");
+            CHECK(tcp_calls == 1 && !binding_of(&c, "rx-second.own", 6),
+                  "own-first: план с обрывом тела подтверждён или полный замер не пошёл");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_rx_ver_hook = saved_rx;
+            d2k_sched_rx_gzip_ver_hook = saved_gzip;
+        }
+
+        /* (g) Снимок клиента приходит, пока задан базовый вопрос заготовкой
+           (задача 31): вопрос бросается и задаётся заново байтами клиента,
+           без вердикта и без покоя; затем — свои планы. */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-snap", pid, 51, 3, "snap-first.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+            base_blocked_answer = 1; base_wait_until_stop = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = 0;
+            ver_answer_port = 42161;
+            d2k_ev h = ev_hello(6, 42161, "snap-second.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42161); d2k_sched_event(s, &su);
+            for (int i = 0; i < 400 && base_calls == 0; i++) tick_once(s);
+            d2k_ev sh;
+            CHECK(tls_shape_event(&sh, "snap-second.own", D2K_SHAPE_MODERN) == 0,
+                  "own-first: снимок не собран");
+            d2k_sched_event(s, &sh);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 42161); d2k_sched_event(s, &ap);
+            spin(s, 40);
+            CHECK(base_calls == 2 && tcp_last_wire == sh.shape_len,
+                  "own-first: брошенный ради снимка базовый вопрос не задан заново его байтами");
+            CHECK(!said("результат неубедителен") && !said("прямой замер не подтвердил"),
+                  "own-first: брошенный базовый вопрос разобран как вердикт");
+            CHECK(tcp_calls == 0 && said("пробую свои подтверждённые планы до полного замера: 1"),
+                  "own-first: после снимка свои планы не испытаны до полного замера");
+            const d2k_cat_binding *bd = binding_of(&c, "snap-second.own", 6);
+            CHECK(bd && !strcmp(bd->plan_id, pid) && bd->input == D2K_INPUT_TRANSFER,
+                  "own-first: после снимка свой план не подтвердился переносом");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            base_wait_until_stop = 0;
+        }
+
+        d2k_sched_tcp_base_hook = saved_base;
+        d2k_sched_rx_ver_hook = saved_rx;
+        d2k_sched_rx_gzip_ver_hook = saved_gzip;
+        tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+        if (own_first_only) { goto voice_only_done; }
     }
 
 voice_only_done:

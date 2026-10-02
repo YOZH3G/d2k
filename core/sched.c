@@ -135,6 +135,9 @@
 /* Сколько выведенных планов держит задача. Это же потолок, который
    d2k_compose получает под свои плечи. */
 #define SCHED_MAX_PLANS 8
+/* Не больше трёх своих подтверждённых планов до полного замера (задача 32):
+   лишних зондов — не больше трёх (плюс повторы RX-пути и местных отказов). */
+#define SCHED_OWN_FIRST_MAX 3
 
 /* Зондов на задачу. ЗАМЕРЕНО на живой линии 11.09 (accounts.youtube.com, та
    самая тяжёлая цель, из-за которой ревью 06.09 сказало «восьми мало»):
@@ -365,6 +368,7 @@ static d2k_vres classify_no_cancel(const char *ip, uint16_t port,
 }
 
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
+d2k_sched_tcp_fn  d2k_sched_tcp_base_hook = NULL;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
 d2k_sched_ver_fn  d2k_sched_rx_ver_hook = verify_rx_default;
@@ -735,6 +739,13 @@ typedef struct {
     int        group_block_proven;
     int        family_fast; /* 1 own-family verifier queue, 2 exhausted */
     int        skip_volume_once; /* resume classifier with existing baseline */
+    /* СВОИ ПОДТВЕРЖДЁННЫЕ ПЛАНЫ ДО ПОЛНОГО ЗАМЕРА (задача 32, ТЗ §3.4).
+       1 — задан только базовый вопрос донора (триггер целиком); 2 — он
+       подтвердил блокировку на рукопожатии, и испытываются не больше
+       SCHED_OWN_FIRST_MAX своих планов той же формы; 3 — шаг пройден (план
+       не подтвердился, своих нет или база не показала блокировки), дальше
+       полный прогон ровно как прежде. 0 — шага нет. */
+    int        own_first;
     /* Объёмный замер этой задачи уже выполнен (задача 30): повтор поиска
        снимком клиента не гоняет его заново, а берёт сохранённый исход —
        но ТОЛЬКО для того же входа замера. Замер зависит от версии TLS
@@ -1714,7 +1725,7 @@ static void *worker_run(void *vp) {
            мимо собственного плана. Владение отдаётся вниз — закроет тот, кто
            им распорядится. */
         int layered_rx = t->vol.rx_tls_unavailable &&
-            (t->res.verdict == D2K_V_OPAQUE || t->rx_bootstrap_only) &&
+            (t->res.verdict == D2K_V_OPAQUE || t->rx_bootstrap_only || t->own_first == 2) &&
             d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_MODERN;
         d2k_sched_ver_fn verifier = t->rx_phase == 2 ? d2k_sched_rx_gzip_ver_hook :
                                    t->transport == 6 && (t->vol.rx_cut || layered_rx)
@@ -1816,6 +1827,19 @@ static void *worker_run(void *vp) {
         t->res = result; t->res_ready = 1;
         pthread_mutex_unlock(&s->mu);
         ssize_t ign_ech = write(s->wake[1], "w", 1); (void)ign_ech;
+        return NULL;
+    }
+    if (t->own_first == 1 && t->transport == 6 && d2k_sched_tcp_base_hook) {
+        /* Задача 32: только базовый вопрос донора. Полный прогон, если он
+           понадобится, пойдёт отдельным потоком ровно как прежде. */
+        d2k_vres base = d2k_sched_tcp_base_hook(t->ip, t->port, trig, ctl,
+                                                s->measure_mark, 0, 0, 0, &t->stop);
+        pthread_mutex_lock(&s->mu);
+        t->res = base;
+        t->res_ready = 1;
+        pthread_mutex_unlock(&s->mu);
+        ssize_t ign_base = write(s->wake[1], "w", 1);
+        (void)ign_base;
         return NULL;
     }
     int volume_first = t->transport == 6 && !t->skip_volume_once &&
@@ -2805,7 +2829,7 @@ static int install_next(d2k_sched *s, task *t) {
         if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
     }
         /* Запасной перебор — последний этап оригинального инструмента. */
-        if(t->family_fast==1) return -1;
+        if(t->family_fast==1 || t->own_first == 2) return -1;
         if (refill_from_fallback(s, t) == 0) { return -1; }
     }
 }
@@ -2890,6 +2914,107 @@ static size_t known_plans(d2k_sched *s, task *t) {
         took++;
     }
     return took;
+}
+
+/* СВОИ ПОДТВЕРЖДЁННЫЕ ПЛАНЫ ТОЙ ЖЕ ФОРМЫ — ДО ПОЛНОГО ЗАМЕРА (задача 32).
+
+   ТЗ §3.4: для подходящей уже изученной коробки сначала проверить своё
+   найденное решение в новом контексте; §5: совпадение отпечатка применимость
+   не доказывает. Поэтому отбор здесь не по отпечатку, а по ПРОТОКОЛУ: план,
+   подтверждённый собственным зондом для другой цели того же транспорта,
+   семейства и формы приветствия (TLS 1.3 / TLS 1.2; ECH и QUIC — нет), из
+   ЛЮБОЙ коробки. Применимость докажет только испытание зондом на этой цели.
+
+   Не берутся: выключенный план, привязка ниже третьего уровня, выключенная
+   или помеченная к повторной проверке (задача 21) — это не подтверждённое
+   знание. При подозрении от потока, где план уже исполнялся (planned), план,
+   уже привязанный к этой цели, не предлагается снова: он и не помог.
+   Уже испытанные в этой задаче тексты (tried) не повторяются.
+
+   Порядок — по числу успехов плана, затем по свежести подтверждения; не
+   больше SCHED_OWN_FIRST_MAX. fill — записать отобранное в очередь задачи
+   (и в tried: полный замер потом не испытывает их второй раз). */
+static int own_plan_bound_here(const d2k_sched *s, const task *t, const char *plan_id) {
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        const d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t j = 0; j < b->n_binds; j++) {
+            const d2k_cat_binding *bd = &b->binds[j];
+            if (!strcmp(bd->plan_id, plan_id) && !strcmp(bd->kind, "name") &&
+                !strcmp(bd->target, t->name) && (bd->transport ? bd->transport : 6) == 6 &&
+                (bd->family ? bd->family : 4) == t->family) return 1;
+        }
+    }
+    return 0;
+}
+
+static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
+    if (!s->cat || t->transport != 6 || t->by_addr || t->ech_offer) return 0;
+    /* Та же форма, что пойдёт в привязку (verify_confirm): старый клиент —
+       старая форма, остальное — форма собственного зонда. */
+    uint8_t want = d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY
+                   ? (uint8_t)D2K_SHAPE_LEGACY : (uint8_t)SCHED_PROBE_SHAPE;
+    const d2k_cat_plan *pick[SCHED_OWN_FIRST_MAX];
+    const d2k_cat_box *owner[SCHED_OWN_FIRST_MAX];
+    int64_t fresh[SCHED_OWN_FIRST_MAX];
+    size_t n = 0;
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        const d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t i = 0; i < b->n_plans; i++) {
+            const d2k_cat_plan *p = &b->plans[i];
+            if (!p->enabled || !p->text || strcmp(p->proto, "tls") ||
+                strlen(p->text) >= sizeof t->plans[0]) continue;
+            int found = 0;
+            int64_t newest = 0;
+            for (size_t j = 0; j < b->n_binds; j++) {
+                const d2k_cat_binding *bd = &b->binds[j];
+                if (strcmp(bd->plan_id, p->id) || !bd->enabled || bd->level < 3 ||
+                    bd->recheck_since || strcmp(bd->kind, "name") ||
+                    (bd->transport ? bd->transport : 6) != 6 ||
+                    (bd->family ? bd->family : 4) != t->family ||
+                    bd->shape != want || bd->ech_origin[0]) continue;
+                if (!found || bd->confirmed > newest) newest = bd->confirmed;
+                found = 1;
+            }
+            if (!found) continue;
+            if (t->trigger_planned == D2K_LINK_PLANNED_YES && own_plan_bound_here(s, t, p->id))
+                continue;
+            uint32_t h = fnv1a(p->text);
+            int tried = 0;
+            for (size_t k = 0; k < t->n_tried && !tried; k++) tried = t->tried[k] == h;
+            if (tried) continue;
+            /* Тот же текст в другой коробке — тот же план: остаётся лучший. */
+            size_t dup = n;
+            for (size_t k = 0; k < n; k++) if (!strcmp(pick[k]->text, p->text)) dup = k;
+            int better_than_dup = dup < n && (p->successes > pick[dup]->successes ||
+                (p->successes == pick[dup]->successes && newest > fresh[dup]));
+            if (dup < n && !better_than_dup) continue;
+            if (dup < n) {
+                for (size_t k = dup; k + 1 < n; k++) {
+                    pick[k] = pick[k + 1]; owner[k] = owner[k + 1]; fresh[k] = fresh[k + 1];
+                }
+                n--;
+            }
+            size_t at = n;
+            while (at > 0 && (p->successes > pick[at - 1]->successes ||
+                              (p->successes == pick[at - 1]->successes && newest > fresh[at - 1])))
+                at--;
+            if (at >= SCHED_OWN_FIRST_MAX) continue;
+            if (n == SCHED_OWN_FIRST_MAX) n--;
+            for (size_t k = n; k > at; k--) {
+                pick[k] = pick[k - 1]; owner[k] = owner[k - 1]; fresh[k] = fresh[k - 1];
+            }
+            pick[at] = p; owner[at] = b; fresh[at] = newest;
+            n++;
+        }
+    }
+    if (!fill) return n;
+    for (size_t k = 0; k < n; k++) {
+        snprintf(t->plans[k], sizeof t->plans[k], "%s", pick[k]->text);
+        snprintf(t->plan_boxes[k], sizeof t->plan_boxes[k], "%s", owner[k]->id);
+        if (t->n_tried < sizeof t->tried / sizeof t->tried[0])
+            t->tried[t->n_tried++] = fnv1a(pick[k]->text);
+    }
+    return n;
 }
 
 /* A suspicion is only a trigger to measure. Reuse or synthesis is allowed
@@ -4224,6 +4349,13 @@ static int start_search(d2k_sched *s, task *t) {
             t->name);
         return 1;
     }
+    /* Задача 32: есть свои подтверждённые планы той же формы — сперва только
+       базовый вопрос донора. Шаг один на задачу: пройденный (3) не
+       повторяется перезапуском поиска; брошенный ради снимка (1) задаётся
+       заново его байтами. Семейный путь и база другого семейства — свои. */
+    if (t->own_first <= 1)
+        t->own_first = d2k_sched_tcp_base_hook && !t->family_reuse &&
+                       own_first_plans(s, t, 0) > 0 ? 1 : 0;
     t->researched = 1;
     t->state = T_ASKING;
     t->asked_shape = t->ech_offer ? D2K_LINK_SHAPE_ECH_TCP :
@@ -4235,6 +4367,9 @@ static int start_search(d2k_sched *s, task *t) {
     say(s, "по %s (%s) начинаю поиск: %s:%u, приветствие %zu байт%s",
         t->name, t->transport == 17 ? "QUIC" : "TCP", t->ip, (unsigned)t->port,
         t->trig_len, t->shape_armed ? ", снимок заказан" : "");
+    if (t->own_first == 1)
+        say(s, "по %s сначала базовый вопрос донора: если рукопожатие режется, "
+               "проверю свои подтверждённые планы до полного замера", t->name);
     return 1;
 }
 
@@ -5170,6 +5305,7 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     t->ctrl_len = 0;   /* контроль соберётся из новых байт */
     t->researched = 0;
     t->family_fast = 0;
+    t->own_first = 0;
     t->n_plans = 0;
     t->next_plan = 0;
     /* ПЕРЕМЕР — НОВЫЙ ПОИСК, И БЮДЖЕТ У НЕГО СВОЙ (задача 24). Прежде задача
@@ -5472,7 +5608,11 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     /* ЧЕМ ГОВОРИЛ ЗАМЕР, ИЗ КОТОРОГО ЭТОТ ПЛАН ВЫВЕДЕН. Не то же, что форма:
        форма у заготовки и у снимка может совпадать, а байты — нет, и коробке
        никто не запрещал смотреть на содержимое (§6). */
-    uint8_t rec_input = t->trig_snapped ? (uint8_t)D2K_INPUT_CLIENT
+    /* Свой план другой цели, проверенный здесь зондом до полного замера
+       (задача 32), выведен НЕ замером этой цели: его вход — перенос. */
+    int transferred = t->own_first == 2;
+    uint8_t rec_input = transferred ? (uint8_t)D2K_INPUT_TRANSFER :
+                        t->trig_snapped ? (uint8_t)D2K_INPUT_CLIENT
                                         : (uint8_t)D2K_INPUT_PROFILE;
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
@@ -5548,7 +5688,11 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        настоящего клиента приём может быть добыт только на ЗАМЕРЕ, и если
        замер шёл заготовкой холодного старта, то байты клиента не проверял
        никто. Это записано в привязке (input) и сказано здесь. */
-    if (!t->trig_snapped) {
+    if (transferred) {
+        say(s, "по %s свой план %s коробки %s перенесён и подтверждён собственным зондом "
+               "до полного замера — классификацию не продолжаю", t->name, plan_id, box_id);
+        t->own_first = 3;
+    } else if (!t->trig_snapped) {
         say(s, "по %s замер шёл ЗАГОТОВКОЙ холодного старта, а не снятыми байтами "
                "клиента: форма та же, содержимое — нет. Приём подтверждён, но "
                "байтами клиента его не проверял никто — повторю поиск, как "
@@ -5579,7 +5723,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        уже прошёл, а крючок наблюдения (on_shape) ловит только снимки,
        пришедшие ПОСЛЕ подтверждения. Без этой проверки привязка легла бы
        заготовкой при настоящих байтах на руках. */
-    if (!t->trig_snapped && t->transport == 6 && s->tcp_shape_len[t->family == 6] > 0 &&
+    if (!transferred && !t->trig_snapped && t->transport == 6 &&
+        s->tcp_shape_len[t->family == 6] > 0 &&
         strcmp(s->tcp_shape_name[t->family == 6], t->name) == 0) {
         remeasure_snapped(s, t, s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]);
     }
@@ -6132,6 +6277,42 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
     }
 }
 
+/* ШАГ СВОИХ ПЛАНОВ ПРОЙДЕН — ПОЛНЫЙ ЗАМЕР КАК ПРЕЖДЕ (задача 32).
+   Испытание своих планов не оставляет следов в поиске: пробная запись снята
+   точно, очередь и бюджет зондов — с нуля, коробка не назначена, объём и
+   ответ базы забыты (база в вердикт не идёт: полный прогон задаст её заново).
+   Снимок клиента, пришедший во время испытания, берётся сразу — иначе
+   прогон пошёл бы заготовкой и перезапустился бы после конца. */
+static void own_first_continue(d2k_sched *s, task *t) {
+    trial_retire(s, t);
+    ver_close(t);
+    t->own_first = 3;
+    t->n_plans = t->n_known = t->next_plan = 0;
+    t->exec_refused = t->exec_probed = 0;
+    t->cached_measure_valid = 0;
+    t->box_id[0] = '\0';
+    t->rx_phase = 0;
+    t->probes = 0;
+    memset(&t->vol, 0, sizeof t->vol);
+    memset(&t->res, 0, sizeof t->res);
+    int f = t->family == 6;
+    if (t->transport == 6 && !t->trig_snapped && !t->reasked && s->tcp_shape_len[f] > 0 &&
+        s->tcp_shape_len[f] <= sizeof t->trig && !strcmp(s->tcp_shape_name[f], t->name)) {
+        memcpy(t->trig, s->tcp_shape[f], s->tcp_shape_len[f]);
+        t->trig_len = s->tcp_shape_len[f];
+        t->trig_snapped = 1;
+        t->reasked = 1;
+        t->ctrl_len = 0;
+        say(s, "по %s снимок клиента пришёл во время проверки своих планов — "
+               "полный замер иду его байтами: %zu", t->name, t->trig_len);
+    }
+    char name[sizeof t->name];
+    snprintf(name, sizeof name, "%s", t->name);
+    if (!start_search(s, t))
+        say(s, "по %s полный замер не запустился — задача снята, следующее "
+               "подозрение начнёт поиск заново", name);
+}
+
 /* A working TLS bootstrap is not necessarily a complete bypass: identity
  * may still be truncated while gzip succeeds. Each follow-up reserves a new
  * socket and reinstalls only this candidate on that socket's source port. */
@@ -6182,7 +6363,7 @@ static int rx_saved_bootstrap(d2k_sched *s, task *t, int allow_other_family) {
 static int layered_rx_result(d2k_sched *s, task *t, int64_t now_ms) {
     int eligible = t->transport == 6 && !t->vol.rx_cut &&
         t->vol.rx_tls_unavailable &&
-        (t->res.verdict == D2K_V_OPAQUE || t->rx_bootstrap_only) &&
+        (t->res.verdict == D2K_V_OPAQUE || t->rx_bootstrap_only || t->own_first == 2) &&
         d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_MODERN;
     if (!eligible || !t->next_plan) return 0;
     d2k_ev own = {0};
@@ -6204,7 +6385,14 @@ static int layered_rx_result(d2k_sched *s, task *t, int64_t now_ms) {
             t->ver.http_outcome != D2K_HTTP_BLOCKED && t->ver.http_outcome != D2K_HTTP_LEGAL_DENIAL &&
             d2k_volume_rx_evidence(&t->rx_identity[0], &t->rx_identity[1], &t->ver, &t->vol);
         ver_close(t); trial_retire(s, t); t->rx_phase = 0;
-        if (proven) {
+        if (proven && t->own_first == 2) {
+            /* Свой план снял ранний блок, но тело под ним режется: перенос не
+               подтверждён. Остаточный RX-поиск выводится из вердикта донора,
+               а его ещё нет — решит полный замер. */
+            say(s, "по %s под своим планом рукопожатие проходит, но identity дважды "
+                   "оборвался около %d КБ при полном gzip — перенос не подтверждаю",
+                t->name, t->vol.rx_at_kb);
+        } else if (proven) {
             t->rx_bootstrap_only = 0;
             say(s, "по %s кандидат снял ранний TLS-блок, но identity дважды "
                    "оборвался около %d КБ при полном gzip; ищу остаточный RX-обход",
@@ -6592,6 +6780,46 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                    заготовкой выброшен выше сознательно — он не тех байт. */
                 say(s, "по %s повтор поиска снимком не запустился — задача снята, "
                        "следующее подозрение начнёт поиск заново", restart_name);
+                moved++;
+                continue;
+            }
+            /* БАЗОВЫЙ ВОПРОС ДОНОРА ОТВЕТИЛ (задача 32). Блокировка на
+               рукопожатии подтверждена — сначала свои подтверждённые планы
+               той же формы, на изолированных портах собственным зондом с
+               полным ответом. Иначе — полный прогон как прежде; ответ базы в
+               его вердикт не идёт. */
+            if (t->own_first == 1) {
+                t->own_first = 3;
+                size_t own = r.base_blocked ? own_first_plans(s, t, 1) : 0;
+                if (own > 0) {
+                    t->own_first = 2;
+                    t->res = r;
+                    /* Прямое рукопожатие не прошло: под кандидатом тело
+                       проверяется identity-путём, как после OPAQUE. */
+                    memset(&t->vol, 0, sizeof t->vol);
+                    t->vol.rx_tls_unavailable = 1;
+                    t->n_plans = t->n_known = own;
+                    t->next_plan = 0;
+                    t->cached_measure_valid = 0;
+                    t->exec_refused = t->exec_probed = 0;
+                    t->rx_phase = 0;
+                    t->state = T_PLANNING;
+                    say(s, "по %s базовый вопрос донора: рукопожатие не проходит (%s) — "
+                           "пробую свои подтверждённые планы до полного замера: %zu",
+                        t->name, r.reason, own);
+                    moved++;
+                    continue;
+                }
+                if (r.base_blocked) {
+                    say(s, "по %s базовый вопрос донора: рукопожатие не проходит (%s), "
+                           "своих подтверждённых планов этой формы нет — продолжаю полный замер",
+                        t->name, r.reason);
+                } else {
+                    say(s, "по %s базовый вопрос донора не подтвердил блокировку рукопожатия "
+                           "(%s) — свои планы не пробую, продолжаю полный замер",
+                        t->name, r.reason);
+                }
+                own_first_continue(s, t);
                 moved++;
                 continue;
             }
@@ -7143,6 +7371,15 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 continue;
             }
             if (inst != 0) {
+                if (t->own_first == 2) {
+                    /* Свои планы кончились (или все отвергнуты исполнителем —
+                       это местный отказ, не повод хоронить поиск). */
+                    say(s, "по %s свои подтверждённые планы не подтвердились — "
+                           "продолжаю полный замер донора", t->name);
+                    own_first_continue(s, t);
+                    moved++;
+                    continue;
+                }
                 if (t->exec_refused > 0 && t->exec_probed == 0) {
                     /* Задача 19: ни один кандидат не дошёл до провода —
                        все отвергнуты исполнителем. Это не блокировка и не

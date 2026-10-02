@@ -127,6 +127,81 @@ static d2k_verdict map_verdict(d2k_verdict_t v)
     }
 }
 
+/* Вход измерителя из аргументов крючка — общий у полного прогона и у его
+ * базового вопроса. 0 — готово; -1 — мерить нечем, out заполнен. */
+static int bridge_input(const char *ip, uint16_t port,
+                        d2k_hello trigger, d2k_hello control,
+                        uint32_t mark, int repeats,
+                        uint32_t gap_us, uint32_t wait_ms,
+                        const volatile sig_atomic_t *stop,
+                        d2k_trigger *trp, d2k_opts *optp, char addr[96], d2k_vres *outp)
+{
+    size_t off = 0, len = 0;
+
+    memset(outp, 0, sizeof(*outp));
+    /* Provider capability, including early input errors: failure to start
+     * the original tool must not authorize a different legacy search. */
+    outp->owns_search = 1;
+    memset(optp, 0, sizeof(*optp));
+    memset(trp, 0, sizeof(*trp));
+
+    if (!ip || !trigger.bytes || trigger.len < 2 || trigger.len > D2K_TRIGGER_MAX) {
+        outp->verdict = D2K_V_FLAKY;
+        snprintf(outp->reason, sizeof(outp->reason),
+                 "мерить нечем: снятого приветствия нет или оно не по размеру");
+        return -1;
+    }
+
+    /* ТРИГГЕР — СНЯТОЕ ПРИВЕТСТВИЕ, ПОБАЙТНО. Ни пересборки, ни подстановки
+     * имени: форма приветствия и есть измерительный инструмент, и самодельная
+     * мерила бы другую коробку, чем видит клиент (см. d2k_meas.h). */
+    memcpy(trp->payload, trigger.bytes, trigger.len);
+    trp->len = trigger.len;
+    trp->accept = D2K_ACCEPT_SERVERHELLO;
+    if (d2k_hello_sni(trp->payload, trp->len, &off, &len) == 0) {
+        trp->sni_off = (int)off;
+        trp->sni_len = (int)len;
+        /* Имя триггера = настоящее SNI клиента (как у донора: "tls:"+sni):
+         * по нему проверяется ОТВЕТНОЕ направление. IP вместо имени дал бы
+         * ложное «чисто». Без SNI имени нет — ответ не проверяется. */
+        if (len > 0 && len <= 253 && len <= sizeof(trp->name) - 5 && !memchr(trp->payload + off, 0, len)) {
+            memcpy(trp->name, "tls:", 4);
+            memcpy(trp->name + 4, trp->payload + off, len);
+            trp->name[4 + len] = '\0';
+        }
+    }
+
+    if (control.bytes && control.len >= 2 && control.len <= D2K_TRIGGER_MAX) {
+        memcpy(optp->control.payload, control.bytes, control.len);
+        optp->control.len = control.len;
+        optp->control.accept = D2K_ACCEPT_TLSRECORD;
+        snprintf(optp->control.name, sizeof(optp->control.name), "control");
+        /* Scheduler builds this automatically (currently disk.rzd.ru).
+         * Supplying bytes does NOT promise that this target serves that
+         * name. Match the original's automatic ControlTrigger path: a
+         * silent unvouched control cannot prove an address block. The
+         * scheduler hook carries no explicit operator-vouch argument. */
+        optp->control_vouched = 0;
+    }
+
+    optp->repeats = repeats;
+    optp->write_gap_ms = gap_us > 0 ? (int)(gap_us / 1000u) : 0;
+    optp->timeout_ms = wait_ms > 0 ? (int)wait_ms : 0;
+    /* МЕТКА — ОТ ВЫЗЫВАЮЩЕГО, а не зашитая. У z2k мимо очереди пропускает
+     * 0x40000000, у d2k — своя (её задаёт --mark датапату, у владельца 0x2d).
+     * Зашитая константа означала бы, что зонд идёт ЧЕРЕЗ наш же обход и мерит
+     * его, а не коробку провайдера. */
+    optp->mark = mark;
+    optp->cancel.fn = stop_asked;
+    /* const снимается намеренно и только для передачи: обратно указатель
+     * читается через const-указатель внутри stop_asked, писать по нему
+     * измеритель не может и не пытается. */
+    optp->cancel.ctx = (void *)(uintptr_t)stop;
+
+    snprintf(addr, 96, strchr(ip, ':') ? "[%s]:%u" : "%s:%u", ip, (unsigned)port);
+    return 0;
+}
+
 /* Крючок планировщика. Сигнатура — d2k_sched_tcp_fn, менять её нельзя. */
 d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
                               d2k_hello trigger, d2k_hello control,
@@ -139,69 +214,11 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
     d2k_trigger tr;
     d2k_result res;
     char addr[96];
-    size_t off = 0, len = 0;
 
-    memset(&out, 0, sizeof(out));
-    /* Provider capability, including early input errors: failure to start
-     * the original tool must not authorize a different legacy search. */
-    out.owns_search = 1;
-    memset(&opt, 0, sizeof(opt));
-    memset(&tr, 0, sizeof(tr));
-
-    if (!ip || !trigger.bytes || trigger.len < 2 || trigger.len > D2K_TRIGGER_MAX) {
-        out.verdict = D2K_V_FLAKY;
-        snprintf(out.reason, sizeof(out.reason),
-                 "мерить нечем: снятого приветствия нет или оно не по размеру");
+    if (bridge_input(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop,
+                     &tr, &opt, addr, &out) != 0) {
         return out;
     }
-
-    /* ТРИГГЕР — СНЯТОЕ ПРИВЕТСТВИЕ, ПОБАЙТНО. Ни пересборки, ни подстановки
-     * имени: форма приветствия и есть измерительный инструмент, и самодельная
-     * мерила бы другую коробку, чем видит клиент (см. d2k_meas.h). */
-    memcpy(tr.payload, trigger.bytes, trigger.len);
-    tr.len = trigger.len;
-    tr.accept = D2K_ACCEPT_SERVERHELLO;
-    if (d2k_hello_sni(tr.payload, tr.len, &off, &len) == 0) {
-        tr.sni_off = (int)off;
-        tr.sni_len = (int)len;
-        /* Имя триггера = настоящее SNI клиента (как у донора: "tls:"+sni):
-         * по нему проверяется ОТВЕТНОЕ направление. IP вместо имени дал бы
-         * ложное «чисто». Без SNI имени нет — ответ не проверяется. */
-        if (len > 0 && len <= 253 && len <= sizeof(tr.name) - 5 && !memchr(tr.payload + off, 0, len)) {
-            memcpy(tr.name, "tls:", 4);
-            memcpy(tr.name + 4, tr.payload + off, len);
-            tr.name[4 + len] = '\0';
-        }
-    }
-
-    if (control.bytes && control.len >= 2 && control.len <= D2K_TRIGGER_MAX) {
-        memcpy(opt.control.payload, control.bytes, control.len);
-        opt.control.len = control.len;
-        opt.control.accept = D2K_ACCEPT_TLSRECORD;
-        snprintf(opt.control.name, sizeof(opt.control.name), "control");
-        /* Scheduler builds this automatically (currently disk.rzd.ru).
-         * Supplying bytes does NOT promise that this target serves that
-         * name. Match the original's automatic ControlTrigger path: a
-         * silent unvouched control cannot prove an address block. The
-         * scheduler hook carries no explicit operator-vouch argument. */
-        opt.control_vouched = 0;
-    }
-
-    opt.repeats = repeats;
-    opt.write_gap_ms = gap_us > 0 ? (int)(gap_us / 1000u) : 0;
-    opt.timeout_ms = wait_ms > 0 ? (int)wait_ms : 0;
-    /* МЕТКА — ОТ ВЫЗЫВАЮЩЕГО, а не зашитая. У z2k мимо очереди пропускает
-     * 0x40000000, у d2k — своя (её задаёт --mark датапату, у владельца 0x2d).
-     * Зашитая константа означала бы, что зонд идёт ЧЕРЕЗ наш же обход и мерит
-     * его, а не коробку провайдера. */
-    opt.mark = mark;
-    opt.cancel.fn = stop_asked;
-    /* const снимается намеренно и только для передачи: обратно указатель
-     * читается через const-указатель внутри stop_asked, писать по нему
-     * измеритель не может и не пытается. */
-    opt.cancel.ctx = (void *)(uintptr_t)stop;
-
-    snprintf(addr, sizeof(addr), strchr(ip, ':') ? "[%s]:%u" : "%s:%u", ip, (unsigned)port);
     d2k_classify_run(addr, &tr, &opt, &res);
 
     if (res.stopped) {
@@ -279,6 +296,94 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
             snprintf(out.reason + n, sizeof(out.reason) - n,
                      "; приём «%s» сработал, но планом не задаётся: %s", res.hit.name, why);
         }
+    }
+    return out;
+}
+
+/* БАЗОВЫЙ ВОПРОС ДОНОРА ОТДЕЛЬНО (задача 32 d2k, d2k_sched_tcp_base_hook).
+ *
+ * Не новый зонд «по мотивам», а тот же d2k_classify_run, остановленный на
+ * границе сразу после первого вопроса: триггер целиком, одной записью, теми
+ * же повторами, тем же критерием прохода. Наблюдение "whole" отдаётся
+ * on_obs, и с этой минуты просьба бросить взведена — следующий вопрос
+ * дерева бросается до первого зонда. Ответное направление не спрашивается
+ * (имя триггера пусто), сырой слой не поднимается: это вопросы полного
+ * прогона, и он задаст их сам, если до него дойдёт.
+ *
+ * base_blocked — ни одного прохода из всех повторов и ни одной ошибки
+ * транспорта: блокировка на рукопожатии подтверждена. Это не вердикт дерева
+ * и в него не идёт: полный прогон потом спрашивает базу заново. */
+typedef struct {
+    const volatile sig_atomic_t *task_stop;
+    int base_done;
+} base_ctx;
+
+static void base_seen(void *ctx, const d2k_obs *o)
+{
+    if (strcmp(o->probe, "whole") == 0) { ((base_ctx *)ctx)->base_done = 1; }
+}
+
+static int base_stop(void *ctx)
+{
+    const base_ctx *b = ctx;
+    return b->base_done || stop_asked((void *)(uintptr_t)b->task_stop);
+}
+
+d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
+                                   d2k_hello trigger, d2k_hello control,
+                                   uint32_t mark, int repeats,
+                                   uint32_t gap_us, uint32_t wait_ms,
+                                   const volatile sig_atomic_t *stop)
+{
+    d2k_vres out;
+    d2k_opts opt;
+    d2k_trigger tr;
+    d2k_result res;
+    char addr[96];
+    base_ctx bc;
+
+    if (bridge_input(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop,
+                     &tr, &opt, addr, &out) != 0) {
+        return out;
+    }
+    tr.name[0] = '\0';
+    opt.no_raw = 1;
+    bc.task_stop = stop;
+    bc.base_done = 0;
+    opt.cancel.fn = base_stop;
+    opt.cancel.ctx = &bc;
+    opt.on_obs = base_seen;
+    opt.on_obs_ctx = &bc;
+    d2k_classify_run(addr, &tr, &opt, &res);
+
+    const d2k_obs *b = res.ntrace > 0 && strcmp(res.trace[0].probe, "whole") == 0
+                       ? &res.trace[0] : NULL;
+    int asked = b ? b->pass + b->fail : 0;
+    out.probes = asked;
+    if (!b) {
+        /* До зонда не дошло: цель не разобрана (вердикт дерева тот же). */
+        out.verdict = map_verdict(res.verdict);
+        snprintf(out.reason, sizeof(out.reason), "%.300s", res.reason);
+    } else if (asked < res.repeats || res.repeats <= 0) {
+        out.verdict = D2K_V_INCONCLUSIVE;
+        snprintf(out.reason, sizeof(out.reason),
+                 "базовый вопрос брошен по требованию остановки — о цели не сказано ничего");
+    } else if (b->err[0] && b->pass == 0) {
+        out.verdict = D2K_V_UNREACHABLE;
+        snprintf(out.reason, sizeof(out.reason), "нет TCP до цели: %.300s", b->err);
+    } else if (b->pass == res.repeats) {
+        out.verdict = D2K_V_CLEAR;
+        snprintf(out.reason, sizeof(out.reason),
+                 "база проходит: %d из %d (только базовый вопрос)", b->pass, res.repeats);
+    } else if (b->pass > 0) {
+        out.verdict = D2K_V_FLAKY;
+        snprintf(out.reason, sizeof(out.reason),
+                 "база не воспроизводится: %d прошло из %d", b->pass, res.repeats);
+    } else {
+        out.verdict = D2K_V_INCONCLUSIVE;
+        out.base_blocked = 1;
+        snprintf(out.reason, sizeof(out.reason),
+                 "база не проходит: 0 из %d — триггер целиком режется", res.repeats);
     }
     return out;
 }

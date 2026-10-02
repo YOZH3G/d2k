@@ -8,6 +8,9 @@
 
 d2k_vres d2k_detect_sched_tcp(const char *, uint16_t, d2k_hello, d2k_hello,
                              uint32_t, int, uint32_t, uint32_t);
+d2k_vres d2k_detect_sched_tcp_base(const char *, uint16_t, d2k_hello, d2k_hello,
+                                  uint32_t, int, uint32_t, uint32_t,
+                                  const volatile sig_atomic_t *);
 int d2k_arm_from_poison(const d2k_poison *, d2k_arm *, char *, size_t);
 
 static d2k_opts seen;
@@ -15,6 +18,7 @@ static d2k_result answer;
 static int failures;
 static char seen_name[D2K_TRIGGER_NAME_MAX];
 static int rule_failed;
+static int base_stop_before, base_stop_other, base_stop_after;
 
 /* raw.o is not linked here: the adapter only asks whether the kernel-RST
  * suppression rule ever failed in this process. */
@@ -31,6 +35,38 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     snprintf(seen_name, sizeof seen_name, "%s", tr->name);
     seen = *opt;
     *res = answer;
+    /* Базовый вопрос (задача 32): остановка взводится ровно наблюдением
+       "whole" — до него дерево не бросается, после — бросается. */
+    if (opt->on_obs) {
+        d2k_obs other, whole;
+        memset(&other, 0, sizeof other); memset(&whole, 0, sizeof whole);
+        snprintf(other.probe, sizeof other.probe, "split");
+        snprintf(whole.probe, sizeof whole.probe, "whole");
+        base_stop_before = opt->cancel.fn(opt->cancel.ctx);
+        opt->on_obs(opt->on_obs_ctx, &other);
+        base_stop_other = opt->cancel.fn(opt->cancel.ctx);
+        opt->on_obs(opt->on_obs_ctx, &whole);
+        base_stop_after = opt->cancel.fn(opt->cancel.ctx);
+    }
+}
+
+static size_t build_hello(uint8_t *o, const char *sni);
+
+static d2k_vres measure_base(int pass, int fail, const char *err)
+{
+    uint8_t hello[300], ctl[] = {0x16, 0x03, 0x01};
+    d2k_hello tr = {hello, build_hello(hello, "base.example")}, control = {ctl, sizeof ctl};
+    memset(&answer, 0, sizeof answer);
+    answer.verdict = D2K_DV_PREFIX; /* дальше дерево не идёт — вердикт не берётся */
+    answer.repeats = 2;
+    answer.ntrace = 2;
+    snprintf(answer.trace[0].probe, sizeof answer.trace[0].probe, "whole");
+    answer.trace[0].pass = pass;
+    answer.trace[0].fail = fail;
+    snprintf(answer.trace[0].err, sizeof answer.trace[0].err, "%s", err);
+    snprintf(answer.trace[1].probe, sizeof answer.trace[1].probe, "split");
+    base_stop_before = base_stop_other = base_stop_after = -1;
+    return d2k_detect_sched_tcp_base("192.0.2.1", 443, tr, control, 0x2d, 2, 12000, 321, NULL);
 }
 
 static d2k_vres measure(void)
@@ -182,6 +218,24 @@ int main(void)
     r = measure();
     CHECK(r.have_arm && r.owns_search); /* a hit is a finished search */
     rule_failed = 0;
+    memset(&answer, 0, sizeof answer);
+
+    /* Базовый вопрос донора отдельно (задача 32): тот же измеритель, та же
+       метка/повторы/контроль, но без ответного направления и сырого слоя;
+       блокировка — ни одного прохода и ни одной ошибки транспорта. */
+    r = measure_base(0, 2, "");
+    CHECK(r.base_blocked && r.verdict == D2K_V_INCONCLUSIVE && r.probes == 2);
+    CHECK(seen_name[0] == '\0' && seen.no_raw == 1);
+    CHECK(seen.mark == 0x2d && seen.repeats == 2 && seen.control.len == 3);
+    CHECK(base_stop_before == 0 && base_stop_other == 0 && base_stop_after == 1);
+    r = measure_base(2, 0, "");
+    CHECK(!r.base_blocked && r.verdict == D2K_V_CLEAR);
+    r = measure_base(1, 1, "");
+    CHECK(!r.base_blocked && r.verdict == D2K_V_FLAKY);
+    r = measure_base(0, 2, "connect: refused");
+    CHECK(!r.base_blocked && r.verdict == D2K_V_UNREACHABLE);
+    r = measure_base(0, 1, ""); /* брошен на втором повторе */
+    CHECK(!r.base_blocked && r.verdict == D2K_V_INCONCLUSIVE);
     memset(&answer, 0, sizeof answer);
 
     memset(&p, 0, sizeof p);
