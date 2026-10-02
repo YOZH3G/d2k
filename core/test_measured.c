@@ -425,10 +425,56 @@ static void rx_volume_fake_sni_split(void) {
     d2k_plan_free(p);
 }
 
+
+/* Задача 37, I2: предел отправки. Сверка с НАСТОЯЩИМ шлюзом датапата
+ * (d2k_plan_max_emit, ctlsrv.c): плечо строится при пределе тогда и только
+ * тогда, когда его самая длинная посылка в предел помещается. Отказ — только
+ * там, где датапат иначе ответил бы BAD_PLAN; урезания байт нет вовсе. */
+static size_t measured_max_emit(const d2k_arm *a, const d2k_arm_input *in) {
+    char text[8192], err[200];
+    uint8_t tlv[D2K_PLAN_TLV_MAX];
+    size_t tlv_len = 0, m = 0;
+    d2k_plan *p = NULL;
+    if (d2k_arm_plan_measured(a, in, text, sizeof text) != 0 ||
+        d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tlv_len, err, sizeof err) != 0 ||
+        d2k_plan_load(tlv, tlv_len, &p, err, sizeof err) != 0) { return 0; }
+    m = d2k_plan_max_emit(p);
+    d2k_plan_free(p);
+    return m;
+}
+
+static void send_limit_cases(void) {
+    static const size_t caps[] = { 1500, 1492, 1452, 1440, 1400, 600 };
+    d2k_arm arms[6];
+    memset(arms, 0, sizeof arms);
+    arms[0].seqovl_hello = 1; arms[0].decoy_hello = 1;              /* seqovl-hello */
+    arms[1].seqovl_hello = 1; arms[1].decoy_hello = 1; arms[1].disorder = 1;
+    arms[2].badsum = 1; arms[2].repeats = 7;                        /* фальшивка 2n */
+    arms[3].badsum = 1; arms[3].tcpts = 1; arms[3].repeats = 2;
+    arms[4].disorder = 1;                                           /* без посылок плана */
+    arms[5].seqovl = 336;
+    d2k_arm_input in;
+    memset(&in, 0, sizeof in);
+    in.trigger_len = 1558; in.sni_off = 500; in.sni_len = 11; in.decoy_len = 1534;
+    for (size_t i = 0; i < in.decoy_len; i++) { in.decoy[i] = (uint8_t)(i * 7 + 1); }
+    case_name = "send-limit";
+    for (size_t ai = 0; ai < sizeof arms / sizeof arms[0]; ai++) {
+        size_t need = measured_max_emit(&arms[ai], &in);
+        char text[8192];
+        CHECK(d2k_arm_plan_measured_cap(&arms[ai], &in, 1500, text, sizeof text) == 0);
+        for (size_t ci = 0; ci < sizeof caps / sizeof caps[0]; ci++) {
+            int rc = d2k_arm_plan_measured_cap(&arms[ai], &in, caps[ci], text, sizeof text);
+            if (rc == 0) { CHECK(need <= caps[ci]); }
+            else { CHECK(need > caps[ci]); }
+        }
+    }
+}
+
 int main(void) {
     malformed();
     fallback_disorder_pos2();
     rx_volume_fake_sni_split();
+    send_limit_cases();
     d2k_arm a = {0};
     a.seqovl = 1; run_case("seqovl-1", a, 289, 0);
     a.seqovl = 0; a.badsum = 1; a.repeats = 2; a.gap_ms = 20;

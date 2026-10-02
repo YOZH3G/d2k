@@ -376,6 +376,7 @@ d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
 d2k_sched_ver_fn  d2k_sched_rx_ver_hook = verify_rx_default;
 d2k_sched_ver_fn  d2k_sched_rx_gzip_ver_hook = verify_rx_gzip_default;
+
 static d2k_voice_res voice_default(const d2k_voice_opt *opt) {
     return d2k_voice_run(opt);
 }
@@ -787,6 +788,8 @@ typedef struct {
     /* Очередь долита из запасного перебора (refill_from_fallback), а не
        выведена из замера: панель и журнал называют её своим именем (задача 37). */
     int        fb_queue;
+    size_t     fb_from;   /* с какого места очереди начинается запасной перебор:
+                             ступени RX-лестницы перед ним — из замера */
     unsigned   rx_volume_next_variant;
     int        res_ready;   /* пишется потоком под мьютексом планировщика */
     /* Подобранное плечо QUIC и признак того, что подбор состоялся. Отдельно
@@ -2518,6 +2521,7 @@ static size_t refill_from_fallback(d2k_sched *s, task *t) {
        RX-volume-профиль (verdict_to_plans), а не исчерпание очереди. */
     t->rx_volume_candidate_pending = t->vol.rx_cut &&
         t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS;
+    size_t ladder = added;
     while (added < cap) {
         char text[sizeof t->plans[0]];
         if (d2k_fallback_plan(t->fb_next, sh, SCHED_DECOY, s->send_cap,
@@ -2544,9 +2548,14 @@ static size_t refill_from_fallback(d2k_sched *s, task *t) {
         t->n_plans = added;
         t->next_plan = 0;
         t->n_known = 0;
-        t->fb_queue = 1;
-        say(s, "по %s кандидаты замера исчерпаны — %zu планов из запасного перебора "
-               "донора (это не находка замера)", t->name, added);
+        /* Ступени RX-лестницы выведены из замеренного RX-обрыва — запасным
+           перебором они не называются; только то, что после них. */
+        t->fb_queue = added > ladder;
+        t->fb_from = ladder;
+        if (added > ladder) {
+            say(s, "по %s кандидаты замера исчерпаны — %zu планов из запасного перебора "
+                   "донора (это не находка замера)", t->name, added - ladder);
+        }
     }
     return added;
 }
@@ -3414,11 +3423,22 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
        бюджет зондов на догадки, имея на руках измеренный ответ. */
     if (r->have_arm && t->n_plans < cap) {
         char text[sizeof t->plans[0]];
-        if (d2k_arm_plan_measured(&r->arm, &r->arm_input, text, sizeof text) == 0) {
+        int rc = d2k_arm_plan_measured_cap(&r->arm, &r->arm_input, s->send_cap,
+                                           text, sizeof text);
+        /* Задача 37, I2: план без предела собирается, а с пределом — нет:
+           посылка не помещается в канал датапата, опыт не состоялся бы
+           (BAD_PLAN). Урезать измеренные байты нельзя — другое воздействие. */
+        int unfit = rc != 0 && s->send_cap > 0 &&
+            d2k_arm_plan_measured(&r->arm, &r->arm_input, text, sizeof text) == 0;
+        if (rc == 0) {
             memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
             t->n_plans++;
             say(s, "по %s приём «%s» НАЙДЕН замером — ставлю его первым кандидатом",
                 t->name, r->arm_name);
+        } else if (unfit) {
+            say(s, "по %s приём «%s» найден замером, но его посылка не помещается "
+                   "в предел отправки %u байт — кандидатом не ставлю",
+                t->name, r->arm_name, (unsigned)s->send_cap);
         } else {
             /* Пробел РЕАЛИЗАЦИИ, а не свойство коробки (0007 п.3): воздействие
                найдено и на замере сработало, задать его планом мы не умеем.
@@ -3703,7 +3723,8 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         fputs(", \"source\": ", f);
         json_str(f, t->n_known > 0 && t->next_plan <= t->n_known
                         ? "готовый план узнанной коробки"
-                        : t->fb_queue ? "запасной перебор" : "выведен из замера");
+                        : t->fb_queue && (t->next_plan ? t->next_plan - 1 : 0) >= t->fb_from
+                        ? "запасной перебор" : "выведен из замера");
         fputc('}', f);
     }
     fputs(first ? "],\n" : "\n  ],\n", f);
@@ -7520,6 +7541,29 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     d2k_vres measured = t->res;
                     t->cached_measure_valid = 0;
                     trial_retire(s, t);
+                    /* ВОПРОСЫ О СВОЙСТВАХ — И ПОСЛЕ ГОТОВЫХ ПЛАНОВ (задача 37, I1).
+                       Ветка узнанной коробки входила в испытание, минуя
+                       вопросы; не помогли её планы — «выведенным из замера»
+                       оказывался синтез по ПУСТОМУ вектору (everythingPlan).
+                       Измеритель без владения поиском (nft-роутер без сырого
+                       сокета) ответа «чем брать» не принёс — его дают
+                       вопросы, как на пути без узнанной коробки. Кандидаты
+                       выводятся из ответов, когда опрос кончится. */
+                    if (measured.verdict == D2K_V_OPAQUE && t->transport == 6 &&
+                        !measured.have_arm && !measured.owns_search) {
+                        say(s, "по %s готовые планы не помогли; вердикт: %s — "
+                               "спрашиваю коробку о свойствах", t->name,
+                            verdict_name(measured.verdict));
+                        memset(&t->props, 0, sizeof t->props);
+                        t->prop_q = -1;
+                        t->props_asked = 0;
+                        t->n_known = 0;
+                        if (prop_send_next(s, t, now_ms) == 0) {
+                            moved++;
+                            continue;
+                        }
+                        prop_finish(s, t);
+                    }
                     verdict_to_plans(s, t, &measured);
                     if (t->n_plans == 0) {
                         say(s, "по %s готовые планы не помогли; прямое измерение "

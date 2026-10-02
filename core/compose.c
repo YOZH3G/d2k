@@ -1696,8 +1696,8 @@ static int measured_payload(char *buf, size_t cap, size_t *pos, unsigned id,
     return append_fmt(buf, cap, pos, "\n");
 }
 
-int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
-                          char *buf, size_t cap) {
+int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
+                              size_t send_cap, char *buf, size_t cap) {
     if (!a || !in || !buf || !cap) { return -1; }
     buf[0] = '\0';
     if (in->trigger_len < 2 || in->trigger_len > D2K_ARM_DECOY_MAX ||
@@ -1742,6 +1742,23 @@ int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
     if (between) { if (mid >= n) { mid = 1; } ov = 0; }
     else { if (mid < 2) { mid = 2; } if (mid >= n) { mid = n - 1; } }
     if (!fake && !between && !disorder && !ov && !a->disorder_pos) { return -1; }
+    /* ПРЕДЕЛ ОТПРАВКИ (задача 37, I2). Посылки плана режутся сегментом
+       D2K_ARM_SEGMENT_MAX — тем же потолком, что у сырого отправителя замера
+       (raw.c), так что найденное воздействие уходит теми же сегментами, что и
+       на замере; при обычном канале (1500) самая длинная посылка — 1440(+12
+       с меткой времени), и план проходит. Урезать приставку или фальшивку
+       ниже того, что прошло на замере, — уже ДРУГОЕ воздействие (то же
+       правило, что у seqovl-hello в d2k_arm_plan), поэтому канал уже этого
+       предела плечо не принимает вовсе: датапат отверг бы его как BAD_PLAN,
+       опыта бы не было. Считается, как в d2k_plan_max_emit: фальшивки и
+       приставка перекрытия, по сегменту. */
+    if (send_cap > 0) {
+        size_t body = (fake || between) ? (between ? n - mid : 2 * n) : 0;
+        if (ov > body) { body = ov; }
+        if (body > D2K_ARM_SEGMENT_MAX) { body = D2K_ARM_SEGMENT_MAX; }
+        size_t hdr = 40 + (fake && a->tcpts ? 12 : 0);
+        if (body && hdr + body > send_cap) { return -1; }
+    }
     if (a->disorder_pos) {
         if (a->disorder_pos >= n) { return -1; }
         if (append_fmt(buf, cap, &pos,
@@ -2075,4 +2092,9 @@ size_t d2k_compose(const d2k_props *pr, d2k_shape target_shape, const char *deco
         if (everything_plan_text(target_shape, decoy, send_cap, out[0], buflen) == 0) { n = 1; }
     }
     return n;
+}
+
+int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
+                          char *buf, size_t cap) {
+    return d2k_arm_plan_measured_cap(a, in, 0, buf, cap);
 }

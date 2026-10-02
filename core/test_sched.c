@@ -9949,11 +9949,17 @@ measured_test:
         ver_app_after_tcp_search = 0;
         vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0; vol_rx_tls_unavailable = 0;
         snapshot_enabled = 0;
-        for (int mode = 0; mode < 3; mode++) {
+        for (int mode = 0; mode < 5; mode++) {
             /* 0 — замер нашёл приём (disorder у донора; здесь плечо badsum);
                1 — замер владеет поиском и приёма не нашёл;
                2 — прежний провайдер без владения поиском: запасной список
-                   законен, но RX-лестница без RX-обрыва — нет. */
+                   законен, но RX-лестница без RX-обрыва — нет;
+               3 — замер нашёл приём, но его посылка не помещается в предел
+                   отправки датапата (I2): кандидатом он не ставится, BAD_PLAN
+                   и «местный отказ» не случаются;
+               4 — «решает содержимое» без владения поиском (nft-роутер без
+                   сырого сокета, I1): после плана коробки — вопросы о
+                   свойствах, и только потом выведенные кандидаты. */
             d2k_catalog c = {0};
             c.boxes = calloc(1, sizeof *c.boxes);
             CHECK(c.boxes != NULL, "t37: коробка не создалась");
@@ -9979,19 +9985,22 @@ measured_test:
                 "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
                 "proto tcp tls\nsplit payload_start +7\norder forward\n");
             tcp_answer = mode == 2 ? D2K_V_PREFIX : D2K_V_OPAQUE;
-            tcp_owns_search = mode != 2;
-            tcp_found_arm = mode == 0;
+            tcp_owns_search = mode != 2 && mode != 4;
+            tcp_found_arm = mode == 0 || mode == 3;
             ver_answer = D2K_VER_HANDSHAKE;   /* ни один кандидат не помогает */
             d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
             saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
+            if (mode == 3) d2k_sched_set_send_cap(s, 1400);
             tcp_calls = ver_calls = vol_calls = 0;
             uint16_t cport = (uint16_t)(42401 + mode);
             ver_answer_port = cport;
             drain(); forget_sent();
             const char *name = mode == 0 ? "edge-mqtt-fallback.facebook.example" :
                                mode == 1 ? "edge-mqtt-miss.facebook.example" :
-                                           "edge-legacy.facebook.example";
+                               mode == 2 ? "edge-legacy.facebook.example" :
+                               mode == 3 ? "edge-mqtt-narrow.facebook.example" :
+                                           "edge-nft.facebook.example";
             d2k_ev h = ev_hello(6, cport, name); d2k_sched_event(s, &h);
             d2k_ev su = ev_suspect(6, cport); d2k_sched_event(s, &su);
             int used = 0;
@@ -10026,17 +10035,40 @@ measured_test:
                       "t37: промах замера, владеющего поиском, не назван");
                 CHECK(used == 1,
                       "t37: замер, владеющий поиском, ничего не нашёл — запасной список не перебирается");
-            } else {
-                CHECK(said("проверяю кандидаты из уже выполненного прямого замера"),
+            } else if (mode == 2) {
+                const char *measured_at = strstr(saidbuf,
+                    "проверяю кандидаты из уже выполненного прямого замера");
+                const char *fallback_at = strstr(saidbuf, "запасного перебора");
+                CHECK(measured_at && fallback_at && measured_at < fallback_at,
                       "t37: прежний провайдер — кандидаты замера не испытаны раньше запасного списка");
-                CHECK(said("запасного перебора"),
-                      "t37: запасной перебор не назван своим именем");
+                /* Между ними — хотя бы один опыт кандидата замера. */
+                const char *trial_between = measured_at ? strstr(measured_at, "поставил план") : NULL;
+                CHECK(trial_between && fallback_at && trial_between < fallback_at,
+                      "t37: кандидат замера не испытан до запасного перебора");
+            } else if (mode == 3) {
+                CHECK(said("не помещается в предел отправки 1400"),
+                      "t37: неподходящий пределу отправки приём замера не назван");
+                CHECK(!said("НАЙДЕН замером"),
+                      "t37: приём, не помещающийся в предел отправки, поставлен кандидатом");
+                CHECK(!said("отвергнуты исполнителем"),
+                      "t37: неподходящий приём дошёл до исполнителя и кончился местным отказом");
+                CHECK(used == 1, "t37: после плана коробки поставлен непомещающийся приём");
+            } else {
+                const char *box_at = strstr(saidbuf, "готовых планов узнанной коробки");
+                const char *ask_at = strstr(saidbuf, "готовые планы не помогли; вердикт: решает содержимое — "
+                                                     "спрашиваю коробку о свойствах");
+                const char *fallback_at = strstr(saidbuf, "запасного перебора");
+                CHECK(box_at && ask_at && box_at < ask_at,
+                      "t37: без владения поиском после плана коробки вопросы о свойствах не заданы");
+                CHECK(ask_at && (!fallback_at || ask_at < fallback_at),
+                      "t37: запасной перебор начался раньше вопросов о свойствах");
             }
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
         }
         tcp_answer = D2K_V_OPAQUE; tcp_owns_search = tcp_found_arm = 0;
         ver_answer = D2K_VER_APPLICATION;
+
         if (measured_only) { goto voice_only_done; }
     }
 

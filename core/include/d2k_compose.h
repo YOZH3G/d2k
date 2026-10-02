@@ -136,6 +136,11 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
  * exact input constraints. Packet-size checks remain mandatory. */
 int d2k_arm_plan_measured(const d2k_arm *arm, const d2k_arm_input *input,
                           char *buf, size_t cap);
+/* То же с объявленным пределом отправки (0 — не объявлен). Плечо, чья самая
+ * длинная посылка (по сегменту замера) в предел не помещается, НЕ строится
+ * (-1): урезать измеренные байты значило бы поставить другое воздействие. */
+int d2k_arm_plan_measured_cap(const d2k_arm *arm, const d2k_arm_input *input,
+                              size_t send_cap, char *buf, size_t cap);
 
 int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
                       size_t send_cap,
