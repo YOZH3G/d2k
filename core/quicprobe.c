@@ -805,10 +805,11 @@ static int qp_verify_vn(const uint8_t *p, size_t n, d2k_hello msg) {
    ранее (правка ревью 2026-09-06, круг 4, находка 5): попытка вовсе НЕ
    ОТПРАВИЛАСЬ (сбой socket()/connect()/send() в qp_send_one, наша сторона,
    к сети отношения не имеет) против попытка ОТПРАВИЛАСЬ и получила явный
-   сетевой отказ (POLLERR/ошибка recv() — ICMP «порт недоступен» и подобное).
-   Первые идут в err, вторые — в fail как «нет ответа» (донор
-   probe.go:573-574, план 2026-10-02-review-fixes задача 10); refused_out,
-   если не NULL, — число вторых. sent_out, если не NULL, — сколько
+   сетевой отказ ECONNREFUSED (ICMP «порт недоступен», донор probe.go:643,
+   :663; прочие ошибки чтения — тишина, как у донора). Первые идут в err,
+   вторые — в fail как «нет ответа» (measure, probe.go:573-574: refused не
+   попадает в NotBuilt; план 2026-10-02-review-fixes задача 10);
+   refused_out, если не NULL, — число вторых. sent_out, если не NULL, — сколько
    ИЗ repeats ДЕЙСТВИТЕЛЬНО ушло на провод (repeats минус "не отправилось") —
    находка 4 ревью, круг 5: pass+fail тождественно равно repeats всегда (обе
    величины считают ВСЕ repeats попыток, просто по разным категориям), значит
@@ -826,6 +827,8 @@ static int qp_verify_vn(const uint8_t *p, size_t n, d2k_hello msg) {
    его с пользовательского сокета — попросить IP_RECVTTL и читать recvmsg.
    Ядро без этой опции просто не положит ничего, и *ttl останется нулём —
    «не измерено», а не выдуманное число. */
+int (*d2k_quic_recv_fault_hook)(int fd);
+
 static ssize_t qp_recv_ttl(int fd, uint8_t *buf, size_t cap, uint8_t *ttl) {
     *ttl = 0;
     struct iovec iov;
@@ -841,6 +844,13 @@ static ssize_t qp_recv_ttl(int fd, uint8_t *buf, size_t cap, uint8_t *ttl) {
     msg.msg_iovlen = 1;
     msg.msg_control = ctl.space;
     msg.msg_controllen = sizeof ctl.space;
+    if (d2k_quic_recv_fault_hook) {
+        int e = d2k_quic_recv_fault_hook(fd);
+        if (e != 0) {
+            errno = e;
+            return -1;
+        }
+    }
     ssize_t n = recvmsg(fd, &msg, 0);
     if (n <= 0) { return n; }
 #if defined(IP_RECVTTL) || defined(IPV6_HOPLIMIT)
@@ -1219,7 +1229,26 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
             int i = idx_of[k];
             uint8_t buf[2048];
             uint8_t ttl_seen = 0;
-            ssize_t n = qp_recv_ttl(fds[i], buf, sizeof buf, &ttl_seen);
+            ssize_t n;
+            int sock_err = 0;
+            if ((pfds[k].revents & POLLERR) && !(pfds[k].revents & POLLIN)) {
+                /* Ошибка без данных: читаем SO_ERROR, а не recv() — у
+                   блокирующего сокета recv() без данных мог бы встать. */
+                socklen_t el = sizeof sock_err;
+                if (getsockopt(fds[i], SOL_SOCKET, SO_ERROR, &sock_err, &el) != 0) {
+                    sock_err = errno;
+                }
+                if (sock_err == 0) {
+                    continue; /* ошибка уже снята — ждём дальше */
+                }
+                n = -1;
+            } else {
+                n = qp_recv_ttl(fds[i], buf, sizeof buf, &ttl_seen);
+                sock_err = n < 0 ? errno : 0;
+            }
+            if (n < 0 && (sock_err == EINTR || sock_err == EAGAIN || sock_err == EWOULDBLOCK)) {
+                continue; /* не исход обмена — ждём дальше в пределах срока */
+            }
             if (n > 0) {
                 /* Проверять ответ надо ключами ТОЙ копии, что ушла с этого
                    сокета: у каждой свой идентификатор, а из него выводятся
@@ -1260,12 +1289,12 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
             } else {
                 done[i] = 1;
                 pending--;
-                /* POLLERR/явная ошибка recv() ПОСЛЕ успешной отправки — это
-                   сетевой отказ (ICMP «порт недоступен» и подобное), не
-                   "опыт не состоялся": датаграмма ушла, ответ (в широком
-                   смысле — включая отказ) пришёл. Отдельный код -2, не -1,
-                   ровно для этого различия (находка 5 выше). */
-                result[i] = -2;
+                /* Ошибка чтения ПОСЛЕ успешной отправки. Донор exchange
+                   (probe.go:660-663, frag_linux.go:91) считает отказом ТОЛЬКО
+                   ECONNREFUSED (ICMP «порт недоступен»); любая другая ошибка
+                   (EHOSTUNREACH, ENETUNREACH, ...) — просто конец обмена без
+                   ответа, то есть тишина. Код -2 — только для первого. */
+                result[i] = sock_err == ECONNREFUSED ? -2 : 0;
             }
         }
     }
@@ -1279,9 +1308,9 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
         if (result[i] == 1) {
             t.pass++;
         } else if (result[i] == -2) {
-            /* ICMP-отказ — «нет ответа», не «опыт не состоялся». Донор
-               measure (probe.go:573-574): case r.refused стоит ДО case
-               r.err и в NotBuilt не попадает; дальше прямой зонд даёт
+            /* ECONNREFUSED (probe.go:643, :663) — «нет ответа», не «опыт
+               не состоялся». Донор measure (probe.go:573-574): case
+               r.refused стоит ДО case r.err и в NotBuilt не попадает; дальше прямой зонд даёт
                content (probe.go:322-337), повторный контроль —
                residual=true (probe.go:355), плечо — «не прошло»
                (arms.go:69-94). Отдельно виден только через refused_out. */

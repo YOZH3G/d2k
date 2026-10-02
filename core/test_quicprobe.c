@@ -509,6 +509,7 @@ static size_t build_authentic_v1(const uint8_t *dcid, size_t dcid_len,
  * ответить аутентично, но БЕЗ CRYPTO (только CONNECTION_CLOSE — находка 5). */
 static volatile int g_rs_respond;
 static int g_rs_fd = -1;
+static pthread_t g_rs_thread;
 
 static int is_neutral_control_packet(const uint8_t *packet, size_t packet_len) {
     char sni[256];
@@ -565,6 +566,11 @@ static size_t build_vn_reply(uint8_t *out, size_t cap) {
     if (cap < sizeof pkt) return 0;
     memcpy(out, pkt, sizeof pkt);
     return sizeof pkt;
+}
+
+static int recv_fault_hostunreach(int fd) {
+    (void)fd;
+    return EHOSTUNREACH;
 }
 
 static void *rs_run(void *arg) {
@@ -645,9 +651,9 @@ static void *rs_run(void *arg) {
                остаточная проверка) получает настоящий ICMP «порт
                недоступен». */
             if (g_rs_respond == 9 && is_ctl && ++ctl_answered >= D2K_QUIC_REPEATS) {
-                int fd = g_rs_fd;
-                g_rs_fd = -1;
-                close(fd);
+                /* g_rs_fd не трогаем: тест режима 9 ждёт этот поток
+                   pthread_join'ом и сам сокет больше не закрывает. */
+                close(g_rs_fd);
                 return NULL;
             }
         }
@@ -673,9 +679,10 @@ static uint16_t rs_start_family(int family) {
     getsockname(g_rs_fd, (struct sockaddr *)&a, &al);
     uint16_t port = family == AF_INET6 ? ntohs(((struct sockaddr_in6 *)&a)->sin6_port)
                                      : ntohs(((struct sockaddr_in *)&a)->sin_port);
-    pthread_t t;
-    pthread_create(&t, NULL, rs_run, NULL);
-    pthread_detach(t);
+    pthread_create(&g_rs_thread, NULL, rs_run, NULL);
+    if (g_rs_respond != 9) {
+        pthread_detach(g_rs_thread); /* режим 9 закрывается сам и ждётся join'ом */
+    }
     return port;
 }
 
@@ -1548,8 +1555,8 @@ int main(int argc, char **argv) {
     }
 
     /* --- ICMP «порт недоступен» на ПРЯМОЙ зонд после ответившего контроля.
-     * Донор: отказ — не ответ (probe.go:573-574 считает его в Refused, не в
-     * NotBuilt), прямой зонд Answered==0 -> content (probe.go:322-337), и
+     * Донор: ECONNREFUSED (probe.go:663) — не ответ (measure probe.go:573-574
+     * считает его в Refused, не в NotBuilt), прямой зонд Answered==0 -> content (probe.go:322-337), и
      * повторный контроль Answered==0 -> residual=true (probe.go:355). Не
      * FLAKY «транспорт». Стенд режима 9 закрывает порт после трёх
      * ответов базовой живости. ------------------------------------------ */
@@ -1564,7 +1571,29 @@ int main(int argc, char **argv) {
               "ICMP на прямой зонд после ответившего контроля — content донора, не FLAKY");
         CHECK(r.qprops.residual_blocking == D2K_PROP_YES,
               "ICMP на повторный контроль — Answered==0, residual=true (probe.go:355)");
-        if (g_rs_fd >= 0) close(g_rs_fd);
+        pthread_join(g_rs_thread, NULL); /* поток сам закрыл свой сокет */
+    }
+
+    /* --- Ошибка чтения, НЕ ECONNREFUSED (EHOSTUNREACH), — тишина, не отказ.
+     * Донор exchange (probe.go:660-663, frag_linux.go:91): refused только
+     * при errors.Is(rerr, ECONNREFUSED). База молчит без отказа -> VN-зонд
+     * (стенд на VN не отвечает) -> address (probe.go:303-311), не no_quic. */
+    {
+        g_rs_respond = 1;
+        uint16_t port = rs_start();
+        d2k_quic_recv_fault_hook = recv_fault_hostunreach;
+        uint32_t rtt_ms = 0;
+        int refused = -1, sent = -1;
+        d2k_tally t = real_ask("127.0.0.1", port, NULL, 0, trig_hello(), 500, 0,
+                               D2K_QUIC_REPEATS, &rtt_ms, &refused, &sent, NULL);
+        CHECK(sent == D2K_QUIC_REPEATS && refused == 0 && t.err == 0 && t.pass == 0 &&
+                  t.fail == D2K_QUIC_REPEATS,
+              "EHOSTUNREACH при чтении — тишина (fail), не refused и не err");
+        d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
+        d2k_quic_recv_fault_hook = NULL;
+        CHECK(r.verdict == D2K_V_ADDRESS,
+              "EHOSTUNREACH на базовом контроле — донор идёт в VN и даёт address, не no_quic");
+        close(g_rs_fd);
     }
 
     /* --- нет UDP-ответа вовсе: настоящий ICMP port-unreachable -> pass==0 И
@@ -1605,9 +1634,9 @@ int main(int argc, char **argv) {
         CHECK(strstr(r.reason, "не решение коробки") == NULL,
               "старая формулировка утверждала ровно то, чего знать нельзя (находка 3)");
 
-        /* Контракт оракула: ICMP-отказ — измеренная тишина, не «опыт не
-           состоялся». Донор measure (probe.go:573-579): case r.refused
-           стоит ДО case r.err, отказ не попадает в NotBuilt. */
+        /* Контракт оракула: ECONNREFUSED (probe.go:663) — измеренная
+           тишина, не «опыт не состоялся». Донор measure (probe.go:573-574):
+           case r.refused стоит ДО case r.err, отказ не попадает в NotBuilt. */
         uint32_t rtt_ms = 0;
         int refused = -1, sent = -1;
         d2k_tally t = real_ask("127.0.0.1", closed_port, NULL, 0, trig_hello(), 500, 0,

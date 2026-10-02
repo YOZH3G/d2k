@@ -5,7 +5,7 @@ D2K_REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 D2K_DONOR=${D2K_REF_ROOT:-"$D2K_REPO/../z2k"}
 D2K_GO=${D2K_REF_GO:-go}
 D2K_PIN=e9a391347671cbb07663d2bee5b3d92f016c789e
-D2K_QUIC_TESTS=${D2K_QUIC_TESTS:-'TestD2K(RunTerminal|Arms|Blob|Residual|Fragments)Parity'}
+D2K_QUIC_TESTS=${D2K_QUIC_TESTS:-'TestD2K(RunTerminal|Reply|Arms|Blob|Residual|Fragments)Parity'}
 case "${1:-}" in
     '') D2K_LINUX=0 ;;
     --linux) D2K_LINUX=1 ;;

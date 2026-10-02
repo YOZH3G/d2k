@@ -701,7 +701,7 @@ static void test_real_ttl_hook_on_wire(void) {
  *
  * Донор: askArms.ask (z2k-detect/internal/quicprobe/arms.go:69-94) считает
  * вопрос незаданным только при NotBuilt>0; measure (probe.go:573-574) кладёт
- * ICMP-отказ в Refused, не в NotBuilt — значит вопрос задан, ответа нет.
+ * ECONNREFUSED (probe.go:643/663) в Refused, не в NotBuilt — значит вопрос задан, ответа нет.
  * Настоящий оракул плеча (d2k_quic_ask_arm_hook) на закрытый порт 127.0.0.1. */
 static uint16_t g_icmp_port;
 static d2k_tally icmp_arm_probe(const d2k_quic_arm_question *q, void *user, int *sent) {

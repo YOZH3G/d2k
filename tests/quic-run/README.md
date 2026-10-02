@@ -31,6 +31,18 @@ read-only temporary artifact mount. It does not pull an image.
 | Only one control response, all target responses | clear | 6 |
 | All control responses, only one target response | flaky | 6 |
 
+`TestD2KReplyParity` (task 10 of plan 2026-10-02-review-fixes) covers the
+original reply criterion (`parse.go:72-74`) and refusal handling:
+
+| Scenario | Original result | Compared |
+| --- | --- | --- |
+| `close`: target gets authenticated CONNECTION_CLOSE only, control CRYPTO | clear, 6 probes | verdict, probes |
+| `close_after_ctl`: control answered 3/3, then port closed (ICMP) | content, residual, 9 probes | verdict, probes |
+| `retry`: control gets Retry (zero integrity tag), target silent | content, no residual | verdict, residual, arm |
+| `ctl_vn`: control gets Version Negotiation, target silent | content, no residual | verdict, residual, arm |
+
+All four fail against the C classifier at 78f6d81 and pass after task 10.
+
 Expected donor results are checked before comparing C. This prevents a broken
 fixture from making both implementations agree for the wrong reason.
 The responder sends authenticated synthetic Initial/CRYPTO data, using donor

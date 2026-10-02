@@ -213,7 +213,8 @@ extern d2k_quic_resolve_fn d2k_quic_resolve_hook;
  * живости в d2k_quic_classify, откуда выводится потолок ожидания для всех
  * дальнейших вопросов (см. D2K_QUIC_RTT_WAIT_FLOOR_MS/CEIL_MS ниже).
  * refused_out, если не NULL, — сколько из repeats получили СЕТЕВОЙ отказ
- * (ICMP «порт недоступен» и подобное — POLLERR/явная ошибка сокета) ПОСЛЕ
+ * (ТОЛЬКО ECONNREFUSED — ICMP «порт недоступен», как у донора probe.go:643,
+ * :663; прочие ошибки сокета — тишина) ПОСЛЕ
  * успешной отправки (или на send() после ушедшей приманки). В err такие
  * попытки НЕ входят: отказ — измеренное «нет ответа» (fail), как у донора
  * (probe.go:573-574 — Refused отдельно от NotBuilt; план
@@ -639,5 +640,11 @@ size_t d2k_quic_build_frag2(const uint8_t *udp_payload, size_t udp_payload_len, 
  * датаграмма (её DCID), что ушла на провод, как у qp_verify_fn. Возвращает
  * 0 — ответ подтверждён, -1 — нет. */
 int d2k_quic_verify_response(const uint8_t *p, size_t n, d2k_hello msg);
+
+/* Шов для тестов: если задан и возвращает ненулевой errno, чтение ответа
+ * оракула (quic_ask_ex) считается провалившимся с этим errno. По умолчанию
+ * NULL. Нужен, чтобы проверить ветку «ошибка чтения не ECONNREFUSED — тишина,
+ * не отказ» (донор probe.go:660-663) без настоящего ICMP host-unreachable. */
+extern int (*d2k_quic_recv_fault_hook)(int fd);
 
 #endif /* D2K_QUICPROBE_H */
