@@ -634,6 +634,7 @@ static size_t build_ip_discovery(uint8_t *p, uint32_t ssrc) {
  * работы голосового потока. */
 static size_t build_ip_discovery_response(uint8_t *p, uint32_t ssrc) {
     size_t n = build_ip_discovery(p, ssrc);
+    p[1] = 2; /* ответ — тип 0x0002; 0x0001 — запрос */
     memcpy(p + 8, "203.0.113.7", 11);
     p[72] = 0xC3; p[73] = 0x50; /* 50000 */
     return n;
@@ -1023,6 +1024,30 @@ static void test_discord_voice(void) {
                 e->code == D2K_UDP_PROOF_VOICE_DISCOVERY) { proof = 1; }
         }
         CHECK(proof, "валидный IP Discovery response не дал протокольного доказательства");
+        d2k_session_free(s);
+    }
+    /* Эхо запроса с типом 0x0001 (даже с заполненным адресом) — не ответ. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t pkt[256], buf[4096], disc[74], reply[74];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 64039, 50004, disc, build_ip_discovery(disc, 0xAABBCCDD));
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        build_ip_discovery_response(reply, 0xAABBCCDD);
+        reply[1] = 1;
+        n = build_udp_pkt(pkt, 64039, 50004, reply, sizeof reply);
+        swap_udp_ends(pkt);
+        d2k_session_set_hook(s, D2K_HOOK_FORWARD);
+        d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+        const d2k_journal *j = d2k_session_journal(s);
+        int proof = 0;
+        for (size_t i = 0; i < d2k_journal_count(j); i++) {
+            const d2k_jrn_entry *e = d2k_journal_at(j, i);
+            if (e && e->kind == D2K_JRN_EXCHANGE &&
+                e->code == D2K_UDP_PROOF_VOICE_DISCOVERY) { proof = 1; }
+        }
+        CHECK(!proof, "эхо запроса типа 0x0001 принято за IP Discovery response");
         d2k_session_free(s);
     }
 }

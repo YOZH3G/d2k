@@ -366,7 +366,7 @@ static int is_discord_ip_discovery(const uint8_t *d, size_t n) {
 
 static int is_discord_ip_discovery_response(const uint8_t *d, size_t n,
                                             const uint8_t ssrc[4]) {
-    if (n != 74 || d[0] != 0 || d[1] != 1 || d[2] != 0 || d[3] != 70 ||
+    if (n != 74 || d[0] != 0 || d[1] != 2 || d[2] != 0 || d[3] != 70 ||
         memcmp(d + 4, ssrc, 4) != 0) { return 0; }
     int nonzero = 0;
     for (size_t i = 8; i < 72; i++) {
