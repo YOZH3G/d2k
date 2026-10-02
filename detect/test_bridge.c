@@ -13,7 +13,7 @@ int d2k_arm_from_poison(const d2k_poison *, d2k_arm *, char *, size_t);
 static d2k_opts seen;
 static d2k_result answer;
 static int failures;
-static char seen_name[96];
+static char seen_name[D2K_TRIGGER_NAME_MAX];
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "bridge:%d: %s\n", __LINE__, #c); failures++; \
 } } while (0)
@@ -78,10 +78,39 @@ int main(void)
         answer.verdict = D2K_DV_INCONCLUSIVE; answer.has_hit = 0;
         d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
         CHECK(strcmp(seen_name, "tls:blocked.example") == 0);
-        /* No SNI in the capture: no name, so no response probe on an IP. */
-        tr.bytes = (uint8_t *)"\x16\x03"; tr.len = 2;
-        d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
-        CHECK(seen_name[0] == '\0');
+        /* Real hello, no server_name extension. */
+        {
+            uint8_t g[300];
+            size_t n = build_hello(g, "x.example");
+            /* turn server_name (type 0) into an unknown extension type */
+            g[n - strlen("x.example") - 9 + 0] = 0xff;
+            g[n - strlen("x.example") - 9 + 1] = 0xff;
+            tr.bytes = g; tr.len = n;
+            seen_name[0] = 'Z';
+            d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+            CHECK(seen_name[0] == '\0');
+        }
+        /* Max-length SNI is held whole. */
+        {
+            char big[254], want[300];
+            uint8_t g[600];
+            memset(big, 'a', 253); big[253] = 0;
+            tr.bytes = g; tr.len = build_hello(g, big);
+            seen_name[0] = 'Z';
+            d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+            snprintf(want, sizeof want, "tls:%s", big);
+            CHECK(strcmp(seen_name, want) == 0);
+        }
+        /* Embedded NUL: no name. */
+        {
+            uint8_t g[300];
+            size_t n = build_hello(g, "ab.example");
+            g[n - 5] = 0;
+            tr.bytes = g; tr.len = n;
+            seen_name[0] = 'Z';
+            d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+            CHECK(seen_name[0] == '\0');
+        }
     }
     answer.verdict = D2K_DV_INCONCLUSIVE;
     r = measure();

@@ -167,7 +167,7 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
         /* Имя триггера = настоящее SNI клиента (как у донора: "tls:"+sni):
          * по нему проверяется ОТВЕТНОЕ направление. IP вместо имени дал бы
          * ложное «чисто». Без SNI имени нет — ответ не проверяется. */
-        if (len > 0 && len <= sizeof(tr.name) - 5 && !memchr(tr.payload + off, 0, len)) {
+        if (len > 0 && len <= 253 && len <= sizeof(tr.name) - 5 && !memchr(tr.payload + off, 0, len)) {
             memcpy(tr.name, "tls:", 4);
             memcpy(tr.name + 4, tr.payload + off, len);
             tr.name[4 + len] = '\0';

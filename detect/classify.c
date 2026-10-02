@@ -785,6 +785,12 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
                 snprintf(tail, sizeof(tail), " (ответное направление: %s)", res->response.reason);
                 strncat(res->reason, tail, sizeof(res->reason) - strlen(res->reason) - 1);
             }
+        } else if (tr->accept == D2K_ACCEPT_SERVERHELLO) {
+            /* TLS-триггер без пригодного SNI: ответное направление спросить
+             * нечем. Вердикт донора («чисто») сохраняем, но непроверенное
+             * обязано быть видно (D2K_SPEC §9.9). */
+            strncat(res->reason, " (ответное направление не проверено: нет SNI)",
+                    sizeof(res->reason) - strlen(res->reason) - 1);
         }
         goto done;
     }

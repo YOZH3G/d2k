@@ -132,7 +132,7 @@ static void *conn_thread(void *arg)
         close(c);
         return NULL;
     }
-    (void)send(c, "SERVER-ANSWER", 13, 0);
+    (void)send(c, "\x16\x03\x03\x00\x04\x02\x00\x00\x00", 9, 0); /* ServerHello-shaped */
     close(c);
     return NULL;
 }
@@ -349,6 +349,33 @@ static void test_reassembling_box_is_opaque(void)
     }
 }
 
+static void test_clear_tls_without_sni_says_unchecked(void)
+{
+    d2k_opts opt;
+    d2k_result res;
+    d2k_trigger t;
+    fake_dpi d;
+    char addr[64];
+
+    fast_opts(&opt);
+    trig(&t);
+    t.name[0] = '\0';
+    t.accept = D2K_ACCEPT_SERVERHELLO;
+    if (fake_dpi_start(&d, M_CLEAR, 0, addr, sizeof(addr)) != 0) {
+        fail("стенд не поднялся");
+        return;
+    }
+    d2k_classify_run(addr, &t, &opt, &res);
+    fake_dpi_stop(&d);
+    if (res.verdict != D2K_DV_CLEAR) {
+        fail("вердикт = %s (%s), ждали clear", d2k_verdict_name(res.verdict), res.reason);
+        return;
+    }
+    if (!strstr(res.reason, "ответное направление не проверено: нет SNI")) {
+        fail("«чисто» без SNI не говорит, что ответ не проверен: %s", res.reason);
+    }
+}
+
 static void test_clear_target_stops_early(void)
 {
     d2k_opts opt;
@@ -552,6 +579,7 @@ int main(void)
     test_whole_packet_matcher();
     test_reassembling_box_is_opaque();
     test_clear_target_stops_early();
+    test_clear_tls_without_sni_says_unchecked();
     test_unreachable_target();
     test_reassembling_box_with_control_stays_opaque();
     test_address_block_is_not_called_opaque();

@@ -97,10 +97,11 @@ typedef enum {
 } d2k_accept_t;
 
 #define D2K_TRIGGER_MAX 16384
+#define D2K_TRIGGER_NAME_MAX 260 /* "tls:" + SNI до 253 + NUL, с запасом */
 
 /* Что шлём и как понимаем, что ответ пришёл. */
 typedef struct {
-    char          name[96];
+    char          name[D2K_TRIGGER_NAME_MAX]; /* "tls:" + SNI до 253 + NUL */
     uint8_t       payload[D2K_TRIGGER_MAX];
     size_t        len;
     int           sni_off;   /* где в нагрузке лежит имя, 0 если неизвестно */
