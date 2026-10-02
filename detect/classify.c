@@ -545,6 +545,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         obs_done(opt, obs);
         if (obs->pass == 0) {
             res->raw_usable = 0;
+            res->raw_selftest_failed = 1;
             return 0;
         }
     }

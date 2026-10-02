@@ -80,6 +80,11 @@ typedef struct {
     uint32_t seq; /* наш следующий номер */
     uint32_t ack; /* что подтверждаем */
     int      rule_up;
+    /* Правило подавления ядерного RST не встало, а зонд идёт дальше (как у
+     * донора: suppressKernelRST продолжает с флагом). Отрицательный исход
+     * такого зонда недостоверен; факт доезжает до трассы через
+     * d2k_raw_rst_rule_failed. */
+    int      rst_unsuppressed;
     /* raw_recv returns a slice which must survive until the next receive
      * on THIS connection, without being overwritten by another worker. */
     raw_buffers *buffers; /* heap-owned: do not grow the router worker stack */
@@ -88,6 +93,11 @@ typedef struct {
 /* rstRuleFailed — хоть раз не удалось закрыть ядру рот. Взводится навсегда:
  * один отказ уже делает отрицательные результаты сырых зондов недостоверными. */
 static int g_rst_rule_failed;
+
+/* Запуск команды правила iptables. Крючок — для теста без root и iptables;
+ * в работе это system(). */
+static int raw_rule_system(const char *cmd) { return system(cmd); }
+d2k_raw_rule_fn d2k_raw_rule_hook = raw_rule_system;
 static uint32_t g_sport_counter;
 static pthread_once_t g_seed_once = PTHREAD_ONCE_INIT;
 static pthread_once_t g_sweep_once = PTHREAD_ONCE_INIT;
@@ -233,7 +243,7 @@ static int suppress_kernel_rst(uint16_t sport, uint8_t family)
     /* Old router iptables cannot be relied on to serialize our commands.
      * Protect only rule edits, not the network lifetime of the probe. */
     pthread_mutex_lock(&g_raw_state);
-    rc = system(cmd);
+    rc = d2k_raw_rule_hook(cmd);
     if (rc != 0) {
         g_rst_rule_failed = 1;
     }
@@ -248,7 +258,7 @@ static void release_kernel_rst(uint16_t sport, uint8_t family)
              "%s -D OUTPUT -p tcp --sport %u --tcp-flags RST RST -j DROP"
              " >/dev/null 2>&1", family == 6 ? "ip6tables" : "iptables", (unsigned)sport);
     pthread_mutex_lock(&g_raw_state);
-    (void)system(cmd);
+    (void)d2k_raw_rule_hook(cmd);
     pthread_mutex_unlock(&g_raw_state);
 }
 
@@ -807,11 +817,14 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
     c->sport = next_source_port();
     seed_once();
     c->seq = (uint32_t)random();
+    /* Как у донора (suppressKernelRST): без правила мерить ПРОДОЛЖАЕМ —
+     * ядерный RST прилетает после SYN-ACK, а зонд к тому времени часто уже
+     * пишет данные. Отказ iptables (нет бинарника, роутер только на nft) —
+     * своя поломка, а не свойство сети: вернув ошибку, мы роняли
+     * самопроверку, и цель уходила в «обойти нечем». Факт отказа не молчит:
+     * он взводит g_rst_rule_failed и доезжает до трассы вердикта. */
     c->rule_up = suppress_kernel_rst(c->sport, family);
-    if (!c->rule_up) {
-        snprintf(err, errcap, "classify: cannot suppress local TCP RST");
-        raw_close(c); return -1;
-    }
+    c->rst_unsuppressed = !c->rule_up;
 
     if (raw_handshake(c, timeout_ms, cancel, err, errcap) != 0) {
         raw_close(c);

@@ -224,6 +224,9 @@ typedef struct {
     char path[32];
     int  composed;
     int  raw_usable;
+    /* Самопроверка сырого слоя ПРОГНАНА и не прошла ни разу. Отлично от
+     * raw_usable=0, которое остаётся и там, где до самопроверки не дошли. */
+    int  raw_selftest_failed;
 
     d2k_obs trace[D2K_TRACE_MAX];
     int     ntrace;
@@ -294,6 +297,11 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
 
 int  d2k_raw_supported(void);
 int  d2k_raw_rst_rule_failed(void);
+/* Запуск команды правила подавления RST (iptables -I/-D). По умолчанию
+ * system(); тест подменяет, чтобы проверить зонд без root и iptables.
+ * Есть только там, где есть сырой слой (Linux или тестовая сборка). */
+typedef int (*d2k_raw_rule_fn)(const char *cmd);
+extern d2k_raw_rule_fn d2k_raw_rule_hook;
 /* probe_poison — ОДИН зонд, собранный из независимых приёмов.
  * Возврат: 1 — прошло, 0 — не прошло, -1 — ошибка зонда (err заполнен). */
 int  d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,

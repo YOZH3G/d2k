@@ -1540,7 +1540,19 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
        новый замер бросался бы на нулевом зонде, отчитываясь «о цели не
        сказано ничего». Поймано стендом с цензором на клиенте TLS 1.2. */
     t->stop = 0;
-    if (pthread_create(&t->th, NULL, worker_run, a) != 0) {
+    /* СТЕК ПОТОКА — ЯВНЫЙ, 1 МиБ. Замер идёт глубоко (дерево зондов, сырой
+       слой, разбор TLS), а умолчание зависит от libc и ulimit -s на роутере
+       (у musl — 128 КиБ); переполнение — тихая порча памяти, не ошибка. */
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        if (a->use_fd >= 0) { close(a->use_fd); }
+        free(a);
+        return -1;
+    }
+    int created = pthread_attr_setstacksize(&attr, (size_t)1u << 20) == 0 &&
+                  pthread_create(&t->th, &attr, worker_run, a) == 0;
+    pthread_attr_destroy(&attr);
+    if (!created) {
         if (a->use_fd >= 0) { close(a->use_fd); }
         free(a);
         return -1;

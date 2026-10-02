@@ -9,11 +9,27 @@
 static ssize_t raw_test_sendto(int, const void *, size_t, int,
                                const struct sockaddr *, socklen_t);
 ssize_t raw_test_recvfrom(int, void *, size_t, int, struct sockaddr *, socklen_t *);
+static int raw_test_socket(int, int, int);
+static int raw_test_setsockopt(int, int, int, const void *, socklen_t);
+static int raw_test_bind(int, const struct sockaddr *, socklen_t);
+static int raw_test_connect(int, const struct sockaddr *, socklen_t);
+static int raw_test_getsockname(int, struct sockaddr *, socklen_t *);
 #define recvfrom raw_test_recvfrom
 #define sendto raw_test_sendto
+#define socket raw_test_socket
+#define setsockopt raw_test_setsockopt
+#define bind raw_test_bind
+#define connect raw_test_connect
+#define getsockname raw_test_getsockname
 #include "raw.c"
 #undef recvfrom
 #undef sendto
+#undef socket
+#undef setsockopt
+#undef bind
+#undef connect
+#undef getsockname
+#include <fcntl.h>
 #include "d2k_wire.h"
 
 #define WORKERS 16
@@ -64,10 +80,57 @@ static void test_disorder_pos2_emits_exact_reverse_segments(void)
     }
 }
 
+/* raw_dial harness: sockets are /dev/null descriptors (no root, no
+ * network); the receive socket answers our own SYN with a SYN-ACK. */
+static int dial_recv_fd = -1;
+static int raw_test_socket(int domain, int type, int proto)
+{
+    int fd = open("/dev/null", O_RDONLY);
+    (void)domain;
+    if (fd >= 0 && type == SOCK_RAW && proto == IPPROTO_TCP) { dial_recv_fd = fd; }
+    return fd;
+}
+static int raw_test_setsockopt(int fd, int lvl, int name, const void *v, socklen_t n)
+{ (void)fd; (void)lvl; (void)name; (void)v; (void)n; return 0; }
+static int raw_test_bind(int fd, const struct sockaddr *a, socklen_t n)
+{ (void)fd; (void)a; (void)n; return 0; }
+static int raw_test_connect(int fd, const struct sockaddr *a, socklen_t n)
+{ (void)fd; (void)a; (void)n; return 0; }
+static int raw_test_getsockname(int fd, struct sockaddr *a, socklen_t *n)
+{
+    struct sockaddr_in local = {0};
+    (void)fd;
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(0xc0000201); /* 192.0.2.1 */
+    memcpy(a, &local, sizeof local);
+    *n = sizeof local;
+    return 0;
+}
+
+static char rule_cmds[4][192];
+static int rule_count;
+static int rule_rc;
+static int test_rule_hook(const char *cmd)
+{
+    if (rule_count < 4) { snprintf(rule_cmds[rule_count], sizeof rule_cmds[0], "%s", cmd); }
+    rule_count++;
+    return rule_rc;
+}
+
 ssize_t raw_test_recvfrom(int fd, void *buf, size_t len, int flags,
                          struct sockaddr *addr, socklen_t *alen)
 {
     (void)flags;
+    if (fd >= 0 && fd == dial_recv_fd) {
+        d2k_poison none = {0};
+        const uint8_t *syn = outgoing[0];
+        size_t n;
+        if (outgoing_count == 0) { return -1; }
+        n = build_ipv4_tcp(buf, len, syn + 16, syn + 12, rd16(syn + 22), rd16(syn + 20),
+                           7000, rd32(syn + 24) + 1, TCP_SYN | TCP_ACK,
+                           NULL, 0, &none, NULL, 0);
+        return n ? (ssize_t)n : -1;
+    }
     if (fd < 0 || fd > 1 || incoming_len[fd] > len) { return -1; }
     memcpy(buf, incoming[fd], incoming_len[fd]);
     if (incoming_noise) {
@@ -222,6 +285,40 @@ static void test_datapath_matches_raw_headers(void)
     }
 }
 
+static void sweep_noop(void) {}
+
+/* Donor suppressKernelRST: a failed iptables insert (no binary, nft-only
+ * router) is a LOCAL defect. The probe continues, flagged; it must not turn
+ * into a failed self-check and an "opaque, nothing to bypass" verdict. */
+static void test_dial_survives_missing_rst_rule(void)
+{
+    static const uint8_t dst[4] = {198, 51, 100, 7};
+    raw_conn c;
+    char err[160] = "";
+    pthread_once(&g_sweep_once, sweep_noop); /* never touch a real firewall */
+    d2k_raw_rule_hook = test_rule_hook;
+
+    rule_rc = 0; rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(c.rule_up == 1 && c.rst_unsuppressed == 0);
+    CHECK(rule_count == 1 && strstr(rule_cmds[0], "iptables -I OUTPUT") != NULL);
+    raw_close(&c);
+    CHECK(rule_count == 2 && strstr(rule_cmds[1], "iptables -D OUTPUT") != NULL);
+    CHECK(!d2k_raw_rst_rule_failed());
+
+    rule_rc = 256; rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; err[0] = '\0';
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(c.rule_up == 0 && c.rst_unsuppressed == 1);
+    CHECK(outgoing_count == 2); /* SYN and the final ACK: probe went on */
+    raw_close(&c);
+    CHECK(rule_count == 1); /* nothing installed, nothing to delete */
+    CHECK(d2k_raw_rst_rule_failed()); /* still reaches the verdict trace */
+
+    outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(d2k_raw_probe_handshake_family(dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 1);
+    d2k_raw_rule_hook = raw_rule_system;
+}
+
 int main(void)
 {
     {
@@ -264,6 +361,7 @@ int main(void)
     test_unrelated_packets_do_not_extend_deadline();
     test_datapath_matches_raw_headers();
     test_disorder_pos2_emits_exact_reverse_segments();
+    test_dial_survives_missing_rst_rule();
     if (failures) { return 1; }
     puts("raw: checksum, connection-owned receives and concurrent ports passed (no network)");
     return 0;

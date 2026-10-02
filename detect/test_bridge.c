@@ -149,6 +149,21 @@ int main(void)
         answer.hit.decoy = NULL; answer.hit.decoy_len = 0;
     }
 
+    /* A raw layer that failed its own self-check is a LOCAL defect, not a
+     * DPI property (spec §9.9): the original search did not run, so the
+     * adapter must not claim it, and the scheduler may ask its datapath
+     * questions instead of failing the task. */
+    memset(&answer, 0, sizeof answer);
+    answer.verdict = D2K_DV_OPAQUE;
+    answer.raw_selftest_failed = 1;
+    r = measure();
+    CHECK(r.verdict == D2K_V_OPAQUE && !r.have_arm && !r.owns_search);
+    answer.raw_selftest_failed = 0;
+    answer.raw_usable = 1;
+    r = measure();
+    CHECK(r.verdict == D2K_V_OPAQUE && r.owns_search); /* search ran, found nothing */
+    memset(&answer, 0, sizeof answer);
+
     memset(&p, 0, sizeof p);
     p.ttl = 8;
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) == 0);
