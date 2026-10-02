@@ -151,7 +151,8 @@ extern d2k_sched_ver_fn  d2k_sched_rx_ver_hook;
 extern d2k_sched_ver_fn  d2k_sched_rx_gzip_ver_hook;
 /* Зонд с ALPN КЛИЕНТА для не-HTTP протокола (задача 37, F3): по умолчанию
  * d2k_verify_probe_alpn_on. Зовётся вместо остальных TCP-зондов, когда снимок
- * клиента — TLS 1.3 и его ALPN не HTTP (или ALPN нет вовсе). */
+ * клиента — TLS 1.3 с ЯВНЫМ не-HTTP ALPN, а замер доказал блок самого
+ * рукопожатия без обрыва объёма (см. client_alpn_nonhttp в sched.c). */
 typedef d2k_ver_result (*d2k_sched_alpn_ver_fn)(int use_fd, const char *ip, uint16_t port,
                                                 const char *sni, int deadline_ms,
                                                 size_t hello_wire,

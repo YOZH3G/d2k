@@ -807,15 +807,27 @@ typedef struct {
 } task;
 
 /* ПРОТОКОЛ КЛИЕНТА — НЕ HTTP (задача 37, F3). Снимок TLS 1.3 целиком, и в
-   его ALPN нет ни http/1.1, ни h2 (MQTT, XMPP… или ALPN нет вовсе): тогда
+   его ALPN явно назван протокол не HTTP (MQTT, XMPP…), без http/1.1 и h2: тогда
    HTTP-зонд спрашивал бы сервер на чужом языке. 1 — зонд берёт ALPN клиента
    (list/len), 0 — прежний HTTP-зонд. Неполный снимок — «не измерено», 0. */
+static int verdict_proves_block(d2k_verdict verdict);
 static int client_alpn_nonhttp(const task *t, uint8_t *list, size_t cap, size_t *len) {
     *len = 0;
     if (t->transport != 6 || t->ech_offer || t->measure_path[0] ||
         d2k_hello_shape(t->trig, t->trig_len) != D2K_SHAPE_MODERN) return 0;
+    /* ТОЛЬКО ПРИ ДОКАЗАННОМ БЛОКЕ САМОГО РУКОПОЖАТИЯ (раунд 2). Завершённое
+       рукопожатие доказывает работу плана лишь там, где без плана оно не
+       проходило: вердикт замера — блок на рукопожатии (или базовый вопрос
+       донора это показал), и обрыва объёма нет. Блок, доказанный объёмом
+       (TX- или RX-cut), рукопожатие пропускает и без плана, а его замер шёл
+       по HTTP — сервер HTTP говорит; там доказательство — RX/HTTP-путь. */
+    int handshake_blocked = verdict_proves_block(t->res.verdict) ||
+                            (t->own_first == 2 && t->res.base_blocked);
+    if (!handshake_blocked || t->vol.rx_cut || t->vol.verdict == D2K_VOL_CUT) return 0;
+    /* Только ЯВНЫЙ не-HTTP ALPN (mqtt…). Клиент без ALPN на HTTPS-порту —
+       обычный HTTP-клиент, и HTTP-зонд с ним совместим. */
     int rc = d2k_hello_alpn(t->trig, t->trig_len, list, cap, len);
-    if (rc < 0) { *len = 0; return 0; }
+    if (rc != 1 || *len == 0) { *len = 0; return 0; }
     return !d2k_alpn_is_http(list, *len);
 }
 

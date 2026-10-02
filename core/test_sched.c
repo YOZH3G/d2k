@@ -10149,6 +10149,67 @@ measured_test:
             d2k_sched_alpn_ver_hook = saved_alpn;
             tcp_answer = D2K_V_OPAQUE;
         }
+        /* F3, раунд 2: рукопожатие НЕ было заблокировано (CLEAR), блок
+           доказан обрывом объёма (RX-cut, мерился по HTTP — сервер говорит
+           HTTP). Рукопожатие тут проходит и без плана, и «доказательство
+           рукопожатием» было бы ложным подтверждением. Ни клиент без ALPN,
+           ни даже явный не-HTTP ALPN не уводят такое испытание с RX-пути. */
+        for (int variant = 0; variant < 2; variant++) {
+            d2k_sched_alpn_ver_fn saved_alpn = d2k_sched_alpn_ver_hook;
+            d2k_sched_alpn_ver_hook = stub_alpn_ver;
+            d2k_catalog c = {0};
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            tcp_answer = D2K_V_CLEAR; tcp_owns_search = tcp_found_arm = 0;
+            vol_answer = D2K_VOL_PASSED; vol_rx_cut = 1;
+            ver_answer = D2K_VER_HANDSHAKE; ver_fail_first = 0;
+            tcp_calls = ver_calls = alpn_ver_calls = 0;
+            const char *nm = variant ? "rxcut-mqtt.example" : "rxcut-noalpn.example";
+            uint16_t cport = (uint16_t)(42441 + variant);
+            ver_answer_port = cport;
+            d2k_ev sh;
+            CHECK(tls_shape_event(&sh, nm, D2K_SHAPE_MODERN) == 0, "t37/F3r2: снимок");
+            uint8_t list[256]; size_t ll = 0;
+            CHECK(d2k_hello_alpn(sh.shape, sh.shape_len, list, sizeof list, &ll) == 1 && ll == 12,
+                  "t37/F3r2: ALPN профиля");
+            for (size_t i = 0; ll == 12 && i + 18 <= sh.shape_len; i++) {
+                /* тип 0x0010, длина 14, список 12 */
+                if (sh.shape[i] == 0x00 && sh.shape[i + 1] == 0x10 && sh.shape[i + 2] == 0 &&
+                    sh.shape[i + 3] == 14 && !memcmp(sh.shape + i + 6, list, 12)) {
+                    static const uint8_t mqtt[12] = { 4,'m','q','t','t', 6,'m','q','t','t','v','5' };
+                    if (variant) memcpy(sh.shape + i + 6, mqtt, 12);
+                    else { sh.shape[i] = 0x0a; sh.shape[i + 1] = 0x0a; } /* GREASE: ALPN нет */
+                    break;
+                }
+            }
+            int arc = d2k_hello_alpn(sh.shape, sh.shape_len, list, sizeof list, &ll);
+            CHECK(variant ? (arc == 1 && !d2k_alpn_is_http(list, ll)) : arc == 0,
+                  "t37/F3r2: снимок не переписан");
+            drain(); forget_sent();
+            d2k_ev h = ev_hello(6, cport, nm); d2k_sched_event(s, &h);
+            d2k_sched_event(s, &sh);
+            d2k_ev su = ev_suspect(6, cport); d2k_sched_event(s, &su);
+            for (int i = 0; i < 20; i++) {
+                spin(s, 100);
+                d2k_ev ap = ev_applied(6, cport); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            CHECK(tcp_calls == 1 && ver_calls >= 1,
+                  "t37/F3r2: RX-cut после CLEAR не дошёл до испытаний обычным путём");
+            CHECK(alpn_ver_calls == 0,
+                  "t37/F3r2: при незаблокированном рукопожатии позван зонд «рукопожатием»");
+            CHECK(!said("на уровне рукопожатия"),
+                  "t37/F3r2: план подтверждён рукопожатием, которое проходит и без него");
+            for (size_t bi = 0; bi < c.n_boxes; bi++)
+                for (size_t j = 0; j < c.boxes[bi].n_binds; j++)
+                    CHECK(c.boxes[bi].binds[j].verified_by != D2K_VERBY_PROBE_HANDSHAKE,
+                          "t37/F3r2: привязка записана уровнем рукопожатия");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_alpn_ver_hook = saved_alpn;
+            vol_rx_cut = 0; tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+        }
         if (measured_only) { goto voice_only_done; }
     }
 
