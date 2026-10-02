@@ -3417,6 +3417,23 @@ static const d2k_cat_plan *area_plan(const d2k_sched *s, const installed_area *a
     return NULL;
 }
 
+/* Собственное подтверждённое точное решение цели в этом контексте (имя,
+ * транспорт, семейство адресов, форма) — любым планом. Помеченная к
+ * перепроверке привязка (задача 21) снята с провода и не считается. */
+static int own_exact_confirmed(const d2k_catalog *cat, const char *name,
+                               const d2k_group_key *key) {
+    for (size_t bi = 0; bi < cat->n_boxes; bi++)
+        for (size_t j = 0; j < cat->boxes[bi].n_binds; j++) {
+            const d2k_cat_binding *bd = &cat->boxes[bi].binds[j];
+            if (bd->enabled && bd->level >= 3 && !bd->recheck_since &&
+                !strcmp(bd->kind, "name") && !strcmp(bd->target, name) &&
+                (bd->transport ? bd->transport : 6) == key->transport &&
+                (bd->family ? bd->family : 4) == key->family &&
+                bd->shape == key->shape) return 1;
+        }
+    return 0;
+}
+
 /* Diagnostic paths/origins are proof context, not visible packet fields.
  * Never pick an arbitrary plan when two proofs collide on a wire key. */
 static int desired_area(const d2k_sched *s, size_t index, installed_area *a) {
@@ -3438,17 +3455,11 @@ static int desired_area(const d2k_sched *s, size_t index, installed_area *a) {
         const d2k_group_observation *v = &g->observations[index-g->n_groups];
         if (!(v->evidence & (D2K_GROUP_DIRECT_CLEAR | D2K_GROUP_PLAN_FAILED))) return 0;
         if (!(v->evidence & D2K_GROUP_DIRECT_CLEAR)) {
-            for(size_t bi=0;bi<s->cat->n_boxes;bi++)
-                for(size_t j=0;j<s->cat->boxes[bi].n_binds;j++) {
-                    const d2k_cat_binding *bd=&s->cat->boxes[bi].binds[j];
-                    /* Помеченная к перепроверке (снята с провода) не
-                       отменяет исключение по провалу плана (задача 21). */
-                    if(bd->enabled && bd->level>=3 && !bd->recheck_since &&
-                       !strcmp(bd->kind,"name") &&
-                       !strcmp(bd->target,v->name) && bd->transport==v->key.transport &&
-                       bd->family==v->key.family && bd->shape==v->key.shape &&
-                       strcmp(bd->plan_id,v->plan_id)) return 0;
-                }
+            /* Исключение семейства снимает УНАСЛЕДОВАННЫЙ план. Собственное
+               подтверждённое точное решение участника — любым планом, и тем
+               же, что у семейства, — оно не гасит (задача 22, §7/§9.10):
+               BYPASS в датапате отключил бы его для всех клиентов. */
+            if (own_exact_confirmed(s->cat, v->name, &v->key)) return 0;
             int still_elected=0;
             for(size_t i=0;i<g->n_groups;i++)
                 if(d2k_group_key_same(&v->key,&g->groups[i].key) &&
@@ -5358,6 +5369,11 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
                 if (g->key.transport != ev->transport || g->key.family != (ev->family ? ev->family : 4) ||
                     g->key.shape != ev->client_shape ||
                     !d2k_domain_member(name, g->suffix) || memcmp(id, ev->plan_id, sizeof id)) continue;
+                /* У участника своё подтверждённое точное решение: отказ
+                   исполнения у одного клиента — свойство его потока, а не
+                   улика против плана для семейства (§7). Не записываем
+                   провал группы: он сделал бы голос участника устаревшим. */
+                int own = own_exact_confirmed(s->cat, name, &g->key);
                 d2k_ev suspicion = *ev;
                 suspicion.kind = D2K_EV_SUSPECT;
                 suspicion.code = D2K_SUSPECT_REPEAT;
@@ -5370,7 +5386,7 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
                 snprintf(failed.plan_id, sizeof failed.plan_id, "%s", g->plan_id);
                 failed.key = g->key; failed.evidence = D2K_GROUP_PLAN_FAILED;
                 failed.at = wall_s(s, s->now_ms);
-                if (d2k_group_learn(s->cat->groups, &failed) > 0) {
+                if (!own && d2k_group_learn(s->cat->groups, &failed) > 0) {
                     s->cat->revision++; s->sync_pending = 1;
                 }
                 if (!task_of(s, name, ev->transport, ev->family)) (void)on_suspect(s, &suspicion);

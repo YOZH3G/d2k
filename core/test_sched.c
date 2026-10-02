@@ -1584,6 +1584,47 @@ int main(int argc, char **argv) {
               !d2k_group_match(c.groups, "unfit.googlevideo.com", &key) &&
               d2k_group_match(c.groups, "rr-other.googlevideo.com", &key),
               "runtime failure exception survives restore without losing siblings");
+        /* Task 22: a family exception never overrides a member's own exact
+           confirmed plan. Settle pending areas first, then fail the group
+           plan for rr-b, which holds its own confirmed exact binding. */
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        for(unsigned i=0;i<8;i++) {
+            ack.code=last_area_command(); if(!ack.code) break;
+            ack.num=1u<<8; area_ack_id(&ack); d2k_sched_event(s,&ack);
+            forget_sent(); sync_out(s);
+        }
+        {
+            const d2k_cat_binding *own = binding_of(&c, "rr-b.googlevideo.com", 6);
+            CHECK(own && own->level >= 3 && !own->recheck_since && own->shape == key.shape &&
+                  !strcmp(own->plan_id, g->plan_id),
+                  "fixture: member holds own exact confirmed binding with the group plan");
+            d2k_group_observation own_fail = {0};
+            strcpy(own_fail.name, "rr-b.googlevideo.com"); strcpy(own_fail.plan_id, g->plan_id);
+            own_fail.key = key; own_fail.evidence = D2K_GROUP_PLAN_FAILED; own_fail.at = g->at+2;
+            CHECK(d2k_group_learn(c.groups, &own_fail) > 0, "member failure of group plan recorded");
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            CHECK(!sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0),
+                  "family bypass is never installed over a member's own exact confirmed plan");
+            /* A foreign client's permanent execution refusal of the group
+               plan on a member with its own confirmed exact plan is about
+               that client's flow, not evidence against the plan (§7): it must
+               not stale the member's vote nor exclude it from the family. */
+            h = ev_hello(6, 40309, "rr-a.googlevideo.com"); d2k_sched_event(s, &h);
+            d2k_ev foreign = h; foreign.kind = D2K_EV_REFUSED; foreign.code = D2K_REFUSE_TOO_LONG;
+            foreign.client_shape = 1;
+            memset(foreign.plan_id, 0, sizeof foreign.plan_id);
+            memcpy(foreign.plan_id, g->plan_id, strlen(g->plan_id));
+            d2k_sched_event(s, &foreign);
+            int stale_vote = 0;
+            for (size_t i = 0; i < c.groups->n_observations; i++)
+                if (!strcmp(c.groups->observations[i].name, "rr-a.googlevideo.com") &&
+                    (c.groups->observations[i].evidence & D2K_GROUP_PLAN_FAILED)) stale_vote = 1;
+            CHECK(d2k_group_match(c.groups, "rr-a.googlevideo.com", &key) && !stale_vote,
+                  "foreign refusal on a member with own exact plan records no family failure");
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            CHECK(!sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0),
+                  "foreign refusal installs no bypass over own exact plan");
+        }
         d2k_sched_free(s);
         s=d2k_sched_new(&c,sv[0],0x2d); spin(s,1);
         tcp_block_until_stop=1;

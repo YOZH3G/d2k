@@ -80,7 +80,22 @@ int main(void) {
         CHECK(!d2k_plantab_set_name_shaped(t, child, sizeof child-1, 3, exact, 1), "exact override");
         CHECK(d2k_plantab_find(t, child, sizeof child-1, 0, 4, 1) == exact, "exact overrides suffix");
         CHECK(!d2k_plantab_set_bypass_family(t, child, sizeof child-1, 6, 1, 4), "install exact bypass");
-        CHECK(!d2k_plantab_find(t, child, sizeof child-1, 0, 5, 1), "bypass prevents suffix and exact plan");
+        /* Task 22: an exception learnt for the family never overrides the
+           member's own exact entry of the observed shape (§7/§9.10). */
+        CHECK(d2k_plantab_find(t, child, sizeof child-1, 0, 5, 1) == exact,
+              "exact name entry of observed shape wins over family bypass");
+        {
+            const uint8_t other[] = "rr-other.googlevideo.com";
+            CHECK(d2k_plantab_find(t, other, sizeof other-1, 0, 5, 1) == group,
+                  "sibling without exception still inherits");
+            CHECK(!d2k_plantab_set_bypass_family(t, other, sizeof other-1, 6, 1, 4), "sibling bypass");
+            CHECK(!d2k_plantab_find(t, other, sizeof other-1, 0, 5, 1),
+                  "bypass without exact entry prevents suffix plan");
+            CHECK(!d2k_plantab_find(t, child, sizeof child-1, 0, 5, 2),
+                  "exact TLS13 entry does not leak to TLS12 through bypass precedence");
+            CHECK(d2k_plantab_del_bypass_family(t, other, sizeof other-1, 6, 1, 4) == 1,
+                  "remove sibling bypass");
+        }
         CHECK(!d2k_plantab_set_name_probe(t, child, sizeof child-1, 5, trial, 1, 123), "trial setup");
         CHECK(d2k_plantab_find_sport(t, child, sizeof child-1, 0, 6, 1, 123) == trial, "trial overrides bypass");
         CHECK(d2k_plantab_del_bypass_family(t, child, sizeof child-1, 6, 1, 4) == 1, "remove bypass");
@@ -93,6 +108,13 @@ int main(void) {
         CHECK(!d2k_plantab_has_ech_target(t, NULL, 0, NULL, 6, 0), "ECH group never inferred from IP");
         CHECK(!d2k_plantab_set_bypass_family(t, child, sizeof child-1, 6, 6, 6), "ECH bypass");
         CHECK(!d2k_plantab_has_ech_target(t, child, sizeof child-1, NULL, 6, 0), "ECH exception suppresses hold");
+        {
+            d2k_plan *own_ech = mkplan();
+            CHECK(!d2k_plantab_set_name_family(t, child, sizeof child-1, 10, own_ech,
+                                               D2K_PLAN_SHAPE_ECH_TCP, 0, 6), "own exact ECH entry");
+            CHECK(d2k_plantab_has_ech_target(t, child, sizeof child-1, NULL, 6, 0),
+                  "own exact ECH entry keeps hold despite family bypass");
+        }
         d2k_plantab_free(t);
     }
     {

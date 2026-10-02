@@ -265,7 +265,9 @@ int d2k_plantab_has_ech_target(const d2k_plantab *t, const uint8_t *name,
         const entry *e = &t->v[i];
         if (e->family != family || e->shape != D2K_PLAN_SHAPE_ECH_TCP ||
             (e->only_sport && e->only_sport != sport_be)) continue;
-        if (!e->only_sport && area_bypassed(t, name, len, e->shape, family)) continue;
+        /* Своя точная запись имени исключением семейства не гасится. */
+        if (!e->only_sport && e->kind != KEY_NAME &&
+            area_bypassed(t, name, len, e->shape, family)) continue;
         if (e->kind == KEY_NAME && name && len &&
             name_eq(e->name, e->name_len, name, len)) return 1;
         if (e->kind == KEY_ADDR && addr &&
@@ -292,7 +294,8 @@ int d2k_plantab_stream_candidate_target(const d2k_plantab *t, const uint8_t *nam
     for (size_t i = 0; i < t->used; i++) {
         const entry *e = &t->v[i];
         if (e->family != family) { continue; }
-        if (!e->only_sport && area_bypassed(t, name, len, e->shape, family)) continue;
+        if (!e->only_sport && e->kind != KEY_NAME &&
+            area_bypassed(t, name, len, e->shape, family)) continue;
         if (!d2k_plan_stream_input(e->plan) ||
             (e->only_sport && e->only_sport != sport_be)) { continue; }
         if (e->kind == KEY_ADDR && addr &&
@@ -991,9 +994,12 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
                 return NULL;
             }
         }
-        /* Сперва запись СВОЕЙ формы: у имени их может быть несколько. */
-        if (area_bypassed(t, name, len, seen_shape, family)) return NULL;
+        /* Сперва запись СВОЕЙ формы: у имени их может быть несколько.
+           Точная запись имени наблюдаемой формы — собственное подтверждённое
+           решение цели — сильнее исключения семейства (BYPASS): исключение
+           снимает унаследованный план, а не чужой точный (Task 22, §7). */
         e = find_name_shape(t, name, len, seen_shape, family);
+        if (!e && area_bypassed(t, name, len, seen_shape, family)) return NULL;
         if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP)
             e = find_name_shape(t, name, len, D2K_PLAN_SHAPE_MODERN, family);
         if (!e) {
