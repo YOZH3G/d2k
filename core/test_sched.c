@@ -524,6 +524,55 @@ static int quic_shape(d2k_ev *sh, const char *name) {
                                  name, sh->shape, sizeof sh->shape, &sh->shape_len);
 }
 
+/* ПЕРВАЯ ИЗ ДВУХ ДАТАГРАММ ПРИВЕТСТВИЯ: CRYPTO с нуля, имя в нём целиком,
+   но ClientHello обрезан сразу за server_name — ровно то, что датапат отдаёт
+   снимком, когда браузер с постквантовым key_share шлёт приветствие двумя
+   Initial. d2k_quic_sni его принимает, d2k_quic_client_hello — нет. */
+static int quic_shape_first_of_two(d2k_ev *sh, const char *name) {
+    d2k_ev whole;
+    if (quic_shape(&whole, name) != 0) { return -1; }
+    uint8_t ch[2048];
+    size_t ch_len = 0;
+    if (d2k_quic_client_hello(whole.shape, whole.shape_len, ch, sizeof ch, &ch_len) != 0) {
+        return -1;
+    }
+    size_t nl = strlen(name), at = 0;
+    while (at + nl <= ch_len && memcmp(ch + at, name, nl) != 0) { at++; }
+    size_t cut = at + nl + 4;
+    if (at + nl > ch_len || cut >= ch_len) { return -1; }
+    uint8_t body[D2K_QW_MAX_DGRAM];
+    size_t b = 0;
+    body[b++] = 0x06;                                   /* CRYPTO */
+    b += d2k_qw_varint_write(body + b, sizeof body - b, 0);
+    b += d2k_qw_varint_write(body + b, sizeof body - b, cut);
+    memcpy(body + b, ch, cut);
+    b += cut;
+    uint8_t dcid[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t sec[32];
+    d2k_qw_keys k;
+    if (d2k_qw_initial_secret(D2K_QW_V1, dcid, sizeof dcid, D2K_QW_CLIENT, sec) != 0 ||
+        d2k_qw_keys_from_secret(D2K_QW_V1, sec, &k) != 0) { return -1; }
+    size_t pn_len = 1, hlen = 0;
+    uint8_t pkt[D2K_QW_MAX_DGRAM];
+    for (int i = 0; i < 4; i++) {
+        hlen = d2k_qw_long_hdr(pkt, sizeof pkt, D2K_QW_V1, D2K_QW_LT_INITIAL,
+                               dcid, sizeof dcid, NULL, 0, pn_len, b);
+        if (hlen == 0) { return -1; }
+        size_t total = hlen + pn_len + b + 16;
+        if (total >= 1250) { break; }
+        memset(body + b, 0, 1250 - total);
+        b += 1250 - total;
+    }
+    hlen = d2k_qw_long_hdr(pkt, sizeof pkt, D2K_QW_V1, D2K_QW_LT_INITIAL,
+                           dcid, sizeof dcid, NULL, 0, pn_len, b);
+    memset(sh, 0, sizeof *sh);
+    sh->kind = D2K_EV_SHAPE;
+    sh->transport = 17;
+    sh->shape_len = d2k_qw_seal(&k, 1, pkt, hlen, 0, pn_len, body, b,
+                                sh->shape, sizeof sh->shape);
+    return sh->shape_len ? 0 : -1;
+}
+
 /* Обмен с ВНЕШНИМ типом записи 23 в маске встреченных типов
    (d2k_ev_outer_appdata). Порогом успеха это БОЛЬШЕ НЕ является: в TLS 1.3 тем
    же типом едет второй полёт рукопожатия (RFC 8446 §5.2). Наблюдение не
@@ -3126,6 +3175,44 @@ admission_only_run:
     }
 
 shape_test:
+    /* СНИМОК — ОДНА ИЗ ДВУХ ДАТАГРАММ ПРИВЕТСТВИЯ (браузер с постквантовым
+       key_share). Датапат отдаёт датаграмму, на которой сборка дала имя, и
+       целого ClientHello в ней нет: d2k_quic_hello_rename отказывает. Контроль
+       обязан всё равно быть — собственный Initial донора с именем приманки
+       (probe.go:280-321 всегда строит свой), а не пустота с «нет контрольного
+       имени» вместо опыта. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_calls = quic_calls = 0;
+        quic_last_ctl[0] = '\0';
+        d2k_ev sh;
+        char got[256];
+        CHECK(quic_shape_first_of_two(&sh, "две.датаграммы.example") == 0 &&
+              d2k_quic_sni(sh.shape, sh.shape_len, got, sizeof got) == 0 &&
+              strcmp(got, "две.датаграммы.example") == 0,
+              "первая датаграмма приветствия не собралась или не даёт имя");
+        uint8_t probe[2048];
+        size_t probe_len = 0;
+        CHECK(d2k_quic_hello_rename(sh.shape, sh.shape_len, "disk.rzd.ru",
+                                    probe, sizeof probe, &probe_len) != 0,
+              "половина приветствия переименовалась — стенд не воспроизводит разрыв");
+        d2k_sched_event(s, &sh);
+        d2k_ev h = ev_hello(17, 40071, "две.датаграммы.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40071);
+        CHECK(d2k_sched_event(s, &su) == 1, "подозрение по QUIC не завело задачу");
+        settle(s);
+        CHECK(quic_calls == 1, "QUIC-поиск по снимку из двух датаграмм не запущен");
+        CHECK(strcmp(quic_last_ctl, "disk.rzd.ru") == 0,
+              "контроль пуст/не QUIC, когда снимок не в одной датаграмме");
+        CHECK(said("контроль — PROFILE"),
+              "контроль из собственного Initial не помечен PROFILE в трассе");
+        d2k_sched_free(s);
+    }
+
     /* A late TCP snapshot must stop a search based on the synthetic profile,
        then start exactly one search with the captured ClientHello. */
     {
