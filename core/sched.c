@@ -79,29 +79,52 @@
    роутера есть смысла держать: каждый занят сетевым ожиданием, не счётом. */
 #define SCHED_MAX_TASKS 64
 #define SCHED_COOLDOWN_SLOTS 128
-/* Одновременных сетевых замеров (задача 29). Замер почти не считает — он
-   ждёт сеть (поле 02.10.2026: KN-1811 занят на 15–22 %), поэтому предел
-   следует СВОБОДНОМУ процессору, а не зашитому числу: при свободных
-   ≥ 30 % — min(2×ядра, 8); ниже 15 % новые не стартуют, но один активный
-   разрешён всегда; между порогами — гистерезис: удерживается уровень входа в
-   полосу (освободившиеся места пополняются, роста нет), идущие не
-   прерываются никогда. Нет данных о процессоре (нет /proc/stat) —
-   прежний предел 2 (145e1da). Пороги — решение владельца, не замер. */
+/* Одновременных сетевых замеров (задачи 29, 38). Замер почти не считает —
+   он ждёт сеть, — но держит поток (стек 1 МиБ адресного пространства),
+   запись conntrack на каждый зонд и пробный план в датапате. Поэтому предел
+   не формула от ядер (задача 29 ставила min(2×ядра, 8) — оценку, не
+   замер; поле 02.10.2026: KN-1811 свободен на 80–90 %, а замеров не больше
+   4), а подстройка по измеренному запасу (AIMD, решение владельца: «не
+   ограничивать искусственно, но с разумным буфером»):
+   - рост на 1 после запуска, заполнившего предел (или при ждущей очереди
+     и полном пределе), — не чаще раза за снимок ресурсов, и только если
+     ВСЕ ресурсы с запасом: процессор свободен ≥ 40 %, MemAvailable ≥
+     max(32 МБ, 20 % MemTotal), conntrack занят < 60 %;
+   - снижение вдвое на снимке, где не хватает ЛЮБОГО: процессор свободен
+     < 25 %, память ниже запаса, conntrack ≥ 60 %; не ниже 1 — один замер
+     разрешён всегда; идущие не прерываются никогда;
+   - между 25 и 40 % свободного процессора предел держится;
+   - сверху — только реальные ёмкости (SCHED_MEASURE_SLOTS);
+   - нет данных о процессоре или памяти (нет /proc, macOS) — прежний
+     предел 2 (145e1da); нет conntrack — он не ограничивает.
+   Пороги — решение владельца (запас под трафик, датапат и NDM), не замер. */
 #define SCHED_DEFAULT_ACTIVE_MEASUREMENTS 2
-#define SCHED_MEASURE_CAP 8
-#define SCHED_CPU_START_FREE_U 300000 /* 30 % в миллионных долях */
-#define SCHED_CPU_STOP_FREE_U  150000 /* 15 % */
+#define SCHED_CPU_GROW_FREE_U   400000 /* 40 % в миллионных долях */
+#define SCHED_CPU_SHRINK_FREE_U 250000 /* 25 % */
+#define SCHED_MEM_RESERVE_MIN_KB (32u * 1024) /* 32 МБ */
+#define SCHED_MEM_RESERVE_PCT   20
+#define SCHED_CT_LIMIT_PCT      60
 #define SCHED_CPU_SAMPLE_MS 1000
 #define SCHED_CPU_EWMA_MS 10000
 #define SCHED_LIMIT_LOG_STABLE_MS 10000
+/* Ёмкость пробных планов датапата. Пробная запись имени живёт в общей
+   таблице планов, адресный опыт — в своей таблице той же ёмкости; обе
+   заводятся по числу потоков d2kd (--flows, по умолчанию 2048 — d2kd.c;
+   установка его не меняет). Контроллер этой ёмкости у датапата не
+   спрашивает (такого запроса в протоколе нет), поэтому здесь —
+   задокументированная константа. Задача держит одну пробную запись за раз
+   (SET_*_PROBE на том же порту/потоке заменяет прежнюю). */
+#define SCHED_DP_TRIAL_SLOTS 2048
+#define SCHED_MEASURE_SLOTS \
+    (SCHED_MAX_TASKS < SCHED_DP_TRIAL_SLOTS ? SCHED_MAX_TASKS : SCHED_DP_TRIAL_SLOTS)
 #define SCHED_MAX_QUEUED_MEASUREMENTS 16
-/* Пауза между стартами из очереди. Сохранена и при новом пределе: занятость
-   процессора снимается раз в секунду и сглажена, и выпуск очереди по одному
-   на снимок даёт каждому следующему старту судиться по нагрузке, в которую
-   уже вошёл предыдущий, — а не восьми стартам по одному устаревшему снимку.
-   Свежее подозрение при уже идущем замере (launch_or_queue) паузой не
-   ограничено: всплеск живого трафика заполняет предел сразу. */
-#define SCHED_START_GAP_MS 1000
+/* Темп запуска (задача 38): не больше одного нового замера за 250 мс —
+   и из очереди, и по свежему подозрению при уже идущем замере, — чтобы
+   подъём предела не давал всплесков SYN/Initial. Прежняя секунда (задача
+   29) нужна была, чтобы каждый выпуск судился по свежему снимку; теперь
+   свежий снимок требуется для РОСТА предела (не чаще раза за снимок), а не
+   для каждого старта в пределах уже измеренного. */
+#define SCHED_START_GAP_MS 250
 
 /* Жизнь задачи. Дольше — и задача занимает место, давно перестав быть про
    актуальное состояние линии. */
@@ -425,6 +448,68 @@ static int cpu_read_proc(uint64_t *busy, uint64_t *total, unsigned *cores) {
     return 0;
 }
 d2k_sched_cpu_fn d2k_sched_cpu_hook = cpu_read_proc;
+
+/* Значение строки «Ключ:   число kB» из текста /proc/meminfo. */
+static int meminfo_field(const char *text, const char *key, uint64_t *kb) {
+    size_t kl = strlen(key);
+    for (const char *p = text; p && *p; ) {
+        if (strncmp(p, key, kl) == 0 && p[kl] == ':') {
+            const char *v = p + kl + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            if (*v < '0' || *v > '9') return -1;
+            char *end = NULL;
+            errno = 0;
+            unsigned long long x = strtoull(v, &end, 10);
+            if (errno || end == v) return -1;
+            *kb = (uint64_t)x;
+            return 0;
+        }
+        p = strchr(p, '\n');
+        if (p) p++;
+    }
+    return -1;
+}
+
+int d2k_sched_meminfo_parse(const char *text, uint64_t *avail_kb, uint64_t *total_kb) {
+    if (!text || !avail_kb || !total_kb) return -1;
+    uint64_t av = 0, tot = 0;
+    if (meminfo_field(text, "MemTotal", &tot) || meminfo_field(text, "MemAvailable", &av) ||
+        tot == 0)
+        return -1;
+    *avail_kb = av;
+    *total_kb = tot;
+    return 0;
+}
+
+static int mem_read_proc(uint64_t *avail_kb, uint64_t *total_kb) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return d2k_sched_meminfo_parse(buf, avail_kb, total_kb);
+}
+d2k_sched_mem_fn d2k_sched_mem_hook = mem_read_proc;
+
+static int read_u64_file(const char *path, uint64_t *v) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    unsigned long long x = 0;
+    int ok = fscanf(f, "%llu", &x) == 1;
+    fclose(f);
+    if (!ok) return -1;
+    *v = (uint64_t)x;
+    return 0;
+}
+
+static int ct_read_proc(uint64_t *count, uint64_t *max) {
+    if (read_u64_file("/proc/sys/net/netfilter/nf_conntrack_count", count) ||
+        read_u64_file("/proc/sys/net/netfilter/nf_conntrack_max", max) || *max == 0)
+        return -1;
+    return 0;
+}
+d2k_sched_ct_fn d2k_sched_ct_hook = ct_read_proc;
 
 /* --------------------------------------------------------------------
  * Состояние задачи.
@@ -919,17 +1004,25 @@ struct d2k_sched {
     int64_t      last_measure_start_ms;
     int          measure_start_seen;
 
-    /* Занятость процессора (задача 29): последний снимок /proc/stat (или
-       крючка), сглаженная доля свободного времени в миллионных и текущий
-       предел одновременных замеров. */
+    /* Ресурсы замеров (задачи 29, 38): последний снимок /proc/stat (или
+       крючка), сглаженная доля свободного процессора в миллионных, память
+       и conntrack последнего снимка; предел одновременных замеров (AIMD) и
+       его журнал. */
     int          cpu_tried, cpu_have_prev, cpu_valid, cpu_logged_valid;
-    int          cpu_band;          /* свободно 15–30 %: уровень удерживается */
     int64_t      cpu_try_ms;
-    int64_t      limit_since_ms;    /* когда предел принял текущее значение */
-    size_t       limit_logged;      /* последний названный в журнале предел */
     uint64_t     cpu_prev_busy, cpu_prev_total;
     int64_t      cpu_free_u;
     unsigned     cpu_cores;
+    int          mem_valid, ct_valid;
+    uint64_t     mem_avail_kb, mem_total_kb;
+    uint64_t     ct_count, ct_max;
+    uint64_t     res_seq;           /* номер снимка ресурсов */
+    uint64_t     limit_seq;         /* снимок, по которому предел менялся */
+    int          grow_pending;      /* запуск заполнил предел — рост к снимку */
+    unsigned     limiter;           /* во что упёрлись (MEAS_LIM_*) */
+    int64_t      limit_since_ms;    /* когда (предел, причина) приняли значение */
+    size_t       limit_logged;      /* последний названный в журнале предел */
+    unsigned     limiter_logged;    /* и причина */
     size_t       meas_limit;
 
     /* Проход по каталогу, разложенный на порции (см. d2k_sched_sync_step):
@@ -3535,6 +3628,9 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
 static size_t measurements_in_flight(const d2k_sched *s);
 static size_t queued_measurements(const d2k_sched *s);
 static int cpu_free_pct(const d2k_sched *s);
+static uint64_t mem_reserve_kb(const d2k_sched *s);
+static int ct_pct(const d2k_sched *s);
+static void limiter_text(unsigned lm, char *buf, size_t n);
 
 d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     if (!cat) { errno = EINVAL; return NULL; }
@@ -3763,14 +3859,31 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
        только в лог: человек смотрит панель, и «подтверждено N» без «а вот
        столько раз план не достался клиенту» читается как «обход работает»
        (седьмая находка лаборатории 13.09.2026). */
-    /* Предел замеров (задача 29): сколько идёт, сколько можно, сколько ждёт
-       и по какой нагрузке; null — данных о процессоре нет (прежний предел). */
+    /* Предел замеров (задачи 29, 38): сколько идёт, сколько можно, сколько
+       ждёт и по какой нагрузке; null — данных нет (прежний предел). */
     fprintf(f, "  \"measurements\": {\"active\": %zu, \"limit\": %zu, \"queued\": %zu, ",
             measurements_in_flight(s), s->meas_limit, queued_measurements(s));
     if (s->cpu_valid)
-        fprintf(f, "\"cores\": %u, \"free_pct\": %d},\n", s->cpu_cores, cpu_free_pct(s));
+        fprintf(f, "\"cores\": %u, \"free_pct\": %d, ", s->cpu_cores, cpu_free_pct(s));
     else
-        fputs("\"cores\": null, \"free_pct\": null},\n", f);
+        fputs("\"cores\": null, \"free_pct\": null, ", f);
+    /* Задача 38: память, conntrack и во что упёрся предел; null — данных
+       нет (или упираться не во что). */
+    if (s->mem_valid)
+        fprintf(f, "\"mem_avail_mb\": %llu, \"mem_total_mb\": %llu, ",
+                (unsigned long long)(s->mem_avail_kb / 1024),
+                (unsigned long long)(s->mem_total_kb / 1024));
+    else
+        fputs("\"mem_avail_mb\": null, \"mem_total_mb\": null, ", f);
+    if (s->ct_valid) fprintf(f, "\"conntrack_pct\": %d, ", ct_pct(s));
+    else fputs("\"conntrack_pct\": null, ", f);
+    if (s->limiter) {
+        char why[96];
+        limiter_text(s->limiter, why, sizeof why);
+        fprintf(f, "\"limited_by\": \"%s\"},\n", why);
+    } else {
+        fputs("\"limited_by\": null},\n", f);
+    }
     fprintf(f, "  \"targets\": %zu,\n  \"confirms\": %d,\n  \"probes_used\": %d,\n"
                "  \"client_unfit\": %u\n}\n",
             targets, s->confirms, s->probes_used, (unsigned)s->unfit_client);
@@ -4755,24 +4868,12 @@ static void quic_addr_start(d2k_sched *s, task *t) {
     (void)start_search(s, t);
 }
 
+static int meas_state(task_state st);
+
 static size_t measurements_in_flight(const d2k_sched *s) {
     size_t n = 0;
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        switch (s->tasks[i].state) {
-        case T_ASKING:
-        case T_PROPS_CONTACT:
-        case T_PROPS_WAIT:
-        case T_PLANNING:
-        case T_TRIAL_SETTLE:
-        case T_VERIFY:
-        case T_VERIFY_WAIT:
-        case T_VOICE_MEASURE:
-            n++;
-            break;
-        default:
-            break;
-        }
-    }
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++)
+        if (meas_state(s->tasks[i].state)) n++;
     return n;
 }
 
@@ -4784,19 +4885,29 @@ static size_t queued_measurements(const d2k_sched *s) {
     return n;
 }
 
-/* Снимок занятости раз в SCHED_CPU_SAMPLE_MS модельных часов и
-   экспоненциальное сглаживание с постоянной ~SCHED_CPU_EWMA_MS. Отказ
-   источника или откат счётчиков — «данных нет», прежний предел. */
-static void cpu_sample(d2k_sched *s, int64_t now_ms) {
-    if (s->cpu_tried && now_ms - s->cpu_try_ms < SCHED_CPU_SAMPLE_MS) return;
+/* Снимок ресурсов раз в SCHED_CPU_SAMPLE_MS модельных часов (задачи 29,
+   38). Процессор — экспоненциальное сглаживание с постоянной
+   ~SCHED_CPU_EWMA_MS; отказ источника или откат счётчиков — «данных нет».
+   Память и conntrack — значения снимка как есть: они отзываются на
+   прибавку замера сразу (поток, записи conntrack зондов), сглаживать их —
+   опоздать с ответом на нехватку. 1 — снят новый снимок. */
+static int res_sample(d2k_sched *s, int64_t now_ms) {
+    if (s->cpu_tried && now_ms - s->cpu_try_ms < SCHED_CPU_SAMPLE_MS) return 0;
     int64_t dt = now_ms - s->cpu_try_ms;
     s->cpu_tried = 1;
     s->cpu_try_ms = now_ms;
+    s->res_seq++;
+    uint64_t av = 0, tot = 0;
+    s->mem_valid = d2k_sched_mem_hook && d2k_sched_mem_hook(&av, &tot) == 0 && tot > 0;
+    if (s->mem_valid) { s->mem_avail_kb = av; s->mem_total_kb = tot; }
+    uint64_t cnt = 0, mx = 0;
+    s->ct_valid = d2k_sched_ct_hook && d2k_sched_ct_hook(&cnt, &mx) == 0 && mx > 0;
+    if (s->ct_valid) { s->ct_count = cnt; s->ct_max = mx; }
     uint64_t busy = 0, total = 0;
     unsigned cores = 0;
     if (!d2k_sched_cpu_hook || d2k_sched_cpu_hook(&busy, &total, &cores) != 0) {
         s->cpu_have_prev = s->cpu_valid = 0;
-        return;
+        return 1;
     }
     if (s->cpu_have_prev && total > s->cpu_prev_total && busy >= s->cpu_prev_busy &&
         busy - s->cpu_prev_busy <= total - s->cpu_prev_total) {
@@ -4816,58 +4927,146 @@ static void cpu_sample(d2k_sched *s, int64_t now_ms) {
     s->cpu_prev_total = total;
     s->cpu_have_prev = 1;
     s->cpu_cores = cores ? cores : 1;
+    return 1;
 }
 
-static size_t measure_cap(const d2k_sched *s) {
-    size_t cap = 2u * (size_t)(s->cpu_cores ? s->cpu_cores : 1);
-    return cap > SCHED_MEASURE_CAP ? SCHED_MEASURE_CAP : cap;
-}
+enum { MEAS_LIM_CPU = 1u, MEAS_LIM_MEM = 2u, MEAS_LIM_CT = 4u, MEAS_LIM_SLOTS = 8u };
+
+/* Подстройка возможна, только когда измерены процессор И память. */
+static int res_valid(const d2k_sched *s) { return s->cpu_valid && s->mem_valid; }
 
 static int cpu_free_pct(const d2k_sched *s) {
     return (int)((s->cpu_free_u + 5000) / 10000);
 }
 
-static void measure_limit_update(d2k_sched *s) {
-    size_t active = measurements_in_flight(s), lim;
-    if (!s->cpu_valid) {
-        lim = SCHED_DEFAULT_ACTIVE_MEASUREMENTS;
-    } else if (s->cpu_free_u >= SCHED_CPU_START_FREE_U) {
-        lim = measure_cap(s);
-    } else if (s->cpu_free_u < SCHED_CPU_STOP_FREE_U) {
-        lim = 1;
-    } else if (s->cpu_band) {
-        lim = s->meas_limit; /* уровень удерживается всё время полосы */
-    } else {
-        /* ГИСТЕРЕЗИС 15–30 %: удерживается уровень, достигнутый при входе в
-           полосу, — не выше прежнего предела и того, что уже шло, не ниже
-           одного. Освободившиеся места пополняются из очереди (уровень
-           держится), сверх него не растёт; идущие не прерываются. Вниз до 1
-           предел падает только ниже 15 %, вверх до 2×ядра — только от 30 %. */
-        lim = s->meas_limit < active ? s->meas_limit : active;
-        if (lim > measure_cap(s)) lim = measure_cap(s);
-        if (lim < 1) lim = 1;
+static uint64_t mem_reserve_kb(const d2k_sched *s) {
+    uint64_t r = s->mem_total_kb * SCHED_MEM_RESERVE_PCT / 100;
+    return r > SCHED_MEM_RESERVE_MIN_KB ? r : SCHED_MEM_RESERVE_MIN_KB;
+}
+
+static int mem_short(const d2k_sched *s) {
+    return s->mem_valid && s->mem_avail_kb < mem_reserve_kb(s);
+}
+
+static int ct_short(const d2k_sched *s) {
+    /* Счётчики conntrack — 32-битные в ядре: произведение в 64 битах
+       не переполняется. */
+    return s->ct_valid && s->ct_count * 100 >= s->ct_max * SCHED_CT_LIMIT_PCT;
+}
+
+static int ct_pct(const d2k_sched *s) {
+    return (int)(s->ct_count >= s->ct_max ? 100 : s->ct_count * 100 / s->ct_max);
+}
+
+static int meas_state(task_state st) {
+    switch (st) {
+    case T_ASKING:
+    case T_PROPS_CONTACT:
+    case T_PROPS_WAIT:
+    case T_PLANNING:
+    case T_TRIAL_SETTLE:
+    case T_VERIFY:
+    case T_VERIFY_WAIT:
+    case T_VOICE_MEASURE:
+        return 1;
+    default:
+        return 0;
     }
-    s->cpu_band = s->cpu_valid && s->cpu_free_u >= SCHED_CPU_STOP_FREE_U &&
-                  s->cpu_free_u < SCHED_CPU_START_FREE_U;
-    if (lim != s->meas_limit) {
+}
+
+/* Реальная ёмкость (задача 38): сколько замеров вообще может идти сейчас —
+   ячейки задач, свободные или уже занятые замером либо очередью (ячейку,
+   где цель наблюдается или отдыхает, замер не займёт), и не больше
+   пробных слотов датапата. */
+static size_t measure_slots(const d2k_sched *s) {
+    size_t n = 0;
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        task_state st = s->tasks[i].state;
+        if (st == T_FREE || st == T_QUEUED || meas_state(st)) n++;
+    }
+    return n < SCHED_MEASURE_SLOTS ? n : SCHED_MEASURE_SLOTS;
+}
+
+static void limiter_text(unsigned lm, char *buf, size_t n) {
+    static const struct { unsigned bit; const char *name; } names[] = {
+        { MEAS_LIM_CPU, "процессор" }, { MEAS_LIM_MEM, "память" },
+        { MEAS_LIM_CT, "conntrack" }, { MEAS_LIM_SLOTS, "слоты" },
+    };
+    size_t at = 0;
+    buf[0] = '\0';
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        if (!(lm & names[i].bit)) continue;
+        int w = snprintf(buf + at, n - at, "%s%s", at ? " / " : "", names[i].name);
+        if (w < 0 || (size_t)w >= n - at) break;
+        at += (size_t)w;
+    }
+}
+
+/* Запуск, заполнивший предел, — спрос дошёл до предела: рост решит
+   следующий снимок ресурсов, который уже видит этот замер. */
+static void measure_started(d2k_sched *s) {
+    if (measurements_in_flight(s) >= s->meas_limit) s->grow_pending = 1;
+}
+
+static void measure_limit_update(d2k_sched *s, int fresh) {
+    size_t active = measurements_in_flight(s), lim = s->meas_limit;
+    int valid = res_valid(s);
+    int cpu_shrink = s->cpu_valid && s->cpu_free_u < SCHED_CPU_SHRINK_FREE_U;
+    int cpu_hold = s->cpu_valid && !cpu_shrink && s->cpu_free_u < SCHED_CPU_GROW_FREE_U;
+    if (!valid) {
+        lim = SCHED_DEFAULT_ACTIVE_MEASUREMENTS;
+        s->grow_pending = 0;
+    } else if (fresh) {
+        /* AIMD: нехватка любого ресурса — вдвое (не ниже 1, идущие не
+           прерываются); запас всех и спрос на пределе — плюс один; между
+           25 и 40 % свободного процессора — держится. Раз за снимок. */
+        if (cpu_shrink || mem_short(s) || ct_short(s)) {
+            lim = lim / 2;
+            if (lim < 1) lim = 1;
+        } else if (!cpu_hold &&
+                   (s->grow_pending || (active >= lim && queued_measurements(s) > 0)) &&
+                   lim < measure_slots(s)) {
+            lim++;
+        }
+        s->grow_pending = 0;
+    }
+    unsigned lm = 0;
+    if (valid) {
+        if (cpu_shrink || cpu_hold) lm |= MEAS_LIM_CPU;
+        if (mem_short(s)) lm |= MEAS_LIM_MEM;
+        if (ct_short(s)) lm |= MEAS_LIM_CT;
+        if (!lm && lim >= measure_slots(s)) lm |= MEAS_LIM_SLOTS;
+    }
+    if (lim != s->meas_limit || lm != s->limiter) {
         s->meas_limit = lim;
+        s->limiter = lm;
         s->limit_since_ms = s->now_ms;
     }
-    /* Журнал с мёртвой зоной: смена наличия данных — сразу; смена предела —
-       только когда новое значение продержалось SCHED_LIMIT_LOG_STABLE_MS.
-       Нагрузка около 30 % иначе писала бы строку на каждом пересечении. */
-    if (s->cpu_valid == s->cpu_logged_valid &&
-        (lim == s->limit_logged || s->now_ms - s->limit_since_ms < SCHED_LIMIT_LOG_STABLE_MS))
+    /* Журнал с мёртвой зоной (задача 29): смена наличия данных — сразу;
+       смена предела или причины — только когда продержалась
+       SCHED_LIMIT_LOG_STABLE_MS. Нагрузка около порога иначе писала бы
+       строку на каждом пересечении. */
+    if (valid == s->cpu_logged_valid &&
+        ((lim == s->limit_logged && lm == s->limiter_logged) ||
+         s->now_ms - s->limit_since_ms < SCHED_LIMIT_LOG_STABLE_MS))
         return;
-    s->cpu_logged_valid = s->cpu_valid;
+    s->cpu_logged_valid = valid;
     s->limit_logged = lim;
-    if (s->cpu_valid) {
-        say(s, "замеров %zu из %zu (ядер %u, свободно %d %%)",
-            active, lim, s->cpu_cores, cpu_free_pct(s));
-    } else {
-        say(s, "замеров %zu из %zu (данных о загрузке процессора нет — прежний предел)",
-            active, lim);
+    s->limiter_logged = lm;
+    if (!valid) {
+        say(s, "замеров %zu из %zu (данных о загрузке процессора и памяти нет — "
+               "прежний предел)", active, lim);
+        return;
     }
+    char why[96], ct[32];
+    limiter_text(lm, why, sizeof why);
+    if (s->ct_valid) snprintf(ct, sizeof ct, "%d %%", ct_pct(s));
+    else snprintf(ct, sizeof ct, "нет данных");
+    say(s, "замеров %zu из %zu, %s%s (процессор свободен %d %%, память доступна "
+           "%llu МБ из %llu, conntrack %s)",
+        active, lim, lm ? "упёрлись в: " : "запас по всем ресурсам", why,
+        cpu_free_pct(s), (unsigned long long)(s->mem_avail_kb / 1024),
+        (unsigned long long)(s->mem_total_kb / 1024), ct);
 }
 
 /* An unplanned flow queued BEFORE a compatible area was installed cannot
@@ -5011,8 +5210,10 @@ static int launch_or_queue(d2k_sched *s, task *t) {
     /* Before the first scheduler tick, model time is intentionally unknown.
        Do not stamp a start at zero and later compare it with the first real
        monotonic tick (or a test's model clock); the concurrency cap still
-       bounds the initial burst. */
-    int start_gap = s->clock_seen && s->measure_start_seen && active == 0 &&
+       bounds the initial burst. Task 38: the start pace applies to a fresh
+       suspicion even while another measurement runs — a raised limit must
+       not turn a traffic burst into a burst of SYN/Initial. */
+    int start_gap = s->clock_seen && s->measure_start_seen &&
                     s->now_ms - s->last_measure_start_ms < SCHED_START_GAP_MS;
     if (active >= s->meas_limit || start_gap) {
         if (queued_measurements(s) >= SCHED_MAX_QUEUED_MEASUREMENTS) {
@@ -5033,7 +5234,9 @@ static int launch_or_queue(d2k_sched *s, task *t) {
     }
     s->last_measure_start_ms = s->now_ms;
     s->measure_start_seen = 1;
-    return launch_task(s, t);
+    int rc = launch_task(s, t);
+    measure_started(s);
+    return rc;
 }
 
 static void voice_observe(d2k_sched *s, task *t) {
@@ -6607,7 +6810,7 @@ static int queued_release(d2k_sched *s, int64_t now_ms) {
        a long-running measurement still occupies a slot. A fresh event may
        immediately fill a genuinely free slot (launch_or_queue), but queued
        backlog must not drain in a burst as workers finish: see
-       SCHED_START_GAP_MS — each release is judged by a fresh CPU sample. */
+       SCHED_START_GAP_MS. */
     int start_gap = s->measure_start_seen &&
                     now_ms - s->last_measure_start_ms < SCHED_START_GAP_MS;
     if (active >= s->meas_limit || start_gap) return 0;
@@ -6624,6 +6827,7 @@ static int queued_release(d2k_sched *s, int64_t now_ms) {
             t->name, waited_s);
     }
     (void)launch_task(s, t);
+    measure_started(s);
     return 1;
 }
 
@@ -6647,8 +6851,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         if (s->measure_start_seen) { s->last_measure_start_ms = now_ms; }
     }
     s->now_ms = now_ms;
-    cpu_sample(s, now_ms);
-    measure_limit_update(s);
+    measure_limit_update(s, res_sample(s, now_ms));
 
     /* Осушить самопайп: он только будит, содержимое значения не имеет. */
     uint8_t drain[64];

@@ -814,6 +814,31 @@ static int stub_cpu(uint64_t *busy, uint64_t *total, unsigned *cores) {
     return 0;
 }
 
+/* Память и conntrack (задача 38) — так же подменены. По умолчанию «данных
+   нет», как и процессор; res_ok() включает все три источника сразу с
+   просторными значениями: 90 % свободного процессора, 400 МБ доступно из
+   512 МБ, conntrack занят на 10 %. */
+static int mem_ok;
+static uint64_t mem_avail_kb_v = 400u * 1024, mem_total_kb_v = 512u * 1024;
+static int stub_mem(uint64_t *avail_kb, uint64_t *total_kb) {
+    if (!mem_ok) return -1;
+    *avail_kb = mem_avail_kb_v; *total_kb = mem_total_kb_v;
+    return 0;
+}
+static int ct_ok;
+static uint64_t ct_count_v = 100, ct_max_v = 1000;
+static int stub_ct(uint64_t *count, uint64_t *max) {
+    if (!ct_ok) return -1;
+    *count = ct_count_v; *max = ct_max_v;
+    return 0;
+}
+static void res_ok(int on) {
+    cpu_ok = mem_ok = ct_ok = on;
+    cpu_cores_v = 4; cpu_free_pm = 900;
+    mem_avail_kb_v = 400u * 1024; mem_total_kb_v = 512u * 1024;
+    ct_count_v = 100; ct_max_v = 1000;
+}
+
 static int stub_spawn(void) {
     if (spawn_fail) { spawn_refused++; return -1; }
     return 0;
@@ -1276,6 +1301,52 @@ static void skip_ahead(d2k_sched *s, int64_t ms) {
     drain();
 }
 
+/* Задача 38: блок "measurements" живого JSON целиком (в buf) и предел из
+   него; -1 — блока нет. */
+static int live_meas(d2k_sched *s, char *buf, size_t n) {
+    char path[] = "/tmp/d2k-t38-live-XXXXXX";
+    int fd = mkstemp(path);
+    if (n) buf[0] = '\0';
+    if (fd < 0) return -1;
+    close(fd);
+    static char body[65536];
+    body[0] = '\0';
+    if (d2k_sched_write_live(s, path, "catalog.json") == 0) {
+        FILE *f = fopen(path, "r");
+        if (f) { size_t got = fread(body, 1, sizeof body - 1, f); body[got] = '\0'; fclose(f); }
+    }
+    unlink(path);
+    const char *m = strstr(body, "\"measurements\": {");
+    if (!m) return -1;
+    const char *e = strchr(m, '}');
+    if (buf && n && e) {
+        size_t len = (size_t)(e - m + 1);
+        if (len >= n) len = n - 1;
+        memcpy(buf, m, len); buf[len] = '\0';
+    }
+    const char *l = strstr(m, "\"limit\": ");
+    return l ? atoi(l + strlen("\"limit\": ")) : -1;
+}
+static int live_limit(d2k_sched *s) { return live_meas(s, NULL, 0); }
+
+/* Задача 38: n новых целей по одной в секунду модельных часов (каждая
+   успевает выйти из очереди за паузу запуска); возвращает наибольший
+   увиденный предел. */
+static int meas_ramp(d2k_sched *s, const char *prefix, uint16_t port0, int n) {
+    int top = 0;
+    for (int i = 0; i < n; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "%s-%d.example", prefix, i);
+        d2k_ev h = ev_hello(6, (uint16_t)(port0 + i), name); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, (uint16_t)(port0 + i)); d2k_sched_event(s, &su);
+        spin(s, 60);
+        skip_ahead(s, 1000);
+        int l = live_limit(s);
+        if (l > top) top = l;
+    }
+    return top;
+}
+
 /* Доводит поиск до конца очереди кандидатов. Каждый неподтверждённый кандидат
    уходит по потолку ожидания применения, а тот считается секундами модельного
    времени — значит нужны прыжки часов, а не долгое кручение. Сорока кругов
@@ -1676,6 +1747,8 @@ int main(int argc, char **argv) {
     d2k_sched_mark_hook = stub_mark;
     d2k_sched_spawn_hook = stub_spawn;
     d2k_sched_cpu_hook = stub_cpu;
+    d2k_sched_mem_hook = stub_mem;
+    d2k_sched_ct_hook = stub_ct;
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -3094,7 +3167,9 @@ admission_only_run:
                 CHECK(queued_at >= time(NULL) - 30 && queued_at <= time(NULL) + 30,
                       "queued task reports its admission time, not router boot time");
                 CHECK(strstr(body, "\"measurements\": {\"active\": 2, \"limit\": 2, "
-                                   "\"queued\": 1, \"cores\": null, \"free_pct\": null}") != NULL,
+                                   "\"queued\": 1, \"cores\": null, \"free_pct\": null, "
+                                   "\"mem_avail_mb\": null, \"mem_total_mb\": null, "
+                                   "\"conntrack_pct\": null, \"limited_by\": null}") != NULL,
                       "без данных о процессоре live JSON не показывает прежний предел 2");
                 unlink(live_path);
             }
@@ -3105,6 +3180,10 @@ admission_only_run:
         d2k_catalog_free(&c);
     }
     {
+        /* Задача 38: темп запуска — не больше одного нового замера за
+           250 мс (было 1 с). События пришли до первого тика: время ещё
+           неизвестно, оба первых стартуют; третий ждёт паузу от первого
+           тика и выходит из очереди после 250 мс, а не через секунду. */
         d2k_catalog c = {0};
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         tcp_calls = 0;
@@ -3120,22 +3199,54 @@ admission_only_run:
                 d2k_ev su = ev_suspect(6, port);
                 d2k_sched_event(s, &su);
             }
-            spin(s, 120); /* 600 ms: let both workers finish before the 1 s gate */
+            spin(s, 40); /* 200 мс: оба первых уже кончились, пауза ещё идёт */
             CHECK(tcp_calls == 2,
-                  "третье измерение обошло межстартовую паузу");
-            skip_ahead(s, 1000);
-            settle(s);
+                  "третье измерение обошло межстартовую паузу 250 мс");
+            spin(s, 30); /* 350 мс */
             CHECK(tcp_calls == 3,
-                  "ограниченная очередь не продолжилась после паузы");
+                  "очередь не продолжилась через 250 мс (осталась прежняя секунда)");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c);
         tcp_answer = D2K_V_OPAQUE;
     }
-    /* ЗАДАЧА 29: параллельность замеров следует свободному процессору.
-       Предел — min(2×ядра, 8) при свободных ≥ 30 %; ниже 15 % новые не
-       стартуют, но один активный разрешён всегда; без данных — прежние 2.
-       Источник занятости подменён: часы модельные, /proc/stat не читается. */
+    {
+        /* Задача 38: темп касается и свежего подозрения при уже идущем
+           замере — всплеск живого трафика не даёт пачки SYN. Предел 2 (нет
+           данных), часы уже идут: второй стартует не раньше 250 мс. */
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_calls = 0; tcp_stop_count = 0;
+        tcp_wait_until_stop = 1; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        if (s) {
+            spin(s, 1);
+            for (uint16_t i = 0; i < 2; i++) {
+                char name[48];
+                uint16_t port = (uint16_t)(41050 + i);
+                snprintf(name, sizeof name, "pace-live-%u.example", (unsigned)i);
+                d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+            }
+            spin(s, 40); /* 200 мс */
+            CHECK(tcp_calls == 1, "pace: второй замер стартовал раньше 250 мс после первого");
+            spin(s, 20); /* 300 мс */
+            CHECK(tcp_calls == 2, "pace: второй замер не стартовал после паузы 250 мс");
+            tcp_release_waiters = 1; spin(s, 60); tcp_release_waiters = 0;
+            d2k_sched_free(s);
+        }
+        tcp_wait_until_stop = 0;
+        tcp_answer = D2K_V_OPAQUE;
+        d2k_catalog_free(&c);
+    }
+    /* ЗАДАЧА 29 → 38: параллельность замеров по измеренным ресурсам с
+       запасом. Задача 29 мерила только процессор и ставила потолок
+       min(2×ядра, 8) — оценку, не замер; её проверки «4 ядра → 8»,
+       «8 ядер → 8», «2 ядра → 4» и полоса 15–30 % заменены: теперь предел
+       растёт на 1 (AIMD) при запасе процессора (свободно ≥ 40 %), памяти
+       (MemAvailable ≥ max(32 МБ, 20 % MemTotal)) и conntrack (< 60 %) до
+       реальной ёмкости слотов, вдвое падает при нехватке любого (процессор
+       < 25 %), не ниже 1; без данных — прежние 2. Источники подменены. */
     {
         /* Разбор строки /proc/stat: занятость без idle и iowait. */
         uint64_t b = 0, tt = 0;
@@ -3147,211 +3258,220 @@ admission_only_run:
               "cpu parse: чужая строка принята");
     }
     {
-        /* Много свободного, 4 ядра → 8 одновременно; девятая ждёт. */
+        /* Разбор /proc/meminfo: MemTotal и MemAvailable в кБ; без
+           MemAvailable (ядро старше 3.14) данных о памяти нет. */
+        uint64_t av = 0, tot = 0;
+        CHECK(d2k_sched_meminfo_parse("MemTotal:         254000 kB\nMemFree:  10000 kB\n"
+                                      "MemAvailable:     120000 kB\nBuffers: 1 kB\n",
+                                      &av, &tot) == 0 && av == 120000 && tot == 254000,
+              "meminfo parse: MemTotal/MemAvailable");
+        CHECK(d2k_sched_meminfo_parse("MemTotal: 254000 kB\nMemFree: 10000 kB\n", &av, &tot) != 0,
+              "meminfo parse: без MemAvailable принята оценка");
+        CHECK(d2k_sched_meminfo_parse("garbage\n", &av, &tot) != 0,
+              "meminfo parse: чужой текст принят");
+    }
+    {
+        /* Рост до ёмкости слотов задач при запасе всех ресурсов; затем
+           нехватка памяти (20 % от 512 МБ = 102 МБ > 32 МБ) — предел вдвое
+           на каждом снимке до 1; идущие не прерываются; один замер
+           разрешён всегда. */
         d2k_catalog c = {0};
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
-        cpu_ok = 1; cpu_cores_v = 4; cpu_free_pm = 900;
+        res_ok(1);
         tcp_calls = 0; tcp_saw_stop = 0; tcp_stop_count = 0;
         tcp_wait_until_stop = 1; tcp_release_waiters = 0;
         tcp_answer = D2K_V_INCONCLUSIVE;
-        CHECK(s != NULL, "cpu: планировщик не завёлся");
+        CHECK(s != NULL, "aimd: планировщик не завёлся");
         if (s) {
             d2k_sched_set_say(s, collect_say, NULL);
             saidbuf[0] = '\0';
             for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
-            CHECK(said("замеров 0 из 8 (ядер 4, свободно 90 %)"),
-                  "cpu: предел не поднялся до 2×ядра при свободном процессоре");
-            for (uint16_t i = 0; i < 9; i++) {
-                char name[48];
-                uint16_t port = (uint16_t)(41100 + i);
-                snprintf(name, sizeof name, "cpu-free-%u.example", (unsigned)i);
-                d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
-                d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
-            }
-            spin(s, 400);
-            CHECK(tcp_calls == 8, "cpu: при 4 ядрах и 90 % свободных не 8 замеров одновременно");
-            CHECK(d2k_sched_active(s) == 9, "cpu: девятая цель не сохранена в очереди");
-            char live_path[] = "/tmp/d2k-cpu-live-XXXXXX";
-            int live_fd = mkstemp(live_path);
-            if (live_fd >= 0) {
-                close(live_fd);
-                CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "cpu live write");
-                char body[32768] = {0}; FILE *live = fopen(live_path, "r");
-                if (live) { fread(body, 1, sizeof body - 1, live); fclose(live); }
-                CHECK(strstr(body, "\"measurements\": {\"active\": 8, \"limit\": 8, "
-                                   "\"queued\": 1, \"cores\": 4, \"free_pct\": 90}") != NULL,
-                      "cpu: live JSON не показывает предел замеров");
-                unlink(live_path);
-            }
-            /* Процессор занят: предел падает до 1, идущие НЕ прерываются. */
-            cpu_free_pm = 50;
-            for (int i = 0; i < 40; i++) skip_ahead(s, 1000);
-            CHECK(said("из 1 (ядер 4, свободно"),
-                  "cpu: при занятом процессоре предел не упал до 1");
-            CHECK(tcp_stop_count == 0 && d2k_sched_active(s) == 9,
-                  "cpu: снижение предела прервало идущие замеры");
-            CHECK(tcp_calls == 8, "cpu: при занятом процессоре стартовал новый замер");
-            tcp_release_waiters = 1;
-            spin(s, 60);
-            tcp_release_waiters = 0;
+            CHECK(said("замеров 0 из 2, запас по всем ресурсам"),
+                  "aimd: появление данных не названо с прежним пределом 2");
+            CHECK(live_limit(s) == 2, "aimd: без спроса предел вырос сам");
+            int top = meas_ramp(s, "grow", 42000, 70);
+            CHECK(tcp_calls == 64,
+                  "aimd: при запасе всех ресурсов замеры не дошли до ёмкости слотов (64)");
+            CHECK(top == 64 && live_limit(s) == 64,
+                  "aimd: предел не дорос до ёмкости слотов или перерос её");
+            for (int i = 0; i < 12; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 64 из 64, упёрлись в: слоты"),
+                  "aimd: журнал не назвал слоты причиной потолка");
+            char m[512];
+            (void)live_meas(s, m, sizeof m);
+            CHECK(strstr(m, "\"active\": 64, \"limit\": 64, \"queued\": 0, \"cores\": 4, "
+                            "\"free_pct\": 90, \"mem_avail_mb\": 400, \"mem_total_mb\": 512, "
+                            "\"conntrack_pct\": 10, \"limited_by\": \"слоты\"}") != NULL,
+                  "aimd: live JSON не показывает ресурсы и причину предела");
+            /* Память: 100 МБ доступно из 512 — меньше 20 % (102 МБ). */
+            mem_avail_kb_v = 100u * 1024;
+            int seq[8], k = 0;
+            for (int i = 0; i < 8; i++) { skip_ahead(s, 1000); seq[k++] = live_limit(s); }
+            CHECK(seq[0] == 32 && seq[1] == 16 && seq[2] == 8 && seq[3] == 4 &&
+                  seq[4] == 2 && seq[5] == 1 && seq[6] == 1 && seq[7] == 1,
+                  "aimd: нехватка памяти не уменьшает предел вдвое за снимок до 1");
+            CHECK(tcp_stop_count == 0 && tcp_calls == 64,
+                  "aimd: снижение предела прервало идущие замеры");
+            for (int i = 0; i < 12; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 64 из 1, упёрлись в: память"),
+                  "aimd: журнал не назвал память причиной снижения");
+            tcp_release_waiters = 1; spin(s, 60); tcp_release_waiters = 0;
             d2k_sched_free(s);
         }
         tcp_wait_until_stop = 0; tcp_release_waiters = 0;
         tcp_answer = D2K_V_OPAQUE;
-        cpu_ok = 0;
+        res_ok(0);
         d2k_catalog_free(&c);
     }
     {
-        /* Мало свободного сразу → только 1. Ядер 8 → потолок 8, ядер 2 → 4. */
+        /* Минимум 1: нехватка памяти с самого начала — 2 → 1 и не ниже;
+           один замер при этом идёт всегда, второй ждёт в очереди. */
         d2k_catalog c = {0};
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
-        cpu_ok = 1; cpu_cores_v = 4; cpu_free_pm = 100;
-        tcp_calls = 0; tcp_saw_stop = 0; tcp_stop_count = 0;
+        res_ok(1);
+        mem_avail_kb_v = 20u * 1024;
+        tcp_calls = 0; tcp_stop_count = 0;
         tcp_wait_until_stop = 1; tcp_release_waiters = 0;
         tcp_answer = D2K_V_INCONCLUSIVE;
         if (s) {
-            d2k_sched_set_say(s, collect_say, NULL);
-            saidbuf[0] = '\0';
-            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
-            CHECK(said("замеров 0 из 1 (ядер 4, свободно 10 %)"),
-                  "cpu: при 10 % свободных предел не 1");
-            for (uint16_t i = 0; i < 3; i++) {
-                char name[48];
-                uint16_t port = (uint16_t)(41120 + i);
-                snprintf(name, sizeof name, "cpu-busy-%u.example", (unsigned)i);
-                d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
-                d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
-            }
-            spin(s, 400);
-            CHECK(tcp_calls == 1, "cpu: при занятом процессоре запущено больше одного замера");
-            CHECK(d2k_sched_active(s) == 3, "cpu: подозрения потеряны вместо очереди");
-            tcp_release_waiters = 1; spin(s, 60); tcp_release_waiters = 0;
-            d2k_sched_free(s);
-        }
-        tcp_wait_until_stop = 0;
-        cpu_cores_v = 8; cpu_free_pm = 900;
-        s = d2k_sched_new(&c, sv[0], 0x2d);
-        if (s) {
-            d2k_sched_set_say(s, collect_say, NULL);
-            saidbuf[0] = '\0';
-            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
-            CHECK(said("замеров 0 из 8 (ядер 8, свободно 90 %)"), "cpu: потолок 8 не соблюдён");
-            d2k_sched_free(s);
-        }
-        cpu_cores_v = 2;
-        s = d2k_sched_new(&c, sv[0], 0x2d);
-        if (s) {
-            d2k_sched_set_say(s, collect_say, NULL);
-            saidbuf[0] = '\0';
-            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
-            CHECK(said("замеров 0 из 4 (ядер 2, свободно 90 %)"), "cpu: 2 ядра не дали 4");
-            d2k_sched_free(s);
-        }
-        cpu_ok = 0; cpu_cores_v = 4;
-        tcp_answer = D2K_V_OPAQUE;
-        d2k_catalog_free(&c);
-    }
-    {
-        /* Полоса 15–30 % — гистерезис: удерживается уровень входа в полосу.
-           2 ядра → потолок 4; идут 3; свободно 20 % — уровень 3: новые ждут,
-           а когда двое завершаются, двое из очереди стартуют (уровень
-           держится), но выше 3 не растёт. */
-        d2k_catalog c = {0};
-        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
-        cpu_ok = 1; cpu_cores_v = 2; cpu_free_pm = 900;
-        tcp_calls = 0; tcp_saw_stop = 0; tcp_stop_count = 0;
-        tcp_wait_until_stop = 1; tcp_release_waiters = 0;
-        tcp_answer = D2K_V_INCONCLUSIVE;
-        if (s) {
-            d2k_sched_set_say(s, collect_say, NULL);
-            saidbuf[0] = '\0';
-            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
-            CHECK(said("замеров 0 из 4 (ядер 2, свободно 90 %)"), "band: потолок 4 не набран");
+            for (int i = 0; i < 10; i++) skip_ahead(s, 1000);
+            CHECK(live_limit(s) == 1, "min: нехватка памяти не опустила предел до 1 или опустила ниже");
             for (uint16_t i = 0; i < 2; i++) {
-                char name[48]; uint16_t port = (uint16_t)(41160 + i);
-                snprintf(name, sizeof name, "band-early-%u.example", (unsigned)i);
+                char name[48];
+                uint16_t port = (uint16_t)(42150 + i);
+                snprintf(name, sizeof name, "aimd-one-%u.example", (unsigned)i);
                 d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
                 d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
             }
-            int64_t early_at = g_now_ms;
-            spin(s, 40);
-            for (int i = 0; i < 60; i++) skip_ahead(s, 1000);
-            {
-                d2k_ev h = ev_hello(6, 41162, "band-late.example"); d2k_sched_event(s, &h);
-                d2k_ev su = ev_suspect(6, 41162); d2k_sched_event(s, &su);
-            }
-            spin(s, 40);
-            CHECK(tcp_calls == 3, "band: три замера не запустились при свободном процессоре");
-            cpu_free_pm = 200;
-            for (int i = 0; i < 45; i++) skip_ahead(s, 1000);
-            CHECK(said("замеров 3 из 3 (ядер 2, свободно"),
-                  "band: в полосе 15–30 % не удержан уровень входа (3)");
-            for (uint16_t i = 0; i < 3; i++) {
-                char name[48]; uint16_t port = (uint16_t)(41170 + i);
-                snprintf(name, sizeof name, "band-wait-%u.example", (unsigned)i);
-                d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
-                d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
-            }
-            spin(s, 40);
+            spin(s, 100);
             for (int i = 0; i < 3; i++) skip_ahead(s, 1000);
-            CHECK(tcp_calls == 3, "band: в полосе 15–30 % уровень вырос сверх идущих");
-            /* Двое ранних упираются в срок задачи; поздний ещё идёт. */
-            skip_ahead(s, early_at + 10 * 60 * 1000 + 1000 - g_now_ms);
-            spin(s, 40);
-            for (int i = 0; i < 4; i++) { skip_ahead(s, 1000); spin(s, 10); }
-            CHECK(tcp_stop_count == 2, "band: ранние замеры не сняты по сроку (подготовка)");
-            CHECK(tcp_calls == 5, "band: освободившиеся места не пополнились из очереди");
-            CHECK(d2k_sched_active(s) == 4, "band: третья ждущая цель стартовала сверх уровня 3");
+            spin(s, 20);
+            CHECK(tcp_calls == 1 && d2k_sched_active(s) == 2,
+                  "min: при пределе 1 идёт не ровно один замер (второй не в очереди)");
             tcp_release_waiters = 1; spin(s, 60); tcp_release_waiters = 0;
             d2k_sched_free(s);
         }
         tcp_wait_until_stop = 0; tcp_release_waiters = 0;
-        cpu_ok = 0; cpu_cores_v = 4; cpu_free_pm = 900;
         tcp_answer = D2K_V_OPAQUE;
+        res_ok(0);
         d2k_catalog_free(&c);
     }
     {
-        /* Мёртвая зона журнала: нагрузка, колеблющаяся около 30 %, не пишет
-           строку предела на каждом пересечении (порог допуска не меняется). */
+        /* Процессор: свободно 30 % (между 25 и 40) — предел держится: ни
+           роста при спросе, ни снижения; ниже 25 % — вдвое за снимок. */
         d2k_catalog c = {0};
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
-        cpu_ok = 1; cpu_cores_v = 2; cpu_free_pm = 900;
+        res_ok(1);
+        tcp_calls = 0; tcp_stop_count = 0;
+        tcp_wait_until_stop = 1; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
         if (s) {
             d2k_sched_set_say(s, collect_say, NULL);
             saidbuf[0] = '\0';
             for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
-            CHECK(said("замеров 0 из 4 (ядер 2, свободно 90 %)"), "log: первый предел не назван");
-            saidbuf[0] = '\0';
-            for (int round = 0; round < 3; round++) {
-                cpu_free_pm = 0;
-                for (int guard = 0; guard < 60; guard++) {
-                    skip_ahead(s, 1000);
-                    char live_path[] = "/tmp/d2k-cpu-band-XXXXXX";
-                    int fd = mkstemp(live_path);
-                    char body[32768] = {0};
-                    if (fd >= 0) {
-                        close(fd);
-                        (void)d2k_sched_write_live(s, live_path, "catalog.json");
-                        FILE *live = fopen(live_path, "r");
-                        if (live) { fread(body, 1, sizeof body - 1, live); fclose(live); }
-                        unlink(live_path);
-                    }
-                    if (strstr(body, "\"limit\": 1,")) break; /* вошли в полосу */
-                    if (!strstr(body, "\"limit\": 4,")) break;
-                }
-                cpu_free_pm = 1000;
-                for (int i = 0; i < 2; i++) skip_ahead(s, 1000);
-            }
-            CHECK(!said("замеров"), "log: колебание около 30 % пишет строку предела на каждом пересечении");
+            (void)meas_ramp(s, "cpu-up", 42200, 8);
+            /* Восемь целей по одной: каждый запуск заполняет предел, и
+               снимок после него прибавляет 1 — окно на шаг впереди спроса. */
+            CHECK(tcp_calls == 8 && live_limit(s) == 9, "cpu: рост до 9 при свободном процессоре");
+            cpu_free_pm = 300;
+            for (int i = 0; i < 60; i++) skip_ahead(s, 1000);
+            CHECK(live_limit(s) == 9, "cpu: при 30 % свободных предел снизился");
+            (void)meas_ramp(s, "cpu-hold", 42220, 3);
+            CHECK(tcp_calls == 9 && live_limit(s) == 9,
+                  "cpu: при 30 % свободных (меньше 40 %) предел вырос");
+            for (int i = 0; i < 12; i++) skip_ahead(s, 1000);
+            CHECK(said(" из 9, упёрлись в: процессор"),
+                  "cpu: журнал не назвал процессор при удержании");
+            cpu_free_pm = 100;
+            int seen[64], n = 0;
+            for (int i = 0; i < 40 && n < 64; i++) { skip_ahead(s, 1000); seen[n++] = live_limit(s); }
+            int halving = 1;
+            for (int i = 0; i < n; i++)
+                if (seen[i] != 9 && seen[i] != 4 && seen[i] != 2 && seen[i] != 1) halving = 0;
+            for (int i = 1; i < n; i++)
+                if (seen[i] != seen[i - 1] && seen[i] != seen[i - 1] / 2) halving = 0;
+            CHECK(halving && seen[n - 1] == 1, "cpu: при свободных < 25 % предел не падает вдвое до 1");
+            CHECK(tcp_stop_count == 0, "cpu: снижение прервало идущие замеры");
+            CHECK(said("упёрлись в: процессор"), "cpu: журнал не назвал процессор");
+            tcp_release_waiters = 1; spin(s, 60); tcp_release_waiters = 0;
             d2k_sched_free(s);
         }
-        cpu_ok = 0; cpu_cores_v = 4; cpu_free_pm = 900;
+        tcp_wait_until_stop = 0; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_OPAQUE;
+        res_ok(0);
+        d2k_catalog_free(&c);
+    }
+    {
+        /* conntrack: 59 % — запас, 60 % — вдвое. Память: при MemTotal
+           128 МБ запас — 32 МБ (20 % меньше), 33 МБ хватает. */
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        res_ok(1);
+        tcp_calls = 0; tcp_stop_count = 0;
+        tcp_wait_until_stop = 1; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            saidbuf[0] = '\0';
+            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
+            mem_total_kb_v = 128u * 1024; mem_avail_kb_v = 33u * 1024;
+            ct_count_v = 590;
+            (void)meas_ramp(s, "ct-up", 42300, 8);
+            CHECK(tcp_calls == 8 && live_limit(s) == 9,
+                  "ct: при 59 % conntrack и 33 МБ из 128 МБ предел не рос");
+            ct_count_v = 600;
+            skip_ahead(s, 1000);
+            CHECK(live_limit(s) == 4, "ct: при 60 % conntrack предел не уменьшился вдвое");
+            for (int i = 0; i < 12; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 8 из 1, упёрлись в: conntrack"),
+                  "ct: журнал не назвал conntrack");
+            ct_count_v = 100;
+            mem_avail_kb_v = 31u * 1024;
+            (void)meas_ramp(s, "ct-mem", 42320, 1);
+            for (int i = 0; i < 12; i++) skip_ahead(s, 1000);
+            CHECK(live_limit(s) == 1 && said("упёрлись в: память"),
+                  "mem: 31 МБ при запасе 32 МБ не названы нехваткой памяти");
+            tcp_release_waiters = 1; spin(s, 60); tcp_release_waiters = 0;
+            d2k_sched_free(s);
+        }
+        tcp_wait_until_stop = 0; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_OPAQUE;
+        res_ok(0);
+        d2k_catalog_free(&c);
+    }
+    {
+        /* Мёртвая зона журнала (задача 29) сохранена: conntrack, скачущий
+           через 60 % каждый снимок, не пишет строку на каждом
+           пересечении; устоявшееся состояние называется один раз. */
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        res_ok(1);
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            saidbuf[0] = '\0';
+            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 0 из 2, запас по всем ресурсам"), "log: первый предел не назван");
+            saidbuf[0] = '\0';
+            for (int i = 0; i < 30; i++) {
+                ct_count_v = (i & 1) ? 100 : 700;
+                skip_ahead(s, 1000);
+            }
+            CHECK(!said("замеров"), "log: колебание около 60 % conntrack пишет строку на каждом пересечении");
+            ct_count_v = 100;
+            for (int i = 0; i < 12; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 0 из 1, запас по всем ресурсам"),
+                  "log: устоявшийся предел не назван");
+            d2k_sched_free(s);
+        }
+        res_ok(0);
         d2k_catalog_free(&c);
     }
     {
         /* Горячая цель: по ждущей в очереди пришло новое подозрение — она
            стартует раньше тех, что встали до неё; остальные — FIFO. Без
-           данных о процессоре: предел 2. */
+           данных о ресурсах: предел 2, темп 250 мс (задача 38: свежее
+           подозрение при идущем замере тоже ждёт паузу, поэтому run1 встаёт
+           в очередь первым и выходит через 250 мс). */
         d2k_catalog c = {0};
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         tcp_calls = 0; tcp_block_until_stop = 0; tcp_answer = D2K_V_CLEAR;
@@ -3365,16 +3485,16 @@ admission_only_run:
                 d2k_ev h = ev_hello(6, port, names[i]); d2k_sched_event(s, &h);
                 d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
             }
-            spin(s, 120);
-            CHECK(tcp_calls == 2, "hot: без данных о процессоре предел не 2");
+            spin(s, 55); /* 275 мс: run0 сразу, run1 — через паузу */
+            CHECK(tcp_calls == 2, "hot: run0 и run1 не стартовали за первую паузу");
             saidbuf[0] = '\0';
             d2k_ev again = ev_suspect(6, 41144); d2k_sched_event(s, &again);
-            skip_ahead(s, 1000);
+            skip_ahead(s, 250);
             CHECK(said("по hot-c.example ожидание в очереди") &&
                   !said("по hot-a.example ожидание в очереди"),
                   "hot: цель с новым подозрением не обогнала тихую очередь");
-            spin(s, 40);
-            skip_ahead(s, 1000);
+            spin(s, 10);
+            skip_ahead(s, 250);
             CHECK(said("по hot-a.example ожидание в очереди") &&
                   !said("по hot-b.example ожидание в очереди"),
                   "hot: тихая очередь нарушила FIFO");
@@ -8962,7 +9082,7 @@ voice_only_run:
             d2k_sched_event(s, &h);
             su = ev_suspect(17, 52041);
             d2k_sched_event(s, &su);
-            /* Общий интервал запуска замеров (1 с) может поставить B в
+            /* Общий интервал запуска замеров (250 мс) может поставить B в
                очередь — это и есть начало работы, не потеря. */
             spin(s, 400);
             drain();

@@ -204,7 +204,8 @@ typedef int (*d2k_sched_spawn_fn)(void);
 extern d2k_sched_spawn_fn d2k_sched_spawn_hook;
 
 /* Источник занятости процессора (задача 29): накопленные с загрузки тики
- * «занято» и «всего» по всем ядрам и число ядер в строю. 0 — данные есть.
+ * «занято» и «всего» по всем ядрам и число ядер в строю (ядра — только для
+ * панели: предел от них не считается, задача 38). 0 — данные есть.
  * По умолчанию читает /proc/stat и sysconf(_SC_NPROCESSORS_ONLN); где
  * /proc/stat нет (macOS), отвечает отказом — и предел замеров остаётся
  * прежним (2). Опрашивается тиком планировщика не чаще раза в секунду
@@ -214,6 +215,19 @@ extern d2k_sched_cpu_fn d2k_sched_cpu_hook;
 /* Разбор строки «cpu ...» из /proc/stat: занято = всё, кроме idle и iowait;
  * guest уже входит в user и второй раз не считается. 0 — строка разобрана. */
 int d2k_sched_cpu_parse(const char *line, uint64_t *busy, uint64_t *total);
+
+/* Память и conntrack (задача 38) — тем же снимком и тем же приёмом, что
+ * процессор. Память: MemAvailable и MemTotal из /proc/meminfo в кБ; без
+ * MemAvailable (ядро старше 3.14) — отказ, оценку не выдумываем. conntrack:
+ * /proc/sys/net/netfilter/nf_conntrack_count и _max; нет таблицы — отказ, и
+ * conntrack предел не ограничивает. Без данных о процессоре ИЛИ памяти
+ * предел замеров — прежний (2). 0 — данные есть. */
+typedef int (*d2k_sched_mem_fn)(uint64_t *avail_kb, uint64_t *total_kb);
+extern d2k_sched_mem_fn d2k_sched_mem_hook;
+typedef int (*d2k_sched_ct_fn)(uint64_t *count, uint64_t *max);
+extern d2k_sched_ct_fn d2k_sched_ct_hook;
+/* Разбор текста /proc/meminfo: нужны обе строки MemTotal и MemAvailable. */
+int d2k_sched_meminfo_parse(const char *text, uint64_t *avail_kb, uint64_t *total_kb);
 
 /* Заводит планировщик поверх уже открытого каталога и уже открытой связи с
  * датапатом. Владения ни тем, ни другим НЕ берёт: каталог переживает
