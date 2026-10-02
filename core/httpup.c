@@ -16,7 +16,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef D2K_HTTPUP_NO_MAIN /* tests include this file on non-Linux hosts */
 #include <linux/netfilter_ipv4.h>
+#endif
 
 #include "d2k_httpup.h"
 
@@ -25,7 +27,9 @@
 #define WORKERS 6
 #define QUEUE_CAP 24
 #define HEADER_CAP 16384
+#ifndef IDLE_MS
 #define IDLE_MS 120000
+#endif
 #define HTTP_HEAD_MS 1200
 
 static int pending[QUEUE_CAP];
@@ -116,9 +120,11 @@ static void relay(int client, int upstream) {
     int open_client = 1, open_upstream = 1;
     unsigned char buf[8192];
     while (open_client || open_upstream) {
+        /* A closed side gets fd=-1 so poll ignores it entirely: with events=0
+           Linux still reports POLLHUP/POLLERR and the loop spun at 100% CPU. */
         struct pollfd p[2] = {
-            { client, open_client ? (short)(POLLIN | POLLHUP) : 0, 0 },
-            { upstream, open_upstream ? (short)(POLLIN | POLLHUP) : 0, 0 }
+            { open_client ? client : -1, POLLIN, 0 },
+            { open_upstream ? upstream : -1, POLLIN, 0 }
         };
         int rc;
         do { rc = poll(p, 2, IDLE_MS); } while (rc < 0 && errno == EINTR);
@@ -143,6 +149,7 @@ static void relay(int client, int upstream) {
     }
 }
 
+#ifndef D2K_HTTPUP_NO_MAIN
 static void serve_client(int client) {
     struct sockaddr_in original;
     socklen_t original_len = sizeof original;
@@ -269,3 +276,4 @@ int main(int argc, char **argv) {
         if (!accepted) { close(client); }
     }
 }
+#endif /* D2K_HTTPUP_NO_MAIN */

@@ -758,7 +758,7 @@ test_quicconn6: test_quicconn6.c quicconn.o quicwire.o compose.o hello.o meas.o 
 	$(CC) $(CFLAGS) -o $@ $< quicconn.o quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 
 .PHONY: test-quicconn6
-TESTS += test_quicconn6 test_volume test_volume_context test_httpup_logic
+TESTS += test_quicconn6 test_volume test_volume_context test_httpup_logic test_httpup_relay
 TESTS += test_catalog_sync
 
 test_catalog_sync: test_catalog_sync.c $(SRC:.c=.o) $(HDR)
@@ -839,3 +839,12 @@ test-quic-original-arms: test_quic_original_arms
 
 test-quic-run-order: test_quic_run_order
 	./test_quic_run_order
+
+test_httpup_relay: test_httpup_relay.c httpup.c include/d2k_httpup.h
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -o $@ test_httpup_relay.c $(TEST_LDFLAGS)
+
+test-httpup-relay: test_httpup_relay
+	./test_httpup_relay
+
+.PHONY: test-httpup-relay
+check: test-httpup-relay
