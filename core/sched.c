@@ -3576,14 +3576,17 @@ static void write_live_groups(FILE *f, const d2k_sched *s) {
             if (!(o->evidence & D2K_GROUP_BLOCKED_CONFIRMED) ||
                 !d2k_group_key_same(&g->key, &o->key) || strcmp(g->plan_id, o->plan_id) ||
                 !d2k_domain_member(o->name, g->suffix)) continue;
-            if (!first) fputs(", ", f); first = 0; json_str(f, o->name);
+            if (!first) fputs(", ", f);
+            first = 0;
+            json_str(f, o->name);
         }
         fputs("], \"exceptions\": [", f); first = 1;
         for (size_t j = 0; j < state->n_observations; j++) {
             const d2k_group_observation *o = &state->observations[j];
             if (!(o->evidence & (D2K_GROUP_DIRECT_CLEAR | D2K_GROUP_PLAN_FAILED)) ||
                 !d2k_group_key_same(&g->key, &o->key) || !d2k_domain_member(o->name, g->suffix)) continue;
-            if (!first) fputs(", ", f); first = 0;
+            if (!first) fputs(", ", f);
+            first = 0;
             fputs("{\"name\": ", f); json_str(f, o->name);
             fputs(", \"reason\": ", f); json_str(f, o->evidence & D2K_GROUP_DIRECT_CLEAR ?
                 "Напрямую работает" : "Общий план не подошёл"); fputc('}', f);
