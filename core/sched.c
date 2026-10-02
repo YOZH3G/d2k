@@ -1044,6 +1044,48 @@ static void fp_add(d2k_cat_fp *fp, const d2k_cat_signal *sig) {
     fp->sig[fp->n_sig++] = *sig;
 }
 
+/* КОРЗИНА ПОРОГА объёмного обрыва (задача 23). Направление уже различено
+   родом приметы ("volume" — исходящая лестница, "rx-volume" — входящее
+   тело); корзина — порядок величины порога: [2^k, 2^(k+1)) КБ -> k+1.
+   Ноль — «порог не измерен» (запись без поля volume): такая примета ни с
+   какой измеренной корзиной не совпадает.
+
+   Степени двух, а не сырые килобайты: имя коробки обязано переживать
+   дрожание прибора. TX-лестница даёт обрыв только на ступенях 15, 19, 23,
+   27, 31, 35 КБ (4000 байт на ступень), полевой разброс одной коробки —
+   19 и 23 КБ (D2K_VOLUME_SLACK) — лежит в одной корзине [16, 32). Соседние
+   ступени через край корзины (15/19, 31/35) разводит имя, но не узнавание:
+   узнавание идёт раньше хеша по допуску D2K_VOLUME_SLACK (d2k_fp_same), и
+   цель с обрывом 19 КБ при коробке на 15 КБ получает имя этой коробки, а
+   не новое. 16 и 128 КБ — корзины 5 и 8: разные коробки. */
+static int volume_bucket(int kb) {
+    if (kb <= 0) { return 0; }
+    int b = 0;
+    while (kb > 1) { kb >>= 1; b++; }
+    return b + 1;
+}
+
+static int is_volume_kind(const char *kind) {
+    return strcmp(kind, "volume") == 0 || strcmp(kind, "rx-volume") == 0;
+}
+
+/* Совпадает ли у коробки корзина порога хоть по одной объёмной примете
+   цели того же направления. Нужна очерёдности сохранённых планов: коробка
+   той же корзины — ближайшая модель, её планы идут первыми. */
+static int box_volume_bucket_agrees(const d2k_cat_fp *box, const d2k_cat_fp *fp) {
+    for (size_t i = 0; i < fp->n_sig; i++) {
+        const d2k_cat_signal *x = &fp->sig[i];
+        if (!is_volume_kind(x->kind)) { continue; }
+        int want = volume_bucket(x->volume);
+        if (want == 0) { continue; }
+        for (size_t j = 0; j < box->n_sig; j++) {
+            if (strcmp(box->sig[j].kind, x->kind) == 0 &&
+                volume_bucket(box->sig[j].volume) == want) { return 1; }
+        }
+    }
+    return 0;
+}
+
 
 /* Начало эфемерного диапазона Linux (ip_local_port_range, умолчание
    32768-60999). Не «порт сервера» и не список сервисов — граница, из которой
@@ -2610,6 +2652,7 @@ static size_t known_plans(d2k_sched *s, task *t) {
     while (took < cap) {
         const d2k_cat_plan *best = NULL;
         const d2k_cat_box *owner = NULL;
+        int best_agree = 0;
         for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
             const d2k_cat_box *b = &s->cat->boxes[bi];
             if (!d2k_fp_same(&b->fp, &t->fp)) { continue; }
@@ -2625,9 +2668,15 @@ static size_t known_plans(d2k_sched *s, task *t) {
                 for (size_t k = 0; k < t->n_tried && !used; k++) {
                     if (t->tried[k] == h) { used = 1; }
                 }
-                if (!used && (!best || p->successes > best->successes)) {
+                /* Коробка той же корзины порога — раньше: обрыв на 16 КБ
+                   сначала проверяет планы 16-КБ-коробки, а не самой
+                   успешной из совместимых по допуску (задача 23). */
+                int agree = box_volume_bucket_agrees(&b->fp, &t->fp);
+                if (!used && (!best || agree > best_agree ||
+                              (agree == best_agree && p->successes > best->successes))) {
                     best = p;
                     owner = b;
+                    best_agree = agree;
                 }
             }
         }
@@ -4005,9 +4054,21 @@ new_box:
         uint64_t h = 1469598103934665603ULL;
         for (size_t i = 0; i < t->fp.n_sig; i++) {
             char b[64];
-            snprintf(b, sizeof b, "%s/%u/%u/%u", t->fp.sig[i].kind,
-                     (unsigned)t->fp.sig[i].ttl, (unsigned)t->fp.sig[i].tos,
-                     (unsigned)t->fp.sig[i].ipid);
+            if (is_volume_kind(t->fp.sig[i].kind)) {
+                /* У объёмной приметы TTL/TOS/IPID нулевые: без корзины порога
+                   обрыв на 16 и на 128 КБ, взятые одним планом, получали бы
+                   одно имя и сливались в одну коробку (задача 23).
+                   Направление — в самом роде приметы. Остальные роды хешируются
+                   как прежде: имена их коробок не меняются. */
+                snprintf(b, sizeof b, "%s/%u/%u/%u/b%d", t->fp.sig[i].kind,
+                         (unsigned)t->fp.sig[i].ttl, (unsigned)t->fp.sig[i].tos,
+                         (unsigned)t->fp.sig[i].ipid,
+                         volume_bucket(t->fp.sig[i].volume));
+            } else {
+                snprintf(b, sizeof b, "%s/%u/%u/%u", t->fp.sig[i].kind,
+                         (unsigned)t->fp.sig[i].ttl, (unsigned)t->fp.sig[i].tos,
+                         (unsigned)t->fp.sig[i].ipid);
+            }
             h ^= fnv1a(b);
             h *= 1099511628211ULL;
         }
@@ -4015,6 +4076,26 @@ new_box:
            into an old model whose ready plans failed. Keep it separate. */
         h ^= fnv1a(text);
         snprintf(box_id, cap, "box-%08x", (unsigned)(h & 0xFFFFFFFFu));
+        /* Имя уже занято коробкой, чей отпечаток с этим ПРОТИВОРЕЧИТ (та же
+           корзина, но порог за допуском; или старая запись с неизмеренным
+           порогом)? Тогда это другая коробка: box_ensure молча вернул бы
+           чужую, а её отпечаток не переписывается — новая примета пропала
+           бы. Имя солится до свободного или совместимого; старая коробка
+           остаётся нетронутой. */
+        for (unsigned salt = 1; s->cat && salt < 64; salt++) {
+            const d2k_cat_box *clash = NULL;
+            for (size_t i = 0; i < s->cat->n_boxes; i++) {
+                if (strcmp(s->cat->boxes[i].id, box_id) == 0) {
+                    clash = &s->cat->boxes[i];
+                    break;
+                }
+            }
+            if (!clash || clash->fp.n_sig == 0 || d2k_fp_same(&clash->fp, &t->fp)) {
+                break;
+            }
+            h = (h ^ salt) * 1099511628211ULL;
+            snprintf(box_id, cap, "box-%08x", (unsigned)(h & 0xFFFFFFFFu));
+        }
     }
 }
 

@@ -173,6 +173,8 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
 static int vol_calls;
 static d2k_vol_verdict vol_answer = D2K_VOL_PASSED;
 static int vol_rx_cut;
+static int vol_at_kb = 20;
+static int vol_rx_at_kb = 24;
 static int vol_rx_tls_unavailable;
 static int vol_direct_complete;
 static int resource_fixture;
@@ -187,11 +189,11 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     d2k_vol_result r;
     memset(&r, 0, sizeof r);
     r.verdict = vol_answer;
-    r.at_kb = 20;
+    r.at_kb = vol_at_kb;
     r.rx_cut = vol_rx_cut;
     r.rx_tls_unavailable = vol_rx_tls_unavailable;
     r.rx_direct_complete = vol_direct_complete;
-    r.rx_at_kb = 24;
+    r.rx_at_kb = vol_rx_at_kb;
     r.rx_expected_kb = 96;
     r.rx_compressed_complete = vol_rx_cut;
     if (resource_fixture) {
@@ -5622,6 +5624,136 @@ recheck_test:
         vol_rx_cut = 0;
         d2k_sched_free(s);
         d2k_catalog_free(&cA);
+    }
+
+    /* --- объёмные коробки не сливаются по одному плану (задача 23) ------ */
+    {
+        /* Две цели режутся по объёму на РАЗНЫХ порогах (16 и 128 КБ), и обе
+           берёт один и тот же план. Это две разные измеренные коробки (§5:
+           не сливать разные случаи из-за одного плана): у каждой свой
+           отпечаток в каталоге. Третья цель с обрывом около 16 КБ узнаёт
+           коробку A и сначала проверяет её сохранённый план. */
+        d2k_catalog cV;
+        memset(&cV, 0, sizeof cV);
+        vol_answer = D2K_VOL_CUT;
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        vol_at_kb = 16;
+        confirm_once(&cV, sv[0], "a.vol-16.test", 40610);
+        vol_at_kb = 128;
+        confirm_once(&cV, sv[0], "b.vol-128.test", 40611);
+
+        const d2k_cat_box *ba = NULL, *bb = NULL;
+        for (size_t i = 0; i < cV.n_boxes; i++) {
+            for (size_t j = 0; j < cV.boxes[i].n_binds; j++) {
+                if (!strcmp(cV.boxes[i].binds[j].target, "a.vol-16.test")) ba = &cV.boxes[i];
+                if (!strcmp(cV.boxes[i].binds[j].target, "b.vol-128.test")) bb = &cV.boxes[i];
+            }
+        }
+        CHECK(ba && bb, "объёмные цели не записаны в каталог");
+        CHECK(ba && bb && ba != bb,
+              "коробки с обрывом 16 и 128 КБ слиты в одну по общему плану");
+        CHECK(ba && bb && ba->n_plans == 1 && bb->n_plans == 1 &&
+              ba->plans[0].text && bb->plans[0].text &&
+              !strcmp(ba->plans[0].text, bb->plans[0].text),
+              "предпосылка теста: обе коробки должны взять один и тот же план");
+        int va = -1, vb = -1;
+        for (size_t i = 0; ba && i < ba->fp.n_sig; i++)
+            if (!strcmp(ba->fp.sig[i].kind, "volume")) va = ba->fp.sig[i].volume;
+        for (size_t i = 0; bb && i < bb->fp.n_sig; i++)
+            if (!strcmp(bb->fp.sig[i].kind, "volume")) vb = bb->fp.sig[i].volume;
+        CHECK(va == 16, "у коробки A не сохранён отпечаток обрыва 16 КБ");
+        CHECK(vb == 128, "у коробки B не сохранён свой отпечаток обрыва 128 КБ");
+
+        char ida[sizeof ba->id] = {0};
+        if (ba) snprintf(ida, sizeof ida, "%s", ba->id);
+        saidbuf[0] = '\0';
+        vol_at_kb = 17;
+        confirm_once(&cV, sv[0], "c.vol-17.test", 40612);
+        char want[160];
+        snprintf(want, sizeof want, "совпал с коробкой %s", ida);
+        CHECK(ida[0] && said(want),
+              "цель с обрывом ~16 КБ не начала с планов коробки A");
+        const d2k_cat_box *bc = NULL;
+        for (size_t i = 0; i < cV.n_boxes; i++)
+            for (size_t j = 0; j < cV.boxes[i].n_binds; j++)
+                if (!strcmp(cV.boxes[i].binds[j].target, "c.vol-17.test")) bc = &cV.boxes[i];
+        CHECK(bc && !strcmp(bc->id, ida), "цель ~16 КБ записана не в коробку A");
+        if (!(ba && bb && ba != bb) || !said(want)) fprintf(stderr, "%s\n", saidbuf);
+
+        /* Та же корзина [16, 32), но порог за допуском (30 КБ против 16):
+           имя по хешу совпало бы с коробкой A, однако её отпечаток с этим
+           противоречит — заводится отдельная коробка, A не трогается. */
+        vol_at_kb = 30;
+        confirm_once(&cV, sv[0], "d.vol-30.test", 40613);
+        const d2k_cat_box *bd30 = NULL, *ba2 = NULL;
+        for (size_t i = 0; i < cV.n_boxes; i++) {
+            if (!strcmp(cV.boxes[i].id, ida)) ba2 = &cV.boxes[i];
+            for (size_t j = 0; j < cV.boxes[i].n_binds; j++)
+                if (!strcmp(cV.boxes[i].binds[j].target, "d.vol-30.test")) bd30 = &cV.boxes[i];
+        }
+        CHECK(bd30 && strcmp(bd30->id, ida) != 0,
+              "обрыв 30 КБ слит с коробкой 16 КБ из-за общей корзины и плана");
+        int vd = -1, va2 = -1;
+        for (size_t i = 0; bd30 && i < bd30->fp.n_sig; i++)
+            if (!strcmp(bd30->fp.sig[i].kind, "volume")) vd = bd30->fp.sig[i].volume;
+        for (size_t i = 0; ba2 && i < ba2->fp.n_sig; i++)
+            if (!strcmp(ba2->fp.sig[i].kind, "volume")) va2 = ba2->fp.sig[i].volume;
+        CHECK(vd == 30, "у коробки 30 КБ не сохранён свой отпечаток");
+        CHECK(va2 == 16, "отпечаток коробки A переписан чужой приметой");
+
+        vol_at_kb = 20;
+        vol_answer = D2K_VOL_PASSED;
+        d2k_catalog_free(&cV);
+    }
+
+    /* --- очерёдность сохранённых планов идёт по корзине порога ---------- */
+    {
+        /* Обрыв 19 КБ совместим по допуску с обеими коробками: X (15 КБ,
+           корзина [8,16)) и Y (21 КБ, корзина [16,32)). У X больше успехов,
+           но ближайшая модель — Y той же корзины: её план проверяется первым. */
+        d2k_catalog cO;
+        memset(&cO, 0, sizeof cO);
+        cO.boxes = calloc(2, sizeof *cO.boxes);
+        CHECK(cO.boxes != NULL, "не удалось создать коробки очерёдности");
+        int ready = cO.boxes != NULL;
+        for (unsigned bi = 0; ready && bi < 2; bi++) {
+            d2k_cat_box *b = &cO.boxes[bi];
+            cO.n_boxes++;
+            snprintf(b->id, sizeof b->id, bi == 0 ? "box-vol-x15" : "box-vol-y21");
+            b->fp.method = D2K_FP_METHOD;
+            b->fp.n_sig = 1;
+            snprintf(b->fp.sig[0].kind, sizeof b->fp.sig[0].kind, "volume");
+            b->fp.sig[0].volume = bi == 0 ? 15 : 21;
+            b->fp.sig[0].seen = 1;
+            b->plans = calloc(1, sizeof *b->plans);
+            if (!b->plans) { ready = 0; break; }
+            b->n_plans = 1;
+            b->plans[0].enabled = 1;
+            b->plans[0].successes = bi == 0 ? 9 : 1;
+            snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "tls");
+            char plan[256];
+            snprintf(plan, sizeof plan,
+                     "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                     "proto tcp tls\nsplit payload_start +%u\norder forward\n", 31 + bi);
+            b->plans[0].text = strdup(plan);
+            if (!b->plans[0].text) { ready = 0; }
+        }
+        CHECK(ready, "не удалось подготовить планы очерёдности");
+        if (ready) {
+            saidbuf[0] = '\0';
+            vol_answer = D2K_VOL_CUT;
+            tcp_answer = D2K_V_PREFIX;
+            ver_answer = D2K_VER_APPLICATION;
+            vol_at_kb = 19;
+            confirm_once(&cO, sv[0], "e.vol-19.test", 40614);
+            CHECK(said("совпал с коробкой box-vol-y21"),
+                  "обрыв 19 КБ начал не с коробки своей корзины порога");
+            if (!said("совпал с коробкой box-vol-y21")) fprintf(stderr, "%s\n", saidbuf);
+        }
+        vol_at_kb = 20;
+        vol_answer = D2K_VOL_PASSED;
+        d2k_catalog_free(&cO);
     }
 
 rx_volume_tests:

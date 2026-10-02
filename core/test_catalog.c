@@ -611,7 +611,47 @@ static void check_recheck_mark_persistence(void) {
     d2k_catalog_free(&c);
 }
 
+/* Объёмные коробки (задача 23): направление (род приметы) и порог (volume)
+ * переживают круговой обход — по ним коробку узнают и называют. Старая
+ * запись объёмной приметы без поля volume грузится и остаётся с порогом 0
+ * («корзина не измерена»), а не валит разбор и не получает выдуманный порог. */
+static void check_volume_box_fingerprint_persistence(void) {
+    write_tmp("/tmp/d2k-cat-vol.json",
+        "{\"schema\":1,\"updated\":\"2026-01-01T00:00:00Z\",\"boxes\":["
+        "{\"id\":\"box-tx16\",\"created\":\"2026-01-01T00:00:00Z\","
+        "\"updated\":\"2026-01-01T00:00:00Z\","
+        "\"fingerprint\":{\"method\":2,\"signals\":[{\"kind\":\"volume\",\"volume\":16,\"seen\":1}]},"
+        "\"plans\":[],\"bindings\":[]},"
+        "{\"id\":\"box-rx128\",\"created\":\"2026-01-01T00:00:00Z\","
+        "\"updated\":\"2026-01-01T00:00:00Z\","
+        "\"fingerprint\":{\"method\":2,\"signals\":[{\"kind\":\"rx-volume\",\"volume\":128,\"seen\":1}]},"
+        "\"plans\":[],\"bindings\":[]},"
+        "{\"id\":\"box-old\",\"created\":\"2026-01-01T00:00:00Z\","
+        "\"updated\":\"2026-01-01T00:00:00Z\","
+        "\"fingerprint\":{\"method\":2,\"signals\":[{\"kind\":\"volume\",\"seen\":3}]},"
+        "\"plans\":[],\"bindings\":[]}]}");
+    d2k_catalog c; char err[200] = {0};
+    CHECK(d2k_catalog_load("/tmp/d2k-cat-vol.json", &c, err, sizeof err) == 0,
+          "объёмные коробки (в т.ч. старая без порога) не загрузились");
+    CHECK(c.n_boxes == 3 && c.boxes[2].fp.n_sig == 1 &&
+          strcmp(c.boxes[2].fp.sig[0].kind, "volume") == 0 &&
+          c.boxes[2].fp.sig[0].volume == 0 && c.boxes[2].fp.sig[0].seen == 3,
+          "старая объёмная примета без порога загрузилась не как «порог не измерен»");
+    CHECK(d2k_catalog_save(&c, "/tmp/d2k-cat-vol-rt.json", err, sizeof err) == 0,
+          "запись объёмных коробок");
+    d2k_catalog_free(&c);
+    CHECK(d2k_catalog_load("/tmp/d2k-cat-vol-rt.json", &c, err, sizeof err) == 0,
+          "перечитывание объёмных коробок");
+    CHECK(c.n_boxes == 3 &&
+          strcmp(c.boxes[0].fp.sig[0].kind, "volume") == 0 && c.boxes[0].fp.sig[0].volume == 16 &&
+          strcmp(c.boxes[1].fp.sig[0].kind, "rx-volume") == 0 && c.boxes[1].fp.sig[0].volume == 128 &&
+          c.boxes[2].fp.sig[0].volume == 0,
+          "направление или порог объёмной коробки потерялись при круговом обходе");
+    d2k_catalog_free(&c);
+}
+
 int main(void) {
+    check_volume_box_fingerprint_persistence();
     check_binding_family_persistence();
     check_recheck_mark_persistence();
     check_time_roundtrip();
