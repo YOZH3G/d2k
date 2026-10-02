@@ -43,6 +43,12 @@ case "$*" in
     *"show running-config"*) [ "${NDMC_FAIL_SHOW:-0}" = 1 ] && exit 7; cat "$NDMC_STATE" ;;
     *"system configuration save"*) [ "${NDMC_FAIL_SAVE:-0}" = 1 ] && exit 8; : ;;
     "-c ip host "*)
+        if [ "${NDMC_TERM_DURING_ADD:-0}" = 1 ]; then
+            printf '%s\n' "$*" >> "$NDMC_CALLS"
+            kill -TERM "$PPID"; sleep 1
+            printf 'ip host %s %s\n' "$(echo "$2" | awk '{print $3}')" "$(echo "$2" | awk '{print $4}')" >> "$NDMC_STATE"
+            exit 0
+        fi
         [ "${NDMC_FAIL_ADD:-0}" = 1 ] && exit 6
         printf '%s\n' "$*" >> "$NDMC_CALLS"
         printf 'ip host %s %s\n' "$(echo "$2" | awk '{print $3}')" "$(echo "$2" | awk '{print $4}')" >> "$NDMC_STATE"
@@ -255,5 +261,45 @@ env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$KILL/d2k" NDMC_STATE="$KILL/ndmc-state" N
     D2K_INSTAGRAM_LOG="$KILL/remove.log" sh "$SCRIPT" remove || fail "remove after an interrupted refresh failed"
 [ "$(cat "$KILL/ndmc-state")" = 'ip host unrelated.example 192.0.2.7' ] || fail "interrupted refresh left an unowned pin"
 ok "a refresh interrupted after an NDM add already owns that pin"
+
+# A stop request (TERM from the scheduler during uninstall) while NDM is still
+# applying an add: the helper lets that add finish, then exits without any
+# further change, so the removal that follows sees and removes the pin.
+STOP="$TMP/stopped"
+mkdir -p "$STOP/d2k/state" "$STOP/d2k/files" "$STOP/d2k/log"
+cp "$TMP/d2k/files/meta-ranges.txt" "$STOP/d2k/files/"
+printf 'ip host unrelated.example 192.0.2.7\n' > "$STOP/ndmc-state"
+rc=0
+env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$STOP/d2k" D2K_META_RANGES="$STOP/d2k/files/meta-ranges.txt" \
+    D2K_RELAY_URL=https://resolve.example/resolve NDMC_TERM_DURING_ADD=1 \
+    NDMC_STATE="$STOP/ndmc-state" NDMC_CALLS="$STOP/ndmc-calls" CURL_CALLS="$STOP/curl-calls" \
+    D2K_INSTAGRAM_LOG="$STOP/refresh.log" sh "$SCRIPT" refresh || rc=$?
+[ "$rc" -ne 0 ] || fail "stopped refresh reported success"
+[ "$(grep -c '^-c ip host ' "$STOP/ndmc-calls")" = 1 ] || fail "refresh continued adding after a stop request"
+added=$(awk '$1=="ip"&&$2=="host"&&$3!="unrelated.example"{print $3" "$4}' "$STOP/ndmc-state")
+[ -n "$added" ] || fail "helper exited before the in-flight NDM add finished"
+[ "$(cat "$STOP/d2k/state/instagram-ip-hosts.tsv")" = "$added" ] || fail "in-flight add is not owned"
+env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$STOP/d2k" NDMC_STATE="$STOP/ndmc-state" NDMC_CALLS="$STOP/ndmc-calls" \
+    D2K_INSTAGRAM_LOG="$STOP/remove.log" sh "$SCRIPT" remove || fail "remove after a stopped refresh failed"
+[ "$(cat "$STOP/ndmc-state")" = 'ip host unrelated.example 192.0.2.7' ] || fail "stopped refresh left an unowned pin"
+ok "a stop request lets the in-flight NDM add finish, then exits; removal takes the pin back"
+
+# A pair claimed by a refresh that died before NDM received it is dropped by
+# the next refresh, so it can never cover the user's own later pin.
+CLAIM="$TMP/claimed"
+mkdir -p "$CLAIM/d2k/state" "$CLAIM/d2k/files" "$CLAIM/d2k/log"
+cp "$TMP/d2k/files/meta-ranges.txt" "$CLAIM/d2k/files/"
+: > "$CLAIM/ndmc-state"
+printf 'graph.instagram.com 157.240.9.199\n' > "$CLAIM/d2k/state/instagram-ip-hosts.tsv"
+env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$CLAIM/d2k" D2K_META_RANGES="$CLAIM/d2k/files/meta-ranges.txt" \
+    D2K_RELAY_URL=https://resolve.example/resolve \
+    NDMC_STATE="$CLAIM/ndmc-state" NDMC_CALLS="$CLAIM/ndmc-calls" CURL_CALLS="$CLAIM/curl-calls" \
+    D2K_INSTAGRAM_LOG="$CLAIM/refresh.log" sh "$SCRIPT" refresh || fail "refresh with a stale claim failed"
+! grep -q '^graph.instagram.com 157.240.9.199$' "$CLAIM/d2k/state/instagram-ip-hosts.tsv" || fail "claim of a pair absent from NDM survived a refresh"
+printf 'ip host graph.instagram.com 157.240.9.199\n' >> "$CLAIM/ndmc-state"
+env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$CLAIM/d2k" NDMC_STATE="$CLAIM/ndmc-state" NDMC_CALLS="$CLAIM/ndmc-calls" \
+    D2K_INSTAGRAM_LOG="$CLAIM/remove.log" sh "$SCRIPT" remove || fail "remove failed"
+grep -q '^ip host graph.instagram.com 157.240.9.199$' "$CLAIM/ndmc-state" || fail "a stale claim removed the user's own later pin"
+ok "a claim that never reached NDM is dropped at the next refresh"
 
 echo "Instagram DNS lifecycle: all checks passed"

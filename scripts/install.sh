@@ -262,7 +262,7 @@ fi
 # clearing the success mark makes the service's scheduler refresh right after
 # start, in the background. A resolver/VPS outage never fails the install.
 rm -f "$DIR/state/instagram-dns-last-success" /tmp/d2k-instagram-dns-last-attempt
-say "DNS Instagram/WhatsApp обновляется в фоне после запуска: результат в $DIR/log/instagram-dns.log; прежние записи сохраняются, далее — ежедневно после 02:00"
+say "DNS Instagram/WhatsApp обновляется в фоне после запуска: результат в $DIR/log/instagram-dns.log; прежние записи сохраняются, далее — ежедневно в 02:00–02:59 (своя минута у каждой установки)"
 # Убираем только legacy Go-панельный бинарник прежней установки; новый C
 # runtime уже проверен выше и установлен отдельно как d2kpanel.
 rm -f "$SBIN/d2k"

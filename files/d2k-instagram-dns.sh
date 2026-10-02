@@ -3,6 +3,10 @@
 # on the VPS (d2k-enroll POST /resolve) and manage only the exact static DNS
 # pairs owned by this D2K installation.
 set -eu
+# A stop request (service stop, uninstall) takes effect only after the
+# current command: an in-flight ndmc add finishes and stays owned, and no
+# further change follows.
+trap 'exit 143' TERM INT HUP
 export PATH="${D2K_STUB_PATH:+$D2K_STUB_PATH:}/opt/sbin:/opt/bin:/sbin:/usr/sbin:/bin:/usr/bin"
 DIR=${D2K_DIR:-/opt/d2k}
 META_RANGES=${D2K_META_RANGES:-$DIR/files/meta-ranges.txt}
@@ -146,7 +150,19 @@ refresh() {
     fi
     next="$MANIFEST.new.$$"; : > "$next"
     if [ -f "$MANIFEST" ]; then
-        while read -r host ip _extra; do [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue; managed_host "$host" && valid_ipv4 "$ip" && printf '%s %s\n' "$host" "$ip" >> "$next"; done < "$MANIFEST"
+        # Keep owning only pairs NDM actually has: a claim written by a refresh
+        # that died before its add (or a pin the user deleted) is dropped, so
+        # it can never cover the user's own later identical pin.
+        current=$(running_config) || { rm -f "$next"; log 'не удалось прочитать NDM перед обновлением'; return 1; }
+        while read -r host ip _extra; do
+            [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+            if ! managed_host "$host" || ! valid_ipv4 "$ip"; then continue; fi
+            if printf '%s\n' "$current" | awk -v h="$host" -v ip="$ip" '$1=="ip"&&$2=="host"&&$3==h&&$4==ip {f=1} END{exit !f}'; then
+                printf '%s %s\n' "$host" "$ip" >> "$next"
+            else
+                log "владение снято: записи $host $ip нет в NDM"
+            fi
+        done < "$MANIFEST"
     fi
     add_failed=0
     for host in $HOSTS; do

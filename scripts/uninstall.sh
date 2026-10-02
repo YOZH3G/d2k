@@ -26,7 +26,8 @@ DNS_SCHED_PID=$DIR/run/d2k-instagram-dns-scheduler.pid
 if [ -f "$DNS_SCHED_PID" ]; then
     start-stop-daemon -K -q -p "$DNS_SCHED_PID" 2>/dev/null || true
     n=0
-    while [ "$n" -lt 15 ] && pid=$(cat "$DNS_SCHED_PID" 2>/dev/null) &&
+    # Up to the resolver curl --max-time (15 s) plus one certificate check.
+    while [ "$n" -lt 30 ] && pid=$(cat "$DNS_SCHED_PID" 2>/dev/null) &&
           [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
         sleep 1
         n=$((n + 1))

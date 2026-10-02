@@ -1,5 +1,6 @@
 #!/bin/sh
-# Local-time daily Instagram/WhatsApp DNS refresh after 02:00 router time.
+# Local-time daily Instagram/WhatsApp DNS refresh after 02:00 router time plus
+# a stable per-install offset of 0-59 minutes.
 # Without any recorded success (fresh install, or the installer cleared it to
 # pin a new host set) the first refresh runs right away, in the background of
 # the service, so installation does not wait for slow edges.
@@ -15,7 +16,10 @@ ATTEMPT=${D2K_INSTAGRAM_SCHED_ATTEMPT:-/tmp/d2k-instagram-dns-last-attempt}
 LOG=${D2K_INSTAGRAM_SCHED_LOG:-$DIR/log/instagram-dns-scheduler.log}
 RUN_EVERY=${D2K_SCHEDULER_INTERVAL:-60}
 RETRY_AFTER=${D2K_SCHEDULER_RETRY_AFTER:-1800}
-RUN_AT=${D2K_INSTAGRAM_REFRESH_AT:-0200}
+OFFSET_FILE=${D2K_INSTAGRAM_SCHED_OFFSET:-$DIR/state/instagram-dns-offset}
+# Explicit HHMM wins; otherwise 02:00 plus a per-install offset of 0-59
+# minutes, drawn once and kept, so routers do not all call /resolve at once.
+RUN_AT=${D2K_INSTAGRAM_REFRESH_AT:-}
 child_pid=
 
 stop_scheduler() {
@@ -32,11 +36,30 @@ log() {
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG"
 }
 
+refresh_offset() {
+    offset=$(cat "$OFFSET_FILE" 2>/dev/null || true)
+    # Decimal only: a leading zero must not turn into octal for printf.
+    case "$offset" in [0-9]|[1-5][0-9]) printf '%s\n' "$offset"; return 0;; 0[0-9]) printf '%s\n' "${offset#0}"; return 0;; esac
+    offset=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ')
+    case "$offset" in ''|*[!0-9]*) offset=$(awk -v s="$$" 'BEGIN{srand(s); print int(rand()*65536)}');; esac
+    offset=$((offset % 60))
+    mkdir -p "$(dirname "$OFFSET_FILE")" 2>/dev/null || true
+    tmp="$OFFSET_FILE.new.$$"
+    if printf '%s\n' "$offset" > "$tmp" && mv -f "$tmp" "$OFFSET_FILE"; then :; else rm -f "$tmp"; fi
+    printf '%s\n' "$offset"
+}
+
+run_at() {
+    if [ -n "$RUN_AT" ]; then printf '%s\n' "$RUN_AT"; return 0; fi
+    printf '02%02d\n' "$(refresh_offset)"
+}
+
 tick() {
     today=$(date +%Y-%m-%d)
     hhmm=$(date +%H%M)
+    at=$(run_at)
     if [ -e "$STATE" ]; then
-        [ "$hhmm" -ge "$RUN_AT" ] || return 0
+        [ "$hhmm" -ge "$at" ] || return 0
     fi
     [ "$(cat "$STATE" 2>/dev/null || true)" != "$today" ] || return 0
 
@@ -55,7 +78,7 @@ tick() {
         child_pid=
         tmp="$STATE.new.$$"
         if printf '%s\n' "$today" > "$tmp" && mv -f "$tmp" "$STATE"; then
-            log "DNS Instagram/WhatsApp обновлён; следующий запуск после $RUN_AT завтра"
+            log "DNS Instagram/WhatsApp обновлён; следующий запуск после $at завтра"
         else
             rm -f "$tmp"
             log 'обновление успешно, но не удалось сохранить дату; временной backoff не даст запускать повтор каждую минуту'
