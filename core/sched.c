@@ -98,7 +98,12 @@
 #define SCHED_CHALLENGE_BACKOFF_MS (60LL * 60 * 1000)
 /* Явный порог планировщика, согласованный с владельцем: обычный TCP RST —
    низкоуверенное подозрение, второй должен прийти по независимому flow key,
-   пока первое ещё отражает текущую линию. Это не порог дерева оригинала. */
+   пока первое ещё отражает текущую линию. Это не порог дерева оригинала.
+   Здесь он применяется к позднему RST после app-data (D2K_SUSPECT_RST_AFTER_APP):
+   датапат шлёт его на любой TLS-поток с прикладными данными и RST, и на
+   здоровом трафике одиночный такой RST устраивал шторм парных замеров. */
+#define SCHED_LATE_RST_CONFIRM_MS (30 * 1000)
+#define SCHED_LATE_RST_SLOTS 16
 /* Сколько ждать решения по потоку разговора с применённым приёмом голоса.
    Приговор «молчит» датапат выносит через две секунды после приветствия
    (silence_deadline); пятнадцать — с запасом на медленную очередь событий, и
@@ -686,6 +691,14 @@ typedef struct {
     int        used;
 } target_cooldown;
 
+/* Первый поздний RST цели, ждущий второго по независимому flow key. */
+typedef struct {
+    char name[256];
+    uint8_t transport, family, used;
+    d2k_flowkey flow;
+    int64_t seen_ms;
+} late_rst_pending;
+
 typedef struct {
     char name[256], plan_id[40];
     uint8_t kind, transport, shape, family;
@@ -710,6 +723,8 @@ struct d2k_sched {
     size_t       seen_next;   /* кольцо: старое вытесняется, а не отказывает */
     target_cooldown cooldowns[SCHED_COOLDOWN_SLOTS];
     size_t       cooldown_next;
+    late_rst_pending late_rst[SCHED_LATE_RST_SLOTS];
+    size_t       late_rst_next;
     struct { d2k_resource ref; int64_t expires_ms; } resources[8];
     size_t resource_next;
     struct { char name[256]; uint8_t bytes[2048]; size_t len;
@@ -1136,6 +1151,44 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     c->exhausted = 0;
     c->signal_code = t->trigger_code;
     c->until_ms = s->now_ms + clear_backoff_ms(c->negative_streak);
+}
+
+/* Порог позднего RST: 1 — это второй RST по независимому потоку в окне,
+   замер можно начинать; 0 — первый (или повтор того же потока), ждём. */
+static int late_rst_confirmed(d2k_sched *s, const char *name, const d2k_ev *ev) {
+    uint8_t family = ev->family ? ev->family : 4;
+    late_rst_pending *p = NULL;
+    for (size_t i = 0; i < SCHED_LATE_RST_SLOTS; i++) {
+        late_rst_pending *c = &s->late_rst[i];
+        if (c->used && c->transport == ev->transport && c->family == family &&
+            strcmp(c->name, name) == 0) { p = c; break; }
+    }
+    if (p && s->now_ms - p->seen_ms <= SCHED_LATE_RST_CONFIRM_MS) {
+        if (ev_matches_flow(ev, &p->flow)) { return 0; }
+        memset(p, 0, sizeof *p);
+        say(s, "по %s второй поздний RST на независимом потоке за %d с — подтверждаю подозрение",
+            name, SCHED_LATE_RST_CONFIRM_MS / 1000);
+        return 1;
+    }
+    if (!p) {
+        p = &s->late_rst[s->late_rst_next];
+        s->late_rst_next = (s->late_rst_next + 1) % SCHED_LATE_RST_SLOTS;
+    }
+    memset(p, 0, sizeof *p);
+    snprintf(p->name, sizeof p->name, "%s", name);
+    p->transport = ev->transport;
+    p->family = family;
+    memcpy(p->flow.a_ip, ev->low_ip, 16);
+    memcpy(p->flow.b_ip, ev->high_ip, 16);
+    p->flow.a_port = ev->low_port;
+    p->flow.b_port = ev->high_port;
+    p->flow.transport = ev->transport;
+    p->flow.family = family;
+    p->seen_ms = s->now_ms;
+    p->used = 1;
+    say(s, "по %s одиночный поздний RST после app-data — жду второй независимый поток до %d с; "
+           "замер пока не запускаю", name, SCHED_LATE_RST_CONFIRM_MS / 1000);
+    return 0;
 }
 
 static task *task_of(d2k_sched *s, const char *name, uint8_t transport, uint8_t family) {
@@ -4342,6 +4395,10 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         t->voice_silent = 1;
         return 0;
     }
+    if (ev->code == D2K_SUSPECT_RST_AFTER_APP && (!t || t->state == T_WATCHING) &&
+        !late_rst_confirmed(s, name, ev)) {
+        return 0;
+    }
     if (t) {
         if (t->state == T_QUEUED) {
             /* An ACK must never erase a later failure of the inherited plan.
@@ -5703,6 +5760,12 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     }
                     say(s, "по %s позднее закрытие не подтвердилось парными измерениями ответа; "
                            "перебор не запускаю", t->name);
+                    /* Не блок: неубедительный замер, как у прямого вердикта
+                       без доказательства. Без cooldown здоровый трафик с
+                       поздними RST повторял пару каждые две минуты. */
+                    cooldown_record(s, t, 2);
+                    say(s, "по %s повторный замер отложен на %lld мин",
+                        t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
                     task_fail(s, t, now_ms);
                     moved++;
                     continue;
@@ -5914,6 +5977,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 }
             }
             if (t->n_plans == 0) {
+                /* Блок доказан, а кандидатов нет — тот же исход, что
+                   исчерпание: повтор через десять минут, не через два. */
+                cooldown_record(s, t, 2);
+                say(s, "по %s кандидатов нет — новый поиск отложен на %lld мин",
+                    t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
                 task_fail(s, t, now_ms);
                 moved++;
                 continue;
@@ -6303,6 +6371,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     if (t->n_plans == 0) {
                         say(s, "по %s готовые планы не помогли; прямое измерение "
                                "не дало новых кандидатов", t->name);
+                        cooldown_record(s, t, 2);
+                        say(s, "по %s после исчерпания кандидатов новый поиск отложен на %lld мин",
+                            t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
                         task_fail(s, t, now_ms);
                         moved++;
                         continue;

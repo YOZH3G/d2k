@@ -1007,6 +1007,16 @@ static void spin_until_installed(d2k_sched *s) {
    проходит меньше двух секунд модельного времени и потолок не пересекает
    никогда. Живое время при этом не тратится — у планировщика часы приходят
    аргументом, а не из ОС. */
+/* Первый поздний RST той же цели на соседнем потоке: одиночный поздний RST
+   замер не запускает (задача 18), второй по независимому flow key — да. */
+static void prime_late_rst(d2k_sched *s, const char *name, uint16_t cport) {
+    d2k_ev h = ev_hello(6, cport, name);
+    d2k_sched_event(s, &h);
+    d2k_ev r = ev_suspect(6, cport);
+    r.code = D2K_SUSPECT_RST_AFTER_APP;
+    d2k_sched_event(s, &r);
+}
+
 static void skip_ahead(d2k_sched *s, int64_t ms) {
     g_now_ms += ms;
     d2k_sched_tick(s, g_now_ms);
@@ -1958,6 +1968,196 @@ int main(int argc, char **argv) {
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c_promote);
+    }
+
+    /* ЗАДАЧА 18. Поздний RST на здоровой цели не устраивает шторм замеров.
+       Датапат шлёт D2K_SUSPECT_RST_AFTER_APP на любой TLS-поток с app-data и
+       RST. Это низкоуверенное подозрение: замер начинается только после
+       второго такого RST по независимому flow key, а неподтверждённая
+       RX-volume-пара откладывает повтор обычным cooldown, а не двухминутным
+       отдыхом. */
+    {
+        d2k_catalog c18 = {0};
+        d2k_sched *s = d2k_sched_new(&c18, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для порога позднего RST не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            vol_calls = tcp_calls = 0;
+            vol_answer = D2K_VOL_PASSED;
+            vol_rx_cut = 0;
+            const char *name = "late-threshold.test";
+            d2k_ev h = ev_hello(6, 41040, name);
+            d2k_sched_event(s, &h);
+            d2k_ev r = ev_suspect(6, 41040);
+            r.code = D2K_SUSPECT_RST_AFTER_APP;
+            CHECK(d2k_sched_event(s, &r) == 0,
+                  "одиночный поздний RST сразу запустил замер");
+            settle(s);
+            CHECK(vol_calls == 0 && tcp_calls == 0,
+                  "одиночный поздний RST дошёл до сетевого измерения");
+            CHECK(said("жду второй независимый поток"),
+                  "ожидание второго позднего RST не отражено в журнале");
+            /* Тот же поток повторно — не независимый ключ. */
+            CHECK(d2k_sched_event(s, &r) == 0,
+                  "повтор позднего RST того же потока засчитан как независимый");
+            settle(s);
+            CHECK(vol_calls == 0, "повтор того же потока запустил замер");
+            /* Второй RST вне окна подтверждения не подтверждает первый. */
+            skip_ahead(s, 31000);
+            d2k_ev h2 = ev_hello(6, 41041, name);
+            d2k_sched_event(s, &h2);
+            d2k_ev r2 = ev_suspect(6, 41041);
+            r2.code = D2K_SUSPECT_RST_AFTER_APP;
+            CHECK(d2k_sched_event(s, &r2) == 0,
+                  "устаревший первый поздний RST подтвердил второй");
+            settle(s);
+            CHECK(vol_calls == 0, "поздний RST вне окна запустил замер");
+            /* Независимый поток в окне — подтверждение, замер начинается. */
+            d2k_ev h3 = ev_hello(6, 41042, name);
+            d2k_sched_event(s, &h3);
+            d2k_ev r3 = ev_suspect(6, 41042);
+            r3.code = D2K_SUSPECT_RST_AFTER_APP;
+            CHECK(d2k_sched_event(s, &r3) == 1,
+                  "второй поздний RST по независимому потоку не запустил замер");
+            settle(s);
+            CHECK(vol_calls == 1 && tcp_calls == 0,
+                  "подтверждённый поздний RST не прошёл ровно одну RX-volume-пару");
+            CHECK(said("позднее закрытие не подтвердилось"),
+                  "неподтверждённый поздний RST не отражён в журнале");
+
+            /* Двухминутный отдых прошёл, здоровый трафик продолжает рвать
+               соединения поздним RST — повторного замера быть не должно. */
+            skip_ahead(s, 3 * 60 * 1000);
+            for (uint16_t port = 41043; port <= 41044; port++) {
+                d2k_ev hh = ev_hello(6, port, name);
+                d2k_sched_event(s, &hh);
+                d2k_ev rr = ev_suspect(6, port);
+                rr.code = D2K_SUSPECT_RST_AFTER_APP;
+                d2k_sched_event(s, &rr);
+                settle(s);
+            }
+            CHECK(vol_calls == 1,
+                  "неподтверждённый поздний RST повторил замер через два минуты");
+            CHECK(said("замер отложен после неподтверждённого прошлого замера"),
+                  "cooldown неподтверждённого позднего RST не отражён в журнале");
+            CHECK(bindings_of(&c18, name, 6) == 0,
+                  "неподтверждённый поздний RST записал обход");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c18);
+    }
+
+    /* «Блок доказан, кандидатов 0»: пустой поиск откладывается на cooldown,
+       а не повторяется после двухминутного отдыха. */
+    {
+        d2k_catalog c18 = {0};
+        d2k_sched *s = d2k_sched_new(&c18, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для пустого поиска не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            quic_answer = D2K_V_PREFIX;
+            arm_kind = D2K_QA_FLAKY;
+            quic_calls = 0;
+            d2k_ev h = ev_hello(17, 41050, "empty-search.test");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 41050);
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(quic_calls == 1 && said("верить нельзя"),
+                  "блок без кандидатов не прошёл ровно один QUIC-замер");
+            skip_ahead(s, 3 * 60 * 1000);
+            d2k_ev h2 = ev_hello(17, 41051, "empty-search.test");
+            d2k_sched_event(s, &h2);
+            d2k_ev su2 = ev_suspect(17, 41051);
+            d2k_sched_event(s, &su2);
+            settle(s);
+            CHECK(quic_calls == 1,
+                  "пустой поиск при доказанном блоке повторён через две минуты");
+            skip_ahead(s, 8 * 60 * 1000);
+            d2k_ev h3 = ev_hello(17, 41052, "empty-search.test");
+            d2k_sched_event(s, &h3);
+            d2k_ev su3 = ev_suspect(17, 41052);
+            d2k_sched_event(s, &su3);
+            settle(s);
+            CHECK(quic_calls == 2, "после cooldown пустой поиск не возобновился");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c18);
+        quic_answer = D2K_V_OPAQUE;
+        arm_kind = D2K_QA_BLOB;
+    }
+
+    /* «Готовые планы не помогли, новых кандидатов нет» — тоже cooldown. */
+    {
+        d2k_catalog cR;
+        memset(&cR, 0, sizeof cR);
+        cR.boxes = calloc(1, sizeof *cR.boxes);
+        CHECK(cR.boxes != NULL, "не удалось создать коробку для пустого повтора");
+        if (cR.boxes) {
+            cR.n_boxes = 1;
+            d2k_cat_box *b = &cR.boxes[0];
+            snprintf(b->id, sizeof b->id, "box-empty-after-known");
+            b->fp.method = D2K_FP_METHOD;
+            b->fp.n_sig = 1;
+            snprintf(b->fp.sig[0].kind, sizeof b->fp.sig[0].kind, "rst");
+            b->fp.sig[0].ttl = 127;
+            b->fp.sig[0].tos = 0x88;
+            b->fp.sig[0].ipid = 54321;
+            b->plans = calloc(1, sizeof *b->plans);
+            CHECK(b->plans != NULL, "не удалось создать готовый план");
+            if (b->plans) {
+                b->n_plans = 1;
+                b->plans[0].enabled = 1;
+                b->plans[0].successes = 3;
+                snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "quic");
+                b->plans[0].text = strdup(
+                    "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                    "proto udp quic\npayload 1 aabb\n"
+                    "fake payload=1 poison=0 repeats=1 gap_us=0 place=before\n"
+                    "order forward\n");
+            }
+            if (b->plans && b->plans[0].text) {
+                d2k_sched *s = d2k_sched_new(&cR, sv[0], 0x2d);
+                saidbuf[0] = '\0';
+                d2k_sched_set_say(s, collect_say, NULL);
+                quic_answer = D2K_V_PREFIX;
+                arm_kind = D2K_QA_FLAKY;
+                ver_answer = D2K_VER_TRANSPORT;
+                ver_fail_first = 0;
+                quic_calls = ver_calls = 0;
+                ver_answer_port = 41060;
+                d2k_ev h = ev_hello(17, 41060, "known-then-empty.test");
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(17, 41060);
+                d2k_sched_event(s, &su);
+                spin_until_installed(s);
+                for (int i = 0; i < 20 && !said("не дало новых кандидатов"); i++) {
+                    d2k_ev ap = ev_applied(17, 41060);
+                    d2k_sched_event(s, &ap);
+                    spin(s, 80);
+                }
+                CHECK(said("готовых планов узнанной коробки") &&
+                      said("не дало новых кандидатов"),
+                      "сценарий «готовые планы не помогли, новых нет» не воспроизведён");
+                int measured = quic_calls;
+                skip_ahead(s, 3 * 60 * 1000);
+                d2k_ev h2 = ev_hello(17, 41061, "known-then-empty.test");
+                d2k_sched_event(s, &h2);
+                d2k_ev su2 = ev_suspect(17, 41061);
+                d2k_sched_event(s, &su2);
+                settle(s);
+                CHECK(quic_calls == measured && said("замер отложен"),
+                      "пустой повтор после готовых планов не отложен cooldown");
+                d2k_sched_free(s);
+            }
+        }
+        d2k_catalog_free(&cR);
+        quic_answer = D2K_V_OPAQUE;
+        arm_kind = D2K_QA_BLOB;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_answer_port = 0;
     }
 
     if (rst_only) {
@@ -4651,6 +4851,7 @@ rx_volume_tests:
         CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
               "не удалось собрать TLS 1.3 shape для позднего RST");
         d2k_sched_event(s, &sh);
+        prime_late_rst(s, h.name, 40182);
         d2k_ev su = ev_suspect(6, 40082);
         su.code = D2K_SUSPECT_RST_AFTER_APP;
         d2k_sched_event(s, &su);
@@ -4675,6 +4876,7 @@ rx_volume_tests:
         CHECK(tls_shape_event(&sh, h2.name, D2K_SHAPE_MODERN) == 0,
               "не удалось собрать TLS 1.3 shape для подтверждённого позднего RST");
         d2k_sched_event(s, &sh);
+        prime_late_rst(s, h2.name, 40183);
         d2k_ev su2 = ev_suspect(6, 40083);
         su2.code = D2K_SUSPECT_RST_AFTER_APP;
         d2k_sched_event(s, &su2);
@@ -4744,6 +4946,7 @@ rx_volume_tests:
                     CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
                           "не удалось собрать TLS 1.3 shape для полной коробки");
                     d2k_sched_event(s, &sh);
+                    prime_late_rst(s, h.name, 40340);
                     d2k_ev su = ev_suspect(6, 40240);
                     su.code = D2K_SUSPECT_RST_AFTER_APP;
                     d2k_sched_event(s, &su);
