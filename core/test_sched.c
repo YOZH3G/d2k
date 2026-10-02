@@ -60,7 +60,7 @@
    узнанной коробки в кандидаты. Про это планировщик говорит, и только по
    этому проверка честна (первая редакция этой проверки смотрела на число
    коробок и проходила даже при выключенном d2k_catalog_match). */
-static char saidbuf[16384];
+static char saidbuf[1 << 18];
 static void collect_say(void *ctx, const char *line) {
     (void)ctx;
     size_t n = strlen(saidbuf);
@@ -609,7 +609,7 @@ static d2k_ev ev_exchange(uint8_t transport, uint16_t cport, int appdata) {
    Прочитанное НЕ выбрасывается: из него тест берёт идентификатор плана (см.
    last_plan_id). */
 static int drain_fd = -1;
-static uint8_t sentbuf[1 << 18];
+static uint8_t sentbuf[1 << 21];
 static size_t sent_len;
 
 static void drain(void) {
@@ -766,6 +766,61 @@ static size_t sent_command_count(uint16_t kind, const uint8_t *body, size_t len)
         off += 4 + n;
     }
     return count;
+}
+
+/* Пробные записи ИМЕНИ name по проводу (задача 20). Каждая SET_NAME_PROBE
+   (имя, форма, семейство, местный порт) обязана быть снята ровно своей
+   DEL_NAME_PROBE с тем же ключом; широкая DEL_NAME подтверждённое знание
+   задела бы. pending — сколько осталось стоять, max_pending — сколько
+   стояло одновременно (каждый переход снимает прежнюю запись ДО следующей),
+   stray — снятия без своей установки. */
+typedef struct {
+    size_t sets, dels, stray, pending, max_pending, broad;
+} probe_tally;
+
+static probe_tally name_probe_tally(const char *name) {
+    probe_tally r;
+    memset(&r, 0, sizeof r);
+    struct { uint8_t shape, family; uint16_t port; } open_set[256];
+    size_t n_open = 0, nl = strlen(name);
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+                     (uint32_t)p[2] << 8 | p[3];
+        if (n < 2 || n > sent_len - off - 4) break;
+        uint16_t cmd = (uint16_t)((uint16_t)p[4] << 8 | p[5]);
+        const uint8_t *body = p + 6;
+        size_t blen = n - 2;
+        int ours = blen >= 1 + nl && body[0] == nl && !memcmp(body + 1, name, nl);
+        if (ours && cmd == D2K_CMD_DEL_NAME) { r.broad++; }
+        if (ours && (cmd == D2K_CMD_SET_NAME_PROBE || cmd == D2K_CMD_DEL_NAME_PROBE) &&
+            blen >= 1 + nl + 4) {
+            uint8_t shape = body[1 + nl], family = body[2 + nl];
+            uint16_t port;
+            memcpy(&port, body + 3 + nl, 2);
+            size_t k = 0;
+            while (k < n_open && !(open_set[k].shape == shape &&
+                                   open_set[k].family == family &&
+                                   open_set[k].port == port)) { k++; }
+            if (cmd == D2K_CMD_SET_NAME_PROBE) {
+                r.sets++;
+                if (k == n_open && n_open < sizeof open_set / sizeof open_set[0]) {
+                    open_set[n_open].shape = shape;
+                    open_set[n_open].family = family;
+                    open_set[n_open].port = port;
+                    n_open++;
+                }
+                if (n_open > r.max_pending) { r.max_pending = n_open; }
+            } else {
+                r.dels++;
+                if (k == n_open) { r.stray++; }
+                else { open_set[k] = open_set[--n_open]; }
+            }
+        }
+        off += 4 + n;
+    }
+    r.pending = n_open;
+    return r;
 }
 
 /* SET_ADDR v7: [family][address 16][форма][план]. Сколько ушло на этот
@@ -1297,8 +1352,9 @@ int main(int argc, char **argv) {
     int question_only = argc == 2 && strcmp(argv[1], "--question-only") == 0;
     int shape_only = argc == 2 && strcmp(argv[1], "--shape-only") == 0;
     int groups_only = argc == 2 && strcmp(argv[1], "--groups-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only) {
-        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only]\n");
+    int retire_only = argc == 2 && strcmp(argv[1], "--retire-only") == 0;
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only]\n");
         return 2;
     }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
@@ -1651,6 +1707,7 @@ int main(int argc, char **argv) {
     uint8_t question_prev_id[D2K_PLAN_ID_LEN] = {0};
     if (rx_only) { goto rx_volume_tests; }
     if (question_only) { goto question_test; }
+    if (retire_only) { goto retire_test; }
     if (shape_only) { goto shape_test; }
     {
         d2k_catalog empty = {0};
@@ -4104,6 +4161,229 @@ question_test:
     }
 
     if (question_only) { goto voice_only_done; }
+retire_test:
+    /* --- ЗАДАЧА 20: каждый пробный план снимается на каждом переходе ---
+       Пробная запись имени живёт по местному порту зонда. Не снятая точно,
+       она стоит до вытеснения LRU или переподключения контроллера: порт
+       вернётся ядру и достанется постороннему сокету с той же меткой, а сама
+       запись вытеснит подтверждённое знание. Считаем по проводу: каждая
+       SET_NAME_PROBE задачи снята своей DEL_NAME_PROBE (тот же порт, форма и
+       семейство), прежняя — ДО установки следующей, широкой DEL_NAME нет. */
+    {
+        /* 1. Провал кандидата → следующий → исчерпание (task_fail). */
+        d2k_catalog cr = {0};
+        d2k_sched *s = d2k_sched_new(&cr, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_HANDSHAKE; ver_fail_first = 0;
+        ver_answer_port = 40201; ver_calls = 0;
+        forget_sent();
+        d2k_ev h = ev_hello(6, 40201, "снятие.провал");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40201);
+        d2k_sched_event(s, &su);
+        settle(s);
+        run_out(s);
+        probe_tally pt = name_probe_tally("снятие.провал");
+        printf("retire/fail: sets=%zu dels=%zu pending=%zu max=%zu stray=%zu broad=%zu\n",
+               pt.sets, pt.dels, pt.pending, pt.max_pending, pt.stray, pt.broad);
+        CHECK(pt.sets >= 2, "retire: провал кандидатов не дошёл до второго кандидата");
+        CHECK(pt.max_pending == 1,
+              "retire: следующий кандидат встал, а план провалившегося не снят");
+        CHECK(pt.pending == 0, "retire: после task_fail пробные записи кандидатов остались стоять");
+        CHECK(pt.stray == 0 && pt.broad == 0,
+              "retire: снятие задело запись, которую задача не ставила");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cr);
+        ver_answer = D2K_VER_APPLICATION;
+    }
+    {
+        /* 2. Непереносимость: зонду план исполнился, клиенту — нет. Кандидат
+           отвергнут в verify_confirm, его запись обязана уйти. */
+        d2k_catalog cr = {0};
+        d2k_sched *s = d2k_sched_new(&cr, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        ver_answer_port = 40210; ver_calls = 0;
+        forget_sent();
+        d2k_ev h = ev_hello(6, 40210, "снятие.непереносимо");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40210);
+        d2k_sched_event(s, &su);
+        settle(s);
+        spin_until_installed(s);
+        d2k_ev hc = ev_hello(6, 40211, "снятие.непереносимо");
+        d2k_sched_event(s, &hc);
+        d2k_ev big = ev_refused(6, 40211, D2K_REFUSE_TOO_LONG, 1);
+        d2k_sched_event(s, &big);
+        d2k_ev ap = ev_applied(6, 40210);
+        d2k_sched_event(s, &ap);
+        spin(s, 60);
+        CHECK(said("потоку клиента"), "retire: непереносимость не сработала — проверять нечего");
+        probe_tally mid = name_probe_tally("снятие.непереносимо");
+        CHECK(mid.sets >= 1 && mid.pending <= 1 && mid.max_pending == 1,
+              "retire: непереносимый кандидат остался стоять рядом со следующим");
+        run_out(s);
+        probe_tally pt = name_probe_tally("снятие.непереносимо");
+        printf("retire/unfit: sets=%zu dels=%zu pending=%zu max=%zu stray=%zu broad=%zu\n",
+               pt.sets, pt.dels, pt.pending, pt.max_pending, pt.stray, pt.broad);
+        CHECK(pt.pending == 0 && pt.stray == 0 && pt.broad == 0,
+              "retire: непереносимый кандидат не снят точно");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cr);
+    }
+    {
+        /* 3. verify_confirm: подтверждённое ставится постоянной записью
+           (проход каталога), пробная запись порта зонда снимается точно, и
+           ни одной широкой DEL_NAME — подтверждённое не задето. */
+        d2k_catalog cr = {0};
+        d2k_sched *s = d2k_sched_new(&cr, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        ver_answer_port = 40220; ver_calls = 0;
+        forget_sent();
+        d2k_ev h = ev_hello(6, 40220, "снятие.подтверждено");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40220);
+        d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev ap = ev_applied(6, 40220);
+        d2k_sched_event(s, &ap);
+        spin(s, 60);
+        CHECK(said("ПОДТВЕРЖДЕНО"), "retire: подтверждения не случилось — проверять нечего");
+        CHECK(binding_of(&cr, "снятие.подтверждено", 6) != NULL,
+              "retire: подтверждённое не записано");
+        sync_out(s);
+        probe_tally pt = name_probe_tally("снятие.подтверждено");
+        printf("retire/confirm: sets=%zu dels=%zu pending=%zu max=%zu stray=%zu broad=%zu\n",
+               pt.sets, pt.dels, pt.pending, pt.max_pending, pt.stray, pt.broad);
+        CHECK(pt.sets >= 1 && pt.pending == 0,
+              "retire: после подтверждения пробная запись порта зонда осталась стоять");
+        CHECK(pt.stray == 0 && pt.broad == 0,
+              "retire: подтверждение сняло больше, чем свою пробную запись");
+        CHECK(sent_command_count(D2K_CMD_SET_NAME, NULL, 0) >= 1,
+              "retire: подтверждённый план не поставлен постоянной записью");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cr);
+    }
+    /* 4–5. Вопросы о свойствах: каждый следующий вопрос снимает прежний,
+       прошедший вопрос снимается до первого кандидата, а task_fail после
+       кандидата снимает и кандидата (не только давно снятый вопрос). */
+    for (int qmode = 0; qmode < 2; qmode++) {
+        int lfd = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(lfd >= 0, "retire: стенд-цель не открылась");
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(0x7f000001);
+        int bound = 0;
+        for (uint16_t port = 19500; port < 19600 && !bound; port++) {
+            a.sin_port = htons(port);
+            bound = (bind(lfd, (struct sockaddr *)&a, sizeof a) == 0);
+        }
+        CHECK(bound && listen(lfd, 8) == 0, "retire: стенд-цель не слушает");
+        g_server_port = ntohs(a.sin_port);
+        const char *qname = qmode ? "снятие.вопрос-прошёл" : "снятие.вопросы";
+
+        d2k_catalog cq = {0};
+        d2k_sched *s = d2k_sched_new(&cq, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_OPAQUE; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_HANDSHAKE; ver_fail_first = 0;
+        ver_answer_port = 40230; ver_calls = 0;
+        forget_sent();
+        d2k_ev h = ev_hello(6, 40230, qname);
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40230);
+        d2k_sched_event(s, &su);
+        for (int i = 0; i < 200 && !said("спрашиваю коробку о свойствах"); i++) {
+            tick_once(s);
+        }
+        CHECK(said("спрашиваю коробку о свойствах"), "retire: вопросы не начались");
+        int peers[16], n_peers = 0;
+        if (!qmode) {
+            /* Ни один вопрос не отвечен: каждый ждёт своего срока. */
+            for (int round = 0; round < 40 && !said("поставил план 1 из"); round++) {
+                for (int i = 0; i < 20; i++) {
+                    struct pollfd p2; p2.fd = lfd; p2.events = POLLIN; p2.revents = 0;
+                    if (poll(&p2, 1, 1) > 0 && n_peers < 16) {
+                        int pf = accept(lfd, NULL, NULL);
+                        if (pf >= 0) { peers[n_peers++] = pf; }
+                    }
+                    tick_once(s);
+                }
+                if (!said("поставил план 1 из")) { skip_ahead(s, 6000); }
+            }
+        } else {
+            int peer = -1;
+            struct sockaddr_in pa;
+            for (int i = 0; i < 400 && peer < 0; i++) {
+                struct pollfd p2; p2.fd = lfd; p2.events = POLLIN; p2.revents = 0;
+                if (poll(&p2, 1, 5) > 0) {
+                    socklen_t pl = sizeof pa;
+                    peer = accept(lfd, (struct sockaddr *)&pa, &pl);
+                }
+                tick_once(s);
+            }
+            CHECK(peer >= 0, "retire: зонд вопроса не пришёл");
+            if (peer >= 0) { peers[n_peers++] = peer; }
+            for (int i = 0; i < 400 && !said("жду обмена"); i++) { tick_once(s); }
+            if (peer >= 0) {
+                d2k_ev x;
+                memset(&x, 0, sizeof x);
+                x.transport = 6;
+                x.low_ip[0] = 127; x.low_ip[3] = 1;
+                x.low_port = g_server_port;
+                x.high_ip[0] = 127; x.high_ip[3] = 1;
+                x.high_port = ntohs(pa.sin_port);
+                x.kind = D2K_EV_APPLIED;
+                (void)last_plan_id(x.plan_id);
+                d2k_sched_event(s, &x);
+                x.kind = D2K_EV_EXCHANGE;
+                x.code = 22; x.num = 1380; x.seen_types = 0x0C; x.server_hello = 1;
+                memset(x.plan_id, 0, sizeof x.plan_id);
+                d2k_sched_event(s, &x);
+            }
+            for (int i = 0; i < 400 && !said("поставил план 1 из"); i++) { tick_once(s); }
+            CHECK(said("вопрос 1 прошёл"), "retire: вопрос не прошёл — проверять нечего");
+        }
+        CHECK(said("поставил план 1 из"), "retire: после вопросов кандидат не встал");
+        probe_tally mid = name_probe_tally(qname);
+        printf("retire/questions%d at candidate: sets=%zu dels=%zu pending=%zu max=%zu stray=%zu\n",
+               qmode, mid.sets, mid.dels, mid.pending, mid.max_pending, mid.stray);
+        CHECK(mid.sets >= 2, "retire: вопрос и кандидат не поставлены");
+        CHECK(mid.pending == 1 && mid.max_pending == 1,
+              qmode ? "retire: прошедший вопрос остался стоять рядом с кандидатом"
+                    : "retire: план прежнего вопроса не снят при переходе к следующему");
+        /* run_out останавливается, когда задача ждёт приёма плана
+           (T_TRIAL_SETTLE не «активна»): крутим до отдыха цели. */
+        for (int i = 0; i < 150 && !said("новый поиск отложен"); i++) {
+            skip_ahead(s, 6000);
+            spin(s, 40);
+        }
+        CHECK(said("новый поиск отложен"), "retire: поиск не дошёл до исчерпания");
+        probe_tally pt = name_probe_tally(qname);
+        printf("retire/questions%d end: sets=%zu dels=%zu pending=%zu max=%zu stray=%zu broad=%zu\n",
+               qmode, pt.sets, pt.dels, pt.pending, pt.max_pending, pt.stray, pt.broad);
+        CHECK(pt.pending == 0,
+              "retire: task_fail после кандидата оставил пробную запись (вопроса или кандидата)");
+        CHECK(pt.stray == 0 && pt.broad == 0,
+              "retire: снятие задело запись, которую задача не ставила");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cq);
+        for (int i = 0; i < n_peers; i++) { close(peers[i]); }
+        close(lfd);
+        g_server_port = 1;
+        tcp_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
+    }
+    if (retire_only) { goto voice_only_done; }
     /* --- узнанная коробка отдаёт свои планы, и успех идёт ЕЙ ----------- */
     {
         d2k_catalog c6;

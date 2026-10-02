@@ -608,6 +608,11 @@ typedef struct {
        занят; тогда вопрос не задаётся вовсе, а не задаётся «всем». */
     int        prop_bound_fd;
     uint16_t   prop_sport_be;
+    /* План ВОПРОСА стоит в датапате (имя + форма вопроса + prop_sport_be).
+       Отдельно от trial_installed (кандидат): после вопросов порт вопроса
+       ещё помнится, и по одному общему флагу task_fail снимал давно снятый
+       вопрос вместо стоящего кандидата (задача 20). */
+    int        prop_installed;
     int        prop_applied;    /* план вопроса применён к пакетам НАШЕГО зонда */
     int        prop_reply_seen;
     d2k_ev     prop_reply;
@@ -875,31 +880,62 @@ static int addr_probe_remove(d2k_sched *s, task *t, char *err, size_t errcap) {
 }
 
 static uint8_t question_shape(const task *t);
+static void say(d2k_sched *s, const char *fmt, ...);
 
-/* Снимает только текущий принадлежащий задаче trial перед сменой входа.
-   Поздний snapshot во время VERIFY нельзя оставлять поверх уже установленного
-   кандидата: иначе следующий поиск стартует рядом с ним, а широкая DEL_NAME
-   может задеть подтверждённое знание той же цели. */
-static void remove_trial_exact(d2k_sched *s, task *t) {
-    if (!t->trial_installed) { return; }
-    char err[160];
-    if (t->by_addr || t->addr_probe_identity_valid) {
-        (void)addr_probe_remove(s, t, err, sizeof err);
-    } else if (t->probe_sport_be != 0 && t->trial_shape != 0) {
-        (void)d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
-                                      t->trial_shape, t->probe_sport_be,
-                                      t->family, err, sizeof err);
-    } else if (t->prop_sport_be != 0) {
-        (void)d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
-                                      question_shape(t), t->prop_sport_be,
-                                      t->family, err, sizeof err);
-    } else {
-        (void)d2k_link_del_name_family(s->link_fd, t->name, t->family, err, sizeof err);
+/* СНЯТИЕ ПРОБНЫХ ЗАПИСЕЙ ЗАДАЧИ — ТОЧНОЕ И НА КАЖДОМ ПЕРЕХОДЕ (задача 20).
+ *
+ * Пробная запись имени живёт по местному порту зонда. Не снятая, она стоит до
+ * вытеснения LRU или переподключения контроллера: порт возвращается ядру и
+ * достаётся постороннему сокету с той же меткой (measure_mark == mark), а сама
+ * запись вытесняет из таблицы подтверждённое знание. Поэтому каждый переход —
+ * следующий кандидат, следующий вопрос, отказ, подтверждение, task_fail —
+ * снимает то, что задача поставила, и только это:
+ *   - адресный опыт (QUIC по адресу, голос) — DEL_ADDR_PROBE по своему потоку
+ *     и trial ID;
+ *   - кандидат по имени — DEL_NAME_PROBE (имя, форма кандидата, семейство,
+ *     порт зонда); порт занят задачей исключительно (SET_NAME_PROBE на том же
+ *     порту передаёт владение), поэтому ключ точен;
+ *   - вопрос — DEL_NAME_PROBE (имя, форма вопроса, семейство, порт вопроса).
+ * Широкой DEL_NAME здесь нет: она снимает все записи имени, включая
+ * подтверждённые (§7). */
+static void question_retire(d2k_sched *s, task *t) {
+    if (t->prop_installed && t->prop_sport_be != 0) {
+        char err[160];
+        if (d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
+                                           question_shape(t), t->prop_sport_be,
+                                           t->family, err, sizeof err) != 0) {
+            say(s, "по %s не удалось снять план вопроса: %s", t->name, err);
+        }
+    }
+    t->prop_installed = 0;
+    if (t->prop_bound_fd > 0) { close(t->prop_bound_fd); }
+    t->prop_bound_fd = -1;
+    t->prop_sport_be = 0;
+}
+
+static void candidate_retire(d2k_sched *s, task *t) {
+    if (t->trial_installed) {
+        char err[160];
+        int rc = 0;
+        if (t->by_addr || t->addr_probe_identity_valid) {
+            rc = addr_probe_remove(s, t, err, sizeof err);
+        } else if (t->probe_sport_be != 0 && t->trial_shape != 0) {
+            rc = d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
+                                                t->trial_shape, t->probe_sport_be,
+                                                t->family, err, sizeof err);
+        }
+        if (rc != 0) {
+            say(s, "по %s не удалось снять пробный план: %s", t->name, err);
+        }
     }
     if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
     t->probe_sport_be = 0;
-    t->prop_sport_be = 0;
     t->trial_installed = 0;
+}
+
+static void trial_retire(d2k_sched *s, task *t) {
+    question_retire(s, t);
+    candidate_retire(s, t);
 }
 
 /* --------------------------------------------------------------------
@@ -1968,6 +2004,9 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
     static char hex[2 * sizeof planbuf + 1];
     d2k_hello ctl; ctl.bytes = t->ctrl_len ? t->ctrl : NULL; ctl.len = t->ctrl_len;
 
+    /* План ПРЕЖНЕГО вопроса снимается до следующего (задача 20): иначе на
+       датапате копились пробные записи по уже свободным портам вопросов. */
+    question_retire(s, t);
     while (++t->prop_q < D2K_PROPS_QUESTIONS) {
         size_t plan_len = 0;
         if (d2k_props_question_plan(t->prop_q, ctl, t->trig_len,
@@ -2031,8 +2070,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
             continue; /* план-вопрос не ушёл — не наше наблюдение о коробке */
         }
         t->props_asked = 1;
-        t->trial_installed = 1;
-        t->trial_shape = question_shape(t);
+        t->prop_installed = 1;
         t->probes++;
         s->probes_used++;
         t->prop_applied = 0;
@@ -2067,48 +2105,22 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
 /* Вопросы кончились: снять план последнего (он не сработал) и идти собирать
    кандидатов по накопленному вектору. */
 static void prop_finish(d2k_sched *s, task *t) {
+    /* Иначе на боевом датапате остался бы стоять план, про который это же
+       измерение только что сказало «не работает» (см. d2k_props_ask). Снятие
+       точное, по порту вопроса: широкая DEL_NAME задела бы подтверждённое. */
+    question_retire(s, t);
     prop_close(t);
-    if (t->props_asked) {
-        /* Иначе на боевом датапате остался бы стоять план, про который это же
-           измерение только что сказало «не работает» (см. d2k_props_ask). */
-        char err[160];
-        if (t->prop_sport_be != 0) {
-            (void)d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
-                                          question_shape(t), t->prop_sport_be,
-                                          t->family, err, sizeof err);
-        } else {
-            (void)d2k_link_del_name_family(s->link_fd, t->name, t->family, err, sizeof err);
-        }
-        t->trial_installed = 0;
-    }
     t->prop_q = -1;
 }
 
 static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     join_worker(t);
+    /* И вопрос, и кандидат — каждый своим ключом (задача 20). Прежде порт
+       вопроса проверялся первым и, оставшись в памяти после вопросов, уводил
+       снятие на давно снятый вопрос, а стоящий кандидат оставался. */
+    trial_retire(s, t);
     prop_close(t);
     ver_close(t);
-    if (t->trial_installed) {
-        char err[160];
-        int rc;
-        if (t->by_addr || t->addr_probe_identity_valid) {
-            rc = addr_probe_remove(s, t, err, sizeof err);
-        } else if (t->prop_sport_be != 0) {
-            rc = d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
-                                         question_shape(t), t->prop_sport_be,
-                                         t->family, err, sizeof err);
-        } else if (t->probe_sport_be != 0 && t->trial_shape != 0) {
-            rc = d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
-                                         t->trial_shape, t->probe_sport_be,
-                                         t->family, err, sizeof err);
-        } else {
-            rc = d2k_link_del_name_family(s->link_fd, t->name, t->family, err, sizeof err);
-        }
-        if (rc != 0) {
-            say(s, "по %s не удалось снять пробный план: %s", t->name, err);
-        }
-        t->trial_installed = 0;
-    }
     /* ПРОХОД ПО КАТАЛОГУ ПОСЛЕ НЕУДАЧИ — не перестраховка.
        Второй поиск по УЖЕ ПОДТВЕРЖДЁННОЙ цели — обычное дело: новое
        подозрение закрывает наблюдение и заводит поиск заново. Пробный план
@@ -2323,6 +2335,7 @@ static int local_refusal_verdict(d2k_sched *s, task *t) {
                "опыт невозможен, кандидат не виноват, беру следующего",
             t->name, (unsigned)t->unsent_code);
         t->unsent_code = 0;
+        trial_retire(s, t);
         ver_close(t);
         t->state = T_PLANNING;
         return 2;
@@ -2334,6 +2347,7 @@ static int local_refusal_verdict(d2k_sched *s, task *t) {
                "повторы исчерпаны — опыта не было, беру следующего кандидата",
             t->name, (unsigned)t->unsent_code);
         t->unsent_code = 0;
+        trial_retire(s, t);
         ver_close(t);
         t->state = T_PLANNING;
         return 2;
@@ -2411,11 +2425,10 @@ static int install_next(d2k_sched *s, task *t) {
         /* ПОРТ ЗОНДА ЗАНИМАЕТСЯ ЗДЕСЬ, в главном потоке, и до установки
            плана. Не в рабочем: управляющий сокет принадлежит главному циклу,
            и писать в него из потока зонда значило бы гонку на канале. */
-        if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
-        if (t->by_addr && t->addr_probe_identity_valid) {
-            (void)addr_probe_remove(s, t, err, sizeof err);
-        }
-        t->probe_sport_be = 0;
+        /* Прежний кандидат снимается ТОЧНО, пока его порт ещё наш (задача
+           20): одно закрытие сокета оставляло пробную запись стоять по
+           свободному порту. */
+        trial_retire(s, t);
         {
             int pfd = -1;
             uint16_t psport = 0;
@@ -4834,7 +4847,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     if (t->ech_offer && (!t->ver.ech_accepted || t->ver.name_ok != 1 ||
         t->ver.level != D2K_VER_APPLICATION || !t->ver.body_complete)) {
         say(s, "по %s ECH-план не подтверждён принятым ECH и полным ответом origin", t->name);
-        ver_close(t); t->state = T_PLANNING; return;
+        trial_retire(s, t); ver_close(t); t->state = T_PLANNING; return;
     }
     /* НЕПЕРЕНОСИМОСТЬ ПЕРЕВЕШИВАЕТ УСПЕХ ЗОНДА.
        Пока шло испытание, тот же план применялся и к потокам настоящих
@@ -4866,6 +4879,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                "который не достаётся человеку, обходом не является. "
                "Беру следующего кандидата",
             t->name, plan_id);
+        trial_retire(s, t);
         ver_close(t);
         t->state = T_PLANNING;
         return;
@@ -4981,16 +4995,12 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     /* Решение принято — только теперь сокет зонда можно закрыть: до этого FIN
        удалил бы ячейку потока в датапате раньше события применения
        (см. d2k_props_contact). */
+    /* Подтверждённое встаёт ПОСТОЯННОЙ записью (адрес — выше, имя — проходом
+       каталога ниже). Пробная запись порта зонда своё отслужила и снимается
+       точно (задача 20): прежде trial_installed просто обнулялся, и запись
+       по уже свободному порту стояла до LRU, вытесняя подтверждённое. */
+    trial_retire(s, t);
     ver_close(t);
-    /* Пробным план быть перестал: он подтверждён и обязан остаться стоять.
-       Снимать его при истечении задачи больше не за что (см. task_fail). */
-    t->trial_installed = 0;
-    if (t->by_addr && t->addr_probe_identity_valid) {
-        char err[160];
-        if (addr_probe_remove(s, t, err, sizeof err) != 0) {
-            say(s, "по %s истёкший адресный probe оставлен до lease: %s", t->name, err);
-        }
-    }
     t->state = T_WATCHING;
     /* Подтверждение — это новое знание, и датапат обязан узнать о нём сразу,
        а не после следующего запуска (та же причина, по которой Sync на
@@ -5383,7 +5393,9 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
             say(s, "по %s вопрос %d прошёл, вектор: %s", t->name, t->prop_q + 1, pv);
         }
         /* Вопрос прошёл — это уже стратегия (двойное назначение плана, см.
-           шапку compose.c), и второй вопрос той же цели не задаётся. */
+           шапку compose.c), и второй вопрос той же цели не задаётся. План
+           вопроса снимается до первого кандидата (задача 20). */
+        question_retire(s, t);
         prop_close(t);
         t->prop_q = -1;
         verdict_to_plans(s, t, &t->res);
@@ -5489,7 +5501,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
                     say(s, "по %s (голос) датапат отверг опыт (причина %u) — "
                            "местный отказ, опыта не было, кандидат не судим",
                         t->name, (unsigned)(ev->num & 0xffu));
-                    remove_trial_exact(s, t);
+                    trial_retire(s, t);
                     task_done(t);
                 }
             }
@@ -5588,7 +5600,7 @@ static int layered_rx_result(d2k_sched *s, task *t, int64_t now_ms) {
         int proven = applied && !t->unsent_code &&
             t->ver.http_outcome != D2K_HTTP_BLOCKED && t->ver.http_outcome != D2K_HTTP_LEGAL_DENIAL &&
             d2k_volume_rx_evidence(&t->rx_identity[0], &t->rx_identity[1], &t->ver, &t->vol);
-        ver_close(t); remove_trial_exact(s, t); t->rx_phase = 0;
+        ver_close(t); trial_retire(s, t); t->rx_phase = 0;
         if (proven) {
             t->rx_bootstrap_only = 0;
             say(s, "по %s кандидат снял ранний TLS-блок, но identity дважды "
@@ -5618,7 +5630,7 @@ static int layered_rx_result(d2k_sched *s, task *t, int64_t now_ms) {
     if (!partial || t->probes >= SCHED_MAX_PROBES) {
         say(s, "по %s повторный identity-обрыв под кандидатом не подтвердился; "
                "RX-профиль не создаю", t->name);
-        ver_close(t); remove_trial_exact(s, t); t->rx_phase = 0;
+        ver_close(t); trial_retire(s, t); t->rx_phase = 0;
         t->state = T_PLANNING;
         return 1;
     }
@@ -5628,7 +5640,7 @@ static int layered_rx_result(d2k_sched *s, task *t, int64_t now_ms) {
            "%s на новом изолированном порту", t->name, t->rx_phase + 1,
         (unsigned long long)t->ver.body_bytes,
         t->rx_phase ? "проверяю gzip-контроль" : "повторяю identity");
-    ver_close(t); remove_trial_exact(s, t);
+    ver_close(t); trial_retire(s, t);
     t->rx_phase++;
     t->next_plan--; /* same candidate, newly reserved socket and trial */
     t->rx_retry_after_ms = now_ms + 500;
@@ -5737,7 +5749,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 say(s, "по %s (голос) не проверено: за %d мин опыт не дождался "
                        "разговора с протокольным ответом — снимаю опыт, "
                        "кандидат не судим", t->name, SCHED_TASK_LIFE_MS / 60000);
-                remove_trial_exact(s, t);
+                trial_retire(s, t);
                 if (t->probes > 0) { cooldown_record(s, t, 2); }
                 task_done(t);
             } else {
@@ -6126,6 +6138,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     t->name, t->prop_q, (unsigned)t->unsent_code);
                 t->unsent_code = 0;
             }
+            question_retire(s, t);
             prop_close(t);
             if (prop_send_next(s, t, now_ms) != 0) {
                 prop_finish(s, t);
@@ -6162,7 +6175,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 strcmp(s->quic_shape_name[t->family == 6], t->name) == 0 &&
                 s->quic_shape_len[t->family == 6] <= sizeof t->trig) {
                 ver_close(t);
-                remove_trial_exact(s, t);
+                trial_retire(s, t);
                 remeasure_snapped(s, t, s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6]);
                 moved++;
                 continue;
@@ -6290,6 +6303,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                         say(s, "по %s план %zu: зонд не дошёл (%s), но и плана на его потоке "
                                "не было — опыта не было, ставлю того же кандидата заново",
                             t->name, t->next_plan, t->ver.reason);
+                        trial_retire(s, t);
                         ver_close(t);
                         t->ver_seen = 0;
                         t->ver_ok = 0;
@@ -6317,6 +6331,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                             plan_ident(t->plans[t->next_plan-1],failed_id,sizeof failed_id,wire_id);
                             group_record(s,t,D2K_GROUP_PLAN_FAILED,failed_id,t->asked_shape,now_ms);
                         }
+                        trial_retire(s, t);
                         ver_close(t);
                         t->state = T_PLANNING;
                     }
@@ -6367,6 +6382,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            "испытываю кандидата ещё раз",
                         t->name, (unsigned)(s->dropped_seen - t->ver_dropped0));
                     t->ver_dropped0 = s->dropped_seen;
+                    trial_retire(s, t);
                     ver_close(t);
                     t->ver_seen = 0;
                     t->ver_ok = 0;
@@ -6387,6 +6403,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     say(s, "по %s зонд прошёл, а применения этого плана к его потоку не было "
                            "— не засчитано, беру следующего кандидата",
                         t->name);
+                    trial_retire(s, t);
                     ver_close(t);
                     t->state = T_PLANNING;
                 }
@@ -6403,6 +6420,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     /* Потока нет — испытать нечем. Это «не измерено»:
                        следующий круг тика возьмёт следующего кандидата. */
                     say(s, "по %s поток испытания не завёлся", t->name);
+                    trial_retire(s, t);
                     t->state = T_PLANNING;
                 }
                 moved++;
@@ -6432,14 +6450,14 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            "на %lld мин",
                         t->name, t->exec_refused,
                         (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
-                    remove_trial_exact(s, t);
+                    trial_retire(s, t);
                     cooldown_record(s, t, 2);
                     task_fail(s, t, now_ms);
                     moved++;
                     continue;
                 }
                 if(t->family_fast==1) {
-                    remove_trial_exact(s,t);
+                    trial_retire(s, t);
                     t->family_fast=2; t->n_plans=t->n_known=t->next_plan=0;
                     t->exec_refused=t->exec_probed=0;
                     t->box_id[0]=0; t->state=T_ASKING;
@@ -6449,7 +6467,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 }
                 if (t->rx_bootstrap_only && !t->vol.rx_cut) {
                     if (t->family_reuse == 2) {
-                        remove_trial_exact(s, t);
+                        trial_retire(s, t);
                         t->family_reuse = 3; t->rx_bootstrap_only = 0;
                         t->exec_refused = t->exec_probed = 0;
                         t->skip_volume_once = 1;
@@ -6469,7 +6487,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 if (t->n_known > 0 && t->cached_measure_valid) {
                     d2k_vres measured = t->res;
                     t->cached_measure_valid = 0;
-                    remove_trial_exact(s, t);
+                    trial_retire(s, t);
                     verdict_to_plans(s, t, &measured);
                     if (t->n_plans == 0) {
                         say(s, "по %s готовые планы не помогли; прямое измерение "
@@ -6490,10 +6508,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 if (!t->researched) {
                     /* Exhausted known plans: remove the trial before any
                        baseline measurement. Research happens at most once. */
-                    char err[160];
-                    if (t->by_addr) { (void)addr_probe_remove(s, t, err, sizeof err); }
-                    else { (void)d2k_link_del_name_family(s->link_fd, t->name, t->family, err, sizeof err); }
-                    t->trial_installed = 0;
+                    /* Точно, своим ключом: широкая DEL_NAME сняла бы и
+                       подтверждённые записи имени (задача 20). */
+                    trial_retire(s, t);
                     t->researched = 1;
                     t->box_id[0] = '\0';
                     t->state = T_ASKING;
