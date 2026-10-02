@@ -156,19 +156,9 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
             if(o->evidence!=D2K_GROUP_DIRECT_CLEAR && o->evidence!=D2K_GROUP_PLAN_FAILED)
                 return changed;
             /* A bounded budget must never discard a new exclusion while
-             * retaining a broad rule. Age out stale unknown evidence and
-             * stale positive votes first, then reclaim unknown evidence, then
-             * a positive vote; never evict any negative evidence. Exact
-             * confirmed catalog bindings are independent and untouched. */
-            for(unsigned pass=D2K_GROUP_INCONCLUSIVE;pass;
-                pass=pass==D2K_GROUP_INCONCLUSIVE?D2K_GROUP_BLOCKED_CONFIRMED:0)
-                for(size_t i=0;i<s->n_observations;) {
-                    const d2k_group_observation *v=&s->observations[i];
-                    if(v->evidence==pass && o->at-v->at>D2K_GROUP_VOTE_TTL_S)
-                        s->observations[i]=s->observations[--s->n_observations];
-                    else i++;
-                }
-            /* Re-enabling: families re-learn only from confirmations newer
+             * retaining a broad rule. Exact confirmed catalog bindings are
+             * independent and untouched; negative evidence is never evicted.
+             * Re-enabling: families re-learn only from confirmations newer
                than the moment the journal lost an exclusion. */
             if(s->disabled)
                 for(size_t i=0;i<s->n_observations;) {
@@ -178,10 +168,23 @@ int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
                     else i++;
                 }
             size_t reclaim=s->n_observations;
+            /* Reclaim exactly one slot: the oldest expired unknown evidence,
+               else the oldest expired positive vote (expired: strictly more
+               than D2K_GROUP_VOTE_TTL_S older than this event), else the
+               first unknown evidence, else the first positive vote. */
+            for(unsigned pass=D2K_GROUP_INCONCLUSIVE;
+                reclaim==D2K_GROUP_OBSERVATION_MAX && pass;
+                pass=pass==D2K_GROUP_INCONCLUSIVE?D2K_GROUP_BLOCKED_CONFIRMED:0)
+                for(size_t i=0;i<s->n_observations;i++) {
+                    const d2k_group_observation *v=&s->observations[i];
+                    if(v->evidence==pass && o->at-v->at>D2K_GROUP_VOTE_TTL_S &&
+                       (reclaim==D2K_GROUP_OBSERVATION_MAX ||
+                        v->at<s->observations[reclaim].at)) reclaim=i;
+                }
             if(reclaim==D2K_GROUP_OBSERVATION_MAX)
                 for(size_t i=0;i<s->n_observations;i++) {
                     if(s->observations[i].evidence==D2K_GROUP_INCONCLUSIVE) { reclaim=i; break; }
-                    if(reclaim==s->n_observations &&
+                    if(reclaim==D2K_GROUP_OBSERVATION_MAX &&
                        s->observations[i].evidence==D2K_GROUP_BLOCKED_CONFIRMED) reclaim=i;
                 }
             if(reclaim==D2K_GROUP_OBSERVATION_MAX) {

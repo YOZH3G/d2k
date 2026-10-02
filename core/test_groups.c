@@ -13,6 +13,29 @@ static void observe(d2k_group_state *s, const char *name, const char *plan,
     o.evidence=evidence; o.key=key; o.at=100;
     CHECK(d2k_group_learn(s,&o)>=0);
 }
+/* Full, frozen, enabled journal: every entry a plain vote of plan Q at `at`
+   (names p<i>.fill<i>.example.net, one family each, never 3 votes). */
+static void full_plain(d2k_group_state *s,int64_t at) {
+    memset(s,0,sizeof *s);
+    for(size_t i=0;i<D2K_GROUP_OBSERVATION_MAX;i++) {
+        d2k_group_observation *o=&s->observations[i];
+        snprintf(o->name,sizeof o->name,"p%zu.fill%zu.example.net",i,i);
+        strcpy(o->plan_id,"Q"); o->key=modern; o->at=at;
+        o->evidence=D2K_GROUP_BLOCKED_CONFIRMED;
+    }
+    s->n_observations=D2K_GROUP_OBSERVATION_MAX; s->frozen=1;
+}
+static int present(const d2k_group_state *s,const char *name) {
+    for(size_t i=0;i<s->n_observations;i++)
+        if(!strcmp(s->observations[i].name,name)) return 1;
+    return 0;
+}
+static int clean_at(d2k_group_state *s,const char *name,int64_t at) {
+    d2k_group_observation o={0};
+    snprintf(o.name,sizeof o.name,"%s",name);
+    o.key=modern; o.evidence=D2K_GROUP_DIRECT_CLEAR; o.at=at;
+    return d2k_group_learn(s,&o);
+}
 int main(void) {
     d2k_group_key long_key;
     char path_a[512],path_b[512];
@@ -279,6 +302,74 @@ int main(void) {
             CHECK(!d2k_group_match(s,"new.fam.example.com",&modern)==(i<2));
         }
         CHECK(d2k_group_restore(s)==0 && d2k_group_match(s,"new.fam.example.com",&modern));
+    }
+    /* Aging on a frozen, NOT disabled journal reclaims exactly one slot,
+       the oldest expired plain vote; the journal stays full and frozen. */
+    {
+        const int64_t T=100*86400;
+        full_plain(s,T-40*86400);
+        s->observations[7].at=T-50*86400; /* oldest */
+        s->observations[0].at=T;          /* fresh, first by index */
+        CHECK(d2k_group_restore(s)==0);
+        CHECK(clean_at(s,"neg.example.org",T)>0);
+        CHECK(!s->disabled && s->frozen && s->n_observations==D2K_GROUP_OBSERVATION_MAX);
+        CHECK(present(s,"neg.example.org") && !present(s,"p7.fill7.example.net"));
+        CHECK(present(s,"p0.fill0.example.net") && present(s,"p1.fill1.example.net"));
+        unsigned plain=0;
+        for(size_t i=0;i<s->n_observations;i++)
+            if(s->observations[i].evidence==D2K_GROUP_BLOCKED_CONFIRMED) plain++;
+        CHECK(plain==D2K_GROUP_OBSERVATION_MAX-1);
+        CHECK(!d2k_group_match(s,"neg.example.org",&modern) && d2k_group_restore(s)==0);
+    }
+    /* INCONCLUSIVE ages before plain votes, oldest first, even when a plain
+       vote is older and a fresh unknown entry comes first by index. */
+    {
+        const int64_t T=100*86400;
+        full_plain(s,T-60*86400);
+        s->observations[0].evidence=D2K_GROUP_INCONCLUSIVE; s->observations[0].at=T;
+        s->observations[0].plan_id[0]=0;
+        s->observations[5].evidence=D2K_GROUP_INCONCLUSIVE; s->observations[5].at=T-35*86400;
+        s->observations[5].plan_id[0]=0;
+        s->observations[9].evidence=D2K_GROUP_INCONCLUSIVE; s->observations[9].at=T-45*86400;
+        s->observations[9].plan_id[0]=0;
+        CHECK(d2k_group_restore(s)==0);
+        CHECK(clean_at(s,"neg.example.org",T)>0);
+        CHECK(present(s,"neg.example.org") && !present(s,"p9.fill9.example.net"));
+        CHECK(present(s,"p0.fill0.example.net") && present(s,"p5.fill5.example.net"));
+        CHECK(s->n_observations==D2K_GROUP_OBSERVATION_MAX && !s->disabled);
+    }
+    /* Exact boundary: expired means strictly more than 30*86400 s older.
+       Entry 0 is a fresh INCONCLUSIVE (the non-aging fallback's choice),
+       entry 1 a plain vote at the probed age. */
+    {
+        const int64_t T=100*86400, ages[]={30*86400-1,30*86400,30*86400+1};
+        for(int k=0;k<3;k++) {
+            full_plain(s,T);
+            s->observations[0].evidence=D2K_GROUP_INCONCLUSIVE; s->observations[0].plan_id[0]=0;
+            s->observations[1].at=T-ages[k];
+            CHECK(d2k_group_restore(s)==0);
+            CHECK(clean_at(s,"neg.example.org",T)>0);
+            int aged=!present(s,"p1.fill1.example.net");
+            CHECK(aged==(k==2));
+            CHECK(present(s,"p0.fill0.example.net")==(k==2));
+        }
+    }
+    /* A stable family with voters older than 30 days survives one reclaim
+       when older expired candidates exist; only one entry is reclaimed. */
+    {
+        const int64_t T=100*86400;
+        full_plain(s,T-60*86400);
+        for(int i=0;i<3;i++) {
+            d2k_group_observation *o=&s->observations[i];
+            snprintf(o->name,sizeof o->name,"v%d.fam.example.com",i);
+            strcpy(o->plan_id,"P"); o->at=T-40*86400;
+        }
+        CHECK(d2k_group_restore(s)==0 && d2k_group_match(s,"new.fam.example.com",&modern));
+        CHECK(clean_at(s,"neg.example.org",T)>0);
+        CHECK(d2k_group_match(s,"new.fam.example.com",&modern));
+        CHECK(present(s,"v0.fam.example.com") && present(s,"v1.fam.example.com") &&
+              present(s,"v2.fam.example.com"));
+        CHECK(s->n_observations==D2K_GROUP_OBSERVATION_MAX);
     }
     /* (c) property: random learn chains always pass restore. */
     srand(7);
