@@ -236,17 +236,30 @@ void d2k_neutral_sni(char *out, size_t cap)
     char hex[11];
     unsigned char rnd[10];
     size_t got = 0;
-    FILE *f = fopen("/dev/urandom", "rb");
+    int fd = open("/dev/urandom", O_RDONLY);
     /* crypto/rand у донора; random() без srandom давал одно и то же имя. */
-    if (f) {
-        got = fread(rnd, 1, sizeof rnd, f);
-        fclose(f);
+    if (fd >= 0) {
+        while (got < sizeof rnd) {
+            ssize_t n = read(fd, rnd + got, sizeof rnd - got);
+            if (n <= 0)
+                break;
+            got += (size_t)n;
+        }
+        close(fd);
     }
     if (got != sizeof rnd) {
+        /* Локальное состояние: глобальный ГСЧ не пересеваем. */
+        static unsigned counter;
         struct timespec ts;
+        uint64_t x;
         clock_gettime(CLOCK_REALTIME, &ts);
-        srandom((unsigned)(ts.tv_nsec ^ ts.tv_sec ^ (long)getpid()));
-        for (i = 0; i < sizeof rnd; i++) rnd[i] = (unsigned char)random();
+        x = ((uint64_t)ts.tv_nsec << 20) ^ (uint64_t)ts.tv_sec ^
+            ((uint64_t)getpid() << 40) ^ ((uint64_t)++counter * 0x9e3779b97f4a7c15ULL);
+        x |= 1;
+        for (i = 0; i < sizeof rnd; i++) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            rnd[i] = (unsigned char)(x >> 24);
+        }
     }
     for (i = 0; i < 10; i++) {
         hex[i] = "0123456789abcdef"[rnd[i] & 0xf];

@@ -68,6 +68,10 @@ test_raw6_live: test_raw6_live.c $(OBJ) ../core/hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
 
 check: d2k-detect test_port test_tree test_bridge test_threads test_raw test_response
+	@# Отправка в сокет — только через d2k_send_nosig: SIGPIPE на мёртвом пире
+	@# воспроизводится гонкой, поэтому места вызова закреплены ещё и статически.
+	@if grep -nE '(^|[^_[:alnum:]])send\(' classify.c response.c | grep -v 'return send(fd, buf, len, flags)'; then \
+	    echo "classify.c/response.c: голый send() запрещён, используйте d2k_send_nosig"; exit 1; fi
 	./test_port
 	./test_tree
 	./test_bridge

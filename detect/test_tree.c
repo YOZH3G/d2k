@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +42,11 @@ static void fail(const char *fmt, ...)
     fails++;
 }
 
-typedef enum { M_PREFIX, M_WHOLE, M_REASM, M_CLEAR, M_DEAF } dpi_mode;
+int d2k_resp_handshake12(const char *host, const char *port, const char *sni,
+                         const d2k_opts *opt);
+
+typedef enum { M_PREFIX, M_WHOLE, M_REASM, M_CLEAR, M_DEAF,
+                M_RST_AFTER_FIRST, M_RST_AT_ONCE } dpi_mode;
 
 typedef struct {
     int      fd;
@@ -73,6 +78,16 @@ static void *conn_thread(void *arg)
     size_t alen;
     ssize_t n;
     int blocked = 0;
+
+    if (d->mode == M_RST_AFTER_FIRST || d->mode == M_RST_AT_ONCE) {
+        struct linger lg = {1, 0};
+        if (d->mode == M_RST_AFTER_FIRST)
+            (void)recv(c, buf, sizeof(buf), 0);
+        (void)setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        close(c);
+        free(j);
+        return NULL;
+    }
     struct timeval tv;
 
     free(j);
@@ -121,6 +136,9 @@ static void *conn_thread(void *arg)
     case M_CLEAR:
         blocked = 0;
         break;
+    case M_RST_AFTER_FIRST:
+    case M_RST_AT_ONCE:
+        break; /* обслужены выше */
     case M_DEAF:
         /* Режет всё подряд: имитация блока по адресу. */
         blocked = 1;
@@ -553,6 +571,45 @@ static void test_loopback_guard_rejects_misresolved_target(void)
     }
 }
 
+/* Настоящие места отправки при SIGPIPE по умолчанию: пир сбросил соединение
+ * после первого сегмента / сразу. Процесс обязан дожить, исход — обычный отказ. */
+static void test_epipe_survives_at_real_send_sites(void)
+{
+    fake_dpi d;
+    char addr[64], host[64];
+    const char *colon;
+    d2k_opts opt;
+    d2k_result res;
+    d2k_trigger t;
+    int i;
+    void (*old)(int) = signal(SIGPIPE, SIG_DFL);
+
+    fast_opts(&opt);
+    trig(&t);
+    if (fake_dpi_start(&d, M_RST_AFTER_FIRST, 0, addr, sizeof addr) != 0) {
+        fail("стенд не поднялся");
+        return;
+    }
+    d2k_classify_run(addr, &t, &opt, &res); /* многосегментные разрезы */
+    if (res.verdict == D2K_DV_CLEAR)
+        fail("сброс после первого сегмента не может быть CLEAR");
+    fake_dpi_stop(&d);
+
+    if (fake_dpi_start(&d, M_RST_AT_ONCE, 0, addr, sizeof addr) != 0) {
+        fail("стенд не поднялся");
+        return;
+    }
+    colon = strrchr(addr, ':');
+    snprintf(host, sizeof host, "%.*s", (int)(colon - addr), addr);
+    for (i = 0; i < 100; i++) {
+        if (d2k_resp_handshake12(host, colon + 1, "example.com", &opt) != 0)
+            fail("сброшенный пир не может дать ServerHelloDone");
+        d2k_sleep_ms(1);
+    }
+    fake_dpi_stop(&d);
+    signal(SIGPIPE, old);
+}
+
 static void test_epipe_and_fresh_neutral(void)
 {
     int sv[2];
@@ -578,6 +635,7 @@ static void test_epipe_and_fresh_neutral(void)
 int main(void)
 {
     test_epipe_and_fresh_neutral();
+    test_epipe_survives_at_real_send_sites();
     {
         fake_dpi d;
         char addr[64];
