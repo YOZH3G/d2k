@@ -14,6 +14,11 @@ static d2k_opts seen;
 static d2k_result answer;
 static int failures;
 static char seen_name[D2K_TRIGGER_NAME_MAX];
+static int rule_failed;
+
+/* raw.o is not linked here: the adapter only asks whether the kernel-RST
+ * suppression rule ever failed in this process. */
+int d2k_raw_rst_rule_failed(void) { return rule_failed; }
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "bridge:%d: %s\n", __LINE__, #c); failures++; \
 } } while (0)
@@ -162,6 +167,21 @@ int main(void)
     answer.raw_usable = 1;
     r = measure();
     CHECK(r.verdict == D2K_V_OPAQUE && r.owns_search); /* search ran, found nothing */
+    /* nft-only router: no RST rule, the self-check (handshake only) passes,
+     * every poison probe is cut by OUR kernel's RST. That empty search is a
+     * local limitation (donor note 04.09), never «nothing to bypass». */
+    rule_failed = 1;
+    snprintf(answer.reason, sizeof answer.reason, "содержимое важно");
+    r = measure();
+    CHECK(r.verdict == D2K_V_OPAQUE && !r.have_arm && !r.owns_search);
+    CHECK(strstr(r.reason, "RST") != NULL && strstr(r.reason, "не подавлен") != NULL);
+    answer.verdict = D2K_DV_POISONABLE;
+    answer.has_hit = 1;
+    strcpy(answer.hit.name, "seqovl-1");
+    answer.hit.seqovl = 1;
+    r = measure();
+    CHECK(r.have_arm && r.owns_search); /* a hit is a finished search */
+    rule_failed = 0;
     memset(&answer, 0, sizeof answer);
 
     memset(&p, 0, sizeof p);

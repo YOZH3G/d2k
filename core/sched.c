@@ -1544,14 +1544,12 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
        слой, разбор TLS), а умолчание зависит от libc и ulimit -s на роутере
        (у musl — 128 КиБ); переполнение — тихая порча памяти, не ошибка. */
     pthread_attr_t attr;
-    if (pthread_attr_init(&attr) != 0) {
-        if (a->use_fd >= 0) { close(a->use_fd); }
-        free(a);
-        return -1;
-    }
-    int created = pthread_attr_setstacksize(&attr, (size_t)1u << 20) == 0 &&
-                  pthread_create(&t->th, &attr, worker_run, a) == 0;
-    pthread_attr_destroy(&attr);
+    /* Атрибуты или размер не приняты — поток всё равно нужен: умолчание
+       лучше, чем сорванный замер. */
+    int have_attr = pthread_attr_init(&attr) == 0;
+    int sized = have_attr && pthread_attr_setstacksize(&attr, (size_t)1u << 20) == 0;
+    int created = pthread_create(&t->th, sized ? &attr : NULL, worker_run, a) == 0;
+    if (have_attr) { pthread_attr_destroy(&attr); }
     if (!created) {
         if (a->use_fd >= 0) { close(a->use_fd); }
         free(a);

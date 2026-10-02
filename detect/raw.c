@@ -80,11 +80,6 @@ typedef struct {
     uint32_t seq; /* наш следующий номер */
     uint32_t ack; /* что подтверждаем */
     int      rule_up;
-    /* Правило подавления ядерного RST не встало, а зонд идёт дальше (как у
-     * донора: suppressKernelRST продолжает с флагом). Отрицательный исход
-     * такого зонда недостоверен; факт доезжает до трассы через
-     * d2k_raw_rst_rule_failed. */
-    int      rst_unsuppressed;
     /* raw_recv returns a slice which must survive until the next receive
      * on THIS connection, without being overwritten by another worker. */
     raw_buffers *buffers; /* heap-owned: do not grow the router worker stack */
@@ -822,9 +817,9 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
      * пишет данные. Отказ iptables (нет бинарника, роутер только на nft) —
      * своя поломка, а не свойство сети: вернув ошибку, мы роняли
      * самопроверку, и цель уходила в «обойти нечем». Факт отказа не молчит:
-     * он взводит g_rst_rule_failed и доезжает до трассы вердикта. */
+     * он взводит g_rst_rule_failed (единственный источник: трасса вердикта и
+     * адаптер планировщика читают d2k_raw_rst_rule_failed). */
     c->rule_up = suppress_kernel_rst(c->sport, family);
-    c->rst_unsuppressed = !c->rule_up;
 
     if (raw_handshake(c, timeout_ms, cancel, err, errcap) != 0) {
         raw_close(c);

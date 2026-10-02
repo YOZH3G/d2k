@@ -300,7 +300,7 @@ static void test_dial_survives_missing_rst_rule(void)
 
     rule_rc = 0; rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
     CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
-    CHECK(c.rule_up == 1 && c.rst_unsuppressed == 0);
+    CHECK(c.rule_up == 1);
     CHECK(rule_count == 1 && strstr(rule_cmds[0], "iptables -I OUTPUT") != NULL);
     raw_close(&c);
     CHECK(rule_count == 2 && strstr(rule_cmds[1], "iptables -D OUTPUT") != NULL);
@@ -308,7 +308,7 @@ static void test_dial_survives_missing_rst_rule(void)
 
     rule_rc = 256; rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; err[0] = '\0';
     CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
-    CHECK(c.rule_up == 0 && c.rst_unsuppressed == 1);
+    CHECK(c.rule_up == 0);
     CHECK(outgoing_count == 2); /* SYN and the final ACK: probe went on */
     raw_close(&c);
     CHECK(rule_count == 1); /* nothing installed, nothing to delete */
