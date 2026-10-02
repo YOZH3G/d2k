@@ -5406,7 +5406,8 @@ lifecycle_test:
         d2k_ev su2 = ev_suspect(6, 40051);
         d2k_sched_event(s, &su2);
         settle(s);
-        CHECK(tcp_calls == 1 && vol_calls == 1,
+        /* Блок на рукопожатии (PREFIX): объём после него не мерится (задача 30). */
+        CHECK(tcp_calls == 1 && vol_calls == 0,
               "узнанная коробка не была проверена прямым замером до готового плана");
         d2k_ev x2 = ev_applied(6, 40051);
         d2k_sched_event(s, &x2);
@@ -5434,7 +5435,7 @@ lifecycle_test:
         d2k_ev su3 = ev_suspect(6, 40052);
         d2k_sched_event(s, &su3);
         settle(s);
-        CHECK(tcp_calls == 1 && vol_calls == 1,
+        CHECK(tcp_calls == 1 && vol_calls == 0,
               "после промаха готового плана повторно запущено прямое измерение");
         CHECK(binding_of(&c6, "вторая.цель", 6) != NULL,
               "промах третьей цели повредил подтверждённую вторую");
@@ -6173,6 +6174,100 @@ lifecycle_test:
         d2k_catalog_free(&cC);
     }
 
+    /* --- сначала донорская классификация, объём — только после CLEAR (задача 30) */
+    {
+        /* Поле 02.10.2026: обычный TCP-поиск начинался с объёмного замера и
+           для цели, режущейся на рукопожатии, ждал таймаута «нет TLS». Донор
+           (z2k «Поиск по домену») сразу задаёт вопросы классификатора; объём
+           — отдельный вопрос, осмысленный лишь когда рукопожатие и запись
+           проходят. */
+        d2k_catalog cH = {0};
+        d2k_sched *s = d2k_sched_new(&cH, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = 0;
+        vol_answer = D2K_VOL_UNREACHABLE; vol_rx_tls_unavailable = 1; vol_rx_cut = 0;
+        tcp_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_NOT_MEASURED;
+        forget_sent();
+        d2k_ev h = ev_hello(6, 40090, "рукопожатие.режут");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40090);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(tcp_calls == 1, "заблокированная на рукопожатии цель не прошла классификацию");
+        CHECK(vol_calls == 0,
+              "объёмный замер запущен при вердикте классификатора, не равном CLEAR");
+        CHECK(!said("подбор и применение обхода не запускаю"),
+              "блок на рукопожатии не повёл к подбору");
+        d2k_sched_free(s); d2k_catalog_free(&cH);
+        vol_answer = D2K_VOL_PASSED; vol_rx_tls_unavailable = 0;
+    }
+    {
+        /* CLEAR без обрыва объёма — прямой путь, подбор не запускается. */
+        d2k_catalog cP = {0};
+        d2k_sched *s = d2k_sched_new(&cP, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = 0;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0;
+        tcp_answer = D2K_V_CLEAR;
+        forget_sent();
+        d2k_ev h = ev_hello(6, 40091, "напрямую.проходит");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40091);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(tcp_calls == 1 && vol_calls == 1,
+              "CLEAR классификатора не дополнен объёмным замером");
+        CHECK(said("напрямую проходит") && total_bindings(&cP) == 0,
+              "CLEAR без обрыва объёма не остался прямым путём");
+        d2k_sched_free(s); d2k_catalog_free(&cP);
+        tcp_answer = D2K_V_OPAQUE;
+    }
+    {
+        /* Снимок клиента пришёл, пока шла классификация: повтор поиска его
+           байтами не повторяет объёмный замер, уже выполненный в этой задаче,
+           и сохраняет его обрыв. */
+        d2k_catalog cR = {0};
+        d2k_sched *s = d2k_sched_new(&cR, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = 0;
+        vol_answer = D2K_VOL_CUT; vol_rx_cut = 0;
+        tcp_answer = D2K_V_CLEAR;
+        ver_answer = D2K_VER_NOT_MEASURED;
+        forget_sent();
+        snapshot_enabled = 1; snapshot_entered = snapshot_release = snapshot_ok = 0;
+        d2k_ev h = ev_hello(6, 40092, "объём.без.повтора");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40092);
+        d2k_sched_event(s, &su);
+        int entered = 0;
+        for (int i = 0; i < 3000 && !entered; i++) {
+            tick_once(s);
+            pthread_mutex_lock(&snapshot_mu);
+            entered = snapshot_entered;
+            pthread_mutex_unlock(&snapshot_mu);
+        }
+        CHECK(entered, "классификатор не позван первым — объём шёл до вопросов донора");
+        d2k_ev sh;
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_LEGACY) == 0, "snapshot fixture failed");
+        d2k_sched_event(s, &sh);
+        pthread_mutex_lock(&snapshot_mu);
+        snapshot_release = 1; pthread_cond_broadcast(&snapshot_cv);
+        pthread_mutex_unlock(&snapshot_mu);
+        settle(s);
+        CHECK(tcp_calls == 2, "снимок клиента не повторил классификацию его байтами");
+        CHECK(vol_calls == 1, "повтор снимком заново прогнал уже выполненный объёмный замер");
+        CHECK(said("исходящая лестница оборвалась"),
+              "повтор снимком потерял обрыв уже выполненного объёмного замера");
+        if (vol_calls != 1 || tcp_calls != 2) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&cR);
+        snapshot_enabled = 0;
+        vol_answer = D2K_VOL_PASSED; tcp_answer = D2K_V_OPAQUE;
+    }
+
     /* --- TX-volume не открывает RX-volume-лестницу ---------------------- */
     {
         /* Один только обрыв исходящей лестницы не эквивалентен подтверждённому
@@ -6185,7 +6280,8 @@ lifecycle_test:
         d2k_sched_set_say(s, collect_say, NULL);
         vol_calls = tcp_calls = 0;
         vol_answer = D2K_VOL_CUT;
-        tcp_answer = D2K_V_OPAQUE;
+        /* Объём мерится после CLEAR донорского классификатора (задача 30). */
+        tcp_answer = D2K_V_CLEAR;
         ver_answer = D2K_VER_NOT_MEASURED;
         ver_calls = 0;
         forget_sent();
@@ -6197,13 +6293,14 @@ lifecycle_test:
         settle(s);
 
         CHECK(vol_calls == 1, "проба на объём не вызвана");
-        CHECK(tcp_calls == 0,
-              "на обрыв по объёму позвано дерево вердиктов — его ответ там ложен");
+        CHECK(tcp_calls == 1,
+              "объём измерен без предшествующей донорской классификации");
         CHECK(!sent_contains_plan_ascii("68636170746368612e636f6d"),
               "TX-volume ошибочно запустил профильную RX fake-SNI-лестницу");
         CHECK(total_bindings(&cA) == 0, "обрыв по объёму записан в каталог");
         CHECK(said("исходящая лестница оборвалась"), "TX-volume не назван в отчёте");
         vol_answer = D2K_VOL_PASSED;
+        tcp_answer = D2K_V_OPAQUE;
         vol_rx_cut = 0;
         d2k_sched_free(s);
         d2k_catalog_free(&cA);
@@ -6219,7 +6316,7 @@ lifecycle_test:
         d2k_catalog cV;
         memset(&cV, 0, sizeof cV);
         vol_answer = D2K_VOL_CUT;
-        tcp_answer = D2K_V_PREFIX;
+        tcp_answer = D2K_V_CLEAR; /* рукопожатие проходит — объём мерится (задача 30) */
         ver_answer = D2K_VER_APPLICATION;
         vol_at_kb = 16;
         confirm_once(&cV, sv[0], "a.vol-16.test", 40610);
@@ -6326,7 +6423,7 @@ lifecycle_test:
         if (ready) {
             saidbuf[0] = '\0';
             vol_answer = D2K_VOL_CUT;
-            tcp_answer = D2K_V_PREFIX;
+            tcp_answer = D2K_V_CLEAR;
             ver_answer = D2K_VER_APPLICATION;
             vol_at_kb = 19;
             confirm_once(&cO, sv[0], "e.vol-19.test", 40614);
@@ -6336,6 +6433,7 @@ lifecycle_test:
         }
         vol_at_kb = 20;
         vol_answer = D2K_VOL_PASSED;
+        tcp_answer = D2K_V_PREFIX; /* прежнее состояние для следующих проверок */
         d2k_catalog_free(&cO);
     }
 
@@ -6556,6 +6654,8 @@ rx_volume_tests:
         vol_answer = D2K_VOL_PASSED;
         vol_rx_cut = 1;
         tcp_calls = 0;
+        d2k_verdict rx_tcp_was = tcp_answer;
+        tcp_answer = D2K_V_CLEAR; /* объём — после CLEAR классификатора (задача 30) */
         d2k_ev h = ev_hello(6, 40081, "непрофильная.цель");
         d2k_sched_event(s, &h);
         d2k_ev sh;
@@ -6565,13 +6665,14 @@ rx_volume_tests:
         d2k_ev su = ev_suspect(6, 40081);
         d2k_sched_event(s, &su);
         settle(s);
-        CHECK(tcp_calls == 0, "RX-обрыв ошибочно отправлен в TLS-разрезный классификатор");
+        CHECK(tcp_calls == 1, "RX-обрыв измерен без предшествующей донорской классификации");
         CHECK(said("identity-тело дважды оборвалось") && said("gzip завершился"),
               "причина RX-volume не раскрыла парный результат");
         CHECK(sent_contains_plan_payload("hcaptcha.com"),
               "RX-volume не приоритизировал fake-SNI/multisplit-кандидат");
         if (!sent_contains_plan_payload("hcaptcha.com")) { fprintf(stderr, "%s\n", saidbuf); }
         vol_rx_cut = 0;
+        tcp_answer = rx_tcp_was;
         d2k_sched_free(s);
         d2k_catalog_free(&cRx);
     }
@@ -6987,7 +7088,7 @@ rx_volume_tests:
                 d2k_ev su = ev_suspect(6, 40101);
                 d2k_sched_event(s, &su);
                 settle(s);
-                CHECK(tcp_calls == 1 && vol_calls == 1,
+                CHECK(tcp_calls == 1 && vol_calls == 0,
                       "модели не проверялись после прямого подтверждения блокировки");
                 d2k_ev ap = ev_applied(6, 40101);
                 d2k_sched_event(s, &ap);

@@ -717,6 +717,10 @@ typedef struct {
     int        group_block_proven;
     int        family_fast; /* 1 own-family verifier queue, 2 exhausted */
     int        skip_volume_once; /* resume classifier with existing baseline */
+    /* Объёмный замер этой задачи уже выполнен (задача 30): повтор поиска
+       снимком клиента не гоняет его заново, а берёт сохранённый исход. */
+    int        vol_done;
+    d2k_vol_result vol_measured;
     char       measure_path[512]; /* selected before worker start, never guessed from ciphertext */
     int        ech_offer;
     int        ech_trial; /* failed baseline permits hypotheses, not a DPI verdict */
@@ -1574,6 +1578,57 @@ d2k_vres d2k_sched_ech_baseline_result(const d2k_ver_result *baseline,
     return result;
 }
 
+/* Объёмный замер TCP-цели — один раз на задачу (задача 30): повтор поиска
+   снимком клиента берёт исход уже выполненного замера. */
+static void worker_volume(d2k_sched *s, task *t, d2k_hello trig) {
+    int tls12 = d2k_hello_shape(trig.bytes, trig.len) == D2K_SHAPE_LEGACY;
+    if (!t->vol_done) {
+        t->vol_measured = t->measure_path[0]
+            ? d2k_sched_vol_path_hook(t->ip, t->port, t->name, t->port == 80,
+                                     tls12, trig.len, s->measure_mark, t->measure_path)
+            : d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80,
+                                tls12, trig.len, s->measure_mark);
+        t->vol_done = 1;
+        if (t->vol_measured.rx_reason[0]) {
+            say(s, "по %s объёмный замер TLS %s, hello=%zu: TX %s; RX %s",
+                t->name, tls12 ? "1.2" : "1.3", trig.len,
+                t->vol_measured.reason, t->vol_measured.rx_reason);
+        }
+    }
+    t->vol = t->vol_measured;
+}
+
+/* Обрыв объёма: 1 — результат задачи уже выложен, поток кончает работу. */
+static int worker_volume_cut(d2k_sched *s, task *t) {
+    if (t->vol.verdict != D2K_VOL_CUT && !t->vol.rx_cut) { return 0; }
+    /* Объёмное измерение не даёт честного ответа на старые вопросы
+       про имя/адрес: оборванный поток исказит их вердикт. Вместо этого
+       записываем направленную улику и сразу идём к соответствующему
+       кандидату; после его отказа общий перебор сохранится. */
+    pthread_mutex_lock(&s->mu);
+    memset(&t->res, 0, sizeof t->res);
+    t->res.verdict = D2K_V_INCONCLUSIVE;
+    if (t->vol.rx_cut) {
+        if (t->vol.rx_expected_kb > 0) {
+            snprintf(t->res.reason, sizeof t->res.reason,
+                     "identity-тело дважды оборвалось около %d/%d КБ, gzip завершился",
+                     t->vol.rx_at_kb, t->vol.rx_expected_kb);
+        } else {
+            snprintf(t->res.reason, sizeof t->res.reason,
+                     "chunked identity-тело дважды оборвалось около %d КБ, gzip завершился",
+                     t->vol.rx_at_kb);
+        }
+    } else {
+        snprintf(t->res.reason, sizeof t->res.reason,
+                 "исходящая лестница оборвалась около %d КБ", t->vol.at_kb);
+    }
+    t->res_ready = 1;
+    pthread_mutex_unlock(&s->mu);
+    ssize_t ign = write(s->wake[1], "w", 1);
+    (void)ign;
+    return 1;
+}
+
 static void *worker_run(void *vp) {
     worker_arg *a = (worker_arg *)vp;
     d2k_sched *s = a->s;
@@ -1672,11 +1727,17 @@ static void *worker_run(void *vp) {
         return NULL;
     }
 
-    /* Два направленных измерения идут перед классификацией TLS: лестница
-       исходящего запроса сохраняется для унаследованного TX-класса, а парные
-       identity/gzip GET отдельно проверяют обрыв ВХОДЯЩЕГО тела. Последний
-       становится своим rx-volume-сигналом и может приоритизировать план,
-       который доказательно обходит такой профиль. QUIC сюда не попадает. */
+    /* ПОРЯДОК ДОНОРА (задача 30, D2K_SPEC §2). «Поиск по домену» z2k сразу
+       задаёт вопросы классификатора; объём (TransferProbe) там — отдельный
+       вопрос (-transfer, tcp16). Поэтому обычный TCP-поиск сначала
+       классифицирует, и лишь вердикт CLEAR (рукопожатие и запись проходят)
+       открывает два направленных измерения: лестницу исходящего запроса
+       (TX-класс) и парные identity/gzip GET (обрыв ВХОДЯЩЕГО тела). До
+       классификации объём идёт только там, где он и есть вопрос: поздний
+       RST (rx_volume_only) и база собственного плана другого семейства
+       (family_reuse == 1). Поле 02.10.2026: объём первым ждал 14–20 с
+       таймаута «нет TLS» на целях, режущихся на рукопожатии. QUIC сюда не
+       попадает. */
     if (t->transport == 6 && t->ech_offer) {
         /* Explicit previously observed/confirmed origins are witnesses, not
          * guessed hidden names. Validate their HTTPS RR public_name first. */
@@ -1719,46 +1780,12 @@ static void *worker_run(void *vp) {
         ssize_t ign_ech = write(s->wake[1], "w", 1); (void)ign_ech;
         return NULL;
     }
-    if (t->transport == 6 && !t->skip_volume_once) {
-        int tls12 = d2k_hello_shape(trig.bytes, trig.len) == D2K_SHAPE_LEGACY;
-        t->vol = t->measure_path[0]
-            ? d2k_sched_vol_path_hook(t->ip, t->port, t->name, t->port == 80,
-                                     tls12, trig.len, s->measure_mark, t->measure_path)
-            : d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80,
-                                tls12, trig.len, s->measure_mark);
-        if (t->vol.rx_reason[0]) {
-            say(s, "по %s объёмный замер TLS %s, hello=%zu: TX %s; RX %s",
-                t->name, tls12 ? "1.2" : "1.3", trig.len,
-                t->vol.reason, t->vol.rx_reason);
-        }
-        if (t->vol.verdict == D2K_VOL_CUT || t->vol.rx_cut) {
-            /* Объёмное измерение не даёт честного ответа на старые вопросы
-               про имя/адрес: оборванный поток исказит их вердикт. Вместо этого
-               записываем направленную улику и сразу идём к соответствующему
-               кандидату; после его отказа общий перебор сохранится. */
-            pthread_mutex_lock(&s->mu);
-            memset(&t->res, 0, sizeof t->res);
-            t->res.verdict = D2K_V_INCONCLUSIVE;
-            if (t->vol.rx_cut) {
-                if (t->vol.rx_expected_kb > 0) {
-                    snprintf(t->res.reason, sizeof t->res.reason,
-                             "identity-тело дважды оборвалось около %d/%d КБ, gzip завершился",
-                             t->vol.rx_at_kb, t->vol.rx_expected_kb);
-                } else {
-                    snprintf(t->res.reason, sizeof t->res.reason,
-                             "chunked identity-тело дважды оборвалось около %d КБ, gzip завершился",
-                             t->vol.rx_at_kb);
-                }
-            } else {
-                snprintf(t->res.reason, sizeof t->res.reason,
-                         "исходящая лестница оборвалась около %d КБ", t->vol.at_kb);
-            }
-            t->res_ready = 1;
-            pthread_mutex_unlock(&s->mu);
-            ssize_t ign2 = write(s->wake[1], "w", 1);
-            (void)ign2;
-            return NULL;
-        }
+    int volume_first = t->transport == 6 && !t->skip_volume_once &&
+                       (t->rx_volume_only || t->family_reuse == 1);
+    int volume_after = t->transport == 6 && !t->skip_volume_once && !volume_first;
+    if (volume_first) {
+        worker_volume(s, t, trig);
+        if (worker_volume_cut(s, t)) { return NULL; }
         if (t->rx_volume_only || (t->family_reuse == 1 && t->vol.rx_tls_unavailable)) {
             pthread_mutex_lock(&s->mu);
             memset(&t->res, 0, sizeof t->res);
@@ -1787,6 +1814,24 @@ static void *worker_run(void *vp) {
            здесь развело бы два места по умолчанию (d2k_verdict.h). gap/wait
            нулями — та же передача умолчания вниз. */
         r = d2k_sched_tcp_hook(t->ip, t->port, trig, ctl, s->measure_mark, 0, 0, 0, &t->stop);
+    }
+
+    if (volume_after) {
+        if (r.verdict == D2K_V_CLEAR && !t->stop) {
+            /* Рукопожатие и запись прошли — теперь блок по объёму. Обрыв
+               ведёт той же веткой, что и прежде: направленная улика и
+               кандидат, без вердикта CLEAR. */
+            worker_volume(s, t, trig);
+            if (worker_volume_cut(s, t)) { return NULL; }
+        } else {
+            /* Объём не измерялся: исход прошлого прогона этой задачи к
+               другому вердикту не прикладывается. Доказанный блок
+               классификатора — это и есть «прямой TLS не прошёл», на чём
+               стоит послойная RX-проверка под кандидатом. */
+            memset(&t->vol, 0, sizeof t->vol);
+            t->vol.rx_tls_unavailable = r.verdict == D2K_V_PREFIX ||
+                r.verdict == D2K_V_WHOLE || r.verdict == D2K_V_OPAQUE;
+        }
     }
 
     pthread_mutex_lock(&s->mu);
