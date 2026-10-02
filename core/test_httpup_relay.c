@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#undef NDEBUG /* asserts carry the side effects; zig cc -O2 defines NDEBUG */
 /* relay() must not spin after one side half-closes (field 2026-10-02: 194% CPU).
    httpup.c is included to reach the static relay(); IDLE_MS is shortened. */
 #define D2K_HTTPUP_NO_MAIN 1
@@ -41,6 +42,15 @@ static void *run(void *v) {
     return NULL;
 }
 
+/* Explicit stack: musl's default thread stack is only 128 KB. */
+static void spawn(pthread_t *th, struct args *a) {
+    pthread_attr_t at;
+    assert(pthread_attr_init(&at) == 0);
+    assert(pthread_attr_setstacksize(&at, 1024 * 1024) == 0);
+    assert(pthread_create(th, &at, run, a) == 0);
+    pthread_attr_destroy(&at);
+}
+
 static void pair(int *proxy_side, int *peer_side) {
     int sv[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -64,7 +74,7 @@ static void scenario(int half_only) {
     pair(&pc, &client); pair(&pu, &upstream);
     struct args a = { pc, pu, 0, 0 };
     pthread_t th = 0;
-    assert(pthread_create(&th, NULL, run, &a) == 0);
+    spawn(&th, &a);
     assert(send(client, "req", 3, 0) == 3);
     if (half_only) { shutdown(client, SHUT_WR); } else { close(client); }
     read_exact(upstream, "req");
@@ -105,7 +115,7 @@ static void scenario_rst(void) {
     int pu, upstream; pair(&pu, &upstream);
     struct args a = { pc, pu, 0, 0 };
     pthread_t th = 0;
-    assert(pthread_create(&th, NULL, run, &a) == 0);
+    spawn(&th, &a);
     struct linger lg = { 1, 0 };
     assert(setsockopt(client, SOL_SOCKET, SO_LINGER, &lg, sizeof lg) == 0);
     close(client);
@@ -116,7 +126,18 @@ static void scenario_rst(void) {
     close(upstream); close(pc); close(pu); close(ls);
 }
 
+/* Old code never returns from relay() (poll always ready): fail instead of hang. */
+static void watchdog(int sig) {
+    static const char m[] = "FAIL: relay() did not return in time (busy loop)\n";
+    (void)sig;
+    if (write(2, m, sizeof m - 1) < 0) { _exit(3); }
+    _exit(2);
+}
+
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    signal(SIGALRM, watchdog);
+    alarm(12);
     signal(SIGPIPE, SIG_IGN);
     scenario(0);
     scenario(1);
