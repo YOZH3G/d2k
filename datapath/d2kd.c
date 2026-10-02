@@ -351,6 +351,11 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
            d2k_session_hellos(s), d2k_session_with_sni(s),
            d2k_session_exchanges(s), d2k_session_suspects(s),
            d2k_session_rst_dropped(s));
+    /* Видимость ответов (ускоритель Keenetic уводит поток мимо очереди).
+       Формат строки читает d2k-ppe-deoffload.sh status — менять вместе. */
+    printf("ответ невидим очереди: %" PRIu64 " из %" PRIu64
+           " TCP-потоков с приветствием\n",
+           d2k_session_reply_hidden(s), d2k_session_tcp_hello_flows(s));
     printf("в очереди отправки %zu, отказов расписания %" PRIu64 "\n",
            d2k_sched_count(sched), d2k_sched_refusals(sched));
     printf("обрезано %" PRIu64 ", без нагрузки %" PRIu64

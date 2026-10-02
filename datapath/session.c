@@ -92,6 +92,10 @@ struct d2k_session {
     uint64_t     suspects;
     uint64_t     rst_dropped;
     uint64_t     exchanges;
+    /* Потоки TCP с приветствием и те из них, чей ответ очередь не видела
+       (d2k_session_reply_hidden). */
+    uint64_t     tcp_hello_flows;
+    uint64_t     reply_hidden;
 
     /* Разбор нагрузки: почему приветствие не узналось. */
     uint64_t     pay_reverse;      /* нагрузка с обратной стороны */
@@ -1241,6 +1245,15 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     d2k_actions_free(&acts);
 }
 
+/* Приветствие TCP узнано: запомнить подтверждение, с которым оно ушло, и
+   учесть поток в знаменателе d2k_session_reply_hidden. */
+static void note_tcp_hello(d2k_session *s, d2k_flow *fl, int ack,
+                           const uint8_t *tcp) {
+    s->tcp_hello_flows++;
+    fl->hello_ack = rd32(tcp + 8);
+    fl->hello_ack_valid = ack ? 1 : 0;
+}
+
 static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap,
                        d2k_result *out, int observe_only,
@@ -1418,6 +1431,19 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             }
         }
     }
+    /* Ответ, которого очередь не видела (d2k_session_reply_hidden): клиент
+       подтверждает данные сервера, а с обратной стороны после приветствия
+       не пришло ни пакета. Стоит до разбора закрытия и до «нет нагрузки»:
+       подтверждение чаще всего едет чистым ACK без нагрузки. Только
+       наблюдение — вердикт пакета не меняется. */
+    if (fwd && ack && !syn && fl->saw_hello && fl->hello_ack_valid &&
+        !fl->reply_hidden_told && !fl->controller_probe &&
+        fl->rev_after_hello == 0 &&
+        (int32_t)(rd32(t + 8) - fl->hello_ack) > 0) {
+        fl->reply_hidden_told = 1;
+        s->reply_hidden++;
+    }
+
     /* Признак «время не записано» — отдельный флаг, а не нулевое время. Ноль
        это законная отметка часов, и опираться на неё значит терять первый же
        поток, начавшийся в начале отсчёта. */
@@ -1623,6 +1649,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             }
             fl->hello_seq = in_seq;
             s->hellos++;
+            note_tcp_hello(s, fl, ack, t);
             if (tls.have_sni && !fl->controller_probe) {
                 s->with_sni++;
                 d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI, 0, 0,
@@ -1674,6 +1701,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                     fl->hello_ns = now_ns;
                     fl->hello_seq = hello_seq;
                     s->hellos++;
+                    note_tcp_hello(s, fl, ack, t);
                 }
                 if (!fl->controller_probe && !fl->had_sni && complete.have_sni) {
                     fl->had_sni = 1;
@@ -2631,6 +2659,14 @@ uint64_t d2k_session_rst_dropped(const d2k_session *s) {
 
 uint64_t d2k_session_exchanges(const d2k_session *s) {
     return s ? s->exchanges : 0;
+}
+
+uint64_t d2k_session_reply_hidden(const d2k_session *s) {
+    return s ? s->reply_hidden : 0;
+}
+
+uint64_t d2k_session_tcp_hello_flows(const d2k_session *s) {
+    return s ? s->tcp_hello_flows : 0;
 }
 
 void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out) {

@@ -566,7 +566,80 @@ static void test_late_rst_after_tls_appdata(void) {
     d2k_session_free(s);
 }
 
+/* --- ОТВЕТ, КОТОРЫЙ СПРЯТАЛ УСКОРИТЕЛЬ -----------------------------------
+ *
+ * Keenetic (MediaTek PPE, fastnat) уводит транзитный поток в аппаратный путь
+ * мимо netfilter: очередь видит приветствие, но не ответ сервера (полевое
+ * сообщение 02.10.2026). Снаружи это неотличимо от молчащей коробки — если
+ * смотреть только на обратную сторону.
+ *
+ * Отличие видно с ПРЯМОЙ стороны: клиент, получивший данные сервера,
+ * подтверждает их — номер подтверждения после приветствия растёт. Растущее
+ * подтверждение при нуле увиденных ответных пакетов значит «ответ был, но
+ * очередь его не видела». Повтор приветствия с тем же подтверждением —
+ * молчание, и в этот счётчик он не попадает. Счётчик — диагностика
+ * видимости, а не вердикт о блокировке. */
+static void test_reply_hidden_by_accelerator(void) {
+    uint8_t hello[512], pkt[1024], buf[8192];
+    size_t hlen = build_hello(hello);
+    d2k_result r;
+
+    /* Ответ скрыт: приветствие, затем чистое ACK клиента с подвинутым
+       подтверждением, обратных пакетов ноль. Второй такой пакет поток
+       повторно не считает. */
+    d2k_session *s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "сессия скрытого ответа не создалась");
+    if (!s) { return; }
+    CHECK(d2k_session_reply_hidden(s) == 0, "счётчик скрытого ответа не с нуля");
+    size_t n = build_pkt(pkt, 47901, 0x18, hello, hlen);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    n = build_pkt(pkt, 47901, 0x10, NULL, 0);
+    wr32(pkt + 24, 1000 + (uint32_t)hlen);
+    wr32(pkt + 28, 0x11223344u + 1400u);
+    d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+    CHECK(r.verdict == D2K_VERDICT_ACCEPT, "диагностика видимости тронула пакет");
+    wr32(pkt + 28, 0x11223344u + 2800u);
+    d2k_session_packet(s, pkt, n, 3000, buf, sizeof buf, &r);
+    CHECK(d2k_session_reply_hidden(s) == 1,
+          "подтверждение данных сервера без единого ответа в очереди не учтено");
+    CHECK(d2k_session_tcp_hello_flows(s) == 1,
+          "знаменатель скрытых ответов — не потоки TCP с приветствием");
+    CHECK(d2k_session_suspects(s) == 0,
+          "скрытый ответ выдан за подозрение на блокировку");
+    d2k_session_free(s);
+
+    /* Ответ виден: тот же порядок, но сервер ответил в очередь. */
+    s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "контрольная сессия видимого ответа не создалась");
+    if (!s) { return; }
+    n = build_pkt(pkt, 47902, 0x18, hello, hlen);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    const uint8_t handshake[] = {0x16, 0x03, 0x03, 0x00, 0x01, 0x00};
+    n = build_rev_pkt(pkt, 47902, 0x18, handshake, sizeof handshake);
+    d2k_session_packet(s, pkt, n, 1500, buf, sizeof buf, &r);
+    n = build_pkt(pkt, 47902, 0x10, NULL, 0);
+    wr32(pkt + 28, 0x11223344u + 1400u);
+    d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+    CHECK(d2k_session_reply_hidden(s) == 0,
+          "поток с увиденным ответом посчитан скрытым");
+    d2k_session_free(s);
+
+    /* Молчание: повторы приветствия с прежним подтверждением. Это не
+       невидимый ответ, а отсутствие ответа. */
+    s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "контрольная сессия молчания не создалась");
+    if (!s) { return; }
+    n = build_pkt(pkt, 47903, 0x18, hello, hlen);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+    d2k_session_packet(s, pkt, n, 3000, buf, sizeof buf, &r);
+    CHECK(d2k_session_reply_hidden(s) == 0,
+          "повтор приветствия без ответа посчитан скрытым ответом");
+    d2k_session_free(s);
+}
+
 int main(void) {
+    test_reply_hidden_by_accelerator();
     {
         d2k_session *v6 = d2k_session_new(32, 32);
         uint8_t hello6[512], ip4[1024], ip6[1044] = {0}, output6[8192];
