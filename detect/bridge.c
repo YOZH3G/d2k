@@ -202,12 +202,13 @@ static int bridge_input(const char *ip, uint16_t port,
     return 0;
 }
 
-/* Крючок планировщика. Сигнатура — d2k_sched_tcp_fn, менять её нельзя. */
-d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
-                              d2k_hello trigger, d2k_hello control,
-                              uint32_t mark, int repeats,
-                              uint32_t gap_us, uint32_t wait_ms,
-                              const volatile sig_atomic_t *stop)
+/* Полный прогон; seed — ответ уже заданного базового вопроса тем же входом
+ * (d2k_opts.seed_whole), NULL — прогон спрашивает базу сам. */
+static d2k_vres sched_tcp(const char *ip, uint16_t port,
+                          d2k_hello trigger, d2k_hello control,
+                          uint32_t mark, int repeats,
+                          uint32_t gap_us, uint32_t wait_ms,
+                          const volatile sig_atomic_t *stop, const d2k_base_seed *seed)
 {
     d2k_vres out;
     d2k_opts opt;
@@ -218,6 +219,13 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
     if (bridge_input(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop,
                      &tr, &opt, addr, &out) != 0) {
         return out;
+    }
+    if (seed && seed->valid) {
+        opt.seed_whole = 1;
+        opt.seed_repeats = seed->repeats;
+        opt.seed_pass = seed->pass;
+        opt.seed_fail = seed->fail;
+        snprintf(opt.seed_err, sizeof(opt.seed_err), "%s", seed->err);
     }
     d2k_classify_run(addr, &tr, &opt, &res);
 
@@ -300,6 +308,27 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
     return out;
 }
 
+/* Крючок планировщика. Сигнатура — d2k_sched_tcp_fn, менять её нельзя. */
+d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
+                              d2k_hello trigger, d2k_hello control,
+                              uint32_t mark, int repeats,
+                              uint32_t gap_us, uint32_t wait_ms,
+                              const volatile sig_atomic_t *stop)
+{
+    return sched_tcp(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop, NULL);
+}
+
+/* Тот же прогон с ответом базового вопроса (d2k_sched_tcp_seeded_fn). */
+d2k_vres d2k_detect_sched_tcp_seeded(const char *ip, uint16_t port,
+                                     d2k_hello trigger, d2k_hello control,
+                                     uint32_t mark, int repeats,
+                                     uint32_t gap_us, uint32_t wait_ms,
+                                     const volatile sig_atomic_t *stop,
+                                     const d2k_base_seed *seed)
+{
+    return sched_tcp(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop, seed);
+}
+
 /* БАЗОВЫЙ ВОПРОС ДОНОРА ОТДЕЛЬНО (задача 32 d2k, d2k_sched_tcp_base_hook).
  *
  * Не новый зонд «по мотивам», а тот же d2k_classify_run, остановленный на
@@ -360,6 +389,14 @@ d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
                        ? &res.trace[0] : NULL;
     int asked = b ? b->pass + b->fail : 0;
     out.probes = asked;
+    if (b && res.repeats > 0 && asked >= res.repeats) {
+        /* Вопрос задан целиком — его ответ годится полному прогону. */
+        out.base.valid = 1;
+        out.base.repeats = res.repeats;
+        out.base.pass = b->pass;
+        out.base.fail = b->fail;
+        snprintf(out.base.err, sizeof(out.base.err), "%s", b->err);
+    }
     if (!b) {
         /* До зонда не дошло: цель не разобрана (вердикт дерева тот же). */
         out.verdict = map_verdict(res.verdict);

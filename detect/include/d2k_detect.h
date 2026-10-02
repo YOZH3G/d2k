@@ -281,6 +281,16 @@ typedef struct {
      * гипотеза не сработала. Нужен поиску приёма, общего для двух приветствий. */
     int (*accept)(const d2k_poison *p, void *ctx);
     void *accept_ctx;
+    /* ОТВЕТ БАЗЫ УЖЕ ИЗВЕСТЕН (задача 32 d2k). Тот же вопрос "whole" — тем же
+     * триггером, с тем же числом повторов — только что задан отдельно; полный
+     * прогон берёт его исход, а не задаёт вопрос второй раз. Применяется лишь
+     * при seed_repeats == repeats (после умолчаний). err непуст — была ошибка
+     * транспорта (has_err у донора). Зондов база в этом прогоне не тратит. */
+    int  seed_whole;
+    int  seed_repeats;
+    int  seed_pass;
+    int  seed_fail;
+    char seed_err[160];
 } d2k_opts;
 
 void d2k_opts_defaults(d2k_opts *o);

@@ -426,6 +426,16 @@ typedef struct {
  * arm is initialized even when the terminal diagnosis prevents arm search. */
 d2k_vres d2k_quic_run(const char *ip, uint16_t port, const char *sni,
     d2k_hello trigger, d2k_hello control, uint32_t mark, d2k_quic_arm *arm);
+/* Задача 32. d2k_quic_base — только базовый вопрос (шаги 0–1: контроль
+ * живости и прямой зонд нашим Initial); base_blocked — контроль ответил, наш
+ * Initial молчит без ошибок отправки; исход — в d2k_vres.base.
+ * d2k_quic_run_seeded — полный прогон, берущий исход шагов 0–1 из seed
+ * (тот же вход), а не опрашивающий их снова; seed NULL — как d2k_quic_run. */
+d2k_vres d2k_quic_base(const char *ip, uint16_t port, const char *sni,
+    d2k_hello trigger, d2k_hello control, uint32_t mark);
+d2k_vres d2k_quic_run_seeded(const char *ip, uint16_t port, const char *sni,
+    d2k_hello trigger, d2k_hello control, uint32_t mark, d2k_quic_arm *arm,
+    const d2k_base_seed *seed);
 
 /* decoy_sni — имя, которым подставляется приманка. Приходит СНАРУЖИ, а не
  * выдумывается здесь: имя приманки — свойство подбора планов целиком (у

@@ -369,6 +369,9 @@ static d2k_vres classify_no_cancel(const char *ip, uint16_t port,
 
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
 d2k_sched_tcp_fn  d2k_sched_tcp_base_hook = NULL;
+d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook = NULL;
+d2k_sched_quic_base_fn  d2k_sched_quic_base_hook = NULL;
+d2k_sched_quic_seeded_fn d2k_sched_quic_seeded_hook = NULL;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
 d2k_sched_ver_fn  d2k_sched_rx_ver_hook = verify_rx_default;
@@ -746,6 +749,16 @@ typedef struct {
        не подтвердился, своих нет или база не показала блокировки), дальше
        полный прогон ровно как прежде. 0 — шага нет. */
     int        own_first;
+    /* Испытан ли на проводе i-й свой план (бит i): только такие уходят в
+       tried — отвергнутый исполнителем опыта не имел (задача 32, M1). */
+    unsigned   own_probed;
+    /* Ответ базового вопроса для полного прогона (задача 32): берётся вместо
+       второго такого же опроса, только тем же входом (seed_input — хэш байт
+       приветствия, адрес и порт) и один раз (seed_use взводит переход к
+       полному прогону, снимает любой исход T_ASKING). */
+    d2k_base_seed seed;
+    uint64_t   seed_input;
+    int        seed_use;
     /* Объёмный замер этой задачи уже выполнен (задача 30): повтор поиска
        снимком клиента не гоняет его заново, а берёт сохранённый исход —
        но ТОЛЬКО для того же входа замера. Замер зависит от версии TLS
@@ -1678,6 +1691,15 @@ static int worker_volume_cut(d2k_sched *s, task *t) {
     return 1;
 }
 
+/* Хэш входа базового вопроса: байты приветствия, адрес и порт цели. */
+static uint64_t seed_input_of(const uint8_t *bytes, size_t len, const char *ip, uint16_t port) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; i++) { h ^= bytes[i]; h *= 1099511628211ULL; }
+    for (const char *c = ip; c && *c; c++) { h ^= (unsigned char)*c; h *= 1099511628211ULL; }
+    h ^= port; h *= 1099511628211ULL;
+    return h ^ len;
+}
+
 static void *worker_run(void *vp) {
     worker_arg *a = (worker_arg *)vp;
     d2k_sched *s = a->s;
@@ -1829,11 +1851,13 @@ static void *worker_run(void *vp) {
         ssize_t ign_ech = write(s->wake[1], "w", 1); (void)ign_ech;
         return NULL;
     }
-    if (t->own_first == 1 && t->transport == 6 && d2k_sched_tcp_base_hook) {
-        /* Задача 32: только базовый вопрос донора. Полный прогон, если он
-           понадобится, пойдёт отдельным потоком ровно как прежде. */
-        d2k_vres base = d2k_sched_tcp_base_hook(t->ip, t->port, trig, ctl,
-                                                s->measure_mark, 0, 0, 0, &t->stop);
+    if (t->own_first == 1 &&
+        (t->transport == 6 ? d2k_sched_tcp_base_hook != NULL : d2k_sched_quic_base_hook != NULL)) {
+        /* Задача 32: только базовый вопрос. Полный прогон, если он
+           понадобится, пойдёт отдельным потоком и возьмёт этот ответ. */
+        d2k_vres base = t->transport == 6
+            ? d2k_sched_tcp_base_hook(t->ip, t->port, trig, ctl, s->measure_mark, 0, 0, 0, &t->stop)
+            : d2k_sched_quic_base_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark);
         pthread_mutex_lock(&s->mu);
         t->res = base;
         t->res_ready = 1;
@@ -1866,16 +1890,23 @@ static void *worker_run(void *vp) {
     t->skip_volume_once = 0;
 
     d2k_vres r;
+    /* Ответ базового вопроса (задача 32) — только тем же входом. */
+    const d2k_base_seed *seed = t->seed_use && t->seed.valid &&
+        t->seed_input == seed_input_of(trig.bytes, trig.len, t->ip, t->port) ? &t->seed : NULL;
     if (t->transport == 17) {
         /* Original Run owns both diagnosis and askArms, BEFORE properties,
            with one residual-aware address pool. Never restart search here. */
-        r = d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm);
+        r = seed && d2k_sched_quic_seeded_hook
+            ? d2k_sched_quic_seeded_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm, seed)
+            : d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm);
         t->arm_ready = t->arm.original;
     } else {
         /* repeats<=0 — то же умолчание (три), что у d2k_meas: второе число
            здесь развело бы два места по умолчанию (d2k_verdict.h). gap/wait
            нулями — та же передача умолчания вниз. */
-        r = d2k_sched_tcp_hook(t->ip, t->port, trig, ctl, s->measure_mark, 0, 0, 0, &t->stop);
+        r = seed && d2k_sched_tcp_seeded_hook
+            ? d2k_sched_tcp_seeded_hook(t->ip, t->port, trig, ctl, s->measure_mark, 0, 0, 0, &t->stop, seed)
+            : d2k_sched_tcp_hook(t->ip, t->port, trig, ctl, s->measure_mark, 0, 0, 0, &t->stop);
     }
 
     if (volume_after) {
@@ -2586,6 +2617,8 @@ static void exec_refusal(d2k_sched *s, task *t, unsigned code, int late) {
         t->ver_unsent_seen = 0;
         t->unsent_code = 0;
         if (t->exec_probed > 0) { t->exec_probed--; }
+        if (t->own_first == 2 && t->next_plan > 0 && t->next_plan <= 32)
+            t->own_probed &= ~(1u << (t->next_plan - 1));
     } else {
         say(s, "по %s план отвергнут исполнителем: %s (код %u) — местный отказ, "
                "опыта не было, кандидат не судим; беру следующего без сетевого зонда",
@@ -2932,15 +2965,16 @@ static size_t known_plans(d2k_sched *s, task *t) {
    Уже испытанные в этой задаче тексты (tried) не повторяются.
 
    Порядок — по числу успехов плана, затем по свежести подтверждения; не
-   больше SCHED_OWN_FIRST_MAX. fill — записать отобранное в очередь задачи
-   (и в tried: полный замер потом не испытывает их второй раз). */
+   больше SCHED_OWN_FIRST_MAX. fill — записать отобранное в очередь задачи.
+   В tried план попадает, только если реально испытан на проводе
+   (own_first_continue): отвергнутый исполнителем опыта не имел. */
 static int own_plan_bound_here(const d2k_sched *s, const task *t, const char *plan_id) {
     for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
         const d2k_cat_box *b = &s->cat->boxes[bi];
         for (size_t j = 0; j < b->n_binds; j++) {
             const d2k_cat_binding *bd = &b->binds[j];
             if (!strcmp(bd->plan_id, plan_id) && !strcmp(bd->kind, "name") &&
-                !strcmp(bd->target, t->name) && (bd->transport ? bd->transport : 6) == 6 &&
+                !strcmp(bd->target, t->name) && (bd->transport ? bd->transport : 6) == t->transport &&
                 (bd->family ? bd->family : 4) == t->family) return 1;
         }
     }
@@ -2948,10 +2982,13 @@ static int own_plan_bound_here(const d2k_sched *s, const task *t, const char *pl
 }
 
 static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
-    if (!s->cat || t->transport != 6 || t->by_addr || t->ech_offer) return 0;
-    /* Та же форма, что пойдёт в привязку (verify_confirm): старый клиент —
-       старая форма, остальное — форма собственного зонда. */
-    uint8_t want = d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY
+    if (!s->cat || (t->transport != 6 && t->transport != 17) || t->by_addr || t->ech_offer)
+        return 0;
+    int quic = t->transport == 17;
+    /* Та же форма, что пойдёт в привязку (verify_confirm): QUIC — форма QUIC;
+       старый TLS-клиент — старая форма, остальное — форма собственного зонда. */
+    uint8_t want = quic ? (uint8_t)D2K_LINK_SHAPE_QUIC :
+                   d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY
                    ? (uint8_t)D2K_SHAPE_LEGACY : (uint8_t)SCHED_PROBE_SHAPE;
     const d2k_cat_plan *pick[SCHED_OWN_FIRST_MAX];
     const d2k_cat_box *owner[SCHED_OWN_FIRST_MAX];
@@ -2961,7 +2998,7 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
         const d2k_cat_box *b = &s->cat->boxes[bi];
         for (size_t i = 0; i < b->n_plans; i++) {
             const d2k_cat_plan *p = &b->plans[i];
-            if (!p->enabled || !p->text || strcmp(p->proto, "tls") ||
+            if (!p->enabled || !p->text || strcmp(p->proto, quic ? "quic" : "tls") ||
                 strlen(p->text) >= sizeof t->plans[0]) continue;
             int found = 0;
             int64_t newest = 0;
@@ -2969,9 +3006,12 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
                 const d2k_cat_binding *bd = &b->binds[j];
                 if (strcmp(bd->plan_id, p->id) || !bd->enabled || bd->level < 3 ||
                     bd->recheck_since || strcmp(bd->kind, "name") ||
-                    (bd->transport ? bd->transport : 6) != 6 ||
+                    (bd->transport ? bd->transport : 6) != t->transport ||
                     (bd->family ? bd->family : 4) != t->family ||
-                    bd->shape != want || bd->ech_origin[0]) continue;
+                    bd->shape != want || bd->ech_origin[0] ||
+                    /* У QUIC подтверждение — только собственным зондом (H3):
+                       «UDP + CLIENT» — любой обратный пакет, не доказательство. */
+                    (quic && bd->verified_by != D2K_VERBY_PROBE)) continue;
                 if (!found || bd->confirmed > newest) newest = bd->confirmed;
                 found = 1;
             }
@@ -3011,9 +3051,8 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
     for (size_t k = 0; k < n; k++) {
         snprintf(t->plans[k], sizeof t->plans[k], "%s", pick[k]->text);
         snprintf(t->plan_boxes[k], sizeof t->plan_boxes[k], "%s", owner[k]->id);
-        if (t->n_tried < sizeof t->tried / sizeof t->tried[0])
-            t->tried[t->n_tried++] = fnv1a(pick[k]->text);
     }
+    t->own_probed = 0;
     return n;
 }
 
@@ -4354,8 +4393,9 @@ static int start_search(d2k_sched *s, task *t) {
        повторяется перезапуском поиска; брошенный ради снимка (1) задаётся
        заново его байтами. Семейный путь и база другого семейства — свои. */
     if (t->own_first <= 1)
-        t->own_first = d2k_sched_tcp_base_hook && !t->family_reuse &&
-                       own_first_plans(s, t, 0) > 0 ? 1 : 0;
+        t->own_first = (t->transport == 17 ? d2k_sched_quic_base_hook != NULL
+                                           : d2k_sched_tcp_base_hook != NULL) &&
+                       !t->family_reuse && own_first_plans(s, t, 0) > 0 ? 1 : 0;
     t->researched = 1;
     t->state = T_ASKING;
     t->asked_shape = t->ech_offer ? D2K_LINK_SHAPE_ECH_TCP :
@@ -5306,6 +5346,8 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     t->researched = 0;
     t->family_fast = 0;
     t->own_first = 0;
+    t->seed_use = 0;
+    t->seed.valid = 0;
     t->n_plans = 0;
     t->next_plan = 0;
     /* ПЕРЕМЕР — НОВЫЙ ПОИСК, И БЮДЖЕТ У НЕГО СВОЙ (задача 24). Прежде задача
@@ -5618,7 +5660,9 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          t->transport == 17 ? "quic" : "tls",
                          t->name, t->by_addr ? "addr" : "name", t->transport, t->family, rec_shape,
                          D2K_VERBY_PROBE, rec_input,
-                         wall_s(s, now_ms), &t->fp);
+                         /* Перенос не меняет отпечаток коробки плана: цель
+                            этой коробкой не измерялась (задача 32, I1). */
+                         wall_s(s, now_ms), transferred ? NULL : &t->fp);
     if (t->group_block_proven)
         group_record(s, t, D2K_GROUP_BLOCKED_CONFIRMED, plan_id, rec_shape, now_ms);
     if (t->ech_offer) {
@@ -6286,6 +6330,14 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
 static void own_first_continue(d2k_sched *s, task *t) {
     trial_retire(s, t);
     ver_close(t);
+    /* Испытанные на проводе свои планы полный прогон второй раз не берёт. */
+    for (size_t k = 0; k < t->n_plans && k < 32; k++) {
+        if (!(t->own_probed & (1u << k))) continue;
+        if (t->n_tried < sizeof t->tried / sizeof t->tried[0])
+            t->tried[t->n_tried++] = fnv1a(t->plans[k]);
+    }
+    t->own_probed = 0;
+    t->seed_use = 1;
     t->own_first = 3;
     t->n_plans = t->n_known = t->next_plan = 0;
     t->exec_refused = t->exec_probed = 0;
@@ -6293,7 +6345,7 @@ static void own_first_continue(d2k_sched *s, task *t) {
     t->box_id[0] = '\0';
     t->rx_phase = 0;
     t->probes = 0;
-    memset(&t->vol, 0, sizeof t->vol);
+    if (t->transport == 6) memset(&t->vol, 0, sizeof t->vol);
     memset(&t->res, 0, sizeof t->res);
     int f = t->family == 6;
     if (t->transport == 6 && !t->trig_snapped && !t->reasked && s->tcp_shape_len[f] > 0 &&
@@ -6666,6 +6718,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
+            /* Ответ базы годится одному полному прогону (задача 32). */
+            int base_answer = t->own_first == 1;
+            if (!base_answer) { t->seed_use = 0; t->seed.valid = 0; }
             if (t->trigger_planned == D2K_LINK_PLANNED_NO && installed_family_ready(s, t, 0, 0)) {
                 say(s, "по %s снимок подтвердил совместимое установленное семейство; "
                        "отдельный поиск прекращаю без перебора", t->name);
@@ -6790,14 +6845,18 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                его вердикт не идёт. */
             if (t->own_first == 1) {
                 t->own_first = 3;
+                t->seed = r.base;
+                t->seed_input = seed_input_of(t->trig, t->trig_len, t->ip, t->port);
                 size_t own = r.base_blocked ? own_first_plans(s, t, 1) : 0;
                 if (own > 0) {
                     t->own_first = 2;
                     t->res = r;
                     /* Прямое рукопожатие не прошло: под кандидатом тело
                        проверяется identity-путём, как после OPAQUE. */
-                    memset(&t->vol, 0, sizeof t->vol);
-                    t->vol.rx_tls_unavailable = 1;
+                    if (t->transport == 6) {
+                        memset(&t->vol, 0, sizeof t->vol);
+                        t->vol.rx_tls_unavailable = 1;
+                    }
                     t->n_plans = t->n_known = own;
                     t->next_plan = 0;
                     t->cached_measure_valid = 0;
@@ -7346,6 +7405,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (t->trial_acked || now_ms >= t->trial_until_ms) {
                 t->trial_acked = 0;
                 t->exec_probed++;
+                if (t->own_first == 2 && t->next_plan > 0 && t->next_plan <= 32)
+                    t->own_probed |= 1u << (t->next_plan - 1);
                 t->state = T_VERIFY;
                 if (start_worker(s, t, JOB_VERIFY) != 0) {
                     /* Потока нет — испытать нечем. Это «не измерено»:

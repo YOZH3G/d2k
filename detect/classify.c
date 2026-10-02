@@ -445,6 +445,22 @@ static d2k_tally measure(const char *host, const char *port, const d2k_trigger *
     }
     obs->delay_ms = gap_ms;
 
+    if (opt->seed_whole && ncuts == 0 && strcmp(name, "whole") == 0 &&
+        opt->seed_repeats == opt->repeats) {
+        /* База уже спрошена этим же триггером (см. d2k_opts.seed_whole). */
+        t.pass = opt->seed_pass;
+        t.fail = opt->seed_fail;
+        if (opt->seed_err[0]) {
+            t.has_err = 1;
+            snprintf(t.err, sizeof(t.err), "%s", opt->seed_err);
+            snprintf(obs->err, sizeof(obs->err), "%s", opt->seed_err);
+        }
+        obs->pass = t.pass;
+        obs->fail = t.fail;
+        obs_done(opt, obs);
+        return t;
+    }
+
     for (i = 0; i < opt->repeats; i++) {
         int rc;
         if (d2k_detect_stopped(&opt->cancel)) {

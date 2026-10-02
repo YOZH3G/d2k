@@ -1000,6 +1000,37 @@ int main(int argc, char **argv) {
         mock_reset();
     }
 
+    /* --- Задача 32: базовый вопрос QUIC отдельно и полный прогон с его
+     * ответом. Тот же исход и вердикт, что без подсказки, но шаги 0–1 не
+     * опрашиваются второй раз. ------------------------------------------- */
+    {
+        mock_reset();
+        d2k_vres base = d2k_quic_base("203.0.113.7", 443, "203.0.113.7",
+                                      trig_hello(), ctl_hello(), 0x2d);
+        CHECK(base.base_blocked && base.base.valid && base.base.direct_asked &&
+              base.base.ctl_pass == D2K_QUIC_REPEATS && base.base.pass == 0,
+              "QUIC base: контроль отвечает, Initial молчит — блокировка не подтверждена");
+        CHECK(base.probes == 2 * D2K_QUIC_REPEATS, "QUIC base: лишние зонды сверх шагов 0–1");
+        d2k_vres seeded = d2k_quic_run_seeded("203.0.113.7", 443, "203.0.113.7",
+                                              trig_hello(), ctl_hello(), 0x2d, NULL, &base.base);
+        mock_reset();
+        d2k_vres plain = d2k_quic_classify("203.0.113.7", 443, "203.0.113.7",
+                                           trig_hello(), ctl_hello(), 0x2d);
+        CHECK(seeded.verdict == plain.verdict &&
+              seeded.qprops.residual_blocking == plain.qprops.residual_blocking,
+              "QUIC seed: вердикт с ответом базы расходится с обычным прогоном");
+        CHECK(seeded.probes == plain.probes - base.probes,
+              "QUIC seed: шаги 0–1 опрошены второй раз");
+        mock_reset();
+        g_mock_dead_addr[0] = '\0';
+        mock_force_push(D2K_QUIC_REPEATS, 0, 0, 1);
+        mock_force_push(D2K_QUIC_REPEATS, 0, 0, 1);
+        base = d2k_quic_base("203.0.113.7", 443, "203.0.113.7", trig_hello(), ctl_hello(), 0x2d);
+        CHECK(!base.base_blocked && base.base.valid && base.base.pass == D2K_QUIC_REPEATS,
+              "QUIC base: проходящий Initial объявлен блокировкой");
+        mock_reset();
+    }
+
     /* --- НАХОДКА 2 РЕВЬЮ (круг 4): d2k_quic_ask_hook — ЧАСТЬ ПУБЛИЧНОГО
      * КОНТРАКТА (extern в d2k_quicprobe.h), не только внутренность дерева.
      * Прежняя редакция называла repeats > D2K_QUIC_MAX_ADDRS "недостижимым",

@@ -11,6 +11,9 @@ d2k_vres d2k_detect_sched_tcp(const char *, uint16_t, d2k_hello, d2k_hello,
 d2k_vres d2k_detect_sched_tcp_base(const char *, uint16_t, d2k_hello, d2k_hello,
                                   uint32_t, int, uint32_t, uint32_t,
                                   const volatile sig_atomic_t *);
+d2k_vres d2k_detect_sched_tcp_seeded(const char *, uint16_t, d2k_hello, d2k_hello,
+                                    uint32_t, int, uint32_t, uint32_t,
+                                    const volatile sig_atomic_t *, const d2k_base_seed *);
 int d2k_arm_from_poison(const d2k_poison *, d2k_arm *, char *, size_t);
 
 static d2k_opts seen;
@@ -232,10 +235,27 @@ int main(void)
     CHECK(!r.base_blocked && r.verdict == D2K_V_CLEAR);
     r = measure_base(1, 1, "");
     CHECK(!r.base_blocked && r.verdict == D2K_V_FLAKY);
+    CHECK(r.base.valid && r.base.repeats == 2 && r.base.pass == 1 && r.base.fail == 1);
     r = measure_base(0, 2, "connect: refused");
     CHECK(!r.base_blocked && r.verdict == D2K_V_UNREACHABLE);
+    CHECK(r.base.valid && strcmp(r.base.err, "connect: refused") == 0);
     r = measure_base(0, 1, ""); /* брошен на втором повторе */
-    CHECK(!r.base_blocked && r.verdict == D2K_V_INCONCLUSIVE);
+    CHECK(!r.base_blocked && r.verdict == D2K_V_INCONCLUSIVE && !r.base.valid);
+    {
+        /* Полный прогон с ответом базы: подсказка доходит до измерителя. */
+        uint8_t hello[] = {0x16, 0x03};
+        d2k_hello tr = {hello, sizeof hello}, none = {0};
+        d2k_base_seed seed;
+        memset(&seed, 0, sizeof seed);
+        seed.valid = 1; seed.repeats = 2; seed.pass = 0; seed.fail = 2;
+        memset(&answer, 0, sizeof answer);
+        answer.verdict = D2K_DV_PREFIX;
+        r = d2k_detect_sched_tcp_seeded("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321, NULL, &seed);
+        CHECK(seen.seed_whole == 1 && seen.seed_repeats == 2 && seen.seed_pass == 0 &&
+              seen.seed_fail == 2 && seen.on_obs == NULL && r.verdict == D2K_V_PREFIX);
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321);
+        CHECK(seen.seed_whole == 0);
+    }
     memset(&answer, 0, sizeof answer);
 
     memset(&p, 0, sizeof p);

@@ -162,6 +162,25 @@ extern d2k_sched_quic_fn d2k_sched_quic_hook;
  * полный прогон, который затем идёт ровно как прежде. NULL (умолчание) — шага
  * нет: прежнее дерево (core/verdict.c) базового вопроса отдельно не умеет. */
 extern d2k_sched_tcp_fn  d2k_sched_tcp_base_hook;
+/* Полный прогон, берущий ответ уже заданного базового вопроса (seed — тот же
+ * вход) вместо повторного опроса. NULL — прогон спрашивает базу сам. */
+typedef d2k_vres (*d2k_sched_tcp_seeded_fn)(const char *ip, uint16_t port,
+                                            d2k_hello trigger, d2k_hello control,
+                                            uint32_t mark, int repeats,
+                                            uint32_t gap_us, uint32_t wait_ms,
+                                            const volatile sig_atomic_t *stop,
+                                            const d2k_base_seed *seed);
+extern d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook;
+/* То же для QUIC: базовый вопрос — контроль живости и прямой зонд нашим
+ * Initial (d2k_quic_base); полный прогон с ответом — d2k_quic_run_seeded.
+ * NULL (умолчание) — шага своих планов для QUIC нет, прогон как прежде. */
+typedef d2k_vres (*d2k_sched_quic_base_fn)(const char *ip, uint16_t port, const char *sni,
+                                           d2k_hello trigger, d2k_hello control, uint32_t mark);
+extern d2k_sched_quic_base_fn d2k_sched_quic_base_hook;
+typedef d2k_vres (*d2k_sched_quic_seeded_fn)(const char *ip, uint16_t port, const char *sni,
+                                             d2k_hello trigger, d2k_hello control, uint32_t mark,
+                                             d2k_quic_arm *arm, const d2k_base_seed *seed);
+extern d2k_sched_quic_seeded_fn d2k_sched_quic_seeded_hook;
 
 /* Голосовой измеритель блокирует на сетевых ответах и запускается
  * асинхронно; крючок позволяет проверить scheduler без сети. */

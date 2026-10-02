@@ -635,6 +635,40 @@ static void test_epipe_and_fresh_neutral(void)
         fail("формат нейтрального имени: %s", a);
 }
 
+/* Ответ базы, уже снятый отдельно (задача 32 d2k): полный прогон не задаёт
+ * "whole" второй раз, а вердикт и граница — те же, что без подсказки. */
+static void test_seeded_base_matches_unseeded(void)
+{
+    static const dpi_mode modes[] = {M_PREFIX, M_WHOLE, M_CLEAR};
+    size_t i;
+    for (i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        d2k_opts opt, seeded;
+        d2k_result a, b;
+        const d2k_obs *wa = NULL, *wb = NULL;
+        int k;
+        fast_opts(&opt);
+        run_on(modes[i], 4, &opt, &a);
+        for (k = 0; k < a.ntrace; k++) if (!strcmp(a.trace[k].probe, "whole")) { wa = &a.trace[k]; break; }
+        if (!wa) { fail("seed: нет наблюдения whole в прогоне без подсказки"); continue; }
+        fast_opts(&seeded);
+        seeded.seed_whole = 1;
+        seeded.seed_repeats = opt.repeats;
+        seeded.seed_pass = wa->pass;
+        seeded.seed_fail = wa->fail;
+        snprintf(seeded.seed_err, sizeof(seeded.seed_err), "%s", wa->err);
+        run_on(modes[i], 4, &seeded, &b);
+        for (k = 0; k < b.ntrace; k++) if (!strcmp(b.trace[k].probe, "whole")) { wb = &b.trace[k]; break; }
+        if (b.verdict != a.verdict || b.boundary != a.boundary)
+            fail("seed: вердикт %s/граница %d расходится с прогоном без подсказки (%s/%d)",
+                 d2k_verdict_name(b.verdict), b.boundary, d2k_verdict_name(a.verdict), a.boundary);
+        if (b.probes != a.probes - opt.repeats)
+            fail("seed: зондов %d, ждали %d — база спрошена второй раз", b.probes,
+                 a.probes - opt.repeats);
+        if (!wb || wb->pass != wa->pass || wb->fail != wa->fail)
+            fail("seed: в трассе нет ответа базы");
+    }
+}
+
 int main(void)
 {
     test_epipe_and_fresh_neutral();
@@ -671,6 +705,7 @@ int main(void)
     test_loopback_guard_rejects_misresolved_target();
     test_stopped_run_is_marked_and_short();
     test_stop_midway_keeps_what_was_measured();
+    test_seeded_base_matches_unseeded();
     if (fails) {
         printf("перенос: ПРОВАЛОВ %d\n", fails);
         return 1;

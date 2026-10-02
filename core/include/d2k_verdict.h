@@ -191,6 +191,25 @@ typedef struct {
     uint8_t server_ttl_in;
 } d2k_quic_props;
 
+/* ОТВЕТ БАЗОВОГО ВОПРОСА, ПРИГОДНЫЙ ДЛЯ ПОВТОРНОГО ИСПОЛЬЗОВАНИЯ (задача 32).
+ * Заполняется базовым вопросом (d2k_sched_tcp_base_hook / quic_base_hook) и
+ * передаётся полному прогону той же цели тем же входом: прогон берёт исход
+ * вместо второго такого же опроса. valid — вопрос задан целиком (все
+ * повторы, без остановки).
+ *   TCP: pass/fail/err — триггер целиком одной записью (вопрос "whole").
+ *   QUIC: ctl_* — контроль живости (шаг 0), pass/fail/err_n — прямой зонд
+ *   (шаг 1); direct_asked=0 — до прямого зонда ветка не дошла. */
+typedef struct {
+    int      valid;
+    int      repeats;
+    int      pass, fail;
+    char     err[160];
+    int      ctl_pass, ctl_fail, ctl_err, ctl_refused, ctl_marked;
+    uint32_t rtt_ms;
+    uint8_t  ttl_in;
+    int      direct_asked, direct_err, direct_marked;
+} d2k_base_seed;
+
 typedef struct {
     d2k_verdict verdict;
     char        reason[D2K_REASON_MAX]; /* заполняется ВСЕГДА и по-человечески — иначе вердикт нечитаем */
@@ -215,6 +234,7 @@ typedef struct {
      * транспорта — блокировка на рукопожатии подтверждена первым вопросом
      * донора. Это не вердикт дерева: полный прогон по-прежнему решает сам. */
     int         base_blocked;
+    d2k_base_seed base;
     uint32_t    split_gap_us;
     d2k_arm     arm;
     d2k_arm_input arm_input;

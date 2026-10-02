@@ -1493,10 +1493,48 @@ static d2k_vres stub_base(const char *ip, uint16_t port, d2k_hello trigger,
     r.owns_search = 1;
     r.probes = 3;
     r.base_blocked = base_blocked_answer;
+    r.base.valid = 1; r.base.repeats = 3;
+    r.base.pass = base_blocked_answer ? 0 : 3;
+    r.base.fail = 3 - r.base.pass;
     r.verdict = base_blocked_answer ? D2K_V_INCONCLUSIVE : D2K_V_CLEAR;
     snprintf(r.reason, sizeof r.reason, "%s", base_blocked_answer
              ? "подменённая база: 0 из 3" : "подменённая база: 3 из 3");
     return r;
+}
+
+/* Полный прогон с ответом базы: сколько раз позван и с каким ответом. */
+static int seeded_calls, seeded_pass, seeded_fail;
+static d2k_vres stub_tcp_seeded(const char *ip, uint16_t port, d2k_hello trigger,
+                                d2k_hello control, uint32_t mark, int repeats,
+                                uint32_t gap_us, uint32_t wait_ms,
+                                const volatile sig_atomic_t *stop, const d2k_base_seed *seed) {
+    seeded_calls++;
+    seeded_pass = seed ? seed->pass : -1;
+    seeded_fail = seed ? seed->fail : -1;
+    return stub_tcp(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop);
+}
+/* QUIC: базовый вопрос и полный прогон с его ответом. */
+static int quic_base_calls, quic_seeded_calls, quic_seeded_ctl;
+static d2k_vres stub_quic_base(const char *ip, uint16_t port, const char *sni,
+                               d2k_hello trigger, d2k_hello control, uint32_t mark) {
+    (void)ip; (void)port; (void)sni; (void)trigger; (void)control; (void)mark;
+    quic_base_calls++;
+    d2k_vres r;
+    memset(&r, 0, sizeof r);
+    r.verdict = D2K_V_INCONCLUSIVE;
+    r.base_blocked = base_blocked_answer;
+    r.base.valid = 1; r.base.repeats = 3; r.base.ctl_pass = 3; r.base.ctl_marked = 1;
+    r.base.direct_asked = 1; r.base.pass = base_blocked_answer ? 0 : 3;
+    r.base.fail = 3 - r.base.pass; r.base.direct_marked = 1;
+    snprintf(r.reason, sizeof r.reason, "подменённая QUIC-база");
+    return r;
+}
+static d2k_vres stub_quic_seeded(const char *ip, uint16_t port, const char *sni,
+                                 d2k_hello trigger, d2k_hello control, uint32_t mark,
+                                 d2k_quic_arm *arm, const d2k_base_seed *seed) {
+    quic_seeded_calls++;
+    quic_seeded_ctl = seed ? seed->ctl_pass : -1;
+    return stub_quic(ip, port, sni, trigger, control, mark, arm);
 }
 
 /* Коробка с одним планом и одной подтверждённой привязкой — фикстура своего
@@ -1505,9 +1543,16 @@ static void own_box(d2k_catalog *c, const char *box, char plan_id[40], unsigned 
                     int successes, const char *target, uint8_t transport, uint8_t shape,
                     uint8_t family, int64_t confirmed, int64_t recheck) {
     char plan[256];
-    snprintf(plan, sizeof plan,
-             "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
-             "proto tcp tls\nsplit payload_start +%u\norder forward\n", split);
+    if (transport == 17)
+        snprintf(plan, sizeof plan,
+                 "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                 "proto udp quic\npayload 1 aa%02x\n"
+                 "fake payload=1 poison=0 repeats=1 gap_us=0 place=before\n"
+                 "order forward\n", split & 0xff);
+    else
+        snprintf(plan, sizeof plan,
+                 "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                 "proto tcp tls\nsplit payload_start +%u\norder forward\n", split);
     /* Идентификатор — из текста, тем же FNV-1a, что plan_ident планировщика:
        каталог роутера иначе не бывает. */
     uint64_t h = 1469598103934665603ULL;
@@ -9967,6 +10012,8 @@ own_first_test:
                     1790000000, 0);
             tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION;
             ver_app_after_tcp_search = 1; base_blocked_answer = 1;
+            d2k_sched_tcp_seeded_hook = stub_tcp_seeded;
+            seeded_calls = 0; seeded_pass = seeded_fail = -2;
             d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
             saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
@@ -9991,6 +10038,9 @@ own_first_test:
             const d2k_cat_binding *bd = binding_of(&c, "miss-second.own", 6);
             CHECK(bd != NULL && bd->input != D2K_INPUT_TRANSFER,
                   "own-first: после полного замера подтверждение записано как перенос");
+            CHECK(seeded_calls == 1 && seeded_pass == 0 && seeded_fail == 3,
+                  "own-first: полный замер не получил ответ базового вопроса (I2)");
+            d2k_sched_tcp_seeded_hook = NULL;
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
             ver_app_after_tcp_search = 0;
@@ -10092,7 +10142,7 @@ own_first_test:
             d2k_ev sq = ev_suspect(17, 42133); d2k_sched_event(s, &sq);
             settle(s);
             CHECK(base_calls == 0 && !said("пробую свои подтверждённые"),
-                  "own-first: QUIC-цели задан TCP-базовый вопрос");
+                  "own-first: без QUIC-крючка базы QUIC-цели задан TCP-базовый вопрос");
             d2k_sched_free(s); d2k_catalog_free(&cq);
         }
 
@@ -10202,6 +10252,135 @@ own_first_test:
             d2k_sched_free(s); d2k_catalog_free(&c);
             base_wait_until_stop = 0;
         }
+
+        /* (h) I1: свой план из коробки без отпечатка — перенос не дарит ей
+           отпечаток неизмеренной цели. */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-без-приметы", pid, 61, 3, "nofp-first.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            memset(&c.boxes[0].fp, 0, sizeof c.boxes[0].fp);
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = 0;
+            ver_answer_port = 42171;
+            d2k_ev h = ev_hello(6, 42171, "nofp-second.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42171); d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 42171); d2k_sched_event(s, &ap);
+            spin(s, 40);
+            const d2k_cat_binding *bd = binding_of(&c, "nofp-second.own", 6);
+            CHECK(bd && bd->input == D2K_INPUT_TRANSFER, "own-first/I1: перенос не подтвердился");
+            CHECK(c.n_boxes == 1 && c.boxes[0].fp.n_sig == 0,
+                  "own-first/I1: перенос записал коробке без приметы чужой отпечаток");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+
+        /* (i) M1: отвергнутый исполнителем свой план опыта не имел — полный
+           замер вправе предложить его снова (узнанная коробка); испытанный
+           на проводе — нет. */
+        for (int nak = 1; nak >= 0; nak--) {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-m1", pid, 71, 3, nak ? "m1a-first.own" : "m1b-first.own", 6,
+                    D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            d2k_cat_fp *fp = &c.boxes[0].fp;
+            fp->sig[0].ttl = 127; fp->sig[0].tos = 0x88; fp->sig[0].ipid = 54321;
+            tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_HANDSHAKE; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = 0;
+            const char *name = nak ? "m1a-second.own" : "m1b-second.own";
+            uint16_t port = (uint16_t)(nak ? 42181 : 42182);
+            ver_answer_port = port;
+            forget_sent();
+            d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+            if (nak) {
+                for (int i = 0; i < 400 && !said("поставил план 1 из 1"); i++) tick_frozen(s);
+                uint8_t id[D2K_TRIAL_ID_LEN];
+                CHECK(name_probe_trial(name, id), "own-first/M1: пробный план не найден");
+                d2k_ev a = name_probe_ack(id, 0, D2K_ACK_BAD_PLAN);
+                d2k_sched_event(s, &a);
+                for (int i = 0; i < 20; i++) tick_frozen(s);
+            }
+            for (int i = 0; i < 30 && tcp_calls == 0; i++) { skip_ahead(s, 6000); spin(s, 40); }
+            settle(s);
+            CHECK(said("свои подтверждённые планы не подтвердились") && tcp_calls == 1,
+                  "own-first/M1: полный замер не пошёл");
+            CHECK(nak ? said("готовых планов узнанной коробки")
+                      : !said("готовых планов узнанной коробки"),
+                  nak ? "own-first/M1: отвергнутый исполнителем план помечен испытанным"
+                      : "own-first/M1: испытанный на проводе план предложен второй раз");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+
+        /* (j) QUIC: базовый вопрос QUIC подтвердил блокировку — свой QUIC-план
+           той же формы подтверждается зондом H3 до полного поиска; (k) не
+           подтвердился — полный поиск получает ответ базы. */
+        for (int miss = 0; miss < 2; miss++) {
+            d2k_catalog c = {0};
+            char pid[40], ptcp[40];
+            own_box(&c, "box-quic-own", pid, 81, 3, "q-first.own", 17, D2K_LINK_SHAPE_QUIC, 4,
+                    1790000000, 0);
+            own_box(&c, "box-tcp-near", ptcp, 82, 9, "t-first.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            d2k_sched_quic_base_hook = stub_quic_base;
+            d2k_sched_quic_seeded_hook = stub_quic_seeded;
+            quic_answer = D2K_V_INCONCLUSIVE; base_blocked_answer = 1;
+            ver_answer = miss ? D2K_VER_HANDSHAKE : D2K_VER_APPLICATION;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            quic_base_calls = quic_seeded_calls = quic_calls = base_calls = ver_calls = 0;
+            quic_seeded_ctl = -2;
+            const char *name = miss ? "q-miss.own" : "q-second.own";
+            uint16_t port = (uint16_t)(42191 + miss);
+            ver_answer_port = port;
+            forget_sent();
+            d2k_ev h = ev_hello(17, port, name); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, port); d2k_sched_event(s, &su);
+            if (miss) {
+                for (int i = 0; i < 30 && quic_calls == 0; i++) { skip_ahead(s, 6000); spin(s, 40); }
+            } else {
+                settle(s);
+                d2k_ev ap = ev_applied(17, port); d2k_sched_event(s, &ap);
+                spin(s, 40);
+            }
+            CHECK(quic_base_calls == 1 && base_calls == 0 &&
+                  said("пробую свои подтверждённые планы до полного замера: 1"),
+                  "own-first/QUIC: базовый вопрос QUIC и свой QUIC-план не взяты");
+            CHECK(ver_calls >= 1 && ver_last_transport == 17,
+                  "own-first/QUIC: свой план испытан не QUIC-зондом");
+            if (!miss) {
+                const d2k_cat_binding *bd = binding_of(&c, name, 17);
+                CHECK(quic_calls == 0 && bd && !strcmp(bd->plan_id, pid) &&
+                      bd->input == D2K_INPUT_TRANSFER && bd->shape == D2K_LINK_SHAPE_QUIC,
+                      "own-first/QUIC: свой QUIC-план не подтверждён переносом до полного поиска");
+                const char *owner = NULL;
+                for (size_t i = 0; i < c.n_boxes; i++)
+                    for (size_t j = 0; j < c.boxes[i].n_binds; j++)
+                        if (!strcmp(c.boxes[i].binds[j].target, name)) owner = c.boxes[i].id;
+                CHECK(owner && !strcmp(owner, "box-quic-own"),
+                      "own-first/QUIC: привязка легла не под коробку QUIC-плана");
+            } else {
+                CHECK(quic_calls == 1 && quic_seeded_calls == 1 && quic_seeded_ctl == 3,
+                      "own-first/QUIC: полный поиск не получил ответ базового вопроса");
+                CHECK(!binding_of(&c, name, 17) && !binding_of(&c, name, 6),
+                      "own-first/QUIC: неподтверждённый план привязан");
+            }
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_quic_base_hook = NULL;
+            d2k_sched_quic_seeded_hook = NULL;
+        }
+        quic_answer = D2K_V_OPAQUE;
 
         d2k_sched_tcp_base_hook = saved_base;
         d2k_sched_rx_ver_hook = saved_rx;

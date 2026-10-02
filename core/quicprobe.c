@@ -1844,9 +1844,12 @@ int d2k_quic_props_findings(const d2k_quic_props *p, char *out, size_t cap) {
 
 static int arm_budget_left(void *budget) { return budget_left(budget); }
 
+/* base_only — только базовый вопрос (шаги 0 и 1: контроль живости и прямой
+   зонд), задача 32; seed — исход этих двух шагов, уже снятый этим же входом:
+   прогон берёт его вместо повторного опроса. */
 static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                             d2k_hello trigger, d2k_hello control, uint32_t mark,
-                            d2k_quic_arm *arm) {
+                            d2k_quic_arm *arm, int base_only, const d2k_base_seed *seed) {
     d2k_vres r;
     memset(&r, 0, sizeof r);
     if(arm) { memset(arm,0,sizeof *arm); arm->kind=D2K_QA_NOT_FOUND; }
@@ -1940,8 +1943,23 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
         uint8_t ttl_in = 0;
         int refused = 0;
         int base_sent = 0;
-        d2k_tally base_ctl = d2k_quic_ask_control_hook(pool[0], port, NULL, 0, control, d2k_quic_wait_ms,
-                                                mark, D2K_QUIC_REPEATS, &rtt_ms, &refused, &base_sent, &ttl_in);
+        int seeded = seed && seed->valid && seed->repeats == D2K_QUIC_REPEATS;
+        d2k_tally base_ctl;
+        if (seeded) {
+            memset(&base_ctl, 0, sizeof base_ctl);
+            base_ctl.pass = seed->ctl_pass; base_ctl.fail = seed->ctl_fail;
+            base_ctl.err = seed->ctl_err; base_ctl.marked = seed->ctl_marked;
+            rtt_ms = seed->rtt_ms; refused = seed->ctl_refused; ttl_in = seed->ttl_in;
+        } else {
+            base_ctl = d2k_quic_ask_control_hook(pool[0], port, NULL, 0, control, d2k_quic_wait_ms,
+                                                 mark, D2K_QUIC_REPEATS, &rtt_ms, &refused, &base_sent, &ttl_in);
+        }
+        if (base_only) {
+            r.base.valid = 1; r.base.repeats = D2K_QUIC_REPEATS;
+            r.base.ctl_pass = base_ctl.pass; r.base.ctl_fail = base_ctl.fail;
+            r.base.ctl_err = base_ctl.err; r.base.ctl_refused = refused;
+            r.base.ctl_marked = base_ctl.marked; r.base.rtt_ms = rtt_ms; r.base.ttl_in = ttl_in;
+        }
         r.probes += base_sent; /* сколько реально ушло на провод, не pass+fail (находка 4 ревью, круг 5) */
         if (!base_ctl.marked) {
             all_marked = 0;
@@ -1951,6 +1969,15 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
            TTL смешался бы с маршрутом. Без пересчёта в расстояние — см.
            d2k_quic_props.server_ttl_in. */
         r.qprops.server_ttl_in = ttl_in;
+        if (base_only && base_ctl.pass == 0) {
+            /* Путь не подтверждён живым: блокировка рукопожатия не доказана,
+               дальше (согласование версии и прочее) решает полный прогон. */
+            r.verdict = D2K_V_INCONCLUSIVE;
+            reason_set(&r, "базовый вопрос: контроль молчит (0/%d) — блокировка имени не доказана",
+                       D2K_QUIC_REPEATS);
+            r.marked = (mark != 0) && all_marked && base_ctl.marked;
+            return r;
+        }
 
         /* Run: ЛЮБОЙ ответ контроля позволяет перейти к прямому зонду.
            Refused рассматривается только при pass==0. Локальные сбои
@@ -2053,8 +2080,31 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
 
             /* ===== ШАГ 1: прямой зонд (тот же адрес — живость уже подтверждена) ===== */
             int base_sent2 = 0;
-            d2k_tally base = d2k_quic_ask_hook(pool[0], port, NULL, 0, trigger, dyn_wait, mark,
-                                                D2K_QUIC_REPEATS, NULL, NULL, &base_sent2, NULL);
+            d2k_tally base;
+            if (seeded && seed->direct_asked) {
+                memset(&base, 0, sizeof base);
+                base.pass = seed->pass; base.fail = seed->fail;
+                base.err = seed->direct_err; base.marked = seed->direct_marked;
+            } else {
+                base = d2k_quic_ask_hook(pool[0], port, NULL, 0, trigger, dyn_wait, mark,
+                                         D2K_QUIC_REPEATS, NULL, NULL, &base_sent2, NULL);
+            }
+            if (base_only) {
+                r.probes += base_sent2;
+                r.base.direct_asked = 1;
+                r.base.pass = base.pass; r.base.fail = base.fail;
+                r.base.direct_err = base.err; r.base.direct_marked = base.marked;
+                r.base_blocked = base.pass == 0 && base.err == 0;
+                r.verdict = base.pass == D2K_QUIC_REPEATS ? D2K_V_CLEAR : D2K_V_INCONCLUSIVE;
+                reason_set(&r, r.base_blocked
+                           ? "базовый вопрос: контроль отвечает (%d/%d), наш Initial молчит (0/%d)"
+                           : "базовый вопрос: контроль %d/%d, наш Initial %d/%d — блокировки рукопожатия нет",
+                           base_ctl.pass, D2K_QUIC_REPEATS,
+                           r.base_blocked ? D2K_QUIC_REPEATS : base.pass,
+                           D2K_QUIC_REPEATS);
+                r.marked = (mark != 0) && all_marked && base.marked;
+                return r;
+            }
             r.probes += base_sent2; /* сколько реально ушло на провод (находка 4 ревью, круг 5) */
             if (!base.marked) {
                 all_marked = 0;
@@ -2148,9 +2198,18 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
 
 d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
     d2k_hello trigger, d2k_hello control, uint32_t mark) {
-    return classify_run(ip,port,sni,trigger,control,mark,NULL);
+    return classify_run(ip,port,sni,trigger,control,mark,NULL,0,NULL);
+}
+d2k_vres d2k_quic_base(const char *ip, uint16_t port, const char *sni,
+    d2k_hello trigger, d2k_hello control, uint32_t mark) {
+    return classify_run(ip,port,sni,trigger,control,mark,NULL,1,NULL);
+}
+d2k_vres d2k_quic_run_seeded(const char *ip, uint16_t port, const char *sni,
+    d2k_hello trigger, d2k_hello control, uint32_t mark, d2k_quic_arm *arm,
+    const d2k_base_seed *seed) {
+    return classify_run(ip,port,sni,trigger,control,mark,arm,0,seed);
 }
 d2k_vres d2k_quic_run(const char *ip, uint16_t port, const char *sni,
     d2k_hello trigger, d2k_hello control, uint32_t mark, d2k_quic_arm *arm) {
-    return classify_run(ip,port,sni,trigger,control,mark,arm);
+    return classify_run(ip,port,sni,trigger,control,mark,arm,0,NULL);
 }
