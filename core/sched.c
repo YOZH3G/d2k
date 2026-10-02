@@ -83,8 +83,9 @@
    ждёт сеть (поле 02.10.2026: KN-1811 занят на 15–22 %), поэтому предел
    следует СВОБОДНОМУ процессору, а не зашитому числу: при свободных
    ≥ 30 % — min(2×ядра, 8); ниже 15 % новые не стартуют, но один активный
-   разрешён всегда; между порогами — гистерезис: новых не прибавляется,
-   идущие не прерываются никогда. Нет данных о процессоре (нет /proc/stat) —
+   разрешён всегда; между порогами — гистерезис: удерживается уровень входа в
+   полосу (освободившиеся места пополняются, роста нет), идущие не
+   прерываются никогда. Нет данных о процессоре (нет /proc/stat) —
    прежний предел 2 (145e1da). Пороги — решение владельца, не замер. */
 #define SCHED_DEFAULT_ACTIVE_MEASUREMENTS 2
 #define SCHED_MEASURE_CAP 8
@@ -92,6 +93,7 @@
 #define SCHED_CPU_STOP_FREE_U  150000 /* 15 % */
 #define SCHED_CPU_SAMPLE_MS 1000
 #define SCHED_CPU_EWMA_MS 10000
+#define SCHED_LIMIT_LOG_STABLE_MS 10000
 #define SCHED_MAX_QUEUED_MEASUREMENTS 16
 /* Пауза между стартами из очереди. Сохранена и при новом пределе: занятость
    процессора снимается раз в секунду и сглажена, и выпуск очереди по одному
@@ -841,7 +843,10 @@ struct d2k_sched {
        крючка), сглаженная доля свободного времени в миллионных и текущий
        предел одновременных замеров. */
     int          cpu_tried, cpu_have_prev, cpu_valid, cpu_logged_valid;
+    int          cpu_band;          /* свободно 15–30 %: уровень удерживается */
     int64_t      cpu_try_ms;
+    int64_t      limit_since_ms;    /* когда предел принял текущее значение */
+    size_t       limit_logged;      /* последний названный в журнале предел */
     uint64_t     cpu_prev_busy, cpu_prev_total;
     int64_t      cpu_free_u;
     unsigned     cpu_cores;
@@ -3265,6 +3270,7 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     s->mark = mark;
     s->measure_mark = mark;
     s->meas_limit = SCHED_DEFAULT_ACTIVE_MEASUREMENTS;
+    s->limit_logged = SCHED_DEFAULT_ACTIVE_MEASUREMENTS;
     s->wake[0] = s->wake[1] = -1;
     s->wall_base_s = (int64_t)time(NULL);
     /* The MIPS Linux pipe syscall returns the first descriptor in v0 (and
@@ -4540,16 +4546,32 @@ static void measure_limit_update(d2k_sched *s) {
         lim = measure_cap(s);
     } else if (s->cpu_free_u < SCHED_CPU_STOP_FREE_U) {
         lim = 1;
+    } else if (s->cpu_band) {
+        lim = s->meas_limit; /* уровень удерживается всё время полосы */
     } else {
-        /* Между порогами новые не прибавляются: предел не выше того, что
-           уже идёт, и не ниже одного. Идущие не прерываются. */
+        /* ГИСТЕРЕЗИС 15–30 %: удерживается уровень, достигнутый при входе в
+           полосу, — не выше прежнего предела и того, что уже шло, не ниже
+           одного. Освободившиеся места пополняются из очереди (уровень
+           держится), сверх него не растёт; идущие не прерываются. Вниз до 1
+           предел падает только ниже 15 %, вверх до 2×ядра — только от 30 %. */
         lim = s->meas_limit < active ? s->meas_limit : active;
         if (lim > measure_cap(s)) lim = measure_cap(s);
         if (lim < 1) lim = 1;
     }
-    if (lim == s->meas_limit && s->cpu_valid == s->cpu_logged_valid) return;
-    s->meas_limit = lim;
+    s->cpu_band = s->cpu_valid && s->cpu_free_u >= SCHED_CPU_STOP_FREE_U &&
+                  s->cpu_free_u < SCHED_CPU_START_FREE_U;
+    if (lim != s->meas_limit) {
+        s->meas_limit = lim;
+        s->limit_since_ms = s->now_ms;
+    }
+    /* Журнал с мёртвой зоной: смена наличия данных — сразу; смена предела —
+       только когда новое значение продержалось SCHED_LIMIT_LOG_STABLE_MS.
+       Нагрузка около 30 % иначе писала бы строку на каждом пересечении. */
+    if (s->cpu_valid == s->cpu_logged_valid &&
+        (lim == s->limit_logged || s->now_ms - s->limit_since_ms < SCHED_LIMIT_LOG_STABLE_MS))
+        return;
     s->cpu_logged_valid = s->cpu_valid;
+    s->limit_logged = lim;
     if (s->cpu_valid) {
         say(s, "замеров %zu из %zu (ядер %u, свободно %d %%)",
             active, lim, s->cpu_cores, cpu_free_pct(s));

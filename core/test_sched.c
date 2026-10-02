@@ -3075,6 +3075,103 @@ admission_only_run:
         d2k_catalog_free(&c);
     }
     {
+        /* Полоса 15–30 % — гистерезис: удерживается уровень входа в полосу.
+           2 ядра → потолок 4; идут 3; свободно 20 % — уровень 3: новые ждут,
+           а когда двое завершаются, двое из очереди стартуют (уровень
+           держится), но выше 3 не растёт. */
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        cpu_ok = 1; cpu_cores_v = 2; cpu_free_pm = 900;
+        tcp_calls = 0; tcp_saw_stop = 0; tcp_stop_count = 0;
+        tcp_wait_until_stop = 1; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            saidbuf[0] = '\0';
+            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 0 из 4 (ядер 2, свободно 90 %)"), "band: потолок 4 не набран");
+            for (uint16_t i = 0; i < 2; i++) {
+                char name[48]; uint16_t port = (uint16_t)(41160 + i);
+                snprintf(name, sizeof name, "band-early-%u.example", (unsigned)i);
+                d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+            }
+            int64_t early_at = g_now_ms;
+            spin(s, 40);
+            for (int i = 0; i < 60; i++) skip_ahead(s, 1000);
+            {
+                d2k_ev h = ev_hello(6, 41162, "band-late.example"); d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, 41162); d2k_sched_event(s, &su);
+            }
+            spin(s, 40);
+            CHECK(tcp_calls == 3, "band: три замера не запустились при свободном процессоре");
+            cpu_free_pm = 200;
+            for (int i = 0; i < 45; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 3 из 3 (ядер 2, свободно"),
+                  "band: в полосе 15–30 % не удержан уровень входа (3)");
+            for (uint16_t i = 0; i < 3; i++) {
+                char name[48]; uint16_t port = (uint16_t)(41170 + i);
+                snprintf(name, sizeof name, "band-wait-%u.example", (unsigned)i);
+                d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+            }
+            spin(s, 40);
+            for (int i = 0; i < 3; i++) skip_ahead(s, 1000);
+            CHECK(tcp_calls == 3, "band: в полосе 15–30 % уровень вырос сверх идущих");
+            /* Двое ранних упираются в срок задачи; поздний ещё идёт. */
+            skip_ahead(s, early_at + 10 * 60 * 1000 + 1000 - g_now_ms);
+            spin(s, 40);
+            for (int i = 0; i < 4; i++) { skip_ahead(s, 1000); spin(s, 10); }
+            CHECK(tcp_stop_count == 2, "band: ранние замеры не сняты по сроку (подготовка)");
+            CHECK(tcp_calls == 5, "band: освободившиеся места не пополнились из очереди");
+            CHECK(d2k_sched_active(s) == 4, "band: третья ждущая цель стартовала сверх уровня 3");
+            tcp_release_waiters = 1; spin(s, 60); tcp_release_waiters = 0;
+            d2k_sched_free(s);
+        }
+        tcp_wait_until_stop = 0; tcp_release_waiters = 0;
+        cpu_ok = 0; cpu_cores_v = 4; cpu_free_pm = 900;
+        tcp_answer = D2K_V_OPAQUE;
+        d2k_catalog_free(&c);
+    }
+    {
+        /* Мёртвая зона журнала: нагрузка, колеблющаяся около 30 %, не пишет
+           строку предела на каждом пересечении (порог допуска не меняется). */
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        cpu_ok = 1; cpu_cores_v = 2; cpu_free_pm = 900;
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            saidbuf[0] = '\0';
+            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 0 из 4 (ядер 2, свободно 90 %)"), "log: первый предел не назван");
+            saidbuf[0] = '\0';
+            for (int round = 0; round < 3; round++) {
+                cpu_free_pm = 0;
+                for (int guard = 0; guard < 60; guard++) {
+                    skip_ahead(s, 1000);
+                    char live_path[] = "/tmp/d2k-cpu-band-XXXXXX";
+                    int fd = mkstemp(live_path);
+                    char body[32768] = {0};
+                    if (fd >= 0) {
+                        close(fd);
+                        (void)d2k_sched_write_live(s, live_path, "catalog.json");
+                        FILE *live = fopen(live_path, "r");
+                        if (live) { fread(body, 1, sizeof body - 1, live); fclose(live); }
+                        unlink(live_path);
+                    }
+                    if (strstr(body, "\"limit\": 1,")) break; /* вошли в полосу */
+                    if (!strstr(body, "\"limit\": 4,")) break;
+                }
+                cpu_free_pm = 1000;
+                for (int i = 0; i < 2; i++) skip_ahead(s, 1000);
+            }
+            CHECK(!said("замеров"), "log: колебание около 30 % пишет строку предела на каждом пересечении");
+            d2k_sched_free(s);
+        }
+        cpu_ok = 0; cpu_cores_v = 4; cpu_free_pm = 900;
+        d2k_catalog_free(&c);
+    }
+    {
         /* Горячая цель: по ждущей в очереди пришло новое подозрение — она
            стартует раньше тех, что встали до неё; остальные — FIFO. Без
            данных о процессоре: предел 2. */
