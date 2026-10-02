@@ -355,6 +355,16 @@ main { min-width: 0; padding-bottom: 80px; }
 }
 .slot-cell[data-on="true"] { background: var(--signal); border-color: var(--signal); }
 .slots b { color: var(--ink); font-weight: 600; }
+.slot-bar {
+  position: relative; width: 160px; height: 14px; border-radius: 5px;
+  border: 1.5px solid var(--rule); overflow: hidden;
+}
+.slot-bar-fill {
+  position: absolute; inset: 0; background: var(--signal);
+  transform-origin: 0 50%; transform: scaleX(var(--share, 0));
+  transition: transform .5s var(--ease-out);
+}
+.slot-note { font-size: 0.8125rem; color: var(--ink-3); }
 
 .searches { margin-top: 8px; }
 

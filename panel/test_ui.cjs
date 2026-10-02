@@ -119,4 +119,16 @@ assert.equal(ui.plural(11, 'поиск', 'поиска', 'поисков'), 'п�
 assert.equal(ui.plural(22, 'поиск', 'поиска', 'поисков'), 'поиска');
 assert.equal(ui.duration(3725000), '1 ч 2 мин');
 
+// Предел замеров — живой, от 1 до десятков: клетки до 16, дальше шкала; подпись честно говорит, откуда предел.
+{
+  const weak = ui.slotsView({ active: 1, limit: 1, queued: 3, free_pct: 12, cores: 1 });
+  assert.equal(weak.kind, 'cells'); assert.equal(weak.limit, 1); assert.equal(weak.queued, 3);
+  assert.equal(weak.short, 'предел по нагрузке роутера');
+  const strong = ui.slotsView({ active: 23, limit: 40, queued: 0, free_pct: 80, cores: 4 });
+  assert.equal(strong.kind, 'bar', 'dozens of slots are shown as a share, not as 16 capped cells');
+  assert.equal(strong.limit, 40);
+  const blind = ui.slotsView({ active: 0, limit: 2, queued: 0, free_pct: null, cores: null });
+  assert.equal(blind.short, 'предел по умолчанию');
+  assert.match(blind.note, /Данных о нагрузке/);
+}
 console.log('panel model: all checks passed');

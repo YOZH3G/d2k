@@ -102,6 +102,23 @@
     }).join(" · ");
   }
 
+  /* Предел одновременных замеров считает движок по нагрузке роутера:
+     от 1 на слабом до десятков на мощном. До 16 — клетками, больше — шкалой. */
+  function slotsView(meas) {
+    var limit = Math.max(0, Math.round(num(meas && meas.limit) || 0));
+    var active = Math.max(0, Math.round(num(meas && meas.active) || 0));
+    var queued = Math.max(0, Math.round(num(meas && meas.queued) || 0));
+    var measured = num(meas && meas.free_pct) !== null;
+    return {
+      kind: limit <= 16 ? "cells" : "bar",
+      limit: limit, active: Math.min(active, Math.max(limit, active)), queued: queued,
+      short: measured ? "предел по нагрузке роутера" : "предел по умолчанию",
+      note: measured
+        ? "Сколько замеров идёт одновременно, решает движок: предел снижается, когда роутеру не хватает процессора, памяти или conntrack, и растёт, когда есть запас и очередь."
+        : "Данных о нагрузке роутера нет — движок держит предел по умолчанию."
+    };
+  }
+
   function normName(n) { return str(n).toLowerCase().replace(/\.$/, ""); }
 
   /* Привязка, уже покрытая применяемым семейством, не дублируется как отдельный результат.
@@ -624,17 +641,29 @@
     var rebuilt = section(slots, JSON.stringify([m.linked, meas, m.k.targets, m.k.confirms, m.k.probes_used, m.k.client_unfit, m.groups.length, m.boxes.length]), function () {
       var out = [];
       if (m.linked && meas && num(meas.limit)) {
+        var sv = slotsView(meas);
         var row = el(doc, "div", "slot-row");
-        var cells = el(doc, "div", "slot-cells");
-        cells.setAttribute("aria-hidden", "true");
-        for (var i = 0; i < Math.min(meas.limit, 16); i++) {
-          var c = el(doc, "span", "slot-cell");
-          c.setAttribute("data-on", String(i < (meas.active || 0)));
-          cells.appendChild(c);
+        row.title = sv.note;
+        if (sv.kind === "cells") {
+          var cells = el(doc, "div", "slot-cells");
+          cells.setAttribute("aria-hidden", "true");
+          for (var i = 0; i < sv.limit; i++) {
+            var c = el(doc, "span", "slot-cell");
+            c.setAttribute("data-on", String(i < sv.active));
+            cells.appendChild(c);
+          }
+          row.appendChild(cells);
+        } else {
+          /* Десятки замеров клетками не нарисовать честно — шкала с долей занятых. */
+          var bar = el(doc, "span", "slot-bar");
+          bar.setAttribute("aria-hidden", "true");
+          var fill = el(doc, "span", "slot-bar-fill");
+          fill.style.setProperty("--share", String(sv.active / sv.limit));
+          bar.appendChild(fill);
+          row.appendChild(bar);
         }
-        add(row, cells, el(doc, "span", "",
-          "Замеры: " + (meas.active || 0) + " из " + meas.limit +
-          (meas.queued ? ", в очереди " + meas.queued : "")));
+        add(row, el(doc, "span", "", "Замеры: " + sv.active + " из " + sv.limit +
+          (sv.queued ? ", в очереди " + sv.queued : "")), el(doc, "small", "slot-note", sv.short));
         out.push(row);
         if (num(meas.free_pct) !== null) {
           out.push(el(doc, "span", "", "Свободно процессора " + meas.free_pct + "%" +
@@ -1724,7 +1753,7 @@
   };
 
   var api = {
-    model: model, coveredBy: coveredBy, trackFor: trackFor, shapeLabel: shapeLabel,
+    model: model, coveredBy: coveredBy, slotsView: slotsView, trackFor: trackFor, shapeLabel: shapeLabel,
     planGist: planGist, plural: plural, duration: duration, App: App
   };
   if (typeof module === "object" && module.exports) module.exports = api;
