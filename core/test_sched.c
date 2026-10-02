@@ -1694,6 +1694,51 @@ static int said_count(const char *needle) {
     return n;
 }
 
+/* ECH OFFER В ПРИВЕТСТВИИ (задача 41). Расширение encrypted_client_hello
+   типа outer со случайными config_id, enc и payload — ровно так выглядит и
+   GREASE Chromium (RFC 9849 §6.2), и настоящее предложение: по байтам они
+   неотличимы намеренно. Отличает их только то, чьё имя снаружи. */
+static int ech_offer_hello(const char *name, uint8_t *out, size_t cap, size_t *len) {
+    size_t n = 0;
+    if (d2k_hello_from_profile(D2K_SHAPE_MODERN, name, out, cap, &n) != 0) return -1;
+    size_t p = 9 + 2 + 32;
+    p += 1 + out[p];
+    p += 2 + ((size_t)out[p] << 8 | out[p + 1]);
+    p += 1 + out[p];
+    size_t ext_len_off = p;
+    const size_t enc = 32, payload = 144, elen = 10 + enc + payload;
+    if (n + 4 + elen > cap) return -1;
+    uint8_t *e = out + n;
+    e[0] = 0xfe; e[1] = 0x0d; e[2] = (uint8_t)(elen >> 8); e[3] = (uint8_t)elen;
+    e[4] = 0; e[5] = 0; e[6] = 1; e[7] = 0; e[8] = 1; e[9] = 0x5a;
+    e[10] = 0; e[11] = (uint8_t)enc;
+    for (size_t i = 0; i < enc; i++) e[12 + i] = (uint8_t)(i * 7 + 3);
+    e[12 + enc] = (uint8_t)(payload >> 8); e[13 + enc] = (uint8_t)payload;
+    for (size_t i = 0; i < payload; i++) e[14 + enc + i] = (uint8_t)(i * 13 + 1);
+    n += 4 + elen;
+    size_t ext = ((size_t)out[ext_len_off] << 8 | out[ext_len_off + 1]) + 4 + elen;
+    out[ext_len_off] = (uint8_t)(ext >> 8); out[ext_len_off + 1] = (uint8_t)ext;
+    size_t hs = n - 9, rec = n - 5;
+    out[6] = (uint8_t)(hs >> 16); out[7] = (uint8_t)(hs >> 8); out[8] = (uint8_t)hs;
+    out[3] = (uint8_t)(rec >> 8); out[4] = (uint8_t)rec;
+    *len = n;
+    return 0;
+}
+
+/* HTTPS RR без сети: ECH есть у origin.ech.example (public_name
+   ech-public.example) и у самого ech-public.example; у прочих — нет. */
+static int ech_resolve_calls;
+static int stub_ech_resolve(const char *origin, uint32_t mark, d2k_ech_config *cfg) {
+    (void)mark;
+    __atomic_add_fetch(&ech_resolve_calls, 1, __ATOMIC_SEQ_CST);
+    if (!origin || !cfg) return -1;
+    if (strcmp(origin, "origin.ech.example") && strcmp(origin, "ech-public.example")) return -1;
+    memset(cfg, 0, sizeof *cfg);
+    cfg->config_id = 0x5a;
+    snprintf(cfg->public_name, sizeof cfg->public_name, "%s", "ech-public.example");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     d2k_sched_mark_fn saved_mark = d2k_sched_mark_hook;
     int voice_only = argc == 2 && strcmp(argv[1], "--voice-only") == 0;
@@ -1708,8 +1753,9 @@ int main(int argc, char **argv) {
     int lifecycle_only = argc == 2 && strcmp(argv[1], "--lifecycle-only") == 0;
     int own_first_only = argc == 2 && strcmp(argv[1], "--own-first-only") == 0;
     int measured_only = argc == 2 && strcmp(argv[1], "--measured-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !measured_only) {
-        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only|--measured-only]\n");
+    int ech_only = argc == 2 && strcmp(argv[1], "--ech-only") == 0;
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !measured_only && !ech_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only|--measured-only|--ech-only]\n");
         return 2;
     }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
@@ -2185,6 +2231,80 @@ int main(int argc, char **argv) {
     }
     if (voice_only) { goto voice_only_run; }
     if (admission_only) { goto admission_only_run; }
+
+    /* ECH OFFER: GREASE ОТДЕЛЬНО ОТ НАСТОЯЩЕГО (задача 41).
+     *
+     * Поле 02.10.2026, Discord (Electron/Chromium): приветствие discord.com
+     * несло расширение encrypted_client_hello — это GREASE (RFC 9849 §6.2):
+     * внешнее имя и есть настоящее имя, конфигурации ECH у клиента нет.
+     * Поиск «с ECH offer» после этого молчал 5+ минут. Прежний рабочий поток
+     * гасил ech_offer и мерил приветствием, а цикл, сравнив форму снимка
+     * (ECH) с формой вопроса (TLS 1.3), выбрасывал ГОТОВЫЙ полный прогон и
+     * запускал его заново теми же байтами — минуты полного «Поиска по
+     * домену» вдвое и ни строки в журнале. Настоящий ECH (внешнее имя —
+     * public_name конфигурации), напротив, мерился обычным приветствием
+     * внешнего имени: cloudflare-ech.com «чисто» — не тот вопрос. */
+    {
+        uint8_t ech_bytes[2048]; size_t ech_len = 0;
+        for (int mode = 0; mode < 3; mode++) {
+            const char *nm = mode == 0 ? "grease.ech.example" :
+                             mode == 1 ? "ech-public.example" : "grease2.ech.example";
+            d2k_catalog empty = {0};
+            d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+            d2k_sched_set_say(s, collect_say, NULL);
+            saidbuf[0] = '\0'; sent_len = 0;
+            tcp_calls = 0; tcp_last_wire = 0; ech_resolve_calls = 0;
+            tcp_answer = D2K_V_CLEAR;
+            d2k_sched_ech_resolve_hook = stub_ech_resolve;
+            CHECK(ech_offer_hello(nm, ech_bytes, sizeof ech_bytes, &ech_len) == 0 &&
+                  d2k_hello_ech_offer(ech_bytes, ech_len, NULL) == 1,
+                  "ECH: приветствие с ECH offer не собралось");
+            if (mode == 2) {
+                /* Свидетель на том же адресе есть, но его public_name — не
+                   внешнее имя этого приветствия: это не доказательство ECH. */
+                d2k_ev w = ev_hello(6, 41199, "origin.ech.example");
+                d2k_sched_event(s, &w);
+            }
+            d2k_ev h = ev_hello(6, (uint16_t)(41100 + mode), nm);
+            d2k_sched_event(s, &h);
+            d2k_ev sh; memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+            memcpy(sh.shape, ech_bytes, ech_len); sh.shape_len = ech_len;
+            d2k_sched_event(s, &sh);
+            d2k_ev su = ev_suspect(6, (uint16_t)(41100 + mode));
+            d2k_sched_event(s, &su);
+            settle(s);
+            if (mode != 1) {
+                CHECK(tcp_calls == 1,
+                      "ECH: GREASE-приветствие — полный поиск выброшен и повторён теми же байтами");
+                CHECK(tcp_last_wire == ech_len, "ECH: GREASE мерился не байтами клиента");
+                CHECK(!said("повторяю поиск"), "ECH: GREASE перезапустил готовый поиск");
+                CHECK(said("GREASE"), "ECH: GREASE не назван в журнале");
+                CHECK(said("напрямую проходит"), "ECH: GREASE-поиск не дошёл до итога");
+            } else {
+                CHECK(tcp_calls == 0,
+                      "ECH: настоящий ECH мерился обычным приветствием внешнего имени");
+                CHECK(said("не проверено"), "ECH: настоящий ECH без свидетеля — нет честного «не проверено»");
+                CHECK(!said("напрямую проходит"), "ECH: настоящий ECH без свидетеля объявлен CLEAR");
+                /* Повтор подозрения в окне не заводит тот же бесплодный опыт. */
+                saidbuf[0] = '\0';
+                d2k_ev h2 = ev_hello(6, 41150, nm);
+                d2k_sched_event(s, &h2);
+                d2k_ev su2 = ev_suspect(6, 41150);
+                d2k_sched_event(s, &su2);
+                settle(s);
+                CHECK(tcp_calls == 0 && !said("начинаю поиск"),
+                      "ECH: «не проверено» не отложило повтор");
+            }
+            if (mode == 2)
+                CHECK(ech_resolve_calls >= 2, "ECH: свидетель на том же адресе не проверен по HTTPS RR");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&empty);
+        }
+        d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+    if (ech_only) { goto voice_only_done; }
 
     /* A completed domain-search provider is not a bare classifier. Its
      * failure must not launch another property questionnaire or fallback. */

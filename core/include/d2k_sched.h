@@ -196,6 +196,14 @@ extern d2k_sched_quic_seeded_fn d2k_sched_quic_seeded_hook;
 typedef d2k_voice_res (*d2k_sched_voice_fn)(const d2k_voice_opt *opt);
 extern d2k_sched_voice_fn d2k_sched_voice_hook;
 
+/* HTTPS RR с ECHConfig (умолчание d2k_ech_resolve: один UDP-запрос, ответ
+ * ждётся не дольше 1,5 с). По нему поиск с ECH offer отличает настоящий ECH
+ * (внешнее имя — public_name конфигурации) от GREASE (задача 41). Крючок —
+ * чтобы проверять это различение без сети. */
+typedef int (*d2k_sched_ech_resolve_fn)(const char *origin, uint32_t mark,
+                                        d2k_ech_config *config);
+extern d2k_sched_ech_resolve_fn d2k_sched_ech_resolve_hook;
+
 /* Запуск рабочего потока задачи. NULL (умолчание) — поток заводится как
  * обычно; ненулевой ответ крючка изображает отказ pthread_create. Нужен,
  * чтобы провал запуска замера был воспроизводим в тесте (задача 24): именно

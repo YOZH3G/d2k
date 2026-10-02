@@ -391,6 +391,7 @@ static d2k_vres classify_no_cancel(const char *ip, uint16_t port,
 }
 
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
+d2k_sched_ech_resolve_fn d2k_sched_ech_resolve_hook = d2k_ech_resolve;
 d2k_sched_tcp_fn  d2k_sched_tcp_base_hook = NULL;
 d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook = NULL;
 d2k_sched_quic_base_fn  d2k_sched_quic_base_hook = NULL;
@@ -861,6 +862,8 @@ typedef struct {
     char       measure_path[512]; /* selected before worker start, never guessed from ciphertext */
     int        ech_offer;
     int        ech_trial; /* failed baseline permits hypotheses, not a DPI verdict */
+    int        ech_grease;     /* ECH offer оказался GREASE: обычный путь по имени */
+    int        ech_unverified; /* настоящий ECH без своего свидетеля: «не проверено» */
     char       ech_origin[256]; /* known own-probe witness, not inferred hidden SNI */
     char       ech_witnesses[4][256];
     size_t     ech_witness_count;
@@ -1940,28 +1943,65 @@ static void *worker_run(void *vp) {
        таймаута «нет TLS» на целях, режущихся на рукопожатии. QUIC сюда не
        попадает. */
     if (t->transport == 6 && t->ech_offer) {
-        /* Explicit previously observed/confirmed origins are witnesses, not
-         * guessed hidden names. Validate their HTTPS RR public_name first. */
+        /* НАСТОЯЩИЙ ECH ИЛИ GREASE (задача 41). По байтам они неотличимы
+         * намеренно (RFC 9849 §6.2): Chromium/Electron без ECHConfig шлёт
+         * расширение со случайными config_id, enc и payload. Отличает их
+         * имя снаружи: у настоящего ECH это public_name конфигурации, у
+         * GREASE — само имя цели. Доказательство «внешнее имя — public_name»
+         * берётся только из своего знания: подтверждённая ECH-привязка этого
+         * имени, HTTPS RR самого имени или известного свидетеля. Каждый
+         * запрос HTTPS RR ограничен (d2k_ech_resolve: ≤1,5 с), запросов не
+         * больше 1 + witnesses (≤4), и отказ DNS не держит поиск: без
+         * доказательства — GREASE и обычный путь по имени. */
+        int real = t->ech_origin[0] != 0; /* своя подтверждённая ECH-привязка имени */
         if (t->ech_origin[0]) {
             d2k_ech_config cfg;
-            if (d2k_ech_resolve(t->ech_origin, s->measure_mark, &cfg) ||
+            if (d2k_sched_ech_resolve_hook(t->ech_origin, s->measure_mark, &cfg) ||
                 strcmp(cfg.public_name, t->name)) t->ech_origin[0] = 0;
         }
+        if (!real && !t->stop) {
+            d2k_ech_config cfg;
+            real = !d2k_sched_ech_resolve_hook(t->name, s->measure_mark, &cfg) &&
+                   !strcmp(cfg.public_name, t->name);
+        }
         if (!t->ech_origin[0]) {
-            for (size_t i = 0; i < t->ech_witness_count; i++) {
+            for (size_t i = 0; i < t->ech_witness_count && !t->stop; i++) {
                 d2k_ech_config cfg;
-                if (!d2k_ech_resolve(t->ech_witnesses[i], s->measure_mark, &cfg) &&
+                if (!d2k_sched_ech_resolve_hook(t->ech_witnesses[i], s->measure_mark, &cfg) &&
                     !strcmp(cfg.public_name, t->name)) {
                     snprintf(t->ech_origin, sizeof t->ech_origin, "%s", t->ech_witnesses[i]);
+                    real = 1;
                     break;
                 }
             }
         }
-        if (!t->ech_origin[0]) {
-            /* An offer may be GREASE. No known matching ECH witness means
-             * no promotion to ECH proof; retain the existing named TLS path. */
+        if (!real) {
+            /* GREASE: обычный путь по имени тем же снимком клиента. Форма
+             * вопроса — форма приветствия, а не ECH: иначе цикл, сравнив её
+             * с ECH-формой того же снимка, выбросил бы готовый полный прогон
+             * и повторил его теми же байтами (поле 02.10, discord.com). */
+            pthread_mutex_lock(&s->mu);
             t->ech_offer = 0;
-            t->asked_shape = SCHED_PROBE_SHAPE;
+            t->ech_grease = 1;
+            t->asked_shape = (uint8_t)d2k_hello_shape(trig.bytes, trig.len);
+            pthread_mutex_unlock(&s->mu);
+            say(s, "по %s ECH offer — GREASE: внешнее имя не является public_name "
+                   "известной ECH-конфигурации; обычный поиск по имени", t->name);
+        } else if (!t->ech_origin[0]) {
+            /* Настоящий ECH, своего свидетеля (origin с этой конфигурацией)
+             * нет: проверить нечем. Обычным приветствием внешнего имени не
+             * меряем — это другой вопрос, и его «чисто» ничего не говорит о
+             * скрытом имени. Честный быстрый итог — «не проверено». */
+            pthread_mutex_lock(&s->mu);
+            memset(&t->res, 0, sizeof t->res);
+            t->res.verdict = D2K_V_INCONCLUSIVE;
+            snprintf(t->res.reason, sizeof t->res.reason,
+                     "настоящий ECH, своего свидетеля нет — не проверено");
+            t->ech_unverified = 1;
+            t->res_ready = 1;
+            pthread_mutex_unlock(&s->mu);
+            ssize_t ign_ech0 = write(s->wake[1], "w", 1); (void)ign_ech0;
+            return NULL;
         }
     }
     if (t->transport == 6 && t->ech_offer) {
@@ -4492,10 +4532,11 @@ static int start_search(d2k_sched *s, task *t) {
         return 0;
     }
     select_resource_path(s, t);
-    t->ech_offer = t->transport == 6 && t->trig_snapped &&
+    t->ech_offer = t->transport == 6 && t->trig_snapped && !t->ech_grease &&
                    d2k_hello_ech_offer(t->trig, t->trig_len, NULL) == 1;
     t->ech_origin[0] = 0;
     t->ech_trial = 0;
+    t->ech_unverified = 0;
     t->ech_witness_count = 0;
     if (t->ech_offer) {
         t->asked_shape = D2K_LINK_SHAPE_ECH_TCP;
@@ -4527,8 +4568,8 @@ static int start_search(d2k_sched *s, task *t) {
                 }
             }
         }
-        say(s, "по %s обнаружен ECH offer; собственный witness: %s; обычный TLS/HTTP внешнего имени не используется",
-            t->name, t->ech_origin[0] ? t->ech_origin : "пока неизвестен");
+        say(s, "по %s обнаружен ECH offer; по HTTPS RR отличаю настоящий ECH от GREASE; "
+               "собственный witness: %s", t->name, t->ech_origin[0] ? t->ech_origin : "пока неизвестен");
         /* Seed from OWN confirmed knowledge after restart, not an imported
          * list. Four most recent distinct named TCP origins bound DNS cost. */
         int64_t times[4] = {0};
@@ -7014,6 +7055,20 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 task_done(t); moved++; continue;
             }
             remember_resources(s, t->vol.resources, t->vol.n_resources);
+            if (t->ech_unverified) {
+                /* Настоящий ECH без своего свидетеля (задача 41): опыта не
+                   было, вердикта нет. Повтор — не раньше общего срока
+                   неубедительного замера: новое ECH-приветствие того же
+                   имени этот срок не снимает (cooldown ech_input). */
+                say(s, "по %s настоящий ECH (внешнее имя — public_name конфигурации), "
+                       "своего ECH-свидетеля нет — не проверено; обычным приветствием "
+                       "внешнего имени не меряю, повтор не раньше чем через %lld мин",
+                    t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
+                cooldown_record(s, t, 2);
+                task_fail(s, t, now_ms);
+                moved++;
+                continue;
+            }
             /* ПРОГОН, ОСТАНОВЛЕННЫЙ РАДИ СНИМКА, — НЕ ВЕРДИКТ (задача 31).
                Поле 02.10.2026, i.ytimg.com: брошенный на первом зонде
                классификатор («о цели не сказано ничего») ушёл в разбор
@@ -7080,7 +7135,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 strcmp(s->tcp_shape_name[t->family == 6], t->name) == 0 &&
                 s->tcp_shape_len[t->family == 6] <= sizeof t->trig &&
                 (!t->trig_snapped ||
-                 (d2k_hello_ech_offer(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6], NULL) == 1
+                 (!t->ech_grease &&
+                  d2k_hello_ech_offer(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6], NULL) == 1
                     ? D2K_LINK_SHAPE_ECH_TCP :
                     (uint8_t)d2k_hello_shape(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]))
                      != t->asked_shape))) {
