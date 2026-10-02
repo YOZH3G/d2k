@@ -537,6 +537,11 @@ typedef struct {
     int        snap_stop;
     uint8_t    snap[2048];
     size_t     snap_len;
+    /* То же для QUIC: целый Initial клиента ЭТОЙ цели, пойманный во время
+       поиска, хранится у задачи — общую ячейку quic_shape к перемеру может
+       занять соседнее имя. snap_seq — номер снимка в quic_shape_seq, по нему
+       видно, пришёл ли он после установки испытуемого плана. */
+    uint64_t   snap_seq;
 
     /* Кандидаты, собранные d2k_compose по вердикту. */
     char       plans[SCHED_MAX_PLANS][4096];
@@ -5132,9 +5137,33 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
  * поиска сбрасывается ПЕРЕД новым, иначе кандидаты прошлого вердикта доживают
  * до установки. Повтор один: после него trig_snapped взведён, и сюда задача
  * больше не попадает. */
+/* ЦЕЛЫЙ INITIAL КЛИЕНТА ЭТОЙ ЦЕЛИ ДЛЯ ПЕРЕМЕРА (задача 31).
+ * Сначала копия задачи (on_shape кладёт её, пока поиск идёт), затем общая
+ * ячейка, если она всё ещё этого имени. Обрывки сюда не попадают: on_shape
+ * отбрасывает их до сохранения (задача 12). */
+static int quic_own_initial(const d2k_sched *s, const task *t,
+                            const uint8_t **bytes, size_t *len, uint64_t *seq) {
+    if (t->transport != 17) { return 0; }
+    if (t->snap_len > 0 && t->snap_len <= sizeof t->trig) {
+        *bytes = t->snap; *len = t->snap_len; *seq = t->snap_seq;
+        return 1;
+    }
+    int f = t->family == 6;
+    if (s->quic_shape_len[f] > 0 && s->quic_shape_len[f] <= sizeof t->trig &&
+        strcmp(s->quic_shape_name[f], t->name) == 0) {
+        *bytes = s->quic_shape[f]; *len = s->quic_shape_len[f]; *seq = s->quic_shape_seq[f];
+        return 1;
+    }
+    return 0;
+}
+
 static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_t len) {
     if (len == 0 || len > sizeof t->trig) { return; }
-    memcpy(t->trig, bytes, len);
+    /* Байты могут лежать в самой задаче (t->snap): memmove, и копия
+       гасится — перемер у задачи один. */
+    memmove(t->trig, bytes, len);
+    t->snap_len = 0;
+    t->snap_stop = 0;
     t->trig_len = len;
     t->trig_snapped = 1;
     t->reasked = 1;
@@ -5250,6 +5279,16 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
         if (t->family != (ev->family ? ev->family : 4)) { continue; }
+        if (ev->transport == 17 && t->transport == 17 && t->state != T_FREE &&
+            t->state != T_WATCHING && t->state != T_SHAPE_WAIT &&
+            !t->trig_snapped && !t->reasked && ev->shape_len <= sizeof t->snap &&
+            strcmp(t->name, name) == 0) {
+            /* Поиск идёт на собственном Initial; вход опыта неизменен, а
+               Initial клиента ждёт у задачи её перемера. */
+            memcpy(t->snap, ev->shape, ev->shape_len);
+            t->snap_len = ev->shape_len;
+            t->snap_seq = s->quic_shape_seq[ev->family == 6];
+        }
         if ((t->state == T_QUEUED || t->state == T_ASKING) && t->transport == 6 && ev->transport == 6 &&
             ev_matches_flow(ev,&t->trigger_flow) && !t->trigger_shape) {
             t->trigger_shape=d2k_hello_ech_offer(ev->shape,ev->shape_len,NULL)==1 ?
@@ -6480,11 +6519,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             /* QUIC snapshots can arrive while the original Run is in flight.
                Keep that Run's copied input immutable, then discard its result
                and repeat once with the exact target-owned client Initial. */
-            if (t->transport == 17 && !t->reasked && !t->trig_snapped &&
-                s->quic_shape_len[t->family == 6] > 0 &&
-                strcmp(s->quic_shape_name[t->family == 6], t->name) == 0 &&
-                s->quic_shape_len[t->family == 6] <= sizeof t->trig) {
-                remeasure_snapped(s, t, s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6]);
+            const uint8_t *qb; size_t ql; uint64_t qseq;
+            if (!t->reasked && !t->trig_snapped && quic_own_initial(s, t, &qb, &ql, &qseq)) {
+                remeasure_snapped(s, t, qb, ql);
                 moved++;
                 continue;
             }
@@ -6832,14 +6869,12 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                trial, его результат относится к профилю, а не к байтам клиента.
                Кандидат обязан быть снят exact-командой ДО повторного поиска;
                иначе успешный VERIFY запишет ложное знание под чужой формой. */
-            if (t->transport == 17 && !t->reasked && !t->trig_snapped &&
-                t->trial_installed && s->quic_shape_seq[t->family == 6] > t->trial_shape_seq &&
-                s->quic_shape_len[t->family == 6] > 0 &&
-                strcmp(s->quic_shape_name[t->family == 6], t->name) == 0 &&
-                s->quic_shape_len[t->family == 6] <= sizeof t->trig) {
+            const uint8_t *qb; size_t ql; uint64_t qseq;
+            if (!t->reasked && !t->trig_snapped && t->trial_installed &&
+                quic_own_initial(s, t, &qb, &ql, &qseq) && qseq > t->trial_shape_seq) {
                 ver_close(t);
                 trial_retire(s, t);
-                remeasure_snapped(s, t, s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6]);
+                remeasure_snapped(s, t, qb, ql);
                 moved++;
                 continue;
             }
@@ -7182,11 +7217,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     t->researched = 1;
                     t->box_id[0] = '\0';
                     t->state = T_ASKING;
-                    if (t->transport == 17 && !t->reasked && !t->trig_snapped &&
-                        s->quic_shape_len[t->family == 6] > 0 &&
-                        strcmp(s->quic_shape_name[t->family == 6], t->name) == 0 &&
-                        s->quic_shape_len[t->family == 6] <= sizeof t->trig) {
-                        remeasure_snapped(s, t, s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6]);
+                    const uint8_t *qb; size_t ql; uint64_t qseq;
+                    if (!t->reasked && !t->trig_snapped &&
+                        quic_own_initial(s, t, &qb, &ql, &qseq)) {
+                        remeasure_snapped(s, t, qb, ql);
                         moved++;
                         continue;
                     }

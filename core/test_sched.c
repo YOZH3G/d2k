@@ -119,6 +119,7 @@ static int tcp_wait_until_stop;
 static int tcp_release_waiters;
 static int tcp_saw_stop;
 static int tcp_stop_count;
+static uint8_t tcp_last_trig[2048];
 
 static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
                          d2k_hello control, uint32_t mark, int repeats,
@@ -128,6 +129,8 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
     (void)repeats; (void)gap_us; (void)wait_ms;
     tcp_calls++;
     tcp_last_wire = trigger.len;
+    if (trigger.bytes && trigger.len <= sizeof tcp_last_trig)
+        memcpy(tcp_last_trig, trigger.bytes, trigger.len);
     if (tcp_wait_until_stop) {
         while (!(stop && *stop) && !tcp_release_waiters) { usleep(1000); }
         if (stop && *stop) {
@@ -173,6 +176,7 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
    HTTP-запросов к стенду, который TLS не умеет, и тест мерил бы это. */
 static int vol_calls;
 static volatile int vol_hold, vol_entered;
+static size_t vol_last_wire;
 static d2k_vol_verdict vol_answer = D2K_VOL_PASSED;
 static int vol_rx_cut;
 static int vol_at_kb = 20;
@@ -186,8 +190,9 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
                                int plain, int tls12, size_t hello_wire,
                                uint32_t mark) {
     (void)ip; (void)port; (void)sni; (void)plain; (void)tls12;
-    (void)hello_wire; (void)mark;
+    (void)mark;
     vol_calls++;
+    vol_last_wire = hello_wire;
     /* Задача 31: проба объёма «в сети», пока тест не отпустит, — чтобы
        снимок клиента пришёл именно во время объёмного шага. */
     vol_entered = 1;
@@ -4434,7 +4439,8 @@ shape_test:
         for (const char *p = saidbuf; (p = strstr(p, msg)) != NULL; p += strlen(msg)) stops++;
         CHECK(stops == 1, "task31: просьба остановки объявлена не один раз за прогон");
         CHECK(tcp_calls == 2, "task31: брошенный ради снимка прогон не перезапущен");
-        CHECK(tcp_last_wire == sh.shape_len,
+        CHECK(tcp_last_wire == sh.shape_len &&
+              memcmp(tcp_last_trig, sh.shape, sh.shape_len) == 0,
               "task31: перезапуск шёл не снятыми байтами клиента");
         /* Вердикт и покой допустимы только у ПЕРЕЗАПУЩЕННОГО прогона —
            его неубедительность честна; до перезапуска их быть не должно. */
@@ -4451,6 +4457,110 @@ shape_test:
         d2k_sched_free(s); d2k_catalog_free(&empty);
         tcp_wait_until_stop = 0; tcp_release_waiters = 0; vol_hold = 0;
         tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* ЗАДАЧА 31, поздний обрыв: снимок клиента пришёл во время RX-пары
+       позднего закрытия. Брошенная пара — не «позднее закрытие не
+       подтвердилось» и не покой: повтор снятыми байтами, и это снова
+       RX-пара (rx_volume_only сохраняется). */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = 0; vol_entered = 0; vol_last_wire = 0;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0;
+        vol_hold = 1;
+        const char *name = "late.rst.snap.example";
+        d2k_ev h1 = ev_hello(6, 41150, name);
+        d2k_sched_event(s, &h1);
+        d2k_ev r1 = ev_suspect(6, 41150); r1.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &r1);
+        d2k_ev h2 = ev_hello(6, 41151, name);
+        d2k_sched_event(s, &h2);
+        d2k_ev r2 = ev_suspect(6, 41151); r2.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &r2);
+        spin(s, 30);
+        for (int i = 0; i < 2000 && !vol_entered; i++) usleep(1000);
+        CHECK(vol_entered && tcp_calls == 0, "task31/rx: RX-пара позднего закрытия не началась");
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, name,
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31/rx: снимок");
+        d2k_sched_event(s, &sh);
+        d2k_ev other = {0}; other.kind = D2K_EV_SHAPE; other.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "neighbour.rx.example",
+              other.shape, sizeof other.shape, &other.shape_len) == 0, "task31/rx: соседний снимок");
+        d2k_sched_event(s, &other);
+        vol_hold = 0;
+        spin(s, 120);
+        const char *restart = strstr(saidbuf, "повторяю поиск его байтами");
+        CHECK(restart != NULL, "task31/rx: брошенная RX-пара не перезапущена снимком");
+        CHECK(vol_calls == 2 && tcp_calls == 0,
+              "task31/rx: перезапуск не остался RX-парой позднего закрытия");
+        CHECK(vol_last_wire == sh.shape_len, "task31/rx: перезапуск шёл не байтами клиента");
+        const char *rest = strstr(saidbuf, "позднее закрытие не подтвердилось");
+        CHECK(!rest || (restart && rest > restart),
+              "task31/rx: брошенная RX-пара разобрана как неподтверждённое позднее закрытие");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        vol_hold = 0;
+    }
+
+    /* ЗАДАЧА 31, QUIC: Initial клиента этой цели пришёл во время прогона,
+       затем общую ячейку quic_shape заняло соседнее имя. Перемер обязан
+       идти Initial клиента цели (он хранится у задачи), без покоя до
+       перемера. Обрывок приветствия (задача 12) копией не становится. */
+    for (int fragment = 0; fragment <= 1; fragment++) {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_calls = quic_calls = 0;
+        memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
+        snapshot_enabled = 1;
+        snapshot_entered = snapshot_release = snapshot_ok = 0;
+        quic_answer = D2K_V_INCONCLUSIVE;
+        const char *name = "quic.own.initial.example";
+        d2k_ev h = ev_hello(17, 40115, name);
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40115);
+        d2k_sched_event(s, &su);
+        pthread_mutex_lock(&snapshot_mu);
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += 2;
+        int rc = 0;
+        while (!snapshot_entered && rc == 0)
+            rc = pthread_cond_timedwait(&snapshot_cv, &snapshot_mu, &dl);
+        int entered = snapshot_entered;
+        pthread_mutex_unlock(&snapshot_mu);
+        CHECK(entered, "task31/quic: QUIC-прогон не начался");
+        d2k_ev sh;
+        CHECK((fragment ? quic_shape_first_of_two(&sh, name) : quic_shape(&sh, name)) == 0,
+              "task31/quic: снимок цели");
+        d2k_sched_event(s, &sh);
+        d2k_ev other;
+        CHECK(quic_shape(&other, "neighbour.quic.example") == 0, "task31/quic: соседний снимок");
+        d2k_sched_event(s, &other);
+        pthread_mutex_lock(&snapshot_mu);
+        snapshot_release = 1;
+        pthread_cond_broadcast(&snapshot_cv);
+        pthread_mutex_unlock(&snapshot_mu);
+        snapshot_enabled = 0;
+        settle(s);
+        if (fragment) {
+            CHECK(quic_calls == 1, "task31/quic: обрывок приветствия запустил перемер");
+        } else {
+            CHECK(quic_calls == 2, "task31/quic: перемер Initial клиента потерян");
+            CHECK(quic_seen_trigger_lens[1] == sh.shape_len &&
+                  memcmp(quic_seen_triggers[1], sh.shape, sh.shape_len) == 0,
+                  "task31/quic: перемер шёл не Initial клиента цели");
+            const char *remeasure = strstr(saidbuf, "перемеряю снимком");
+            const char *rest = strstr(saidbuf, "результат неубедителен");
+            CHECK(remeasure && (!rest || rest > remeasure),
+                  "task31/quic: цель ушла на покой до перемера Initial клиента");
+        }
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        quic_answer = D2K_V_OPAQUE;
     }
 
     /* A confirmed TLS1.3 task must not hide blocked TLS1.2 of the same name. */
