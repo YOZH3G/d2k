@@ -3441,7 +3441,10 @@ static int desired_area(const d2k_sched *s, size_t index, installed_area *a) {
             for(size_t bi=0;bi<s->cat->n_boxes;bi++)
                 for(size_t j=0;j<s->cat->boxes[bi].n_binds;j++) {
                     const d2k_cat_binding *bd=&s->cat->boxes[bi].binds[j];
-                    if(bd->enabled && bd->level>=3 && !strcmp(bd->kind,"name") &&
+                    /* Помеченная к перепроверке (снята с провода) не
+                       отменяет исключение по провалу плана (задача 21). */
+                    if(bd->enabled && bd->level>=3 && !bd->recheck_since &&
+                       !strcmp(bd->kind,"name") &&
                        !strcmp(bd->target,v->name) && bd->transport==v->key.transport &&
                        bd->family==v->key.family && bd->shape==v->key.shape &&
                        strcmp(bd->plan_id,v->plan_id)) return 0;
@@ -4828,7 +4831,10 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
                     const d2k_cat_box *b = &s->cat->boxes[bi];
                     for (size_t j = 0; j < b->n_binds; j++) {
                         const d2k_cat_binding *bd = &b->binds[j];
-                        if (bd->enabled && bd->level >= 3 &&
+                        /* Помеченная «требует повторной проверки» снята с
+                           провода (задача 21): клиентам этой формы плана нет,
+                           и покрытием она не считается. */
+                        if (bd->enabled && bd->level >= 3 && !bd->recheck_since &&
                             (bd->transport ? bd->transport : 6) == 6 &&
                             (bd->family ? bd->family : 4) == t->family &&
                             strcmp(bd->kind, "name") == 0 &&

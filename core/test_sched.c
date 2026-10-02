@@ -4687,6 +4687,57 @@ recheck_test:
         d2k_catalog_free(&c);
         ver_answer = D2K_VER_APPLICATION;
     }
+    {
+        /* 7. Ревью задачи 21: помеченная к перепроверке привязка TLS 1.3
+           снята с провода и «покрытием» формы не считается. Блок вернулся,
+           TLS 1.2 подтверждён, задача наблюдает; клиент TLS 1.3 без плана
+           приходит неприменённым — его снимок обязан завести перемер. */
+        const char *nm = "recheck-watch.example";
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        confirm_once(&c, sv[0], nm, 40641);
+        d2k_cat_binding *m = binding_shape(&c, nm, 6, D2K_SHAPE_MODERN);
+        CHECK(m != NULL, "recheck/watch: TLS1.3 fixture not confirmed");
+        /* Вход «байты клиента»: иначе перемер заводит другая ветка (привязка
+           добыта заготовкой), и проверка покрытия не различалась бы. */
+        if (m) { m->recheck_since = 1790000000; m->recheck_mono_ms = 0;
+                 m->input = D2K_INPUT_CLIENT; }
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6; sh.family = 4;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, nm, sh.shape, sizeof sh.shape,
+                                     &sh.shape_len) == 0, "recheck/watch: legacy snapshot");
+        d2k_sched_event(s, &sh);
+        ver_answer_port = 40642;
+        d2k_ev h = ev_hello(6, 40642, nm);
+        d2k_sched_event(s, &h);
+        d2k_ev su = h; su.kind = D2K_EV_SUSPECT; su.code = D2K_SUSPECT_RST_CUT;
+        d2k_sched_event(s, &su); settle(s);
+        d2k_ev ap = ev_applied(6, 40642);
+        d2k_sched_event(s, &ap); spin(s, 40);
+        CHECK(binding_shape(&c, nm, 6, D2K_SHAPE_LEGACY) != NULL,
+              "recheck/watch: TLS1.2 not confirmed — nothing to watch");
+        d2k_cat_binding *lg = binding_shape(&c, nm, 6, D2K_SHAPE_LEGACY);
+        if (lg) lg->input = D2K_INPUT_CLIENT;
+        int before = tcp_calls;
+        saidbuf[0] = '\0';
+        forget_sent();
+        h.high_port++; su.high_port++;
+        d2k_sched_event(s, &h);
+        su.planned = D2K_LINK_PLANNED_NO;
+        d2k_sched_event(s, &su); drain();
+        CHECK(sent_command_count(D2K_CMD_ARM_SHAPE, NULL, 0) == 1,
+              "recheck/watch: unplanned flow did not request a snapshot");
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, nm, sh.shape, sizeof sh.shape,
+                                     &sh.shape_len) == 0, "recheck/watch: modern snapshot");
+        d2k_sched_event(s, &sh); settle(s);
+        CHECK(tcp_calls > before,
+              "recheck/watch: off-wire recheck binding counted as covering TLS1.3 — no remeasure");
+        d2k_sched_free(s);
+        d2k_catalog_free(&c);
+    }
     if (recheck_only) { goto voice_only_done; }
     /* --- узнанная коробка отдаёт свои планы, и успех идёт ЕЙ ----------- */
     {
