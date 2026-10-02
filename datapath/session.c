@@ -1249,7 +1249,9 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
    учесть поток в знаменателе d2k_session_reply_hidden. */
 static void note_tcp_hello(d2k_session *s, d2k_flow *fl, int ack,
                            const uint8_t *tcp) {
-    s->tcp_hello_flows++;
+    /* Зонд контроллера — не пользовательский поток: исключён и здесь, и в
+       числителе, иначе доля «невидимых» ответов занижалась бы. */
+    if (!fl->controller_probe) { s->tcp_hello_flows++; }
     fl->hello_ack = rd32(tcp + 8);
     fl->hello_ack_valid = ack ? 1 : 0;
 }

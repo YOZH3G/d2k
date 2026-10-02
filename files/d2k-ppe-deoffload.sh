@@ -170,7 +170,15 @@ d2k_ppe_status() {
         if d2k_ppe_available ip6tables; then
             _d2k_ppe_line="$_d2k_ppe_line, v6: $(_d2k_ppe_count ip6tables) из $_d2k_ppe_want"
         fi
-        if [ "$_d2k_ppe_n4" -ge "$_d2k_ppe_want" ]; then
+        # «Включена» — только если стоит целиком в каждом доступном семействе:
+        # IPv6-поток без разгрузки так же слеп, как IPv4.
+        _d2k_ppe_full=1
+        [ "$_d2k_ppe_n4" -ge "$_d2k_ppe_want" ] || _d2k_ppe_full=0
+        if d2k_ppe_available ip6tables &&
+            [ "$(_d2k_ppe_count ip6tables)" -lt "$_d2k_ppe_want" ]; then
+            _d2k_ppe_full=0
+        fi
+        if [ "$_d2k_ppe_full" = 1 ]; then
             echo "  разгрузка PPE: включена ($_d2k_ppe_line, первые $D2K_PPE_CONNSKIP пакетов)"
         else
             echo "  разгрузка PPE: не стоит ($_d2k_ppe_line)"
@@ -180,10 +188,16 @@ d2k_ppe_status() {
 
     # Основной оракул на MediaTek: поток в binds ушёл мимо netfilter.
     if [ -r "$D2K_PPE_BINDS" ]; then
-        echo "  ускоритель binds: $(grep -c . "$D2K_PPE_BINDS" 2>/dev/null) строк в $D2K_PPE_BINDS"
+        # Заголовок вида «PPE0:» записью не является.
+        _d2k_ppe_nb=$(grep -cv '^[[:space:]]*PPE[0-9]*:[[:space:]]*$' "$D2K_PPE_BINDS" 2>/dev/null)
+        echo "  ускоритель binds: ${_d2k_ppe_nb:-0} записей в $D2K_PPE_BINDS"
         if [ -n "${1:-}" ]; then
-            if grep -F -- "$1" "$D2K_PPE_BINDS" 2>/dev/null |
-                grep -q -- "$1[^0-9]\|$1\$"; then
+            # Адрес — точно и с границами: 1.2.3.4 не находится в 11.2.3.4
+            # и 1.2.3.45, точка — буквальная. Формат записи (KN-1811,
+            # 02.10.2026): «IPv4_NAPT=802: 87.228.47.201:443 -> …».
+            # shellcheck disable=SC2016  # $ здесь — буквальный символ класса
+            _d2k_ppe_re=$(printf '%s' "$1" | sed 's/[].[\*^$()+?{}|]/\\&/g')
+            if grep -Eq -- "(^|[^0-9.])$_d2k_ppe_re(:|[^0-9]|\$)" "$D2K_PPE_BINDS" 2>/dev/null; then
                 echo "  $1: в ускорителе (поток привязан, мимо netfilter)"
             else
                 echo "  $1: в binds нет"
@@ -204,10 +218,11 @@ d2k_ppe_status() {
         _d2k_ppe_pct=0
         [ "$_d2k_ppe_m" -gt 0 ] && _d2k_ppe_pct=$((_d2k_ppe_h * 100 / _d2k_ppe_m))
         echo "  ответ невидим очереди: $_d2k_ppe_h из $_d2k_ppe_m ($_d2k_ppe_pct%) TCP-потоков с приветствием"
-        # Порог: не меньше 5 потоков и не меньше пятой части — единичный
-        # случай бывает и без ускорителя (обрыв очереди, перезапуск).
+        # Порог: не меньше 5 потоков и не меньше пятой части. Причина —
+        # вероятная, не доказанная: ответы теряются и при переполнении очереди
+        # или перезапуске датапата.
         if [ "$_d2k_ppe_h" -ge 5 ] && [ "$_d2k_ppe_pct" -ge 20 ]; then
-            echo "  ускоритель скрывает ответы: выключите аппаратное ускорение в CLI Keenetic (no ppe hardware) — d2k этого сам не делает"
+            echo "  вероятно, ускоритель скрывает ответы (другие причины: переполнение очереди, перезапуск датапата); если подтвердится по binds — выключите аппаратное ускорение в CLI Keenetic (no ppe hardware), d2k этого сам не делает"
         fi
     fi
     return 0

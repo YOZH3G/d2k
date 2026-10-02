@@ -624,6 +624,20 @@ static void test_reply_hidden_by_accelerator(void) {
           "поток с увиденным ответом посчитан скрытым");
     d2k_session_free(s);
 
+    /* Зонд контроллера — не пользовательский поток: ни в числителе, ни в
+       знаменателе. */
+    s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "сессия зонда не создалась");
+    if (!s) { return; }
+    n = build_pkt(pkt, 47904, 0x18, hello, hlen);
+    d2k_session_packet_probe(s, pkt, n, 1000, buf, sizeof buf, &r);
+    n = build_pkt(pkt, 47904, 0x10, NULL, 0);
+    wr32(pkt + 28, 0x11223344u + 1400u);
+    d2k_session_packet_probe(s, pkt, n, 2000, buf, sizeof buf, &r);
+    CHECK(d2k_session_reply_hidden(s) == 0 && d2k_session_tcp_hello_flows(s) == 0,
+          "зонд контроллера попал в счёт скрытых ответов");
+    d2k_session_free(s);
+
     /* Молчание: повторы приветствия с прежним подтверждением. Это не
        невидимый ответ, а отсутствие ответа. */
     s = d2k_session_new(64, 64);

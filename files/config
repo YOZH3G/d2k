@@ -10,6 +10,10 @@ DECOY_SNI=disk.rzd.ru
 # Keenetic: первые 30 пакетов каждого потока идут мимо аппаратного ускорителя
 # (-j PPE с connskip), иначе d2k не видит ответов. 0 — не ставить.
 D2K_PPE_DEOFFLOAD=1
+# TCP-порты разгрузки; по умолчанию — PORTS очереди (0:65535). UDP — 443 и
+# голосовые VOICE_PORTS (D2K_PPE_UDP_PORTS). Сузить, если окно в 30 пакетов
+# на каждый поток слишком дорого процессору:
+# D2K_PPE_TCP_PORTS=80,443
 MARK=0x2d
 # Each router creates its own private identity and registers its public key.
 TG_ENABLED=1

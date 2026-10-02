@@ -242,6 +242,44 @@ rm -f "$TMP/binds"
 d2k_ppe_status > "$TMP/status"
 check "статус: нет binds — так и сказано" grep -q 'binds: нет' "$TMP/status"
 
+# Настоящий формат binds (KN-1811, 02.10.2026): строка-заголовок PPE0: и
+# записи вида «адрес:порт -> адрес:порт ===>>> …». Поиск адреса — точный:
+# 1.2.3.4 не должен находиться в 11.2.3.4, точка — не подстановочный знак.
+cat > "$TMP/binds" <<'EOF'
+PPE0:
+IPv4_NAPT=802: 87.228.47.201:443 -> 88.87.93.11:50016 ===>>> 87.228.47.201:443 -> 192.168.1.67:50016 (DSCP 28/VLAN.PCP (0.0),(4032.1)/QID 1) [50:ff:20:b9:fa:91 ==>> 68:5e:dd:83:16:1a] {0}
+IPv4_NAPT=803: 11.2.3.4:443 -> 88.87.93.11:50017 ===>>> 11.2.3.4:443 -> 192.168.1.68:50017 (DSCP 0/VLAN.PCP (0.0),(4032.1)/QID 1) [50:ff:20:b9:fa:91 ==>> 68:5e:dd:83:16:1a] {0}
+EOF
+binds_has() { d2k_ppe_status "$1" > "$TMP/st.b"; grep -qF -- "$1: в ускорителе" "$TMP/st.b"; }
+binds_hasnt() { d2k_ppe_status "$1" > "$TMP/st.b"; grep -qF -- "$1: в binds нет" "$TMP/st.b"; }
+d2k_ppe_status > "$TMP/status"
+check "binds: заголовок PPE0: не считается записью" grep -q 'binds: 2 ' "$TMP/status"
+check "binds: 87.228.47.201 найден" binds_has 87.228.47.201
+check "binds: 192.168.1.67 найден" binds_has 192.168.1.67
+check "binds: 7.228.47.201 (хвост чужого адреса) не найден" binds_hasnt 7.228.47.201
+check "binds: 87.228.47.20 (начало чужого адреса) не найден" binds_hasnt 87.228.47.20
+check "binds: 1.2.3.4 не найден в 11.2.3.4" binds_hasnt 1.2.3.4
+check "binds: 87x228x47x201 — точка не подстановка" binds_hasnt 87x228x47x201
+check "binds: 11.2.3.4 найден" binds_has 11.2.3.4
+rm -f "$TMP/binds"
+
+# «включена» учитывает v6, если v6 доступен: неполный v6 — «не стоит».
+reset_rules
+targets 1 1
+d2k_ppe_ensure
+: > "$RULES/v6.mangle.FORWARD"
+d2k_ppe_status > "$TMP/status"
+check "статус: v6 неполон — не «включена»" sh -c "! grep -q 'разгрузка PPE: включена' '$TMP/status'"
+check "статус: v6 неполон — «не стоит»" grep -q 'разгрузка PPE: не стоит' "$TMP/status"
+
+# Совет честный: причина вероятная, и названы другие.
+printf 'ответ невидим очереди: 12 из 40 TCP-потоков с приветствием\n' > "$TMP/d2kd.log"
+d2k_ppe_status > "$TMP/status"
+check "совет: «вероятно»" grep -q 'вероятно' "$TMP/status"
+check "совет: названы переполнение очереди и перезапуск" \
+    sh -c "grep -q 'переполн' '$TMP/status' && grep -q 'перезапуск' '$TMP/status'"
+check "конфигурация: D2K_PPE_TCP_PORTS описан в files/config" grep -q 'D2K_PPE_TCP_PORTS' "$ROOT/files/config"
+
 # --- встраивание в S99d2k: порядок в FORWARD, снятие при остановке ---------
 # Функции службы без диспетчера команд — как в scripts/test-runtime-files.cjs.
 sed '/^case "\$1" in/,$d' "$ROOT/files/S99d2k" > "$TMP/init"
