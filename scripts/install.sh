@@ -91,6 +91,7 @@ fetch "builds/d2ktg-linux-$ARCH" "$TMP/d2ktg"
 fetch "files/S99d2k"            "$TMP/S99d2k"
 fetch "files/config"            "$TMP/config"
 fetch "files/d2k-fw-heal.sh"    "$TMP/d2k-fw-heal.sh"
+fetch "files/d2k-ppe-deoffload.sh" "$TMP/d2k-ppe-deoffload.sh"
 fetch "files/d2k-log-maintenance.sh" "$TMP/d2k-log-maintenance.sh"
 fetch "files/001-d2k.sh"        "$TMP/001-d2k.sh"
 fetch "files/d2k-tg-firewall.sh" "$TMP/d2k-tg-firewall.sh"
@@ -118,7 +119,7 @@ fetch "internal/web/assets/logo-d2k.png" "$TMP/panel/logo-d2k.png"
 fetch "internal/web/assets/mascot-d2k.png" "$TMP/panel/mascot-d2k.png"
 
 chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kd" "$TMP/d2ktg" "$TMP/d2khttp" \
-         "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/d2k-log-maintenance.sh" "$TMP/001-d2k.sh" \
+         "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/d2k-ppe-deoffload.sh" "$TMP/d2k-log-maintenance.sh" "$TMP/001-d2k.sh" \
          "$TMP/d2k-tg-firewall.sh" "$TMP/d2k-tg-watchdog.sh" \
          "$TMP/d2k-instagram-dns.sh" "$TMP/d2k-instagram-dns-scheduler.sh"
 
@@ -198,6 +199,7 @@ install_data_atomic "$TMP/panel/family-rack.webp" "$DIR/panel/family-rack.webp"
 install_data_atomic "$TMP/panel/logo-d2k.png" "$DIR/panel/logo-d2k.png"
 install_data_atomic "$TMP/panel/mascot-d2k.png" "$DIR/panel/mascot-d2k.png"
 install_atomic "$TMP/d2k-fw-heal.sh" "$DIR/d2k-fw-heal.sh"
+install_atomic "$TMP/d2k-ppe-deoffload.sh" "$DIR/d2k-ppe-deoffload.sh"
 install_atomic "$TMP/d2k-log-maintenance.sh" "$DIR/d2k-log-maintenance.sh"
 install_atomic "$TMP/d2k-tg-firewall.sh" "$DIR/d2k-tg-firewall.sh"
 install_atomic "$TMP/d2k-tg-watchdog.sh" "$DIR/d2k-tg-watchdog.sh"

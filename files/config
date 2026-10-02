@@ -7,6 +7,9 @@ STATE_DIR=/opt/d2k/state
 QUEUE_NUM=2000
 CONTROL_SOCKET=/opt/d2k/run/d2kd.sock
 DECOY_SNI=disk.rzd.ru
+# Keenetic: первые 30 пакетов каждого потока идут мимо аппаратного ускорителя
+# (-j PPE с connskip), иначе d2k не видит ответов. 0 — не ставить.
+D2K_PPE_DEOFFLOAD=1
 MARK=0x2d
 # Each router creates its own private identity and registers its public key.
 TG_ENABLED=1

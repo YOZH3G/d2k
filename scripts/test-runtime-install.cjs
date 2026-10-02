@@ -29,10 +29,10 @@ try {
   for (const name of ['d2kc', 'd2khttp']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
   fixture('files/S99d2k', '#!/bin/sh\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
-  for (const name of ['d2k-fw-heal.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
+  for (const name of ['d2k-fw-heal.sh', 'd2k-ppe-deoffload.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
   fixture('files/d2k-log-maintenance.sh', fs.readFileSync(path.join(root, 'files/d2k-log-maintenance.sh')));
   for (const name of ['meta-ranges.txt', 'tg-roots.pem', 'fake/stun.bin', 'fake/quic_initial_dbankcloud_ru.bin']) fixture(`files/${name}`, 'fixture\n');
-  for (const name of ['index.html', 'panel.css', 'panel.js', 'logo-d2k.png', 'mascot-d2k.png']) fixture(`internal/web/assets/${name}`, 'fixture\n');
+  for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'fonts/oswald.ttf', 'fonts/OFL-oswald.txt', 'slide-left.webp', 'slide-center.webp', 'slide-right.webp', 'slide-holder.webp', 'ground.webp', 'rack.webp', 'family-rack.webp', 'logo-d2k.png', 'mascot-d2k.png']) fixture(`internal/web/assets/${name}`, 'fixture\n');
   fs.mkdirSync(path.join(tmp, 'proc/net/netfilter'), { recursive: true });
   fs.writeFileSync(path.join(tmp, 'proc/net/netfilter/nfnetlink_queue'), '');
   fs.writeFileSync(path.join(tmp, 'proc/net/ip_tables_targets'), 'NFQUEUE\n');
@@ -55,6 +55,10 @@ try {
   const installed = path.join(tmp, 'opt/d2k/d2k-log-maintenance.sh');
   assert.deepEqual(fs.readFileSync(installed), fs.readFileSync(path.join(root, 'files/d2k-log-maintenance.sh')), 'installer must fetch and install helper');
   assert(fs.statSync(installed).mode & 0o111, 'installed helper must be executable');
+  const ppe = path.join(tmp, 'opt/d2k/d2k-ppe-deoffload.sh');
+  assert(fs.existsSync(ppe) && (fs.statSync(ppe).mode & 0o111), 'installer must install the PPE de-offload helper executable');
+  // Uninstall without init must still remove its own tagged -j PPE rules.
+  fs.writeFileSync(ppe, '#!/bin/sh\nd2k_ppe_remove() { printf "ppe-remove\\n" >> "$CALLS"; }\n');
   const state = path.join(tmp, 'opt/d2k/state/catalog.json'); fs.writeFileSync(state, '{"learned":true}');
   fs.writeFileSync(path.join(tmp, 'opt/d2k/run/d2k-log-maintenance.pid'), '123');
   // Init may already be missing: uninstall still stops its owned helper.
@@ -70,6 +74,8 @@ try {
   fs.appendFileSync(path.join(tmp, 'opt/d2k/config'), `D2K_RUNTIME_DIR='${customRuntime}'\n`);
   run('uninstall');
   assert(!fs.existsSync(installed), 'uninstall must remove helper even when persistent state is kept');
+  assert(!fs.existsSync(ppe), 'uninstall must remove the PPE de-offload helper');
+  assert(fs.readFileSync(path.join(tmp, 'calls'), 'utf8').includes('ppe-remove'), 'uninstall must remove own PPE rules even without init');
   assert(!fs.existsSync(path.join(runtime, 'live.json')), 'uninstall must remove volatile live snapshot');
   assert(!fs.existsSync(path.join(runtime, 'log-tail.ABCDEF')), 'uninstall must remove owned abandoned stage');
   assert.equal(fs.readFileSync(path.join(runtime, 'unrelated'), 'utf8'), 'keep');

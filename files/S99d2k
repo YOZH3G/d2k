@@ -133,6 +133,19 @@ TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
 unset TG_RELAY_SECRET TG_RELAY_URL TG_IDENTITY TG_CA_BUNDLE
 FW_LOCK=${FW_LOCK:-/tmp/d2k-fw-operation.lock}
 
+# Разгрузка окна рукопожатия от аппаратного ускорителя Keenetic (-j PPE с
+# connskip): без неё поток уходит мимо netfilter, и d2k не видит ответов.
+# Правила и их уборка — в d2k-ppe-deoffload.sh, здесь только вызовы. Нет
+# файла — нет разгрузки, остальная служба работает как прежде.
+# D2K_PPE_DEOFFLOAD=0 в конфигурации выключает её.
+PPE_LIB=$DIR/d2k-ppe-deoffload.sh
+# shellcheck disable=SC2034  # читает d2k-ppe-deoffload.sh
+D2K_PPE_DPLOG=$LOG/d2kd.log
+# shellcheck disable=SC2034
+D2K_PPE_CONFIG=$CONF
+# shellcheck disable=SC1090
+[ -r "$PPE_LIB" ] && . "$PPE_LIB"
+
 httpup_enabled() { [ "$MODE" = "apply" ] && [ "$HTTP_UPGRADE" = "1" ]; }
 
 say() { echo "$NAME: $*"; }
@@ -343,7 +356,32 @@ fw_family_up() (
     return 0
 )
 
-fw_up_unlocked() { fw_family_up iptables && fw_family_up ip6tables; }
+# Разгрузка ставится ПОСЛЕ переходов в цепочки d2k: -I кладёт её в начало
+# FORWARD, выше перехода в D2K_IN. Пакет, отданный в NFQUEUE, до правил ниже
+# по цепочке не доходит, и разгрузка под очередью не сработала бы для
+# ответов в окне. Её отказ не отменяет правил очереди: без неё d2k видит
+# хуже, но работает, как до неё.
+ppe_up() {
+    command -v d2k_ppe_ensure >/dev/null 2>&1 || return 0
+    d2k_ppe_ensure
+    case $? in
+        0) ;;
+        2) say "разгрузка PPE не ставится: в прошивке нет цели PPE" ;;
+        3) say "разгрузка PPE выключена владельцем (D2K_PPE_DEOFFLOAD=0)" ;;
+        *) say "разгрузка PPE встала не целиком — ответы под ускорителем могут быть не видны" ;;
+    esac
+    return 0
+}
+
+ppe_down() {
+    command -v d2k_ppe_remove >/dev/null 2>&1 || return 0
+    d2k_ppe_remove
+}
+
+fw_up_unlocked() {
+    fw_family_up iptables && fw_family_up ip6tables || return 1
+    ppe_up
+}
 
 fw_family_down() (
     fw_tool=$1
@@ -375,7 +413,19 @@ fw_family_down() (
     done
 )
 
-fw_down_unlocked() { fw_family_down iptables; fw_family_down ip6tables; }
+fw_down_unlocked() { ppe_down; fw_family_down iptables; fw_family_down ip6tables; }
+
+# Сторож: вернуть снесённую разгрузку, не трогая правил очереди. Под тем же
+# замком, что fw_up, — иначе вставка может лечь между снятием и постановкой.
+ppe_ensure() {
+    command -v d2k_ppe_ensure >/dev/null 2>&1 || return 0
+    running "$DP_PID" || return 0
+    fw_lock_acquire || return 1
+    d2k_ppe_ensure
+    rc=$?
+    fw_lock_release || return 1
+    case $rc in 0|2|3) return 0 ;; *) return 1 ;; esac
+}
 
 fw_lock_acquire() {
     local attempt owner
@@ -820,6 +870,9 @@ status() {
     running "$HL_PID" && echo "  сторож правил: работает (pid $(cat $HL_PID))" \
                       || echo "  сторож правил: не работает"
     fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
+    if command -v d2k_ppe_status >/dev/null 2>&1; then
+        d2k_ppe_status
+    fi
     bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
         /proc/net/netfilter/nfnetlink_queue 2>/dev/null)
     if [ -n "$bound" ] && [ "$bound" != "0" ]; then
@@ -862,5 +915,10 @@ case "$1" in
     telegram-reapply) telegram_reapply ;;
     status)  status ;;
     reapply) reapply ;;
-    *) echo "использование: $0 {start|stop|restart|engine-start|engine-stop|engine-restart|status|reapply}" >&2; exit 2 ;;
+    ppe-ensure) ppe_ensure ;;
+    ppe-status)
+        command -v d2k_ppe_status >/dev/null 2>&1 || die "нет $PPE_LIB"
+        d2k_ppe_status "$2"
+        ;;
+    *) echo "использование: $0 {start|stop|restart|engine-start|engine-stop|engine-restart|status|reapply|ppe-ensure|ppe-status [адрес]}" >&2; exit 2 ;;
 esac

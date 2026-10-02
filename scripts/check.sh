@@ -66,6 +66,7 @@ D2K_REQUIRE_LAB=1 $GO test -race -count=1 ./...
 echo "== скрипты =="
 find scripts spike -name '*.sh' -print0 | xargs -0 shellcheck -s sh
 sh scripts/test-instagram-dns.sh
+sh scripts/test-ppe-deoffload.sh
 sh scripts/test-instagram-dns-scheduler.sh
 node scripts/test-runtime-files.cjs
 node scripts/test-log-maintenance.cjs
@@ -84,6 +85,7 @@ shellcheck -s sh files/S99d2k
 shellcheck -s sh files/d2k-instagram-dns.sh
 shellcheck -s sh files/d2k-instagram-dns-scheduler.sh
 shellcheck -s sh files/d2k-log-maintenance.sh
+shellcheck -s sh files/d2k-ppe-deoffload.sh
 
 # Синтаксис files/S99d2k проверен строкой выше; ПОВЕДЕНИЕ его правил firewall
 # (что для UDP есть обе стороны, что на них --queue-bypass, что RETURN по

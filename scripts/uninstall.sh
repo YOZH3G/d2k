@@ -49,6 +49,15 @@ if command -v ipset >/dev/null 2>&1; then
     ipset destroy d2k_tg_dc6 2>/dev/null || true
 fi
 
+# Разгрузка ускорителя (-j PPE с меткой d2k-ppe) живёт в общих цепочках
+# mangle, а не в своей, и снимается по метке: чужие -j PPE (z2k, NDM)
+# остаются. Даже без init-скрипта — init мог быть удалён руками.
+if [ -r "$DIR/d2k-ppe-deoffload.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$DIR/d2k-ppe-deoffload.sh"
+    d2k_ppe_remove || true
+fi
+
 # Цепочка снимается даже если init-скрипта уже нет: он мог быть удалён руками,
 # а правила остаться.
 # Старое имя D2K тоже снимается: установка прошлой версии могла оставить его.
@@ -84,6 +93,7 @@ rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2kt
 # Remove only d2kc snapshots explicitly named as D2K pre-install/work backups.
 # These were created during router development and are not user configuration.
 rm -f "$SBIN"/d2kc.before-d2k-* "$SBIN"/d2kc.pre-goal-* "$SBIN"/d2kc.pre-sched-*
+rm -f "$DIR/d2k-ppe-deoffload.sh"
 rm -f "$DIR/d2k-tg-firewall.sh" "$DIR/d2k-tg-watchdog.sh" "$DIR/d2k-instagram-dns.sh" \
     "$DIR/d2k-instagram-dns-scheduler.sh" "$DIR/d2k-log-maintenance.sh" \
     "$DIR/files/meta-ranges.txt" "$DIR/files/tg-roots.pem"
