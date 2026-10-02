@@ -840,7 +840,10 @@ static int addr_probe_remove(d2k_sched *s, task *t, char *err, size_t errcap) {
                                      t->addr_probe_src_port_be, dst,
                                      dst_port_be, 17, t->family,
                                      t->addr_probe_trial_id, err, errcap);
-    t->addr_probe_identity_valid = 0;
+    /* Принадлежность забывается только после того, как команда ушла. Не
+       ушла — опыт по-прежнему наш и стоит до lease; следующая возможность
+       (освобождение задачи, d2k_sched_free) обязана снять его снова. */
+    if (rc == 0) { t->addr_probe_identity_valid = 0; }
     return rc;
 }
 
@@ -4221,7 +4224,7 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          is_stun ? "stun" : "voice",
                          is_stun ? t->ip : t->name,
                          is_stun ? "addr" : "name", 17, t->family, D2K_LINK_SHAPE_VOICE,
-                         is_stun ? D2K_VERBY_STUN : D2K_VERBY_CLIENT,
+                         is_stun ? D2K_VERBY_STUN : D2K_VERBY_VOICE_DISCOVERY,
                          D2K_INPUT_PROFILE,
                          wall_s(s, now_ms), &t->fp);
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
@@ -4279,6 +4282,24 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         name[n] = '\0';
     }
     int by_addr = name[0] == '\0' && ev->transport == 17;
+    if (by_addr && ev->client_shape == D2K_LINK_SHAPE_VOICE) {
+        /* STUN ВНЕ ГОЛОСА ДИСКОРДА (задача 17, п.7). Датапат не даёт ему
+           ярлык @discord-voice (только IP Discovery и STUN на медиапорты
+           Дискорда) и ведёт его адресным путём: подтверждённое по точке
+           сервера с формой голоса/STUN применяется. Но ИССЛЕДОВАТЬ его
+           нечем: у оригинала (voiceprobe/voice.go) путь — разговор Дискорда
+           из conntrack с его приманками, а не произвольный STUN (§4: не
+           заявлять, что voiceprobe умеет любой STUN). QUIC-поиск по адресу
+           здесь был бы подменой протокола, ярлык голоса — чужой целью.
+           Пробел оригинала называется вслух, а не закрывается выдумкой. */
+        char srv[INET6_ADDRSTRLEN];
+        uint16_t sport = 0;
+        server_of(ev, srv, sizeof srv, &sport);
+        say(s, "STUN к %s:%u без класса голоса Дискорда: исследование не поддержано "
+               "(у оригинала нет пути для произвольного STUN) — поиск не запускаю, "
+               "применяется только подтверждённое по адресу", srv, (unsigned)sport);
+        return 0;
+    }
     if (by_addr) {
         /* ИМЕНИ НЕТ, НО ЕСТЬ АДРЕС. У QUIC приветствие настоящего клиента
            разбросано по датаграммам, и имя из него не читает никто — ни мы,

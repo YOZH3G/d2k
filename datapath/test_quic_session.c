@@ -841,7 +841,9 @@ static void test_discord_voice(void) {
                                           D2K_PLAN_SHAPE_VOICE) == 0,
               "STUN voice plan не загрузился");
         size_t sn = build_stun_binding(stun, 0x0001, txid);
-        size_t n = build_udp_pkt(pkt, 64041, 3478, stun, sn);
+        /* Медиапорт Дискорда: STUN на него — голосовой класс (задача 17;
+           STUN на прочие порты класса не получает, см. test_stun_session). */
+        size_t n = build_udp_pkt(pkt, 64041, 50004, stun, sn);
         d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
         d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
         CHECK(r.applied && d2k_session_hellos(s) == 1,

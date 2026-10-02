@@ -791,6 +791,16 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     int discord_voice = is_discord_ip_discovery(pkt + payload_off, payload_len);
     int stun_voice = is_stun_request(pkt + payload_off, payload_len);
     int voice = discord_voice || stun_voice;
+    /* КЛАСС ГОЛОСА ДИСКОРДА — только то, что про Дискорд и доказано: IP
+       Discovery (строгая сигнатура) или STUN на медиапорт Дискорда. Прочий
+       STUN (3478 к любому адресу, TURN, WebRTC других приложений) — не голос
+       Дискорда: ярлык класса отдал бы ему чужой постоянный план и завёл бы
+       задачу @discord-voice. Его путь — адресный, по точке сервера с формой
+       голоса/STUN (задача 16), без выдуманного имени (§4, §5). */
+    uint16_t server_port = (uint16_t)((uint16_t)u[2] << 8 | u[3]);
+    int discord_class = discord_voice ||
+        (stun_voice && server_port >= D2K_DISCORD_MEDIA_PORT_LO &&
+         server_port <= D2K_DISCORD_MEDIA_PORT_HI);
     if (discord_voice && !fl->voice_ssrc_valid) {
         memcpy(fl->voice_ssrc, pkt + payload_off + 4, sizeof fl->voice_ssrc);
         fl->voice_ssrc_valid = 1;
@@ -831,8 +841,11 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
      * более. */
     char name[256];
     int named = 1;
-    if (voice) {
+    if (discord_class) {
         snprintf(name, sizeof name, "%s", D2K_VOICE_CLASS);
+    } else if (voice) {
+        named = 0;          /* STUN без класса: только адресный путь */
+        name[0] = '\0';
     } else {
         int assembled = d2k_quic_assembly_feed(&fl->quic_assembly,
                                                 pkt + payload_off,

@@ -62,6 +62,9 @@ static int      g_calls;
 static uint32_t g_last_ip;
 static int      g_last_copies;
 static int      g_marked_ok = 1;
+static uint32_t g_answer_ip2;     /* и этот тоже (контроль рядом с целью) */
+static uint32_t g_err_ip;          /* на этот адрес зонд не уходит: ошибка сокета */
+static int      g_pre_calls;       /* сколько зондов шло с приманкой впереди */
 
 static d2k_tally stub_ask(uint32_t ip, uint16_t port, const uint8_t *pre, size_t pre_len,
                           int copies, uint32_t wait_ms, uint32_t mark, int repeats,
@@ -69,13 +72,20 @@ static d2k_tally stub_ask(uint32_t ip, uint16_t port, const uint8_t *pre, size_t
     (void)port; (void)pre_len; (void)wait_ms;
     d2k_tally t;
     memset(&t, 0, sizeof t);
-    t.marked = (mark == 0) || g_marked_ok;
+    /* Как у настоящего оракула: без запрошенной метки сокет НЕ помечен. */
+    t.marked = (mark != 0) && g_marked_ok;
     g_calls++;
     g_last_ip = ip;
     g_last_copies = copies;
+    if (pre) { g_pre_calls++; }
+    if (g_err_ip && ip == g_err_ip) {
+        t.err = repeats;
+        t.fail = repeats;
+        return t;
+    }
 
     int ok = 0;
-    if (ip == g_answer_ip) {
+    if (ip == g_answer_ip || (g_answer_ip2 && ip == g_answer_ip2)) {
         ok = 1;
     } else if (g_answer_with_pre && ip == g_answer_with_pre && pre && copies >= g_need_copies) {
         ok = 1;
@@ -186,6 +196,9 @@ static void reset(void) {
     g_last_ip = 0;
     g_last_copies = 0;
     g_marked_ok = 1;
+    g_err_ip = 0;
+    g_answer_ip2 = 0;
+    g_pre_calls = 0;
     g_ctl_ip = ip4(162, 159, 128, 233);
     g_alive = -1;   /* по умолчанию сказать нечего */
 }
@@ -499,7 +512,11 @@ int main(void) {
               "молчит и контроль — значит режут UDP целиком, а не голос");
         CHECK(strstr(r.reason, "бессмысленно") != NULL,
               "причина обязана сказать, что обходить голос отдельно незачем");
-        CHECK(g_calls == 1, "спрошен обязан быть только контроль: про сам поток ответ уже есть");
+        /* Донорный порядок (voiceprobe.Run): прямой STUN к цели, затем
+           контроль — и больше ничего: приманки после мёртвого контроля не
+           перебираются. */
+        CHECK(g_calls == 2 && g_pre_calls == 0,
+              "после молчания цели спрошены не ровно прямой зонд и контроль");
     }
 
     /* --- МОЛЧАНИЕ ЗОНДА ПРИ ЖИВОМ РАЗГОВОРЕ — НЕ БЛОКИРОВКА --------------
@@ -557,7 +574,9 @@ int main(void) {
               "блокировка объявлена без единого зонда контроля — это вывод из недостачи данных");
         CHECK(r.verdict == D2K_VOICE_UNMEASURED,
               "незаконченное измерение не названо незаконченным");
-        CHECK(r.probes == 0, "зонды посчитаны там, где их не было");
+        /* Ушёл только донорный прямой зонд к цели; контрольных — ноль. */
+        CHECK(r.probes == D2K_VOICE_REPEATS && g_calls == 1,
+              "зонды посчитаны там, где их не было");
     }
 
     /* --- ОТВЕТ ОДНОМУ КЛИЕНТУ НЕ ПРЯЧЕТ БЕДУ ДРУГОГО ----------------------
@@ -618,6 +637,79 @@ int main(void) {
     }
 
 
+
+    /* --- ЗАДАЧА 17 -------------------------------------------------------- */
+
+    /* П.3: донор ставит найденную приманку с repeats=max(n,2)
+       (voiceprobe.askVoiceArms). Текст fake_arm и копии, по которым
+       собирается Plan, обязаны совпадать: n=1 едет на провод двумя копиями. */
+    {
+        reset();
+        g_answer_ip = g_ctl_ip;
+        g_alive = 0;
+        g_answer_with_pre = ip4(104, 16, 58, 99);
+        g_need_copies = 1;
+        d2k_voice_opt o;
+        memset(&o, 0, sizeof o);
+        o.ip = ip4(104, 16, 58, 99);
+        o.port = 50003;
+        o.mark = 0x2d;
+        d2k_voice_res r = d2k_voice_run(&o);
+        CHECK(r.verdict == D2K_VOICE_BLOCKED && strcmp(r.fake_arm, "stun:repeats=2") == 0 &&
+              r.arm_copies == 2,
+              "приманка n=1 поставлена не с repeats=max(n,2), как у донора");
+    }
+
+    /* П.4: без запрошенной метки прогон НЕ помечен (донор: Marked =
+       markSupported(); у нас метка — это o.mark, а без неё зонд идёт через
+       наш же обход). */
+    {
+        reset();
+        g_alive = 1;   /* ни одного зонда — и всё равно не «помечен» */
+        d2k_voice_opt o;
+        memset(&o, 0, sizeof o);
+        o.ip = ip4(104, 16, 58, 99);
+        o.port = 50003;
+        d2k_voice_res r = d2k_voice_run(&o);
+        CHECK(r.marked == 0, "прогон без метки объявлен помеченным");
+    }
+
+    /* П.5: донорный шаг 1 — прямой STUN к цели ДО перебора приманок. Цель
+       отвечает — резать нечего: перебора нет, повышения нет. */
+    {
+        reset();
+        g_ctl_ip = ip4(162, 159, 128, 233);
+        g_answer_ip = ip4(104, 16, 58, 99);    /* прямой зонд к цели отвечает */
+        g_answer_ip2 = g_ctl_ip;                /* и контроль жив */
+        g_alive = 0;                            /* а поток клиента молчит */
+        g_answer_with_pre = ip4(104, 16, 58, 99);
+        d2k_voice_opt o;
+        memset(&o, 0, sizeof o);
+        o.ip = ip4(104, 16, 58, 99);
+        o.port = 50003;
+        o.mark = 0x2d;
+        d2k_voice_res r = d2k_voice_run(&o);
+        CHECK(r.verdict == D2K_VOICE_CLEAR && r.arm_len == 0 && g_pre_calls == 0,
+              "прямой STUN-зонд к цели не выполнен до перебора приманок либо его ответ "
+              "не остановил перебор");
+    }
+
+    /* П.6: контроль не ушёл (ошибка сокета/отправки) — это не молчание сети,
+       а незаконченное измерение. */
+    {
+        reset();
+        g_err_ip = g_ctl_ip;
+        g_alive = 0;
+        d2k_voice_opt o;
+        memset(&o, 0, sizeof o);
+        o.ip = ip4(104, 16, 58, 99);
+        o.port = 50003;
+        o.mark = 0x2d;
+        d2k_voice_res r = d2k_voice_run(&o);
+        CHECK(r.verdict == D2K_VOICE_UNMEASURED,
+              "ошибка отправки контрольного зонда названа «UDP не ходит»");
+    }
+
     /* --- НЕПОМЕЧЕННЫЙ ЗОНД: замер про наш же обход, а не про коробку ------ */
     {
         reset();
@@ -654,6 +746,7 @@ int main(void) {
             CHECK(t.pass == D2K_VOICE_REPEATS,
                   "настоящий ответ STUN не засчитан — оракул не узнаёт собственный запрос");
             CHECK(t.err == 0, "зонд не отправился");
+            CHECK(t.marked == 0, "зонд без метки объявлен помеченным");
         }
         pthread_join(th, NULL);
 

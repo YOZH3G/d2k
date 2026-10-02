@@ -211,6 +211,12 @@ int d2k_plantab_del_bypass_family(d2k_plantab *, const uint8_t *, size_t,
  * объявлено у контроллера (D2K_LINK_VOICE_CLASS в d2k_link.h). */
 #define D2K_VOICE_CLASS "@discord-voice"
 
+/* Медиапорты Дискорда — те же, что DISCORD_MEDIA_PORT_RANGE эталона и
+ * voice_ports в core/voice.c. STUN на них — голос Дискорда (класс выше);
+ * STUN на прочие порты класса не получает и идёт адресным путём. */
+#define D2K_DISCORD_MEDIA_PORT_LO 50000
+#define D2K_DISCORD_MEDIA_PORT_HI 50099
+
 int d2k_plantab_set_name(d2k_plantab *t, const uint8_t *name, size_t len,
                          uint64_t now_ns, d2k_plan *p);
 /* То же, но с объявленной формой приветствия: план не применится к

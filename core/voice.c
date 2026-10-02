@@ -170,7 +170,9 @@ size_t d2k_voice_targets(const char *path, d2k_voice_target *out, size_t cap) {
 static int send_one(uint32_t ip, uint16_t port, const uint8_t *pre, size_t pre_len,
                     int copies, uint32_t mark, uint8_t txid[D2K_STUN_TXID_LEN],
                     int *marked) {
-    *marked = (mark == 0);
+    /* Без запрошенной метки сокет НЕ помечен: зонд идёт через наш же обход
+       (донор: Marked = markSupported(), а у нас метка — это mark). */
+    *marked = 0;
     uint8_t req[D2K_STUN_HDR_LEN];
     if (d2k_stun_request(req, sizeof req, txid) == 0) { return -1; }
 
@@ -392,9 +394,11 @@ static void voice_ask_arms(const d2k_voice_opt *o, d2k_voice_res *r) {
             if (q.pass != D2K_VOICE_REPEATS) { continue; }
             memcpy(r->arm_bytes, bytes, len);
             r->arm_len = len;
-            r->arm_copies = copies[c];
+            /* Донор ставит найденное с repeats=max(n,2) (askVoiceArms):
+               текст и копии, по которым собирается Plan, — одно число. */
+            r->arm_copies = copies[c] < 2 ? 2 : copies[c];
             snprintf(r->fake_arm, sizeof r->fake_arm, "%s:repeats=%d",
-                     blobs[b].name, copies[c] < 2 ? 2 : copies[c]);
+                     blobs[b].name, r->arm_copies);
             return;
         }
     }
@@ -440,7 +444,9 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
 
     d2k_voice_res r;
     memset(&r, 0, sizeof r);
-    r.marked = 1;
+    /* Помечен — только если метку просили; дальше её обязан подтвердить
+       каждый ушедший зонд. */
+    r.marked = (o.mark != 0);
 
     uint32_t wait_ms = o.wait_ms ? o.wait_ms : VOICE_WAIT_DEFAULT_MS;
 
@@ -533,7 +539,38 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
         /* Поток без единого ответа. Контроль нужен ровно затем, чтобы
            отделить «режут этот поток» от «UDP не ходит вовсе». */
         const char *ctl0 = ctl;
-        int ctl_ok = 0, asked0 = 0;
+        /* ДОНОРНЫЙ ШАГ 1 — прямой STUN к самой цели, ДО контроля и перебора
+           приманок (voiceprobe.Run: direct → control → askVoiceArms). Цель
+           отвечает — резать нечего, перебор не запускается. Молчание здесь
+           по-прежнему ничего не доказывает (поле 17.09) и ведёт дальше. */
+        uint32_t rtt0 = 0;
+        d2k_tally d0 = d2k_voice_ask_hook(r.ip, r.port, NULL, 0, 0, wait_ms, o.mark,
+                                          D2K_VOICE_REPEATS, &rtt0);
+        r.probes += D2K_VOICE_REPEATS - d0.err;
+        if (!d0.marked) { r.marked = 0; }
+        if (d0.pass == D2K_VOICE_REPEATS) {
+            r.verdict = D2K_VOICE_CLEAR;
+            say_reason(&r, "точка %s:%u отвечает на прямой STUN-зонд (%d/%d за %u мс) — "
+                           "резать нечего, приманки не перебираю",
+                       addr, r.port, d0.pass, D2K_VOICE_REPEATS, rtt0);
+        } else if (d0.pass > 0) {
+            r.verdict = D2K_VOICE_FLAKY;
+            say_reason(&r, "прямой STUN-зонд к %s:%u: ответов %d из %d — не "
+                           "воспроизводится, вердикт выносить нельзя",
+                       addr, r.port, d0.pass, D2K_VOICE_REPEATS);
+        } else if (d0.err > 0) {
+            r.verdict = D2K_VOICE_UNMEASURED;
+            say_reason(&r, "прямой STUN-зонд к %s:%u не ушёл (%d из %d — местная ошибка "
+                           "сокета/отправки): измерение не закончено",
+                       addr, r.port, d0.err, D2K_VOICE_REPEATS);
+        }
+        if (d0.pass > 0 || d0.err > 0) {
+            if (!r.marked) {
+                add_reason(&r, "; СОКЕТ НЕ ПОМЕЧЕН — зонд шёл через наш же обход");
+            }
+            return r;
+        }
+        int ctl_ok = 0, asked0 = 0, ctl_local_err = 0;
         if (ctl_resolved) {
             d2k_tally c0 = d2k_voice_ask_hook(cip, cport, NULL, 0, 0, wait_ms, o.mark,
                                               D2K_VOICE_REPEATS, NULL);
@@ -541,8 +578,17 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
             if (!c0.marked) { r.marked = 0; }
             asked0 = 1;
             ctl_ok = (c0.pass > 0);
+            /* Зонд не ушёл (сокет, connect, send) — это наша ошибка, а не
+               молчание сети: «UDP не ходит» из неё не выводится. */
+            ctl_local_err = (c0.pass == 0 && c0.err > 0);
         }
-        if (!asked0) {
+        if (ctl_local_err) {
+            r.verdict = D2K_VOICE_UNMEASURED;
+            say_reason(&r, "поток к %s:%u идёт без единого ответа, но контрольный зонд к %s "
+                           "не ушёл (местная ошибка сокета/отправки): отделить «режут этот "
+                           "поток» от «UDP не ходит вовсе» нечем — измерение не закончено",
+                       addr, r.port, ctl0);
+        } else if (!asked0) {
             /* КОНТРОЛЬ НЕ СПРОШЕН — ВЫБОРА МЕЖДУ ДВУМЯ ОБЪЯСНЕНИЯМИ НЕТ.
                «Режут этот поток» и «UDP не ходит вовсе» различает только он.
                Объявлять первое вердиктом, потому что второе не проверено, —

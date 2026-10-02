@@ -24,6 +24,8 @@ static size_t binding(uint8_t *p, uint16_t type, const uint8_t txid[12]) {
     return 20;
 }
 
+static uint16_t g_server_port = 3478;
+
 static size_t udp_packet(uint8_t *p, int reverse, uint16_t client_port,
                          const uint8_t *payload, size_t payload_len) {
     size_t n = 28 + payload_len;
@@ -36,11 +38,11 @@ static size_t udp_packet(uint8_t *p, int reverse, uint16_t client_port,
         memcpy(p + 12, "\xc0\xa8\x01\x43", 4);
         memcpy(p + 16, "\x01\x02\x03\x04", 4);
         wr16(p + 20, client_port);
-        wr16(p + 22, 3478);
+        wr16(p + 22, g_server_port);
     } else {
         memcpy(p + 12, "\x01\x02\x03\x04", 4);
         memcpy(p + 16, "\xc0\xa8\x01\x43", 4);
-        wr16(p + 20, 3478);
+        wr16(p + 20, g_server_port);
         wr16(p + 22, client_port);
     }
     wr16(p + 24, (uint16_t)(8 + payload_len));
@@ -130,6 +132,59 @@ static void live_trial(void) {
     d2k_session_free(s);
 }
 
+/* Задача 17, п.7: класс @discord-voice — только голос Дискорда: IP
+   Discovery или STUN на медиапорты Дискорда (50000-50099, как
+   DISCORD_MEDIA_PORT_RANGE и voice_ports в core/voice.c). Прочий STUN
+   (например, 3478 к не-Discord адресу) имени не получает: его путь —
+   адресный, по точке сервера и форме голоса/STUN (задача 16); выдумывать
+   ему имя класса значило бы отдать ему чужой постоянный план. */
+static void generic_stun(void) {
+    const uint8_t txid[12] = {7,7,7,7,7,7,7,7,7,7,7,7};
+    uint8_t req[20], pkt[96], outbuf[1024];
+    d2k_result result;
+    char err[160];
+    binding(req, 0x0001, txid);
+
+    d2k_session *s = d2k_session_new(8, 32);
+    CHECK(s != NULL, "generic-STUN session allocation");
+    if (!s) { return; }
+    d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+    d2k_plan *p = NULL;
+    CHECK(d2k_plan_load(plan_voice, sizeof plan_voice, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_name_shaped(d2k_session_plans(s),
+                                      (const uint8_t *)D2K_VOICE_CLASS,
+                                      strlen(D2K_VOICE_CLASS), 1, p,
+                                      D2K_PLAN_SHAPE_VOICE) == 0,
+          "voice-class plan installs");
+    g_server_port = 3478;
+    size_t n = udp_packet(pkt, 0, 64061, req, sizeof req);
+    d2k_session_packet(s, pkt, n, 1000, outbuf, sizeof outbuf, &result);
+    CHECK(!result.applied,
+          "STUN to a non-Discord port got the permanent @discord-voice plan");
+    CHECK(d2k_session_hellos(s) == 0 && journal_kind(s, D2K_JRN_HELLO_SNI, 0) == 0,
+          "STUN to a non-Discord port was named @discord-voice");
+
+    /* Адресный STUN-путь: подтверждённое по точке сервера с формой голоса. */
+    const uint8_t server[4] = {1, 2, 3, 4};
+    p = NULL;
+    CHECK(d2k_plan_load(plan_voice, sizeof plan_voice, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_addr_shaped(d2k_session_plans(s), server, 4, 1, p,
+                                      D2K_PLAN_SHAPE_VOICE) == 0,
+          "address STUN plan installs");
+    n = udp_packet(pkt, 0, 64062, req, sizeof req);
+    d2k_session_packet(s, pkt, n, 2000, outbuf, sizeof outbuf, &result);
+    CHECK(result.applied, "STUN to a non-Discord port did not take its address-keyed plan");
+
+    /* Медиапорт Дискорда остаётся в голосовом классе. */
+    g_server_port = 50004;
+    n = udp_packet(pkt, 0, 64063, req, sizeof req);
+    d2k_session_packet(s, pkt, n, 3000, outbuf, sizeof outbuf, &result);
+    CHECK(d2k_session_hellos(s) == 1 && journal_kind(s, D2K_JRN_HELLO_SNI, 0) == 1,
+          "STUN to a Discord media port left the voice class");
+    g_server_port = 3478;
+    d2k_session_free(s);
+}
+
 int main(void) {
     const uint8_t txid[12] = {0,1,2,3,4,5,6,7,8,9,10,11};
     uint8_t req[20], resp[20], alien[12], pkt[64], outbuf[512];
@@ -142,6 +197,7 @@ int main(void) {
     CHECK(s != NULL, "session allocation");
     if (!s) { return 1; }
 
+    g_server_port = 50004;   /* медиапорт Дискорда: голосовой класс */
     size_t n = udp_packet(pkt, 0, 64041, req, sizeof req);
     d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
     d2k_session_packet(s, pkt, n, 1000, outbuf, sizeof outbuf, &result);
@@ -161,6 +217,7 @@ int main(void) {
     CHECK(journal_kind(s, D2K_JRN_EXCHANGE, D2K_UDP_PROOF_STUN) == 1,
           "matching transaction ID proves a STUN exchange");
     d2k_session_free(s);
+    g_server_port = 3478;
 
     s = d2k_session_new(8, 16);
     CHECK(s != NULL, "malformed-case session allocation");
@@ -176,6 +233,7 @@ int main(void) {
     }
 
     live_trial();
+    generic_stun();
 
     if (fails) { return 1; }
     puts("STUN datapath proof: all checks passed");

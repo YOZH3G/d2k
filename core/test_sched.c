@@ -6287,7 +6287,26 @@ voice_only_run:
             CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1 &&
                   sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0,
                   "подтверждённый голос оставил временный опыт или задел имя");
+            /* Задача 17, п.1: доказательство IP Discovery записано своим
+               видом, а не «UDP CLIENT», и переживает перезапуск. */
+            CHECK(bd != NULL && bd->verified_by == D2K_VERBY_VOICE_DISCOVERY,
+                  "подтверждение IP Discovery записано не видом VOICE_DISCOVERY");
             d2k_sched_free(s);
+            saidbuf[0] = '\0';
+            s = d2k_sched_new(&cD, sv[0], 0x2d);
+            if (s) {
+                d2k_sched_set_say(s, collect_say, NULL);
+                drain();
+                forget_sent();
+                (void)d2k_sched_sync(s);
+                int rounds = 0;
+                while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+                drain();
+                CHECK(sent_command_count(D2K_CMD_SET_NAME, NULL, 0) == 1 &&
+                      !said("UDP CLIENT без протокольного"),
+                      "после перезапуска подтверждённый IP Discovery голос не поставлен на провод");
+                d2k_sched_free(s);
+            }
         }
         d2k_catalog_free(&cD);
 
@@ -6356,15 +6375,61 @@ voice_only_run:
             d2k_ev ap = ev_applied(17, 40210);
             memcpy(ap.trial_id, wtrial, sizeof wtrial);
             d2k_sched_event(s, &ap);
+            /* Задача 17, п.8: снятие опыта не дошло до датапата (связь
+               оборвана) — опыт остаётся своим и снимается при следующей
+               возможности, а не забывается. */
+            drain();
+            int saved_link = dup(sv[0]);
+            int broken[2];
+            CHECK(saved_link >= 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, broken) == 0,
+                  "не удалось подготовить оборванную связь");
+            close(broken[1]);
+            dup2(broken[0], sv[0]);
+            close(broken[0]);
             d2k_ev su2 = ev_suspect(17, 40210);
             d2k_sched_event(s, &su2);
             spin(s, 20);
+            dup2(saved_link, sv[0]);
+            close(saved_link);
             CHECK(binding_of(&cW, D2K_LINK_VOICE_CLASS, 17) == NULL,
                   "молчание разговора с приёмом записано подтверждением");
             CHECK(said("не пробил"), "провал приёма голоса не назван");
+            forget_sent();
             d2k_sched_free(s);
+            drain();
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1,
+                  "неудачное снятие адресной пробы сбросило её принадлежность — "
+                  "повторного снятия нет");
         }
         d2k_catalog_free(&cW);
+
+        /* Задача 17, п.7: STUN вне голоса Дискорда приходит безымянным с
+           формой голоса/STUN. Это не @discord-voice и не QUIC: поиск не
+           запускается, пробел оригинала назван вслух. */
+        d2k_catalog cG;
+        memset(&cG, 0, sizeof cG);
+        saidbuf[0] = '\0';
+        s = d2k_sched_new(&cG, sv[0], 0x2d);
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            forget_sent();
+            tcp_calls = quic_calls = vol_calls = 0;
+            ver_calls = voice_calls = 0;
+            d2k_ev su = ev_suspect(17, 52031);
+            su.code = D2K_SUSPECT_SILENT;
+            su.client_shape = D2K_LINK_SHAPE_VOICE;
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            drain();
+            CHECK(voice_calls == 0 && quic_calls == 0 &&
+                  sent_command_count(D2K_CMD_SET_ADDR_PROBE, NULL, 0) == 0 &&
+                  binding_of(&cG, D2K_LINK_VOICE_CLASS, 17) == NULL,
+                  "безымянный STUN завёл голосовую или QUIC-задачу");
+            CHECK(said("не поддержано"),
+                  "пробел оригинала для произвольного STUN не назван");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cG);
         d2k_sched_voice_hook = saved_voice_hook;
         g_server_port = saved_port;
     }
