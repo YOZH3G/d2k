@@ -203,44 +203,57 @@ static int anchor_by_name(const char *s, uint16_t *out) {
     return -1;
 }
 
-/* Режет строку на слова по пробелам. Возвращает число слов. */
-static size_t split_fields(char *line, char **f, size_t cap) {
+/* Режет строку на слова по пробелам. Возвращает число слов или -1, если слов
+   больше cap: молча отбросить хвост значило бы исполнить не то, что записано. */
+static int split_fields(char *line, char **f, size_t cap) {
     size_t n = 0;
     char *p = line;
-    while (*p && n < cap) {
+    for (;;) {
         while (*p == ' ' || *p == '\t') { p++; }
         if (!*p) { break; }
+        if (n >= cap) { return -1; }
         f[n++] = p;
         while (*p && *p != ' ' && *p != '\t') { p++; }
         if (*p) { *p++ = '\0'; }
     }
-    return n;
+    return (int)n;
+}
+
+/* Строгое беззнаковое десятичное число: только цифры, без знака, пробела и
+   хвоста, не больше max. Единственный путь числа из текста плана в поле. */
+static int parse_uint(const char *s, unsigned long max, unsigned long *out) {
+    if (!s || *s < '0' || *s > '9') { return -1; }
+    char *end = NULL;
+    errno = 0;
+    unsigned long val = strtoul(s, &end, 10);
+    if (errno == ERANGE || end == s || *end != '\0' || val > max) { return -1; }
+    *out = val;
+    return 0;
+}
+
+/* Знаковое число с необязательным "+"/"-" в пределах [lo, hi]. */
+static int parse_int(const char *s, long lo, long hi, long *out) {
+    int neg = 0;
+    unsigned long mag;
+    if (s && (*s == '+' || *s == '-')) { neg = (*s == '-'); s++; }
+    unsigned long lim = neg ? (unsigned long)(-(lo + 1)) + 1ul : (unsigned long)hi;
+    if (parse_uint(s, lim, &mag) != 0) { return -1; }
+    *out = neg ? (long)(0 - mag) : (long)mag;
+    return 0;
 }
 
 /* Разбирает "ключ=значение" и сверяет ключ. */
-static int kv_u32(const char *field, const char *key, unsigned long *out) {
+static int kv_u32(const char *field, const char *key, unsigned long max, unsigned long *out) {
     size_t kl = strlen(key);
     if (strncmp(field, key, kl) != 0 || field[kl] != '=') { return -1; }
-    const char *v = field + kl + 1;
-    if (!*v) { return -1; }
-    char *end = NULL;
-    unsigned long val = strtoul(v, &end, 10);
-    if (!end || *end != '\0') { return -1; }
-    *out = val;
-    return 0;
+    return parse_uint(field + kl + 1, max, out);
 }
 
-/* Разбирает голое десятичное число. Отдельно от kv_u32: у pace значение
+/* Голое десятичное число (pace и др.). Отдельно от kv_u32: у pace значение
    идёт без ключа, и притворяться, что "ключ=значение" тут есть, значило бы
    принимать "pace pace=12000". */
 static int str_u32(const char *sv, unsigned long *out) {
-    if (!sv || *sv < '0' || *sv > '9') { return -1; }
-    char *end = NULL;
-    errno = 0;
-    unsigned long val = strtoul(sv, &end, 10);
-    if (errno == ERANGE || val > UINT32_MAX || !end || *end != '\0') { return -1; }
-    *out = val;
-    return 0;
+    return parse_uint(sv, UINT32_MAX, out);
 }
 
 static void plan_free(pl_plan *p) {
@@ -277,13 +290,19 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
         if (*t == '\0' || *t == '#') { continue; }
 
         char *f[8];
-        size_t nf = split_fields(t, f, 8);
+        int nfi = split_fields(t, f, 8);
+        if (nfi < 0) { say(err, errcap, "строка %zu: слов больше 8", lineno); goto bad; }
+        size_t nf = (size_t)nfi;
         if (nf == 0) { continue; }
 
         if (strcmp(f[0], "d2k-plan") == 0) {
             if (nf != 3) { say(err, errcap, "строка %zu: d2k-plan ждёт два числа", lineno); goto bad; }
-            p->schema = (uint16_t)strtoul(f[1], NULL, 10);
-            p->minexec = (uint16_t)strtoul(f[2], NULL, 10);
+            unsigned long sc, mx;
+            if (parse_uint(f[1], 65535, &sc) || parse_uint(f[2], 65535, &mx)) {
+                say(err, errcap, "строка %zu: d2k-plan ждёт два числа 0..65535", lineno); goto bad;
+            }
+            p->schema = (uint16_t)sc;
+            p->minexec = (uint16_t)mx;
             seen_header = 1;
         } else if (strcmp(f[0], "id") == 0) {
             if (nf != 2) { say(err, errcap, "строка %zu: id ждёт одно слово", lineno); goto bad; }
@@ -311,8 +330,12 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             if (nf < 2 || nf > 3) { say(err, errcap, "строка %zu: payload ждёт номер и байты", lineno); goto bad; }
             if (p->n_payloads >= MAX_PAYLOADS) { say(err, errcap, "строка %zu: приманок больше %d", lineno, MAX_PAYLOADS); goto bad; }
             pl_payload *v = &p->payloads[p->n_payloads];
-            v->id = (uint16_t)strtoul(f[1], NULL, 10);
+            unsigned long pid;
             char why[80];
+            if (parse_uint(f[1], 65535, &pid)) {
+                say(err, errcap, "строка %zu: номер нагрузки вне 0..65535", lineno); goto bad;
+            }
+            v->id = (uint16_t)pid;
             if (parse_hex(nf == 3 ? f[2] : "", &v->bytes, &v->len, why, sizeof why) != 0) {
                 say(err, errcap, "строка %zu: нагрузка: %s", lineno, why);
                 goto bad;
@@ -405,15 +428,27 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             if (p->n_poisons >= MAX_POISONS) { say(err, errcap, "строка %zu: порч больше %d", lineno, MAX_POISONS); goto bad; }
             pl_poison *v = &p->poisons[p->n_poisons];
             memset(v, 0, sizeof *v);
-            v->id = (uint16_t)strtoul(f[1], NULL, 10);
+            unsigned long pid;
+            if (parse_uint(f[1], 65535, &pid)) {
+                say(err, errcap, "строка %zu: номер порчи вне 0..65535", lineno); goto bad;
+            }
+            v->id = (uint16_t)pid;
             for (size_t i = 2; i < nf; i++) {
                 unsigned long u;
                 if (strcmp(f[i], "badsum") == 0) { v->flags |= 1u << 0; }
                 else if (strcmp(f[i], "tcpts") == 0) { v->flags |= 1u << 1; }
                 else if (strcmp(f[i], "ipidzero") == 0) { v->flags |= 1u << 2; }
-                else if (kv_u32(f[i], "ttl", &u) == 0) { v->ttl = (uint8_t)u; }
-                else if (strncmp(f[i], "seqshift=", 9) == 0) {
-                    v->seq_shift = (int32_t)strtol(f[i] + 9, NULL, 10);
+                else if (strncmp(f[i], "ttl=", 4) == 0) {
+                    if (kv_u32(f[i], "ttl", 255, &u) != 0) {
+                        say(err, errcap, "строка %zu: ttl вне 0..255 \"%s\"", lineno, f[i]); goto bad;
+                    }
+                    v->ttl = (uint8_t)u;
+                } else if (strncmp(f[i], "seqshift=", 9) == 0) {
+                    long sh;
+                    if (parse_int(f[i] + 9, INT32_MIN, INT32_MAX, &sh) != 0) {
+                        say(err, errcap, "строка %zu: seqshift вне int32 \"%s\"", lineno, f[i]); goto bad;
+                    }
+                    v->seq_shift = (int32_t)sh;
                 } else {
                     say(err, errcap, "строка %zu: неизвестный признак порчи \"%s\"", lineno, f[i]);
                     goto bad;
@@ -428,7 +463,11 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 say(err, errcap, "строка %zu: неизвестный якорь \"%s\"", lineno, f[1]);
                 goto bad;
             }
-            v->offset = (int16_t)strtol(f[2], NULL, 10);
+            long off;
+            if (parse_int(f[2], INT16_MIN, INT16_MAX, &off) != 0) {
+                say(err, errcap, "строка %zu: смещение split вне int16 \"%s\"", lineno, f[2]); goto bad;
+            }
+            v->offset = (int16_t)off;
             p->n_splits++;
         } else if (strcmp(f[0], "oob") == 0) {
             uint16_t anchor = 0;
@@ -451,13 +490,13 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             pl_fake *v = &p->fakes[p->n_fakes];
             memset(v, 0, sizeof *v);
             unsigned long u;
-            if (kv_u32(f[1], "payload", &u) != 0) { say(err, errcap, "строка %zu: fake без payload=", lineno); goto bad; }
+            if (kv_u32(f[1], "payload", 65535, &u) != 0) { say(err, errcap, "строка %zu: fake без payload=", lineno); goto bad; }
             v->payload_id = (uint16_t)u;
-            if (kv_u32(f[2], "poison", &u) != 0) { say(err, errcap, "строка %zu: fake без poison=", lineno); goto bad; }
+            if (kv_u32(f[2], "poison", 65535, &u) != 0) { say(err, errcap, "строка %zu: fake без poison=", lineno); goto bad; }
             v->poison_id = (uint16_t)u;
-            if (kv_u32(f[3], "repeats", &u) != 0) { say(err, errcap, "строка %zu: fake без repeats=", lineno); goto bad; }
+            if (kv_u32(f[3], "repeats", 255, &u) != 0) { say(err, errcap, "строка %zu: fake без repeats=", lineno); goto bad; }
             v->repeats = (uint8_t)u;
-            if (kv_u32(f[4], "gap_us", &u) != 0) { say(err, errcap, "строка %zu: fake без gap_us=", lineno); goto bad; }
+            if (kv_u32(f[4], "gap_us", UINT32_MAX, &u) != 0) { say(err, errcap, "строка %zu: fake без gap_us=", lineno); goto bad; }
             v->gap_us = (uint32_t)u;
             if (strcmp(f[5], "place=before") == 0) { v->placement = 0; }
             else if (strcmp(f[5], "place=between") == 0) { v->placement = 1; }
@@ -475,9 +514,9 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             if (p->n_seqovls >= MAX_SEQOVLS) { say(err, errcap, "строка %zu: перекрытий больше %d", lineno, MAX_SEQOVLS); goto bad; }
             pl_seqovl *v = &p->seqovls[p->n_seqovls];
             unsigned long u;
-            if (kv_u32(f[1], "payload", &u) != 0) { say(err, errcap, "строка %zu: seqovl без payload=", lineno); goto bad; }
+            if (kv_u32(f[1], "payload", 65535, &u) != 0) { say(err, errcap, "строка %zu: seqovl без payload=", lineno); goto bad; }
             v->payload_id = (uint16_t)u;
-            if (kv_u32(f[2], "poison", &u) != 0) { say(err, errcap, "строка %zu: seqovl без poison=", lineno); goto bad; }
+            if (kv_u32(f[2], "poison", 65535, &u) != 0) { say(err, errcap, "строка %zu: seqovl без poison=", lineno); goto bad; }
             v->poison_id = (uint16_t)u;
             p->n_seqovls++;
         } else if (strcmp(f[0], "order") == 0) {

@@ -206,6 +206,39 @@ int main(void) {
               out,sizeof out,&n,err,sizeof err)!=0,"fragment with TCP text");
     }
 
+    /* Строгий разбор: усечённое слово и число вне ширины поля — отказ. */
+    {
+        uint8_t out[512]; size_t n=0; char err[200], text[512];
+        const char *bad[]={
+            "poison 1 badsum tcpts ipidzero ttl=5 seqshift=1 extra\n",
+            "poison 1 ttl=300\n", "poison 1 ttl=5x\n", "poison 1 ttl=-1\n",
+            "poison 1 seqshift=2147483648\n", "poison 1 seqshift=-2147483649\n",
+            "poison 65536\n", "payload 65536 aa\n", "payload 1x aa\n",
+            "split payload_start +32768\n", "split payload_start -32769\n",
+            "split payload_start 1x\n",
+            "payload 1 aa\npoison 1\nfake payload=1 poison=1 repeats=70000 gap_us=0 place=before\n",
+            "payload 1 aa\npoison 1\nfake payload=1 poison=1 repeats=256 gap_us=0 place=before\n",
+            "payload 1 aa\npoison 1\nfake payload=1 poison=1 repeats=1 gap_us=4294967296 place=before\n",
+            "payload 1 aa\npoison 1\nfake payload=65536 poison=1 repeats=1 gap_us=0 place=before\n",
+            "payload 1 aa\npoison 1\nseqovl payload=1 poison=65536\n",
+        };
+        for (size_t i=0;i<sizeof bad/sizeof bad[0];i++) {
+            snprintf(text,sizeof text,"d2k-plan 1 1\nproto tcp tls\n%s",bad[i]);
+            CHECK(d2k_plan_text_to_tlv(text,out,sizeof out,&n,err,sizeof err)!=0,
+                  "строгий разбор принял усечённое/внедиапазонное число");
+        }
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 1 1\nproto tcp tls\n",
+              out,sizeof out,&n,err,sizeof err)!=0,"d2k-plan с лишним словом");
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 65536 1\nproto tcp tls\n",
+              out,sizeof out,&n,err,sizeof err)!=0,"schema вне u16");
+        /* Границы ширины полей остаются допустимыми. */
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 1\nproto tcp tls\npayload 65535 aa\n"
+              "poison 65535 ttl=255 seqshift=-2147483648\n"
+              "split payload_start -32768\nsplit sni_middle +32767\n"
+              "fake payload=65535 poison=65535 repeats=255 gap_us=4294967295 place=before\n",
+              out,sizeof out,&n,err,sizeof err)==0,"граничные значения отвергнуты");
+    }
+
     {
         static const char good[] =
             "d2k-plan 1 8\nproto tcp tls\nwire detect-tcp-v1\n"
