@@ -373,6 +373,13 @@ static d2k_ver_result stub_resource_verify(int fd, const char *ip, uint16_t port
 /* Layered failure fixture: TLS works under the candidate, identity is cut,
  * but the compressed control may finish. No network access is involved. */
 static int layered_identity_calls, layered_gzip_calls, layered_bad_control;
+/* Полное identity-тело под кандидатом: TLS доходит, обрыва нет (задача 30). */
+static d2k_ver_result stub_rx_counting(int fd, const char *ip, uint16_t port,
+        uint8_t transport, const char *name, int deadline, size_t wire, uint8_t shape) {
+    layered_identity_calls++;
+    return stub_ver(fd, ip, port, transport, name, deadline, wire, shape);
+}
+
 static d2k_ver_result stub_layered_identity(int fd, const char *ip, uint16_t port,
         uint8_t transport, const char *name, int deadline, size_t wire, uint8_t shape) {
     d2k_ver_result r = stub_ver(fd, ip, port, transport, name, deadline, wire, shape);
@@ -6323,9 +6330,12 @@ lifecycle_test:
         tcp_answer = D2K_V_OPAQUE;
     }
     {
+        const int other_shape = 0;
         /* Снимок клиента пришёл, пока шла классификация: повтор поиска его
-           байтами не повторяет объёмный замер, уже выполненный в этой задаче,
-           и сохраняет его обрыв. */
+           байтами (та же форма и длина, что у заготовки) не гоняет объём
+           второй раз. Другая форма здесь объёма не застаёт: устаревший
+           прогон останавливается до объёмного замера — разная форма
+           проверяется ниже, после подтверждения. */
         d2k_catalog cR = {0};
         d2k_sched *s = d2k_sched_new(&cR, sv[0], 0x2d);
         saidbuf[0] = '\0';
@@ -6334,11 +6344,13 @@ lifecycle_test:
         vol_answer = D2K_VOL_CUT; vol_rx_cut = 0;
         tcp_answer = D2K_V_CLEAR;
         ver_answer = D2K_VER_NOT_MEASURED;
+        tcp_last_wire = 0;
         forget_sent();
         snapshot_enabled = 1; snapshot_entered = snapshot_release = snapshot_ok = 0;
-        d2k_ev h = ev_hello(6, 40092, "объём.без.повтора");
+        d2k_ev h = ev_hello(6, (uint16_t)(40092 + other_shape),
+                            other_shape ? "объём.другая.форма" : "объём.без.повтора");
         d2k_sched_event(s, &h);
-        d2k_ev su = ev_suspect(6, 40092);
+        d2k_ev su = ev_suspect(6, (uint16_t)(40092 + other_shape));
         d2k_sched_event(s, &su);
         int entered = 0;
         for (int i = 0; i < 3000 && !entered; i++) {
@@ -6348,21 +6360,121 @@ lifecycle_test:
             pthread_mutex_unlock(&snapshot_mu);
         }
         CHECK(entered, "классификатор не позван первым — объём шёл до вопросов донора");
+        size_t template_wire = tcp_last_wire;
         d2k_ev sh;
-        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_LEGACY) == 0, "snapshot fixture failed");
+        CHECK(tls_shape_event(&sh, h.name, other_shape ? D2K_SHAPE_LEGACY : D2K_SHAPE_MODERN) == 0,
+              "snapshot fixture failed");
+        CHECK(other_shape || sh.shape_len == template_wire,
+              "предпосылка: снимок TLS 1.3 должен совпасть с заготовкой по длине");
         d2k_sched_event(s, &sh);
         pthread_mutex_lock(&snapshot_mu);
         snapshot_release = 1; pthread_cond_broadcast(&snapshot_cv);
         pthread_mutex_unlock(&snapshot_mu);
         settle(s);
         CHECK(tcp_calls == 2, "снимок клиента не повторил классификацию его байтами");
-        CHECK(vol_calls == 1, "повтор снимком заново прогнал уже выполненный объёмный замер");
+        CHECK(other_shape || vol_calls == 1,
+              "повтор снимком того же входа заново прогнал объёмный замер");
         CHECK(said("исходящая лестница оборвалась"),
-              "повтор снимком потерял обрыв уже выполненного объёмного замера");
-        if (vol_calls != 1 || tcp_calls != 2) fprintf(stderr, "%s\n", saidbuf);
+              "повтор снимком потерял обрыв объёмного замера");
+        if (tcp_calls != 2 || vol_calls != 1) fprintf(stderr, "%s\n", saidbuf);
         d2k_sched_free(s); d2k_catalog_free(&cR);
         snapshot_enabled = 0;
         vol_answer = D2K_VOL_PASSED; tcp_answer = D2K_V_OPAQUE;
+    }
+    for (int other_shape = 0; other_shape < 2; other_shape++) {
+        /* Подтверждено заготовкой TLS 1.3 после обрыва объёма; затем пришёл
+           снимок клиента, и поиск повторяется его байтами. Тот же вход
+           (TLS 1.3, та же длина) берёт выполненный замер; снимок TLS 1.2 —
+           другая версия, обрыв заготовки ему не улика: объём мерится заново
+           (после CLEAR классификатора). */
+        d2k_catalog cW = {0};
+        d2k_sched *s = d2k_sched_new(&cW, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = ver_calls = 0;
+        vol_answer = D2K_VOL_CUT; vol_rx_cut = 0;
+        tcp_answer = D2K_V_CLEAR; tcp_last_wire = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        uint16_t port = (uint16_t)(40095 + other_shape);
+        ver_answer_port = port;
+        forget_sent();
+        d2k_ev h = ev_hello(6, port, other_shape ? "объём.tls12.снимок" : "объём.tls13.снимок");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, port);
+        d2k_sched_event(s, &su);
+        int installed = 0;
+        for (int i = 0; i < 2000 && !total_bindings(&cW); i++) {
+            tick_once(s);
+            int n = (int)sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+            if (n > installed) {
+                installed = n;
+                d2k_ev ap = ev_applied(6, port);
+                d2k_sched_event(s, &ap);
+            }
+        }
+        spin(s, 40);
+        CHECK(total_bindings(&cW) == 1 && vol_calls == 1 && tcp_calls == 1,
+              "предпосылка: объёмный обрыв заготовкой не подтвердился");
+        size_t template_wire = tcp_last_wire;
+        d2k_ev sh;
+        CHECK(tls_shape_event(&sh, h.name, other_shape ? D2K_SHAPE_LEGACY : D2K_SHAPE_MODERN) == 0,
+              "snapshot fixture failed");
+        CHECK(other_shape || sh.shape_len == template_wire,
+              "предпосылка: снимок TLS 1.3 должен совпасть с заготовкой по длине");
+        d2k_sched_event(s, &sh);
+        installed = (int)sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+        for (int i = 0; i < 2000 && tcp_calls < 2; i++) tick_once(s);
+        settle(s);
+        CHECK(tcp_calls == 2, "снимок после подтверждения не повторил классификацию");
+        CHECK(other_shape || vol_calls == 1,
+              "повтор снимком того же входа заново прогнал объёмный замер");
+        CHECK(!other_shape || vol_calls == 2,
+              "обрыв, измеренный приветствием другой версии TLS, приложен к снимку");
+        if (tcp_calls != 2 || vol_calls != 1 + other_shape)
+            fprintf(stderr, "shape=%d tcp=%d vol=%d\n%s\n", other_shape, tcp_calls, vol_calls, saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&cW);
+        vol_answer = D2K_VOL_PASSED; tcp_answer = D2K_V_OPAQUE;
+    }
+    {
+        /* OPAQUE: прямое рукопожатие не прошло, объём не мерился, флаг
+           «TLS недоступен» выведен из вердикта и открывает послойную
+           RX-проверку под кандидатом. Если под кандидатом TLS доходит и
+           identity-тело приходит целиком, это обычное подтверждение —
+           без RX-лестницы и без RX-улики. */
+        d2k_catalog cO2 = {0};
+        d2k_sched *s = d2k_sched_new(&cO2, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = ver_calls = 0;
+        tcp_answer = D2K_V_OPAQUE; vol_rx_cut = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_answer_port = 40094; ver_fail_first = 0;
+        layered_identity_calls = layered_gzip_calls = 0;
+        d2k_sched_rx_ver_hook = stub_rx_counting;
+        forget_sent();
+        d2k_ev h = ev_hello(6, 40094, "opaque.tls.reachable"), sh;
+        d2k_sched_event(s, &h);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0, "OPAQUE shape fixture");
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40094);
+        d2k_sched_event(s, &su);
+        int installed = 0;
+        for (int i = 0; i < 2000 && !total_bindings(&cO2); i++) {
+            tick_once(s);
+            int n = (int)sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+            if (n > installed) {
+                installed = n;
+                d2k_ev ap = ev_applied(6, 40094);
+                d2k_sched_event(s, &ap);
+            }
+        }
+        CHECK(vol_calls == 0 && tcp_calls == 1, "OPAQUE: объём мерился после блока рукопожатия");
+        CHECK(layered_identity_calls >= 1, "OPAQUE: послойная RX-проверка под кандидатом не открыта");
+        CHECK(total_bindings(&cO2) == 1 && layered_gzip_calls == 0 &&
+              !sent_contains_plan_payload("hcaptcha.com"),
+              "OPAQUE с доступным TLS под кандидатом не подтвердился обычным путём");
+        if (total_bindings(&cO2) != 1) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&cO2);
+        d2k_sched_rx_ver_hook = stub_ver;
     }
 
     /* --- TX-volume не открывает RX-volume-лестницу ---------------------- */

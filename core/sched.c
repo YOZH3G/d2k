@@ -720,9 +720,17 @@ typedef struct {
     int        family_fast; /* 1 own-family verifier queue, 2 exhausted */
     int        skip_volume_once; /* resume classifier with existing baseline */
     /* Объёмный замер этой задачи уже выполнен (задача 30): повтор поиска
-       снимком клиента не гоняет его заново, а берёт сохранённый исход. */
+       снимком клиента не гоняет его заново, а берёт сохранённый исход —
+       но ТОЛЬКО для того же входа замера. Замер зависит от версии TLS
+       приветствия, его длины на проводе, пути ресурса и адреса: обрыв,
+       снятый TLS 1.3-заготовкой, не улика для снимка TLS 1.2 (§4). */
     int        vol_done;
     d2k_vol_result vol_measured;
+    int        vol_tls12;
+    size_t     vol_wire;
+    uint16_t   vol_port;
+    char       vol_ip[INET6_ADDRSTRLEN];
+    char       vol_path[512];
     char       measure_path[512]; /* selected before worker start, never guessed from ciphertext */
     int        ech_offer;
     int        ech_trial; /* failed baseline permits hypotheses, not a DPI verdict */
@@ -1583,17 +1591,26 @@ d2k_vres d2k_sched_ech_baseline_result(const d2k_ver_result *baseline,
     return result;
 }
 
-/* Объёмный замер TCP-цели — один раз на задачу (задача 30): повтор поиска
-   снимком клиента берёт исход уже выполненного замера. */
+/* Объёмный замер TCP-цели — один раз на задачу и вход (задача 30): повтор
+   поиска с тем же приветствием (форма, длина), путём и адресом берёт исход
+   уже выполненного замера; другой вход мерится заново. */
 static void worker_volume(d2k_sched *s, task *t, d2k_hello trig) {
     int tls12 = d2k_hello_shape(trig.bytes, trig.len) == D2K_SHAPE_LEGACY;
-    if (!t->vol_done) {
+    int same_input = t->vol_done && t->vol_tls12 == tls12 && t->vol_wire == trig.len &&
+                     t->vol_port == t->port && !strcmp(t->vol_ip, t->ip) &&
+                     !strcmp(t->vol_path, t->measure_path);
+    if (!same_input) {
         t->vol_measured = t->measure_path[0]
             ? d2k_sched_vol_path_hook(t->ip, t->port, t->name, t->port == 80,
                                      tls12, trig.len, s->measure_mark, t->measure_path)
             : d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80,
                                 tls12, trig.len, s->measure_mark);
         t->vol_done = 1;
+        t->vol_tls12 = tls12;
+        t->vol_wire = trig.len;
+        t->vol_port = t->port;
+        snprintf(t->vol_ip, sizeof t->vol_ip, "%s", t->ip);
+        snprintf(t->vol_path, sizeof t->vol_path, "%s", t->measure_path);
         if (t->vol_measured.rx_reason[0]) {
             say(s, "по %s объёмный замер TLS %s, hello=%zu: TX %s; RX %s",
                 t->name, tls12 ? "1.2" : "1.3", trig.len,
@@ -1830,12 +1847,16 @@ static void *worker_run(void *vp) {
             if (worker_volume_cut(s, t)) { return NULL; }
         } else {
             /* Объём не измерялся: исход прошлого прогона этой задачи к
-               другому вердикту не прикладывается. Доказанный блок
-               классификатора — это и есть «прямой TLS не прошёл», на чём
-               стоит послойная RX-проверка под кандидатом. */
+               другому вердикту не прикладывается. Флаг «TLS недоступен»
+               здесь выводится из вердикта классификатора, а не из прямого
+               RX-GET: OPAQUE (единственный вердикт, открывающий послойную
+               RX-проверку под кандидатом) значит, что прямое рукопожатие
+               не прошло. Под кандидатом без обрыва identity-тела такая
+               проверка кончается обычным подтверждением. Путь
+               rx_saved_bootstrap этим флагом не открывается: он идёт только
+               после прямого объёмного замера (поздний RST, family_reuse 1). */
             memset(&t->vol, 0, sizeof t->vol);
-            t->vol.rx_tls_unavailable = r.verdict == D2K_V_PREFIX ||
-                r.verdict == D2K_V_WHOLE || r.verdict == D2K_V_OPAQUE;
+            t->vol.rx_tls_unavailable = r.verdict == D2K_V_OPAQUE;
         }
     }
 
