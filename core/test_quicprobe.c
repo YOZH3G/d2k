@@ -537,8 +537,39 @@ static size_t build_ack_body(uint8_t *out, size_t cap) {
     return 5;
 }
 
+/* Retry (RFC 9000 §17.2.5) для v1: тип 0b11 в битах 4-5, версия 1, свои
+ * DCID/SCID, токен и 16 байт тега целостности. Тег НУЛЕВОЙ нарочно: донор
+ * (z2k-detect/internal/quicprobe/parse.go:118-122) засчитывает Retry по
+ * типу и версии, тег не проверяет — тест обязан закрепить ровно это. */
+static size_t build_retry_v1(uint8_t *out, size_t cap) {
+    static const uint8_t pkt[] = {
+        0xF0, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+        0x08, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7,
+        'T', 'O', 'K', 'E', 'N',
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (cap < sizeof pkt) return 0;
+    memcpy(out, pkt, sizeof pkt);
+    return sizeof pkt;
+}
+
+/* Version Negotiation (RFC 9000 §17.2.1): длинный заголовок, версия 0,
+ * DCID/SCID, список версий. Донор (parse.go:110-116) узнаёт его по нулевой
+ * версии, не сверяя CID с нашими. */
+static size_t build_vn_reply(uint8_t *out, size_t cap) {
+    static const uint8_t pkt[] = {
+        0x80, 0x00, 0x00, 0x00, 0x00,
+        0x08, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+        0x08, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7,
+        0x00, 0x00, 0x00, 0x01};
+    if (cap < sizeof pkt) return 0;
+    memcpy(out, pkt, sizeof pkt);
+    return sizeof pkt;
+}
+
 static void *rs_run(void *arg) {
     (void)arg;
+    int ctl_answered = 0;
     for (;;) {
         uint8_t buf[2048];
         struct sockaddr_storage from;
@@ -559,8 +590,16 @@ static void *rs_run(void *arg) {
         int is_trig = ((size_t)n == g_trig_len && memcmp(buf, g_trig_bytes, (size_t)n) == 0);
         int is_ctl = ((size_t)n == g_ctl_len && memcmp(buf, g_ctl_bytes, (size_t)n) == 0) ||
                      is_neutral_control_packet(buf, (size_t)n);
-        if (g_rs_respond == 3 && is_trig) {
+        if ((g_rs_respond == 3 || g_rs_respond == 7 || g_rs_respond == 8 ||
+             g_rs_respond == 9) && is_trig) {
             continue; /* триггер молчит нарочно */
+        }
+        if ((g_rs_respond == 7 || g_rs_respond == 8) && is_ctl) {
+            uint8_t pkt[64];
+            size_t pl = g_rs_respond == 7 ? build_retry_v1(pkt, sizeof pkt)
+                                          : build_vn_reply(pkt, sizeof pkt);
+            (void)sendto(g_rs_fd, pkt, pl, 0, (struct sockaddr *)&from, fl);
+            continue;
         }
         const uint8_t *dcid = NULL;
         size_t dcid_len = QP_DCID_LEN;
@@ -594,11 +633,22 @@ static void *rs_run(void *arg) {
                 }
             }
             uint8_t body[32];
-            size_t bl = (g_rs_respond == 4) ? build_close_body(body, sizeof body)
-                                             : build_crypto_body(body, sizeof body);
+            int close_only = g_rs_respond == 4 || (g_rs_respond == 6 && is_trig);
+            size_t bl = close_only ? build_close_body(body, sizeof body)
+                                   : build_crypto_body(body, sizeof body);
             size_t rl = build_authentic_v1(dcid, dcid_len, body, bl, resp, sizeof resp);
             if (rl > 0) {
                 (void)sendto(g_rs_fd, resp, rl, 0, (struct sockaddr *)&from, fl);
+            }
+            /* РЕЖИМ 9: ответив на D2K_QUIC_REPEATS контролей базовой
+               живости, стенд закрывает порт — всё дальнейшее (прямой зонд,
+               остаточная проверка) получает настоящий ICMP «порт
+               недоступен». */
+            if (g_rs_respond == 9 && is_ctl && ++ctl_answered >= D2K_QUIC_REPEATS) {
+                int fd = g_rs_fd;
+                g_rs_fd = -1;
+                close(fd);
+                return NULL;
             }
         }
     }
@@ -1302,7 +1352,7 @@ int main(int argc, char **argv) {
      * одного ответа, а не единогласия. ----------------------------------- */
     {
         mock_reset();
-        mock_force_push_refused(2, 1, 1, 1, 1); /* база: 2 из 3 прошли, 1 — сетевой отказ */
+        mock_force_push_refused(2, 1, 0, 1, 1); /* база: 2 из 3 прошли, 1 — сетевой отказ (fail, не err — probe.go:573-574) */
         mock_force_push(3, 0, 0, 1); /* прямой зонд: исходные три ответа */
         d2k_vres r = d2k_quic_classify("10.0.10.1", 443, "x.example", trig_hello(), ctl_hello(), 0);
         CHECK(r.verdict == D2K_V_CLEAR,
@@ -1317,7 +1367,7 @@ int main(int argc, char **argv) {
          * "неправильными" двумя, чтобы порог не оказался вырожденным
          * (закрытым для любого входа). */
         mock_reset();
-        mock_force_push_refused(0, 3, 1, 1, 1); /* база: 0 из 3, 1 — сетевой отказ, 2 — тишина */
+        mock_force_push_refused(0, 3, 0, 1, 1); /* база: 0 из 3, 1 — сетевой отказ, 2 — тишина (отказ — fail, не err) */
         d2k_vres r = d2k_quic_classify("10.0.10.2", 443, "x.example", trig_hello(), ctl_hello(), 0);
         CHECK(r.verdict == D2K_V_NO_QUIC,
               "pass=0,refused=1 — единственный случай тройки ревьюера, где сетевой отказ "
@@ -1420,16 +1470,101 @@ int main(int argc, char **argv) {
         close(g_rs_fd);
     }
 
-    /* --- НАХОДКА 5 РЕВЬЮ: аутентичный ответ БЕЗ кадра CRYPTO (только
-     * CONNECTION_CLOSE) — вежливый отказ, не прогресс, CLEAR запрещён ------ */
+    /* --- ОТВЕТ СЕРВЕРА — ЛЮБОЙ РАСШИФРОВАННЫЙ Initial, ВКЛЮЧАЯ
+     * CONNECTION_CLOSE БЕЗ CRYPTO. Прежде здесь была закреплена «находка 5
+     * ревью, круг 2» — отступление от оригинала (вежливый отказ не
+     * засчитывался). Критерий донора: Response.Answered()
+     * (z2k-detect/internal/quicprobe/parse.go:72-74) — KindInitial ставится
+     * за успешную расшифровку (parse.go:176-178), кадры на ответ не влияют.
+     * По AGENTS.md («не перепридумывать критерии оригинала») и плану
+     * .superpowers/sdd/2026-10-02-review-fixes, задача 10, паритет: CLEAR. */
     {
         g_rs_respond = 4; /* аутентично, но только CONNECTION_CLOSE, без CRYPTO */
         uint16_t port = rs_start();
         d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
-        CHECK(r.verdict != D2K_V_CLEAR,
-              "аутентичный CONNECTION_CLOSE без CRYPTO — вежливый отказ, не рукопожатие; CLEAR — "
-              "самая дорогая ошибка дерева (находка 5 ревью, круг 2)");
+        CHECK(r.verdict == D2K_V_CLEAR,
+              "аутентичный CONNECTION_CLOSE — ответ сервера у донора (parse.go:72-74), прямой "
+              "зонд 3/3 даёт clear (probe.go:326-327)");
         close(g_rs_fd);
+    }
+
+    /* --- Границы критерия донора на уровне одного пакета (parse.go:77-127):
+     * Retry засчитывается только для НАШЕЙ версии и типа; VN — по нулевой
+     * версии; обрезанный SCID и короткий заголовок — не ответ. ----------- */
+    {
+        uint8_t pkt[64];
+        size_t pl = build_retry_v1(pkt, sizeof pkt);
+        CHECK(d2k_quic_verify_response(pkt, pl, trig_hello()) == 0, "Retry v1 на v1 — ответ (parse.go:118-122)");
+        pkt[4] = 0x02;
+        CHECK(d2k_quic_verify_response(pkt, pl, trig_hello()) != 0, "Retry чужой версии — не ответ (parse.go:123-127)");
+        pl = build_vn_reply(pkt, sizeof pkt);
+        CHECK(d2k_quic_verify_response(pkt, pl, trig_hello()) == 0, "VN — ответ (parse.go:110-116)");
+        CHECK(d2k_quic_verify_response(pkt, 14, trig_hello()) != 0, "VN с обрезанным SCID — не ответ (parse.go:96-98)");
+        pkt[0] = 0x40;
+        CHECK(d2k_quic_verify_response(pkt, pl, trig_hello()) != 0, "короткий заголовок — не ответ (parse.go:81-85)");
+    }
+
+    /* --- Цель получает CONNECTION_CLOSE, контроль — ServerHello: у донора
+     * оба «ответили» (parse.go:72-74), прямой зонд 3/3 -> clear
+     * (probe.go:326-327), а не content/OPAQUE. ---------------------------- */
+    {
+        g_rs_respond = 6;
+        uint16_t port = rs_start();
+        d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
+        CHECK(r.verdict == D2K_V_CLEAR,
+              "CONNECTION_CLOSE на имя при ответившем контроле — clear донора, не OPAQUE");
+        close(g_rs_fd);
+    }
+
+    /* --- Контроль получает Retry (тег не проверяется — как у донора,
+     * parse.go:118-122): это ответ, база жива, замер продолжается прямым
+     * зондом; имя молчит -> content (OPAQUE), не NO_QUIC/ADDRESS. ------ */
+    {
+        g_rs_respond = 7;
+        uint16_t port = rs_start();
+        uint32_t saved_budget = d2k_quic_budget_s;
+        d2k_quic_budget_s = 2; /* хватает на шаги 1-2; вопросы дальше не нужны тесту */
+        d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
+        d2k_quic_budget_s = saved_budget;
+        CHECK(r.verdict == D2K_V_OPAQUE,
+              "Retry на контроль — ответ у донора (parse.go:72-74), замер обязан дойти до content");
+        CHECK(r.qprops.residual_blocking == D2K_PROP_NO,
+              "Retry на повторный контроль — ответ, остаточной блокировки нет");
+        close(g_rs_fd);
+    }
+
+    /* --- Контроль получает Version Negotiation: тоже ответ донора
+     * (parse.go:110-116 — по нулевой версии, без сверки CID). --------- */
+    {
+        g_rs_respond = 8;
+        uint16_t port = rs_start();
+        uint32_t saved_budget = d2k_quic_budget_s;
+        d2k_quic_budget_s = 2;
+        d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
+        d2k_quic_budget_s = saved_budget;
+        CHECK(r.verdict == D2K_V_OPAQUE,
+              "VN на контроль — ответ у донора (parse.go:72-74), замер обязан дойти до content");
+        close(g_rs_fd);
+    }
+
+    /* --- ICMP «порт недоступен» на ПРЯМОЙ зонд после ответившего контроля.
+     * Донор: отказ — не ответ (probe.go:573-574 считает его в Refused, не в
+     * NotBuilt), прямой зонд Answered==0 -> content (probe.go:322-337), и
+     * повторный контроль Answered==0 -> residual=true (probe.go:355). Не
+     * FLAKY «транспорт». Стенд режима 9 закрывает порт после трёх
+     * ответов базовой живости. ------------------------------------------ */
+    {
+        g_rs_respond = 9;
+        uint16_t port = rs_start();
+        uint32_t saved_budget = d2k_quic_budget_s;
+        d2k_quic_budget_s = 5;
+        d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
+        d2k_quic_budget_s = saved_budget;
+        CHECK(r.verdict == D2K_V_OPAQUE,
+              "ICMP на прямой зонд после ответившего контроля — content донора, не FLAKY");
+        CHECK(r.qprops.residual_blocking == D2K_PROP_YES,
+              "ICMP на повторный контроль — Answered==0, residual=true (probe.go:355)");
+        if (g_rs_fd >= 0) close(g_rs_fd);
     }
 
     /* --- нет UDP-ответа вовсе: настоящий ICMP port-unreachable -> pass==0 И
@@ -1469,6 +1604,18 @@ int main(int argc, char **argv) {
               "утверждать 'не решение коробки' (находка 3)");
         CHECK(strstr(r.reason, "не решение коробки") == NULL,
               "старая формулировка утверждала ровно то, чего знать нельзя (находка 3)");
+
+        /* Контракт оракула: ICMP-отказ — измеренная тишина, не «опыт не
+           состоялся». Донор measure (probe.go:573-579): case r.refused
+           стоит ДО case r.err, отказ не попадает в NotBuilt. */
+        uint32_t rtt_ms = 0;
+        int refused = -1, sent = -1;
+        d2k_tally t = real_ask("127.0.0.1", closed_port, NULL, 0, trig_hello(), 500, 0,
+                               D2K_QUIC_REPEATS, &rtt_ms, &refused, &sent, NULL);
+        CHECK(sent == D2K_QUIC_REPEATS && refused == D2K_QUIC_REPEATS,
+              "ICMP-отказ: все попытки ушли и получили отказ");
+        CHECK(t.err == 0 && t.pass == 0 && t.fail == D2K_QUIC_REPEATS,
+              "ICMP-отказ — «нет ответа» (fail), не err: донор probe.go:573-574");
     }
 
     /* --- НЕ ОТПРАВИЛОСЬ ни разу (наша сторона) -> FLAKY, НЕ UNREACHABLE

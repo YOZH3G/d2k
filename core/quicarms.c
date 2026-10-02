@@ -47,7 +47,10 @@ static int ask(d2k_quic_arm_context *c, d2k_quic_arm *r, int blob, int copies,
     step->sent=sent; step->answered=t.pass;
     if(sent>0) r->probes+=sent;
     if(!t.marked) c->marked=0;
-    /* Unsent/local failures are not negative network observations. */
+    /* Unsent/local failures are not negative network observations. An ICMP
+       refusal is not err (quic_ask_ex counts it as fail): donor measure
+       probe.go:573-574 keeps Refused out of NotBuilt, so askArms.ask
+       (arms.go:69-94) treats the question as asked and not passed. */
     if(sent!=D2K_QUIC_REPEATS || t.err>0) { r->incomplete=1; step->not_measured=3; return 0; }
     *measured=1;
     return t.pass==D2K_QUIC_REPEATS;

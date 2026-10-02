@@ -62,9 +62,10 @@
  * видел наш пакет и не знает DCID, не подделает тег), офф-путевую инъекцию
  * (та же причина) и посторонний UDP-сервис, ответивший на порт случайно или
  * по недоразумению (тег не сойдётся ни при каком DCID, которого у него нет).
- * Ставка от смешения этих двух вещей высокая: она разобрана ниже, у
- * qp_verify_server_response, вместе с тем, как проект её снижает (порог
- * успеха — не любой аутентичный Initial, а кадр CRYPTO внутри).
+ * Порог успеха — критерий донора (parse.go:72-74): любой расшифрованный
+ * Initial, Retry или Version Negotiation; прежний собственный порог «нужен
+ * кадр CRYPTO» снят планом 2026-10-02-review-fixes, задача 10 — см.
+ * комментарий у qp_donor_unauth_reply.
  *
  * ТРИГГЕР И КОНТРОЛЬ — ПАРАМЕТРЫ, А НЕ СОБИРАЮТСЯ ЗДЕСЬ. Причина НЕ в нехватке
  * криптографии (собрать структурно валидный самодельный Initial можно было бы
@@ -421,137 +422,75 @@ static int qp_dcid_of(const uint8_t *p, size_t n, uint32_t *version, size_t *off
 #define QP_VERSION_V2 0x6b3343cfu
 
 /* ---------------------------------------------------------------------
- * Внутри РАСШИФРОВАННОГО серверного Initial: хотя бы один кадр CRYPTO?
- * (правка ревью 2026-09-06 круг 2, находка 5). §8 спецификации требует
- * прикладной обмен, а не любые вернувшиеся байты; полного прикладного обмена
- * на уровне Initial нам не видно (ключи Handshake/1-RTT недоступны), но
- * РАЗЛИЧИТЬ "рукопожатие продвинулось" (кадр CRYPTO — часть ServerHello) от
- * "сервер вежливо отказал" (только CONNECTION_CLOSE) можно и обязательно:
- * серверный Initial мы РАСШИФРОВЫВАЕМ, значит кадры внутри видны. Это
- * доказательство СЛАБЕЕ, чем у TCP (там видны типы записей вплоть до
- * ApplicationData) — выше подняться нечем: дальше Initial у нас нет ключей
- * ни при каких обстоятельствах, ни здесь, ни в проде.
+ * ЧТО СЧИТАЕТСЯ ОТВЕТОМ — КРИТЕРИЙ ДОНОРА, БЕЗ ДОБАВОК.
  *
- * Разбор — тот же набор разрешённых в Initial типов, что и
- * collect_crypto_frames в quic.c (RFC 9000 §17.2.2), и по той же причине
- * (задача 2 разбирает клиентский Initial, эта функция — серверный; те же
- * основания для копии, что и у qp_parse_hdr выше). Короче: не реассемблирует
- * поток CRYPTO, останавливается на первом же кадре этого типа — достаточно
- * самого факта, координаты внутри ClientHello/ServerHello не нужны. */
-static int qp_progressed(const uint8_t *plain, size_t plen) {
-    size_t i = 0;
-    while (i < plen) {
-        uint8_t t = plain[i];
-        if (t == 0x00) { /* PADDING */
-            while (i < plen && plain[i] == 0x00) {
-                i++;
-            }
-            continue;
-        }
-        if (t == 0x01) { /* PING */
-            i++;
-            continue;
-        }
-        if (t == 0x02 || t == 0x03) { /* ACK / ACK_ECN */
-            size_t j = i + 1;
-            size_t w;
-            uint64_t largest, delay, range_count, first_range;
-            if (qp_varint(plain + j, plen - j, &largest, &w) != 0) {
-                break;
-            }
-            j += w;
-            if (qp_varint(plain + j, plen - j, &delay, &w) != 0) {
-                break;
-            }
-            j += w;
-            if (qp_varint(plain + j, plen - j, &range_count, &w) != 0) {
-                break;
-            }
-            j += w;
-            if (qp_varint(plain + j, plen - j, &first_range, &w) != 0) {
-                break;
-            }
-            j += w;
-            int ranges_ok = 1;
-            for (uint64_t r = 0; r < range_count; r++) {
-                uint64_t gap, rlen;
-                if (qp_varint(plain + j, plen - j, &gap, &w) != 0) {
-                    ranges_ok = 0;
-                    break;
-                }
-                j += w;
-                if (qp_varint(plain + j, plen - j, &rlen, &w) != 0) {
-                    ranges_ok = 0;
-                    break;
-                }
-                j += w;
-            }
-            if (!ranges_ok) {
-                break;
-            }
-            if (t == 0x03) {
-                uint64_t e0, e1, ecn;
-                if (qp_varint(plain + j, plen - j, &e0, &w) != 0) {
-                    break;
-                }
-                j += w;
-                if (qp_varint(plain + j, plen - j, &e1, &w) != 0) {
-                    break;
-                }
-                j += w;
-                if (qp_varint(plain + j, plen - j, &ecn, &w) != 0) {
-                    break;
-                }
-                j += w;
-            }
-            i = j;
-            continue;
-        }
-        if (t == 0x06) { /* CRYPTO — рукопожатие продвинулось, дальше читать незачем */
-            return 1;
-        }
-        if (t == 0x1c) { /* CONNECTION_CLOSE транспортного уровня — вежливый отказ, не прогресс */
-            size_t j = i + 1;
-            size_t w;
-            uint64_t err_code, frame_type, reason_len;
-            if (qp_varint(plain + j, plen - j, &err_code, &w) != 0) {
-                break;
-            }
-            j += w;
-            if (qp_varint(plain + j, plen - j, &frame_type, &w) != 0) {
-                break;
-            }
-            j += w;
-            if (qp_varint(plain + j, plen - j, &reason_len, &w) != 0) {
-                break;
-            }
-            j += w;
-            if (reason_len > (uint64_t)(plen - j)) {
-                break;
-            }
-            j += (size_t)reason_len;
-            i = j;
-            continue;
-        }
-        break; /* неразрешённый в Initial тип — дальше не гадаем, как и quic.c */
+ * Донор: z2k-detect/internal/quicprobe/parse.go, Parse (:77-179) и
+ * Response.Answered (:72-74). Ответ — одно из трёх:
+ *   - Version Negotiation: длинный заголовок, версия 0 (:110-116); CID с
+ *     нашими не сверяются, список версий не проверяется;
+ *   - Retry: тип Retry ДЛЯ НАШЕЙ версии и версия совпадает (:118-122); тег
+ *     целостности Retry (RFC 9001 §5.8) донор НЕ проверяет;
+ *   - Initial нашей версии, РАСШИФРОВАННЫЙ серверными ключами из нашего DCID
+ *     (:176-178) — любой: ACK-only, CONNECTION_CLOSE, CRYPTO. Кадры на
+ *     ответ не влияют.
+ * Всё прочее (короткий заголовок, чужой тип/версия, не раскрывшийся
+ * нашими ключами пакет) — не ответ, ожидание продолжается.
+ *
+ * Здесь раньше стояло отступление «нужен кадр CRYPTO» (правка ревью
+ * 2026-09-06 круг 2, находка 5) с доводом про инъекцию на пути. Оно
+ * отменено планом .superpowers/sdd/2026-10-02-review-fixes, задача 10:
+ * AGENTS.md — «не перепридумывать критерии оригинала». Граница
+ * доказательства та же, что у донора: Retry/VN не аутентифицированы, а
+ * Initial-ключи публичны для всякого, кто видел наш пакет.
+ * --------------------------------------------------------------------- */
+
+/* Retry/VN по donor Parse. 1 — ответ, 0 — не Retry/VN нашей версии, но
+   может оказаться Initial (решает дальнейший разбор), -1 — не ответ. */
+static int qp_donor_unauth_reply(const uint8_t *p, size_t n, uint32_t version) {
+    if (n < 7) {
+        return -1; /* parse.go:78-80 */
+    }
+    if ((p[0] & 0x80) == 0) {
+        return -1; /* короткий заголовок — KindForeign, parse.go:81-85 */
+    }
+    uint32_t ver = (uint32_t)p[1] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 8 | (uint32_t)p[4];
+    size_t off = 5;
+    size_t dcid_len = p[off++];
+    if (off + dcid_len > n) {
+        return -1; /* parse.go:91-93 */
+    }
+    off += dcid_len;
+    if (off >= n) {
+        return -1; /* parse.go:96-98 */
+    }
+    size_t scid_len = p[off++];
+    if (off + scid_len > n) {
+        return -1; /* parse.go:101-103 */
+    }
+    if (ver == 0) {
+        return 1; /* Version Negotiation, parse.go:110-116 */
+    }
+    uint8_t typ = (uint8_t)((p[0] & 0x30) >> 4);
+    uint8_t retry_type = version == QP_VERSION_V2 ? 0x00 : 0x03;   /* initial.go:64-67 */
+    uint8_t initial_type = version == QP_VERSION_V2 ? 0x01 : 0x00;
+    if (typ == retry_type && ver == version) {
+        return 1; /* Retry, parse.go:118-122 */
+    }
+    if (typ != initial_type || ver != version) {
+        return -1; /* KindForeign, parse.go:123-127 */
     }
     return 0;
 }
 
-/* Проверяет, что p[0..n) — АУТЕНТИЧНЫЙ Initial-пакет СЕРВЕРНОГО направления
- * для DCID (dcid, dcid_len), которым мы сами адресовали отправленную
- * датаграмму, И что рукопожатие внутри него ПРОДВИНУЛОСЬ (кадр CRYPTO, не
- * только CONNECTION_CLOSE — см. большой комментарий у qp_progressed и в
- * шапке файла про то, что проверка тега защищает НЕ от инъекции на пути:
- * ключи выводятся из DCID, лежащего в нашем же пакете открытым текстом,
- * значит подделать аутентичный Initial с CONNECTION_CLOSE внутри может
- * кто угодно на пути, и без проверки кадра "три раза получили вежливый
- * отказ, подделанный посторонним" превратилось бы в D2K_V_CLEAR — самую
- * дорогую ошибку дерева по его же доктрине). Возвращает 0, если оба условия
- * выполнены, -1 во всех остальных случаях. */
+/* Ответ сервера на датаграмму с DCID (dcid, dcid_len) версии version — по
+ * критерию донора (см. комментарий выше). Возвращает 0 — ответ, -1 — нет. */
 static int qp_verify_server_response(const uint8_t *p, size_t n,
                                       const uint8_t *dcid, size_t dcid_len,
                                       uint32_t version) {
+    int unauth = qp_donor_unauth_reply(p, n, version);
+    if (unauth != 0) {
+        return unauth > 0 ? 0 : -1;
+    }
     qp_hdr h;
     if (qp_parse_hdr(p, n, &h) != 0) {
         return -1;
@@ -592,18 +531,15 @@ static int qp_verify_server_response(const uint8_t *p, size_t n,
         return -1; /* заведомо больше любой правдоподобной Initial-датаграммы */
     }
     if (d2k_qw_open(&k, &qh, p, 0, plain, &plain_len, NULL) != 0) {
-        return -1; /* тег не сошёлся: похоже на ответ, но не доказательство */
+        return -1; /* не раскрывается нашими ключами — KindForeign, parse.go:171-175 */
     }
-
-    if (!qp_progressed(plain, plain_len)) {
-        return -1; /* аутентичный, но без кадра CRYPTO — вежливый отказ, не прогресс */
-    }
-    return 0;
+    return 0; /* KindInitial: любой расшифрованный Initial, parse.go:176-178 */
 }
 
 /* ---------------------------------------------------------------------
- * Базовая живость: зонд согласования версии (RFC 9000 §6). Проверка ответа
- * СТРУКТУРНАЯ, а не криптографическая — у Version Negotiation нет AEAD
+ * Базовая живость: зонд согласования версии (RFC 9000 §6). Ответ —
+ * донорский Answered() (см. qp_verify_vn); сам VN узнаётся СТРУКТУРНО, а не
+ * криптографически — у Version Negotiation нет AEAD
  * вовсе (ключи разворачивать не из чего: ответ по конструкции протокола НЕ
  * шифрован): длинный заголовок, поле версии — все нули (RFC 9000 §6:
  * "A Version Negotiation packet ... value of 0 for the Version field").
@@ -664,16 +600,6 @@ static size_t qp_build_vn_trigger(uint8_t *out, size_t cap) {
     return total;
 }
 
-static int qp_looks_like_vn(const uint8_t *p, size_t n) {
-    if (n < 5) {
-        return 0;
-    }
-    if ((p[0] & 0x80) == 0) {
-        return 0; /* не длинный заголовок */
-    }
-    return p[1] == 0 && p[2] == 0 && p[3] == 0 && p[4] == 0; /* версия нулевая — RFC 9000 §6 */
-}
-
 /* ---------------------------------------------------------------------
  * Оракул: серия ПАРАЛЛЕЛЬНЫХ попыток с единогласием (см. шапку файла,
  * находка 6 ревью).
@@ -691,7 +617,8 @@ static void nap_us(uint32_t us) {
    ожидание общее для всех попыток серии, см. quic_ask_ex. Возвращает fd
    готовый к чтению или -1, если попытка не состоялась (сбой
    сокета/адреса/отправки — тогда это "опыт не состоялся", d2k_tally.err, а
-   не тишина). *marked — 1, если метка подтверждена или не запрошена
+   не тишина); -2 — send() вернул ECONNREFUSED: ICMP-отказ на уже ушедшую
+   датаграмму (приманку), у донора это refused (probe.go:642-643). *marked — 1, если метка подтверждена или не запрошена
    (mark==0). Общая для quic_ask_ex (AEAD) и qp_ask_vn (VN) — байты есть
    байты, отправка не знает и не обязана знать, что внутри.
    prefix_ttl<=0 — TTL сокета не трогать (обычная приманка, умолчание
@@ -804,8 +731,9 @@ static int qp_send_one(const char *addr, uint16_t port,
         int copies = prefix_copies > 0 ? prefix_copies : 1;
         for (int c = 0; c < copies; c++) {
             if (send(fd, prefix, prefix_len, 0) < 0) {
+                int refused = errno == ECONNREFUSED;
                 close(fd);
-                return -1;
+                return refused ? -2 : -1;
             }
         }
         if (prefix_ttl > 0 && orig_ttl >= 0) {
@@ -820,8 +748,12 @@ static int qp_send_one(const char *addr, uint16_t port,
            An inserted settle delay changes the measured hypothesis. */
     }
     if (send(fd, msg.bytes, msg.len, 0) < 0) {
+        /* ICMP-отказ на предыдущую датаграмму всплыл на этом send():
+           донор exchange (probe.go:642-643) считает его refused, не
+           «не отправилось». */
+        int refused = errno == ECONNREFUSED;
         close(fd);
-        return -1;
+        return refused ? -2 : -1;
     }
     return fd;
 }
@@ -854,9 +786,15 @@ int d2k_quic_verify_response(const uint8_t *p, size_t n, d2k_hello msg) {
     return qp_verify_aead(p, n, msg);
 }
 
+/* Зонд согласования версии у донора идёт через ту же exchange/Parse, что и
+   любой вопрос (probe.go:303-307: probeSpec{dcid, ver: V1}), значит и
+   ответом для него служит тот же Answered(): VN, Retry v1 или Initial v1,
+   раскрывшийся ключами из DCID зонда. */
 static int qp_verify_vn(const uint8_t *p, size_t n, d2k_hello msg) {
-    (void)msg;
-    return qp_looks_like_vn(p, n) ? 0 : -1;
+    if (!msg.bytes || msg.len < 6 || (size_t)6 + msg.bytes[5] > msg.len) {
+        return -1;
+    }
+    return qp_verify_server_response(p, n, msg.bytes + 6, msg.bytes[5], QP_VERSION_V1);
 }
 
 /* Серия из repeats ПАРАЛЛЕЛЬНЫХ попыток: сначала ВСЕ уходят на провод (см.
@@ -868,8 +806,9 @@ static int qp_verify_vn(const uint8_t *p, size_t n, d2k_hello msg) {
    ОТПРАВИЛАСЬ (сбой socket()/connect()/send() в qp_send_one, наша сторона,
    к сети отношения не имеет) против попытка ОТПРАВИЛАСЬ и получила явный
    сетевой отказ (POLLERR/ошибка recv() — ICMP «порт недоступен» и подобное).
-   Обе считаются в err (d2k_tally не различает), но refused_out, если не
-   NULL, — только вторые: err ⊇ refused. sent_out, если не NULL, — сколько
+   Первые идут в err, вторые — в fail как «нет ответа» (донор
+   probe.go:573-574, план 2026-10-02-review-fixes задача 10); refused_out,
+   если не NULL, — число вторых. sent_out, если не NULL, — сколько
    ИЗ repeats ДЕЙСТВИТЕЛЬНО ушло на провод (repeats минус "не отправилось") —
    находка 4 ревью, круг 5: pass+fail тождественно равно repeats всегда (обе
    величины считают ВСЕ repeats попыток, просто по разным категориям), значит
@@ -1228,7 +1167,9 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
             t.marked = 0;
         }
         if (fds[i] < 0) {
-            result[i] = -1; /* не отправилось: socket()/connect()/send() в qp_send_one */
+            /* -1 не отправилось (socket()/connect()/send() в qp_send_one);
+               -2 сетевой отказ всплыл уже на send() — см. qp_send_one. */
+            result[i] = fds[i] == -2 ? -2 : -1;
             done[i] = 1;
         } else {
             result[i] = 0;
@@ -1338,7 +1279,12 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
         if (result[i] == 1) {
             t.pass++;
         } else if (result[i] == -2) {
-            t.err++;
+            /* ICMP-отказ — «нет ответа», не «опыт не состоялся». Донор
+               measure (probe.go:573-574): case r.refused стоит ДО case
+               r.err и в NotBuilt не попадает; дальше прямой зонд даёт
+               content (probe.go:322-337), повторный контроль —
+               residual=true (probe.go:355), плечо — «не прошло»
+               (arms.go:69-94). Отдельно виден только через refused_out. */
             t.fail++;
             refused++;
         } else if (result[i] == -1) {
@@ -2027,6 +1973,9 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                 all_marked = 0;
             }
 
+            /* err — только «не отправилось» (NotBuilt донора, probe.go:323).
+               ICMP-отказ сюда не попадает: он в fail, и молчащий прямой
+               зонд ведёт к content (probe.go:322-337). */
             if (base.err > 0) {
                 r.verdict = D2K_V_FLAKY;
                 reason_set(&r, "прямой зонд: %d/%d не состоялись — транспорт, не коробка", base.err,
@@ -2072,6 +2021,8 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                         r.verdict = D2K_V_FLAKY;
                         reason_set(&r, "остаточная блокировка: локальная ошибка, опыт не завершён");
                     } else {
+                        /* probe.go:355: hasResidual = Answered == 0 —
+                           ICMP-отказ на повторный контроль тоже «нет ответа». */
                         int residual = same.pass == 0;
                         r.qprops.residual_blocking = residual ? D2K_PROP_YES : D2K_PROP_NO;
                         r.qprops.residual_ignores_src_port = residual ? D2K_PROP_YES : D2K_PROP_UNKNOWN;

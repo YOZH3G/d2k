@@ -37,6 +37,7 @@
 #include "d2k_compose.h"
 #include "d2k_plantlv.h"
 #include "d2k_quicprobe.h"
+#include "d2k_quic_arms.h"
 /* d2k_quic_is_initial — им проверяется, что снятые приманки доехали в бинарник
    именно приветствиями, а не чем попало (см. test_blob_catalogue_is_captured). */
 #include "d2k_quic.h"
@@ -696,6 +697,44 @@ static void test_real_ttl_hook_on_wire(void) {
     close(fd);
 }
 
+/* ICMP «ПОРТ НЕДОСТУПЕН» НА ПЛЕЧО — ПЛЕЧО «НЕ ПРОШЛО», А НЕ «НЕ ИЗМЕРЕНО».
+ *
+ * Донор: askArms.ask (z2k-detect/internal/quicprobe/arms.go:69-94) считает
+ * вопрос незаданным только при NotBuilt>0; measure (probe.go:573-574) кладёт
+ * ICMP-отказ в Refused, не в NotBuilt — значит вопрос задан, ответа нет.
+ * Настоящий оракул плеча (d2k_quic_ask_arm_hook) на закрытый порт 127.0.0.1. */
+static uint16_t g_icmp_port;
+static d2k_tally icmp_arm_probe(const d2k_quic_arm_question *q, void *user, int *sent) {
+    (void)user;
+    return d2k_quic_ask_arm_hook(q, "x.example.com", g_icmp_port, 500, 0, sent);
+}
+
+static void test_real_arm_icmp_is_measured_silence(void) {
+    int probe = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(probe >= 0, "щуп свободного порта");
+    if (probe < 0) return;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(probe, (struct sockaddr *)&a, sizeof a);
+    socklen_t al = sizeof a;
+    getsockname(probe, (struct sockaddr *)&a, &al);
+    g_icmp_port = ntohs(a.sin_port);
+    close(probe); /* порт закрыт — настоящий ICMP port-unreachable */
+
+    static const char pool[1][D2K_QUIC_ADDR_LEN] = {"127.0.0.1"};
+    d2k_quic_arm_context c;
+    memset(&c, 0, sizeof c);
+    c.pool = pool; c.n_pool = 1; c.residual = 0; c.probe = icmp_arm_probe; c.marked = 1;
+    d2k_quic_arm r = d2k_quic_original_arms(&c);
+    CHECK(r.n_trace > 0, "первый вопрос лестницы задан");
+    CHECK(r.trace[0].sent == D2K_QUIC_REPEATS && r.trace[0].answered == 0,
+          "плечо ушло 3/3 и получило ICMP, ответов 0");
+    CHECK(r.trace[0].not_measured == 0,
+          "ICMP на плечо — «не прошло» (arms.go:69-94, probe.go:573-574), не «не измерено»");
+}
+
 /* ПОДОБРАННОЕ ПЛЕЧО ПЕРЕВОДИТСЯ В ПЛАН, И ПЛАН ЭТОТ ИСПОЛНИМ.
  *
  * До сих пор подбор плеча был вещью в себе: результат некуда было девать.
@@ -912,6 +951,7 @@ int main(void) {
 
     test_frag_builder_correctness();
     test_real_ttl_hook_on_wire();
+    test_real_arm_icmp_is_measured_silence();
 
     test_arm_to_plan();
     test_voice_plan();
