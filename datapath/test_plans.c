@@ -137,6 +137,48 @@ int main(void) {
         d2k_plantab_free(t);
     }
     {
+        /* Final review #3/#6: the member's OWN exact entry beats a family
+           BYPASS also through the ECH->MODERN fallback and through a
+           grandfathered (unshaped legacy) name entry for TCP TLS shapes.
+           BYPASS still removes the inherited suffix plan elsewhere, and a
+           grandfather entry does not override a QUIC exception. */
+        const uint8_t root[] = "own.test", child[] = "m.own.test", sib[] = "s.own.test";
+        const uint8_t old[] = "g.own.test";
+        d2k_plantab *t = d2k_plantab_new(8);
+        d2k_plan *group = mkplan(), *ech_group = mkplan(), *quic_group = mkplan();
+        d2k_plan *modern = mkplan(), *legacy_gf = mkplan();
+        CHECK(t && group && ech_group && quic_group && modern && legacy_gf, "own/bypass fixture");
+        if (t) {
+            CHECK(!d2k_plantab_set_suffix_family(t, root, sizeof root-1, 1, group,
+                                                 D2K_PLAN_SHAPE_MODERN, 4), "modern suffix");
+            CHECK(!d2k_plantab_set_suffix_family(t, root, sizeof root-1, 1, ech_group,
+                                                 D2K_PLAN_SHAPE_ECH_TCP, 4), "ech suffix");
+            CHECK(!d2k_plantab_set_suffix_family(t, root, sizeof root-1, 1, quic_group,
+                                                 D2K_PLAN_SHAPE_QUIC, 4), "quic suffix");
+            CHECK(!d2k_plantab_set_name_shaped(t, child, sizeof child-1, 2, modern,
+                                               D2K_PLAN_SHAPE_MODERN), "own exact TLS1.3");
+            CHECK(!d2k_plantab_set_bypass_family(t, child, sizeof child-1, 6,
+                                                 D2K_PLAN_SHAPE_ECH_TCP, 4), "ECH bypass");
+            CHECK(d2k_plantab_find(t, child, sizeof child-1, 0, 3,
+                                   D2K_PLAN_SHAPE_ECH_TCP) == modern,
+                  "ECH-shaped flow: own exact TLS1.3 entry must win over family BYPASS");
+            CHECK(!d2k_plantab_set_bypass_family(t, sib, sizeof sib-1, 6,
+                                                 D2K_PLAN_SHAPE_ECH_TCP, 4), "sibling ECH bypass");
+            CHECK(!d2k_plantab_find(t, sib, sizeof sib-1, 0, 3, D2K_PLAN_SHAPE_ECH_TCP),
+                  "ECH bypass without own entry still removes inherited plan");
+            CHECK(!d2k_plantab_set_name(t, old, sizeof old-1, 4, legacy_gf), "grandfather entry");
+            CHECK(!d2k_plantab_set_bypass_family(t, old, sizeof old-1, 6,
+                                                 D2K_PLAN_SHAPE_MODERN, 4), "modern bypass on legacy");
+            CHECK(!d2k_plantab_set_bypass_family(t, old, sizeof old-1, 17,
+                                                 D2K_PLAN_SHAPE_QUIC, 4), "quic bypass on legacy");
+            CHECK(d2k_plantab_find(t, old, sizeof old-1, 0, 5, D2K_PLAN_SHAPE_MODERN) == legacy_gf,
+                  "grandfathered exact name entry must win over family BYPASS (TCP TLS)");
+            CHECK(!d2k_plantab_find(t, old, sizeof old-1, 0, 5, D2K_PLAN_SHAPE_QUIC),
+                  "grandfather entry must not override a QUIC family exception");
+            d2k_plantab_free(t);
+        }
+    }
+    {
         d2k_plantab *t = d2k_plantab_new(8);
         const uint8_t a[16] = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,192,0,2,1};
         uint8_t b[16]; memcpy(b, a, 16); b[4] = 1;

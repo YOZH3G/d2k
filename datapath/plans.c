@@ -368,11 +368,6 @@ static entry *find_name_port(d2k_plantab *t, const uint8_t *name, size_t len,
     return NULL;
 }
 
-static entry *find_name_shape(d2k_plantab *t, const uint8_t *name, size_t len,
-                              uint8_t shape, uint8_t family) {
-    return find_name_shape_port(t, name, len, shape, 0, family);
-}
-
 /* Адресная запись — КЛЮЧ (адрес, семейство, форма протокола). Один IP может
    нести и QUIC, и STUN/голос, и TLS: подтверждённое на одном протоколе к
    другому отношения не имеет (D2K_SPEC §5), и одна запись на адрес давала
@@ -394,6 +389,45 @@ static entry *find_addr_shape(d2k_plantab *t, const uint8_t *addr, uint8_t famil
 
 static entry *find_addr(d2k_plantab *t, const uint8_t *addr, uint8_t family) {
     return find_addr_shape(t, addr, family, 1, 0);
+}
+
+/* ОДИН ПРОХОД НА ПРОМАХЕ ПЕРВОГО ПАКЕТА (финальное ревью, п.7). Прежде путь
+   без пробной записи звал find_name_shape/find_addr_shape до четырёх раз
+   подряд — своя форма, TLS 1.3 для ECH, дедушкина, любая. Здесь каждая
+   категория запоминается ПЕРВОЙ подходящей записью по индексу — ровно то,
+   что вернул бы соответствующий отдельный поиск, — и порядок предпочтения
+   решает вызывающий, как раньше. */
+typedef struct { entry *shaped, *modern, *grandfather, *any; } name_hits;
+typedef struct { entry *shaped, *modern, *grandfather, *any; } addr_hits;
+
+static void scan_name(d2k_plantab *t, const uint8_t *name, size_t len,
+                      uint8_t seen_shape, uint8_t family, name_hits *h) {
+    memset(h, 0, sizeof *h);
+    for (size_t i = 0; i < t->used; i++) {
+        entry *e = &t->v[i];
+        if (e->kind != KEY_NAME || e->family != family || e->only_sport != 0 ||
+            !name_eq(e->name, e->name_len, name, len)) continue;
+        if (!h->any) h->any = e;
+        if (!h->shaped && e->shape == seen_shape) h->shaped = e;
+        if (!h->modern && e->shape == D2K_PLAN_SHAPE_MODERN) h->modern = e;
+        if (!h->grandfather && e->shape == D2K_PLAN_SHAPE_GRANDFATHER) h->grandfather = e;
+    }
+}
+
+static void scan_addr(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+                      uint8_t seen_shape, addr_hits *h) {
+    memset(h, 0, sizeof *h);
+    if (!addr || (family != 4 && family != 6)) return;
+    for (size_t i = 0; i < t->used; i++) {
+        entry *e = &t->v[i];
+        if (e->kind != KEY_ADDR || e->family != family ||
+            memcmp(e->addr, addr, family == 6 ? 16 : 4) != 0) continue;
+        if (!h->any) h->any = e;
+        if (!h->shaped && seen_shape != D2K_PLAN_SHAPE_ANY && e->shape == seen_shape)
+            h->shaped = e;
+        if (!h->modern && e->shape == D2K_PLAN_SHAPE_MODERN) h->modern = e;
+        if (!h->grandfather && e->shape == D2K_PLAN_SHAPE_GRANDFATHER) h->grandfather = e;
+    }
 }
 
 /* Кандидат на вытеснение — запись с самой старой отметкой обращения.
@@ -995,24 +1029,30 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
             }
         }
         /* Сперва запись СВОЕЙ формы: у имени их может быть несколько.
-           Точная запись имени наблюдаемой формы — собственное подтверждённое
-           решение цели — сильнее исключения семейства (BYPASS): исключение
-           снимает унаследованный план, а не чужой точный (Task 22, §7). */
-        e = find_name_shape(t, name, len, seen_shape, family);
+           Точная запись имени — собственное подтверждённое решение цели —
+           сильнее исключения семейства (BYPASS): исключение снимает
+           унаследованный план, а не чужой точный (Task 22, §7). Своей
+           считается и запись TLS 1.3 для ECH-формы (тот же перенос, что
+           ниже), и — для TCP TLS — дедушкина запись имени без формы:
+           старое подтверждённое решение цели (финальное ревью, п.3, п.6).
+           Один проход по таблице на промахе (п.7), порядок прежний. */
+        name_hits h;
+        scan_name(t, name, len, seen_shape, family, &h);
+        e = h.shaped;
+        if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP) e = h.modern;
+        if (!e && shape_transport(seen_shape) == 6) e = h.grandfather;
         if (!e && area_bypassed(t, name, len, seen_shape, family)) return NULL;
-        if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP)
-            e = find_name_shape(t, name, len, D2K_PLAN_SHAPE_MODERN, family);
         if (!e) {
             /* Дедушкино право — отдельная запись, и она подходит любой
                форме (см. shape_fits). Ищем её только когда своей нет. */
-            e = find_name_shape(t, name, len, D2K_PLAN_SHAPE_GRANDFATHER, family);
+            e = h.grandfather;
         }
         if (!e) {
             const area_entry *area = area_match(t, name, len, seen_shape, family);
             if (area) return area->plan;
             /* Имя знаем, а формы такой у него нет — это отдельный факт, см.
                счётчик ниже. */
-            e = find_name(t, name, len, family);
+            e = h.any;
         }
         if (e) {
             /* Обращение продлевает жизнь записи — см. d2k_plans.h про то,
@@ -1040,17 +1080,17 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
        затем дедушкино право. Запись адреса другой формы не подходит: план,
        подтверждённый на STUN/голосе, QUIC Initial этого IP не достаётся, и
        наоборот (§5). */
-    entry *e = seen_shape == D2K_PLAN_SHAPE_ANY ? NULL
-             : find_addr_shape(t, addr, family, 0, seen_shape);
-    if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP)
-        e = find_addr_shape(t, addr, family, 0, D2K_PLAN_SHAPE_MODERN);
-    if (!e)
-        e = find_addr_shape(t, addr, family, 0, D2K_PLAN_SHAPE_GRANDFATHER);
+    /* Один проход по таблице (финальное ревью, п.7), порядок прежний. */
+    addr_hits a;
+    scan_addr(t, addr, family, seen_shape, &a);
+    entry *e = a.shaped;
+    if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP) e = a.modern;
+    if (!e) e = a.grandfather;
     if (e) {
         e->last_used_ns = now_ns;
         return e->plan;
     }
-    if (find_addr(t, addr, family)) {
+    if (a.any) {
         /* Адрес знаем, а протокола такого у него нет — тот же отдельный
            факт, что и у имени. */
         t->shape_misses++;
