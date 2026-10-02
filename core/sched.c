@@ -353,6 +353,7 @@ static d2k_voice_res voice_default(const d2k_voice_opt *opt) {
     return d2k_voice_run(opt);
 }
 d2k_sched_voice_fn d2k_sched_voice_hook = voice_default;
+d2k_sched_spawn_fn d2k_sched_spawn_hook = NULL;
 
 /* --------------------------------------------------------------------
  * Состояние задачи.
@@ -614,6 +615,14 @@ typedef struct {
        вопрос вместо стоящего кандидата (задача 20). */
     int        prop_installed;
     int        prop_applied;    /* план вопроса применён к пакетам НАШЕГО зонда */
+    /* РАННИЕ ПРИМЕНЕНИЯ ВОПРОСА — тем же приёмом, что ver_early у кандидата
+       (задача 24). Поток JOB_CONTACT возвращается сразу после посылки, а
+       d2kc читает события связи раньше тика: APPLIED приходит, пока задача
+       ещё в T_PROPS_CONTACT и ключ её потока не известен. Копятся полные
+       ключи применений ЭТОГО плана вопроса; сверка — при переходе в
+       T_PROPS_WAIT. Переполнение теряет улику, но не выдумывает её. */
+    d2k_flowkey prop_early[8];
+    size_t     prop_early_seen;
     int        prop_reply_seen;
     d2k_ev     prop_reply;
     int64_t    prop_until_ms;   /* потолок текущего шага */
@@ -1721,7 +1730,8 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
        лучше, чем сорванный замер. */
     int have_attr = pthread_attr_init(&attr) == 0;
     int sized = have_attr && pthread_attr_setstacksize(&attr, (size_t)1u << 20) == 0;
-    int created = pthread_create(&t->th, sized ? &attr : NULL, worker_run, a) == 0;
+    int created = (!d2k_sched_spawn_hook || d2k_sched_spawn_hook() == 0) &&
+                  pthread_create(&t->th, sized ? &attr : NULL, worker_run, a) == 0;
     if (have_attr) { pthread_attr_destroy(&attr); }
     if (!created) {
         if (a->use_fd >= 0) { close(a->use_fd); }
@@ -2121,6 +2131,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         t->probes++;
         s->probes_used++;
         t->prop_applied = 0;
+        t->prop_early_seen = 0;
         t->prop_reply_seen = 0;
         /* Подтверждения команды НЕ ждём, и это не спешка.
          *
@@ -4340,7 +4351,10 @@ static int family_recovery_eligible(const d2k_sched *s,const task *t) {
 static int family_recovery_start(d2k_sched *s, task *t) {
     if(t->family_fast || t->trigger_planned!=D2K_LINK_PLANNED_YES ||
        t->rx_volume_only || t->ech_offer || !installed_family_ready(s,t,0,1)) return 0;
-    if(t->transport==6 && d2k_hello_shape(t->trig,t->trig_len)!=t->trigger_shape) return 0;
+    /* Совместимость, а не равенство (задача 24): «не измерено» с любой
+       стороны не противоречит форме ключа (d2k_cat_shape_fits). */
+    if(t->transport==6 &&
+       !d2k_cat_shape_fits((uint8_t)d2k_hello_shape(t->trig,t->trig_len),t->trigger_shape)) return 0;
     d2k_group_key key;
     if(d2k_group_key_make(&key,t->transport,t->family,t->trigger_shape,
                          t->measure_path[0]?t->measure_path:"/","")) return 0;
@@ -4366,10 +4380,17 @@ static int family_recovery_start(d2k_sched *s, task *t) {
                 int confirmed=0;
                 for(size_t j=0;j<box->n_binds;j++) {
                     const d2k_cat_binding *bd=&box->binds[j];
-                    if(bd->enabled && bd->level>=3 && !strcmp(bd->kind,"name") &&
-                       !strcmp(bd->target,o->name) && !strcmp(bd->plan_id,o->plan_id) &&
+                    /* Наблюдение семейства хранит НОРМАЛИЗОВАННОЕ имя
+                       (d2k_group_learn), привязка — имя из SNI как пришло:
+                       сравнение сырых строк теряло брата, подтверждённого
+                       под «B.Example.COM.» (задача 24). */
+                    char bd_name[256];
+                    if(!bd->enabled || bd->level<3 || strcmp(bd->kind,"name") ||
+                       d2k_domain_normalize(bd->target,bd_name)) continue;
+                    if(!strcmp(bd_name,o->name) && !strcmp(bd->plan_id,o->plan_id) &&
                        (bd->transport?bd->transport:6)==key.transport &&
-                       (bd->family?bd->family:4)==key.family && bd->shape==key.shape &&
+                       (bd->family?bd->family:4)==key.family &&
+                       d2k_cat_shape_fits(bd->shape,key.shape) &&
                        !strcmp(bd->probe_path[0]?bd->probe_path:"/",key.probe_path) &&
                        !strcmp(bd->ech_origin,key.ech_origin)) confirmed=1;
                 }
@@ -4786,6 +4807,19 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     t->family_fast = 0;
     t->n_plans = 0;
     t->next_plan = 0;
+    /* ПЕРЕМЕР — НОВЫЙ ПОИСК, И БЮДЖЕТ У НЕГО СВОЙ (задача 24). Прежде задача
+       несла сюда зонды и список испытанных текстов прошлого поиска: после
+       долгого подбора перемер упирался в потолок зондов на первых шагах, а
+       known_plans и запасной перебор пропускали уже испытанные хэши — в том
+       числе только что подтверждённый план, который перемер и должен
+       проверить первым. Курсоры источников кандидатов сбрасываются вместе с
+       ними, иначе «свежий» перебор начинался бы с середины. */
+    t->probes = 0;
+    memset(t->tried, 0, sizeof t->tried);
+    t->n_tried = 0;
+    t->fb_next = 0;
+    t->rx_volume_next_variant = 0;
+    t->exec_refused = t->exec_probed = 0;
     say(s, "по %s привязка добыта заготовкой, а снимок клиента есть — "
            "перемеряю снимком: %zu байт", t->name, len);
     (void)launch_or_queue(s, t);
@@ -5259,6 +5293,26 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
             t->voice_silent = 0;
             t->voice_watch_ms = 0;
             t->state = T_VOICE_WATCH;
+            return;
+        }
+        if (t->state == T_PROPS_CONTACT) {
+            /* Ключа потока вопроса ещё нет — копим применение ЭТОГО плана
+               целиком; разберём при переходе в T_PROPS_WAIT. */
+            if (memcmp(ev->plan_id, t->prop_plan_id, D2K_PLAN_ID_LEN) != 0) { continue; }
+            int duplicate = 0;
+            for (size_t k = 0; k < t->prop_early_seen; k++) {
+                if (ev_matches_flow(ev, &t->prop_early[k])) { duplicate = 1; break; }
+            }
+            if (duplicate) { return; }
+            if (t->prop_early_seen == sizeof t->prop_early / sizeof t->prop_early[0]) { continue; }
+            d2k_flowkey *k = &t->prop_early[t->prop_early_seen++];
+            memset(k, 0, sizeof *k);
+            k->family = t->family;
+            memcpy(k->a_ip, ev->low_ip, t->family == 6 ? 16 : 4);
+            memcpy(k->b_ip, ev->high_ip, t->family == 6 ? 16 : 4);
+            k->a_port = ev->low_port;
+            k->b_port = ev->high_port;
+            k->transport = ev->transport;
             return;
         }
         if (t->state == T_PROPS_WAIT) {
@@ -5843,12 +5897,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                       "следующий поток наследует обход без отдельного замера",t->name);
                 task_done(t); moved++; continue;
             }
-            int recovery_waiting=0;
-            if(!family_recovery_eligible(s,t))
-                for(size_t j=0;j<SCHED_MAX_TASKS;j++)
-                    if(s->tasks[j].state==T_QUEUED && family_recovery_eligible(s,&s->tasks[j]))
-                        recovery_waiting=1;
-            if(recovery_waiting) continue;
+            /* Срок — ДО приоритета восстановления семейства (задача 24):
+               приоритет решает, кому достанется слот, а не продлевает жизнь
+               чужому подозрению. Прежде устаревшее ждало, пока восстановление
+               получит слот, и висело в очереди сверх SCHED_TASK_LIFE_MS. */
             if (now_ms - t->queued_ms > SCHED_TASK_LIFE_MS) {
                 say(s, "по %s подозрение устарело в очереди — сетевой замер не запускал",
                     t->name);
@@ -5856,6 +5908,12 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++;
                 continue;
             }
+            int recovery_waiting=0;
+            if(!family_recovery_eligible(s,t))
+                for(size_t j=0;j<SCHED_MAX_TASKS;j++)
+                    if(s->tasks[j].state==T_QUEUED && family_recovery_eligible(s,&s->tasks[j]))
+                        recovery_waiting=1;
+            if(recovery_waiting) continue;
             size_t active = measurements_in_flight(s);
             /* Once work has actually waited in the queue, pace its release
                even if a long-running measurement still occupies one slot.
@@ -6080,10 +6138,21 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 t->researched = 0;
                 t->n_plans = 0;
                 t->next_plan = 0;
+                char restart_name[sizeof t->name];
+                snprintf(restart_name, sizeof restart_name, "%s", t->name);
                 if (start_search(s, t)) {
                     moved++;
                     continue;
                 }
+                /* ПРОВАЛ ПЕРЕЗАПУСКА — КОНЕЦ ЗАДАЧИ (задача 24). start_search
+                   уже сбросил её (task_reset): разбирать дальше вердикт
+                   устаревшего прогона занулённой задачей значило завести
+                   T_PLANNING без имени, цели и формы. Результат прогона
+                   заготовкой выброшен выше сознательно — он не тех байт. */
+                say(s, "по %s повтор поиска снимком не запустился — задача снята, "
+                       "следующее подозрение начнёт поиск заново", restart_name);
+                moved++;
+                continue;
             }
             int volume_proven = t->transport == 6 &&
                 (t->vol.verdict == D2K_VOL_CUT || t->vol.rx_cut);
@@ -6266,6 +6335,21 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 t->prop_flow.b_port = t->port;
                 t->prop_flow.transport = 6;
                 t->state = T_PROPS_WAIT;
+                {
+                    /* Применение, пришедшее ещё в T_PROPS_CONTACT. */
+                    d2k_ev own;
+                    memset(&own, 0, sizeof own);
+                    own.family = t->prop_flow.family;
+                    memcpy(own.low_ip, t->prop_flow.a_ip, sizeof own.low_ip);
+                    memcpy(own.high_ip, t->prop_flow.b_ip, sizeof own.high_ip);
+                    own.low_port = t->prop_flow.a_port;
+                    own.high_port = t->prop_flow.b_port;
+                    own.transport = t->prop_flow.transport;
+                    for (size_t k = 0; k < t->prop_early_seen && !t->prop_applied; k++) {
+                        if (ev_matches_flow(&own, &t->prop_early[k])) { t->prop_applied = 1; }
+                    }
+                    t->prop_early_seen = 0;
+                }
                 t->prop_until_ms = now_ms + SCHED_PROP_STEP_MS;
                 say(s, "по %s зонд вопроса %d ушёл с местного порта %u — жду обмена",
                     t->name, t->prop_q + 1, (unsigned)t->c_port);
@@ -6707,6 +6791,19 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                         moved++;
                         continue;
                     }
+                }
+                if (t->probes >= SCHED_MAX_PROBES) {
+                    /* Кончился БЮДЖЕТ, а не кандидаты (задача 24, D2K_SPEC §3):
+                       поиск не завершён, и это не «обхода нет». */
+                    say(s, "по %s бюджет зондов исчерпан (зондов %d из %d) — поиск не "
+                           "завершён, это не «обхода нет»; цель отдыхает",
+                        t->name, t->probes, SCHED_MAX_PROBES);
+                    cooldown_record(s, t, 2);
+                    say(s, "по %s после исчерпания бюджета зондов новый поиск отложен на %lld мин",
+                        t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
+                    task_fail(s, t, now_ms);
+                    moved++;
+                    continue;
                 }
                 say(s, "по %s выведенные планы исчерпаны (зондов %d) — цель отдыхает. "
                        "Это не «перебор кончился»: планы выводятся из замера, и если "

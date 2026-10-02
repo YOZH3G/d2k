@@ -729,6 +729,37 @@ static int live_probes_used(d2k_sched *s) {
     return v;
 }
 
+/* Зонды ОДНОЙ активной задачи из живого файла ("probes" её записи). -1 —
+   задачи нет среди активных или файл не прочитан. */
+static int live_task_probes(d2k_sched *s, const char *target) {
+    char path[] = "/tmp/d2k-task-probes-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return -1;
+    close(fd);
+    int v = -1;
+    if (d2k_sched_write_live(s, path, "catalog.json") == 0) {
+        FILE *f = fopen(path, "r");
+        static char body[65536];
+        body[0] = 0;
+        if (f) { size_t got = fread(body, 1, sizeof body - 1, f); body[got] = 0; fclose(f); }
+        char needle[300];
+        snprintf(needle, sizeof needle, "\"target\": \"%s\"", target);
+        const char *at = strstr(body, needle);
+        if (at) at = strstr(at, "\"probes\": ");
+        if (at) v = atoi(at + strlen("\"probes\": "));
+    }
+    unlink(path);
+    return v;
+}
+
+/* Отказ запуска рабочего потока (задача 24): spawn_fail взводит тест,
+   spawn_refused считает изображённые отказы. */
+static int spawn_fail, spawn_refused;
+static int stub_spawn(void) {
+    if (spawn_fail) { spawn_refused++; return -1; }
+    return 0;
+}
+
 /* Безымянный QUIC по IPv6: задача by_addr, опыт — SET_ADDR_PROBE. */
 static d2k_ev addr_quic_suspect(uint16_t port) {
     d2k_ev su = ev_suspect(17, port);
@@ -1413,8 +1444,9 @@ int main(int argc, char **argv) {
     int groups_only = argc == 2 && strcmp(argv[1], "--groups-only") == 0;
     int retire_only = argc == 2 && strcmp(argv[1], "--retire-only") == 0;
     int recheck_only = argc == 2 && strcmp(argv[1], "--recheck-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only) {
-        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only]\n");
+    int lifecycle_only = argc == 2 && strcmp(argv[1], "--lifecycle-only") == 0;
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only]\n");
         return 2;
     }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
@@ -1450,6 +1482,7 @@ int main(int argc, char **argv) {
     d2k_sched_rx_ver_hook = stub_ver;
     d2k_sched_rx_gzip_ver_hook = stub_ver;
     d2k_sched_mark_hook = stub_mark;
+    d2k_sched_spawn_hook = stub_spawn;
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -1810,6 +1843,7 @@ int main(int argc, char **argv) {
     if (question_only) { goto question_test; }
     if (retire_only) { goto retire_test; }
     if (recheck_only) { goto recheck_test; }
+    if (lifecycle_only) { goto lifecycle_test; }
     if (shape_only) { goto shape_test; }
     {
         d2k_catalog empty = {0};
@@ -4782,6 +4816,307 @@ recheck_test:
         d2k_catalog_free(&c);
     }
     if (recheck_only) { goto voice_only_done; }
+lifecycle_test:
+    /* --- ЗАДАЧА 24: жизненный цикл задачи --------------------------------
+       (1) провал запуска замера при перезапуске снимком не оставляет зомби;
+       (2) перемер снимком получает свежий бюджет и сначала проверяет уже
+           подтверждённый план; (3) просроченное T_QUEUED снимается, пока
+           восстановление семейства ждёт слота; (4) APPLIED вопроса, пришедший
+           до T_PROPS_WAIT, засчитан; (5) восстановление семейства находит
+           планы братьев при другом регистре имени и совместимой форме;
+           (6) исчерпание бюджета зондов не называется «планы исчерпаны». */
+    {
+        /* (1) Поздний TCP-снимок перезапускает поиск, а рабочий поток не
+           заводится. start_search уже сбросил задачу — продолжать разбор
+           старого вердикта занулённой задачей нельзя. */
+        d2k_catalog c1 = {0};
+        d2k_sched *s = d2k_sched_new(&c1, sv[0], 0x2d);
+        tcp_wait_until_stop = 1; tcp_release_waiters = 0;
+        tcp_saw_stop = tcp_stop_count = tcp_calls = 0;
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev h = ev_hello(6, 41301, "restart.fail.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 41301);
+        d2k_sched_event(s, &su);
+        spin(s, 30);
+        CHECK(tcp_calls == 1, "lifecycle/restart: первый замер не начался");
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "restart.fail.example",
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "lifecycle/restart: снимок");
+        d2k_sched_event(s, &sh);
+        spawn_fail = 1;
+        tcp_release_waiters = 1;
+        drain(); forget_sent();
+        spin(s, 80);
+        tcp_wait_until_stop = 0; tcp_release_waiters = 0;
+        CHECK(said("повторяю поиск его байтами"), "lifecycle/restart: перезапуск снимком не начат");
+        CHECK(spawn_refused > 0, "lifecycle/restart: отказ запуска потока не случился");
+        CHECK(d2k_sched_active(s) == 0,
+              "lifecycle/restart: после провала запуска осталась задача-зомби");
+        spawn_fail = 0;
+        settle(s);
+        /* Пустое имя в трассе («по  ...») — та самая задача-зомби: сброшенная
+           задача продолжала разбор старого вердикта. */
+        CHECK(!said("по  "), "lifecycle/restart: задача без имени продолжила поиск");
+        CHECK(said("по restart.fail.example повтор поиска снимком не запустился"),
+              "lifecycle/restart: провал перезапуска не назван");
+        CHECK(sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0) == 0,
+              "lifecycle/restart: задача без имени поставила пробный план");
+        d2k_sched_free(s); d2k_catalog_free(&c1);
+        tcp_answer = D2K_V_OPAQUE;
+    }
+    {
+        /* (2) Подтверждённое заготовкой после многих промахов (бюджет почти
+           потрачен), затем снимок клиента. Перемер — новый поиск: свежий
+           бюджет и ранее подтверждённый план — первым кандидатом. */
+        d2k_catalog c2 = {0};
+        d2k_sched *s = d2k_sched_new(&c2, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_calls = 0; ver_fail_first = 12;
+        ver_answer_port = 41311;
+        forget_sent();
+        d2k_ev h = ev_hello(6, 41311, "remeasure.budget.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 41311);
+        d2k_sched_event(s, &su);
+        for (int i = 0; i < 60 && ver_calls <= ver_fail_first; i++) { skip_ahead(s, 6000); spin(s, 40); }
+        settle(s);
+        d2k_ev ap = ev_applied(6, 41311);
+        d2k_sched_event(s, &ap);
+        spin(s, 40);
+        const d2k_cat_binding *bd = binding_of(&c2, "remeasure.budget.example", 6);
+        CHECK(bd != NULL && bd->input == D2K_INPUT_PROFILE,
+              "lifecycle/remeasure: подтверждение заготовкой не записано");
+        char confirmed_plan[40] = {0};
+        if (bd) snprintf(confirmed_plan, sizeof confirmed_plan, "%s", bd->plan_id);
+        ver_fail_first = 0;
+        ver_answer_port = 41312;
+        saidbuf[0] = '\0';
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "remeasure.budget.example",
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "lifecycle/remeasure: снимок");
+        d2k_sched_event(s, &sh);
+        CHECK(said("перемеряю снимком"), "lifecycle/remeasure: перемер не начат");
+        int probes_after = live_task_probes(s, "remeasure.budget.example");
+        printf("lifecycle/remeasure: probes after remeasure start = %d\n", probes_after);
+        CHECK(probes_after == 0,
+              "lifecycle/remeasure: перемер унаследовал бюджет зондов прошлого поиска");
+        settle(s);
+        CHECK(said("готовых планов узнанной коробки"),
+              "lifecycle/remeasure: ранее подтверждённый план не проверен первым");
+        d2k_ev ap2 = ev_applied(6, 41312);
+        d2k_sched_event(s, &ap2);
+        spin(s, 40);
+        bd = binding_of(&c2, "remeasure.budget.example", 6);
+        CHECK(bd != NULL && bd->input == D2K_INPUT_CLIENT && !strcmp(bd->plan_id, confirmed_plan),
+              "lifecycle/remeasure: перемер не подтвердил прежний план байтами клиента");
+        d2k_sched_free(s); d2k_catalog_free(&c2);
+    }
+    {
+        /* (6) Бюджет зондов кончается раньше кандидатов: каждый кандидат
+           переиспытывается после временных отказов отправки. Это неполный
+           поиск, а не «планы исчерпаны» (D2K_SPEC §3). */
+        d2k_catalog c6 = {0};
+        d2k_sched *s = d2k_sched_new(&c6, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        ver_answer_port = 41361; ver_calls = 0;
+        d2k_ev h = ev_hello(6, 41361, "budget.out.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 41361);
+        d2k_sched_event(s, &su);
+        settle(s);
+        int done = 0;
+        for (int i = 0; i < 400 && !done; i++) {
+            d2k_ev tmp = ev_refused(6, 41361, D2K_REFUSE_QUEUE, 1);
+            d2k_sched_event(s, &tmp);
+            skip_ahead(s, 6000);
+            spin(s, 30);
+            done = said("цель отдыхает") || said("бюджет зондов исчерпан") ||
+                   said("новый поиск отложен");
+        }
+        CHECK(done, "lifecycle/budget: поиск не завершился");
+        CHECK(said("бюджет зондов исчерпан"),
+              "lifecycle/budget: исчерпание бюджета зондов не названо");
+        CHECK(!said("выведенные планы исчерпаны"),
+              "lifecycle/budget: исчерпание бюджета выдано за исчерпание планов");
+        CHECK(total_bindings(&c6) == 0, "lifecycle/budget: отказ отправки записан успехом");
+        d2k_sched_free(s); d2k_catalog_free(&c6);
+    }
+    {
+        /* (4) APPLIED вопроса приходит, пока задача ещё в T_PROPS_CONTACT:
+           рабочий поток вернулся сразу после посылки, а d2kc читает события
+           связи раньше тика. Применение засчитывается после перехода. */
+        uint16_t saved_port = g_server_port;
+        int lfd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(0x7f000001);
+        int bound = 0;
+        for (uint16_t port = 19500; port < 19600 && !bound; port++) {
+            a.sin_port = htons(port);
+            bound = (bind(lfd, (struct sockaddr *)&a, sizeof a) == 0);
+        }
+        CHECK(lfd >= 0 && bound, "lifecycle/question: стенд-цель не привязалась");
+        socklen_t al = sizeof a;
+        CHECK(getsockname(lfd, (struct sockaddr *)&a, &al) == 0 && listen(lfd, 4) == 0,
+              "lifecycle/question: стенд-цель не слушает");
+        g_server_port = ntohs(a.sin_port);
+        d2k_catalog c4 = {0};
+        d2k_sched *s = d2k_sched_new(&c4, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_OPAQUE; tcp_owns_search = tcp_found_arm = 0;
+        d2k_ev h = ev_hello(6, 41341, "early.question.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 41341);
+        d2k_sched_event(s, &su);
+        for (int i = 0; i < 200 && !said("спрашиваю коробку о свойствах"); i++) tick_once(s);
+        CHECK(said("спрашиваю коробку о свойствах"), "lifecycle/question: вопрос не задан");
+        uint8_t qid[D2K_PLAN_ID_LEN] = {0};
+        CHECK(last_plan_id(qid), "lifecycle/question: id вопроса не прочитан");
+        int peer = -1;
+        for (int i = 0; i < 400 && peer < 0; i++) {
+            struct pollfd p2; p2.fd = lfd; p2.events = POLLIN; p2.revents = 0;
+            if (poll(&p2, 1, 5) > 0) {
+                struct sockaddr_in pa;
+                socklen_t pl = sizeof pa;
+                peer = accept(lfd, (struct sockaddr *)&pa, &pl);
+                if (peer >= 0) { a = pa; break; }
+            }
+            tick_once(s);
+        }
+        CHECK(peer >= 0, "lifecycle/question: зонд вопроса не пришёл к цели");
+        CHECK(!said("жду обмена"), "lifecycle/question: стенд не воспроизводит T_PROPS_CONTACT");
+        d2k_ev x;
+        memset(&x, 0, sizeof x);
+        x.transport = 6;
+        x.low_ip[0] = 127; x.low_ip[3] = 1; x.low_port = g_server_port;
+        x.high_ip[0] = 127; x.high_ip[3] = 1; x.high_port = ntohs(a.sin_port);
+        x.kind = D2K_EV_APPLIED;
+        memcpy(x.plan_id, qid, sizeof qid);
+        d2k_sched_event(s, &x);
+        for (int i = 0; i < 400 && !said("жду обмена"); i++) tick_once(s);
+        CHECK(said("жду обмена"), "lifecycle/question: ожидание обмена не началось");
+        x.kind = D2K_EV_EXCHANGE;
+        memset(x.plan_id, 0, sizeof x.plan_id);
+        x.code = 22; x.num = 1380; x.seen_types = 0x0C; x.server_hello = 1;
+        d2k_sched_event(s, &x);
+        CHECK(said("вопрос 1 прошёл"),
+              "lifecycle/question: ранний APPLIED вопроса потерян в T_PROPS_CONTACT");
+        CHECK(!said("жду подтверждения полного исполнения"),
+              "lifecycle/question: ответ ждёт применения, которое уже пришло");
+        d2k_sched_free(s); d2k_catalog_free(&c4);
+        if (peer >= 0) close(peer);
+        close(lfd);
+        g_server_port = saved_port;
+    }
+    {
+        /* (5) Братья семейства подтверждены под именами в другом регистре
+           (SNI клиента не нормализован), новый член пишется
+           WWW.Mixed.NET. — восстановление обязано найти их планы. Второй
+           каталог: формы привязок братьев не измерены (0), что совместимо
+           с формой ключа семейства. */
+        for (int variant = 0; variant < 2; variant++) {
+            static const char *mixed[4] = {"A.Mixed.NET", "b.MIXED.net.", "C.mixed.Net", "d.Mixed.net"};
+            static const char *plain[4] = {"a.shape.net", "b.shape.net", "c.shape.net", "d.shape.net"};
+            const char **names = variant == 0 ? mixed : plain;
+            const char *member = variant == 0 ? "WWW.Mixed.NET." : "www.shape.net";
+            int saved_buf = 256 * 1024;
+            (void)setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &saved_buf, sizeof saved_buf);
+            tcp_answer = D2K_V_PREFIX; tcp_found_arm = 0; tcp_owns_search = 0; ver_fail_first = 0;
+            d2k_catalog c5 = {0};
+            for (int i = 0; i < 4; i++) confirm_once(&c5, sv[0], names[i], (uint16_t)(41350 + variant * 10 + i));
+            if (variant == 1) {
+                for (int i = 0; i < 4; i++) {
+                    d2k_cat_binding *m = binding_mut(&c5, names[i], 6);
+                    CHECK(m != NULL, "lifecycle/family: привязка брата не найдена");
+                    if (m) m->shape = 0;
+                }
+            }
+            d2k_group_key key = {0}; key.transport = 6; key.family = 4; key.shape = 1;
+            strcpy(key.probe_path, "/");
+            CHECK(d2k_group_match(c5.groups, member, &key) != NULL,
+                  "lifecycle/family: семейство братьев не выучено");
+            d2k_sched *s = d2k_sched_new(&c5, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            d2k_ev ack = {0}; ack.kind = D2K_EV_ACK; ack.code = D2K_CMD_SET_SUFFIX; ack.num = 1u << 8;
+            area_ack_id(&ack);
+            d2k_sched_event(s, &ack); sync_out(s);
+            tcp_calls = vol_calls = ver_calls = 0;
+            uint16_t port = (uint16_t)(41358 + variant * 10);
+            ver_answer_port = port;
+            d2k_ev h = ev_hello(6, port, member); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, port); su.planned = D2K_LINK_PLANNED_YES;
+            su.code = D2K_SUSPECT_SILENT; su.client_shape = D2K_SHAPE_MODERN;
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(said("собственных планов семейства"),
+                  variant == 0 ? "lifecycle/family: регистр имени брата скрыл его план"
+                               : "lifecycle/family: совместимая форма привязки брата отвергнута");
+            CHECK(ver_calls > 0 && tcp_calls == 0 && vol_calls == 0,
+                  "lifecycle/family: восстановление семейства ушло в полный замер");
+            d2k_sched_free(s); d2k_catalog_free(&c5);
+        }
+    }
+    {
+        /* (3) Два слота заняты, в очереди — обычное подозрение O, позже —
+           восстановление семейства R. Срок жизни O истекает: O снимается
+           в том же круге, а не ждёт, пока R получит слот. */
+        d2k_catalog c3 = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_found_arm = 0; tcp_owns_search = 0; ver_fail_first = 0;
+        for (int i = 0; i < 4; i++) {
+            char nm[64];
+            snprintf(nm, sizeof nm, "%c.queue.net", 'a' + i);
+            confirm_once(&c3, sv[0], nm, (uint16_t)(41370 + i));
+        }
+        d2k_sched *s = d2k_sched_new(&c3, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        d2k_ev ack = {0}; ack.kind = D2K_EV_ACK; ack.code = D2K_CMD_SET_SUFFIX; ack.num = 1u << 8;
+        area_ack_id(&ack);
+        d2k_sched_event(s, &ack); sync_out(s);
+        tick_once(s);
+        tcp_wait_until_stop = 1; tcp_release_waiters = 0; tcp_calls = 0;
+        for (uint16_t port = 41381; port < 41383; port++) {
+            d2k_ev h = ev_hello(6, port, port == 41381 ? "busy-q1.example" : "busy-q2.example");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+        }
+        spin(s, 5);
+        d2k_ev h = ev_hello(6, 41383, "old-queued.example"); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 41383); d2k_sched_event(s, &su);
+        CHECK(said("по old-queued.example подозрение сохранено в ограниченной очереди"),
+              "lifecycle/queue: обычное подозрение не встало в очередь");
+        int64_t queued_at = g_now_ms;
+        skip_ahead(s, 9 * 60 * 1000);
+        h = ev_hello(6, 41384, "new.queue.net"); d2k_sched_event(s, &h);
+        su = ev_suspect(6, 41384); su.planned = D2K_LINK_PLANNED_YES;
+        su.code = D2K_SUSPECT_SILENT; su.client_shape = D2K_SHAPE_MODERN;
+        d2k_sched_event(s, &su);
+        CHECK(said("по new.queue.net подозрение сохранено в ограниченной очереди"),
+              "lifecycle/queue: восстановление семейства не ждёт слота");
+        saidbuf[0] = '\0';
+        skip_ahead(s, queued_at + 10 * 60 * 1000 + 1000 - g_now_ms);
+        CHECK(said("по old-queued.example подозрение устарело в очереди"),
+              "lifecycle/queue: просроченное подозрение ждёт слота восстановления семейства");
+        tcp_wait_until_stop = 0; tcp_release_waiters = 1;
+        d2k_sched_free(s); d2k_catalog_free(&c3);
+        tcp_release_waiters = 0;
+    }
+    if (lifecycle_only) { goto voice_only_done; }
     /* --- узнанная коробка отдаёт свои планы, и успех идёт ЕЙ ----------- */
     {
         d2k_catalog c6;
