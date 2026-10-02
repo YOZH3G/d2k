@@ -457,18 +457,6 @@ static int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t cap, 
     return 0;
 }
 
-/* Профиль декодируется лениво и один раз в статический буфер — тот же
- * приём ленивой однократной сборки, что применялся в props.c,
- * и по той же причине: не пакетный путь, незачем повторять decode на
- * каждый вызов d2k_hello_from_profile. */
-static uint8_t g_profile_modern[TEMPLATE_MAX];
-static size_t  g_profile_modern_len;
-static int     g_profile_modern_ready;
-
-static uint8_t g_profile_legacy[TEMPLATE_MAX];
-static size_t  g_profile_legacy_len;
-static int     g_profile_legacy_ready;
-
 int d2k_hello_rename(const uint8_t *ch, size_t n, const char *sni,
                      uint8_t *out, size_t cap, size_t *out_len) {
     if (!ch || !sni || !out || !out_len) {
@@ -556,28 +544,20 @@ int d2k_hello_from_profile(d2k_shape s, const char *sni, uint8_t *out, size_t ca
         return -1; /* пустое имя — не имя, как в tls.c */
     }
 
-    const uint8_t *tmpl;
-    size_t tmpl_len;
+    /* Профиль декодируется в локальный буфер на каждый вызов: общий ленивый
+       статический буфер гонялся бы между рабочими потоками. */
+    uint8_t tmpl[TEMPLATE_MAX];
+    size_t tmpl_len = 0;
     if (s == D2K_SHAPE_MODERN) {
-        if (!g_profile_modern_ready) {
-            if (hex_decode(d2k_profile_modern_hex, sizeof(d2k_profile_modern_hex) - 1,
-                            g_profile_modern, sizeof g_profile_modern, &g_profile_modern_len) != 0) {
-                return -1;
-            }
-            g_profile_modern_ready = 1;
+        if (hex_decode(d2k_profile_modern_hex, sizeof(d2k_profile_modern_hex) - 1,
+                       tmpl, sizeof tmpl, &tmpl_len) != 0) {
+            return -1;
         }
-        tmpl = g_profile_modern;
-        tmpl_len = g_profile_modern_len;
     } else if (s == D2K_SHAPE_LEGACY) {
-        if (!g_profile_legacy_ready) {
-            if (hex_decode(d2k_profile_legacy_hex, sizeof(d2k_profile_legacy_hex) - 1,
-                            g_profile_legacy, sizeof g_profile_legacy, &g_profile_legacy_len) != 0) {
-                return -1;
-            }
-            g_profile_legacy_ready = 1;
+        if (hex_decode(d2k_profile_legacy_hex, sizeof(d2k_profile_legacy_hex) - 1,
+                       tmpl, sizeof tmpl, &tmpl_len) != 0) {
+            return -1;
         }
-        tmpl = g_profile_legacy;
-        tmpl_len = g_profile_legacy_len;
     } else {
         return -1; /* UNKNOWN — профиля для него не бывает */
     }

@@ -6,6 +6,9 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/socket.h>
 
 #include "d2k_tls12.h"
 
@@ -59,10 +62,82 @@ static void test_prf_partial_block(void) {
           "короткая развёртка PRF не совпала с началом длинной");
 }
 
+/* Два соединения одновременно собирают ClientHello с разными SNI; барьер
+ * между сборкой и отправкой заставляет обе сборки закончиться до первой
+ * отправки. Общий статический буфер дал бы обоим одно и то же приветствие. */
+static pthread_mutex_t bar_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t bar_cv = PTHREAD_COND_INITIALIZER;
+static int bar_n;
+
+static void test_barrier(void) {
+    pthread_mutex_lock(&bar_mu);
+    bar_n++;
+    if (bar_n >= 2) {
+        pthread_cond_broadcast(&bar_cv);
+    } else {
+        while (bar_n < 2) { pthread_cond_wait(&bar_cv, &bar_mu); }
+    }
+    pthread_mutex_unlock(&bar_mu);
+}
+
+struct conn_arg { int fd; const char *sni; };
+
+static void *conn_thread(void *p) {
+    struct conn_arg *a = p;
+    d2k_tls12 *t = NULL;
+    char err[128];
+    if (d2k_tls12_connect(a->fd, a->sni, 3000, 0, &t, err, sizeof err) == 0) {
+        d2k_tls12_free(t);
+    }
+    return NULL;
+}
+
+static int has_str(const unsigned char *b, size_t n, const char *s) {
+    size_t m = strlen(s);
+    for (size_t i = 0; i + m <= n; i++) {
+        if (memcmp(b + i, s, m) == 0) { return 1; }
+    }
+    return 0;
+}
+
+static void test_clienthello_not_shared(void) {
+    const char *snia = "alpha-aaaa.example.com", *snib = "bravo-b.example.org";
+    d2k_tls12_test_barrier = test_barrier;
+    for (int it = 0; it < 200; it++) {
+        int sa[2], sb[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sa) != 0 ||
+            socketpair(AF_UNIX, SOCK_STREAM, 0, sb) != 0) {
+            check(0, "socketpair");
+            return;
+        }
+        bar_n = 0;
+        struct conn_arg aa = { sa[0], snia }, ab = { sb[0], snib };
+        pthread_t ta, tb;
+        pthread_create(&ta, NULL, conn_thread, &aa);
+        pthread_create(&tb, NULL, conn_thread, &ab);
+        unsigned char ba[2048], bb[2048];
+        ssize_t na = recv(sa[1], ba, sizeof ba, 0);
+        ssize_t nb = recv(sb[1], bb, sizeof bb, 0);
+        int ok = na > 5 && nb > 5 &&
+                 has_str(ba, (size_t)na, snia) && !has_str(ba, (size_t)na, snib) &&
+                 has_str(bb, (size_t)nb, snib) && !has_str(bb, (size_t)nb, snia);
+        close(sa[1]); close(sb[1]);
+        pthread_join(ta, NULL);
+        pthread_join(tb, NULL);
+        close(sa[0]); close(sb[0]);
+        if (!ok) {
+            check(0, "ClientHello двух параллельных соединений общий: SNI чужого соединения");
+            break;
+        }
+    }
+    d2k_tls12_test_barrier = NULL;
+}
+
 int main(void) {
     printf("TLS 1.2: проверки без сети\n");
     test_prf_vector();
     test_prf_partial_block();
+    test_clienthello_not_shared();
     if (fails) { printf("TLS 1.2: ПРОВАЛОВ %d\n", fails); return 1; }
     printf("TLS 1.2: все проверки прошли\n");
     return 0;

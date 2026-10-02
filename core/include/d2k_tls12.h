@@ -73,4 +73,9 @@ void d2k_tls12_prf_for_test(const uint8_t *secret, size_t slen, const char *labe
                             const uint8_t *seed, size_t seed_len,
                             uint8_t *out, size_t out_len);
 
+/* Только для теста гонки: вызывается между сборкой ClientHello и отправкой.
+ * По умолчанию NULL. Позволяет детерминированно развести две сборки во
+ * времени и убедиться, что у соединений нет общего буфера. */
+extern void (*d2k_tls12_test_barrier)(void);
+
 #endif /* D2K_TLS12_H */

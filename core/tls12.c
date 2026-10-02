@@ -472,6 +472,8 @@ static size_t ch12_build(const char *sni, const uint8_t random[32],
     return 5 + 4 + body_len;
 }
 
+void (*d2k_tls12_test_barrier)(void);
+
 int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
                       d2k_tls12 **out, char *err, size_t errcap) {
     if (!out) { say(err, errcap, "некуда положить сессию"); return -1; }
@@ -481,18 +483,21 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
     t->peer_name = -1;
     int64_t deadline = now_ms() + (deadline_ms > 0 ? deadline_ms : 5000);
 
-    static uint8_t ch[REC_MAX + 5];
+    /* Буфер приветствия — в структуре соединения, не static: connect идёт
+       из нескольких рабочих потоков, общий буфер смешал бы чужие SNI. */
+    uint8_t *ch = t->wire;
     if (d2k_t13_random(t->c_random, 32) != 0) {
         say(err, errcap, "нет случайных байт");
         free(t);
         return -1;
     }
-    size_t hello_len = ch12_build(sni, t->c_random, want_wire, ch, sizeof ch);
+    size_t hello_len = ch12_build(sni, t->c_random, want_wire, ch, sizeof t->wire);
     if (hello_len == 0) {
         say(err, errcap, "приветствие не собралось");
         free(t);
         return -1;
     }
+    if (d2k_tls12_test_barrier) { d2k_tls12_test_barrier(); }
     if (write_all(fd, ch, hello_len, err, errcap) != 0) { free(t); return -1; }
     tr_add(t, ch + 5, hello_len - 5);
 
