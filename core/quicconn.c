@@ -131,6 +131,16 @@ struct d2k_qc {
        эта вертикаль и строится. */
     uint8_t  last_app[DGRAM_OUT];
     size_t   last_app_len;
+    /* Срок и счёт повтора last_app — состояние СОЕДИНЕНИЯ, а не одного
+       вызова d2k_qc_stream_recv. Проверка читает ответ кусками по 200 мс, и
+       таймер в 300 мс, заводимый заново в каждом куске, не срабатывал
+       никогда: запрос HTTP/3 ни разу не переотправлялся (задача 33, трасса).
+       Заводится отправкой посылки. */
+    int64_t  app_pto_ms;
+    int      app_tries;
+    /* Сколько байт датаграмм принято всего: по нему проверка отличает
+       «сервер замолчал» от «сервер говорит, но не отвечает на запрос». */
+    uint64_t rx_wire_bytes;
 
     uint8_t  local_addr[16];
     uint8_t  family;
@@ -513,6 +523,7 @@ static int recv_dgram(d2k_qc *c, int wait_ms, char *err, size_t errcap) {
             n == 0 ? "пусто" : strerror(errno));
         return -1;
     }
+    c->rx_wire_bytes += (uint64_t)n;
 
     size_t off = 0;
     int any = 0;
@@ -959,6 +970,8 @@ int d2k_qc_stream_send(d2k_qc *c, uint64_t stream_id, const uint8_t *data, size_
     if (o <= sizeof c->last_app) {
         memcpy(c->last_app, fr, o);
         c->last_app_len = o;
+        c->app_pto_ms = now_ms() + 300;
+        c->app_tries = 0;
     }
     return send_level(c, D2K_QW_LEVEL_APP, fr, o, 0, err, errcap);
 }
@@ -967,8 +980,6 @@ long d2k_qc_stream_recv(d2k_qc *c, uint64_t *stream_out, uint8_t *buf, size_t ca
                         int wait_ms, char *err, size_t errcap) {
     if (!c || !buf) { return -1; }
     int64_t until = now_ms() + (wait_ms > 0 ? wait_ms : 0);
-    int64_t pto = now_ms() + 300;
-    int tries = 0;
     for (;;) {
         if (c->rx_len > c->rx_taken) {
             size_t have = c->rx_len - c->rx_taken;
@@ -983,9 +994,10 @@ long d2k_qc_stream_recv(d2k_qc *c, uint64_t *stream_out, uint8_t *buf, size_t ca
         int r = recv_dgram(c, left > 50 ? 50 : left, err, errcap);
         if (r < 0) { return -1; }
         /* Повтор последней посылки по таймеру: см. last_app в структуре. */
-        if (c->rx_len == 0 && c->last_app_len && now_ms() >= pto && tries < 3) {
-            tries++;
-            pto = now_ms() + (300 << tries);
+        if (c->rx_len == 0 && c->last_app_len && now_ms() >= c->app_pto_ms &&
+            c->app_tries < 3) {
+            c->app_tries++;
+            c->app_pto_ms = now_ms() + (300 << c->app_tries);
             (void)send_level(c, D2K_QW_LEVEL_APP, c->last_app, c->last_app_len,
                              0, err, errcap);
         }
@@ -1002,6 +1014,7 @@ long d2k_qc_stream_recv(d2k_qc *c, uint64_t *stream_out, uint8_t *buf, size_t ca
 }
 
 int d2k_qc_peer_name(const d2k_qc *c) { return c ? c->peer_name : -1; }
+uint64_t d2k_qc_rx_wire_bytes(const d2k_qc *c) { return c ? c->rx_wire_bytes : 0; }
 int d2k_qc_handshake_done(const d2k_qc *c) { return c ? c->handshake_done : 0; }
 int d2k_qc_fd(const d2k_qc *c) { return c ? c->fd : -1; }
 

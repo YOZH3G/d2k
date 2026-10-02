@@ -766,7 +766,18 @@ test-verify: test_verify
 test_quicconn6: test_quicconn6.c quicconn.o quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< quicconn.o quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 
+# Includes quicconn.c itself: the retransmit timer is connection state, and
+# the test needs a ready 1-RTT connection without a live server.
+test_quicconn_rtx: test_quicconn_rtx.c quicconn.c quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+
+.PHONY: test-quicconn-rtx
+check: test-quicconn-rtx
+test-quicconn-rtx: test_quicconn_rtx
+	./test_quicconn_rtx
+
 .PHONY: test-quicconn6
+TESTS += test_quicconn_rtx
 TESTS += test_quicconn6 test_volume test_volume_context test_httpup_logic test_httpup_relay
 TESTS += test_catalog_sync
 

@@ -81,6 +81,11 @@ int d2k_qc_stream_send(d2k_qc *c, uint64_t stream_id, const uint8_t *data, size_
 long d2k_qc_stream_recv(d2k_qc *c, uint64_t *stream_out, uint8_t *buf, size_t cap,
                         int wait_ms, char *err, size_t errcap);
 
+/* Сколько байт датаграмм соединение приняло от сервера за всё время (все
+ * уровни, включая неразобранное). Разность до и после запроса отличает
+ * «сервер замолчал» от «сервер говорит, но не отвечает». */
+uint64_t d2k_qc_rx_wire_bytes(const d2k_qc *c);
+
 /* Совпало ли имя в сертификате сервера с тем, что спросили: 1 да, 0 НЕТ,
  * -1 сказать нечего. Смысл тот же, что у d2k_tls_peer_name: это НЕ проверка
  * подлинности. */

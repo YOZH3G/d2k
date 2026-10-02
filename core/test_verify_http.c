@@ -74,6 +74,20 @@ int main(void) {
         ech_http_denial(&r);
         if (r.level != ech[i].after) { fprintf(stderr,"ECH denial case %zu failed\n",i); fails++; }
     }
+    /* Задача 42: этап «рукопожатие прошло, приложение молчит» назван прямо. */
+    {
+        d2k_ver_result r = {0};
+        quic_app_silent(&r, 0, 4812, NULL);
+        if (!strstr(r.reason, "рукопожатие прошло, приложение молчит, получено 0 байт") ||
+            !strstr(r.reason, "4812")) {
+            fprintf(stderr, "QUIC silent-application stage: %s\n", r.reason); fails++;
+        }
+        quic_app_silent(&r, 2337, 7170, "сервер закрыл соединение");
+        if (!strstr(r.reason, "рукопожатие прошло, приложение молчит, получено 2337 байт") ||
+            !strstr(r.reason, "закрыто")) {
+            fprintf(stderr, "QUIC silent-application stage (closed): %s\n", r.reason); fails++;
+        }
+    }
     if (fails) return 1;
     puts("Production HTTP reader: 76 fragments + 4 stylesheet + 4 ECH checks passed without sockets");
     return 0;

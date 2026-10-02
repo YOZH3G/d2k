@@ -1016,6 +1016,26 @@ d2k_ver_result d2k_verify_probe_quic(const char *ip, uint16_t port, const char *
     return d2k_verify_probe_quic_on(-1, ip, port, sni, deadline_ms, hello_wire);
 }
 
+/* ЭТАП «РУКОПОЖАТИЕ ПРОШЛО, ПРИЛОЖЕНИЕ МОЛЧИТ» — СВОЕЙ СТРОКОЙ (задача 42).
+   Поле 02.10.2026 (задача 33): на части адресов поток обрывается на пути
+   сразу после рукопожатия, и прежняя строка «кода ответа HTTP/3 нет»
+   читалась как дефект датапата. Это честный отрицательный исход проверки, и
+   его этап называется прямо: получено got байт ответа, после запроса пришло
+   wire байт датаграмм (ноль — сервер замолчал совсем). closed — причина, если
+   соединение закрылось. */
+static void quic_app_silent(d2k_ver_result *r, size_t got, uint64_t wire,
+                            const char *closed) {
+    if (closed) {
+        snprintf(r->reason, sizeof r->reason,
+                 "рукопожатие прошло, приложение молчит, получено %zu байт; "
+                 "соединение закрыто: %.40s", got, closed);
+    } else {
+        snprintf(r->reason, sizeof r->reason,
+                 "рукопожатие прошло, приложение молчит, получено %zu байт "
+                 "(после запроса пришло %llu байт)", got, (unsigned long long)wire);
+    }
+}
+
 /* use_fd — УЖЕ ЗАНЯТЫЙ сокет UDP (d2k_props_bind_udp), под чей местный порт
    поставлен пробный план. Меньше единицы — завести свой. */
 d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t port,
@@ -1096,12 +1116,16 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
 
     uint8_t rx[8192];
     size_t got = 0;
+    int closed = 0;
+    uint64_t wire_before = d2k_qc_rx_wire_bytes(c);
     int64_t until = verify_now_ms() + (deadline_ms > 0 ? deadline_ms : 5000);
     while (got < sizeof rx && verify_now_ms() < until) {
         uint64_t sid = 0;
+        /* Куски по 200 мс безопасны: срок повтора запроса живёт в соединении
+           (d2k_qc_stream_recv), а не в куске. */
         long n = d2k_qc_stream_recv(c, &sid, rx + got, sizeof rx - got, 200,
                                     err, sizeof err);
-        if (n < 0) { break; }
+        if (n < 0) { closed = 1; break; }
         if (n > 0) { got += (size_t)n; }
         int st = 0;
         if (got > 0 && d2k_h3_status(rx, got, &st) == 0) {
@@ -1119,8 +1143,8 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
         }
     }
     if (r.level != D2K_VER_APPLICATION && r.level != D2K_VER_DENIED) {
-        snprintf(r.reason, sizeof r.reason,
-                 "кода ответа HTTP/3 нет: принято %zu байт", got);
+        quic_app_silent(&r, got, d2k_qc_rx_wire_bytes(c) - wire_before,
+                        closed ? err : NULL);
     }
     /* Сокет остаётся ОТКРЫТЫМ до d2k_verify_close — по той же причине, что у
        TCP-зонда: закрытие удаляет ячейку потока в датапате раньше, чем придёт
