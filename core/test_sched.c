@@ -756,6 +756,22 @@ static int live_task_probes(d2k_sched *s, const char *target) {
 /* Отказ запуска рабочего потока (задача 24): spawn_fail взводит тест,
    spawn_refused считает изображённые отказы. */
 static int spawn_fail, spawn_refused;
+/* Источник занятости процессора (задача 29). По умолчанию «данных нет» —
+   прежний предел 2, и остальные проверки не зависят от того, есть ли у
+   машины /proc/stat. Включённый, он отдаёт ровную долю свободного времени:
+   каждый вызов добавляет 1000 тиков, из них занято 1000 - cpu_free_pm. */
+static int cpu_ok;
+static unsigned cpu_cores_v = 4;
+static int cpu_free_pm = 900;
+static uint64_t cpu_busy_acc, cpu_total_acc;
+static int stub_cpu(uint64_t *busy, uint64_t *total, unsigned *cores) {
+    if (!cpu_ok) return -1;
+    cpu_total_acc += 1000;
+    cpu_busy_acc += (uint64_t)(1000 - cpu_free_pm);
+    *busy = cpu_busy_acc; *total = cpu_total_acc; *cores = cpu_cores_v;
+    return 0;
+}
+
 static int stub_spawn(void) {
     if (spawn_fail) { spawn_refused++; return -1; }
     return 0;
@@ -1484,6 +1500,7 @@ int main(int argc, char **argv) {
     d2k_sched_rx_gzip_ver_hook = stub_ver;
     d2k_sched_mark_hook = stub_mark;
     d2k_sched_spawn_hook = stub_spawn;
+    d2k_sched_cpu_hook = stub_cpu;
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -2899,6 +2916,9 @@ admission_only_run:
                                       "%Y-%m-%dT%H:%M:%SZ", &tm)) queued_at = timegm(&tm);
                 CHECK(queued_at >= time(NULL) - 30 && queued_at <= time(NULL) + 30,
                       "queued task reports its admission time, not router boot time");
+                CHECK(strstr(body, "\"measurements\": {\"active\": 2, \"limit\": 2, "
+                                   "\"queued\": 1, \"cores\": null, \"free_pct\": null}") != NULL,
+                      "без данных о процессоре live JSON не показывает прежний предел 2");
                 unlink(live_path);
             }
             tcp_block_until_stop = 0;
@@ -2934,6 +2954,160 @@ admission_only_run:
         }
         d2k_catalog_free(&c);
         tcp_answer = D2K_V_OPAQUE;
+    }
+    /* ЗАДАЧА 29: параллельность замеров следует свободному процессору.
+       Предел — min(2×ядра, 8) при свободных ≥ 30 %; ниже 15 % новые не
+       стартуют, но один активный разрешён всегда; без данных — прежние 2.
+       Источник занятости подменён: часы модельные, /proc/stat не читается. */
+    {
+        /* Разбор строки /proc/stat: занятость без idle и iowait. */
+        uint64_t b = 0, tt = 0;
+        CHECK(d2k_sched_cpu_parse("cpu  100 5 50 800 40 3 2 0 0 0\n", &b, &tt) == 0 &&
+              b == 160 && tt == 1000, "cpu parse: busy/total из строки cpu");
+        CHECK(d2k_sched_cpu_parse("cpu0 1 2 3 4\n", &b, &tt) != 0,
+              "cpu parse: строка отдельного ядра принята за общую");
+        CHECK(d2k_sched_cpu_parse("intr 1 2 3\n", &b, &tt) != 0,
+              "cpu parse: чужая строка принята");
+    }
+    {
+        /* Много свободного, 4 ядра → 8 одновременно; девятая ждёт. */
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        cpu_ok = 1; cpu_cores_v = 4; cpu_free_pm = 900;
+        tcp_calls = 0; tcp_saw_stop = 0; tcp_stop_count = 0;
+        tcp_wait_until_stop = 1; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        CHECK(s != NULL, "cpu: планировщик не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            saidbuf[0] = '\0';
+            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 0 из 8 (ядер 4, свободно 90 %)"),
+                  "cpu: предел не поднялся до 2×ядра при свободном процессоре");
+            for (uint16_t i = 0; i < 9; i++) {
+                char name[48];
+                uint16_t port = (uint16_t)(41100 + i);
+                snprintf(name, sizeof name, "cpu-free-%u.example", (unsigned)i);
+                d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+            }
+            spin(s, 400);
+            CHECK(tcp_calls == 8, "cpu: при 4 ядрах и 90 % свободных не 8 замеров одновременно");
+            CHECK(d2k_sched_active(s) == 9, "cpu: девятая цель не сохранена в очереди");
+            char live_path[] = "/tmp/d2k-cpu-live-XXXXXX";
+            int live_fd = mkstemp(live_path);
+            if (live_fd >= 0) {
+                close(live_fd);
+                CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "cpu live write");
+                char body[32768] = {0}; FILE *live = fopen(live_path, "r");
+                if (live) { fread(body, 1, sizeof body - 1, live); fclose(live); }
+                CHECK(strstr(body, "\"measurements\": {\"active\": 8, \"limit\": 8, "
+                                   "\"queued\": 1, \"cores\": 4, \"free_pct\": 90}") != NULL,
+                      "cpu: live JSON не показывает предел замеров");
+                unlink(live_path);
+            }
+            /* Процессор занят: предел падает до 1, идущие НЕ прерываются. */
+            cpu_free_pm = 50;
+            for (int i = 0; i < 40; i++) skip_ahead(s, 1000);
+            CHECK(said("из 1 (ядер 4, свободно"),
+                  "cpu: при занятом процессоре предел не упал до 1");
+            CHECK(tcp_stop_count == 0 && d2k_sched_active(s) == 9,
+                  "cpu: снижение предела прервало идущие замеры");
+            CHECK(tcp_calls == 8, "cpu: при занятом процессоре стартовал новый замер");
+            tcp_release_waiters = 1;
+            spin(s, 60);
+            tcp_release_waiters = 0;
+            d2k_sched_free(s);
+        }
+        tcp_wait_until_stop = 0; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_OPAQUE;
+        cpu_ok = 0;
+        d2k_catalog_free(&c);
+    }
+    {
+        /* Мало свободного сразу → только 1. Ядер 8 → потолок 8, ядер 2 → 4. */
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        cpu_ok = 1; cpu_cores_v = 4; cpu_free_pm = 100;
+        tcp_calls = 0; tcp_saw_stop = 0; tcp_stop_count = 0;
+        tcp_wait_until_stop = 1; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            saidbuf[0] = '\0';
+            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 0 из 1 (ядер 4, свободно 10 %)"),
+                  "cpu: при 10 % свободных предел не 1");
+            for (uint16_t i = 0; i < 3; i++) {
+                char name[48];
+                uint16_t port = (uint16_t)(41120 + i);
+                snprintf(name, sizeof name, "cpu-busy-%u.example", (unsigned)i);
+                d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+            }
+            spin(s, 400);
+            CHECK(tcp_calls == 1, "cpu: при занятом процессоре запущено больше одного замера");
+            CHECK(d2k_sched_active(s) == 3, "cpu: подозрения потеряны вместо очереди");
+            tcp_release_waiters = 1; spin(s, 60); tcp_release_waiters = 0;
+            d2k_sched_free(s);
+        }
+        tcp_wait_until_stop = 0;
+        cpu_cores_v = 8; cpu_free_pm = 900;
+        s = d2k_sched_new(&c, sv[0], 0x2d);
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            saidbuf[0] = '\0';
+            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 0 из 8 (ядер 8, свободно 90 %)"), "cpu: потолок 8 не соблюдён");
+            d2k_sched_free(s);
+        }
+        cpu_cores_v = 2;
+        s = d2k_sched_new(&c, sv[0], 0x2d);
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            saidbuf[0] = '\0';
+            for (int i = 0; i < 4; i++) skip_ahead(s, 1000);
+            CHECK(said("замеров 0 из 4 (ядер 2, свободно 90 %)"), "cpu: 2 ядра не дали 4");
+            d2k_sched_free(s);
+        }
+        cpu_ok = 0; cpu_cores_v = 4;
+        tcp_answer = D2K_V_OPAQUE;
+        d2k_catalog_free(&c);
+    }
+    {
+        /* Горячая цель: по ждущей в очереди пришло новое подозрение — она
+           стартует раньше тех, что встали до неё; остальные — FIFO. Без
+           данных о процессоре: предел 2. */
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_calls = 0; tcp_block_until_stop = 0; tcp_answer = D2K_V_CLEAR;
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 1);
+            const char *names[5] = { "hot-run0.example", "hot-run1.example",
+                                     "hot-a.example", "hot-b.example", "hot-c.example" };
+            for (uint16_t i = 0; i < 5; i++) {
+                uint16_t port = (uint16_t)(41140 + i);
+                d2k_ev h = ev_hello(6, port, names[i]); d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+            }
+            spin(s, 120);
+            CHECK(tcp_calls == 2, "hot: без данных о процессоре предел не 2");
+            saidbuf[0] = '\0';
+            d2k_ev again = ev_suspect(6, 41144); d2k_sched_event(s, &again);
+            skip_ahead(s, 1000);
+            CHECK(said("по hot-c.example ожидание в очереди") &&
+                  !said("по hot-a.example ожидание в очереди"),
+                  "hot: цель с новым подозрением не обогнала тихую очередь");
+            spin(s, 40);
+            skip_ahead(s, 1000);
+            CHECK(said("по hot-a.example ожидание в очереди") &&
+                  !said("по hot-b.example ожидание в очереди"),
+                  "hot: тихая очередь нарушила FIFO");
+            d2k_sched_free(s);
+        }
+        tcp_answer = D2K_V_OPAQUE;
+        d2k_catalog_free(&c);
     }
     if (admission_only) {
         close(sv[0]); close(sv[1]);

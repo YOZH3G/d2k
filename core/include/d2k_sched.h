@@ -168,6 +168,18 @@ extern d2k_sched_voice_fn d2k_sched_voice_hook;
 typedef int (*d2k_sched_spawn_fn)(void);
 extern d2k_sched_spawn_fn d2k_sched_spawn_hook;
 
+/* Источник занятости процессора (задача 29): накопленные с загрузки тики
+ * «занято» и «всего» по всем ядрам и число ядер в строю. 0 — данные есть.
+ * По умолчанию читает /proc/stat и sysconf(_SC_NPROCESSORS_ONLN); где
+ * /proc/stat нет (macOS), отвечает отказом — и предел замеров остаётся
+ * прежним (2). Опрашивается тиком планировщика не чаще раза в секунду
+ * модельных часов, поэтому тест подменяет его без настоящего процессора. */
+typedef int (*d2k_sched_cpu_fn)(uint64_t *busy, uint64_t *total, unsigned *cores);
+extern d2k_sched_cpu_fn d2k_sched_cpu_hook;
+/* Разбор строки «cpu ...» из /proc/stat: занято = всё, кроме idle и iowait;
+ * guest уже входит в user и второй раз не считается. 0 — строка разобрана. */
+int d2k_sched_cpu_parse(const char *line, uint64_t *busy, uint64_t *total);
+
 /* Заводит планировщик поверх уже открытого каталога и уже открытой связи с
  * датапатом. Владения ни тем, ни другим НЕ берёт: каталог переживает
  * планировщик (его пишет на диск вызывающий, он же решает когда — см.

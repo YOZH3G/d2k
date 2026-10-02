@@ -79,8 +79,26 @@
    роутера есть смысла держать: каждый занят сетевым ожиданием, не счётом. */
 #define SCHED_MAX_TASKS 64
 #define SCHED_COOLDOWN_SLOTS 128
-#define SCHED_MAX_ACTIVE_MEASUREMENTS 2
+/* Одновременных сетевых замеров (задача 29). Замер почти не считает — он
+   ждёт сеть (поле 02.10.2026: KN-1811 занят на 15–22 %), поэтому предел
+   следует СВОБОДНОМУ процессору, а не зашитому числу: при свободных
+   ≥ 30 % — min(2×ядра, 8); ниже 15 % новые не стартуют, но один активный
+   разрешён всегда; между порогами — гистерезис: новых не прибавляется,
+   идущие не прерываются никогда. Нет данных о процессоре (нет /proc/stat) —
+   прежний предел 2 (145e1da). Пороги — решение владельца, не замер. */
+#define SCHED_DEFAULT_ACTIVE_MEASUREMENTS 2
+#define SCHED_MEASURE_CAP 8
+#define SCHED_CPU_START_FREE_U 300000 /* 30 % в миллионных долях */
+#define SCHED_CPU_STOP_FREE_U  150000 /* 15 % */
+#define SCHED_CPU_SAMPLE_MS 1000
+#define SCHED_CPU_EWMA_MS 10000
 #define SCHED_MAX_QUEUED_MEASUREMENTS 16
+/* Пауза между стартами из очереди. Сохранена и при новом пределе: занятость
+   процессора снимается раз в секунду и сглажена, и выпуск очереди по одному
+   на снимок даёт каждому следующему старту судиться по нагрузке, в которую
+   уже вошёл предыдущий, — а не восьми стартам по одному устаревшему снимку.
+   Свежее подозрение при уже идущем замере (launch_or_queue) паузой не
+   ограничено: всплеск живого трафика заполняет предел сразу. */
 #define SCHED_START_GAP_MS 1000
 
 /* Жизнь задачи. Дольше — и задача занимает место, давно перестав быть про
@@ -355,6 +373,48 @@ static d2k_voice_res voice_default(const d2k_voice_opt *opt) {
 d2k_sched_voice_fn d2k_sched_voice_hook = voice_default;
 d2k_sched_spawn_fn d2k_sched_spawn_hook = NULL;
 
+int d2k_sched_cpu_parse(const char *line, uint64_t *busy, uint64_t *total) {
+    if (!line || !busy || !total || strncmp(line, "cpu ", 4) != 0) return -1;
+    const char *p = line + 4;
+    uint64_t v[8] = {0};
+    int n = 0;
+    while (n < 8) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p < '0' || *p > '9') break;
+        char *end = NULL;
+        errno = 0;
+        unsigned long long x = strtoull(p, &end, 10);
+        if (errno || end == p) return -1;
+        v[n++] = (uint64_t)x;
+        p = end;
+    }
+    if (n < 4) return -1;   /* user nice system idle — минимум ядра 2.4 */
+    uint64_t sum = 0;
+    for (int i = 0; i < n; i++) sum += v[i];
+    uint64_t idle = v[3] + v[4]; /* idle + iowait: процессор не занят */
+    if (sum < idle) return -1;
+    *total = sum;
+    *busy = sum - idle;
+    return 0;
+}
+
+static int cpu_read_proc(uint64_t *busy, uint64_t *total, unsigned *cores) {
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return -1;
+    char line[512];
+    int rc = fgets(line, sizeof line, f) ? d2k_sched_cpu_parse(line, busy, total) : -1;
+    fclose(f);
+    if (rc) return -1;
+#ifdef _SC_NPROCESSORS_ONLN
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+#else
+    long n = 1; /* без /proc/stat сюда не доходим; на всякий случай — одно ядро */
+#endif
+    *cores = n > 0 ? (unsigned)n : 1u;
+    return 0;
+}
+d2k_sched_cpu_fn d2k_sched_cpu_hook = cpu_read_proc;
+
 /* --------------------------------------------------------------------
  * Состояние задачи.
  * -------------------------------------------------------------------- */
@@ -415,6 +475,11 @@ typedef struct {
     int64_t    started_ms; /* active search/lifecycle budget begins on launch */
     int64_t    queued_ms;  /* independent age of a queued suspicion */
     uint64_t   queued_event;
+    /* «Горячая» цель (задача 29): по ждущей в очереди пришло новое
+       подозрение — номер события последнего такого и их число. Очередь
+       выпускает сначала горячие (по свежести), остальные — FIFO. */
+    uint64_t   hot_event;
+    unsigned   hot_count;
     int64_t    rest_until_ms;
     int        probes;
 
@@ -767,6 +832,16 @@ struct d2k_sched {
     size_t ech_input_next;
     int64_t      last_measure_start_ms;
     int          measure_start_seen;
+
+    /* Занятость процессора (задача 29): последний снимок /proc/stat (или
+       крючка), сглаженная доля свободного времени в миллионных и текущий
+       предел одновременных замеров. */
+    int          cpu_tried, cpu_have_prev, cpu_valid, cpu_logged_valid;
+    int64_t      cpu_try_ms;
+    uint64_t     cpu_prev_busy, cpu_prev_total;
+    int64_t      cpu_free_u;
+    unsigned     cpu_cores;
+    size_t       meas_limit;
 
     /* Проход по каталогу, разложенный на порции (см. d2k_sched_sync_step):
        где остановились и просили ли начать заново. */
@@ -3132,6 +3207,10 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
  * Открытое наружу.
  * -------------------------------------------------------------------- */
 
+static size_t measurements_in_flight(const d2k_sched *s);
+static size_t queued_measurements(const d2k_sched *s);
+static int cpu_free_pct(const d2k_sched *s);
+
 d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     if (!cat) { errno = EINVAL; return NULL; }
     d2k_sched *s = calloc(1, sizeof *s);
@@ -3140,6 +3219,7 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     s->link_fd = link_fd;
     s->mark = mark;
     s->measure_mark = mark;
+    s->meas_limit = SCHED_DEFAULT_ACTIVE_MEASUREMENTS;
     s->wake[0] = s->wake[1] = -1;
     s->wall_base_s = (int64_t)time(NULL);
     /* The MIPS Linux pipe syscall returns the first descriptor in v0 (and
@@ -3355,6 +3435,14 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
        только в лог: человек смотрит панель, и «подтверждено N» без «а вот
        столько раз план не достался клиенту» читается как «обход работает»
        (седьмая находка лаборатории 13.09.2026). */
+    /* Предел замеров (задача 29): сколько идёт, сколько можно, сколько ждёт
+       и по какой нагрузке; null — данных о процессоре нет (прежний предел). */
+    fprintf(f, "  \"measurements\": {\"active\": %zu, \"limit\": %zu, \"queued\": %zu, ",
+            measurements_in_flight(s), s->meas_limit, queued_measurements(s));
+    if (s->cpu_valid)
+        fprintf(f, "\"cores\": %u, \"free_pct\": %d},\n", s->cpu_cores, cpu_free_pct(s));
+    else
+        fputs("\"cores\": null, \"free_pct\": null},\n", f);
     fprintf(f, "  \"targets\": %zu,\n  \"confirms\": %d,\n  \"probes_used\": %d,\n"
                "  \"client_unfit\": %u\n}\n",
             targets, s->confirms, s->probes_used, (unsigned)s->unfit_client);
@@ -4356,6 +4444,76 @@ static size_t queued_measurements(const d2k_sched *s) {
     return n;
 }
 
+/* Снимок занятости раз в SCHED_CPU_SAMPLE_MS модельных часов и
+   экспоненциальное сглаживание с постоянной ~SCHED_CPU_EWMA_MS. Отказ
+   источника или откат счётчиков — «данных нет», прежний предел. */
+static void cpu_sample(d2k_sched *s, int64_t now_ms) {
+    if (s->cpu_tried && now_ms - s->cpu_try_ms < SCHED_CPU_SAMPLE_MS) return;
+    int64_t dt = now_ms - s->cpu_try_ms;
+    s->cpu_tried = 1;
+    s->cpu_try_ms = now_ms;
+    uint64_t busy = 0, total = 0;
+    unsigned cores = 0;
+    if (!d2k_sched_cpu_hook || d2k_sched_cpu_hook(&busy, &total, &cores) != 0) {
+        s->cpu_have_prev = s->cpu_valid = 0;
+        return;
+    }
+    if (s->cpu_have_prev && total > s->cpu_prev_total && busy >= s->cpu_prev_busy &&
+        busy - s->cpu_prev_busy <= total - s->cpu_prev_total) {
+        uint64_t db = busy - s->cpu_prev_busy, dtot = total - s->cpu_prev_total;
+        int64_t inst = 1000000 - (int64_t)(db * 1000000 / dtot);
+        if (!s->cpu_valid) {
+            s->cpu_free_u = inst;
+            s->cpu_valid = 1;
+        } else {
+            if (dt < 1) dt = 1;
+            s->cpu_free_u += (inst - s->cpu_free_u) * dt / (dt + SCHED_CPU_EWMA_MS);
+        }
+    } else if (s->cpu_have_prev) {
+        s->cpu_valid = 0; /* счётчики откатились — прежнее сглаживание не о том */
+    }
+    s->cpu_prev_busy = busy;
+    s->cpu_prev_total = total;
+    s->cpu_have_prev = 1;
+    s->cpu_cores = cores ? cores : 1;
+}
+
+static size_t measure_cap(const d2k_sched *s) {
+    size_t cap = 2u * (size_t)(s->cpu_cores ? s->cpu_cores : 1);
+    return cap > SCHED_MEASURE_CAP ? SCHED_MEASURE_CAP : cap;
+}
+
+static int cpu_free_pct(const d2k_sched *s) {
+    return (int)((s->cpu_free_u + 5000) / 10000);
+}
+
+static void measure_limit_update(d2k_sched *s) {
+    size_t active = measurements_in_flight(s), lim;
+    if (!s->cpu_valid) {
+        lim = SCHED_DEFAULT_ACTIVE_MEASUREMENTS;
+    } else if (s->cpu_free_u >= SCHED_CPU_START_FREE_U) {
+        lim = measure_cap(s);
+    } else if (s->cpu_free_u < SCHED_CPU_STOP_FREE_U) {
+        lim = 1;
+    } else {
+        /* Между порогами новые не прибавляются: предел не выше того, что
+           уже идёт, и не ниже одного. Идущие не прерываются. */
+        lim = s->meas_limit < active ? s->meas_limit : active;
+        if (lim > measure_cap(s)) lim = measure_cap(s);
+        if (lim < 1) lim = 1;
+    }
+    if (lim == s->meas_limit && s->cpu_valid == s->cpu_logged_valid) return;
+    s->meas_limit = lim;
+    s->cpu_logged_valid = s->cpu_valid;
+    if (s->cpu_valid) {
+        say(s, "замеров %zu из %zu (ядер %u, свободно %d %%)",
+            active, lim, s->cpu_cores, cpu_free_pct(s));
+    } else {
+        say(s, "замеров %zu из %zu (данных о загрузке процессора нет — прежний предел)",
+            active, lim);
+    }
+}
+
 /* An unplanned flow queued BEFORE a compatible area was installed cannot
    testify against that new area. Let its next flow inherit without an old
    backlog probe. Applied-plan failures and exact overrides remain diagnostic. */
@@ -4500,7 +4658,7 @@ static int launch_or_queue(d2k_sched *s, task *t) {
        bounds the initial burst. */
     int start_gap = s->clock_seen && s->measure_start_seen && active == 0 &&
                     s->now_ms - s->last_measure_start_ms < SCHED_START_GAP_MS;
-    if (active >= SCHED_MAX_ACTIVE_MEASUREMENTS || start_gap) {
+    if (active >= s->meas_limit || start_gap) {
         if (queued_measurements(s) >= SCHED_MAX_QUEUED_MEASUREMENTS) {
             say(s, "по %s измерение не поставлено: ограниченная очередь заполнена; "
                    "следующий поток снова сможет поднять подозрение", t->name);
@@ -4512,9 +4670,9 @@ static int launch_or_queue(d2k_sched *s, task *t) {
         t->queued_ms = s->clock_seen ? s->now_ms : 0;
         t->queued_event = s->event_sequence;
         say(s, "по %s подозрение сохранено в ограниченной очереди замеров "
-               "(%zu из %d); новые измерения ограничены до %d одновременно",
+               "(%zu из %d); новые измерения ограничены до %zu одновременно",
             t->name, queued_measurements(s), SCHED_MAX_QUEUED_MEASUREMENTS,
-            SCHED_MAX_ACTIVE_MEASUREMENTS);
+            s->meas_limit);
         return 0;
     }
     s->last_measure_start_ms = s->now_ms;
@@ -4727,6 +4885,10 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     }
     if (t) {
         if (t->state == T_QUEUED) {
+            /* Задача 29: цель снова подозревается, пока ждёт — её очередь
+               поднимается (queued_pick), место и возраст в очереди те же. */
+            t->hot_event = s->event_sequence;
+            t->hot_count++;
             /* An ACK must never erase a later failure of the inherited plan.
                A different TCP flow has unknown protocol provenance here. */
             if (ev->planned != D2K_LINK_PLANNED_NO ||
@@ -5943,6 +6105,58 @@ static int layered_rx_result(d2k_sched *s, task *t, int64_t now_ms) {
     return 1;
 }
 
+/* Порядок выпуска очереди (задача 29). Сохранённое восстановление семейства
+   по-прежнему впереди всех (задача 24); среди равных — сначала «горячие»
+   (новое подозрение пришло, пока цель ждала; свежее — раньше), затем FIFO по
+   порядку постановки. Истёкшие к этому моменту уже сняты проходом тика. */
+static int queued_before(const task *a, const task *b) {
+    if (a->hot_event != b->hot_event) return a->hot_event > b->hot_event;
+    if (a->queued_event != b->queued_event) return a->queued_event < b->queued_event;
+    return a->queued_ms < b->queued_ms;
+}
+
+static task *queued_pick(d2k_sched *s) {
+    int recovery = 0;
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++)
+        if (s->tasks[i].state == T_QUEUED && family_recovery_eligible(s, &s->tasks[i]))
+            recovery = 1;
+    task *best = NULL;
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        task *t = &s->tasks[i];
+        if (t->state != T_QUEUED) continue;
+        if (recovery && !family_recovery_eligible(s, t)) continue;
+        if (!best || queued_before(t, best)) best = t;
+    }
+    return best;
+}
+
+static int queued_release(d2k_sched *s, int64_t now_ms) {
+    if (!queued_measurements(s)) return 0;
+    size_t active = measurements_in_flight(s);
+    /* Once work has actually waited in the queue, pace its release even if
+       a long-running measurement still occupies a slot. A fresh event may
+       immediately fill a genuinely free slot (launch_or_queue), but queued
+       backlog must not drain in a burst as workers finish: see
+       SCHED_START_GAP_MS — each release is judged by a fresh CPU sample. */
+    int start_gap = s->measure_start_seen &&
+                    now_ms - s->last_measure_start_ms < SCHED_START_GAP_MS;
+    if (active >= s->meas_limit || start_gap) return 0;
+    task *t = queued_pick(s);
+    if (!t) return 0;
+    s->last_measure_start_ms = now_ms;
+    s->measure_start_seen = 1;
+    long long waited_s = (long long)((now_ms - t->queued_ms + 500) / 1000);
+    if (t->hot_count) {
+        say(s, "по %s ожидание в очереди замеров: %lld с; цель снова подозревалась "
+               "(%u раз) — запускаю поиск раньше тихих", t->name, waited_s, t->hot_count);
+    } else {
+        say(s, "по %s ожидание в очереди замеров: %lld с; запускаю поиск",
+            t->name, waited_s);
+    }
+    (void)launch_task(s, t);
+    return 1;
+}
+
 int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     if (!s) { return 0; }
     /* Привязка монотонных часов к стенным делается ПО ПЕРВОМУ ТИКУ, а не при
@@ -5963,6 +6177,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         if (s->measure_start_seen) { s->last_measure_start_ms = now_ms; }
     }
     s->now_ms = now_ms;
+    cpu_sample(s, now_ms);
+    measure_limit_update(s);
 
     /* Осушить самопайп: он только будит, содержимое значения не имеет. */
     uint8_t drain[64];
@@ -5995,29 +6211,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++;
                 continue;
             }
-            int recovery_waiting=0;
-            if(!family_recovery_eligible(s,t))
-                for(size_t j=0;j<SCHED_MAX_TASKS;j++)
-                    if(s->tasks[j].state==T_QUEUED && family_recovery_eligible(s,&s->tasks[j]))
-                        recovery_waiting=1;
-            if(recovery_waiting) continue;
-            size_t active = measurements_in_flight(s);
-            /* Once work has actually waited in the queue, pace its release
-               even if a long-running measurement still occupies one slot.
-               A fresh event may immediately fill a genuinely free second
-               slot (launch_or_queue), but queued backlog must not drain in
-               a burst as workers finish. */
-            int start_gap = s->measure_start_seen &&
-                            now_ms - s->last_measure_start_ms < SCHED_START_GAP_MS;
-            if (active < SCHED_MAX_ACTIVE_MEASUREMENTS && !start_gap) {
-                s->last_measure_start_ms = now_ms;
-                s->measure_start_seen = 1;
-                long long waited_s = (long long)((now_ms - t->queued_ms + 500) / 1000);
-                say(s, "по %s ожидание в очереди замеров: %lld с; запускаю поиск",
-                    t->name, waited_s);
-                (void)launch_task(s, t);
-                moved++;
-            }
+            /* Выпуск — после прохода (queued_release): кому достанется
+               слот, решает порядок очереди, а не номер ячейки. */
             continue;
         }
 
@@ -6961,5 +7156,6 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             moved++;
         }
     }
+    moved += queued_release(s, now_ms);
     return moved;
 }
