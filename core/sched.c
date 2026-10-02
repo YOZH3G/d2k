@@ -526,6 +526,17 @@ typedef struct {
        по заготовке — то есть выдавалась бы за измерение то, что им не
        является (§2.4). Ноль означает «форма клиента не измерена». */
     int        trig_snapped;
+    /* ПРОГОН ОСТАНОВЛЕН РАДИ СНИМКА КЛИЕНТА (задача 31). Взводит on_shape,
+       когда приветствие клиента приходит во время профильного замера; байты
+       снимка лежат здесь, у задачи, а не только в общей ячейке tcp_shape:
+       пока измеритель доходит до границы зонда, ячейку занимает приветствие
+       соседнего имени, и перезапуск терял свою цель. Результат такого
+       прогона — не замер и не вердикт: он выбрасывается, поиск повторяется
+       этими байтами. Флаг stop для этого не годится — его взводит и
+       join_worker. */
+    int        snap_stop;
+    uint8_t    snap[2048];
+    size_t     snap_len;
 
     /* Кандидаты, собранные d2k_compose по вердикту. */
     char       plans[SCHED_MAX_PLANS][4096];
@@ -5246,14 +5257,22 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         }
         if (t->state == T_ASKING && t->transport == 6 &&
             strcmp(t->name, name) == 0) {
-            if (!t->trig_snapped && !t->reasked) {
+            if (!t->trig_snapped && !t->reasked && ev->shape_len <= sizeof t->snap) {
                 /* The worker owns an immutable cold-start profile copy. Ask
                    it to stop at its next bounded probe boundary; T_ASKING's
-                   completion path will restart with tcp_shape. */
+                   completion path restarts with the task-owned snapshot
+                   (the shared tcp_shape slot may be taken by another name
+                   by then). The latest client hello wins; the stop is
+                   announced once per run. */
+                memcpy(t->snap, ev->shape, ev->shape_len);
+                t->snap_len = ev->shape_len;
                 t->stop = 1;
-                say(s, "по %s во время профильного замера пойман ClientHello клиента — "
-                       "останавливаю устаревший прогон и повторю его снятыми байтами",
-                    t->name);
+                if (!t->snap_stop) {
+                    t->snap_stop = 1;
+                    say(s, "по %s во время профильного замера пойман ClientHello клиента — "
+                           "останавливаю устаревший прогон и повторю его снятыми байтами",
+                        t->name);
+                }
             }
             continue;
         }
@@ -6426,7 +6445,16 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 task_done(t); moved++; continue;
             }
             remember_resources(s, t->vol.resources, t->vol.n_resources);
-            if (t->rx_volume_only) {
+            /* ПРОГОН, ОСТАНОВЛЕННЫЙ РАДИ СНИМКА, — НЕ ВЕРДИКТ (задача 31).
+               Поле 02.10.2026, i.ytimg.com: брошенный на первом зонде
+               классификатор («о цели не сказано ничего») ушёл в разбор
+               вердикта — «прямой замер не подтвердил блокировку» и покой на
+               десять минут, — потому что общую ячейку снимка к его возврату
+               заняло соседнее имя. Ни вердикта, ни покоя: повтор байтами,
+               сохранёнными у задачи. */
+            int snap_restart = t->transport == 6 && t->snap_stop && !t->reasked &&
+                               t->snap_len > 0 && t->snap_len <= sizeof t->trig;
+            if (t->rx_volume_only && !snap_restart) {
                 t->rx_volume_only = 0;
                 if (!t->vol.rx_cut) {
                     if (t->vol.rx_tls_unavailable && rx_saved_bootstrap(s, t, 0)) {
@@ -6480,23 +6508,26 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                руках. Коробка вправе смотреть на содержимое и длину, а не
                только на версию (§6), поэтому повод для повтора один: мерили
                НЕ байтами клиента, а они уже есть. */
-            if (t->transport == 6 && !t->reasked && s->tcp_shape_len[t->family == 6] > 0 &&
+            if (snap_restart ||
+                (t->transport == 6 && !t->reasked && s->tcp_shape_len[t->family == 6] > 0 &&
                 strcmp(s->tcp_shape_name[t->family == 6], t->name) == 0 &&
                 s->tcp_shape_len[t->family == 6] <= sizeof t->trig &&
                 (!t->trig_snapped ||
                  (d2k_hello_ech_offer(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6], NULL) == 1
                     ? D2K_LINK_SHAPE_ECH_TCP :
                     (uint8_t)d2k_hello_shape(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]))
-                     != t->asked_shape)) {
-                int other_form = d2k_hello_shape(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6])
-                                     != (d2k_shape)t->asked_shape;
+                     != t->asked_shape))) {
+                const uint8_t *snap = snap_restart ? t->snap : s->tcp_shape[t->family == 6];
+                size_t snap_len = snap_restart ? t->snap_len : s->tcp_shape_len[t->family == 6];
+                int other_form = d2k_hello_shape(snap, snap_len) != (d2k_shape)t->asked_shape;
                 /* Снимок берём ТОЛЬКО ТЕПЕРЬ, когда замер закончен: вход
                    опыта неизменен, пока опыт идёт (см. on_shape — снимок
                    кладётся лишь задачам, которые его ЖДУТ). */
                 t->reasked = 1;
+                t->snap_stop = 0;
                 size_t was_len = t->trig_len;
-                memcpy(t->trig, s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]);
-                t->trig_len = s->tcp_shape_len[t->family == 6];
+                memcpy(t->trig, snap, snap_len);
+                t->trig_len = snap_len;
                 t->trig_snapped = 1;
                 t->ctrl_len = 0;   /* контроль соберётся из новых байт */
                 if (other_form) {

@@ -172,6 +172,7 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
 /* Проба на объём подменена: иначе планировщик гонял бы настоящую лестницу
    HTTP-запросов к стенду, который TLS не умеет, и тест мерил бы это. */
 static int vol_calls;
+static volatile int vol_hold, vol_entered;
 static d2k_vol_verdict vol_answer = D2K_VOL_PASSED;
 static int vol_rx_cut;
 static int vol_at_kb = 20;
@@ -187,6 +188,10 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     (void)ip; (void)port; (void)sni; (void)plain; (void)tls12;
     (void)hello_wire; (void)mark;
     vol_calls++;
+    /* Задача 31: проба объёма «в сети», пока тест не отпустит, — чтобы
+       снимок клиента пришёл именно во время объёмного шага. */
+    vol_entered = 1;
+    while (vol_hold) { usleep(1000); }
     d2k_vol_result r;
     memset(&r, 0, sizeof r);
     r.verdict = vol_answer;
@@ -4379,6 +4384,72 @@ shape_test:
               "late TCP snapshot restart was not reported");
         d2k_sched_free(s); d2k_catalog_free(&empty);
         tcp_wait_until_stop = 0; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* ЗАДАЧА 31. Поле 02.10.2026, i.ytimg.com: классификатор (первый шаг
+       после задачи 30) брошен ради снимка клиента, а пока он доходил до
+       границы зонда, общую ячейку TCP-снимка заняло приветствие соседнего
+       имени. Повтор снимком не узнал своей цели, брошенный прогон («о цели
+       не сказано ничего») ушёл в разбор вердикта — «прямой замер не
+       подтвердил блокировку» и десять минут покоя. Остановленный ради
+       снимка прогон — не замер: он перезапускается байтами клиента. */
+    for (int during_volume = 0; during_volume <= 1; during_volume++) {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        tcp_wait_until_stop = !during_volume; tcp_release_waiters = 0;
+        tcp_saw_stop = tcp_stop_count = tcp_calls = 0;
+        tcp_last_wire = 0; vol_calls = 0; vol_entered = 0;
+        vol_hold = during_volume;
+        tcp_answer = during_volume ? D2K_V_CLEAR : D2K_V_INCONCLUSIVE;
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev h = ev_hello(6, 39989, "snap.stop.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 39989);
+        d2k_sched_event(s, &su);
+        spin(s, 30);
+        CHECK(tcp_calls == 1, "task31: профильный классификатор не начался");
+        if (during_volume) {
+            for (int i = 0; i < 2000 && !vol_entered; i++) usleep(1000);
+            CHECK(vol_entered, "task31: объёмный шаг не начался после CLEAR");
+        }
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "snap.stop.example",
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31: снимок");
+        /* Клиент повторяет приветствие — несколько снимков одной цели. */
+        for (int k = 0; k < 4; k++) d2k_sched_event(s, &sh);
+        /* Соседнее имя занимает общую ячейку снимка. */
+        d2k_ev other = {0}; other.kind = D2K_EV_SHAPE; other.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "neighbour.other.example",
+              other.shape, sizeof other.shape, &other.shape_len) == 0, "task31: соседний снимок");
+        d2k_sched_event(s, &other);
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        vol_hold = 0;
+        spin(s, 50);
+        tcp_wait_until_stop = 0;
+        spin(s, 120);
+        const char *msg = "останавливаю устаревший прогон";
+        int stops = 0;
+        for (const char *p = saidbuf; (p = strstr(p, msg)) != NULL; p += strlen(msg)) stops++;
+        CHECK(stops == 1, "task31: просьба остановки объявлена не один раз за прогон");
+        CHECK(tcp_calls == 2, "task31: брошенный ради снимка прогон не перезапущен");
+        CHECK(tcp_last_wire == sh.shape_len,
+              "task31: перезапуск шёл не снятыми байтами клиента");
+        /* Вердикт и покой допустимы только у ПЕРЕЗАПУЩЕННОГО прогона —
+           его неубедительность честна; до перезапуска их быть не должно. */
+        const char *restart = strstr(saidbuf, "повторяю поиск его байтами");
+        CHECK(restart != NULL, "task31: перезапуск снимком не объявлен");
+        const char *verdict = strstr(saidbuf, "прямой замер не подтвердил блокировку");
+        const char *rest = strstr(saidbuf, "результат неубедителен");
+        const char *clear = strstr(saidbuf, "напрямую проходит");
+        CHECK(!verdict || (restart && verdict > restart),
+              "task31: брошенный прогон разобран как вердикт");
+        CHECK(!rest || (restart && rest > restart),
+              "task31: брошенный прогон отправил цель на покой");
+        CHECK(!clear, "task31: брошенный объёмный прогон отправил цель на покой как CLEAR");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        tcp_wait_until_stop = 0; tcp_release_waiters = 0; vol_hold = 0;
         tcp_answer = D2K_V_OPAQUE;
     }
 
