@@ -623,6 +623,14 @@ typedef struct {
        T_PROPS_WAIT. Переполнение теряет улику, но не выдумывает её. */
     d2k_flowkey prop_early[8];
     size_t     prop_early_seen;
+    /* РАННИЕ ОТВЕТЫ ВОПРОСА (EXCHANGE с ServerHello) — по той же причине:
+       ответ сервера может прийти, пока задача ещё в T_PROPS_CONTACT. Прежде
+       он терялся, и по сроку шага вопрос записывался ПРОМАХОМ — ложное
+       «нет» о свойстве коробки из-за местного порядка событий (§7). Копятся
+       только обмены по местному порту вопроса; полная сверка с prop_flow —
+       при переходе в T_PROPS_WAIT, один раз. */
+    d2k_ev     prop_early_x[4];
+    size_t     prop_early_x_seen;
     int        prop_reply_seen;
     d2k_ev     prop_reply;
     int64_t    prop_until_ms;   /* потолок текущего шага */
@@ -2132,6 +2140,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         s->probes_used++;
         t->prop_applied = 0;
         t->prop_early_seen = 0;
+        t->prop_early_x_seen = 0;
         t->prop_reply_seen = 0;
         /* Подтверждения команды НЕ ждём, и это не спешка.
          *
@@ -5570,6 +5579,18 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
        в compose.c — воспроизводилось 5/5 на стенде). */
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
+        if (t->state == T_PROPS_CONTACT && ev->server_hello && ev->transport == 6 &&
+            t->prop_sport_be != 0 &&
+            (ev->family ? ev->family : 4) == (t->family ? t->family : 4) &&
+            (ev->low_port == ntohs(t->prop_sport_be) ||
+             ev->high_port == ntohs(t->prop_sport_be))) {
+            /* Ключа потока вопроса ещё нет, но местный порт вопроса занят
+               заранее и известен. Копим; полная сверка — при переходе. */
+            if (t->prop_early_x_seen < sizeof t->prop_early_x / sizeof t->prop_early_x[0]) {
+                t->prop_early_x[t->prop_early_x_seen++] = *ev;
+            }
+            return;
+        }
         if (t->state != T_PROPS_WAIT) { continue; }
         if (!ev_matches_flow(ev, &t->prop_flow)) { continue; }
         if (!ev->server_hello) {
@@ -6350,6 +6371,27 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     }
                     t->prop_early_seen = 0;
                 }
+                {
+                    /* Ответ сервера, пришедший ещё в T_PROPS_CONTACT: первый,
+                       чей ПОЛНЫЙ ключ — поток вопроса; чужие отбрасываются. */
+                    d2k_ev early;
+                    int have_early = 0;
+                    for (size_t k = 0; k < t->prop_early_x_seen && !have_early; k++) {
+                        if (ev_matches_flow(&t->prop_early_x[k], &t->prop_flow)) {
+                            early = t->prop_early_x[k];
+                            have_early = 1;
+                        }
+                    }
+                    t->prop_early_x_seen = 0;
+                    if (have_early) {
+                        say(s, "по %s зонд вопроса %d ушёл с местного порта %u — ответ "
+                               "пришёл раньше перехода к ожиданию",
+                            t->name, t->prop_q + 1, (unsigned)t->c_port);
+                        on_exchange(s, &early);
+                        moved++;
+                        continue;
+                    }
+                }
                 t->prop_until_ms = now_ms + SCHED_PROP_STEP_MS;
                 say(s, "по %s зонд вопроса %d ушёл с местного порта %u — жду обмена",
                     t->name, t->prop_q + 1, (unsigned)t->c_port);
@@ -6792,9 +6834,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                         continue;
                     }
                 }
-                if (t->probes >= SCHED_MAX_PROBES) {
+                if (t->probes >= SCHED_MAX_PROBES && t->next_plan < t->n_plans) {
                     /* Кончился БЮДЖЕТ, а не кандидаты (задача 24, D2K_SPEC §3):
-                       поиск не завершён, и это не «обхода нет». */
+                       поиск не завершён, и это не «обхода нет». Только пока
+                       кандидаты ЕСТЬ: если они кончились на том же зонде,
+                       что и бюджет, правдивее «планы исчерпаны». */
                     say(s, "по %s бюджет зондов исчерпан (зондов %d из %d) — поиск не "
                            "завершён, это не «обхода нет»; цель отдыхает",
                         t->name, t->probes, SCHED_MAX_PROBES);

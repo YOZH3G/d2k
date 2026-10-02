@@ -4951,10 +4951,13 @@ lifecycle_test:
         CHECK(total_bindings(&c6) == 0, "lifecycle/budget: отказ отправки записан успехом");
         d2k_sched_free(s); d2k_catalog_free(&c6);
     }
-    {
+    for (int qmode = 0; qmode < 3; qmode++) {
         /* (4) APPLIED вопроса приходит, пока задача ещё в T_PROPS_CONTACT:
            рабочий поток вернулся сразу после посылки, а d2kc читает события
-           связи раньше тика. Применение засчитывается после перехода. */
+           связи раньше тика. Применение засчитывается после перехода.
+           qmode 1: и ответ сервера (EXCHANGE с ServerHello) пришёл до тика —
+           это улика, а не промах. qmode 2: ранний обмен ЧУЖОГО потока с тем
+           же местным портом не засчитан; настоящий ответ — засчитан. */
         uint16_t saved_port = g_server_port;
         int lfd = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in a;
@@ -4976,9 +4979,10 @@ lifecycle_test:
         saidbuf[0] = '\0';
         d2k_sched_set_say(s, collect_say, NULL);
         tcp_answer = D2K_V_OPAQUE; tcp_owns_search = tcp_found_arm = 0;
-        d2k_ev h = ev_hello(6, 41341, "early.question.example");
+        uint16_t cport = (uint16_t)(41341 + qmode);
+        d2k_ev h = ev_hello(6, cport, "early.question.example");
         d2k_sched_event(s, &h);
-        d2k_ev su = ev_suspect(6, 41341);
+        d2k_ev su = ev_suspect(6, cport);
         d2k_sched_event(s, &su);
         for (int i = 0; i < 200 && !said("спрашиваю коробку о свойствах"); i++) tick_once(s);
         CHECK(said("спрашиваю коробку о свойствах"), "lifecycle/question: вопрос не задан");
@@ -4996,7 +5000,7 @@ lifecycle_test:
             tick_once(s);
         }
         CHECK(peer >= 0, "lifecycle/question: зонд вопроса не пришёл к цели");
-        CHECK(!said("жду обмена"), "lifecycle/question: стенд не воспроизводит T_PROPS_CONTACT");
+        CHECK(!said("ушёл с местного порта"), "lifecycle/question: стенд не воспроизводит T_PROPS_CONTACT");
         d2k_ev x;
         memset(&x, 0, sizeof x);
         x.transport = 6;
@@ -5005,14 +5009,26 @@ lifecycle_test:
         x.kind = D2K_EV_APPLIED;
         memcpy(x.plan_id, qid, sizeof qid);
         d2k_sched_event(s, &x);
-        for (int i = 0; i < 400 && !said("жду обмена"); i++) tick_once(s);
-        CHECK(said("жду обмена"), "lifecycle/question: ожидание обмена не началось");
-        x.kind = D2K_EV_EXCHANGE;
-        memset(x.plan_id, 0, sizeof x.plan_id);
-        x.code = 22; x.num = 1380; x.seen_types = 0x0C; x.server_hello = 1;
-        d2k_sched_event(s, &x);
+        d2k_ev ex = x;
+        ex.kind = D2K_EV_EXCHANGE;
+        memset(ex.plan_id, 0, sizeof ex.plan_id);
+        ex.code = 22; ex.num = 1380; ex.seen_types = 0x0C; ex.server_hello = 1;
+        if (qmode == 1) d2k_sched_event(s, &ex);
+        if (qmode == 2) {
+            d2k_ev foreign = ex;
+            foreign.low_port = (uint16_t)(g_server_port + 1);   /* другой сервер */
+            d2k_sched_event(s, &foreign);
+        }
+        for (int i = 0; i < 400 && !said("ушёл с местного порта"); i++) tick_once(s);
+        CHECK(said("ушёл с местного порта"), "lifecycle/question: переход к ожиданию не случился");
+        if (qmode == 2) {
+            CHECK(!said("вопрос 1 прошёл") && !said("ответ замечен"),
+                  "lifecycle/question: ранний обмен чужого потока засчитан за ответ вопроса");
+        }
+        if (qmode != 1) d2k_sched_event(s, &ex);
         CHECK(said("вопрос 1 прошёл"),
-              "lifecycle/question: ранний APPLIED вопроса потерян в T_PROPS_CONTACT");
+              qmode == 1 ? "lifecycle/question: ранний ответ сервера потерян — вопрос станет промахом"
+                         : "lifecycle/question: ранний APPLIED вопроса потерян в T_PROPS_CONTACT");
         CHECK(!said("жду подтверждения полного исполнения"),
               "lifecycle/question: ответ ждёт применения, которое уже пришло");
         d2k_sched_free(s); d2k_catalog_free(&c4);
