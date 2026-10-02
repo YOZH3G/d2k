@@ -155,6 +155,39 @@ int main(void) {
     CHECK(s->n_groups==0);
     CHECK(!d2k_group_match(s,"new.googlevideo.com",&modern));
     CHECK(d2k_group_restore(s)==0 && s->n_groups==0);
+    /* (a) member excluded by plan failure, then directly clear, does not
+       disable the family for its siblings. */
+    memset(s,0,sizeof *s);
+    observe(s,"a.example.com","P",1,modern);
+    observe(s,"b.example.com","P",1,modern);
+    observe(s,"c.example.com","P",1,modern);
+    observe(s,"x.example.com","P",4,modern);
+    CHECK(!d2k_group_match(s,"x.example.com",&modern));
+    observe(s,"x.example.com","",2,modern);
+    CHECK(d2k_group_match(s,"new.example.com",&modern));
+    CHECK(!d2k_group_match(s,"x.example.com",&modern));
+    /* (b) everything learn writes can be restored. */
+    memset(s,0,sizeof *s);
+    observe(s,"a.example.com","P",1,modern);
+    observe(s,"b.example.com","P",1,modern);
+    observe(s,"c.example.com","P",1,modern);
+    observe(s,"a.example.com","",2,modern);
+    observe(s,"a.example.com","P",4,modern);
+    CHECK(d2k_group_restore(s)==0);
+    /* (c) property: random learn chains always pass restore. */
+    srand(7);
+    for(int round=0;round<2000;round++) {
+        memset(s,0,sizeof *s);
+        const char *names[]={"a.example.com","b.example.com","c.example.com","d.example.com"};
+        const char *plans[]={"P","Q",""};
+        static const unsigned ev[]={1,2,4,8};
+        for(int k=0;k<12;k++) {
+            unsigned e=ev[rand()%4]; const char *p=plans[rand()%3];
+            if((e==1||e==4)&&!p[0]) p="P";
+            observe(s,names[rand()%4],p,e,modern);
+        }
+        if(d2k_group_restore(s)!=0) { CHECK(0); break; }
+    }
     free(s);
     if(!failed) puts("groups: passed");
     return failed?1:0;

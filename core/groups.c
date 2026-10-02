@@ -109,26 +109,39 @@ static void rebuild(d2k_group_state *s) {
         if(best[0]) add_group(s,best,o,best_count,best_at);
     }
 }
+/* Group covering a normalized name, ignoring per-member exclusions. */
+static const d2k_domain_group *cover(const d2k_group_state *s,const char *norm,
+                                     const d2k_group_key *key) {
+    const d2k_domain_group *best=NULL;
+    if(s->disabled || s->n_groups>D2K_GROUP_MAX) return NULL;
+    for(size_t i=0;i<s->n_groups;i++) {
+        const d2k_domain_group *g=&s->groups[i];
+        if(d2k_group_key_same(&g->key,key) && member(norm,g->suffix) &&
+           (!best || strlen(g->suffix)>strlen(best->suffix))) best=g;
+    }
+    return best;
+}
 int d2k_group_learn(d2k_group_state *s,const d2k_group_observation *o) {
     char name[256],base[256];
     if(!s || !valid(o) || d2k_domain_normalize(o->name,name) ||
        d2k_domain_base(name,base) || s->n_groups>D2K_GROUP_MAX ||
        s->n_observations>D2K_GROUP_OBSERVATION_MAX) return -1;
     int admitted_clear=o->evidence==D2K_GROUP_DIRECT_CLEAR &&
-        d2k_group_match(s,name,&o->key)!=NULL;
+        cover(s,name,&o->key)!=NULL;
     size_t slot=s->n_observations;
-    size_t replace=s->n_observations;
+    size_t replace=s->n_observations,any=s->n_observations;
     for(size_t i=0;i<s->n_observations;i++)
         if(!strcmp(s->observations[i].name,name) &&
            d2k_group_key_same(&s->observations[i].key,&o->key)) {
             const d2k_group_observation *old=&s->observations[i];
-            if(!strcmp(old->plan_id,o->plan_id) ||
-               o->evidence==D2K_GROUP_DIRECT_CLEAR || o->evidence==D2K_GROUP_INCONCLUSIVE) {
-                slot=i; break;
-            }
+            if(!strcmp(old->plan_id,o->plan_id)) { slot=i; break; }
+            /* Prefer the same-plan entry: never leave two entries of one plan. */
+            if((o->evidence==D2K_GROUP_DIRECT_CLEAR || o->evidence==D2K_GROUP_INCONCLUSIVE) &&
+               any==s->n_observations) any=i;
             if(o->evidence==D2K_GROUP_BLOCKED_CONFIRMED &&
                !(old->evidence&D2K_GROUP_PLAN_FAILED) && replace==s->n_observations) replace=i;
         }
+    if(slot==s->n_observations && any<s->n_observations) slot=any;
     if(slot==s->n_observations && replace<s->n_observations) slot=replace;
     if(slot==s->n_observations) {
         if(s->frozen || slot==D2K_GROUP_OBSERVATION_MAX) {
@@ -195,12 +208,18 @@ int d2k_group_restore(d2k_group_state *s) {
     if(!s || s->n_observations>D2K_GROUP_OBSERVATION_MAX) return -1;
     for(size_t i=0;i<s->n_observations;i++) {
         d2k_group_observation *o=&s->observations[i], test=*o;
-        if(test.evidence==(D2K_GROUP_BLOCKED_CONFIRMED|D2K_GROUP_PLAN_FAILED))
-            test.evidence=D2K_GROUP_BLOCKED_CONFIRMED;
-        if(test.evidence==(D2K_GROUP_DIRECT_CLEAR|D2K_GROUP_ADMITTED_EXCEPTION))
-            test.evidence=D2K_GROUP_DIRECT_CLEAR;
-        if(test.evidence==(D2K_GROUP_BLOCKED_CONFIRMED|D2K_GROUP_DIRECT_CLEAR|
-                          D2K_GROUP_ADMITTED_EXCEPTION)) test.evidence=D2K_GROUP_BLOCKED_CONFIRMED;
+        /* learn() writes masks; reduce them to the raw events they came from. */
+        /* A failure may be ORed onto a stored INCONCLUSIVE; the failure stays. */
+        if(test.evidence!=D2K_GROUP_INCONCLUSIVE) test.evidence&=~D2K_GROUP_INCONCLUSIVE;
+        if(test.evidence&D2K_GROUP_ADMITTED_EXCEPTION) {
+            if(!(test.evidence&D2K_GROUP_DIRECT_CLEAR)) return -1;
+            test.evidence&=~D2K_GROUP_ADMITTED_EXCEPTION;
+        }
+        if(test.evidence&D2K_GROUP_BLOCKED_CONFIRMED)
+            test.evidence&=~(D2K_GROUP_DIRECT_CLEAR|D2K_GROUP_PLAN_FAILED);
+        else if((test.evidence&D2K_GROUP_DIRECT_CLEAR) &&
+                (test.evidence&D2K_GROUP_PLAN_FAILED))
+            test.evidence=D2K_GROUP_PLAN_FAILED;
         char norm[256],base[256];
         if(!valid(&test) || o->at<0 || d2k_domain_normalize(o->name,norm) ||
            d2k_domain_base(norm,base)) return -1;
