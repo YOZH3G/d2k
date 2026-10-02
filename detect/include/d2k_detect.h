@@ -227,6 +227,14 @@ typedef struct {
     /* Самопроверка сырого слоя ПРОГНАНА и не прошла ни разу. Отлично от
      * raw_usable=0, которое остаётся и там, где до самопроверки не дошли. */
     int  raw_selftest_failed;
+    /* Самопроверка взята из кэша процесса (см. classify.c): слой уже прошёл
+     * её на этом процессе, и зонда в этом прогоне не было. */
+    int  raw_selftest_cached;
+    /* Исходы сырых зондов прогона: дошло ли наше рукопожатие (rc>=0) или
+     * зонд упал локальной ошибкой (rc<0). Ими прогон с кэшированной
+     * самопроверкой решает, не пора ли перепроверить сам слой. */
+    int  raw_probes_ok;
+    int  raw_probes_err;
 
     d2k_obs trace[D2K_TRACE_MAX];
     int     ntrace;
@@ -320,6 +328,10 @@ int d2k_raw_probe_poison_family(const uint8_t *ip, uint8_t family, uint16_t port
     const d2k_detect_stop *cancel, char *err, size_t errcap);
 int d2k_run_properties_family(const uint8_t *ip, uint8_t family, uint16_t port,
     const d2k_trigger *tr, const d2k_opts *opt, d2k_result *res, d2k_poison *hit);
+/* Каждый сырой зонд отравления отдаёт сюда свой код возврата: счёт прогона
+ * и общий на процесс счёт подряд идущих локальных ошибок (rc<0). Серия таких
+ * ошибок снимает кэш самопроверки — следующий прогон проверит слой заново. */
+void d2k_raw_note_rc(d2k_result *res, uint8_t family, int rc);
 
 const d2k_poison *d2k_poisons(int *n);
 int d2k_poison_supports_family(const d2k_poison *p, uint8_t family);

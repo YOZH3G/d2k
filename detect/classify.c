@@ -34,6 +34,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -421,10 +422,16 @@ typedef struct {
     char err[160];
 } d2k_tally;
 
-/* measure гоняет один зонд Repeats раз и записывает наблюдение в трассу. */
+/* measure гоняет один зонд Repeats раз и записывает наблюдение в трассу.
+ *
+ * until_pass — остановиться на первом проходе. Это для вопроса, исход
+ * которого решает ОДИН проход (контроль: «ответил ли хоть раз»): дальнейшие
+ * повторы его уже не изменят. База и разрез идут все повторы — их исход
+ * различает «ни разу», «частично» и «всегда». */
 static d2k_tally measure(const char *host, const char *port, const d2k_trigger *tr,
                          const d2k_opts *opt, const char *name,
-                         const int *cuts, int ncuts, int gap_ms, d2k_result *res)
+                         const int *cuts, int ncuts, int gap_ms, d2k_result *res,
+                         int until_pass)
 {
     d2k_tally t;
     d2k_obs *obs;
@@ -454,6 +461,9 @@ static d2k_tally measure(const char *host, const char *port, const d2k_trigger *
             }
         } else if (rc > 0) {
             t.pass++;
+            if (until_pass) {
+                break;
+            }
         } else {
             t.fail++;
         }
@@ -481,6 +491,134 @@ static void bind_decoy(d2k_poison *p, const d2k_opts *opt)
     }
 }
 
+/* --- самопроверка сырого слоя: раз на процесс --------------------------- */
+
+/* Самопроверка проверяет НАШ сырой слой — своё рукопожатие, свои суммы,
+ * придержанное ядро, — а не цель: до сырого перебора дерево доходит только
+ * когда обычное TCP-соединение с целью уже установилось (база без ошибки
+ * соединения). Поэтому прошедшая самопроверка — свойство процесса на этом
+ * роутере, и повторять её у каждой цели незачем. Поле 02.10.2026: три зонда
+ * самопроверки из восемнадцати на YouTube.
+ *
+ * Кэш снимается по сроку и по серии подряд идущих локальных ошибок сырых
+ * зондов (rc<0): слой мог сломаться после проверки (правило, маршрут,
+ * интерфейс). Ключ — семейство адресов: сырой IPv6 — другие сокеты и другой
+ * путь. Классификаторы работают в разных потоках одновременно — отсюда
+ * мьютекс. Провал самопроверки не кэшируется: он ведёт себя как прежде. */
+#define D2K_SELFTEST_TTL_MS   (10L * 60L * 1000L)
+#define D2K_RAW_ERR_STREAK    3
+
+static pthread_mutex_t g_selftest_mu = PTHREAD_MUTEX_INITIALIZER;
+static int  g_selftest_ok[2];
+static long g_selftest_at[2];
+static int  g_raw_err_streak[2];
+
+static int fam_ix(uint8_t family) { return family == 6 ? 1 : 0; }
+
+/* Возраст кэшированной самопроверки в мс или -1, если кэша нет. */
+static long selftest_cached_age(uint8_t family)
+{
+    long age = -1;
+    int k = fam_ix(family);
+    pthread_mutex_lock(&g_selftest_mu);
+    if (g_selftest_ok[k]) {
+        long d = d2k_now_ms() - g_selftest_at[k];
+        if (d >= 0 && d < D2K_SELFTEST_TTL_MS) {
+            age = d;
+        } else {
+            g_selftest_ok[k] = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_selftest_mu);
+    return age;
+}
+
+static void selftest_store(uint8_t family, int ok)
+{
+    int k = fam_ix(family);
+    pthread_mutex_lock(&g_selftest_mu);
+    g_selftest_ok[k] = ok;
+    g_selftest_at[k] = d2k_now_ms();
+    g_raw_err_streak[k] = 0;
+    pthread_mutex_unlock(&g_selftest_mu);
+}
+
+void d2k_raw_note_rc(d2k_result *res, uint8_t family, int rc)
+{
+    int k = fam_ix(family);
+    if (rc < 0) {
+        res->raw_probes_err++;
+    } else {
+        /* Ответ или тишина ПОСЛЕ нашего рукопожатия — слой работает. */
+        res->raw_probes_ok++;
+    }
+    pthread_mutex_lock(&g_selftest_mu);
+    if (rc < 0) {
+        if (++g_raw_err_streak[k] >= D2K_RAW_ERR_STREAK) {
+            g_selftest_ok[k] = 0;
+        }
+    } else {
+        g_raw_err_streak[k] = 0;
+    }
+    pthread_mutex_unlock(&g_selftest_mu);
+}
+
+/* Самопроверка как таковая. Засчитывается по одному успеху, поэтому первый
+ * успех её и заканчивает; до провала доходит только после всех повторов. */
+static int raw_selftest(const uint8_t *ip, uint8_t family, uint16_t pnum,
+                        const d2k_opts *opt, d2k_result *res)
+{
+    char err[160];
+    int i;
+    d2k_obs *obs = d2k_trace_add(res, "raw-selftest");
+    for (i = 0; i < opt->repeats; i++) {
+        int rc;
+        if (d2k_detect_stopped(&opt->cancel)) { break; }
+        rc = d2k_raw_probe_handshake_family(ip, family, pnum, opt->timeout_ms, opt->mark,
+                                            &opt->cancel, err, sizeof(err));
+        res->probes++;
+        if (rc < 0) {
+            obs->fail++;
+            if (obs->err[0] == '\0') {
+                snprintf(obs->err, sizeof(obs->err), "%s", err);
+            }
+        } else if (rc > 0) {
+            obs->pass++;
+            break;
+        } else {
+            obs->fail++;
+        }
+    }
+    obs_done(opt, obs);
+    selftest_store(family, obs->pass > 0);
+    return obs->pass > 0;
+}
+
+/* Кэшированная самопроверка под сомнением: в этом прогоне ни один сырой
+ * зонд не дошёл даже до рукопожатия. Тогда слой перепроверяется сейчас же,
+ * а не следующей целью: иначе отказы своего слоя записались бы в свойства
+ * коробки — ровно то, от чего самопроверка и защищает. */
+static int raw_doubted(const d2k_result *res)
+{
+    return res->raw_selftest_cached && res->raw_probes_ok == 0 && res->raw_probes_err >= 2;
+}
+
+/* 1 — слой исправен, перебор продолжается; 0 — слой сломан: прогон
+ * заканчивается так же, как при проваленной самопроверке в начале. */
+static int raw_recheck(const uint8_t *ip, uint8_t family, uint16_t pnum,
+                       const d2k_opts *opt, d2k_result *res, const d2k_dprops *props0)
+{
+    res->raw_selftest_cached = 0;
+    if (raw_selftest(ip, family, pnum, opt, res)) {
+        return 1;
+    }
+    /* Ответы, снятые со сломанного слоя, о коробке ничего не говорят. */
+    res->props = *props0;
+    res->raw_usable = 0;
+    res->raw_selftest_failed = 1;
+    return 0;
+}
+
 /* sweepPoisons перебирает гипотезы отравления и возвращает первую сработавшую.
  *
  * Порядок в poisons() не случайный: сначала то, что не требует знания
@@ -498,6 +636,8 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
     char err[160];
     d2k_poison cands[8];
     int ncands;
+    d2k_dprops props0;
+    long age;
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = strchr(host, ':') ? AF_INET6 : AF_INET;
@@ -523,31 +663,19 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
      * ВСЕ зонды дали бы «тишину», а мы прочитали бы её как «отравить не
      * удалось». Поэтому сперва гоняем по тому же пути безобидную нагрузку без
      * всякой отравы. */
-    {
-        d2k_obs *obs = d2k_trace_add(res, "raw-selftest");
-        for (i = 0; i < opt->repeats; i++) {
-            int rc;
-            if (d2k_detect_stopped(&opt->cancel)) { break; }
-            rc = d2k_raw_probe_handshake_family(ip4, family, pnum, opt->timeout_ms, opt->mark,
-                                         &opt->cancel, err, sizeof(err));
-            res->probes++;
-            if (rc < 0) {
-                obs->fail++;
-                if (obs->err[0] == '\0') {
-                    snprintf(obs->err, sizeof(obs->err), "%s", err);
-                }
-            } else if (rc > 0) {
-                obs->pass++;
-            } else {
-                obs->fail++;
-            }
-        }
+    age = selftest_cached_age(family);
+    if (age >= 0) {
+        /* Строка в трассе — чтобы читающий видел, что самопроверку не
+         * пропустили, а взяли из кэша, и что зондов она не стоила. */
+        d2k_obs *obs = d2k_trace_add(res, "raw-selftest:кэш");
+        snprintf(obs->err, sizeof(obs->err),
+                 "прошла %ld с назад в этом процессе, зондов не было", age / 1000);
         obs_done(opt, obs);
-        if (obs->pass == 0) {
-            res->raw_usable = 0;
-            res->raw_selftest_failed = 1;
-            return 0;
-        }
+        res->raw_selftest_cached = 1;
+    } else if (!raw_selftest(ip4, family, pnum, opt, res)) {
+        res->raw_usable = 0;
+        res->raw_selftest_failed = 1;
+        return 0;
     }
     res->raw_usable = 1;
 
@@ -562,6 +690,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
 
     /* СВОЙСТВА СПЕРВА, СТРАТЕГИЯ — ИЗ НИХ. Шесть вопросов вместо девяноста
      * попыток. Перебор ниже остаётся, но уже запасным путём. */
+    props0 = res->props;
     if (opt->only[0] == '\0') {
         if (d2k_run_properties_family(ip4, family, pnum, tr, opt, res, hit)) {
             if (d2k_opts_acceptable(opt, hit)) {
@@ -569,11 +698,14 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
                 return 1;
             }
         }
+        if (raw_doubted(res) && !raw_recheck(ip4, family, pnum, opt, res, &props0)) {
+            return 0;
+        }
         ncands = d2k_compose_from_props(&res->props, opt->control.payload,
                                         opt->control.len, cands, 8);
         for (k = 0; k < ncands; k++) {
             d2k_obs *obs;
-            int pass = 0;
+            int pass = 0, done = 0;
             if (d2k_detect_stopped(&opt->cancel)) {
                 break;
             }
@@ -583,17 +715,25 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
             }
             obs = d2k_trace_add(res, cands[k].name);
             obs->delay_ms = cands[k].gap_ms;
+            /* Единогласие: первый провал решает исход, остальные повторы
+             * его не изменят. */
             for (i = 0; i < opt->repeats; i++) {
                 int rc = d2k_raw_probe_poison_family(ip4, family, pnum, tr, &cands[k], opt->timeout_ms,
                                               opt->mark, &opt->cancel, err, sizeof(err));
                 res->probes++;
-                if (rc > 0) {
-                    pass++;
+                done++;
+                d2k_raw_note_rc(res, family, rc);
+                if (rc <= 0) {
+                    break;
                 }
+                pass++;
             }
             obs->pass = pass;
-            obs->fail = opt->repeats - pass;
+            obs->fail = done - pass;
             obs_done(opt, obs);
+            if (raw_doubted(res) && !raw_recheck(ip4, family, pnum, opt, res, &props0)) {
+                return 0;
+            }
             if (pass == opt->repeats && d2k_opts_acceptable(opt, &cands[k])) {
                 *hit = cands[k];
                 res->composed = 1;
@@ -625,22 +765,29 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         obs = d2k_trace_add(res, pname);
         obs->delay_ms = p.gap_ms;
         bind_decoy(&p, opt);
+        /* Единогласие (см. ниже): первый провал решает исход гипотезы. */
         for (r = 0; r < opt->repeats; r++) {
             int rc = d2k_raw_probe_poison_family(ip4, family, pnum, tr, &p, opt->timeout_ms, opt->mark,
                                           &opt->cancel, err, sizeof(err));
             res->probes++;
+            d2k_raw_note_rc(res, family, rc);
             if (rc < 0) {
                 obs->fail++;
                 if (obs->err[0] == '\0') {
                     snprintf(obs->err, sizeof(obs->err), "%s", err);
                 }
+                break;
             } else if (rc > 0) {
                 obs->pass++;
             } else {
                 obs->fail++;
+                break;
             }
         }
         obs_done(opt, obs);
+        if (raw_doubted(res) && !raw_recheck(ip4, family, pnum, opt, res, &props0)) {
+            return 0;
+        }
         /* Единогласие обязательно: одна случайная удача назначила бы
          * стратегией то, что не работает. */
         if (obs->pass == opt->repeats) {
@@ -756,7 +903,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
 
     /* 1. БАЗА. Триггер целиком, одной записью. Если проходит — блокировки по
      * содержимому нет, и всё остальное дерево не имеет смысла. */
-    base = measure(host, port, tr, opt, "whole", NULL, 0, opt->write_gap_ms, res);
+    base = measure(host, port, tr, opt, "whole", NULL, 0, opt->write_gap_ms, res, 0);
     if (base.has_err && base.pass == 0) {
         res->verdict = D2K_DV_UNREACHABLE;
         snprintf(res->reason, sizeof(res->reason), "нет TCP до цели: %s", base.err);
@@ -806,15 +953,17 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
      * из возможных: в первом сегменте остаётся один байт. Если и он не
      * проходит, никакая точка разреза не пройдёт тем более. */
     cut1[0] = 1;
-    one = measure(host, port, tr, opt, "split", cut1, 1, opt->write_gap_ms, res);
+    one = measure(host, port, tr, opt, "split", cut1, 1, opt->write_gap_ms, res, 0);
     if (one.pass == 0) {
         /* 2а. КОНТРОЛЬ. Разрез не спас — но прежде чем говорить «пересборка»,
          * надо исключить, что содержимое вообще ни при чём. */
         int control_ok = 1;
         d2k_poison hit;
         if (opt->control.len > 0) {
+            /* Контроль засчитывается по ОДНОМУ проходу (control_ok ниже), так
+             * что после первого прохода повторы его не изменят. */
             d2k_tally ctl = measure(host, port, &opt->control, opt, "control", NULL, 0,
-                                    opt->write_gap_ms, res);
+                                    opt->write_gap_ms, res, 1);
             control_ok = ctl.pass > 0;
         }
         /* МОЛЧАНИЕ КОНТРОЛЯ — НЕ ПОВОД ЗАКОНЧИТЬ.
@@ -884,7 +1033,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     /* 3. ЕСТЬ ЛИ БУФЕР ПЕРЕСБОРКИ. Тот же разрез, но с паузой в сотни
      * миллисекунд. Коробка без буфера ведёт себя так же; коробка с буфером и
      * таймаутом успевает склеить сегменты и снова опознать сигнатуру. */
-    lng = measure(host, port, tr, opt, "split-long", cut1, 1, opt->long_gap_ms, res);
+    lng = measure(host, port, tr, opt, "split-long", cut1, 1, opt->long_gap_ms, res, 0);
     reass = lng.pass == 0;
     res->reassembles = reass ? D2K_TRI_TRUE : D2K_TRI_FALSE;
     res->props.reassembles = res->reassembles;
@@ -896,7 +1045,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     {
         int c[1];
         c[0] = (int)tr->len - 1;
-        last = measure(host, port, tr, opt, "split", c, 1, opt->write_gap_ms, res);
+        last = measure(host, port, tr, opt, "split", c, 1, opt->write_gap_ms, res, 0);
     }
     if (last.pass == opt->repeats) {
         res->verdict = D2K_DV_WHOLE_PACKET;
@@ -913,7 +1062,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         int c[1];
         d2k_tally m;
         c[0] = mid;
-        m = measure(host, port, tr, opt, "split", c, 1, opt->write_gap_ms, res);
+        m = measure(host, port, tr, opt, "split", c, 1, opt->write_gap_ms, res, 0);
         if (m.pass == opt->repeats) {
             lo = mid;
         } else if (m.pass == 0) {

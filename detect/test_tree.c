@@ -438,7 +438,10 @@ static void test_reassembling_box_with_control_stays_opaque(void)
         return;
     }
     for (i = 0; i < res.ntrace; i++) {
-        if (strcmp(res.trace[i].probe, "control") == 0 && res.trace[i].pass == opt.repeats) {
+        /* Контроль засчитывается по одному проходу и на нём останавливается:
+         * дальнейшие повторы исход не меняют (Task 35). */
+        if (strcmp(res.trace[i].probe, "control") == 0 && res.trace[i].pass == 1 &&
+            res.trace[i].fail == 0) {
             saw_control = 1;
         }
     }

@@ -147,7 +147,7 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         d2k_poison p = pp[i].p;
         d2k_obs *obs;
         char label[160];
-        int pass = 0, got;
+        int pass = 0, done = 0, got;
 
         if (d2k_detect_stopped(&opt->cancel)) {
             break;
@@ -165,16 +165,23 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         snprintf(label, sizeof(label), "свойство:%s", pp[i].label);
         obs = d2k_trace_add(res, label);
         obs->delay_ms = p.gap_ms;
+        /* Ответ засчитывается только при единогласии, поэтому первый же
+         * провал решает вопрос: остальные повторы исход изменить не могут, и
+         * гнать их — по таймауту каждый при тихом сбросе — значит тратить
+         * время цели впустую. Проход же требует все повторы, как и раньше. */
         for (j = 0; j < opt->repeats; j++) {
             int rc = d2k_raw_probe_poison_family(ip4, family, port, tr, &p, opt->timeout_ms, opt->mark,
                                           &opt->cancel, err, sizeof(err));
             res->probes++;
-            if (rc > 0) {
-                pass++;
+            done++;
+            d2k_raw_note_rc(res, family, rc);
+            if (rc <= 0) {
+                break;
             }
+            pass++;
         }
         obs->pass = pass;
-        obs->fail = opt->repeats - pass;
+        obs->fail = done - pass;
         if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
         got = pass == opt->repeats;
         apply_set(&res->props, pp[i].set, got);

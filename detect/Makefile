@@ -49,6 +49,11 @@ test_port: test_port.c $(OBJ) ../core/hello.o $(HDR)
 test_tree: test_tree.c $(OBJ) ../core/hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_tree.c $(OBJ) ../core/hello.o $(LDFLAGS) -lpthread
 
+# Повторы и кэш самопроверки: классификатор и свойства включены в тест
+# исходником (#include), сырой слой подменён сценарием ответов.
+test_repeats: test_repeats.c classify.c props.c poison.o trigger.o response.o raw.o ../core/hello.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_repeats.c poison.o trigger.o response.o raw.o ../core/hello.o $(LDFLAGS) -lpthread
+
 test_bridge: test_bridge.c bridge.o poison.o ../core/hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_bridge.c bridge.o poison.o ../core/hello.o $(LDFLAGS) -lpthread
 
@@ -67,13 +72,14 @@ bridge.o: bridge.c $(HDR) ../core/include/d2k_arm.h ../core/include/d2k_verdict.
 test_raw6_live: test_raw6_live.c $(OBJ) ../core/hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
 
-check: d2k-detect test_port test_tree test_bridge test_threads test_raw test_response
+check: d2k-detect test_port test_tree test_repeats test_bridge test_threads test_raw test_response
 	@# Отправка в сокет — только через d2k_send_nosig: SIGPIPE на мёртвом пире
 	@# воспроизводится гонкой, поэтому места вызова закреплены ещё и статически.
 	@if grep -nE '(^|[^_[:alnum:]])send\(' classify.c response.c | grep -v 'return send(fd, buf, len, flags)'; then \
 	    echo "classify.c/response.c: голый send() запрещён, используйте d2k_send_nosig"; exit 1; fi
 	./test_port
 	./test_tree
+	./test_repeats
 	./test_bridge
 	./test_threads
 	./test_raw
@@ -110,7 +116,7 @@ cross:
 	fi
 
 clean:
-	rm -f *.o d2k-detect test_port test_tree test_bridge test_threads test_raw
+	rm -f *.o d2k-detect test_port test_tree test_repeats test_bridge test_threads test_raw
 
 FORCE:
 
