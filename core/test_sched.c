@@ -5962,17 +5962,27 @@ voice_only_run:
                   "результат C voice-измерителя не отражён в журнале");
             /* Кандидат голоса ставится не на класс, а на точную пятёрку (ниже):
                класс получает только подтверждённый план (voice_confirm). */
-            /* Задача 15: опыт — точная пятёрка живого разговора с trial ID.
-               Портовая запись имени пользовательскому трафику не видна, и
-               разговор её не получил бы никогда. */
+            /* Задача 15: опыт — клиент LAN + точка сервера + ЛЮБОЙ клиентский
+               порт, с trial ID. Портовая запись имени пользовательскому
+               трафику не видна, а разговор во время замера уже за окном
+               экрана (первые 8 пакетов) — опыт ждёт следующего потока. */
             uint8_t vsrc[4], vtrial[D2K_TRIAL_ID_LEN];
             uint16_t vsport = 0;
             CHECK(sent_command_count(D2K_CMD_SET_ADDR_PROBE, NULL, 0) == 1 &&
                   sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0) == 0 &&
                   last_addr_probe_endpoint(vsrc, &vsport, vtrial) &&
                   memcmp(vsrc, "\xc0\xa8\x01\x43", 4) == 0 &&
-                  vsport == htons(40200),
-                  "voice Plan не ограничен точной пятёркой измеренного разговора");
+                  vsport == 0,
+                  "voice Plan не ограничен клиентом LAN и точкой сервера");
+            /* Опыт ждёт дольше lease датапата — продление тем же поколением. */
+            forget_sent();
+            skip_ahead(s, 61 * 1000);
+            uint8_t rsrc[4], rtrial[D2K_TRIAL_ID_LEN];
+            uint16_t rsport = 1;
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR_PROBE, NULL, 0) == 1 &&
+                  last_addr_probe_endpoint(rsrc, &rsport, rtrial) && rsport == 0 &&
+                  memcmp(rtrial, vtrial, sizeof vtrial) == 0,
+                  "голосовой опыт не продлён тем же trial ID");
             CHECK(tcp_calls == 0 && quic_calls == 0 && ver_calls == 0,
                   "по голосу пошёл замер или зонд, которые мерить его не могут");
             CHECK(!said("жду форму приветствия"),
@@ -5981,27 +5991,32 @@ voice_only_run:
                измерением конкретной conntrack-пятёрки. */
             d2k_ev ap = ev_applied(17, 40201);
             memcpy(ap.trial_id, vtrial, sizeof vtrial);
+            ap.high_ip[3] = 68;                 /* другой клиент LAN */
+            d2k_sched_event(s, &ap);
+            ap = ev_applied(17, 40201);
+            memcpy(ap.trial_id, vtrial, sizeof vtrial);
+            ap.low_port = 50005;                /* другая точка сервера */
             d2k_sched_event(s, &ap);
             d2k_ev ex = ev_exchange(17, 40201, 0);
             d2k_sched_event(s, &ex);
             spin(s, 20);
             CHECK(!said("UDP-ответ наблюдался"),
                   "посторонний голосовой поток выбран для измеренного arm");
-            /* Та же пятёрка, тот же Plan ID, но без trial ID опыта — это не
-               наш опыт: один plan hash опыта не называет. */
-            ap = ev_applied(17, 40200);
+            /* Следующий поток того же клиента, тот же Plan ID, но без trial ID
+               опыта — это не наш опыт: один plan hash опыта не называет. */
+            ap = ev_applied(17, 40201);
             d2k_sched_event(s, &ap);
-            ex = ev_exchange(17, 40200, 0);
+            ex = ev_exchange(17, 40201, 0);
             d2k_sched_event(s, &ex);
             spin(s, 20);
             CHECK(!said("UDP-ответ наблюдался"),
                   "APPLIED без trial ID опыта признан применением голосового опыта");
-            /* Только исходный поток, с которого снята цель, становится WATCH:
-               новый пакет живого разговора с trial ID опыта. */
-            ap = ev_applied(17, 40200);
+            /* Следующий разговор того же клиента к той же точке (новый
+               клиентский порт) с trial ID опыта становится WATCH. */
+            ap = ev_applied(17, 40201);
             memcpy(ap.trial_id, vtrial, sizeof vtrial);
             d2k_sched_event(s, &ap);
-            ex = ev_exchange(17, 40200, 0);
+            ex = ev_exchange(17, 40201, 0);
             d2k_sched_event(s, &ex);
             spin(s, 20);
             const d2k_cat_binding *bd = binding_of(&cV, D2K_LINK_VOICE_CLASS, 17);
@@ -6015,6 +6030,8 @@ voice_only_run:
                   sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0 &&
                   sent_command_count(D2K_CMD_DEL_NAME_PROBE, NULL, 0) == 0,
                   "UDP-ответ оставил неподтверждённый голосовой кандидат навсегда");
+            CHECK(said("не проверено") && !said("не пробил"),
+                  "истёкший голосовой опыт не назван «не проверено» либо назван провалом");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cV);
@@ -6077,13 +6094,13 @@ voice_only_run:
             drain();
             uint8_t dsrc[4], dtrial[D2K_TRIAL_ID_LEN];
             uint16_t dsport = 0;
-            CHECK(last_addr_probe_endpoint(dsrc, &dsport, dtrial) &&
-                  dsport == htons(52006),
-                  "голосовой опыт Дискорда не поставлен на пятёрку разговора");
-            d2k_ev ap = ev_applied(17, 52006);
+            CHECK(last_addr_probe_endpoint(dsrc, &dsport, dtrial) && dsport == 0,
+                  "голосовой опыт Дискорда не поставлен на клиента и точку сервера");
+            /* Следующий разговор: новый клиентский порт, первый IP Discovery. */
+            d2k_ev ap = ev_applied(17, 52016);
             memcpy(ap.trial_id, dtrial, sizeof dtrial);
             d2k_sched_event(s, &ap);
-            d2k_ev ex = ev_exchange(17, 52006, 0);
+            d2k_ev ex = ev_exchange(17, 52016, 0);
             ex.code = D2K_UDP_PROOF_VOICE_DISCOVERY;
             d2k_sched_event(s, &ex);
             spin(s, 20);
@@ -6096,6 +6113,49 @@ voice_only_run:
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cD);
+
+        /* Датапат отверг опыт (NAK) — местный отказ, а не провал кандидата. */
+        d2k_catalog cN;
+        memset(&cN, 0, sizeof cN);
+        saidbuf[0] = '\0';
+        s = d2k_sched_new(&cN, sv[0], 0x2d);
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            forget_sent();
+            d2k_ev h = ev_hello(17, 52007, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 52007);
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            drain();
+            uint8_t nsrc[4], ntrial[D2K_TRIAL_ID_LEN];
+            uint16_t nsport = 1;
+            CHECK(last_addr_probe_endpoint(nsrc, &nsport, ntrial),
+                  "голосовой опыт для NAK-проверки не ушёл");
+            forget_sent();
+            d2k_ev nak;
+            memset(&nak, 0, sizeof nak);
+            nak.kind = D2K_EV_ACK;
+            nak.code = D2K_CMD_SET_ADDR_PROBE;
+            nak.num = D2K_ACK_NO_ROOM;          /* ok = 0 в старшем байте */
+            memcpy(nak.trial_id, ntrial, sizeof ntrial);
+            d2k_sched_event(s, &nak);
+            spin(s, 5);
+            CHECK(said("местный отказ") && !said("не пробил") &&
+                  binding_of(&cN, D2K_LINK_VOICE_CLASS, 17) == NULL,
+                  "NAK голосового опыта не назван местным отказом");
+            /* Задача освобождена: APPLIED с этим trial ID ничего не двигает. */
+            d2k_ev ap = ev_applied(17, 52017);
+            memcpy(ap.trial_id, ntrial, sizeof ntrial);
+            d2k_sched_event(s, &ap);
+            d2k_ev ex = ev_exchange(17, 52017, 0);
+            ex.code = D2K_UDP_PROOF_VOICE_DISCOVERY;
+            d2k_sched_event(s, &ex);
+            spin(s, 5);
+            CHECK(!said("ПОДТВЕРЖДЕНО"), "отвергнутый опыт подтвердился");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cN);
 
         /* Тот же путь, но поток разговора с приёмом МОЛЧИТ. */
         d2k_catalog cW;

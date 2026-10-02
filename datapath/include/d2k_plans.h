@@ -253,6 +253,14 @@ int d2k_plantab_del_addr_probe(d2k_plantab *t,
 const d2k_plan *d2k_plantab_find_addr_probe(
     d2k_plantab *t, const d2k_addr_probe_flow *flow, uint64_t now_ns,
     uint8_t trial_id_out[D2K_TRIAL_ID_LEN]);
+/* The same lookup for a voice request (IP Discovery / STUN) of a user flow.
+ * Additionally matches a VOICE WILDCARD entry (flow.src_port_be == 0): the
+ * same LAN client address, the same server address and UDP port, any client
+ * port — the next call or rejoin from that client to that voice endpoint.
+ * find_addr_probe never returns wildcard entries. */
+const d2k_plan *d2k_plantab_find_voice_probe(
+    d2k_plantab *t, const d2k_addr_probe_flow *flow, uint64_t now_ns,
+    uint8_t trial_id_out[D2K_TRIAL_ID_LEN]);
 size_t d2k_plantab_probe_count(const d2k_plantab *t);
 
 /* Сперва по имени, потом по адресу. NULL — плана для этой цели нет, и это

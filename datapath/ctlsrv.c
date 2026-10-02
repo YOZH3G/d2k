@@ -267,7 +267,9 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
                             (uint32_t)b[lease_off + 2] << 8 | b[lease_off + 3];
         uint8_t any_id = 0;
         for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any_id |= trial_id[i]; }
-        if (flow.transport != 17 || !flow.src_port_be || !flow.dst_port_be ||
+        /* src_port 0 — голосовой опыт «любой клиентский порт» (задача 15);
+           подстановка видна только поиску голоса (d2k_plantab_find_voice_probe). */
+        if (flow.transport != 17 || !flow.dst_port_be ||
             !lease_ms || lease_ms > D2K_ADDR_PROBE_LEASE_MAX_MS || !any_id ||
             cx->now_ns > UINT64_MAX - (uint64_t)lease_ms * 1000000u) {
             ack_trial(cx, type, 0, D2K_ACK_BAD_ARGS, trial_id);
@@ -396,7 +398,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         const uint8_t *trial_id = b + D2K_ADDR_PROBE_FLOW_WIRE_LEN;
         uint8_t any_id = 0;
         for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any_id |= trial_id[i]; }
-        if (flow.transport != 17 || !flow.src_port_be || !flow.dst_port_be || !any_id) {
+        if (flow.transport != 17 || !flow.dst_port_be || !any_id) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }

@@ -104,6 +104,8 @@
    (silence_deadline); пятнадцать — с запасом на медленную очередь событий, и
    не больше, чем человек готов слушать тишину в звонке. */
 #define SCHED_VOICE_WATCH_MS (15 * 1000)
+/* Продление голосового опыта: вдвое чаще потолка lease датапата. */
+#define SCHED_VOICE_LEASE_RENEW_MS ((int64_t)D2K_ADDR_PROBE_LEASE_MAX_MS / 2)
 
 /* Сколько выведенных планов держит задача. Это же потолок, который
    d2k_compose получает под свои плечи. */
@@ -426,6 +428,7 @@ typedef struct {
        назвать сервером клиента. Ноль — адресат по-старому, t->ip/t->port. */
     uint8_t     addr_probe_dst_ip[16];
     uint16_t    addr_probe_dst_port_be;
+    int64_t     voice_lease_ms;   /* когда опыт голоса последний раз (пере)ставлен */
     d2k_flowkey voice_flow;
     int         voice_flow_bound;
     int         voice_answered;
@@ -3766,6 +3769,51 @@ new_box:
  * Только BLOCKED + найденные и помеченные байты превращаются во временный
  * voice Plan; проверка применением к самому разговору остаётся отдельной.
  * Обычный UDP EXCHANGE не подтверждает приложение и не создаёт каталог. */
+/* Ставит или продлевает голосовой опыт: тот же поток-ключ (клиент, точка
+   сервера, клиентский порт 0) и то же поколение — датапат продлевает lease
+   и не заводит второй записи (d2k_plantab_set_addr_probe). */
+static int voice_trial_send(d2k_sched *s, task *t, int64_t now_ms,
+                            char *err, size_t errcap) {
+    if (t->n_plans == 0) { snprintf(err, errcap, "нет плана"); return -1; }
+    char wire[sizeof t->plans[0]];
+    char hex[2 * D2K_PLAN_TLV_MAX + 1];
+    snprintf(wire, sizeof wire, "%s", t->plans[0]);
+    if (stamp_plan_id(wire, t->ver_plan_id) != 0) {
+        snprintf(err, errcap, "Plan не идентифицируется");
+        return -1;
+    }
+    if (d2k_plan_text_to_hex(wire, hex, sizeof hex, err, errcap) != 0 ||
+        d2k_link_set_addr_probe_family(s->link_fd, t->addr_probe_src_ip, 0,
+                                       t->addr_probe_dst_ip, t->addr_probe_dst_port_be,
+                                       17, 4, t->addr_probe_trial_id,
+                                       D2K_ADDR_PROBE_LEASE_MAX_MS, hex,
+                                       err, errcap) != 0) {
+        return -1;
+    }
+    t->voice_lease_ms = now_ms;
+    return 0;
+}
+
+static const char *voice_ip_fmt(const uint32_t *ip, char *buf) {
+    if (!inet_ntop(AF_INET, ip, buf, INET_ADDRSTRLEN)) { snprintf(buf, INET_ADDRSTRLEN, "?"); }
+    return buf;
+}
+static const char *voice_ip_text(const uint32_t *ip) {
+    static char b[INET_ADDRSTRLEN];
+    return voice_ip_fmt(ip, b);
+}
+static const char *voice_ip_text2(const uint32_t *ip) {
+    static char b[INET_ADDRSTRLEN];
+    return voice_ip_fmt(ip, b);
+}
+
+/* Голосовой опыт этой задачи (не QUIC по адресу): клиент LAN + точка
+   сервера, клиентский порт любой. */
+static int voice_trial_owned(const task *t) {
+    return !t->by_addr && t->addr_probe_identity_valid &&
+           t->addr_probe_src_port_be == 0 && t->addr_probe_dst_port_be != 0;
+}
+
 static void voice_start(d2k_sched *s, task *t) {
     t->n_plans = 0;
     t->next_plan = 0;
@@ -3826,35 +3874,31 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
         task_fail(s, t, now_ms);
         return;
     }
-    /* ОПЫТ — ТОЧНАЯ ПЯТЁРКА ЖИВОГО РАЗГОВОРА С TRIAL ID (задача 15).
-       Портовая запись имени (SET_NAME_PROBE) пользовательскому трафику не
-       видна — она для собственных проб контроллера, — и разговор, ради
-       которого опыт ставится, его не получал. Адресный опыт держит клиента
-       LAN (адрес и порт), сервер и поколение; APPLIED несёт этот trial ID,
-       и только им опыт признаётся (on_applied). Срок — lease датапата. */
-    char hex[2 * D2K_PLAN_TLV_MAX + 1];
-    uint8_t client_ip[16] = {0}, server_ip[16] = {0};
-    memcpy(client_ip, &r.client_ip, sizeof r.client_ip);
-    memcpy(server_ip, &r.ip, sizeof r.ip);
+    /* ОПЫТ — КЛИЕНТ LAN + ТОЧКА СЕРВЕРА + ЛЮБОЙ КЛИЕНТСКИЙ ПОРТ, С TRIAL ID
+       (задача 15). Портовая запись имени (SET_NAME_PROBE) пользовательскому
+       трафику не видна, а разговор, шедший во время замера, к этому моменту
+       за окном экрана (S99d2k: в очередь идут первые 8 пакетов потока) —
+       его поздние пакеты датапат не видит вовсе. Опыт ждёт СЛЕДУЮЩИЙ поток
+       того же клиента к той же точке (повторный вход, новый звонок): его
+       первый запрос голоса получает план, APPLIED несёт trial ID (on_applied).
+       Другим клиентам и другим точкам опыт не достаётся. */
+    (void)cat_id;
     if (t->family != 4 || fresh_trial_id(t->addr_probe_trial_id) != 0) {
-        say(s, "по %s (голос) опыт на точной пятёрке не завести", t->name);
+        say(s, "по %s (голос) опыт не завести", t->name);
         task_fail(s, t, now_ms);
         return;
     }
-    if (d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0 ||
-        d2k_link_set_addr_probe_family(s->link_fd, client_ip, htons(r.client_port),
-                                       server_ip, htons(r.port), 17, 4,
-                                       t->addr_probe_trial_id,
-                                       D2K_ADDR_PROBE_LEASE_MAX_MS, hex,
-                                       err, sizeof err) != 0) {
+    memset(t->addr_probe_src_ip, 0, sizeof t->addr_probe_src_ip);
+    memcpy(t->addr_probe_src_ip, &r.client_ip, sizeof r.client_ip);
+    t->addr_probe_src_port_be = 0;      /* любой клиентский порт */
+    memset(t->addr_probe_dst_ip, 0, sizeof t->addr_probe_dst_ip);
+    memcpy(t->addr_probe_dst_ip, &r.ip, sizeof r.ip);
+    t->addr_probe_dst_port_be = htons(r.port);
+    if (voice_trial_send(s, t, now_ms, err, sizeof err) != 0) {
         say(s, "по %s (голос) измеренный Plan не поставился: %s", t->name, err);
         task_fail(s, t, now_ms);
         return;
     }
-    memcpy(t->addr_probe_src_ip, client_ip, sizeof t->addr_probe_src_ip);
-    t->addr_probe_src_port_be = htons(r.client_port);
-    memcpy(t->addr_probe_dst_ip, server_ip, sizeof t->addr_probe_dst_ip);
-    t->addr_probe_dst_port_be = htons(r.port);
     t->addr_probe_identity_valid = 1;
     t->trial_installed = 1;
     t->trial_shape = D2K_LINK_SHAPE_VOICE;
@@ -3863,9 +3907,10 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
     s->probes_used += r.probes;
     t->state = T_VOICE_TRIAL;
     say(s, "по %s (голос) найденный исходным перебором arm %s ×%d (%zu байт) "
-           "поставлен только на измеренный клиентский порт %u. Это временный опыт",
+           "поставлен на следующий разговор клиента %s к %s:%u (любой клиентский "
+           "порт, lease). Это временный опыт",
         t->name, r.fake_arm[0] ? r.fake_arm : "voice", r.arm_copies, r.arm_len,
-        (unsigned)r.client_port);
+        voice_ip_text(&r.client_ip), voice_ip_text2(&r.ip), (unsigned)r.port);
 }
 
 /* QUIC-цель без доступного SNI. Не выдумываем имя: start_search проходит
@@ -4824,13 +4869,26 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
                пакет живого разговора приходит за окном приветствия, и
                признать его можно только по поколению опыта — один Plan ID
                опыта не называет (задача 15). */
-            if (!t->by_addr &&
-                (!t->voice_flow_bound || !ev_matches_flow(ev, &t->voice_flow) ||
-                 !t->addr_probe_identity_valid ||
-                 memcmp(ev->trial_id, t->addr_probe_trial_id, D2K_TRIAL_ID_LEN) != 0)) {
-                continue;
+            if (!t->by_addr) {
+                /* Голос: trial ID этого опыта И клиент LAN + точка сервера
+                   опыта; клиентский порт любой — это следующий поток того же
+                   клиента (задача 15). Пятёрка этого потока становится
+                   потоком наблюдения: доказательство ждётся на нём. */
+                if (!voice_trial_owned(t) ||
+                    memcmp(ev->trial_id, t->addr_probe_trial_id, D2K_TRIAL_ID_LEN) != 0 ||
+                    (ev->family ? ev->family : 4) != 4) {
+                    continue;
+                }
+                uint16_t dport = ntohs(t->addr_probe_dst_port_be);
+                int server_low = memcmp(ev->low_ip, t->addr_probe_dst_ip, 4) == 0 &&
+                                 ev->low_port == dport &&
+                                 memcmp(ev->high_ip, t->addr_probe_src_ip, 4) == 0;
+                int server_high = memcmp(ev->high_ip, t->addr_probe_dst_ip, 4) == 0 &&
+                                  ev->high_port == dport &&
+                                  memcmp(ev->low_ip, t->addr_probe_src_ip, 4) == 0;
+                if (!server_low && !server_high) { continue; }
             }
-            if (t->by_addr) {
+            {
                 memcpy(t->voice_flow.a_ip, ev->low_ip, 4);
                 memcpy(t->voice_flow.b_ip, ev->high_ip, 4);
                 t->voice_flow.a_port = ev->low_port;
@@ -5211,6 +5269,22 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
                     t->trial_acked = 1;
                 }
             }
+        } else if (ev->code == D2K_CMD_SET_ADDR_PROBE &&
+                   ((ev->num >> 8) & 0xffu) != 1u) {
+            /* ДАТАПАТ ОТВЕРГ ГОЛОСОВОЙ ОПЫТ (нет места, план не принят) —
+               это местный отказ: опыта не было, кандидат не судим. */
+            for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+                task *t = &s->tasks[i];
+                if ((t->state == T_VOICE_TRIAL || t->state == T_VOICE_WATCH) &&
+                    voice_trial_owned(t) &&
+                    memcmp(ev->trial_id, t->addr_probe_trial_id, D2K_TRIAL_ID_LEN) == 0) {
+                    say(s, "по %s (голос) датапат отверг опыт (причина %u) — "
+                           "местный отказ, опыта не было, кандидат не судим",
+                        t->name, (unsigned)(ev->num & 0xffu));
+                    remove_trial_exact(s, t);
+                    task_done(t);
+                }
+            }
         }
         return 0;
     case D2K_EV_SUSPECT:
@@ -5447,6 +5521,17 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                    неудача: план уже подтверждён зондом и записан, снимать его
                    (task_fail) не за что. Просто освобождаем место. */
                 task_done(t);
+            } else if ((t->state == T_VOICE_TRIAL || t->state == T_VOICE_WATCH) &&
+                       voice_trial_owned(t)) {
+                /* Следующего разговора с доказательством за срок не было —
+                   опыт НЕ ПРОВЕРЕН, а не провален: кандидата никто не судил.
+                   Снимаем только свой опыт (поток + trial ID). */
+                say(s, "по %s (голос) не проверено: за %d мин опыт не дождался "
+                       "разговора с протокольным ответом — снимаю опыт, "
+                       "кандидат не судим", t->name, SCHED_TASK_LIFE_MS / 60000);
+                remove_trial_exact(s, t);
+                if (t->probes > 0) { cooldown_record(s, t, 2); }
+                task_done(t);
             } else {
                 /* СРОК ЗАДАЧИ ИСТЁК — И ЕСЛИ ЗАМЕР ЕЩЁ ШЁЛ, ЭТО НАДО СКАЗАТЬ.
                    Иначе в журнале остаётся «поисков идёт 1» и тишина, а
@@ -5507,7 +5592,19 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             }
             continue;
         }
-        if (t->state == T_VOICE_TRIAL) { continue; }
+        if (t->state == T_VOICE_TRIAL) {
+            /* Опыт ждёт следующего разговора дольше lease датапата —
+               продлеваем тем же поколением, пока задача жива. */
+            if (voice_trial_owned(t) &&
+                now_ms - t->voice_lease_ms >= SCHED_VOICE_LEASE_RENEW_MS) {
+                char err[160];
+                if (voice_trial_send(s, t, now_ms, err, sizeof err) != 0) {
+                    say(s, "по %s (голос) опыт не продлился: %s", t->name, err);
+                    t->voice_lease_ms = now_ms;
+                }
+            }
+            continue;
+        }
 
         if (t->state == T_ASKING) {
             int ready;

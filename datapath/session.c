@@ -768,36 +768,8 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        проходил именно так.
 
        Окно поиска по-прежнему держит цену: попыток не больше
-       D2K_HELLO_WINDOW на поток.
-
-       ИСКЛЮЧЕНИЕ — ГОЛОСОВОЙ ОПЫТ НА ЭТОЙ САМОЙ ПЯТЁРКЕ (задача 15).
-       Контроллер ставит временный голосовой план ПОСЛЕ замера живого
-       разговора, когда тот давно за окном. Опыт — точная пятёрка клиента
-       (адрес LAN и порт) с trial ID поколения (d2k_plantab_set_addr_probe);
-       только запрос голоса (IP Discovery / STUN) этой пятёрки идёт дальше,
-       и только с пользовательского потока: пробы контроллера здесь не
-       расширяются. Цена держится на probe_count: без опытов таблица не
-       обходится. */
-    int voice_trial_flow = 0;
-    if (fl->fwd_pkts > D2K_HELLO_WINDOW && !fl->plan_done && !fl->controller_probe &&
-        payload_len > 0 && d2k_plantab_probe_count(s->plans) > 0 &&
-        (is_discord_ip_discovery(pkt + payload_off, payload_len) ||
-         is_stun_request(pkt + payload_off, payload_len))) {
-        d2k_addr_probe_flow live;
-        memset(&live, 0, sizeof live);
-        live.family = ip->family;
-        memcpy(ip->family == 6 ? live.src_ip6 : live.src_ip4,
-               ip->src.bytes, ip->family == 6 ? 16 : 4);
-        memcpy(&live.src_port_be, u + 0, 2);
-        memcpy(ip->family == 6 ? live.dst_ip6 : live.dst_ip4,
-               ip->dst.bytes, ip->family == 6 ? 16 : 4);
-        memcpy(&live.dst_port_be, u + 2, 2);
-        live.transport = 17;
-        voice_trial_flow = d2k_plantab_find_addr_probe(s->plans, &live, now_ns,
-                                                       NULL) != NULL;
-    }
-    if ((fl->saw_hello && fl->plan_done) ||
-        (fl->fwd_pkts > D2K_HELLO_WINDOW && !voice_trial_flow)) {
+       D2K_HELLO_WINDOW на поток. */
+    if ((fl->saw_hello && fl->plan_done) || fl->fwd_pkts > D2K_HELLO_WINDOW) {
         out->skipped = fl->saw_hello ? "поток уже показывал приветствие"
                                       : "за окном поиска";
         return;
@@ -983,11 +955,19 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     memcpy(&probe_flow.dst_port_be, u + 2, 2);
     probe_flow.transport = 17;
     uint8_t trial_id[D2K_TRIAL_ID_LEN] = {0};
-    /* Голосу точный опыт достаётся только на пользовательском потоке — это
-       временный план живого разговора (задача 15). Голосовые пакеты
-       контроллера адресных опытов не берут. */
-    const d2k_plan *use = (voice && fl->controller_probe) ? NULL : d2k_plantab_find_addr_probe(
-        s->plans, &probe_flow, now_ns, trial_id);
+    /* ГОЛОСОВОЙ ОПЫТ (задача 15) — только запросу голоса пользовательского
+       потока. Межсетевой экран отдаёт в очередь лишь первые пакеты потока
+       (S99d2k, connbytes 0:8), поэтому опыт ждёт СЛЕДУЮЩИЙ разговор того же
+       клиента LAN с той же точкой сервера (адрес и порт), с любым клиентским
+       портом; его первый IP Discovery / STUN-запрос и получает план, APPLIED
+       несёт trial ID. Голосовые пакеты контроллера адресных опытов не берут;
+       не-голос подстановочных записей не видит (find_addr_probe). */
+    const d2k_plan *use = NULL;
+    if (!voice) {
+        use = d2k_plantab_find_addr_probe(s->plans, &probe_flow, now_ns, trial_id);
+    } else if (!fl->controller_probe) {
+        use = d2k_plantab_find_voice_probe(s->plans, &probe_flow, now_ns, trial_id);
+    }
     if (!use) { memset(trial_id, 0, sizeof trial_id); }
     if (!use) { use = d2k_plantab_find_target(s->plans,
                                                  named ? (const uint8_t *)name : NULL,

@@ -693,7 +693,8 @@ int d2k_link_set_addr_family(int fd, const uint8_t *ip4, uint8_t family,
 static int addr_probe_flow_bytes(uint8_t *p, const uint8_t src_ip4[4], uint16_t src_port_be,
                                  const uint8_t dst_ip4[4], uint16_t dst_port_be,
                                  uint8_t transport, uint8_t family) {
-    if (!src_ip4 || !dst_ip4 || !src_port_be || !dst_port_be || transport != 17 ||
+    /* src_port_be 0 — голосовой опыт на любой клиентский порт (задача 15). */
+    if (!src_ip4 || !dst_ip4 || !dst_port_be || transport != 17 ||
         (family != 4 && family != 6)) { return -1; }
     memset(p, 0, 38);
     p[0] = family;

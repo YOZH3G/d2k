@@ -659,8 +659,11 @@ static int trial_id_valid(const uint8_t id[D2K_TRIAL_ID_LEN]) {
     return any != 0;
 }
 
+/* src_port_be == 0 is the voice wildcard: same LAN client, same server
+   endpoint, ANY client port (the next call/rejoin socket). Only
+   d2k_plantab_find_voice_probe consults such entries. */
 static int probe_flow_valid(const d2k_addr_probe_flow *f) {
-    if (!f || f->transport != 17 || f->src_port_be == 0 || f->dst_port_be == 0) {
+    if (!f || f->transport != 17 || f->dst_port_be == 0) {
         return 0;
     }
     if (f->family != 0 && f->family != 4 && f->family != 6) return 0;
@@ -770,10 +773,10 @@ int d2k_plantab_del_addr_probe(d2k_plantab *t,
     return 0;
 }
 
-const d2k_plan *d2k_plantab_find_addr_probe(
-    d2k_plantab *t, const d2k_addr_probe_flow *flow, uint64_t now_ns,
-    uint8_t trial_id_out[D2K_TRIAL_ID_LEN]) {
-    if (!t || !probe_flow_valid(flow)) { return NULL; }
+static const d2k_plan *find_probe(d2k_plantab *t, const d2k_addr_probe_flow *flow,
+                                  uint64_t now_ns, uint8_t trial_id_out[D2K_TRIAL_ID_LEN],
+                                  int voice) {
+    if (!t || !probe_flow_valid(flow) || flow->src_port_be == 0) { return NULL; }
     for (size_t i = 0; i < t->cap; i++) {
         probe_entry *e = &t->probes[i];
         if (!e->used) { continue; }
@@ -781,7 +784,16 @@ const d2k_plan *d2k_plantab_find_addr_probe(
             probe_drop(t, e);
             continue;
         }
-        if (probe_flow_equal(&e->flow, flow)) {
+        int match;
+        if (e->flow.src_port_be == 0) {
+            /* Wildcard client port: voice only, every other field exact. */
+            d2k_addr_probe_flow q = *flow;
+            q.src_port_be = 0;
+            match = voice && probe_flow_equal(&e->flow, &q);
+        } else {
+            match = probe_flow_equal(&e->flow, flow);
+        }
+        if (match) {
             if (trial_id_out) {
                 memcpy(trial_id_out, e->trial_id, D2K_TRIAL_ID_LEN);
             }
@@ -789,6 +801,18 @@ const d2k_plan *d2k_plantab_find_addr_probe(
         }
     }
     return NULL;
+}
+
+const d2k_plan *d2k_plantab_find_addr_probe(
+    d2k_plantab *t, const d2k_addr_probe_flow *flow, uint64_t now_ns,
+    uint8_t trial_id_out[D2K_TRIAL_ID_LEN]) {
+    return find_probe(t, flow, now_ns, trial_id_out, 0);
+}
+
+const d2k_plan *d2k_plantab_find_voice_probe(
+    d2k_plantab *t, const d2k_addr_probe_flow *flow, uint64_t now_ns,
+    uint8_t trial_id_out[D2K_TRIAL_ID_LEN]) {
+    return find_probe(t, flow, now_ns, trial_id_out, 1);
 }
 
 size_t d2k_plantab_probe_count(const d2k_plantab *t) {
