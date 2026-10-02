@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* relay() must not spin after one side half-closes (field 2026-10-02: 194% CPU).
    httpup.c is included to reach the static relay(); IDLE_MS is shortened. */
 #define D2K_HTTPUP_NO_MAIN 1
@@ -58,10 +59,11 @@ static void read_exact(int fd, const char *want) {
 /* half_only: client shuts only its write side and still reads the reply;
    otherwise the client closes entirely. Upstream stays silent and open. */
 static void scenario(int half_only) {
+    polls_inert = 0; polls_total = 0;
     int pc, client, pu, upstream;
     pair(&pc, &client); pair(&pu, &upstream);
     struct args a = { pc, pu, 0, 0 };
-    pthread_t th;
+    pthread_t th = 0;
     assert(pthread_create(&th, NULL, run, &a) == 0);
     assert(send(client, "req", 3, 0) == 3);
     if (half_only) { shutdown(client, SHUT_WR); } else { close(client); }
@@ -81,16 +83,44 @@ static void scenario(int half_only) {
     assert(polls_inert == 0);
     assert(polls_total < 20);
     polls_total = 0;
-    assert(half_only || a.wall_ms >= IDLE_MS - 200);   /* silent upstream: idle timeout ends it */
-    if (!half_only) { assert(a.wall_ms < IDLE_MS + 1000); }
+    if (!half_only) {                                  /* silent upstream: idle timeout ends it */
+        assert(a.wall_ms >= IDLE_MS - 200 && a.wall_ms < IDLE_MS + 1000);
+    }
     if (half_only) { close(client); }
     close(upstream); close(pc); close(pu);
+}
+
+/* TCP client aborts with RST (SO_LINGER 1,0); upstream silent: relay must end
+   quickly through the recv error, not wait for the idle timeout. */
+static void scenario_rst(void) {
+    polls_inert = 0; polls_total = 0;
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(0x7f000001u);
+    assert(bind(ls, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(ls, 1) == 0);
+    socklen_t sl = sizeof sa; assert(getsockname(ls, (struct sockaddr *)&sa, &sl) == 0);
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    assert(connect(client, (struct sockaddr *)&sa, sizeof sa) == 0);
+    int pc = accept(ls, NULL, NULL); assert(pc >= 0);
+    int pu, upstream; pair(&pu, &upstream);
+    struct args a = { pc, pu, 0, 0 };
+    pthread_t th = 0;
+    assert(pthread_create(&th, NULL, run, &a) == 0);
+    struct linger lg = { 1, 0 };
+    assert(setsockopt(client, SOL_SOCKET, SO_LINGER, &lg, sizeof lg) == 0);
+    close(client);
+    pthread_join(th, NULL);
+    printf("rst cpu=%ldms wall=%ldms\n", a.cpu_ms, a.wall_ms);
+    assert(a.cpu_ms < 50 && a.wall_ms < 1000);
+    assert(polls_inert == 0 && polls_total < 20);
+    close(upstream); close(pc); close(pu); close(ls);
 }
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     scenario(0);
     scenario(1);
+    scenario_rst();
     puts("test_httpup_relay: ok");
     return 0;
 }
