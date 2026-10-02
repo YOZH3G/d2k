@@ -35,7 +35,7 @@
 #include "d2k_compose_internal.h" /* d2k_props_contact — общее обращение к цели */
 #include "d2k_h3.h"
 #include "d2k_quicconn.h"
-#include "d2k_quicprobe.h" /* D2K_QUIC_ARM_DATA_BYTES */
+#include "d2k_quicprobe.h" /* D2K_QUIC_ARM_DATA_BYTES, d2k_quic_arm_data_judge */
 #include "d2k_tls13.h"
 #include "d2k_tls12.h"
 #include "d2k_verify.h"
@@ -1090,6 +1090,15 @@ static void quic_app_silent(d2k_ver_result *r, size_t got, uint64_t wire,
 d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t port,
                                         const char *sni, int deadline_ms,
                                         size_t hello_wire) {
+    return d2k_verify_probe_quic_path_on(use_fd, ip, port, sni, deadline_ms, hello_wire, "/");
+}
+
+/* То же по пути path — известному большому ресурсу цели (задача 39, раунд 1:
+   select_resource_path теперь и для QUIC). NULL или пусто — «/». */
+d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_t port,
+                                             const char *sni, int deadline_ms,
+                                             size_t hello_wire, const char *path) {
+    if (!path || !path[0]) path = "/";
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
     r.fd = -1;
@@ -1156,7 +1165,7 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
     }
 
     uint8_t req[512];
-    size_t rn = d2k_h3_request(host, "/", req, sizeof req);
+    size_t rn = d2k_h3_request(host, path, req, sizeof req);
     if (rn == 0 || d2k_qc_stream_send(c, 0, req, rn, 1, err, sizeof err) != 0) {
         snprintf(r.reason, sizeof r.reason, "запрос не ушёл: %.150s", err);
         r.fd = d2k_qc_release(c);
@@ -1191,29 +1200,32 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
     /* ЗАГОЛОВКИ — ЕЩЁ НЕ ПРИЛОЖЕНИЕ (задача 39). Поле 02.10.2026 (задача 33):
        после фальшивки линия пропускает рукопожатие и первые килобайты, а
        дальше поток обрывается. Приложение доказано, когда ответ пришёл
-       ЦЕЛИКОМ (сервер закрыл поток — как полный ответ у TCP-зонда) или когда
-       через линию прошло не меньше D2K_QUIC_ARM_DATA_BYTES данных ответа.
+       ЦЕЛИКОМ (FIN и все байты до него без дыр — FIN под прикладными ключами
+       коробке не подделать) или когда через линию прошло не меньше
+       D2K_QUIC_ARM_DATA_BYTES данных ответа. Поток, вставший без полного
+       ответа ниже порога, — обрыв.
        Чтение продолжается в том же сроке; лишние байты не храним. */
     if (r.status != 0 && r.level != D2K_VER_DENIED) {
         uint64_t bytes = 0;
-        int fin = 0;
-        d2k_qc_app_progress(c, &bytes, &fin);
-        while (!closed && !fin && bytes < D2K_QUIC_ARM_DATA_BYTES &&
+        int complete = 0;
+        d2k_qc_app_progress(c, &bytes, &complete);
+        while (!closed && !complete && bytes < D2K_QUIC_ARM_DATA_BYTES &&
                verify_now_ms() < until) {
             uint64_t sid = 0;
             uint8_t sink[4096];
             if (d2k_qc_stream_recv(c, &sid, sink, sizeof sink, 200, err, sizeof err) < 0) {
                 closed = 1;
             }
-            d2k_qc_app_progress(c, &bytes, &fin);
+            d2k_qc_app_progress(c, &bytes, &complete);
         }
         r.body_bytes = bytes;
-        r.body_complete = fin;
-        if (fin || bytes >= D2K_QUIC_ARM_DATA_BYTES) {
+        r.body_complete = complete;
+        /* То же правило, что у этапа данных плеча (d2k_quic_arm_data_judge). */
+        if (d2k_quic_arm_data_judge(1, bytes, complete) == D2K_QAD_PASS) {
             r.level = D2K_VER_APPLICATION;
             snprintf(r.reason, sizeof r.reason,
                      "заголовки HTTP/3 получены, статус %d, данных %llu байт%s", r.status,
-                     (unsigned long long)bytes, fin ? ", ответ целиком" : "");
+                     (unsigned long long)bytes, complete ? ", ответ целиком" : "");
         } else {
             snprintf(r.reason, sizeof r.reason,
                      "заголовки HTTP/3 получены (статус %d), поток оборван на %llu байт "

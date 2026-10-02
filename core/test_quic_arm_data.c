@@ -39,12 +39,13 @@ static int fails;
 
 /* --- стенд: UDP-сервер с режимами ответа ------------------------------- */
 
-enum { M_SILENT, M_BOUND, M_RETRY, M_VN, M_FAKE_KEYS, M_WRONG_CID };
+enum { M_SILENT, M_BOUND, M_RETRY, M_RETRY_BADTAG, M_RETRY_FOREIGN, M_VN, M_FAKE_KEYS, M_WRONG_CID };
 
 #define MAX_SEEN 256
 static volatile int g_mode;
 static int g_fd = -1;
 static uint16_t g_seen_port[MAX_SEEN];
+static size_t g_seen_token[MAX_SEEN]; /* длина токена Initial (после Retry) */
 static size_t g_seen_len[MAX_SEEN];
 static int g_seen_ours[MAX_SEEN];
 static volatile int g_seen_n;
@@ -83,6 +84,12 @@ static void *stand_run(void *arg) {
             g_seen_port[g_seen_n] = ntohs(from.sin_port);
             g_seen_len[g_seen_n] = (size_t)n;
             g_seen_ours[g_seen_n] = ours;
+            g_seen_token[g_seen_n] = 0;
+            {
+                d2k_qw_hdr th;
+                if (d2k_qw_hdr_parse(buf, (size_t)n, 0, &th) == 0 && th.long_hdr &&
+                    th.type == D2K_QW_LT_INITIAL) g_seen_token[g_seen_n] = th.token_len;
+            }
             g_seen_n++;
         }
         pthread_mutex_unlock(&g_mu);
@@ -98,10 +105,19 @@ static void *stand_run(void *arg) {
             if (ours) ol = server_initial(dcid, h.dcid_len, scid, h.scid_len, out, sizeof out);
             break;
         case M_RETRY:
-            /* Retry с ВЕРНЫМ тегом целостности — всё равно не успех плеча. */
-            if (ours) ol = d2k_qw_retry_build(out, sizeof out, D2K_QW_V1, dcid, h.dcid_len,
-                                              scid, h.scid_len, other, sizeof other,
-                                              (const uint8_t *)"tok", 3);
+        case M_RETRY_BADTAG:
+        case M_RETRY_FOREIGN:
+            /* Retry нашему SCID с верным тегом от нашего DCID (M_RETRY);
+               с испорченным тегом; адресованный чужому CID. Отвечаем только
+               на Initial без токена: Initial после Retry стенд принимает
+               молча (повторный Retry клиент обязан отвергнуть). */
+            if (ours && h.token_len == 0) {
+                int foreign = g_mode == M_RETRY_FOREIGN;
+                ol = d2k_qw_retry_build(out, sizeof out, D2K_QW_V1, dcid, h.dcid_len,
+                                        foreign ? other : scid, foreign ? sizeof other : h.scid_len,
+                                        other, sizeof other, (const uint8_t *)"tok", 3);
+                if (ol && g_mode == M_RETRY_BADTAG) out[ol - 1] ^= 0x01;
+            }
             break;
         case M_VN:
             if (ours) {
@@ -163,7 +179,9 @@ static d2k_quic_arm_question quic5_question(void) {
 static void test_bound_replies_only(uint16_t port) {
     static const struct { int mode; int want; const char *what; } cases[] = {
         {M_BOUND, 3, "привязанный Initial: плечо проходит фильтр 3/3 (стенд исправен)"},
-        {M_RETRY, 0, "Retry (с верным тегом) не делает плечо успешным"},
+        {M_RETRY, 3, "Retry нашему SCID с верным тегом от нашего DCID проходит фильтр"},
+        {M_RETRY_BADTAG, 0, "Retry с неверным тегом не проходит фильтр"},
+        {M_RETRY_FOREIGN, 0, "Retry чужому CID не проходит фильтр"},
         {M_VN, 0, "Version Negotiation не делает плечо успешным"},
         {M_FAKE_KEYS, 0, "ответ на приманку (её ключи и CID) не засчитывается"},
         {M_WRONG_CID, 0, "Initial на наших ключах, но не нашему SCID, не засчитывается"},
@@ -218,15 +236,32 @@ static void test_ladder_handshake_without_data(uint16_t port) {
 /* --- 2б. судья и лестница с подменённым этапом данных -------------------- */
 
 static void test_judge(void) {
-    CHECK(d2k_quic_arm_data_judge(1, 6 * 1024, 0) == D2K_QAD_CUT,
-          "рукопожатие есть, обрыв после 6 КБ — не прошло (CUT)");
-    CHECK(d2k_quic_arm_data_judge(1, 6 * 1024, 0) != D2K_QAD_PASS, "обрыв 6 КБ — не PASS");
+    d2k_qw_ranges r;
+    /* Полный короткий ответ: FIN, все байты 0..3000 — прошло. */
+    d2k_qw_ranges_reset(&r);
+    d2k_qw_ranges_add(&r, 1000, 2000, 1);
+    d2k_qw_ranges_add(&r, 0, 1000, 0);
+    CHECK(d2k_qw_ranges_complete(&r) && d2k_qw_ranges_bytes(&r) == 3000, "FIN и все байты до него — ответ целиком");
+    CHECK(d2k_quic_arm_data_judge(1, d2k_qw_ranges_bytes(&r), d2k_qw_ranges_complete(&r)) == D2K_QAD_PASS,
+          "полный короткий ответ (3 КБ) — прошло");
+    /* Дыра перед FIN — не целиком, ниже порога — обрыв. */
+    d2k_qw_ranges_reset(&r);
+    d2k_qw_ranges_add(&r, 0, 1000, 0);
+    d2k_qw_ranges_add(&r, 2000, 1000, 1);
+    CHECK(!d2k_qw_ranges_complete(&r) && d2k_qw_ranges_bytes(&r) == 2000, "дыра перед FIN — ответ не целиком");
+    CHECK(d2k_quic_arm_data_judge(1, d2k_qw_ranges_bytes(&r), d2k_qw_ranges_complete(&r)) == D2K_QAD_CUT,
+          "дыра перед FIN — не прошло");
+    /* Поток встал на 6 КБ без FIN — обрыв. */
+    d2k_qw_ranges_reset(&r);
+    for (uint64_t off = 0; off < 6144; off += 1024) d2k_qw_ranges_add(&r, off, 1024, 0);
+    d2k_qw_ranges_add(&r, 0, 1024, 0); /* повтор не считается дважды */
+    CHECK(d2k_qw_ranges_bytes(&r) == 6144 && r.n == 1, "повтор кадра не раздувает счёт");
+    CHECK(d2k_quic_arm_data_judge(1, d2k_qw_ranges_bytes(&r), d2k_qw_ranges_complete(&r)) == D2K_QAD_CUT,
+          "рукопожатие есть, поток встал на 6 КБ без FIN — не прошло");
     CHECK(d2k_quic_arm_data_judge(1, D2K_QUIC_ARM_DATA_BYTES, 0) == D2K_QAD_PASS,
-          "не меньше порога данных — прошло");
+          "не меньше порога без FIN — прошло");
     CHECK(d2k_quic_arm_data_judge(1, D2K_QUIC_ARM_DATA_BYTES - 1, 0) == D2K_QAD_CUT,
-          "на байт меньше порога без конца ответа — обрыв");
-    CHECK(d2k_quic_arm_data_judge(1, 3000, 1) == D2K_QAD_SHORT,
-          "ответ кончился до порога — данные не измерены, не успех");
+          "на байт меньше порога без FIN — обрыв");
     CHECK(d2k_quic_arm_data_judge(0, 100000, 1) == D2K_QAD_NO_HANDSHAKE,
           "без рукопожатия данных не бывает");
     CHECK(D2K_QUIC_ARM_DATA_BYTES >= 16384 && D2K_QUIC_ARM_DATA_BYTES <= 32768,
@@ -251,7 +286,7 @@ static d2k_quic_arm_data fixed_data(const d2k_quic_arm_question *q, void *u) {
     d2k_quic_arm_data d;
     memset(&d, 0, sizeof d);
     d.verdict = g_data_verdict;
-    d.app_bytes = g_data_verdict == D2K_QAD_PASS ? 40000 : g_data_verdict == D2K_QAD_CUT ? 6144 : 3000;
+    d.app_bytes = g_data_verdict == D2K_QAD_PASS ? 3000 : 6144;
     return d;
 }
 
@@ -281,13 +316,6 @@ static void test_ladder_with_data_stage(void) {
     CHECK(r.kind == D2K_QA_TTL && r.len > 0 && strcmp(r.blob_name, "quic5") == 0,
           "плечо с данными не меньше порога — прошло");
 
-    g_data_verdict = D2K_QAD_SHORT; g_calls = g_data_calls = 0;
-    r = d2k_quic_original_arms(&c);
-    CHECK(r.len == 0 && r.kind != D2K_QA_COPIES && r.kind != D2K_QA_TTL,
-          "короткий ответ цели — не успех плеча");
-    CHECK(r.incomplete && r.data_short > 0 && strstr(r.reason, "данные не измерены"),
-          "короткий ответ — «рукопожатие доказано, данные не измерены», поиск не завершён");
-
     c.data = NULL;
     r = d2k_quic_original_arms(&c);
     CHECK(r.kind == D2K_QA_TTL, "без этапа данных (юнит-оракул) — порядок лестницы прежний");
@@ -309,7 +337,7 @@ static void test_fresh_ports(uint16_t port) {
     int sent = 0;
     (void)d2k_quic_ask_arm_hook(&q, TARGET, port, 60, 0, &sent);
     (void)d2k_quic_ask_arm_hook(&q, TARGET, port, 60, 0, &sent);
-    d2k_quic_arm_data d = d2k_quic_arm_data_hook(&q, TARGET, port, 60, 0);
+    d2k_quic_arm_data d = d2k_quic_arm_data_hook(&q, TARGET, NULL, port, 60, 0);
     {
         struct timespec nap = {0, 50000000L};
         (void)nanosleep(&nap, NULL);
@@ -351,6 +379,30 @@ static void test_fresh_ports(uint16_t port) {
 }
 #endif
 
+/* Retry, прошедший фильтр, ведёт этап данных: d2k_qc идёт за его токеном
+   на той же свежей четвёрке. Стенд второй Retry не шлёт и рукопожатия не
+   ведёт — исход «рукопожатия нет», но Initial с токеном обязан уйти. */
+static void test_data_stage_follows_retry(uint16_t port) {
+    g_mode = M_RETRY;
+    seen_reset();
+    d2k_quic_arm_question q = quic5_question();
+    d2k_quic_arm_data d = d2k_quic_arm_data_hook(&q, TARGET, "/big.css", port, 100, 0);
+    struct timespec nap = {0, 50000000L};
+    (void)nanosleep(&nap, NULL);
+    int plain = 0, with_token = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_seen_n; i++) {
+        if (g_seen_port[i] != d.local_port || !g_seen_ours[i]) continue;
+        if (g_seen_token[i] == 3) with_token++; else if (g_seen_token[i] == 0) plain++;
+    }
+    pthread_mutex_unlock(&g_mu);
+    CHECK(d.local_port && plain >= 1 && with_token >= 1,
+          "этап данных идёт за верным Retry: Initial с его токеном на той же четвёрке");
+    CHECK(d.verdict == D2K_QAD_NO_HANDSHAKE, "Retry без рукопожатия плечо не засчитывает");
+    CHECK(strstr(d.note, "d2k_qc") && strstr(d.note, "/big.css"),
+          "трасса этапа: каким приветствием и по какому пути");
+}
+
 int main(void) {
     int old_local = d2k_quic_allow_local;
     d2k_quic_allow_local = 1;
@@ -362,6 +414,7 @@ int main(void) {
     test_judge();
     test_ladder_with_data_stage();
     test_fresh_ports(port);
+    test_data_stage_follows_retry(port);
 #endif
     d2k_quic_allow_local = old_local;
     if (fails) { printf("test_quic_arm_data: %d FAIL\n", fails); return 1; }

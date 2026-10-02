@@ -25,6 +25,7 @@
 typedef struct {
     uint16_t port;
     char target_sni[256];
+    const char *path;
     uint32_t wait_ms, mark;
 } original_wire;
 
@@ -42,12 +43,12 @@ static d2k_tally original_probe(const d2k_quic_arm_question *q, void *user, int 
 /* Task 39: the arm's data stage on the same address, name and action. */
 static d2k_quic_arm_data original_data(const d2k_quic_arm_question *q, void *user) {
     original_wire *w=user;
-    return d2k_quic_arm_data_hook(q,w->target_sni,w->port,w->wait_ms,w->mark);
+    return d2k_quic_arm_data_hook(q,w->target_sni,w->path,w->port,w->wait_ms,w->mark);
 }
 
 d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
     d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark) {
-    original_wire wire={.port=port,.wait_ms=wait_ms,.mark=mark};
+    original_wire wire={.port=port,.wait_ms=wait_ms,.mark=mark,.path=ctx?ctx->path:NULL};
     if(d2k_quic_sni(trigger.bytes,trigger.len,wire.target_sni,sizeof wire.target_sni)!=0) {
         wire.target_sni[0]='\0';
         /* У буквальной IP-цели donor ClientHello не содержит SNI, но askArms
@@ -67,6 +68,7 @@ d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
     local.probe=original_probe; local.user=&wire;
     local.data=original_data; local.data_user=&wire;
     d2k_quic_arm r=d2k_quic_original_arms(&local);
+    if(ctx->path) snprintf(r.probe_path,sizeof r.probe_path,"%s",ctx->path);
     ctx->next=local.next; ctx->marked=local.marked;
     return r;
 }

@@ -480,3 +480,52 @@ size_t d2k_qw_retry_build(uint8_t *out, size_t cap, uint32_t version,
     }
     return o + 16;
 }
+
+/* --- принятые байты одного потока ---------------------------------------- */
+
+void d2k_qw_ranges_reset(d2k_qw_ranges *r) {
+    if (r) { memset(r, 0, sizeof *r); }
+}
+
+void d2k_qw_ranges_add(d2k_qw_ranges *r, uint64_t off, uint64_t len, int fin) {
+    if (!r) { return; }
+    uint64_t end = off + len;
+    if (end < off) { return; } /* переполнение — не наш кадр */
+    if (fin && !r->fin) { r->fin = 1; r->fin_off = end; }
+    if (len == 0) { return; }
+    /* Вставка с слиянием: всё, что пересекается или касается, поглощается. */
+    size_t i = 0;
+    while (i < r->n && r->end[i] < off) { i++; }
+    size_t j = i;
+    uint64_t s = off, e = end;
+    while (j < r->n && r->start[j] <= end) {
+        if (r->start[j] < s) { s = r->start[j]; }
+        if (r->end[j] > e) { e = r->end[j]; }
+        j++;
+    }
+    if (j == i) {
+        if (r->n == D2K_QW_RANGES_MAX) { return; }
+        memmove(&r->start[i + 1], &r->start[i], (r->n - i) * sizeof r->start[0]);
+        memmove(&r->end[i + 1], &r->end[i], (r->n - i) * sizeof r->end[0]);
+        r->n++;
+    } else if (j > i + 1) {
+        size_t drop = j - i - 1;
+        memmove(&r->start[i + 1], &r->start[j], (r->n - j) * sizeof r->start[0]);
+        memmove(&r->end[i + 1], &r->end[j], (r->n - j) * sizeof r->end[0]);
+        r->n -= drop;
+    }
+    r->start[i] = s;
+    r->end[i] = e;
+}
+
+uint64_t d2k_qw_ranges_bytes(const d2k_qw_ranges *r) {
+    uint64_t sum = 0;
+    for (size_t i = 0; r && i < r->n; i++) { sum += r->end[i] - r->start[i]; }
+    return sum;
+}
+
+int d2k_qw_ranges_complete(const d2k_qw_ranges *r) {
+    if (!r || !r->fin) { return 0; }
+    if (r->fin_off == 0) { return 1; }
+    return r->n >= 1 && r->start[0] == 0 && r->end[0] >= r->fin_off;
+}

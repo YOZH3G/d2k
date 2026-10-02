@@ -200,6 +200,12 @@ d2k_ver_result d2k_verify_probe_quic(const char *ip, uint16_t port, const char *
 d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t port,
                                         const char *sni, int deadline_ms,
                                         size_t hello_wire);
+/* То же, но запрос HTTP/3 — по пути path (известный большой ресурс цели);
+ * NULL или пусто — «/». Успех — тот же, что у этапа данных плеча: ответ
+ * целиком без дыр или не меньше D2K_QUIC_ARM_DATA_BYTES. */
+d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_t port,
+                                             const char *sni, int deadline_ms,
+                                             size_t hello_wire, const char *path);
 
 /* Закрывает сокет обращения и обнуляет fd. Безопасна на любом результате, в
  * том числе на том, где обращения не было. */

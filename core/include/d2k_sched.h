@@ -161,6 +161,10 @@ extern d2k_sched_alpn_ver_fn d2k_sched_alpn_ver_hook;
 typedef d2k_ver_result (*d2k_sched_path_ver_fn)(int, const char *, uint16_t,
     const char *, int, size_t, int, int, uint32_t, const char *);
 extern d2k_sched_path_ver_fn d2k_sched_path_ver_hook;
+/* QUIC-проверка плана по известному большому ресурсу (задача 39, раунд 1). */
+typedef d2k_ver_result (*d2k_sched_quic_path_ver_fn)(int, const char *, uint16_t,
+    const char *, int, size_t, const char *);
+extern d2k_sched_quic_path_ver_fn d2k_sched_quic_path_ver_hook;
 
 extern d2k_sched_tcp_fn  d2k_sched_tcp_hook;
 extern d2k_sched_quic_fn d2k_sched_quic_hook;

@@ -19,21 +19,20 @@ typedef struct {
     d2k_quic_arm_data_verdict verdict;
     uint64_t app_bytes;   /* данные ответа на запрос, прошедшие после рукопожатия */
     uint16_t local_port;  /* местный порт соединения — свежая четвёрка */
+    char note[160];      /* приветствие и путь этапа (в трассу шага) */
     char reason[256];
 } d2k_quic_arm_data;
 
-/* Вердикт по наблюдениям одного соединения — без сети, ради тестов и одного
- * правила для всех: handshake — рукопожатие дошло до прикладных ключей,
- * app_bytes — данные ответа, fin — сервер закрыл поток ответа. */
-d2k_quic_arm_data_verdict d2k_quic_arm_data_judge(int handshake, uint64_t app_bytes, int fin);
+/* d2k_quic_arm_data_judge — d2k_quicprobe.h (одно правило с verify.c). */
 
 /* Данные плеча, прошедшего фильтр: user — из контекста. */
 typedef d2k_quic_arm_data (*d2k_quic_arm_data_fn)(const d2k_quic_arm_question *, void *user);
 
 /* Сетевой этап данных (quicprobe.c): d2k_qc с воздействием вопроса перед
- * первым Initial, запрос HTTP/3 к sni. Подменяем в тестах. */
+ * первым Initial, запрос HTTP/3 к sni по пути path (NULL или пусто — «/»;
+ * планировщик подставляет известный большой ресурс цели). Подменяем в тестах. */
 typedef d2k_quic_arm_data (*d2k_quic_arm_data_wire_fn)(const d2k_quic_arm_question *,
-    const char *sni, uint16_t port, uint32_t wait_ms, uint32_t mark);
+    const char *sni, const char *path, uint16_t port, uint32_t wait_ms, uint32_t mark);
 extern d2k_quic_arm_data_wire_fn d2k_quic_arm_data_hook;
 
 typedef struct {
@@ -52,6 +51,8 @@ typedef struct {
     /* Время этапа данных — цена уже заданного вопроса, а не следующих:
        бюджет Run продлевается на него (NULL — не продлевать). */
     void (*spent)(void *limit_user, uint32_t ms);
+    /* Путь запроса этапа данных (d2k_quic_arm.probe_path); NULL — «/». */
+    const char *path;
 } d2k_quic_arm_context;
 
 /* Runtime transport for one original askArms question. It receives the SNI

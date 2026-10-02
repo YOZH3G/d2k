@@ -81,9 +81,12 @@ static d2k_tally arm_probe(const d2k_quic_arm_question *q,const char *sni,
 /* Task 39: this test pins the ladder ORDER; the arm data stage (handshake
    plus application data) is stubbed as passed, and counted. */
 static int data_calls;
+static char want_path[64];
 static d2k_quic_arm_data data_pass(const d2k_quic_arm_question *q,const char *sni,
-    uint16_t port,uint32_t wait,uint32_t mark) {
+    const char *path,uint16_t port,uint32_t wait,uint32_t mark) {
     (void)port;(void)wait;(void)mark;
+    if(want_path[0]) CHECK(path && !strcmp(path,want_path));
+    else CHECK(path==NULL); /* no known resource: the data stage asks "/" */
     CHECK(!q->control && sni && !strcmp(sni,"target.example"));
     data_calls++;
     d2k_quic_arm_data d; memset(&d,0,sizeof d);
@@ -102,6 +105,7 @@ int main(void) {
     CHECK(d2k_quic_probe_initial("target.example",tb,sizeof tb,&tn)==0);
     CHECK(d2k_quic_probe_initial("neutral.example",cb,sizeof cb,&cn)==0);
     d2k_quic_arm arm;
+    memset(&arm,0,sizeof arm);
     d2k_vres r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE);
@@ -110,6 +114,15 @@ int main(void) {
     CHECK(arm.original && arm.len==1200 && arm.ttl==3 && arm.copies==6);
     CHECK(fragment_calls==2 && arm.frag_kind==1 && arm.frag_survives==D2K_PROP_YES);
     CHECK(data_calls==4); /* quic5, copies 6, ttl 3, frag pos8; never the survival control */
+    /* The scheduler's known large resource reaches the data stage. */
+    calls=0;first_prefix=0;fragment_calls=0;data_calls=0;
+    memset(&arm,0,sizeof arm);
+    snprintf(want_path,sizeof want_path,"/static/site.css");
+    snprintf(arm.probe_path,sizeof arm.probe_path,"%s",want_path);
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(data_calls==4 && !strcmp(arm.probe_path,want_path));
+    want_path[0]=0; memset(&arm,0,sizeof arm);
     calls=0;first_prefix=0;lose_base_mark=1;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},99,&arm);

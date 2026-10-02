@@ -121,12 +121,12 @@ struct d2k_qc {
     uint8_t  rx_data[STREAM_BUF];
     size_t   rx_len, rx_taken;
     int      rx_fin;
-    /* Сколько данных ответа на НАШ запрос прошло через линию: наибольший
-       конец кадра STREAM этого потока, принятого ПРИКЛАДНЫМИ ключами, — не
-       только то, что влезло в rx_data. Задача 39: коробка рвёт поток через
-       несколько килобайт после рукопожатия, и «пришли заголовки» этого не
-       видит. Повтор сервером уже принятого кадра конец не сдвигает. */
-    uint64_t rx_app_end;
+    /* Какие байты ответа на НАШ запрос прошли через линию под ПРИКЛАДНЫМИ
+       ключами — все, а не только то, что влезло в rx_data (задача 39).
+       Коробка рвёт поток через несколько килобайт после рукопожатия, и
+       «пришли заголовки» этого не видит; «ответ целиком» — это FIN и все
+       байты до него без дыр, а не наибольшее смещение. */
+    d2k_qw_ranges app_rx;
 
     /* Последняя прикладная посылка — для повтора по таймеру. Обнаружения
        потерь у нас нет и не нужно (см. шапку), но ОДИН повтор обязателен:
@@ -497,9 +497,8 @@ static int frames_in(d2k_qc *c, d2k_qw_level lvl, const uint8_t *p, size_t n,
                         if (off + take > c->rx_len) { c->rx_len = (size_t)off + take; }
                     }
                     if (t & 0x01) { c->rx_fin = 1; }
-                    if (lvl == D2K_QW_LEVEL_APP && c->have_want &&
-                        off + len > c->rx_app_end) {
-                        c->rx_app_end = off + len;
+                    if (lvl == D2K_QW_LEVEL_APP && c->have_want) {
+                        d2k_qw_ranges_add(&c->app_rx, off, len, (int)(t & 0x01));
                     }
                 }
                 i += (size_t)len;
@@ -799,8 +798,9 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
         }
     } else {
         /* СВОЙ СОКЕТ — СО СВЕЖЕЙ ЧЕТВЁРКОЙ (задача 39): местный порт, бывший
-           у нашего зонда за окно остаточной блокировки, отвергается, и сокет
-           с ним держится открытым, пока ищется следующий. Занятый вызывающим
+           у нашего зонда за окно остаточной блокировки, отвергается; сокет с
+           ним открыт, пока ищется следующий, и закрывается при выходе из
+           поиска. Занятый вызывающим
            сокет (use_fd) проверен там, где его заняли. */
         int held[D2K_UDP_FRESH_TRIES];
         int n_held = 0;
@@ -1008,7 +1008,7 @@ int d2k_qc_stream_send(d2k_qc *c, uint64_t stream_id, const uint8_t *data, size_
            байты двух разных потоков как один. */
         c->rx_len = c->rx_taken = 0;
         c->rx_fin = 0;
-        c->rx_app_end = 0;
+        d2k_qw_ranges_reset(&c->app_rx);
     }
     uint8_t fr[DGRAM_OUT];
     size_t o = 0;
@@ -1068,9 +1068,9 @@ long d2k_qc_stream_recv(d2k_qc *c, uint64_t *stream_out, uint8_t *buf, size_t ca
     }
 }
 
-void d2k_qc_app_progress(const d2k_qc *c, uint64_t *bytes, int *fin) {
-    if (bytes) { *bytes = c ? c->rx_app_end : 0; }
-    if (fin) { *fin = c ? c->rx_fin : 0; }
+void d2k_qc_app_progress(const d2k_qc *c, uint64_t *bytes, int *complete) {
+    if (bytes) { *bytes = c ? d2k_qw_ranges_bytes(&c->app_rx) : 0; }
+    if (complete) { *complete = c ? d2k_qw_ranges_complete(&c->app_rx) : 0; }
 }
 
 int d2k_qc_peer_name(const d2k_qc *c) { return c ? c->peer_name : -1; }

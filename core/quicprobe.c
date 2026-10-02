@@ -151,6 +151,7 @@
 #include "d2k_quicconn.h"
 #include "d2k_h3.h"
 #include "d2k_meas.h"
+#include "d2k_resource.h"
 
 /* ---------------------------------------------------------------------
  * Умолчание и тестовый шов. См. шапку d2k_quicprobe.h про то, почему
@@ -620,8 +621,9 @@ static void nap_us(uint32_t us) {
 /* Сокет одной попытки: открыт, помечен, при необходимости привязан к
    спрошенному исходному порту и подключён к цели — и с МЕСТНЫМ ПОРТОМ,
    которого не было у наших зондов за окно остаточной блокировки
-   (d2k_udp_port_claim, задача 39). Отвергнутые сокеты держатся открытыми до
-   конца поиска, чтобы ядро не выдало тот же порт снова. Спрошенный исходный
+   (d2k_udp_port_claim, задача 39). Отвергнутые сокеты не закрываются, пока
+   идёт поиск (чтобы ядро не выдало тот же порт тут же снова), и все
+   закрываются при возврате. Спрошенный исходный
    порт (вопрос 7 оригинала) не подменяется: его выбирает вопрос, а не ядро,
    — он только записывается. *marked — как у qp_send_one. */
 static int qp_open_fresh(int family, const struct sockaddr *a, socklen_t alen,
@@ -824,10 +826,11 @@ static int qp_verify_aead(const uint8_t *p, size_t n, d2k_hello msg) {
    без проверки тега: оба не аутентифицированы, и на линии, где коробка
    отвечает за сервер или сервер отвечает на приманку (Heitmann et al.,
    FOCI 2026), они не доказывают, что НАШ Initial дошёл. Для плеча годится
-   только Initial нашей версии, который раскрывается серверными ключами из
-   НАШЕГО DCID и адресован НАШЕМУ SCID (RFC 9000 §7.2: DCID ответа — SCID
-   клиента). Ответ на приманку несёт её собственный DCID и сюда не проходит.
-   Retry и VN остаются тишиной этого вопроса, а не его успехом. */
+   Initial нашей версии, который раскрывается серверными ключами из НАШЕГО
+   DCID и адресован НАШЕМУ SCID (RFC 9000 §7.2: DCID ответа — SCID
+   клиента), либо Retry нашему SCID с верным тегом от нашего DCID. Ответ на
+   приманку несёт её собственный DCID и сюда не проходит; VN и Retry с
+   неверным тегом или чужим CID — тишина этого вопроса, а не его успех. */
 static int qp_verify_bound(const uint8_t *p, size_t n, d2k_hello msg) {
     uint32_t version;
     size_t dcid_off, dcid_len;
@@ -838,8 +841,23 @@ static int qp_verify_bound(const uint8_t *p, size_t n, d2k_hello msg) {
     if (so >= msg.len) return -1;
     size_t scid_len = msg.bytes[so];
     if (so + 1 + scid_len > msg.len) return -1;
-    if (qp_donor_unauth_reply(p, n, version) != 0) {
-        return -1; /* VN, Retry или чужое — не успех плеча */
+    int unauth = qp_donor_unauth_reply(p, n, version);
+    if (unauth < 0) return -1;            /* чужое */
+    if (unauth > 0) {
+        /* Retry ПРИВЯЗАН к нашему Initial, только если адресован нашему
+           SCID и его тег целостности сходится с НАШИМ DCID как ODCID
+           (RFC 9001 §5.8) — подделать тег без нашего DCID нельзя. Такой Retry
+           проходит фильтр; дальше решает этап данных: d2k_qc идёт за его
+           токеном. VN (версия 0) не аутентифицируется ничем — не успех. */
+        uint32_t ver = (uint32_t)p[1] << 24 | (uint32_t)p[2] << 16 |
+                       (uint32_t)p[3] << 8 | (uint32_t)p[4];
+        if (ver == 0) return -1;
+        size_t rd = p[5];
+        if ((size_t)6 + rd > n || rd != scid_len ||
+            (scid_len && memcmp(p + 6, msg.bytes + so + 1, scid_len) != 0)) {
+            return -1;
+        }
+        return d2k_qw_retry_verify(version, msg.bytes + dcid_off, dcid_len, p, n) == 0 ? 0 : -1;
     }
     qp_hdr h;
     if (qp_parse_hdr(p, n, &h) != 0) return -1;
@@ -1554,7 +1572,7 @@ static int64_t qp_now_ms(void) {
 }
 
 static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const char *sni,
-    uint16_t port, uint32_t wait_ms, uint32_t mark) {
+    const char *path, uint16_t port, uint32_t wait_ms, uint32_t mark) {
     d2k_quic_arm_data d;
     memset(&d, 0, sizeof d);
     d.verdict = D2K_QAD_NOT_RUN;
@@ -1572,6 +1590,23 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
        [пол; потолок]): рукопожатию — два таких срока, тишине потока после
        последнего прироста — один, всему чтению — четыре. */
     uint32_t step = wait_ms ? wait_ms : D2K_QUIC_RTT_WAIT_FLOOR_MS;
+    if (!path || !path[0]) path = "/";
+    /* Приветствие этапа — клиент d2k_qc (только он доводит рукопожатие), но
+       первая датаграмма добита до длины Initial фильтра (донорский
+       d2k_quic_probe_initial к тому же имени): коробка видит датаграмму той же
+       длины, что в вопросе. Что именно ушло — в трассе шага. */
+    size_t filter_len = 0, filter_ch = 0;
+    {
+        uint8_t probe[D2K_QW_MAX_DGRAM], ch[D2K_QW_MAX_DGRAM];
+        if (d2k_quic_probe_initial(sni, probe, sizeof probe, &filter_len) != 0 ||
+            d2k_quic_client_hello(probe, filter_len, ch, sizeof ch, &filter_ch) != 0) {
+            filter_len = filter_ch = 0;
+        }
+    }
+    /* pad_to у d2k_qc — длина ClientHello: добиваем до ClientHello фильтра,
+       тогда и датаграмма выходит длиной с Initial фильтра. */
+    snprintf(d.note, sizeof d.note, "hello d2k_qc, ClientHello %zu как у Initial %zu фильтра, GET %.32s",
+             filter_ch, filter_len, path);
     d2k_qc_opts o;
     memset(&o, 0, sizeof o);
     o.ip = q->addr;
@@ -1579,6 +1614,7 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
     o.sni = sni;
     o.alpn = "h3";
     o.deadline_ms = (int)(2u * step);
+    o.pad_to = filter_ch;
     o.mark = mark;
     o.first_send = qp_arm_first_send;
     o.first_send_user = &a;
@@ -1608,34 +1644,30 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
     /* Та же пауза до вопроса, что у проверки плана (verify.c): сервер обязан
        увидеть SETTINGS раньше запроса. */
     (void)d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 400, err, sizeof err);
-    size_t rn = d2k_h3_request(sni, "/", buf, sizeof buf);
+    size_t rn = d2k_h3_request(sni, path, buf, sizeof buf);
     if (rn == 0 || d2k_qc_stream_send(c, 0, buf, rn, 1, err, sizeof err) != 0) {
         snprintf(d.reason, sizeof d.reason, "запрос не ушёл: %.120s", err);
         d2k_qc_close(c);
         return d;
     }
     uint64_t bytes = 0, last = 0;
-    int fin = 0, closed = 0;
+    int complete = 0, closed = 0;
     int64_t start = qp_now_ms(), progress_at = start;
-    while (!fin && bytes < D2K_QUIC_ARM_DATA_BYTES) {
+    while (!complete && bytes < D2K_QUIC_ARM_DATA_BYTES) {
         int64_t now = qp_now_ms();
         if (now - progress_at >= (int64_t)step || now - start >= (int64_t)(4u * step)) break;
         long n = d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 200, err, sizeof err);
         if (n < 0) { closed = 1; }
-        d2k_qc_app_progress(c, &bytes, &fin);
+        d2k_qc_app_progress(c, &bytes, &complete);
         if (bytes > last) { last = bytes; progress_at = qp_now_ms(); }
         if (closed) break;
     }
-    d2k_qc_app_progress(c, &bytes, &fin);
+    d2k_qc_app_progress(c, &bytes, &complete);
     d.app_bytes = bytes;
-    d.verdict = d2k_quic_arm_data_judge(1, bytes, fin);
+    d.verdict = d2k_quic_arm_data_judge(1, bytes, complete);
     if (d.verdict == D2K_QAD_PASS) {
-        snprintf(d.reason, sizeof d.reason, "рукопожатие и %llu байт данных",
-                 (unsigned long long)bytes);
-    } else if (d.verdict == D2K_QAD_SHORT) {
-        snprintf(d.reason, sizeof d.reason,
-                 "рукопожатие доказано, ответ кончился на %llu байт — данные не измерены",
-                 (unsigned long long)bytes);
+        snprintf(d.reason, sizeof d.reason, "рукопожатие и %llu байт данных%s",
+                 (unsigned long long)bytes, complete ? ", ответ целиком" : "");
     } else {
         snprintf(d.reason, sizeof d.reason, "рукопожатие есть, поток оборван на %llu байт%s%.80s",
                  (unsigned long long)bytes, closed ? ": " : "", closed ? err : "");
@@ -2112,7 +2144,17 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                             d2k_quic_arm *arm, int base_only, const d2k_base_seed *seed) {
     d2k_vres r;
     memset(&r, 0, sizeof r);
-    if(arm) { memset(arm,0,sizeof *arm); arm->kind=D2K_QA_NOT_FOUND; }
+    char arm_path[sizeof ((d2k_quic_arm *)0)->probe_path] = "";
+    if(arm) {
+        /* Input only when the caller filled it: a terminated, public resource
+           path (d2k_resource_path_ok). Anything else -- including an
+           uninitialised arm -- means "/". */
+        if(memchr(arm->probe_path,0,sizeof arm->probe_path) &&
+           d2k_resource_path_ok(arm->probe_path))
+            memcpy(arm_path,arm->probe_path,strlen(arm->probe_path)+1);
+        memset(arm,0,sizeof *arm); arm->kind=D2K_QA_NOT_FOUND;
+        memcpy(arm->probe_path,arm_path,sizeof arm_path);
+    }
 
     /* ОДИН guard на весь класс "структурно непригодный вход" — было разведено
        на FLAKY и INCONCLUSIVE (находка 9 ревью, круг 2): эталон относит
@@ -2430,7 +2472,8 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                             d2k_quic_arm_context context = {.pool=pool, .n_pool=n_pool,
                                 .next=next_addr, .residual=residual, .marked=all_marked,
                                 .can_ask=arm_budget_left, .limit_user=&start,
-                                .spent=arm_budget_spent};
+                                .spent=arm_budget_spent,
+                                .path=arm_path[0]?arm_path:NULL};
                             if (budget_left(&start)) {
                                 *arm = d2k_quic_original_measure(&context, port, trigger, control, dyn_wait, mark);
                                 next_addr = context.next;

@@ -209,4 +209,28 @@ size_t d2k_qw_retry_build(uint8_t *out, size_t cap, uint32_t version,
                           const uint8_t *scid, size_t scid_len,
                           const uint8_t *token, size_t token_len);
 
+
+/* --- принятые байты одного потока (задача 39, раунд 1) ------------------ */
+
+/* Какие байты потока уже пришли: непересекающиеся отрезки [start, end),
+ * упорядоченные и слитые. Ответ «целиком» — это FIN И все байты от нуля до
+ * смещения FIN без дыр: наибольшее смещение этого не доказывает. Отрезков
+ * больше D2K_QW_RANGES_MAX не храним — новый, не сливающийся ни с одним,
+ * тогда не засчитывается (меньше, а не больше, чем пришло). */
+#define D2K_QW_RANGES_MAX 64
+typedef struct {
+    uint64_t start[D2K_QW_RANGES_MAX], end[D2K_QW_RANGES_MAX];
+    size_t   n;
+    int      fin;       /* FIN принят */
+    uint64_t fin_off;   /* окончательный размер потока */
+} d2k_qw_ranges;
+
+void     d2k_qw_ranges_reset(d2k_qw_ranges *r);
+/* Записывает кадр STREAM: off, len, fin — флаг FIN кадра. */
+void     d2k_qw_ranges_add(d2k_qw_ranges *r, uint64_t off, uint64_t len, int fin);
+/* Сколько разных байт потока принято. */
+uint64_t d2k_qw_ranges_bytes(const d2k_qw_ranges *r);
+/* 1 — FIN принят и все байты [0; fin_off) пришли. */
+int      d2k_qw_ranges_complete(const d2k_qw_ranges *r);
+
 #endif /* D2K_QUICWIRE_H */

@@ -71,19 +71,10 @@ static int ask(d2k_quic_arm_context *c, d2k_quic_arm *r, int blob, int copies,
         c->spent(c->limit_user,ms>0?(uint32_t)ms:0u);
     }
     step->data=(int)d.verdict; step->data_bytes=d.app_bytes;
+    snprintf(step->data_note,sizeof step->data_note,"%s",d.note);
     if(d.verdict==D2K_QAD_PASS) return 1;
-    if(d.verdict==D2K_QAD_SHORT) { r->data_short++; r->incomplete=1; }
-    else if(d.verdict==D2K_QAD_NOT_RUN) { r->incomplete=1; step->not_measured=3; *measured=0; }
+    if(d.verdict==D2K_QAD_NOT_RUN) { r->incomplete=1; step->not_measured=3; *measured=0; }
     return 0;
-}
-
-d2k_quic_arm_data_verdict d2k_quic_arm_data_judge(int handshake, uint64_t app_bytes, int fin) {
-    if(!handshake) return D2K_QAD_NO_HANDSHAKE;
-    if(app_bytes>=D2K_QUIC_ARM_DATA_BYTES) return D2K_QAD_PASS;
-    /* The server closed the response stream below the threshold: everything
-       it had passed, so the line was not shown to cut it -- and not shown to
-       carry the threshold either. Neither a pass nor a box failure. */
-    return fin ? D2K_QAD_SHORT : D2K_QAD_CUT;
 }
 
 d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
@@ -127,11 +118,5 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
     snprintf(r.reason,sizeof r.reason,"original askArms: %s copies=%d ttl=%d frag=%d%s",
              chosen>=0?r.blob_name:"no fake",r.copies,r.ttl,r.frag_kind,
              r.incomplete?"; incomplete questions":"");
-    if(r.data_short) {
-        size_t used=strlen(r.reason);
-        snprintf(r.reason+used,sizeof r.reason-used,
-                 "; рукопожатие доказано, данные не измерены: ответ цели короче %u байт (%d)",
-                 D2K_QUIC_ARM_DATA_BYTES,r.data_short);
-    }
     return r;
 }

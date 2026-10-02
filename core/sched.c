@@ -376,6 +376,7 @@ d2k_sched_mark_fn d2k_sched_mark_hook = mark_default;
 d2k_sched_vol_fn  d2k_sched_vol_hook  = d2k_volume_probe;
 d2k_sched_vol_path_fn d2k_sched_vol_path_hook = d2k_volume_probe_path;
 d2k_sched_path_ver_fn d2k_sched_path_ver_hook = d2k_verify_probe_path_on;
+d2k_sched_quic_path_ver_fn d2k_sched_quic_path_ver_hook = d2k_verify_probe_quic_path_on;
 /* Прежнее дерево вердиктов (core/verdict.c) отмены не умеет: у него нет ни
    контекста, ни проверок между зондами. Переходник это НЕ скрывает — он
    просто не передаёт флаг дальше, и join такого замера ждёт его до конца.
@@ -1896,6 +1897,9 @@ static void *worker_run(void *vp) {
                 SCHED_VERIFY_STEP_MS, trig.len,
                 d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY,
                 encoding, 0, t->measure_path);
+        } else if (t->transport == 17 && t->measure_path[0] && verifier == d2k_sched_ver_hook) {
+            vr = d2k_sched_quic_path_ver_hook(a_use_fd, t->ip, t->port, t->name,
+                SCHED_VERIFY_STEP_MS, trig.len, t->measure_path);
         } else vr = verifier(a_use_fd, t->ip, t->port, t->transport,
                                                t->name, SCHED_VERIFY_STEP_MS,
                                                trig.len,
@@ -2066,6 +2070,8 @@ static void *worker_run(void *vp) {
     if (t->transport == 17) {
         /* Original Run owns both diagnosis and askArms, BEFORE properties,
            with one residual-aware address pool. Never restart search here. */
+        /* Task 39 round 1: the arm data stage asks the known large resource. */
+        snprintf(t->arm.probe_path, sizeof t->arm.probe_path, "%s", t->measure_path);
         r = seed && d2k_sched_quic_seeded_hook
             ? d2k_sched_quic_seeded_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm, seed)
             : d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm);
@@ -3473,12 +3479,12 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
                 step->not_measured==3 ? "не измерено: не собрано/локальный отказ" :
                 /* Task 39: the filter alone is not an arm's pass. */
                 step->data==D2K_QAD_NO_HANDSHAKE ? "ответ есть, рукопожатия нет: не прошло" :
-                step->data==D2K_QAD_CUT ? "рукопожатие есть, поток оборван до порога данных: не прошло" :
-                step->data==D2K_QAD_SHORT ? "рукопожатие доказано, данные не измерены: ответ цели короче порога" :
+                step->data==D2K_QAD_CUT ? "рукопожатие есть, поток встал без полного ответа ниже порога: не прошло" :
                 step->answered==D2K_QUIC_REPEATS ? "прошло" :
                 step->answered>0 ? "неустойчиво, не засчитано" : "не прошло";
-            say(s, "по %s (QUIC) %s, адрес %s: %d/%d, %s", t->name,
-                step->label, step->addr[0]?step->addr:"—", step->answered,step->sent,note);
+            say(s, "по %s (QUIC) %s, адрес %s: %d/%d, %s%s%s", t->name,
+                step->label, step->addr[0]?step->addr:"—", step->answered,step->sent,note,
+                step->data?"; ":"", step->data?step->data_note:"");
         }
         /* ТРИ РАЗНЫХ ИСХОДА, И ИХ НЕЛЬЗЯ СЛИВАТЬ В ОДИН.
            «Не нашлось» — это про коробку и бюджет: перебор дошёл до конца и
@@ -4497,7 +4503,8 @@ static int public_resource_peer(const task *t) {
 }
 
 static void select_resource_path(d2k_sched *s, task *t) {
-    if (t->transport != 6 || t->port != 443 || t->by_addr || !public_resource_peer(t)) return;
+    if ((t->transport != 6 && t->transport != 17) || t->port != 443 || t->by_addr ||
+        !public_resource_peer(t)) return;
     /* Confirmed witness survives restart; never borrow proof across family
        or TLS shape. A live HTML hint contains no protocol proof at all. */
     const d2k_cat_binding *best = NULL;
@@ -4506,7 +4513,7 @@ static void select_resource_path(d2k_sched *s, task *t) {
         for (size_t j = 0; j < s->cat->boxes[bi].n_binds; j++) {
             const d2k_cat_binding *bd = &s->cat->boxes[bi].binds[j];
             if (bd->enabled && bd->level >= 3 && !strcmp(bd->kind, "name") &&
-                !strcmp(bd->target, t->name) && bd->transport == 6 &&
+                !strcmp(bd->target, t->name) && bd->transport == t->transport &&
                 (bd->family ? bd->family : 4) == t->family && bd->shape == shape &&
                 d2k_resource_path_ok(bd->probe_path) &&
                 (!best || best->confirmed < bd->confirmed)) best = bd;
@@ -6012,7 +6019,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
             for (size_t j = 0; j < b->n_binds; j++) {
                 d2k_cat_binding *bd = &b->binds[j];
                 if (!strcmp(bd->target, t->name) && !strcmp(bd->plan_id, plan_id) &&
-                    bd->family == t->family && bd->shape == rec_shape && bd->transport == 6) {
+                    bd->family == t->family && bd->shape == rec_shape && bd->transport == t->transport) {
                     snprintf(bd->probe_path, sizeof bd->probe_path, "%s", t->measure_path);
                     s->cat->revision++;
                 }
