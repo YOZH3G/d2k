@@ -24,12 +24,13 @@ try {
   fixture('scripts/architecture.sh', '#!/bin/sh\nprintf "amd64\\n"\n');
   for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, '#!/bin/sh\nexit 0\n');
   fixture('builds/d2kpanel-linux-amd64', '#!/bin/sh\necho features=telegram-control\n');
-  fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=per-install-enrollment,instagram-ip-probe\n');
+  fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=per-install-enrollment,instagram-ip-probe,meta-hosts-v2\n');
   fixture('builds/d2kd-linux-amd64', '#!/bin/sh\nexit 0\n');
   for (const name of ['d2kc', 'd2khttp']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
   fixture('files/S99d2k', '#!/bin/sh\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
-  for (const name of ['d2k-fw-heal.sh', 'd2k-ppe-deoffload.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
+  for (const name of ['d2k-fw-heal.sh', 'd2k-ppe-deoffload.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
+  fixture('files/d2k-instagram-dns.sh', '#!/bin/sh\nprintf "dns-%s\\n" "$1" >> "$CALLS"\n');
   fixture('files/d2k-log-maintenance.sh', fs.readFileSync(path.join(root, 'files/d2k-log-maintenance.sh')));
   for (const name of ['meta-ranges.txt', 'tg-roots.pem', 'fake/stun.bin', 'fake/quic_initial_dbankcloud_ru.bin']) fixture(`files/${name}`, 'fixture\n');
   for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'gsap.js', 'fonts/onest.woff2', 'fonts/OFL-onest.txt', 'fonts/jbmono.woff2', 'fonts/OFL-jbmono.txt']) fixture(`internal/web/assets/${name}`, 'fixture\n');
@@ -50,7 +51,28 @@ try {
   function run(name, extraEnv = {}) {
     const result = spawnSync('/bin/sh', [path.join(tmp, `${name}.sh`)], { env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 10000 });
     assert.equal(result.status, 0, result.stderr || result.stdout);
+    return result.stdout;
   }
+  const calls = () => { try { return fs.readFileSync(path.join(tmp, 'calls'), 'utf8'); } catch { return ''; } };
+  const installOut = run('install');
+  // The first DNS refresh (15 names, possibly silent edges) must not hold the
+  // installer: the service's scheduler runs it in the background with a log.
+  assert(!calls().includes('dns-refresh'), 'installer must not run the DNS refresh synchronously');
+  assert.match(installOut, /в фоне/, 'installer must say the DNS refresh runs in the background');
+  // An upgrade clears the recorded success so the new host set is pinned now.
+  const dnsSuccess = path.join(tmp, 'opt/d2k/state/instagram-dns-last-success');
+  fs.writeFileSync(dnsSuccess, '2026-10-02\n');
+  run('install');
+  assert(!fs.existsSync(dnsSuccess), 'upgrade must clear the DNS success mark so the scheduler refreshes right away');
+  assert(!calls().includes('dns-refresh'), 'upgrade must not run the DNS refresh synchronously');
+  // A d2ktg without the 15-name certificate check would silently skip WhatsApp/fbcdn.
+  const tgFixture = path.join(tmp, 'source/builds/d2ktg-linux-amd64');
+  const tgCurrent = fs.readFileSync(tgFixture);
+  fs.writeFileSync(tgFixture, '#!/bin/sh\necho features=per-install-enrollment,instagram-ip-probe\n');
+  const stale = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
+  assert.notEqual(stale.status, 0, 'installer must reject a d2ktg without the Meta host list check');
+  assert.match(stale.stdout + stale.stderr, /d2ktg устарел/);
+  fs.writeFileSync(tgFixture, tgCurrent);
   run('install');
   const installed = path.join(tmp, 'opt/d2k/d2k-log-maintenance.sh');
   assert.deepEqual(fs.readFileSync(installed), fs.readFileSync(path.join(root, 'files/d2k-log-maintenance.sh')), 'installer must fetch and install helper');
@@ -61,6 +83,8 @@ try {
   fs.writeFileSync(ppe, '#!/bin/sh\nd2k_ppe_remove() { printf "ppe-remove\\n" >> "$CALLS"; }\n');
   const state = path.join(tmp, 'opt/d2k/state/catalog.json'); fs.writeFileSync(state, '{"learned":true}');
   fs.writeFileSync(path.join(tmp, 'opt/d2k/run/d2k-log-maintenance.pid'), '123');
+  // A background DNS refresh must not race the removal of its pins.
+  fs.writeFileSync(path.join(tmp, 'opt/d2k/run/d2k-instagram-dns-scheduler.pid'), '999999');
   // Init may already be missing: uninstall still stops its owned helper.
   fs.unlinkSync(path.join(tmp, 'opt/etc/init.d/S99d2k'));
   fs.mkdirSync(runtime); fs.writeFileSync(path.join(runtime, 'live.json'), '{}');
@@ -73,6 +97,9 @@ try {
   fs.writeFileSync(path.join(customRuntime, 'unrelated'), 'keep');
   fs.appendFileSync(path.join(tmp, 'opt/d2k/config'), `D2K_RUNTIME_DIR='${customRuntime}'\n`);
   run('uninstall');
+  assert(calls().includes('dns-remove'), 'uninstall must remove the owned DNS pins through the manifest helper');
+  const sched = calls().indexOf('d2k-instagram-dns-scheduler.pid');
+  assert(sched >= 0 && sched < calls().indexOf('dns-remove'), 'uninstall must stop the DNS scheduler before removing its pins');
   assert(!fs.existsSync(installed), 'uninstall must remove helper even when persistent state is kept');
   assert(!fs.existsSync(ppe), 'uninstall must remove the PPE de-offload helper');
   assert(fs.readFileSync(path.join(tmp, 'calls'), 'utf8').includes('ppe-remove'), 'uninstall must remove own PPE rules even without init');

@@ -177,17 +177,37 @@ static int redirect_log(const char *path) {
 
 /* DNS edge health, not an application/bypass verdict. Keep the certificate
    bound to the requested Meta name while avoiding its blocked wire SNI.
-   No HTTP requests, account data, or relay traffic are involved. */
+   No HTTP requests, account data, or relay traffic are involved.
+   The list is the router script's HOSTS and the VPS /resolve allowlist
+   (scripts/test-instagram-dns.sh compares all three). Measured 03.10.2026
+   with SNI example.com: Instagram edges present *.instagram.com and
+   *.cdninstagram.com; fbcdn edges *.facebook.com with *.xx.fbcdn.net in SAN;
+   WhatsApp edges *.whatsapp.net with *.whatsapp.com in SAN. So every name is
+   verified as itself, except the c10r alias below. */
+static const char *const meta_hosts[]={
+    /* META_HOSTS_BEGIN */
+    "instagram.com","www.instagram.com","graph.instagram.com","api.instagram.com",
+    "i.instagram.com","instagram.c10r.instagram.com","static.cdninstagram.com",
+    "scontent.cdninstagram.com","static.xx.fbcdn.net","scontent.xx.fbcdn.net",
+    "web.whatsapp.com","www.whatsapp.com","scontent.whatsapp.net","graph.whatsapp.com",
+    "v.whatsapp.com"
+    /* META_HOSTS_END */
+};
+
+/* The certificate name that authenticates host, or NULL outside the list. */
+static const char *meta_verify_name(const char *host) {
+    for(size_t i=0;i<sizeof(meta_hosts)/sizeof(meta_hosts[0]);i++){
+        if(strcmp(host,meta_hosts[i])!=0)continue;
+        /* This DNS alias is not covered by *.instagram.com; authenticate its
+           canonical service rather than disabling certificate validation. */
+        return strcmp(host,"instagram.c10r.instagram.com")==0?"instagram.com":meta_hosts[i];
+    }
+    return NULL;
+}
+
 static int check_instagram_ip(const char *host,const char *ip,const char *ca) {
-    static const char *const hosts[]={"instagram.com","www.instagram.com",
-        "graph.instagram.com","api.instagram.com","instagram.c10r.instagram.com",
-        "static.cdninstagram.com","scontent.cdninstagram.com"};
-    int allowed=0;struct in_addr address;
-    for(size_t i=0;i<sizeof(hosts)/sizeof(hosts[0]);i++)if(strcmp(host,hosts[i])==0)allowed=1;
-    if(!allowed||inet_pton(AF_INET,ip,&address)!=1)return 2;
-    /* This DNS alias is not covered by *.instagram.com; authenticate its
-       canonical service rather than disabling certificate validation. */
-    const char *verify=strcmp(host,"instagram.c10r.instagram.com")==0?"instagram.com":host;
+    struct in_addr address;const char *verify=meta_verify_name(host);
+    if(!verify||inet_pton(AF_INET,ip,&address)!=1)return 2;
     (void)signal(SIGPIPE,SIG_IGN);
     alarm(5); /* Bound the entire operation, including slow TLS peers. */
     SSL_CTX *ctx=tg_tls_client_context(ca);if(!ctx)return 1;
@@ -200,7 +220,7 @@ static int check_instagram_ip(const char *host,const char *ip,const char *ca) {
 
 int main(int argc,char **argv) {
     const char *config="/opt/d2k/config",*log_path=NULL;
-    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=per-install-enrollment,instagram-ip-probe");return 0;}
+    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=per-install-enrollment,instagram-ip-probe,meta-hosts-v2");return 0;}
     if(argc==5&&strcmp(argv[1],"--check-instagram-ip")==0)return check_instagram_ip(argv[2],argv[3],argv[4]);
     if(argc==2&&strcmp(argv[1],"--help")==0){puts("d2ktg [--config FILE]");return 0;}
     if(argc==3&&strcmp(argv[1],"--check-config")==0)return check_config(argv[2]);

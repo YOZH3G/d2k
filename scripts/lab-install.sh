@@ -153,8 +153,8 @@ NDMC
 cat > /tmp/d2k-test-bin/curl <<'CURL'
 #!/bin/sh
 case "$*" in
-    *https://213.176.74.63.nip.io/resolve*)
-        printf '%s' '{"results":{"instagram.com":["157.240.9.174"],"www.instagram.com":["157.240.9.175"]}}'
+    *https://213.176.74.63.nip.io:9443/resolve*)
+        printf '%s' '{"results":{"instagram.com":["157.240.9.174"],"www.instagram.com":["157.240.9.175"],"web.whatsapp.com":["157.240.9.52"]}}'
         exit 0
         ;;
     *https://instagram.com/*|*https://www.instagram.com/*)
@@ -169,7 +169,7 @@ cat > /tmp/d2k-test-bin/d2ktg <<'TGPROBE'
 if [ "$1" = --check-instagram-ip ]; then
     [ "$#" = 4 ] || exit 2
     case "$2:$3" in
-        instagram.com:157.240.9.174|www.instagram.com:157.240.9.175) exit 0 ;;
+        instagram.com:157.240.9.174|www.instagram.com:157.240.9.175|web.whatsapp.com:157.240.9.52) exit 0 ;;
         *) exit 1 ;;
     esac
 fi
@@ -207,7 +207,13 @@ nfq6_direct
 [ -x "$DIR/d2k-tg-watchdog.sh" ] || fail "не установлен сторож Telegram"
 [ -x "$DIR/d2k-instagram-dns.sh" ] || fail "не установлен Instagram DNS manager"
 [ -s "$DIR/files/meta-ranges.txt" ] || fail "не установлены диапазоны Meta для проверки VPS-ответа"
-[ "$(grep -c '^ip host instagram.com 157.240.9.174$' /tmp/d2k-ndmc-state)" = 1 ] || fail "установщик не применил VPS Instagram-резолв"
+# The first DNS refresh runs in the background (service scheduler), not in the installer.
+dns_wait=0
+while [ "$dns_wait" -lt 30 ] && [ ! -s "$DIR/state/instagram-dns-last-success" ]; do
+    sleep 1; dns_wait=$((dns_wait + 1))
+done
+[ "$(grep -c '^ip host instagram.com 157.240.9.174$' /tmp/d2k-ndmc-state)" = 1 ] || fail "фоновое обновление не применило VPS Instagram-резолв"
+[ "$(grep -c '^ip host web.whatsapp.com 157.240.9.52$' /tmp/d2k-ndmc-state)" = 1 ] || fail "фоновое обновление не прописало WhatsApp Web"
 [ "$(grep -c '^instagram.com 157.240.9.174$' "$DIR/state/instagram-ip-hosts.tsv")" = 1 ] || fail "установщик не сохранил владение Instagram-записью"
 [ "$(grep -c '^www.instagram.com 157.240.9.175$' "$DIR/state/instagram-ip-hosts.tsv" || true)" = 0 ] || fail "установщик присвоил себе заранее существующую запись"
 [ -s "$DIR/files/tg-roots.pem" ] || fail "не установлен CA bundle Telegram"
@@ -387,6 +393,7 @@ sh scripts/uninstall.sh >/dev/null
 [ -e "$DIR/d2k-instagram-dns.sh" ] && fail "после удаления остался Instagram DNS manager"
 [ -e "$DIR/files/meta-ranges.txt" ] && fail "после удаления остались диапазоны Meta"
 [ "$(grep -c '^ip host instagram.com 157.240.9.174$' /tmp/d2k-ndmc-state || true)" = 0 ] || fail "деинсталлятор оставил D2K Instagram запись"
+[ "$(grep -c '^ip host web.whatsapp.com 157.240.9.52$' /tmp/d2k-ndmc-state || true)" = 0 ] || fail "деинсталлятор оставил D2K WhatsApp запись"
 [ "$(grep -c '^ip host www.instagram.com 157.240.9.175$' /tmp/d2k-ndmc-state)" = 1 ] || fail "деинсталлятор удалил существовавшую до D2K запись"
 [ "$(grep -c '^ip host instagram.com 203.0.113.10$' /tmp/d2k-ndmc-state)" = 1 ] || fail "деинсталлятор удалил пользовательскую запись"
 [ -e "$DIR/files/tg-roots.pem" ] && fail "после удаления остался CA bundle Telegram"

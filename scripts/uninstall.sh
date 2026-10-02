@@ -19,10 +19,23 @@ say() { echo "d2k: $*"; }
 # Remove only exact DNS pairs recorded by this installation. If NDM cannot
 # confirm cleanup, stop before deleting the helper/manifest so the owner can
 # retry rather than leaving unexplained static routes behind.
+# A background refresh (scheduled, or the first one after install) must not
+# add pins while they are being removed: stop the owned scheduler first; its
+# trap stops the running refresh. Pairs are claimed before they are added.
+DNS_SCHED_PID=$DIR/run/d2k-instagram-dns-scheduler.pid
+if [ -f "$DNS_SCHED_PID" ]; then
+    start-stop-daemon -K -q -p "$DNS_SCHED_PID" 2>/dev/null || true
+    n=0
+    while [ "$n" -lt 15 ] && pid=$(cat "$DNS_SCHED_PID" 2>/dev/null) &&
+          [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        n=$((n + 1))
+    done
+fi
 if [ -x "$DIR/d2k-instagram-dns.sh" ]; then
-    say "снимаю свои Instagram DNS-записи"
+    say "снимаю свои DNS-записи Instagram/WhatsApp"
     "$DIR/d2k-instagram-dns.sh" remove || {
-        say "не удалось снять D2K Instagram DNS; удаление остановлено, повторите позже"
+        say "не удалось снять D2K DNS-записи Instagram/WhatsApp; удаление остановлено, повторите позже"
         exit 1
     }
 fi

@@ -1,15 +1,17 @@
 #!/bin/sh
-# Resolve Instagram A records through the authenticated VPS and manage only
-# the exact static DNS pairs owned by this D2K installation.
+# Resolve Instagram/fbcdn/WhatsApp Web A records through d2k's own C resolver
+# on the VPS (d2k-enroll POST /resolve) and manage only the exact static DNS
+# pairs owned by this D2K installation.
 set -eu
 export PATH="${D2K_STUB_PATH:+$D2K_STUB_PATH:}/opt/sbin:/opt/bin:/sbin:/usr/sbin:/bin:/usr/bin"
 DIR=${D2K_DIR:-/opt/d2k}
-CONFIG=${D2K_CONFIG:-$DIR/config}
 META_RANGES=${D2K_META_RANGES:-$DIR/files/meta-ranges.txt}
 MANIFEST=${D2K_INSTAGRAM_MANIFEST:-$DIR/state/instagram-ip-hosts.tsv}
 LOG=${D2K_INSTAGRAM_LOG:-$DIR/log/instagram-dns.log}
-RELAY_URL=${D2K_RELAY_URL:-https://213.176.74.63.nip.io/resolve}
-HOSTS='instagram.com www.instagram.com graph.instagram.com api.instagram.com instagram.c10r.instagram.com static.cdninstagram.com scontent.cdninstagram.com'
+RELAY_URL=${D2K_RELAY_URL:-https://213.176.74.63.nip.io:9443/resolve}
+# The only list: d2ktg --check-instagram-ip and the VPS allowlist carry the
+# same names (scripts/test-instagram-dns.sh compares them).
+HOSTS='instagram.com www.instagram.com graph.instagram.com api.instagram.com i.instagram.com instagram.c10r.instagram.com static.cdninstagram.com scontent.cdninstagram.com static.xx.fbcdn.net scontent.xx.fbcdn.net web.whatsapp.com www.whatsapp.com scontent.whatsapp.net graph.whatsapp.com v.whatsapp.com'
 mkdir -p "$(dirname "$LOG")" "$(dirname "$MANIFEST")" 2>/dev/null || true
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$LOG"; }
 mark_refresh_success() {
@@ -22,8 +24,7 @@ mark_refresh_success() {
         log 'не удалось записать дату успешного обновления; планировщик может повторить его сегодня'
     fi
 }
-config_value() { awk -F= -v key="$1" '$1==key {v=substr($0,index($0,"=")+1); gsub(/["[:space:]]/, "", v); print v; exit}' "$CONFIG" 2>/dev/null || true; }
-managed_host() { case "$1" in instagram.com|www.instagram.com|graph.instagram.com|api.instagram.com|instagram.c10r.instagram.com|static.cdninstagram.com|scontent.cdninstagram.com) return 0;; *) return 1;; esac; }
+managed_host() { case " $HOSTS " in *" $1 "*) return 0;; *) return 1;; esac; }
 valid_ipv4() {
     case "$1" in *[!0-9.]*|*..*|.*|*.) return 1;; esac
     awk -F. 'NF==4 {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || $i>255) exit 1; exit 0} {exit 1}' <<EOF_IP
@@ -41,7 +42,7 @@ record_exists() {
         '$1=="ip"&&$2=="host"&&$3==h&&$4==ip {f=1} END{exit !f}'
 }
 remove_owned() {
-    [ -s "$MANIFEST" ] || { rm -f "$MANIFEST"; log 'нет D2K-owned Instagram DNS pins'; return 0; }
+    [ -s "$MANIFEST" ] || { rm -f "$MANIFEST"; log 'нет D2K-owned DNS-записей Instagram/WhatsApp'; return 0; }
     command -v ndmc >/dev/null 2>&1 || { log 'ndmc отсутствует; manifest оставлен'; return 1; }
     while read -r host ip _extra; do
         [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
@@ -66,36 +67,33 @@ remove_owned() {
 refresh() {
     if ! command -v ndmc >/dev/null 2>&1; then log 'ndmc отсутствует — пропускаю (не Keenetic)'; return 0; fi
     [ -s "$META_RANGES" ] || { log "нет списка диапазонов Meta: $META_RANGES"; return 1; }
-    [ -r "$CONFIG" ] || { log "нет конфига: $CONFIG"; return 1; }
     command -v d2ktg >/dev/null 2>&1 || { log 'нет C-инструмента проверки адресов d2ktg'; return 1; }
     ca_bundle=${D2K_IP_CA_BUNDLE:-/opt/etc/ssl/certs/ca-certificates.crt}
     [ -r "$ca_bundle" ] || ca_bundle=/etc/ssl/certs/ca-certificates.crt
     [ -r "$ca_bundle" ] || { log 'нет системных доверенных CA; установите ca-bundle'; return 1; }
-    SECRET=$(config_value D2K_RESOLVE_SECRET)
-    [ -n "$SECRET" ] || SECRET=$(config_value Z2K_RESOLVE_SECRET)
-    # This public credential can call only the public DNS resolver, not Telegram relay.
-    [ -n "$SECRET" ] || SECRET=57745177a4b883471a4ddc6124a1df6fec77e790729e074ed34dc434f7cdb6f2
-    RELAY_HOST=${RELAY_URL#*://}; RELAY_HOST=${RELAY_HOST%%/*}; RELAY_HOST=${RELAY_HOST%%:*}
+    # No credential: the VPS answers public DNS data for this fixed list only.
+    RELAY_AUTHORITY=${RELAY_URL#*://}; RELAY_AUTHORITY=${RELAY_AUTHORITY%%/*}
+    RELAY_HOST=${RELAY_AUTHORITY%%:*}
+    RELAY_PORT=443
+    case "$RELAY_AUTHORITY" in *:*) RELAY_PORT=${RELAY_AUTHORITY##*:};; esac
     RESOLVE_IP=
     case "$RELAY_HOST" in *.nip.io) _nip=${RELAY_HOST%.nip.io}; case "$_nip" in *[!0-9.]*|*..*|.*|*.) ;; *.*.*.*.*) ;; *.*.*.*) RESOLVE_IP=$_nip;; esac;; esac
     body='{"hosts":['; first=1
     for host in $HOSTS; do [ "$first" = 1 ] || body="$body,"; body="$body\"$host\""; first=0; done
     body="$body]}"
-    sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$SECRET" -hex 2>/dev/null | awk '{print $NF}')
-    [ -n "$sig" ] || { log 'не удалось вычислить HMAC'; return 1; }
     attempts=${D2K_RESOLVE_ATTEMPTS:-3}
     attempt=1
     response=
     while [ "$attempt" -le "$attempts" ]; do
         if [ -n "$RESOLVE_IP" ]; then
             response=$(curl -fsS --connect-timeout "${D2K_RESOLVE_CONNECT_TIMEOUT:-5}" \
-                --max-time "${D2K_RESOLVE_TIMEOUT:-15}" --resolve "$RELAY_HOST:443:$RESOLVE_IP" \
+                --max-time "${D2K_RESOLVE_TIMEOUT:-15}" --resolve "$RELAY_HOST:$RELAY_PORT:$RESOLVE_IP" \
                 -X POST "$RELAY_URL" -H 'Content-Type: application/json' \
-                -H "X-Z2K-Auth: $sig" --data "$body" 2>>"$LOG") && break
+                --data "$body" 2>>"$LOG") && break
         else
             response=$(curl -fsS --connect-timeout "${D2K_RESOLVE_CONNECT_TIMEOUT:-5}" \
                 --max-time "${D2K_RESOLVE_TIMEOUT:-15}" -X POST "$RELAY_URL" \
-                -H 'Content-Type: application/json' -H "X-Z2K-Auth: $sig" \
+                -H 'Content-Type: application/json' \
                 --data "$body" 2>>"$LOG") && break
         fi
         log "VPS /resolve: попытка $attempt/$attempts не удалась"
@@ -160,7 +158,13 @@ refresh() {
                 rc=$?
                 [ "$rc" = 1 ] || { rm -f "$next"; log "не удалось проверить NDM перед добавлением $host $ip"; return 1; }
             fi
-            if LD_LIBRARY_PATH='' ndmc -c "ip host $host $ip" >/dev/null 2>&1; then printf '%s %s\n' "$host" "$ip" >> "$next"; log "добавлена D2K-запись $host $ip"; else add_failed=1; log "ошибка добавления $host $ip"; fi
+            # Claim the absent pair before adding it: a refresh stopped at any
+            # point (service stop, uninstall) still leaves it removable, and
+            # remove skips a claimed pair that NDM never received.
+            printf '%s %s\n' "$host" "$ip" >> "$MANIFEST"
+            if LD_LIBRARY_PATH='' ndmc -c "ip host $host $ip" >/dev/null 2>&1; then
+                printf '%s %s\n' "$host" "$ip" >> "$next"; log "добавлена D2K-запись $host $ip"
+            else add_failed=1; log "ошибка добавления $host $ip"; fi
         done
     done
     if [ "$add_failed" = 1 ]; then
@@ -213,7 +217,7 @@ refresh() {
         log 'не удалось сохранить конфигурацию NDM'
         return 1
     fi
-    log 'обновление Instagram DNS завершено'
+    log 'обновление DNS Instagram/WhatsApp завершено'
     mark_refresh_success
 }
 case "${1:-}" in refresh) refresh;; remove) remove_owned;; *) echo "usage: $0 refresh|remove" >&2; exit 2;; esac

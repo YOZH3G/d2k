@@ -1,6 +1,10 @@
 #!/bin/sh
-# Local-time daily Instagram DNS refresh. Cron is intentionally not used:
-# Keenetic Entware cron does not reliably reload its crontab.
+# Local-time daily Instagram/WhatsApp DNS refresh after 02:00 router time.
+# Without any recorded success (fresh install, or the installer cleared it to
+# pin a new host set) the first refresh runs right away, in the background of
+# the service, so installation does not wait for slow edges.
+# Cron is intentionally not used: Keenetic Entware cron does not reliably
+# reload its crontab.
 set -u
 export PATH="${D2K_STUB_PATH:+$D2K_STUB_PATH:}/opt/sbin:/opt/bin:/sbin:/usr/sbin:/bin:/usr/bin"
 
@@ -11,7 +15,7 @@ ATTEMPT=${D2K_INSTAGRAM_SCHED_ATTEMPT:-/tmp/d2k-instagram-dns-last-attempt}
 LOG=${D2K_INSTAGRAM_SCHED_LOG:-$DIR/log/instagram-dns-scheduler.log}
 RUN_EVERY=${D2K_SCHEDULER_INTERVAL:-60}
 RETRY_AFTER=${D2K_SCHEDULER_RETRY_AFTER:-1800}
-RUN_AT=${D2K_INSTAGRAM_REFRESH_AT:-0400}
+RUN_AT=${D2K_INSTAGRAM_REFRESH_AT:-0200}
 child_pid=
 
 stop_scheduler() {
@@ -31,7 +35,9 @@ log() {
 tick() {
     today=$(date +%Y-%m-%d)
     hhmm=$(date +%H%M)
-    [ "$hhmm" -ge "$RUN_AT" ] || return 0
+    if [ -e "$STATE" ]; then
+        [ "$hhmm" -ge "$RUN_AT" ] || return 0
+    fi
     [ "$(cat "$STATE" 2>/dev/null || true)" != "$today" ] || return 0
 
     now=$(date +%s)
@@ -42,14 +48,14 @@ tick() {
 
     mkdir -p "$(dirname "$STATE")" "$(dirname "$ATTEMPT")" 2>/dev/null || true
     printf '%s\n' "$now" > "$ATTEMPT"
-    log "ночное обновление Instagram DNS: старт"
+    log "обновление DNS Instagram/WhatsApp: старт"
     "$HELPER" refresh &
     child_pid=$!
     if wait "$child_pid"; then
         child_pid=
         tmp="$STATE.new.$$"
         if printf '%s\n' "$today" > "$tmp" && mv -f "$tmp" "$STATE"; then
-            log "Instagram DNS обновлён; следующий запуск после $RUN_AT завтра"
+            log "DNS Instagram/WhatsApp обновлён; следующий запуск после $RUN_AT завтра"
         else
             rm -f "$tmp"
             log 'обновление успешно, но не удалось сохранить дату; временной backoff не даст запускать повтор каждую минуту'

@@ -33,15 +33,29 @@ run_tick() {
         D2K_SCHEDULER_RETRY_AFTER=1800 sh "$SCHEDULER" tick
 }
 
-run_tick
-[ ! -e "$TMP/calls" ] || { echo 'FAIL: ran before 04:00 local time' >&2; exit 1; }
-FAKE_HHMM=0400 run_tick
-[ "$(cat "$TMP/calls")" = 1 ] || { echo 'FAIL: did not run at 04:00' >&2; exit 1; }
-FAKE_HHMM=0410 FAKE_EPOCH=1790654940 run_tick
+# A previous day's success: wait for 02:00 router time.
+printf '2026-09-28\n' > "$TMP/d2k/state/success"
+FAKE_HHMM=0159 run_tick
+[ ! -e "$TMP/calls" ] || { echo 'FAIL: ran before 02:00 local time' >&2; exit 1; }
+FAKE_HHMM=0200 run_tick
+[ "$(cat "$TMP/calls")" = 1 ] || { echo 'FAIL: did not run at 02:00' >&2; exit 1; }
+FAKE_HHMM=0210 FAKE_EPOCH=1790654940 run_tick
 [ "$(cat "$TMP/calls")" = 1 ] || { echo 'FAIL: retried before backoff expired' >&2; exit 1; }
-FAKE_HHMM=0431 FAKE_EPOCH=1790656200 run_tick
+FAKE_HHMM=0231 FAKE_EPOCH=1790656200 run_tick
 [ "$(cat "$TMP/calls")" = 2 ] || { echo 'FAIL: did not retry after resolver failure' >&2; exit 1; }
 [ "$(cat "$TMP/d2k/state/success")" = 2026-09-29 ] || { echo 'FAIL: successful date not persisted' >&2; exit 1; }
 FAKE_HHMM=0500 FAKE_EPOCH=1790657940 run_tick
 [ "$(cat "$TMP/calls")" = 2 ] || { echo 'FAIL: refreshed more than once after success' >&2; exit 1; }
+
+# No recorded success (fresh install, or the installer cleared it to pin a new
+# host set): refresh in the background right away, whatever the hour.
+rm -f "$TMP/d2k/state/success" "$TMP/attempt" "$TMP/calls"
+FAKE_DAY=2026-09-30 FAKE_HHMM=0100 FAKE_EPOCH=1790730000 run_tick
+[ "$(cat "$TMP/calls")" = 1 ] || { echo 'FAIL: first refresh waited for 02:00' >&2; exit 1; }
+FAKE_DAY=2026-09-30 FAKE_HHMM=0110 FAKE_EPOCH=1790730600 run_tick
+[ "$(cat "$TMP/calls")" = 1 ] || { echo 'FAIL: first-refresh retry ignored the backoff' >&2; exit 1; }
+FAKE_DAY=2026-09-30 FAKE_HHMM=0131 FAKE_EPOCH=1790731860 run_tick
+[ "$(cat "$TMP/calls")" = 2 ] || { echo 'FAIL: failed first refresh was not retried' >&2; exit 1; }
+[ "$(cat "$TMP/d2k/state/success")" = 2026-09-30 ] || { echo 'FAIL: first refresh success not persisted' >&2; exit 1; }
+grep -q 'D2K_INSTAGRAM_REFRESH_AT:-0200' "$SCHEDULER" || { echo 'FAIL: default refresh time is not 02:00' >&2; exit 1; }
 echo 'Instagram DNS scheduler: all checks passed'

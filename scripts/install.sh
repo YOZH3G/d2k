@@ -137,6 +137,12 @@ case "$TG_VERSION" in
     *instagram-ip-probe*) ;;
     *) die "скачанный d2ktg устарел: нет проверки доступности Instagram IP" ;;
 esac
+# The DNS helper pins 15 Instagram/fbcdn/WhatsApp names; an older d2ktg knows
+# only 7 and would silently reject the rest.
+case "$TG_VERSION" in
+    *meta-hosts-v2*) ;;
+    *) die "скачанный d2ktg устарел: нет проверки сертификатов WhatsApp и fbcdn" ;;
+esac
 # d2kc без обязательного --control печатает использование и выходит кодом 2 —
 # это и есть признак «запускается и та арка». Ноль он здесь вернуть не может.
 #
@@ -251,13 +257,12 @@ if [ "$TG_INSTALL_URL" = wss://213.176.74.63.nip.io/ws ] &&
    ! grep -q '^TG_ENROLL_PORT=' "$DIR/config"; then
     printf 'TG_ENROLL_PORT=9443\n' >> "$DIR/config"
 fi
-# Resolve and pin Instagram through the same authenticated VPS flow as z2k.
-# A resolver/VPS outage must not turn a healthy D2K installation into a failure.
-if "$DIR/d2k-instagram-dns.sh" refresh; then
-    say "Instagram DNS проверен через VPS"
-else
-    say "Instagram DNS не обновлён: причина в $DIR/log/instagram-dns.log; прежние записи сохранены, повторы — с 04:00"
-fi
+# Instagram/WhatsApp DNS pins come from d2k's own C resolver on the VPS.
+# Checking 15 names can wait on silent edges, so the installer does not run it:
+# clearing the success mark makes the service's scheduler refresh right after
+# start, in the background. A resolver/VPS outage never fails the install.
+rm -f "$DIR/state/instagram-dns-last-success" /tmp/d2k-instagram-dns-last-attempt
+say "DNS Instagram/WhatsApp обновляется в фоне после запуска: результат в $DIR/log/instagram-dns.log; прежние записи сохраняются, далее — ежедневно после 02:00"
 # Убираем только legacy Go-панельный бинарник прежней установки; новый C
 # runtime уже проверен выше и установлен отдельно как d2kpanel.
 rm -f "$SBIN/d2k"
