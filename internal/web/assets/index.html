@@ -1,44 +1,100 @@
 <!doctype html>
 <html lang="ru">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#eab71f">
-<title>D2K — Слайдоскоп</title>
-<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
-<link rel="stylesheet" href="/assets/panel.css">
-<script src="/assets/panel.js" defer></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>D2K</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+  <link rel="preload" href="/assets/onest.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/assets/panel.css">
+  <script src="/assets/gsap.js" defer></script>
+  <script src="/assets/panel.js" defer></script>
 </head>
 <body>
-<div class="frame">
-  <aside class="rail">
-    <a class="brand" href="#overview" aria-label="D2K — на главную">
-      <svg class="brand-mark" aria-hidden="true" width="58" height="36" viewBox="0 0 58 36"><path fill="currentColor" d="M0 32 19 4h10L10 32zm19 0L38 4h10L29 32z"/><path fill="#82948c" d="m38 32 19-28h1v15l-9 13z"/></svg>
-      <span class="brand-name">D2K /<span>Слайдоскоп</span></span>
-    </a>
-    <nav class="nav" aria-label="Разделы панели">
-      <a class="nav-link active" href="#searches"><span>Подборы</span></a>
-      <a class="nav-link" href="#families"><span>Семейства</span></a>
-      <a class="nav-link" href="#boxes"><span>Результаты</span></a>
-      <a class="header-tool" href="#box-filter" aria-label="Поиск по результатам"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="m15 15 7 7"/></svg><span>Поиск</span></a>
-      <a class="header-tool" href="#diagnostics" aria-label="Диагностика и настройки"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 3 1-2h4l1 2 3 2 3 1v4l-2 2 2 2v4l-3 1-3 2-1 2h-4l-1-2-3-2-3-1v-4l2-2-2-2V6l3-1z"/><circle cx="12" cy="12" r="3"/></svg></a>
-    </nav>
-    <div class="rail-bottom">
-      <span class="rail-dot" aria-hidden="true"></span>
-      <span><b id="rail-state">Подключаемся</b><small id="rail-updated">к локальному движку</small></span>
-    </div>
-  </aside>
+  <a class="skip" href="#now">К текущему состоянию</a>
 
-  <div class="workspace">
-    <header class="topbar">
-      <span class="crumb">Keenetic <i>/</i> <b>Автоматический подбор обходов</b></span>
-      <span class="live-indicator" id="live-indicator"><i></i><span>Получение данных</span></span>
-    </header>
-    <main id="app" class="content" aria-live="polite" aria-busy="true">
-      <div class="loading"><span class="loader" aria-hidden="true"></span><p>Подключаюсь к D2K…</p></div>
+  <header class="mast" id="mast">
+    <div class="mast-id">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+        <rect class="mark-ground" width="32" height="32" rx="7"/>
+        <path class="mark-line" d="M4 20h7c2 0 3-1.2 3.6-3l.8-2.4C16 12.8 17 12 18.6 12h0c1.6 0 2.6.8 3.2 2.6l.8 2.4c.6 1.8 1.6 3 3.6 3H28"/>
+        <rect class="mark-block" x="14.5" y="17.5" width="8" height="6" rx="1"/>
+      </svg>
+      <span class="wordmark">D2K</span>
+      <span class="mast-host" id="host"></span>
+    </div>
+
+    <div class="mast-state" id="engine-state" aria-live="polite">
+      <span class="lamp" data-tone="idle"></span>
+      <span class="mast-state-text">Получаем состояние…</span>
+    </div>
+
+    <div class="mast-actions" id="engine-actions" role="group" aria-label="Управление движком"></div>
+  </header>
+
+  <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
+
+  <div class="frame">
+    <nav class="index" aria-label="Разделы">
+      <a href="#now" data-nav="now"><span>Сейчас</span><b id="nav-now"></b></a>
+      <a href="#families" data-nav="families"><span>Семейства</span><b id="nav-families"></b></a>
+      <a href="#boxes" data-nav="boxes"><span>Коробки</span><b id="nav-boxes"></b></a>
+      <a href="#telegram" data-nav="telegram"><span>Telegram-туннель</span><b id="nav-telegram"></b></a>
+      <a href="#diagnostics" data-nav="diagnostics"><span>Диагностика</span><b id="nav-diagnostics"></b></a>
+    </nav>
+
+    <main id="app">
+      <section class="sheet sheet-now" id="now" aria-labelledby="now-title">
+        <h1 class="statement" id="now-title">Получаем состояние…</h1>
+        <p class="lede" id="now-lede"></p>
+        <div class="slots" id="slots"></div>
+        <ol class="searches" id="searches" aria-label="Текущие поиски"></ol>
+      </section>
+
+      <div class="filter-bar">
+        <label class="filter" for="filter">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg>
+          <span class="visually-hidden">Найти цель</span>
+          <input id="filter" type="search" placeholder="Найти домен или адрес в семействах и коробках" autocomplete="off" spellcheck="false">
+        </label>
+        <p class="filter-count" id="filter-count" aria-live="polite"></p>
+      </div>
+
+      <section class="sheet" id="families" aria-labelledby="families-title">
+        <header class="sheet-head">
+          <h2 id="families-title">Семейства</h2>
+          <p>Обход, подтверждённый на нескольких доменах одного суффикса, применяется ко всему семейству. Исключения остаются отдельными.</p>
+        </header>
+        <div id="families-body"></div>
+      </section>
+
+      <section class="sheet" id="boxes" aria-labelledby="boxes-title">
+        <header class="sheet-head">
+          <h2 id="boxes-title">Коробки</h2>
+          <p>Коробка — измеренное поведение блокировки. Для совместимой коробки сначала проверяется уже найденный план.</p>
+        </header>
+        <div id="boxes-body"></div>
+      </section>
+
+      <section class="sheet sheet-telegram" id="telegram" aria-labelledby="telegram-title">
+        <header class="sheet-head">
+          <h2 id="telegram-title">Telegram-туннель</h2>
+          <p>Отдельная служба со своим состоянием. Обходы D2K через неё не идут.</p>
+        </header>
+        <div class="tunnel" id="telegram-body"></div>
+      </section>
+
+      <section class="sheet" id="diagnostics" aria-labelledby="diagnostics-title">
+        <header class="sheet-head">
+          <h2 id="diagnostics-title">Диагностика</h2>
+          <p>Что движок может подтвердить сам, чего не измеряет, и с какими настройками запущен.</p>
+        </header>
+        <div id="diagnostics-body"></div>
+      </section>
+
+      <footer class="colophon" id="colophon"></footer>
     </main>
   </div>
-</div>
 </body>
 </html>

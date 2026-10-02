@@ -107,16 +107,11 @@ fetch "internal/web/assets/index.html" "$TMP/panel/index.html"
 fetch "internal/web/assets/favicon.svg" "$TMP/panel/favicon.svg"
 fetch "internal/web/assets/panel.css"  "$TMP/panel/panel.css"
 fetch "internal/web/assets/panel.js"   "$TMP/panel/panel.js"
-fetch "internal/web/assets/fonts/oswald.ttf" "$TMP/panel/oswald.ttf"
-fetch "internal/web/assets/fonts/OFL-oswald.txt" "$TMP/panel/OFL-oswald.txt"
-for slide_layer in slide-left slide-center slide-right slide-holder; do
-    fetch "internal/web/assets/$slide_layer.webp" "$TMP/panel/$slide_layer.webp"
+fetch "internal/web/assets/gsap.js"    "$TMP/panel/gsap.js"
+for face in onest jbmono; do
+    fetch "internal/web/assets/fonts/$face.woff2" "$TMP/panel/$face.woff2"
+    fetch "internal/web/assets/fonts/OFL-$face.txt" "$TMP/panel/OFL-$face.txt"
 done
-fetch "internal/web/assets/ground.webp" "$TMP/panel/ground.webp"
-fetch "internal/web/assets/rack.webp" "$TMP/panel/rack.webp"
-fetch "internal/web/assets/family-rack.webp" "$TMP/panel/family-rack.webp"
-fetch "internal/web/assets/logo-d2k.png" "$TMP/panel/logo-d2k.png"
-fetch "internal/web/assets/mascot-d2k.png" "$TMP/panel/mascot-d2k.png"
 
 chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kd" "$TMP/d2ktg" "$TMP/d2khttp" \
          "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/d2k-ppe-deoffload.sh" "$TMP/d2k-log-maintenance.sh" "$TMP/001-d2k.sh" \
@@ -187,17 +182,20 @@ install_data_atomic "$TMP/panel/index.html" "$DIR/panel/index.html"
 install_data_atomic "$TMP/panel/favicon.svg" "$DIR/panel/favicon.svg"
 install_data_atomic "$TMP/panel/panel.css"  "$DIR/panel/panel.css"
 install_data_atomic "$TMP/panel/panel.js"   "$DIR/panel/panel.js"
+install_data_atomic "$TMP/panel/gsap.js"    "$DIR/panel/gsap.js"
 mkdir -p "$DIR/panel/fonts"
-install_data_atomic "$TMP/panel/oswald.ttf" "$DIR/panel/fonts/oswald.ttf"
-install_data_atomic "$TMP/panel/OFL-oswald.txt" "$DIR/panel/fonts/OFL-oswald.txt"
-for slide_layer in slide-left slide-center slide-right slide-holder; do
-    install_data_atomic "$TMP/panel/$slide_layer.webp" "$DIR/panel/$slide_layer.webp"
+for face in onest jbmono; do
+    install_data_atomic "$TMP/panel/$face.woff2" "$DIR/panel/fonts/$face.woff2"
+    install_data_atomic "$TMP/panel/OFL-$face.txt" "$DIR/panel/fonts/OFL-$face.txt"
 done
-install_data_atomic "$TMP/panel/ground.webp" "$DIR/panel/ground.webp"
-install_data_atomic "$TMP/panel/rack.webp" "$DIR/panel/rack.webp"
-install_data_atomic "$TMP/panel/family-rack.webp" "$DIR/panel/family-rack.webp"
-install_data_atomic "$TMP/panel/logo-d2k.png" "$DIR/panel/logo-d2k.png"
-install_data_atomic "$TMP/panel/mascot-d2k.png" "$DIR/panel/mascot-d2k.png"
+# Файлы прежней панели («Слайдоскоп») новой не нужны: убираем их при обновлении.
+for old in slide-left.webp slide-center.webp slide-right.webp slide-holder.webp ground.webp \
+           rack.webp family-rack.webp slide-left.webp.json slide-center.webp.json \
+           slide-right.webp.json slide-holder.webp.json ground.webp.json rack.webp.json \
+           family-rack.webp.json logo-d2k.png mascot-d2k.png mascot.svg \
+           fonts/oswald.ttf fonts/OFL-oswald.txt; do
+    rm -f "$DIR/panel/$old"
+done
 install_atomic "$TMP/d2k-fw-heal.sh" "$DIR/d2k-fw-heal.sh"
 install_atomic "$TMP/d2k-ppe-deoffload.sh" "$DIR/d2k-ppe-deoffload.sh"
 install_atomic "$TMP/d2k-log-maintenance.sh" "$DIR/d2k-log-maintenance.sh"

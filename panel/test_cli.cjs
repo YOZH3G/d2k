@@ -93,12 +93,10 @@ async function main() {
     const pageText = await page.text();
     assert.match(pageText, /id="app"/);
     assert.match(pageText, /rel="icon"[^>]+href="\/assets\/favicon\.svg"/,
-      'The installed panel must declare its local Slidoscope favicon');
+      'The installed panel must declare its local favicon');
     for (const [asset, mime] of [
-      ['favicon.svg', 'image/svg+xml'], ['ground.webp', 'image/webp'],
-      ['rack.webp', 'image/webp'], ['family-rack.webp', 'image/webp'],
-      ['oswald.ttf', 'font/ttf'], ['slide-left.webp', 'image/webp'],
-      ['slide-center.webp', 'image/webp'], ['slide-right.webp', 'image/webp'], ['slide-holder.webp', 'image/webp']
+      ['favicon.svg', 'image/svg+xml'], ['onest.woff2', 'font/woff2'],
+      ['gsap.js', 'application/javascript; charset=utf-8'], ['jbmono.woff2', 'font/woff2']
     ]) {
       const r = await fetch(`http://127.0.0.1:${port}/assets/${asset}`);
       assert.equal(r.status, 200, asset + ' must be served by the real C panel');

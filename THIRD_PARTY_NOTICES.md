@@ -52,3 +52,16 @@ under the Apache License 2.0. Source and license: <https://www.openssl.org/sourc
 anchors published by Internet Security Research Group (ISRG) for the relay's
 Let's Encrypt certificate chain. Inclusion adds trust anchors without
 disabling certificate-chain or hostname verification.
+
+## Web panel: fonts and animation library
+
+- `internal/web/assets/fonts/onest.woff2` — Onest (The Onest Project Authors),
+  subset to Latin/Cyrillic; SIL Open Font License 1.1, text in `fonts/OFL-onest.txt`.
+- `internal/web/assets/fonts/jbmono.woff2` — JetBrains Mono (The JetBrains Mono
+  Project Authors), same subset; SIL Open Font License 1.1, text in `fonts/OFL-jbmono.txt`.
+- `internal/web/assets/gsap.js` — GSAP 3.15.0 core with the Flip, MotionPathPlugin,
+  DrawSVGPlugin, MorphSVGPlugin, ScrollToPlugin, SplitText, CustomEase and CustomWiggle
+  files from the public `gsap` npm package, concatenated unmodified with
+  their original copyright headers. Copyright GreenSock; distributed under the GreenSock
+  standard "no charge" license, https://gsap.com/standard-license. The panel loads it
+  from the router itself; without it the panel works without transitions.

@@ -32,7 +32,7 @@ try {
   for (const name of ['d2k-fw-heal.sh', 'd2k-ppe-deoffload.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
   fixture('files/d2k-log-maintenance.sh', fs.readFileSync(path.join(root, 'files/d2k-log-maintenance.sh')));
   for (const name of ['meta-ranges.txt', 'tg-roots.pem', 'fake/stun.bin', 'fake/quic_initial_dbankcloud_ru.bin']) fixture(`files/${name}`, 'fixture\n');
-  for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'fonts/oswald.ttf', 'fonts/OFL-oswald.txt', 'slide-left.webp', 'slide-center.webp', 'slide-right.webp', 'slide-holder.webp', 'ground.webp', 'rack.webp', 'family-rack.webp', 'logo-d2k.png', 'mascot-d2k.png']) fixture(`internal/web/assets/${name}`, 'fixture\n');
+  for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'gsap.js', 'fonts/onest.woff2', 'fonts/OFL-onest.txt', 'fonts/jbmono.woff2', 'fonts/OFL-jbmono.txt']) fixture(`internal/web/assets/${name}`, 'fixture\n');
   fs.mkdirSync(path.join(tmp, 'proc/net/netfilter'), { recursive: true });
   fs.writeFileSync(path.join(tmp, 'proc/net/netfilter/nfnetlink_queue'), '');
   fs.writeFileSync(path.join(tmp, 'proc/net/ip_tables_targets'), 'NFQUEUE\n');

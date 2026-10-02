@@ -1,909 +1,1736 @@
-(function (root) {
+/* D2K — локальная панель. Только чтение /api/status и шесть команд управления.
+   Данные из сети попадают в DOM исключительно через textContent. */
+(function (global) {
   "use strict";
 
-  var currentFilter = "";
-  var controlMessage = "";
-  var controlInFlight = false;
-  var refreshInFlight = false;
-  var refreshTimer = null;
-  var refreshAbort = null;
-  var selectedSlide = "";
+  var POLL_MS = 2000;
+  var STALE_MS = 9000;
 
-  function arrangeSlides(cards) {
-    var index = cards.findIndex(function (card) { return card.getAttribute("data-slide-key") === selectedSlide; });
-    if (index < 0) index = Math.min(1, cards.length - 1);
-    if (index >= 0) selectedSlide = cards[index].getAttribute("data-slide-key");
-    cards.forEach(function (card, i) {
-      var slot = i === index ? "center" :
-        i === (index - 1 + cards.length) % cards.length ? "left" :
-        i === (index + 1) % cards.length ? "right" : "hidden";
-      card.setAttribute("data-slot", slot);
-      card.setAttribute("data-selected", i === index ? "true" : "false");
-      card.inert = slot === "hidden";
-      var button = card.querySelector && card.querySelector("[data-select-slide]");
-      if (button) {
-        button.setAttribute("aria-pressed", i === index ? "true" : "false");
-        button.querySelector(".slide-number").textContent = String(i + 1).padStart(2, "0");
-        button.querySelector(".slide-label").textContent = i === index ? "Выбранный подбор" : "Подбор";
+  /* ─── Словарь ─── */
+
+  var SHAPES = { 0: "", 1: "TLS 1.3", 2: "TLS 1.2", 3: "QUIC", 4: "любая форма", 5: "голос", 6: "TLS 1.3 + ECH" };
+  var MODES = { apply: "применение", observe: "наблюдение", off: "выключен" };
+
+  var TRACK = [
+    { label: "Очередь", phases: ["ожидает безопасного слота замера", "заводим поиск"] },
+    { label: "Форма", phases: ["ждём форму приветствия"] },
+    { label: "Распознаём", phases: ["распознаём поведение"] },
+    { label: "Свойства", phases: ["спрашиваем коробку о свойствах"] },
+    { label: "Планы", phases: ["выводим планы"] },
+    { label: "Проверка", phases: ["проверяем готовое узнанной коробки", "проверяем выведенный план"] },
+    { label: "Подтверждено", phases: ["подтверждено, смотрим живой трафик"] }
+  ];
+  var VOICE_TRACK = [
+    { label: "Замер голоса", phases: ["измеряем живой голосовой поток"] },
+    { label: "Приём стоит", phases: ["приём голоса стоит, ждём разговора"] },
+    { label: "Ждём ответа", phases: ["приём применился к разговору, ждём ответа сервера"] }
+  ];
+
+  function plural(n, one, few, many) {
+    var m10 = n % 10, m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return one;
+    if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+    return many;
+  }
+  function count(n, one, few, many) { return n + " " + plural(n, one, few, many); }
+
+  function num(v) { return typeof v === "number" && isFinite(v) ? v : null; }
+  function list(v) { return Array.isArray(v) ? v : []; }
+  function str(v) { return v === undefined || v === null ? "" : String(v); }
+
+  function shapeLabel(shape, transport) {
+    var s = SHAPES[shape];
+    if (s) return s;
+    if (transport === 17) return "UDP";
+    if (transport === 6) return "TCP";
+    return "протокол не указан";
+  }
+  function familyLabel(f) { return f === 6 ? "IPv6" : f === 4 ? "IPv4" : "IP?"; }
+  function targetLabel(t) {
+    if (t === "@discord-voice") return "Голос Discord";
+    return str(t) || "цель без имени";
+  }
+
+  function trackFor(phase) {
+    var tracks = [TRACK, VOICE_TRACK];
+    for (var t = 0; t < tracks.length; t++) {
+      for (var i = 0; i < tracks[t].length; i++) {
+        if (tracks[t][i].phases.indexOf(phase) >= 0) return { steps: tracks[t], at: i, voice: t === 1 };
       }
-    });
-  }
-
-  function transferSlide(card, rootNode, doc) {
-    if (!doc.body || !card.cloneNode || !card.getBoundingClientRect) return;
-    var source = JSON.parse(card.getAttribute("data-slide-key"));
-    var target = Array.prototype.find.call(rootNode.querySelectorAll("[data-family-context]"), function (item) {
-      var family = JSON.parse(item.getAttribute("data-family-context"));
-      return (source[0] === family[0] || source[0].endsWith("." + family[0])) &&
-        source[1] === family[1] && source[2] === family[2] && source[3] === family[3] &&
-        source[5] === family[4] && source[6] === family[5] && !family[6].includes(source[0]);
-    });
-    if (!target) return;
-    var from = card.getBoundingClientRect(), to = target.getBoundingClientRect();
-    if (to.top >= root.innerHeight || to.bottom <= 0 || to.left >= root.innerWidth ||
-        to.right <= 0 || !to.width || from.bottom <= 0) return;
-    var ghost = card.cloneNode(true);
-    ghost.removeAttribute("data-motion");
-    ghost.setAttribute("aria-hidden", "true");
-    ghost.inert = true;
-    Object.assign(ghost.style, { position:"fixed", left:from.left+"px", top:from.top+"px",
-      width:from.width+"px", height:from.height+"px", minHeight:"0", margin:"0",
-      zIndex:"25", pointerEvents:"none", transformOrigin:"top left", transition:"none" });
-    doc.body.appendChild(ghost);
-    var flight = ghost.animate([
-      {transform:"translate(0,0) scale(1)",opacity:.9},
-      {transform:"translate("+(to.left-from.left)+"px,"+(to.top-from.top)+"px) scale("+(to.width/from.width)+","+(to.height/from.height)+")",opacity:0}
-    ], {duration:660,easing:"cubic-bezier(.22,.7,.2,1)"});
-    var remove = function () { ghost.remove(); };
-    flight.onfinish = remove;
-    flight.oncancel = remove;
-  }
-
-  function slideEvents(previous, current) {
-    if (!previous) return [];
-    var stages = new Map(previous.map(function (item) { return [item.key, item.stage]; }));
-    return current.reduce(function (events, item) {
-      if (!stages.has(item.key)) events.push({ key: item.key, kind: "arrive" });
-      else if (stages.get(item.key) !== item.stage) {
-        events.push({ key: item.key, kind: item.stage === "confirmed" ? "confirm" : "advance" });
-      }
-      return events;
-    }, []);
-  }
-
-  function animateSlides(rootNode, doc) {
-    if (!rootNode.querySelectorAll) return;
-    var cards = Array.prototype.slice.call(rootNode.querySelectorAll("[data-slide-key]"));
-    var current = cards.map(function (card) {
-      return { key: card.getAttribute("data-slide-key"), stage: card.getAttribute("data-slide-stage") };
-    });
-    arrangeSlides(cards);
-    if (rootNode.addEventListener && !rootNode.__slideSelectBound) {
-      rootNode.__slideSelectBound = true;
-      rootNode.addEventListener("click", function (event) {
-        var button = event.target && event.target.closest && event.target.closest("[data-select-slide]");
-        var step = event.target && event.target.closest && event.target.closest("[data-slide-step]");
-        if (!button && !step) return;
-        var all = Array.prototype.slice.call(rootNode.querySelectorAll("[data-slide-key]"));
-        var oldIndex = all.findIndex(function (card) { return card.getAttribute("data-slide-key") === selectedSlide; });
-        selectedSlide = button ? button.getAttribute("data-select-slide") :
-          all[(oldIndex + Number(step.getAttribute("data-slide-step")) + all.length) % all.length].getAttribute("data-slide-key");
-        arrangeSlides(all);
-        var reduced = root.matchMedia && root.matchMedia("(prefers-reduced-motion: reduce)").matches;
-        var chosen = all.find(function (card) { return card.getAttribute("data-slide-key") === selectedSlide; });
-        if (chosen && chosen.animate && !reduced) chosen.animate([
-          {transform:"translateY(18px)",filter:"brightness(.88)"},
-          {transform:"translateY(-4px)",filter:"brightness(1.04)",offset:.7},
-          {transform:"translateY(0)",filter:"brightness(1)"}
-        ],{duration:520,easing:"cubic-bezier(.16,1,.3,1)"});
-      });
     }
-    var events = slideEvents(rootNode.__slideSnapshot, current);
-    rootNode.__slideSnapshot = current;
-    if (doc.hidden) return;
-    var reduced = root.matchMedia && root.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    var byKey = new Map(cards.map(function (card) { return [card.getAttribute("data-slide-key"), card]; }));
-    events.forEach(function (event) {
-      var card = byKey.get(event.key);
-      if (!card || !card.animate || card.getAttribute("data-slot") === "hidden") return;
-      card.setAttribute("data-motion", event.kind);
-      if (reduced) {
-        card.animate([{ opacity: .72 }, { opacity: 1 }], { duration: 120 });
-        return;
-      }
-      if (event.kind === "confirm") transferSlide(card, rootNode, doc);
-      var frames = event.kind === "arrive"
-        ? [{ transform: "perspective(1100px) translateY(36px) rotateX(8deg)", opacity: .45 },
-           { transform: "perspective(1100px) translateY(0) rotateX(0)", opacity: 1 }]
-        : event.kind === "confirm"
-        ? [{ transform: "translateY(0)", filter: "brightness(1)" },
-           { transform: "translateY(-14px)", filter: "brightness(1.16)", offset: .35 },
-           { transform: "translateY(0)", filter: "brightness(1)" }]
-        : [{ filter: "brightness(1)" }, { filter: "brightness(1.2)", offset: .3 }, { filter: "brightness(1)" }];
-      card.animate(frames, { duration: event.kind === "confirm" ? 620 : 440,
-        easing: "cubic-bezier(.16,1,.3,1)" });
-    });
+    return null;
   }
 
-  async function requestJSON(url, options, timeout) {
-    var controller = new root.AbortController();
-    var timer = root.setTimeout(function () { controller.abort(); }, timeout);
-    options.signal = controller.signal;
+  function parseTime(iso) {
+    var t = Date.parse(iso);
+    return isFinite(t) && t > 86400000 ? t : null;
+  }
+
+  function duration(ms) {
+    var s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return s + " с";
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + " мин " + (s % 60 < 10 ? "0" : "") + (s % 60) + " с";
+    var h = Math.floor(m / 60);
+    if (h < 48) return h + " ч " + (m % 60) + " мин";
+    return Math.floor(h / 24) + " дн " + (h % 24) + " ч";
+  }
+  function clock(ms) {
+    var s = Math.max(0, Math.floor(ms / 1000));
+    var m = Math.floor(s / 60), h = Math.floor(m / 60);
+    var pad = function (x) { return (x < 10 ? "0" : "") + x; };
+    return (h ? h + ":" + pad(m % 60) : m) + ":" + pad(s % 60);
+  }
+  function ago(ms) {
+    if (ms < 45000) return "только что";
+    return duration(ms).replace(/ \d+ с$/, "").replace(/ 0 (мин|ч)$/, "") + " назад";
+  }
+  function localTime(t) {
     try {
-      var response = await root.fetch(url, options);
-      var payload = await response.json();
-      if (!response.ok) throw new Error(payload.message || ("HTTP " + response.status));
-      return payload;
-    } finally { root.clearTimeout(timer); }
+      return new Date(t).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+    } catch (e) { return new Date(t).toISOString(); }
   }
 
-  function node(doc, tag, text, className) {
-    var out = doc.createElement(tag);
-    if (text !== undefined && text !== null) out.textContent = String(text);
-    if (className) out.className = className;
-    return out;
+  /* Краткая выжимка плана — только директивы, без полезной нагрузки. */
+  function planGist(text) {
+    var skip = { "d2k-plan": 1, id: 1, proto: 1, payload: 1, wire: 1, input: 1 };
+    return str(text).split("\n").map(function (line) { return line.trim(); }).filter(function (line) {
+      return line && !skip[line.split(/\s+/)[0]];
+    }).map(function (line) {
+      var parts = line.split(/\s+/);
+      return parts.length > 3 ? parts.slice(0, 3).join(" ") + "…" : line;
+    }).join(" · ");
   }
 
-  function append(parent, child) { parent.appendChild(child); return child; }
+  function normName(n) { return str(n).toLowerCase().replace(/\.$/, ""); }
 
-  function icon(doc, kind) {
-    if (!doc.createElementNS) return node(doc, "span", undefined, "ui-icon");
-    var svg = doc.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.setAttribute("viewBox", "0 0 24 24");
-    svg.setAttribute("class", "ui-icon");
-    svg.setAttribute("aria-hidden", "true");
-    svg.setAttribute("fill", "none");
-    svg.setAttribute("stroke", "currentColor");
-    svg.setAttribute("stroke-width", "1.7");
-    var paths = {
-      document:"M5 2h14v20H5z M8 7h8 M8 12h8 M8 17h6",
-      arrow:"M4 12h16 M14 6l6 6-6 6",
-      start:"M7 4l13 8-13 8z",
-      stop:"M5 5h14v14H5z",
-      restart:"M20 9a8 8 0 1 0 0 6 M20 3v6h-6",
-      reapply:"M8 8l-3 4 3 4 M16 8l3 4-3 4 M14 4l-4 16",
-      power:"M12 2v10 M6 5a9 9 0 1 0 12 0",
-      confirmed:"M8 12l3 3 5-6",
-      check:"M5 12l4 4L19 6",
-      minus:"M5 12h14",
-      error:"M6 6l12 12 M18 6 6 18",
-      telegram:"M2 10 22 2l-5 20-6-7-5 3 1-7z M7 11 22 2 M11 15 22 2"
-    };
-    var path = doc.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("d", paths[kind] || paths.document);
-    if (kind === "stop") path.setAttribute("fill", "currentColor");
-    if (kind === "restart" || kind === "power") svg.setAttribute("stroke-width", "2.7");
-    if (kind === "confirmed") {
-      var circle = doc.createElementNS("http://www.w3.org/2000/svg", "circle");
-      circle.setAttribute("cx", "12"); circle.setAttribute("cy", "12"); circle.setAttribute("r", "11");
-      circle.setAttribute("fill", "currentColor"); circle.setAttribute("stroke", "none");
-      svg.appendChild(circle);
-      path.setAttribute("stroke", "var(--glass)");
-      path.setAttribute("stroke-width", "2.5");
+  /* Привязка, уже покрытая применяемым семейством, не дублируется как отдельный результат.
+     Исключения семейства остаются видимыми. */
+  function coveredBy(binding, groups) {
+    if (binding.kind && binding.kind !== "name") return null;
+    var name = normName(binding.target);
+    for (var i = 0; i < groups.length; i++) {
+      var g = groups[i];
+      var suffix = normName(g.suffix);
+      if (!g.active || (binding.transport || 6) !== g.transport || (binding.family || 4) !== g.family ||
+          (binding.shape || 0) !== g.shape ||
+          (binding.probe_path || "/") !== (g.probe_path || "/") ||
+          (binding.ech_origin || "") !== (g.ech_origin || "")) continue;
+      if (name !== suffix && name.slice(-suffix.length - 1) !== "." + suffix) continue;
+      var excepted = list(g.exceptions).some(function (ex) {
+        return normName(ex && typeof ex === "object" ? ex.name : ex) === name;
+      });
+      if (!excepted) return g;
     }
-    svg.appendChild(path);
-    return svg;
+    return null;
   }
 
-  function syncControls(current, next) {
-    if (current.nodeType === 3) {
-      if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+  /* ─── Модель: что можно честно утверждать по снимку ─── */
+
+  function model(status, received, now) {
+    var snap = (status && status.snapshot) || {};
+    var k = (status && status.knowledge) || {};
+    var linked = !!k.linked;
+    var engine = !!snap.engine_running;
+    var searches = linked ? list(k.searches) : [];
+    var QUEUED = "ожидает безопасного слота замера";
+    var active = searches.filter(function (s) { return s.phase !== "подтверждено, смотрим живой трафик"; });
+    var m = {
+      snap: snap, k: k, linked: linked, engine: engine,
+      fresh: snap.live_fresh !== false,
+      searches: searches, hunting: active.length,
+      running: searches.filter(function (s) { return s.phase !== QUEUED; }),
+      queued: searches.filter(function (s) { return s.phase === QUEUED; }),
+      groups: list(k.groups), boxes: list(k.boxes),
+      mode: str(snap.mode) || "observe"
+    };
+
+    if (!engine) {
+      m.tone = "bad"; m.lamp = "bad";
+      m.headline = ["Движок ", "остановлен"];
+      m.state = "Движок остановлен";
+      m.lede = m.snap.mode === "off"
+        ? "В конфигурации задан режим MODE=off. Трафик не читается и обходы не применяются."
+        : "Трафик не читается, подбор не идёт, сохранённые обходы не применяются. Каталог ниже — последнее сохранённое состояние.";
+    } else if (!linked) {
+      m.tone = "bad"; m.lamp = "warn";
+      m.headline = ["Нет связи ", "с датапатом"];
+      m.state = "Движок запущен, связи с датапатом нет";
+      m.lede = (k.link_note ? "Причина: " + k.link_note + ". " : "") +
+        "Идут ли поиски и применяются ли обходы, отсюда не видно. Это не «ноль поисков», а отсутствие измерения.";
+    } else if (m.hunting > 0) {
+      m.tone = "live"; m.lamp = "live";
+      m.headline = ["Идёт ", count(m.hunting, "поиск", "поиска", "поисков")];
+      m.state = "Движок работает, идёт подбор";
+      m.lede = "D2K подтвердил блокировку и сам подбирает обход в протоколе, где она встретилась. Делать ничего не нужно." +
+        (m.queued.length ? " Замеряется " + (m.hunting - m.queued.length) + ", " + m.queued.length + " " +
+          plural(m.queued.length, "ждёт", "ждут", "ждут") + " свободного слота замера." : "");
+    } else {
+      m.tone = "ok"; m.lamp = "ok";
+      m.headline = ["Поисков ", "нет"];
+      m.state = "Движок работает";
+      m.lede = "Подтверждённых блокировок без решения сейчас нет. Живой трафик под наблюдением: подбор начнётся, только если блокировка подтвердится измерением.";
+    }
+    if (engine && !m.fresh) {
+      m.lamp = "warn";
+      m.state = "Снимок движка устарел";
+    }
+    /* uptime_seconds — время работы процесса панели, а не движка. */
+    m.panelUptime = num(snap.uptime_seconds);
+    m.stateDetail = "режим: " + (MODES[m.mode] || m.mode);
+    return m;
+  }
+
+  /* ─── Движение ───
+     GSAP — локальный /assets/gsap.js. Без него (или при «уменьшить движение»)
+     панель полностью работает: состояния выставляются сразу, без переходов. */
+
+  var Motion = (function () {
+    var g = global && global.gsap;
+    var doc = global && global.document;
+    var mq = global && global.matchMedia ? global.matchMedia("(prefers-reduced-motion: reduce)") : null;
+    if (g) {
+      var plugins = [global.Flip, global.MotionPathPlugin, global.DrawSVGPlugin, global.MorphSVGPlugin,
+        global.ScrollToPlugin, global.SplitText, global.CustomEase, global.CustomWiggle].filter(Boolean);
+      if (plugins.length) g.registerPlugin.apply(g, plugins);
+      if (global.CustomEase) global.CustomEase.create("d2k", ".16,1,.3,1");
+      g.defaults({ ease: global.CustomEase ? "d2k" : "power3.out", duration: 0.5 });
+      if (global.CustomWiggle) global.CustomWiggle.create("d2kShake", { wiggles: 5, type: "easeOut" });
+      if (doc && doc.documentElement) doc.documentElement.classList.add("has-gsap");
+    }
+    function on() { return !!g && !(mq && mq.matches); }
+    /* Перестроения раскладки (Flip) при смене размера окна завершаются сразу:
+       иначе зафиксированные на время анимации размеры вылезают за новый край. */
+    var live = [];
+    function track(anim) {
+      if (anim) { live.push(anim); anim.eventCallback("onComplete", function () { live.splice(live.indexOf(anim), 1); }); }
+      return anim;
+    }
+    if (g && global.addEventListener) global.addEventListener("resize", function () {
+      live.splice(0).forEach(function (a) { a.progress(1); });
+    });
+    return { g: g, on: on, Flip: global && global.Flip, track: track };
+  })();
+
+  /* ─── DOM ─── */
+
+  var SVG = "http://www.w3.org/2000/svg";
+  var ICONS = {
+    play: "M8 5.5v13l10.5-6.5z",
+    stop: "M7 7h10v10H7z",
+    restart: "M20 11.5a8 8 0 1 1-2.3-5.6M20 4.5v5h-5",
+    reapply: "M4 7h11M4 12h16M4 17h9M17 15l3 2-3 2",
+    check: "M5 12.5l4.5 4.5L19 7.5",
+    cross: "M6.5 6.5l11 11M17.5 6.5l-11 11",
+    dash: "M6 12h12",
+    send: "M21 3 3 10.5l7 2.5 2.5 7zM10 13l5-5"
+  };
+
+  function el(doc, tag, cls, text) {
+    var n = doc.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  }
+  function add(parent) {
+    for (var i = 1; i < arguments.length; i++) {
+      var c = arguments[i];
+      if (c === null || c === undefined || c === false) continue;
+      parent.appendChild(typeof c === "string" ? parent.ownerDocument.createTextNode(c) : c);
+    }
+    return parent;
+  }
+  function icon(doc, name) {
+    var s = doc.createElementNS(SVG, "svg");
+    s.setAttribute("viewBox", "0 0 24 24");
+    s.setAttribute("aria-hidden", "true");
+    var p = doc.createElementNS(SVG, "path");
+    p.setAttribute("d", ICONS[name]);
+    s.appendChild(p);
+    return s;
+  }
+  function tag(doc, text, tone) {
+    var t = el(doc, "span", "tag", text);
+    if (tone) t.setAttribute("data-tone", tone);
+    return t;
+  }
+
+  /* Раздел перерисовывается, только если изменились его данные: так не теряются
+     раскрытые подробности, фокус и выделение текста. */
+  function section(node, key, build) {
+    if (node.__d2kKey === key) return false;
+    var open = {};
+    var nodes = node.querySelectorAll("details[data-key]");
+    for (var i = 0; i < nodes.length; i++) if (nodes[i].open) open[nodes[i].getAttribute("data-key")] = true;
+    var fresh = build();
+    if (Motion.g) {
+      /* Анимации уходящих узлов не должны доживать после перерисовки. */
+      var gone = node.querySelectorAll("[style]");
+      if (gone.length) Motion.g.killTweensOf(gone);
+      var tls = node.querySelectorAll(".crate");
+      for (var ti = 0; ti < tls.length; ti++) if (tls[ti].__tl) tls[ti].__tl.kill();
+    }
+    node.replaceChildren.apply(node, fresh);
+    var again = node.querySelectorAll("details[data-key]");
+    for (var j = 0; j < again.length; j++) if (open[again[j].getAttribute("data-key")]) again[j].open = true;
+    node.__d2kKey = key;
+    return true;
+  }
+
+  function App(doc, win) {
+    this.doc = doc;
+    this.win = win;
+    this.status = null;
+    this.received = 0;
+    this.lastOk = 0;
+    this.failed = false;
+    this.pending = null;
+    this.armed = null;
+    this.filter = "";
+    this.flash = null;
+    this.$ = function (id) { return doc.getElementById(id); };
+  }
+
+  App.prototype.start = function () {
+    var self = this, doc = this.doc, win = this.win;
+    var input = this.$("filter");
+    input.addEventListener("input", function () {
+      self.filter = input.value.trim().toLowerCase();
+      var flip = Motion.on() && Motion.Flip;
+      var state = flip ? Motion.Flip.getState(".ftag-wrap, .crate") : null;
+      self.renderCatalog(true);
+      if (state) {
+        /* Оставшиеся бирки и коробки съезжаются; появившиеся проявляются. */
+        Motion.track(Motion.Flip.from(state, {
+          targets: doc.querySelectorAll(".ftag-wrap, .crate"),
+          duration: 0.5, ease: "power3.inOut", absolute: false, nested: true, scale: true, simple: true,
+          onEnter: function (els) { return Motion.g.fromTo(els, { autoAlpha: 0, scale: 0.94 }, { autoAlpha: 1, scale: 1, duration: 0.4, clearProps: "transform,opacity,visibility" }); }
+        }));
+      }
+    });
+    doc.addEventListener("visibilitychange", function () { if (!doc.hidden) self.poll(); });
+    doc.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && self.armed) { self.armed = null; self.renderActions(); }
+      if (e.key === "/" && doc.activeElement && doc.activeElement.tagName !== "INPUT") {
+        e.preventDefault(); input.focus();
+      }
+    });
+    this.spy();
+    this.navMotion();
+    this.drawMark();
+    this.poll();
+    win.setInterval(function () { if (!doc.hidden) self.poll(); }, POLL_MS);
+    win.setInterval(function () { self.tick(); }, 1000);
+  };
+
+  App.prototype.poll = function () {
+    var self = this;
+    if (this.inflight) return;
+    this.inflight = true;
+    var ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    var timer = this.win.setTimeout(function () { if (ctrl) ctrl.abort(); }, 5000);
+    this.win.fetch("/api/status", { cache: "no-store", signal: ctrl ? ctrl.signal : undefined })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (data) {
+        self.status = data;
+        self.received = Date.now();
+        self.lastOk = self.received;
+        self.failed = false;
+        self.render();
+      })
+      .catch(function () {
+        self.failed = true;
+        self.renderNotice();
+      })
+      .then(function () { self.win.clearTimeout(timer); self.inflight = false; });
+  };
+
+  App.prototype.serverNow = function () {
+    var taken = this.status && parseTime(this.status.snapshot && this.status.snapshot.taken);
+    return taken ? taken + (Date.now() - this.received) : Date.now();
+  };
+
+  var CONTROL_RESULT = {
+    done: { tone: "ok", text: "Команда службы выполнена." },
+    failed: { tone: "bad", text: "Команда службы завершилась ошибкой." },
+    timeout: { tone: "bad", text: "Команда службы не завершилась вовремя и была прервана." }
+  };
+
+  App.prototype.render = function () {
+    var m = model(this.status, this.received, Date.now());
+    var cs = str(m.snap.control_state);
+    if (this.lastControl === "running" && CONTROL_RESULT[cs]) {
+      this.flash = { tone: CONTROL_RESULT[cs].tone, text: CONTROL_RESULT[cs].text, what: this.lastAction || "", at: Date.now() };
+    }
+    this.lastControl = cs;
+    this.m = m;
+    this.renderMast(m);
+    this.renderNotice();
+    this.renderNow(m);
+    this.renderCatalog(false);
+    this.renderTelegram(m);
+    this.renderDiagnostics(m);
+    this.renderNav(m);
+    if (!this.arrived) {
+      this.arrived = true;
+      if (Motion.on()) {
+        var d = this.doc;
+        var rows = [].slice.call(d.querySelectorAll("#searches > li")).slice(0, 4);
+        Motion.g.timeline({ defaults: { ease: "power4.out", clearProps: "transform,opacity,visibility" } })
+          .from("#now-title", { y: 36, autoAlpha: 0, duration: 0.7 })
+          .from("#now-lede", { y: 16, autoAlpha: 0, duration: 0.55 }, "-=0.5")
+          .from(".slot-cell", { scale: 0.3, autoAlpha: 0, duration: 0.4, stagger: 0.05, ease: "back.out(2.4)" }, "-=0.4")
+          .from(rows, { y: 24, autoAlpha: 0, duration: 0.6, stagger: 0.08 }, "-=0.35");
+      }
+    }
+  };
+
+  /* ─── Мачта ─── */
+
+  App.prototype.renderMast = function (m) {
+    var doc = this.doc;
+    var host = this.$("host");
+    host.textContent = str(m.snap.panel_listen);
+    var state = this.$("engine-state");
+    var lamp = state.querySelector(".lamp");
+    lamp.setAttribute("data-tone", m.lamp);
+    var text = state.querySelector(".mast-state-text");
+    /* Живой регион трогаем только при смене текста: иначе диктор повторяет его на каждом опросе. */
+    var stateKey = m.state + "|" + m.stateDetail;
+    if (text.__d2kKey !== stateKey) {
+      text.__d2kKey = stateKey;
+      text.replaceChildren(doc.createTextNode(m.state), el(doc, "small", "", m.stateDetail));
+    }
+    doc.title = (m.hunting ? "● " : "") + "D2K — " + m.state;
+    this.renderActions();
+  };
+
+  App.prototype.renderActions = function () {
+    var self = this, doc = this.doc, m = this.m;
+    var box = this.$("engine-actions");
+    if (!m) return;
+    var snap = m.snap;
+    var busy = snap.control_state === "running" || !!this.pending;
+    var key = JSON.stringify([snap.controls_enabled, m.engine, busy, this.pending, this.armed, snap.mode]);
+    if (box.__d2kKey === key) return;
+    box.__d2kKey = key;
+    var focused = doc.activeElement && box.contains(doc.activeElement) ? doc.activeElement.getAttribute("data-control") : null;
+    var buttons = [];
+    if (!snap.controls_enabled) {
+      buttons.push(el(doc, "span", "tag", "Управление отключено в конфигурации"));
+    } else {
+      if (m.engine) {
+        if (this.armed === "stop") {
+          buttons.push(this.button("stop", "Остановить движок?", "stop", "confirm", busy));
+          buttons.push(this.button("cancel", "Отмена", null, "ghost", false));
+        } else {
+          buttons.push(this.button("reapply", "Восстановить правила", "reapply", "ghost", busy, "Правила"));
+          buttons.push(this.button("restart", "Перезапустить", "restart", null, busy));
+          buttons.push(this.button("stop", "Остановить", "stop", "danger", busy));
+        }
+      } else {
+        buttons.push(this.button("start", "Запустить движок", "play", "primary", busy || snap.mode === "off"));
+      }
+    }
+    var flipState = Motion.on() && Motion.Flip && box.children.length ? Motion.Flip.getState(box.children) : null;
+    var oldIcons = {};
+    for (var oi = 0; oi < box.children.length; oi++) {
+      var op = box.children[oi].querySelector && box.children[oi].querySelector("svg path");
+      if (op) oldIcons[box.children[oi].getAttribute("data-flip-id")] = op.getAttribute("d");
+    }
+    box.replaceChildren.apply(box, buttons);
+    if (flipState) {
+      /* Кнопки перетекают: «Остановить» ↔ «Остановить движок?», «стоп» ↔ «запуск». */
+      Motion.track(Motion.Flip.from(flipState, {
+        targets: box.children, duration: 0.45, ease: "power3.inOut", scale: false, simple: true,
+        onEnter: function (els) { return Motion.g.fromTo(els, { autoAlpha: 0, scale: 0.85 }, { autoAlpha: 1, scale: 1, duration: 0.35, clearProps: "transform,opacity,visibility" }); }
+      }));
+      if (global.MorphSVGPlugin) {
+        for (var ni = 0; ni < box.children.length; ni++) {
+          var np = box.children[ni].querySelector && box.children[ni].querySelector("svg path");
+          var was = oldIcons[box.children[ni].getAttribute("data-flip-id")];
+          if (np && was && was !== np.getAttribute("d")) Motion.g.from(np, { morphSVG: was, duration: 0.5, ease: "power2.inOut" });
+        }
+      }
+    }
+    if (focused) {
+      var again = box.querySelector('[data-control="' + focused + '"]') || box.querySelector("button");
+      if (again) again.focus();
+    }
+    void self;
+  };
+
+  App.prototype.button = function (action, label, iconName, variant, disabled, shortLabel) {
+    var self = this, doc = this.doc;
+    var b = el(doc, "button", "btn");
+    b.type = "button";
+    b.setAttribute("data-control", action);
+    b.setAttribute("data-flip-id", action === "start" || action === "stop" ? "power" : action);
+    if (variant) b.setAttribute("data-variant", variant);
+    if (this.pending === action) b.setAttribute("data-busy", "true");
+    if (iconName) add(b, icon(doc, this.pending === action ? "restart" : iconName));
+    if (shortLabel) {
+      add(b, el(doc, "span", "btn-label-long", label));
+      b.setAttribute("aria-label", label);
+    } else {
+      add(b, el(doc, "span", "", label));
+    }
+    b.setAttribute("aria-label", label);
+    b.title = label;
+    if (disabled) b.disabled = true;
+    b.addEventListener("click", function () { self.act(action); });
+    return b;
+  };
+
+  var ENDPOINTS = {
+    start: "start", stop: "stop", restart: "restart", reapply: "reapply",
+    "telegram-enable": "telegram-enable", "telegram-disable": "telegram-disable"
+  };
+
+  /* Неудавшаяся команда — короткое покачивание её кнопки рядом с текстом ошибки. */
+  App.prototype.shake = function (action) {
+    if (!Motion.on()) return;
+    var b = this.doc.querySelector('[data-control="' + action + '"]');
+    if (b) Motion.g.fromTo(b, { x: 0 }, { x: 7, duration: 0.6, ease: global.CustomWiggle ? "d2kShake" : "power1.inOut", clearProps: "transform" });
+  };
+
+  App.prototype.act = function (action) {
+    var self = this;
+    if (action === "cancel") { this.armed = null; this.renderActions(); return; }
+    if (action === "stop" && this.armed !== "stop") {
+      this.armed = "stop";
+      this.renderActions();
+      this.win.setTimeout(function () { if (self.armed === "stop") { self.armed = null; self.renderActions(); } }, 6000);
       return;
     }
-    Array.prototype.slice.call(current.attributes).forEach(function (attribute) {
-      if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
-    });
-    Array.prototype.forEach.call(next.attributes, function (attribute) {
-      if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
-    });
-    Array.prototype.forEach.call(next.childNodes, function (child, index) {
-      var existing = current.childNodes[index];
-      if (!existing) current.appendChild(child.cloneNode(true));
-      else if (existing.nodeType !== child.nodeType || existing.nodeName !== child.nodeName) {
-        current.replaceChild(child.cloneNode(true), existing);
-      } else syncControls(existing, child);
-    });
-    while (current.childNodes.length > next.childNodes.length) current.lastChild.remove();
-  }
-
-  function clearContent(rootNode) {
-    var controls = rootNode.querySelector && rootNode.querySelector("#controls");
-    if (!controls) { rootNode.replaceChildren(); return null; }
-    Array.prototype.slice.call(rootNode.childNodes).forEach(function (child) {
-      if (child !== controls) child.remove();
-    });
-    return controls;
-  }
-
-  function setAttr(element, name, value) {
-    element.setAttribute(name, String(value));
-    return element;
-  }
-
-  function heading(doc, parent, level, text) {
-    return append(parent, node(doc, "h" + level, text));
-  }
-
-  function section(doc, parent, id, title, note) {
-    var out = append(parent, node(doc, "section", undefined, "section-block"));
-    setAttr(out, "id", id);
-    var head = append(out, node(doc, "div", undefined, "section-heading"));
-    heading(doc, head, 2, title);
-    if (note) append(head, node(doc, "p", note, "section-note"));
-    return out;
-  }
-
-  function russianCount(value, one, few, many) {
-    var n = Math.abs(Number(value) || 0);
-    var last = n % 10, lastTwo = n % 100;
-    return n + " " + (last === 1 && lastTwo !== 11 ? one :
-      last >= 2 && last <= 4 && (lastTwo < 12 || lastTwo > 14) ? few : many);
-  }
-
-  function protocolName(proto) {
-    return ({ tls12: "TLS 1.2", tls13: "TLS 1.3", tls: "TLS", quic: "QUIC", stun: "STUN" })[proto] || proto || "Сетевой план";
-  }
-
-  function modeName(mode) {
-    return ({ off: "Подбор выключен", observe: "Только наблюдение", apply: "Автоматический подбор" })[mode] || "режим не определён";
-  }
-
-  function searchPhase(phase) {
-    var names = {
-      "ждём форму приветствия": "Изучаем особенности соединения",
-      "распознаём поведение": "Изучаем соединение",
-      "спрашиваем коробку о свойствах": "Сравниваем с похожими блокировками",
-      "выводим планы": "Подбираем вариант обхода",
-      "проверяем готовое узнанной коробки": "Проверяем найденный ранее обход",
-      "проверяем выведенный план": "Проверяем обход",
-      "подтверждено, смотрим живой трафик": "Подтверждено",
-      "цель отдыхает после неудачи": "Повторная проверка будет позже",
-      "измеряем живой голосовой поток": "Проверяем качество звонка",
-      "приём голоса стоит, ждём разговора": "Ждём начала звонка",
-      "приём применился к разговору, ждём ответа сервера": "Проверяем связь во время звонка"
-    };
-    return names[phase] || "Проверяем обход";
-  }
-
-  function safeDate(value) {
-    if (!value) return "время не записано";
-    var date = new Date(value);
-    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("ru-RU", {
-      day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit"
-    });
-  }
-
-  function metric(doc, parent, number, label, tone) {
-    var item = append(parent, node(doc, "div", undefined, "metric" + (tone ? " " + tone : "")));
-    append(item, node(doc, "span", number, "metric-value"));
-    append(item, node(doc, "span", label, "metric-label"));
-    return item;
-  }
-
-  function updateChrome(doc, knowledge, snapshot) {
-    if (!doc.getElementById) return;
-    var linked = !!(knowledge && knowledge.linked) && !(snapshot && snapshot.live_fresh === false) &&
-      !(snapshot && snapshot.engine_running === false) &&
-      !(snapshot && snapshot.controller_running === false);
-    var rail = doc.getElementById("rail-state");
-    var updated = doc.getElementById("rail-updated");
-    var indicator = doc.getElementById("live-indicator");
-    if (rail) {
-      rail.textContent = linked ? "D2K на связи" : "D2K не на связи";
-      rail.setAttribute("data-connected", linked ? "true" : "false");
-    }
-    if (updated) updated.textContent = linked ? "обновлено " + safeDate(snapshot && snapshot.taken) : "нет свежих данных";
-    if (indicator) {
-      indicator.setAttribute("data-state", linked ? "connected" : "disconnected");
-      var text = indicator.querySelector && indicator.querySelector("span");
-      if (text) text.textContent = linked ? "Обновляется автоматически" : "Связь потеряна";
-    }
-  }
-
-  function render(rootNode, payload, doc) {
-    doc = doc || root.document;
-    var active = doc.activeElement && rootNode.contains && rootNode.contains(doc.activeElement)
-      ? doc.activeElement : null;
-    var focusedId = active ? active.id : "";
-    var focusedKey = active && active.getAttribute ? active.getAttribute("data-ui-key") : null;
-    var selectionStart = focusedId === "box-filter" ? active.selectionStart : null;
-    var selectionEnd = focusedId === "box-filter" ? active.selectionEnd : null;
-    var openDetails = Object.create(null);
-    if (rootNode.querySelectorAll) {
-      Array.prototype.forEach.call(rootNode.querySelectorAll("details[data-ui-key]"), function (item) {
-        if (item.open) openDetails[item.getAttribute("data-ui-key")] = true;
-      });
-    }
-    var snapshot = payload && payload.snapshot ? payload.snapshot : {};
-    var serverControlBusy = snapshot.control_state === "running";
-    if (snapshot.control_state && snapshot.control_state !== "idle") {
-      controlMessage = ({ running: "Выполняется команда службы…", done: "Команда выполнена.",
-        failed: "Команда завершилась ошибкой. Проверьте журнал панели.",
-        timeout: "Команда не завершилась вовремя и остановлена. Проверьте состояние служб." })[snapshot.control_state] || controlMessage;
-    }
-    var knowledge = payload && payload.knowledge ? payload.knowledge : {};
-    var linked = !!knowledge.linked && snapshot.live_fresh !== false &&
-      snapshot.engine_running !== false && snapshot.controller_running !== false;
-    var linkNote = snapshot.engine_running === false
-      ? "D2K остановлен. Всё, что он уже запомнил, осталось сохранено."
-      : (snapshot.controller_running === false
-        ? "Служба подбора не запущена. Сохранённые результаты на месте."
-        : (snapshot.live_fresh === false
-        ? "Давно не было свежих данных. Сохранённые результаты на месте."
-        : "Нет связи с D2K. Проверьте, включён ли он на роутере."));
-    var stages = Array.isArray(snapshot.stages) ? snapshot.stages : [];
-    var boxes = Array.isArray(knowledge.boxes) ? knowledge.boxes : [];
-    var searches = Array.isArray(knowledge.searches) ? knowledge.searches : [];
-    var groups = Array.isArray(knowledge.groups) ? knowledge.groups.filter(function (g) {
-      return g && typeof g.suffix === "string" && g.suffix;
-    }) : [];
-    var stableControls = clearContent(rootNode);
-
-    var title = append(rootNode, node(doc, "header", undefined, "page-heading"));
-    var titleCopy = append(title, node(doc, "div"));
-    heading(doc, titleCopy, 1, "Замер. План. Результат.");
-    append(titleCopy, node(doc, "p", "Автоматический подбор рабочих решений для доступа к нужным сайтам.", "page-intro"));
-    append(title, node(doc, "span", (snapshot.preview ? "Демонстрационные данные · " : "Обновлено ") + safeDate(snapshot.taken), "updated-at"));
-
-    var hero = append(rootNode, node(doc, "section", undefined, "hero" + (linked ? " connected" : " disconnected")));
-    setAttr(hero, "id", "overview");
-    var heroCopy = append(hero, node(doc, "div", undefined, "hero-copy"));
-    var state = append(heroCopy, node(doc, "span", undefined, "state-label"));
-    append(state, node(doc, "i", undefined, "state-dot"));
-    append(state, node(doc, "span", linked ? "D2K на связи" : "D2K не на связи"));
-    heading(doc, heroCopy, 2, linked ? "D2K подключён" : "D2K пока не подключён");
-    append(heroCopy, node(doc, "p", linked
-      ? (snapshot.mode === "apply"
-        ? "Если что-то заблокировано, D2K подберёт обход и запомнит его."
-        : (snapshot.mode === "observe"
-          ? "Сейчас D2K только наблюдает. Для подбора обходов включите автоматический режим."
-          : "Подбор выключен. Ранее найденные обходы остаются сохранёнными."))
-      : linkNote, "hero-description"));
-    var heroFoot = append(heroCopy, node(doc, "div", undefined, "hero-foot"));
-    append(heroFoot, node(doc, "span", modeName(snapshot.mode), "mode-tag"));
-    append(heroFoot, node(doc, "span", "Обновляется каждые 5 секунд", "poll-note"));
-
-    var metrics = append(rootNode, node(doc, "div", undefined, "metrics"));
-    metric(doc, metrics, snapshot.catalog_available === false ? "—" : russianCount(knowledge.targets, "результат", "результата", "результатов"),
-      snapshot.catalog_available === false ? "результаты недоступны" : "сохранено на роутере", "metric-blue");
-    metric(doc, metrics, linked
-      ? russianCount(knowledge.confirms, "подтверждение", "подтверждения", "подтверждений") : "—",
-      linked ? "обходы проверены" : "нет свежих данных", "metric-mint");
-    metric(doc, metrics, linked
-      ? russianCount(searches.length, "поиск", "поиска", "поисков") : "—",
-      linked ? "D2K проверяет сейчас" : "статус неизвестен", searches.length && linked ? "metric-amber" : "");
-    metric(doc, metrics, snapshot.catalog_available === false ? "—" : String(boxes.length),
-      snapshot.catalog_available === false ? "результаты недоступны" : "типов блокировки", "");
-    append(rootNode, node(doc, "p", snapshot.catalog_available === false
-      ? "Сохранённые результаты пока недоступны. Это не значит, что D2K ничего не находил."
-      : "Найденное хранится на роутере и используется повторно.", "metric-footnote"));
-
-    var searchSection = section(doc, rootNode, "searches", "Подбор сейчас",
-      "Здесь видны сайты, которые D2K проверяет в эту минуту.");
-    var rackCaption = append(searchSection, node(doc, "aside", undefined, "rack-caption"));
-    heading(doc, rackCaption, 2, "Одним подбором больше свободы");
-    append(rackCaption, node(doc, "p", "Реальные замеры. Найденные решения. Автоматическое применение."));
-    if (!linked) {
-      append(searchSection, node(doc, "p", "Не могу проверить, идёт ли сейчас подбор: D2K не на связи.", "empty-state empty-warning"));
-    } else if (!searches.length) {
-      var calm = append(searchSection, node(doc, "div", undefined, "empty-state"));
-      append(calm, node(doc, "span", "○", "empty-mark"));
-      var calmCopy = append(calm, node(doc, "div"));
-      heading(doc, calmCopy, 3, "Сейчас всё спокойно");
-      append(calmCopy, node(doc, "p", "Когда D2K заметит блокировку, проверка появится здесь автоматически."));
-    } else {
-      var list = append(searchSection, node(doc, "div", undefined, "search-list"));
-      searches.forEach(function (search) { renderSearch(doc, list, search); });
-      if (searches.length > 1) {
-        var pager = append(searchSection, node(doc, "div", undefined, "slide-pager"));
-        [["-1","Предыдущий"],["1","Следующий"]].forEach(function (entry) {
-          var button = append(pager, node(doc, "button"));
-          append(button, icon(doc, "arrow"));
-          setAttr(button, "type", "button");
-          setAttr(button, "aria-label", entry[1] + " подбор");
-          setAttr(button, "title", entry[1] + " подбор");
-          setAttr(button, "data-slide-step", entry[0]);
-          setAttr(button, "data-ui-key", "slide-step:" + entry[0]);
+    this.armed = null;
+    if (!ENDPOINTS[action] || this.pending) return;
+    this.pending = action;
+    this.renderActions();
+    this.renderTelegram(this.m, true);
+    this.win.fetch("/api/control/" + ENDPOINTS[action], { method: "POST", cache: "no-store" })
+      .then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (body) {
+          if (body.action) self.lastAction = str(body.action);
+          if (!r.ok) self.shake(action);
+          self.flash = {
+            tone: r.ok ? "info" : "bad",
+            text: str(body.message) || (r.ok ? "Команда принята" : "Команда не выполнена (HTTP " + r.status + ")"),
+            what: str(body.action),
+            at: Date.now()
+          };
         });
-      }
-    }
-
-    if (groups.length) {
-      var families = section(doc, rootNode, "families", "Сохранённые семейства",
-        "Новые адреса используют найденное решение");
-      var familyList = append(families, node(doc, "div", undefined, "family-list"));
-      groups.forEach(function (group, index) {
-        renderFamily(doc, familyList, group, linked, index);
+      })
+      .catch(function () {
+        self.shake(action);
+        self.flash = { tone: "bad", text: "Панель не ответила на команду. Состояние ниже — последнее полученное.", at: Date.now() };
+      })
+      .then(function () {
+        self.pending = null;
+        self.renderNotice();
+        self.poll();
+        self.win.setTimeout(function () { self.poll(); }, 800);
       });
+  };
+
+  /* ─── Уведомление ─── */
+
+  App.prototype.renderNotice = function () {
+    var doc = this.doc, n = this.$("notice");
+    var parts = null, tone = null;
+    var now = Date.now();
+    var stale = this.lastOk && now - this.lastOk > STALE_MS;
+    doc.body.setAttribute("data-stale", String(!!(this.failed && (stale || !this.lastOk))));
+    if (this.failed && !this.lastOk) {
+      tone = "bad"; parts = [el(doc, "b", "", "Панель не получает состояние."), " Повторяем запрос каждые две секунды."];
+    } else if (this.failed && stale) {
+      tone = "bad";
+      parts = [el(doc, "b", "", "Нет ответа от панели."), " Показан снимок, полученный " + ago(now - this.lastOk) + "."];
+    } else if (this.m && this.m.snap.control_state === "running" && !(this.flash && now - this.flash.at < 1500)) {
+      tone = "info"; parts = [el(doc, "b", "", "Выполняется команда службы."), " Управление станет доступно, когда она завершится."];
+    } else if (this.flash && now - this.flash.at < 8000) {
+      tone = this.flash.tone;
+      parts = [this.flash.what ? el(doc, "b", "", this.flash.what + ".") : null, " " + this.flash.text];
+    } else if (this.m && this.m.snap.preview) {
+      tone = "info"; parts = [el(doc, "b", "", "Демонстрационные данные."), " Это локальный стенд, а не роутер."];
+    } else if (this.m && this.m.engine && !this.m.fresh) {
+      tone = "warn"; parts = [el(doc, "b", "", "Снимок движка устарел."), " Движок давно не обновлял состояние; цифры ниже могут быть не текущими."];
     }
-    var boxSection = section(doc, rootNode, "boxes", "Изученные коробки",
-      "Рабочие обходы сохраняются и повторно проверяются для похожих блокировок.");
-    var boxToolbar = append(boxSection, node(doc, "div", undefined, "box-toolbar"));
-    var filterLabel = append(boxToolbar, node(doc, "label", "Найти сайт или результат", "filter-label"));
-    var filter = append(filterLabel, node(doc, "input", undefined, "box-filter"));
-    filter.setAttribute("id", "box-filter");
-    filter.setAttribute("type", "search");
-    filter.setAttribute("placeholder", "Например, youtube.com");
-    filter.setAttribute("autocomplete", "off");
-    filter.setAttribute("aria-label", "Поиск по сайту или типу блокировки");
-    filter.value = currentFilter;
-    append(boxToolbar, node(doc, "span", snapshot.catalog_available === false
-      ? "результаты недоступны" : russianCount(boxes.length, "тип блокировки", "типа блокировки", "типов блокировки"), "box-total"));
-    if (!boxes.length) {
-      append(boxSection, node(doc, "p", snapshot.catalog_available === false
-        ? "Сохранённые результаты сейчас недоступны."
-        : groups.length ? "Обходы объединены в семейства выше. Точные решения вне семейств появятся здесь."
-        : "Пока нет сохранённых обходов. D2K добавит результат, когда проверит, что он работает.",
-        snapshot.catalog_available === false ? "empty-state empty-warning" : "empty-state"));
-    } else {
-      var boxList = append(boxSection, node(doc, "div", undefined, "box-list"));
-      boxes.forEach(function (box, index) { renderBox(doc, boxList, box, index, groups); });
-      filterBoxes(rootNode, currentFilter);
-      if (rootNode.addEventListener && !rootNode.__d2kFilterBound) {
-        rootNode.__d2kFilterBound = true;
-        rootNode.addEventListener("input", function (event) {
-          if (!event.target || event.target.id !== "box-filter") return;
-          currentFilter = event.target.value;
-          filterBoxes(rootNode, event.target.value);
-        });
-      }
-      if (rootNode.addEventListener && !rootNode.__d2kCopyBound) {
-        rootNode.__d2kCopyBound = true;
-        rootNode.addEventListener("click", function (event) {
-          var button = event.target && event.target.closest ? event.target.closest("[data-copy]") : null;
-          if (!button) return;
-          var value = button.getAttribute("data-copy");
-          copyValue(doc, value).then(function (ok) {
-            if (!ok) return;
-            var old = button.textContent;
-            button.textContent = "Скопировано";
-            root.setTimeout(function () { button.textContent = old; }, 1400);
+    if (!parts) {
+      if (n.hidden || n.__closing) return;
+      if (Motion.on()) {
+        n.__closing = true;
+        Motion.g.to(n, { height: 0, paddingTop: 0, paddingBottom: 0, autoAlpha: 0, duration: 0.3, ease: "power2.in", onComplete: function () {
+          n.__closing = false; n.hidden = true; n.replaceChildren(); Motion.g.set(n, { clearProps: "all" });
+        } });
+      } else { n.hidden = true; n.replaceChildren(); }
+      return;
+    }
+    var key = tone + "|" + parts.map(function (x) { return x && x.textContent !== undefined ? x.textContent : String(x); }).join("");
+    if (key === n.__d2kKey && !n.hidden && !n.__closing) return;
+    n.__d2kKey = key;
+    var appearing = n.hidden || n.__closing;
+    if (n.__closing) { Motion.g.killTweensOf(n); n.__closing = false; Motion.g.set(n, { clearProps: "all" }); }
+    n.hidden = false;
+    n.setAttribute("data-tone", tone);
+    n.replaceChildren();
+    add.apply(null, [n].concat(parts));
+    if (appearing && Motion.on()) Motion.g.from(n, { height: 0, paddingTop: 0, paddingBottom: 0, autoAlpha: 0, duration: 0.4, clearProps: "all" });
+  };
+
+  /* ─── Сейчас ─── */
+
+  App.prototype.renderNow = function (m) {
+    var doc = this.doc;
+    var title = this.$("now-title");
+    var h = JSON.stringify(m.headline);
+    if (title.__d2kKey !== h) {
+      var prev = title.__d2kHeadline;
+      title.__d2kKey = h;
+      title.__d2kHeadline = m.headline;
+      var apply = function () { title.replaceChildren(doc.createTextNode(m.headline[0]), el(doc, "em", "", m.headline[1])); };
+      var from = prev && /^(\d+) /.exec(prev[1]), to = /^(\d+) /.exec(m.headline[1]);
+      if (!prev || !Motion.on()) {
+        apply();
+      } else if (from && to && prev[0] === m.headline[0]) {
+        /* Тот же заголовок, другое число: число прокручивается. */
+        apply();
+        var em = title.lastChild, n = { v: +from[1] };
+        Motion.g.to(n, { v: +to[1], duration: 0.6, ease: "power2.out", onUpdate: function () {
+          var v = Math.round(n.v);
+          em.textContent = count(v, "поиск", "поиска", "поисков");
+        } });
+        Motion.g.fromTo(em, { y: -6 }, { y: 0, duration: 0.5, ease: "back.out(3)" });
+      } else {
+        /* Новая фраза собирается по буквам; разбиение снимается по окончании. */
+        Motion.g.timeline()
+          .to(title, { y: -14, autoAlpha: 0, duration: 0.18, ease: "power2.in" })
+          .add(function () {
+            apply();
+            Motion.g.set(title, { y: 0, autoAlpha: 1 });
+            if (!global.SplitText) { Motion.g.from(title, { y: 22, autoAlpha: 0, duration: 0.5, clearProps: "all" }); return; }
+            var split = new global.SplitText(title, { type: "words,chars" });
+            Motion.g.from(split.chars, { yPercent: 70, autoAlpha: 0, rotation: 4, duration: 0.55, stagger: 0.018, ease: "power4.out",
+              onComplete: function () { split.revert(); Motion.g.set(title, { clearProps: "all" }); } });
           });
-        });
       }
     }
+    title.setAttribute("data-tone", m.tone);
+    this.$("now-lede").textContent = m.lede;
 
-    var diagnostics = append(rootNode, node(doc, "details", undefined, "diagnostics"));
-    setAttr(diagnostics, "id", "diagnostics");
-    setAttr(diagnostics, "data-ui-key", "diagnostics");
-    append(diagnostics, node(doc, "summary", "Технические сведения для диагностики"));
-    var system = section(doc, diagnostics, "system", "Как устроена работа D2K",
-      "Сведения о подключении, настройках и доступных измерениях.");
-    var stageList = append(system, node(doc, "div", undefined, "stage-list"));
-    stages.forEach(function (stage) {
-      var row = append(stageList, node(doc, "article", undefined, "stage-row" + (stage.built ? " stage-present" : " stage-absent")));
-      var stageIcon = append(row, icon(doc, stage.built ? "check" : "minus"));
-      stageIcon.setAttribute("class", "ui-icon stage-icon");
-      var text = append(row, node(doc, "div", undefined, "stage-copy"));
-      heading(doc, text, 3, stage.title || "Звено обработки");
-      append(text, node(doc, "p", stage.detail || "Сведения отсутствуют."));
-      append(row, node(doc, "span", stage.built ? "доступно" : "не подтверждено", "stage-state"));
+    var slots = this.$("slots");
+    var meas = m.k.measurements;
+    var wasActive = slots.__d2kActive;
+    var rebuilt = section(slots, JSON.stringify([m.linked, meas, m.k.targets, m.k.confirms, m.k.probes_used, m.k.client_unfit, m.groups.length, m.boxes.length]), function () {
+      var out = [];
+      if (m.linked && meas && num(meas.limit)) {
+        var row = el(doc, "div", "slot-row");
+        var cells = el(doc, "div", "slot-cells");
+        cells.setAttribute("aria-hidden", "true");
+        for (var i = 0; i < Math.min(meas.limit, 16); i++) {
+          var c = el(doc, "span", "slot-cell");
+          c.setAttribute("data-on", String(i < (meas.active || 0)));
+          cells.appendChild(c);
+        }
+        add(row, cells, el(doc, "span", "",
+          "Замеры: " + (meas.active || 0) + " из " + meas.limit +
+          (meas.queued ? ", в очереди " + meas.queued : "")));
+        out.push(row);
+        if (num(meas.free_pct) !== null) {
+          out.push(el(doc, "span", "", "Свободно процессора " + meas.free_pct + "%" +
+            (num(meas.cores) ? " на " + count(meas.cores, "ядре", "ядрах", "ядрах") : "")));
+        }
+      }
+      if (m.linked) {
+        var facts = el(doc, "span", "");
+        add(facts,
+          el(doc, "b", "", String(num(m.k.confirms) || 0)), " " + plural(num(m.k.confirms) || 0, "подтверждение", "подтверждения", "подтверждений") + ", ",
+          el(doc, "b", "", String(num(m.k.probes_used) || 0)), " " + plural(num(m.k.probes_used) || 0, "зонд", "зонда", "зондов") + " за работу движка");
+        out.push(facts);
+        if (num(m.k.client_unfit)) {
+          var unfit = el(doc, "span", "");
+          add(unfit, tag(doc, "план не подошёл клиенту: " + m.k.client_unfit, "warn"));
+          out.push(unfit);
+        }
+      }
+      return out;
     });
-    var facts = append(system, node(doc, "dl", undefined, "system-facts"));
-    [
-      ["Режим", snapshot.mode || "неизвестен"], ["Версия", snapshot.version || "неизвестна"],
-      ["Коммит", snapshot.commit ? String(snapshot.commit).slice(0, 12) : "неизвестен"],
-      ["Конфигурация", snapshot.config_path || "неизвестна"], ["Очередь", snapshot.queue_num === undefined ? "неизвестна" : snapshot.queue_num],
-      ["Панель", snapshot.panel_listen || "неизвестна"], ["Каталог состояния", snapshot.state_dir || "неизвестен"],
-      ["Состояние каталога", snapshot.state_dir_note || "неизвестно"]
-    ].forEach(function (pair) {
-      append(facts, node(doc, "dt", pair[0]));
-      append(facts, node(doc, "dd", pair[1]));
+    var nowActive = meas && num(meas.active) !== null ? meas.active : null;
+    if (rebuilt && Motion.on() && wasActive !== undefined && nowActive !== null && nowActive !== wasActive) {
+      var cellsNow = slots.querySelectorAll(".slot-cell");
+      var lit = [], dim = [];
+      for (var ci = 0; ci < cellsNow.length; ci++) {
+        if (ci >= Math.min(wasActive || 0, nowActive) && ci < Math.max(wasActive || 0, nowActive)) (ci < nowActive ? lit : dim).push(cellsNow[ci]);
+      }
+      if (lit.length) Motion.g.from(lit, { scale: 0.2, autoAlpha: 0, duration: 0.45, stagger: 0.07, ease: "back.out(2.4)", clearProps: "all" });
+      if (dim.length) {
+        var sig = global.getComputedStyle(doc.documentElement).getPropertyValue("--signal").trim();
+        Motion.g.from(dim, { backgroundColor: sig, duration: 0.6, ease: "power2.out", clearProps: "all" });
+      }
+    }
+    slots.__d2kActive = nowActive === null ? undefined : nowActive;
+
+    this.renderSearches(m);
+  };
+
+  App.prototype.renderSearches = function (m) {
+    var doc = this.doc, self = this;
+    var listNode = this.$("searches");
+    if (!m.linked || !m.engine) {
+      section(listNode, "absent:" + m.engine + ":" + m.linked, function () {
+        var li = el(doc, "li", "quiet");
+        add(li, el(doc, "b", "", "Поиски не измеряются."), m.engine
+          ? " Контроллер не подключён к датапату, поэтому список поисков недоступен."
+          : " Движок остановлен.");
+        return [li];
+      });
+      return;
+    }
+    if (!m.searches.length) {
+      section(listNode, "none", function () {
+        var li = el(doc, "li", "quiet");
+        add(li, el(doc, "b", "", "Рабочий прямой трафик подбор не запускает"),
+          " — он начинается только после подтверждённой блокировки, а найденное решение сохраняется в каталоге ниже.");
+        return [li];
+      });
+      return;
+    }
+    if (listNode.__d2kKey === "none" || (listNode.__d2kKey && listNode.__d2kKey.indexOf("absent:") === 0)) {
+      listNode.replaceChildren();
+    }
+    var firstLive = listNode.__d2kKey !== "live";
+    listNode.__d2kKey = "live";
+    var animate = Motion.on() && Motion.Flip;
+    var stable = [];
+    for (var si = 0; si < listNode.children.length; si++) if (!listNode.children[si].__leaving) stable.push(listNode.children[si]);
+    var wantKeys = m.running.map(function (x) { return JSON.stringify([x.target, x.family, x.transport, x.ip, x.port]); });
+    if (m.queued.length) wantKeys.push("queue");
+    var haveKeys = stable.map(function (r) { return r.__d2kKey; });
+    var flipState = animate && stable.length && wantKeys.join("\n") !== haveKeys.join("\n") ? Motion.Flip.getState(stable) : null;
+    if (flipState) stable.forEach(function (r) { r.__oldTop = r.getBoundingClientRect().top; });
+    var entered = [], moved = false;
+
+    var keep = {};
+    m.running.forEach(function (s, index) {
+      var key = JSON.stringify([s.target, s.family, s.transport, s.ip, s.port]);
+      keep[key] = true;
+      var row = null;
+      for (var i = 0; i < listNode.children.length; i++) {
+        if (listNode.children[i].__d2kKey === key) { row = listNode.children[i]; break; }
+      }
+      if (!row) {
+        row = self.searchRow(s);
+        row.__d2kKey = key;
+        entered.push(row);
+      }
+      self.updateSearch(row, s);
+      if (listNode.children[index] !== row) { listNode.insertBefore(row, listNode.children[index] || null); moved = true; }
     });
-    if (snapshot.dirty) append(system, node(doc, "p", "Эта сборка создана с незакоммиченными изменениями.", "notice notice-amber"));
-    if (snapshot.config_exists === false) append(system, node(doc, "p", "Файла конфигурации нет, действуют значения по умолчанию.", "notice"));
-    if (Array.isArray(snapshot.unknown_keys) && snapshot.unknown_keys.length) {
-      var unknown = append(system, node(doc, "p", undefined, "notice notice-amber"));
-      append(unknown, doc.createTextNode("Незнакомые этой сборке параметры сохранены: "));
-      snapshot.unknown_keys.forEach(function (key, index) {
-        if (index) append(unknown, doc.createTextNode(", "));
-        append(unknown, node(doc, "code", key));
-      });
+    var queue = null;
+    for (var q = 0; q < listNode.children.length; q++) if (listNode.children[q].__d2kKey === "queue") queue = listNode.children[q];
+    if (m.queued.length) {
+      if (!queue) { queue = el(doc, "li", "queue"); queue.__d2kKey = "queue"; }
+      keep.queue = true;
+      this.updateQueue(queue, m.queued);
+      if (listNode.lastChild !== queue) { listNode.appendChild(queue); moved = true; }
     }
-    if (Array.isArray(snapshot.absent) && snapshot.absent.length) {
-      var absent = append(system, node(doc, "div", undefined, "not-measured"));
-      heading(doc, absent, 3, "Чего панель не измеряет");
-      snapshot.absent.forEach(function (item) {
-        var row = append(absent, node(doc, "p"));
-        append(row, node(doc, "b", item.title || "Нет измерения"));
-        append(row, doc.createTextNode(" — " + (item.detail || "Причина не указана.")));
-      });
+    var leaving = [];
+    for (var j = listNode.children.length - 1; j >= 0; j--) {
+      var gone = listNode.children[j];
+      if (keep[gone.__d2kKey] || gone.__leaving) continue;
+      if (animate) leaving.push(gone); else listNode.removeChild(gone);
     }
-    if (!linked && snapshot.catalog_available !== false) append(system, node(doc, "p", "Каталог ниже отображает последнее сохранённое знание; живые события сейчас недоступны.", "notice notice-amber"));
-    if (linked) append(system, node(doc, "p", "Зондов использовано: " + (knowledge.probes_used || 0) +
-      " · неподходящих применений к клиенту: " + (knowledge.client_unfit || 0), "notice"));
-    var api = append(system, node(doc, "a", "Открыть данные для поддержки"));
-    api.setAttribute("href", "/api/status");
-    var controls = section(doc, stableControls ? node(doc, "div") : rootNode, "controls", "Управление D2K",
-      "Остановка подбора не удаляет уже сохранённые результаты.");
-    var tgStatusNames = {
-      not_configured: "Не настроен", stopped: "Выключен",
-      connecting: "Подключается", connected: "Работает"
+    if (!animate) return;
+    if (!entered.length && !leaving.length && !moved) return;
+    /* Ушедшая строка уезжает и гаснет; остальные плавно занимают её место. */
+    leaving.forEach(function (row) {
+      row.__leaving = true;
+      var done = row.getAttribute("data-done") === "true";
+      Motion.g.timeline({ onComplete: function () {
+        var rest = [];
+        for (var k = 0; k < listNode.children.length; k++) if (listNode.children[k] !== row && !listNode.children[k].__leaving) rest.push(listNode.children[k]);
+        var st = rest.length ? Motion.Flip.getState(rest) : null;
+        if (row.parentNode) row.parentNode.removeChild(row);
+        if (st) Motion.track(Motion.Flip.from(st, { duration: 0.5, ease: "power3.inOut", scale: true, simple: true }));
+      } })
+        .to(row, { x: done ? 0 : 36, y: done ? 18 : 0, autoAlpha: 0, duration: 0.4, ease: "power2.in" });
+    });
+    if (flipState) {
+      /* Переставляемые строки «приподнимаются» и проезжают поверх соседних, не сквозь них. */
+      var movers = stable.filter(function (r) { return !r.__leaving; });
+      movers.forEach(function (r) { r.__goesUp = r.getBoundingClientRect().top < r.__oldTop - 1; });
+      Motion.track(Motion.Flip.from(flipState, {
+        duration: 0.6, ease: "power3.inOut", scale: true, simple: true, targets: movers,
+        onStart: function () { movers.forEach(function (r) { r.classList.add("is-moving"); r.style.zIndex = r.__goesUp ? 3 : 2; }); },
+        onComplete: function () { movers.forEach(function (r) { r.classList.remove("is-moving"); r.style.zIndex = ""; }); }
+      }));
+    }
+    if (entered.length && !firstLive) {
+      Motion.g.fromTo(entered, { y: 28, autoAlpha: 0 }, { y: 0, autoAlpha: 1, duration: 0.6, stagger: 0.08, ease: "power4.out", clearProps: "transform,opacity,visibility" });
+    }
+  };
+
+  App.prototype.updateQueue = function (li, queued) {
+    var doc = this.doc, self = this;
+    var key = JSON.stringify(queued.map(function (s) { return [s.target, s.family, s.transport, s.ip, s.port, s.since]; }));
+    if (li.__d2kData !== key) {
+      li.__d2kData = key;
+      var head = el(doc, "p", "queue-head");
+      add(head, el(doc, "b", "", "Ждут свободного слота замера: " + queued.length),
+        " — замеры идут не больше, чем позволяет свободный процессор.");
+      var ul = el(doc, "ul", "queue-list");
+      queued.forEach(function (s) {
+        var row = el(doc, "li");
+        var wait = el(doc, "span", "queue-wait");
+        wait.__since = parseTime(s.since);
+        add(row, el(doc, "span", "queue-target", targetLabel(s.target)),
+          tag(doc, shapeLabel(s.shape, s.transport)), tag(doc, familyLabel(s.family)), wait);
+        ul.appendChild(row);
+      });
+      li.replaceChildren(head, ul);
+    }
+    var waits = li.querySelectorAll(".queue-wait");
+    var now = this.serverNow();
+    for (var i = 0; i < waits.length; i++) waits[i].textContent = waits[i].__since ? "ждёт " + clock(now - waits[i].__since) : "";
+    void self;
+  };
+
+  App.prototype.searchRow = function (s) {
+    var doc = this.doc;
+    var li = el(doc, "li", "search");
+    li.__parts = {
+      target: el(doc, "h2", "search-target"),
+      meta: el(doc, "div", "search-meta"),
+      clock: el(doc, "div", "search-clock"),
+      phase: el(doc, "p", "search-phase"),
+      track: el(doc, "div", "track")
     };
-    var tgCard = append(controls, node(doc, "div", undefined, "telegram-control"));
-    var tgCopy = append(tgCard, node(doc, "div", undefined, "telegram-copy"));
-    var tgTitle = append(tgCopy, node(doc, "strong"));
-    append(tgTitle, icon(doc, "telegram"));
-    append(tgTitle, node(doc, "span", "Telegram-туннель"));
-    var tgState = append(tgCopy, node(doc, "span", tgStatusNames[snapshot.telegram_status] || "Состояние неизвестно", "telegram-state"));
-    tgState.setAttribute("data-state", snapshot.telegram_status || "unknown");
-    append(tgCopy, node(doc, "p", snapshot.telegram_configured
-      ? "Отдельный TCP-туннель для Telegram; подбор D2K управляется независимо."
-      : "Настройка туннеля не завершена. Повторите установку D2K для автоматической регистрации роутера."));
-    var tgAction = snapshot.telegram_enabled ? "telegram-disable" : "telegram-enable";
-    var tgButton = append(tgCard, node(doc, "button",
-      undefined, "control-button " + (snapshot.telegram_enabled ? "button-danger" : "button-primary")));
-    append(tgButton, icon(doc, "power"));
-    append(tgButton, node(doc, "span", snapshot.telegram_enabled ? "Выключить" : "Включить"));
-    tgButton.setAttribute("type", "button");
-    tgButton.setAttribute("data-control", tgAction);
-    tgButton.setAttribute("data-ui-key", "control:telegram");
-    tgButton.disabled = !snapshot.controls_enabled || !snapshot.telegram_configured || controlInFlight || serverControlBusy;
-    append(controls, node(doc, "p", snapshot.controls_enabled
-      ? (snapshot.mode === "off"
-        ? "Подбор выключен в настройках. Включите его там, чтобы D2K снова искал обходы."
-        : "Эти действия управляют D2K на роутере. Команды принимаются только с того же адреса панели.")
-      : "Управление отключено для текущей привязки панели.", "control-note"));
-    var controlButtons = append(controls, node(doc, "div", undefined, "control-buttons"));
-    append(controlButtons, node(doc, "strong", "D2K / " + (snapshot.engine_running === true
-      ? (snapshot.controller_running === true ? "Работает" : "Без подбора")
-      : snapshot.engine_running === false ? "Остановлен" : "Неизвестно"), "control-engine-state"));
-    [
-      ["start", "Запустить", "button-primary"],
-      ["stop", "Остановить", "button-danger"],
-      ["restart", "Перезапустить", "button-quiet"],
-      ["reapply", "Восстановить", "button-quiet"],
-    ].forEach(function (item) {
-      var button = append(controlButtons, node(doc, "button", undefined, "control-button " + item[2]));
-      append(button, icon(doc, item[0]));
-      append(button, node(doc, "span", item[1]));
-      button.setAttribute("type", "button");
-      button.setAttribute("data-control", item[0]);
-      button.setAttribute("data-ui-key", "control:" + item[0]);
-      button.disabled = !snapshot.controls_enabled || controlInFlight || serverControlBusy ||
-        ((item[0] === "start" || item[0] === "restart") && snapshot.mode === "off");
-    });
-    var result = append(controls, node(doc, "p", controlMessage, "control-result"));
-    result.setAttribute("id", "control-result");
-    if (stableControls) syncControls(stableControls, controls);
-    if (rootNode.addEventListener && !rootNode.__d2kControlBound) {
-      rootNode.__d2kControlBound = true;
-      rootNode.addEventListener("click", function (event) {
-        var button = event.target && event.target.closest ? event.target.closest("[data-control]") : null;
-        if (!button || button.disabled) return;
-        var action = button.getAttribute("data-control");
-        if ((action === "stop" || action === "restart" || action === "telegram-disable") && root.confirm &&
-            !root.confirm(action === "stop" ? "Приостановить подбор? Сохранённые результаты останутся на месте." :
-              action === "telegram-disable" ? "Выключить Telegram-туннель? Новые Telegram-соединения пойдут напрямую." :
-              "Перезапустить D2K? Текущие соединения могут на короткое время переключиться на прямое подключение.")) return;
-        runControl(action, button, doc);
-      });
+    li.__parts.track.setAttribute("aria-hidden", "true");
+    li.__parts.fill = el(doc, "span", "track-fill");
+    li.__parts.puck = el(doc, "span", "track-puck");
+    add(li, li.__parts.target, li.__parts.clock, li.__parts.meta, li.__parts.phase, li.__parts.track);
+    void s;
+    return li;
+  };
+
+  App.prototype.updateSearch = function (li, s) {
+    var doc = this.doc, p = li.__parts;
+    p.target.textContent = targetLabel(s.target);
+    var metaKey = JSON.stringify([s.shape, s.transport, s.family, s.ip, s.port, s.source, s.attempts, s.probes]);
+    if (p.meta.__d2kKey !== metaKey) {
+      p.meta.__d2kKey = metaKey;
+      var addr = s.ip ? (s.family === 6 ? "[" + s.ip + "]" : s.ip) + (s.port ? ":" + s.port : "") : "";
+      p.meta.replaceChildren();
+      add(p.meta,
+        tag(doc, shapeLabel(s.shape, s.transport)),
+        tag(doc, familyLabel(s.family)),
+        addr ? el(doc, "span", "mono", addr) : null,
+        s.source ? el(doc, "span", "", s.source) : null);
     }
-    var footer = append(rootNode, node(doc, "footer", undefined, "page-footer"));
-    append(footer, node(doc, "span", "D2K · работает на вашем роутере"));
-    append(footer, node(doc, "span", "Ваши результаты остаются на роутере"));
-    updateChrome(doc, knowledge, snapshot);
-    if (rootNode.querySelectorAll) {
-      Array.prototype.forEach.call(rootNode.querySelectorAll("details[data-ui-key]"), function (item) {
-        item.open = !!openDetails[item.getAttribute("data-ui-key")];
-      });
-      if (focusedKey) {
-        Array.prototype.forEach.call(rootNode.querySelectorAll("[data-ui-key]"), function (item) {
-          if (item.getAttribute("data-ui-key") === focusedKey && item.focus) item.focus();
+    li.__since = parseTime(s.since);
+    var counters = [];
+    if (num(s.attempts)) counters.push(count(s.attempts, "план", "плана", "планов"));
+    if (num(s.probes)) counters.push(count(s.probes, "зонд", "зонда", "зондов"));
+    li.__counters = counters.join(" · ");
+    this.updateClock(li);
+
+    var phase = str(s.phase) || "этап не указан";
+    var phaseText = phase.charAt(0).toUpperCase() + phase.slice(1) + (s.candidate ? " — " + s.candidate : "");
+    if (p.phase.textContent !== phaseText) {
+      if (p.phase.textContent && Motion.on()) {
+        Motion.g.timeline()
+          .to(p.phase, { y: -8, autoAlpha: 0, duration: 0.16, ease: "power2.in" })
+          .add(function () { p.phase.textContent = phaseText; })
+          .fromTo(p.phase, { y: 10, autoAlpha: 0 }, { y: 0, autoAlpha: 1, duration: 0.45, ease: "power3.out", clearProps: "transform,opacity,visibility" });
+      } else {
+        p.phase.textContent = phaseText;
+      }
+    }
+    var tr = trackFor(s.phase);
+    li.setAttribute("data-done", String(!!tr && !tr.voice && tr.at === TRACK.length - 1));
+    if (!tr) { p.track.hidden = true; return; }
+    p.track.hidden = false;
+    var trackKey = (tr.voice ? "v" : "t");
+    if (p.track.__d2kKey !== trackKey) {
+      p.track.__d2kKey = trackKey;
+      p.track.replaceChildren(p.fill, p.puck);
+      tr.steps.forEach(function (step) { p.track.appendChild(el(doc, "span", "track-step", step.label)); });
+      p.track.style.setProperty("--steps", String(tr.steps.length));
+    }
+    var steps = p.track.querySelectorAll(".track-step");
+    var paint = function (cur, target) {
+      for (var i = 0; i < steps.length; i++) {
+        steps[i].setAttribute("data-state", i === target && cur >= target - 0.02 ? "now" : i < cur + 0.02 ? "past" : "next");
+      }
+    };
+    var oldAt = p.track.__d2kAt;
+    p.track.__d2kAt = tr.at;
+    if (p.track.__tween) p.track.__tween.kill();
+    if (oldAt !== undefined && oldAt !== tr.at && Motion.on()) {
+      /* Маркер переезжает к новому этапу; точки загораются, когда он их проходит. */
+      var pos = { at: oldAt };
+      p.track.__tween = Motion.g.to(pos, { at: tr.at, duration: 0.9, ease: "power3.inOut", onUpdate: function () {
+        p.track.style.setProperty("--at", String(pos.at));
+        paint(pos.at, tr.at);
+      } });
+      Motion.g.fromTo(p.puck, { scale: 1 }, { scale: 1.7, duration: 0.22, delay: 0.75, yoyo: true, repeat: 1, ease: "power2.out" });
+    } else {
+      p.track.style.setProperty("--at", String(tr.at));
+      paint(tr.at, tr.at);
+    }
+  };
+
+  App.prototype.updateClock = function (li) {
+    var doc = this.doc, p = li.__parts;
+    var text = li.__since ? clock(this.serverNow() - li.__since) : "—";
+    if (!p.clock.firstChild) add(p.clock, el(doc, "strong"), el(doc, "span"));
+    p.clock.firstChild.textContent = text;
+    p.clock.firstChild.title = li.__since ? "С " + localTime(li.__since) : "";
+    p.clock.lastChild.textContent = li.__counters || "идёт";
+  };
+
+  App.prototype.tick = function () {
+    var rows = this.$("searches").children;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].__parts) this.updateClock(rows[i]);
+      else if (rows[i].__d2kKey === "queue") this.updateQueue(rows[i], this.m ? this.m.queued : []);
+    }
+    this.renderNotice();
+  };
+
+  /* ─── Каталог: семейства и коробки ─── */
+
+  App.prototype.matches = function (text) {
+    return !this.filter || normName(text).indexOf(this.filter) >= 0;
+  };
+
+  App.prototype.renderCatalog = function (force) {
+    var m = this.m;
+    if (!m) return;
+    var key = JSON.stringify([this.filter, m.linked, m.k.catalog_at, m.groups, m.boxes, this.status.snapshot.catalog_available]);
+    if (!force && key === this.catalogKey) return;
+    this.catalogKey = key;
+    var self = this;
+    var famBody = this.$("families-body"), famKey = famBody.__d2kKey;
+    this.renderFamilies(m);
+    if (famBody.__d2kKey !== famKey && !force) this.swingTags();
+    if (this.renderBoxes(m) === false) this.catalogKey = null;
+    var families = m.groups.filter(function (g) { return self.familyMatches(g); }).length;
+    var bindings = 0;
+    m.boxes.forEach(function (b) { list(b.bindings).forEach(function (bd) { if (self.matches(bd.target)) bindings++; }); });
+    var c = this.$("filter-count");
+    c.textContent = this.filter
+      ? "Найдено: " + count(families, "семейство", "семейства", "семейств") + ", " + count(bindings, "цель", "цели", "целей")
+      : "";
+  };
+
+  App.prototype.familyMatches = function (g) {
+    var self = this;
+    return this.matches(g.suffix) || list(g.evidence).some(function (e) { return self.matches(e); });
+  };
+
+  App.prototype.renderFamilies = function (m) {
+    var doc = this.doc, self = this;
+    var body = this.$("families-body");
+    section(body, JSON.stringify([this.filter, m.linked, m.groups]), function () {
+      var groups = m.groups.filter(function (g) { return self.familyMatches(g); });
+      if (!m.groups.length) {
+        var e = el(doc, "p", "empty");
+        add(e, el(doc, "b", "", "Семейств пока нет. "),
+          "Они появляются, когда один и тот же обход подтверждается на нескольких доменах одного суффикса.");
+        return [e];
+      }
+      if (!groups.length) return [el(doc, "p", "empty", "Ни одно семейство не подходит под запрос.")];
+      /* Семейство — бирка на общей струне: суффикс, контекст протокола, штамп
+         применения, дерево доменов-доказательств, исключения и коробки с этим планом. */
+      var rail = el(doc, "div", "tag-rail");
+      groups.forEach(function (g, gi) {
+        var active = !!(m.linked && g.active);
+        var wrap = el(doc, "div", "ftag-wrap");
+        wrap.setAttribute("data-flip-id", "fam:" + JSON.stringify([g.suffix, g.family, g.transport, g.shape, g.probe_path || "/", g.ech_origin || ""]));
+        wrap.setAttribute("data-active", String(active));
+        var swing = el(doc, "div", "ftag-swing");
+        swing.appendChild(el(doc, "span", "ftag-string"));
+        wrap.appendChild(swing);
+        var card = el(doc, "article", "ftag");
+        card.appendChild(el(doc, "span", "ftag-eyelet"));
+        var name = el(doc, "h3", "ftag-name");
+        add(name, el(doc, "span", "", "*."), str(g.suffix));
+        var ctx = el(doc, "div", "ftag-ctx");
+        add(ctx, tag(doc, shapeLabel(g.shape, g.transport)), tag(doc, familyLabel(g.family)));
+        if (g.ech_origin) ctx.appendChild(tag(doc, "ECH: " + g.ech_origin));
+        if (g.probe_path && g.probe_path !== "/") ctx.appendChild(tag(doc, "путь " + g.probe_path));
+        var stamp = el(doc, "span", "ftag-stamp", active ? "Применяется" : "Не подтверждено");
+        stamp.setAttribute("data-active", String(active));
+        if (!active) stamp.title = "Решение сохранено, но применение к семейству сейчас не подтверждено";
+        var ev = list(g.evidence);
+        var sub = el(doc, "p", "ftag-sub",
+          "Подтверждено на " + count(num(g.evidence_count) || ev.length, "домене", "доменах", "доменах"));
+        var tree = el(doc, "ul", "ftag-tree");
+        ev.forEach(function (d) { tree.appendChild(el(doc, "li", "", d)); });
+        list(g.exceptions).forEach(function (x) {
+          var nm = x && typeof x === "object" ? x.name : x;
+          var li = el(doc, "li", "ex");
+          add(li, str(nm), el(doc, "small", "", " — исключение"));
+          tree.appendChild(li);
         });
+        var foot = el(doc, "div", "ftag-foot");
+        if (g.plan_id) {
+          foot.appendChild(el(doc, "code", "", str(g.plan_id)));
+          var owners = [];
+          m.boxes.forEach(function (b, bi) {
+            if (list(b.plans).some(function (p) { return p.id === g.plan_id; })) owners.push({ id: str(b.id), n: bi + 1 });
+          });
+          if (owners.length) {
+            var links = el(doc, "span", "ftag-boxes", owners.length > 1 ? "план есть в коробках " : "план из коробки ");
+            owners.forEach(function (o, oi) {
+              if (oi) links.appendChild(doc.createTextNode(" · "));
+              var b = el(doc, "button", "ftag-box", String(o.n));
+              b.type = "button";
+              b.setAttribute("aria-label", "Показать коробку " + o.n);
+              b.addEventListener("click", function () { self.showBox(o.id); });
+              links.appendChild(b);
+            });
+            foot.appendChild(links);
+          }
+        }
+        add(card, name, ctx, stamp, sub, tree, foot);
+        swing.appendChild(card);
+        var tilt = ([-1.4, 0.9, -0.5, 1.6, -1.1, 0.4])[gi % 6];
+        wrap.style.setProperty("--tilt", tilt + "deg");
+        swing.__tilt = tilt;
+        if (Motion.on()) {
+          /* Наклон, раскачивание и наведение ведёт GSAP — без спора с CSS-переходом. */
+          Motion.g.set(swing, { rotation: tilt, transformOrigin: "50% -44px" });
+          var straighten = function () { Motion.g.to(swing, { rotation: 0, duration: 0.5, ease: "power3.out", overwrite: "auto" }); };
+          var release = function () {
+            if (wrap.matches(":hover") || wrap.contains(doc.activeElement)) return;
+            Motion.g.to(swing, { rotation: tilt, duration: 1.6, ease: "elastic.out(1, 0.32)", overwrite: "auto" });
+          };
+          wrap.addEventListener("mouseenter", straighten);
+          wrap.addEventListener("mouseleave", release);
+          wrap.addEventListener("focusin", straighten);
+          wrap.addEventListener("focusout", function () { setTimeout(release, 0); });
+        }
+        rail.appendChild(wrap);
+      });
+      var grid = rail;
+      return [grid];
+    });
+  };
+
+  /* Бирки раскачиваются, когда блок впервые попадает на экран и когда набор семейств меняется. */
+  App.prototype.swingTags = function () {
+    var body = this.$("families-body"), win = global;
+    if (!Motion.on()) return;
+    var run = function () {
+      var swings = body.querySelectorAll(".ftag-swing");
+      if (!swings.length) return;
+      Motion.g.fromTo(swings, { rotation: function (i) { return (i % 2 ? 7 : -7) + i % 3; } },
+        { rotation: function (i, t) { return t.__tilt || 0; }, duration: 1.8, ease: "elastic.out(1, 0.3)", stagger: 0.07, overwrite: "auto" });
+    };
+    if (body.__seen) { run(); return; }
+    if (typeof win.IntersectionObserver !== "function") { body.__seen = true; return; }
+    if (body.__io) return;
+    body.__io = new win.IntersectionObserver(function (entries) {
+      if (!entries[entries.length - 1].isIntersecting) return;
+      body.__seen = true;
+      body.__io.disconnect();
+      run();
+    }, { threshold: 0.25 });
+    body.__io.observe(body);
+  };
+
+  /* Переход от бирки к коробке: прокрутка к ней, раскрытие и короткая подсветка. */
+  App.prototype.showBox = function (id) {
+    var doc = this.doc;
+    var crates = doc.querySelectorAll(".crate"), crate = null;
+    for (var i = 0; i < crates.length; i++) if (crates[i].getAttribute("data-key") === "box:" + id) crate = crates[i];
+    if (!crate) return;
+    var open = function () {
+      if (!crate.open) { if (Motion.on()) crateToggle(crate); else crate.open = true; }
+      if (Motion.on()) {
+        var sig = global.getComputedStyle(doc.documentElement).getPropertyValue("--signal").trim() || "#e8470f";
+        Motion.g.fromTo(crate, { boxShadow: "0 0 0 4px " + sig }, { boxShadow: "0 0 0 0px transparent", duration: 1.4, ease: "power2.out", clearProps: "boxShadow" });
+      }
+      var lid = crate.querySelector(".crate-lid");
+      if (lid) lid.focus({ preventScroll: true });
+    };
+    var mast = doc.getElementById("mast");
+    var offset = (mast ? mast.offsetHeight : 0) + 24;
+    if (Motion.on() && global.ScrollToPlugin) {
+      Motion.g.to(global, { scrollTo: { y: crate, offsetY: offset }, duration: 0.8, ease: "power3.inOut", onComplete: open });
+    } else {
+      global.scrollTo(0, crate.getBoundingClientRect().top + global.pageYOffset - offset);
+      open();
+    }
+  };
+
+  App.prototype.renderBoxes = function (m) {
+    var doc = this.doc, self = this;
+    var body = this.$("boxes-body");
+    var busy = body.querySelectorAll(".crate");
+    for (var bi0 = 0; bi0 < busy.length; bi0++) {
+      /* Пока коробка в движении, перерисовку отложим до следующего опроса. */
+      if (busy[bi0].__tl && busy[bi0].__tl.isActive()) return false;
+    }
+    var available = this.status.snapshot.catalog_available !== false || m.boxes.length;
+    section(body, JSON.stringify([this.filter, m.linked, available, m.boxes, m.groups]), function () {
+      if (!available) {
+        var na = el(doc, "p", "empty");
+        add(na, el(doc, "b", "", "Каталог не открыт. "), "Сохранённые коробки и решения сейчас недоступны — это не означает, что их нет.");
+        return [na];
+      }
+      if (!m.boxes.length) {
+        var e = el(doc, "p", "empty");
+        add(e, el(doc, "b", "", "Каталог пуст. "),
+          "Коробка появится, когда D2K подтвердит блокировку, измерит её поведение и найдёт обход. Начальных списков нет — всё узнаётся по живому трафику.");
+        return [e];
+      }
+      var out = [];
+      m.boxes.forEach(function (b, bi) {
+        var binds = list(b.bindings);
+        var visible = [], covered = [];
+        binds.forEach(function (bd) {
+          if (!self.matches(bd.target)) return;
+          var g = m.linked ? coveredBy(bd, m.groups) : null;
+          (g ? covered : visible).push({ bd: bd, g: g });
+        });
+        if (self.filter && !visible.length && !covered.length) return;
+        out.push(self.boxNode(b, bi, visible, covered, binds.length));
+      });
+      if (!out.length) return [el(doc, "p", "empty", "Ни одна цель в коробках не подходит под запрос.")];
+      return out;
+    });
+  };
+
+  function svgEl(doc, tag, attrs, cls) {
+    var n = doc.createElementNS(SVG, tag);
+    for (var k in attrs) n.setAttribute(k, attrs[k]);
+    if (cls) n.setAttribute("class", cls);
+    return n;
+  }
+
+  /* Коробка в изометрии: закрытая — с лентой на крышке; открытая — откинутые клапаны. */
+  /* Иконка коробки в изометрии. Верх — два клапана на шарнирах: левый на переднем
+     ребре A–D, правый на заднем B–C; шов между ними (M1–M2) заклеен лентой.
+     Положение клапана считается по углу поворота вокруг его ребра:
+     0° — лежит плашмя (закрыто), 90° — стоит, ~135° — откинут наружу. */
+  var BOX = { A: [8, 24], B: [32, 12], C: [56, 24], D: [32, 36] };
+  var FLAP_W = Math.sqrt(12 * 12 + 6 * 6);
+  /* Углы раскрытия подобраны под изометрию: передний клапан при большем угле
+     смотрел бы на зрителя ребром и пропадал. */
+  var CRATE_OPEN = { l: 105, r: 130 };
+  function flapPoints(side, deg) {
+    var r = deg * Math.PI / 180, c = Math.cos(r), sn = Math.sin(r);
+    /* В плоскости верха клапан тянется от шарнира к шву; «вверх» в изометрии — это −y. */
+    var inward = side === "l" ? [12, -6] : [-12, 6];
+    var off = [c * inward[0], c * inward[1] - sn * FLAP_W];
+    var h1 = side === "l" ? BOX.A : BOX.B, h2 = side === "l" ? BOX.D : BOX.C;
+    var f = function (p) { return (p[0] + off[0]).toFixed(2) + "," + (p[1] + off[1]).toFixed(2); };
+    return h1.join(",") + " " + h2.join(",") + " " + f(h2) + " " + f(h1);
+  }
+  function setFlaps(icon, degL, degR) {
+    var l = icon.querySelector(".flap-l"), r = icon.querySelector(".flap-r");
+    l.setAttribute("points", flapPoints("l", degL));
+    r.setAttribute("points", flapPoints("r", degR));
+    /* За вертикалью видна внутренняя сторона клапана. */
+    l.setAttribute("data-inner", String(degL > 90));
+    r.setAttribute("data-inner", String(degR > 90));
+  }
+
+  function crateIcon(doc) {
+    var s = svgEl(doc, "svg", { viewBox: "0 0 64 64", "aria-hidden": "true" }, "crate-icon");
+    var pg = function (pts, cls) { s.appendChild(svgEl(doc, "polygon", { points: pts }, cls)); };
+    pg("8,24 32,36 32,60 8,48", "face-l");
+    pg("32,36 56,24 56,48 32,60", "face-r");
+    pg("8,24 32,12 56,24 32,36", "inside");
+    s.appendChild(svgEl(doc, "polygon", { points: flapPoints("r", 0) }, "flap flap-r"));
+    s.appendChild(svgEl(doc, "polygon", { points: flapPoints("l", 0) }, "flap flap-l"));
+    s.appendChild(svgEl(doc, "path", { d: "M20 18 44 30" }, "tape"));
+    s.appendChild(svgEl(doc, "path", { d: "M14 39v7l6 3" }, "mark"));
+    return s;
+  }
+
+  /* Сцена коробки — один таймлайн: вперёд открывает, назад закрывает.
+     Повторный клик во время анимации разворачивает её с текущего места.
+     Лента на крышке рвётся пополам, крышка приподнимается, клапаны откидываются,
+     наклейка качается, тело раскрывается, строки проявляются все, по очереди. */
+  function crateTimeline(crate) {
+    var g = Motion.g;
+    var lidEl = crate.querySelector(".crate-lid"), body = crate.querySelector(".crate-body");
+    var icon = crate.querySelector(".crate-icon");
+    var iconTape = icon.querySelector(".tape");
+    var hinge = { l: 0, r: 0 };
+    var drawFlaps = function () { setFlaps(icon, hinge.l, hinge.r); };
+    var tapeL = lidEl.querySelector(".crate-tape-l"), tapeR = lidEl.querySelector(".crate-tape-r");
+    var label = crate.querySelector(".crate-label");
+    var bits = [].slice.call(body.querySelectorAll(".box-aside > *, .bindings tbody tr, .covered")).slice(0, 60);
+    var all = [lidEl, body, iconTape, tapeL, tapeR, label, bits];
+    var cs = global.getComputedStyle(body), padT = cs.paddingTop, padB = cs.paddingBottom;
+    var done = function () {
+      g.set(all, { clearProps: "all" });
+      crate.__tl = null;
+      setFlaps(icon, crate.open ? CRATE_OPEN.l : 0, crate.open ? CRATE_OPEN.r : 0);
+    };
+    var tl = g.timeline({ paused: true, defaults: { ease: "power3.out" },
+      onComplete: done,
+      onReverseComplete: function () { crate.open = false; done(); } });
+    /* Начало ленты задано явно: CSS прячет её у открытой коробки, а коробка
+       помечается открытой в самом начале сцены. */
+    var tape0 = { xPercent: 0, yPercent: 0, rotation: 0, autoAlpha: 1 };
+    tl.fromTo(tapeL, tape0, { xPercent: -10, yPercent: -160, rotation: -9, autoAlpha: 0, duration: 0.42, ease: "power2.in", transformOrigin: "0% 50%" }, 0)
+      .fromTo(tapeR, tape0, { xPercent: 10, yPercent: -160, rotation: 9, autoAlpha: 0, duration: 0.42, ease: "power2.in", transformOrigin: "100% 50%" }, 0.05)
+      .fromTo(iconTape, { drawSVG: "0% 100%", opacity: 0.8 }, { drawSVG: "50% 50%", opacity: 0.8, duration: 0.2, ease: "power2.in" }, 0)
+      .to(lidEl, { y: -5, duration: 0.16, ease: "power2.out" }, 0.02)
+      .to(lidEl, { y: 0, duration: 0.45, ease: "back.out(3)" }, 0.18)
+      .to(iconTape, { opacity: 0, duration: 0.08 }, 0.17)
+      .fromTo(hinge, { l: 0 }, { l: CRATE_OPEN.l, duration: 0.6, ease: "back.out(1.6)", onUpdate: drawFlaps }, 0.14)
+      .fromTo(hinge, { r: 0 }, { r: CRATE_OPEN.r, duration: 0.6, ease: "back.out(1.6)", onUpdate: drawFlaps }, 0.22)
+      .fromTo(label, { rotation: -1.5 }, { rotation: 3.5, duration: 0.18, ease: "power2.out" }, 0.06)
+      .to(label, { rotation: -1.5, duration: 0.7, ease: "elastic.out(1, 0.4)" }, 0.24)
+      .fromTo(body, { height: 0, paddingTop: 0, paddingBottom: 0, overflow: "hidden" },
+        { height: "auto", paddingTop: padT, paddingBottom: padB, duration: 0.6, ease: "power3.inOut" }, 0.14);
+    if (bits.length) tl.fromTo(bits, { y: 16, autoAlpha: 0 }, { y: 0, autoAlpha: 1, duration: 0.42, stagger: { amount: Math.min(0.45, bits.length * 0.03) } }, 0.3);
+    return tl;
+  }
+
+  function crateToggle(crate) {
+    var tl = crate.__tl;
+    if (tl && tl.isActive()) {
+      /* Разворот на ходу: та же сцена в обратную сторону с текущего кадра. */
+      tl.timeScale(tl.reversed() ? 1 : 1.6).reversed(!tl.reversed());
+      return;
+    }
+    if (tl) tl.kill();
+    if (!crate.open) {
+      crate.open = true;
+      crate.__tl = crateTimeline(crate);
+      crate.__tl.timeScale(1).play(0);
+    } else {
+      crate.__tl = crateTimeline(crate);
+      crate.__tl.progress(1).timeScale(1.6).reverse();
+    }
+  }
+
+  function boxFacts(binds) {
+    var protos = {}, v6 = false, recheck = 0, off = 0;
+    binds.forEach(function (bd) {
+      protos[shapeLabel(bd.shape, bd.transport)] = true;
+      if (bd.family === 6) v6 = true;
+      if (bd.recheck) recheck++;
+      if (bd.enabled === false) off++;
+    });
+    return { protos: Object.keys(protos), v6: v6, recheck: recheck, off: off };
+  }
+
+  App.prototype.boxNode = function (b, bi, visible, covered, total) {
+    var doc = this.doc;
+    var crate = el(doc, "details", "crate");
+    crate.addEventListener("toggle", function () {
+      if (crate.__tl) return;
+      var ic = crate.querySelector(".crate-icon");
+      if (ic) setFlaps(ic, crate.open ? CRATE_OPEN.l : 0, crate.open ? CRATE_OPEN.r : 0);
+    });
+    crate.setAttribute("data-key", "box:" + str(b.id));
+    crate.setAttribute("data-flip-id", "box:" + str(b.id));
+    if (this.filter) crate.open = true;
+    var lid = el(doc, "summary", "crate-lid");
+    var head = el(doc, "div", "crate-head");
+    var sigs = list(b.signals);
+    var first = sigs.length ? (str(sigs[0].human) || str(sigs[0].kind)) : "приметы не записаны";
+    add(head, el(doc, "h3", "crate-name", "Коробка " + (bi + 1)),
+      el(doc, "p", "crate-signal", first + (sigs.length > 1 ? " · ещё " + (sigs.length - 1) : "")));
+    var facts = boxFacts(list(b.bindings));
+    var meta = el(doc, "div", "crate-meta");
+    facts.protos.forEach(function (p) { meta.appendChild(tag(doc, p)); });
+    if (facts.v6) meta.appendChild(tag(doc, "IPv6"));
+    if (facts.recheck) meta.appendChild(tag(doc, "перепроверяется: " + facts.recheck, "live"));
+    var updated = parseTime(b.updated);
+    if (updated) meta.appendChild(el(doc, "span", "crate-when", "обновлена " + ago(this.serverNow() - updated)));
+    head.appendChild(meta);
+    var label = el(doc, "div", "crate-label");
+    var nPlans = list(b.plans).length;
+    add(label,
+      el(doc, "code", "crate-id", str(b.id)),
+      el(doc, "strong", "", String(total)),
+      el(doc, "span", "", plural(total, "цель", "цели", "целей") + " · " + count(nPlans, "план", "плана", "планов")));
+    var tapeL = el(doc, "span", "crate-tape crate-tape-l"), tapeR = el(doc, "span", "crate-tape crate-tape-r");
+    tapeL.setAttribute("aria-hidden", "true");
+    tapeR.setAttribute("aria-hidden", "true");
+    add(lid, tapeL, tapeR, crateIcon(doc), head, label);
+    lid.addEventListener("click", function (e) {
+      if (!Motion.on()) return;
+      e.preventDefault();
+      crateToggle(crate);
+    });
+    var art = el(doc, "div", "box crate-body");
+    var aside = el(doc, "div", "box-aside");
+    var self = this;
+    var dates = [];
+    var created = parseTime(b.created), updated = parseTime(b.updated);
+    if (created) dates.push("найдена " + localTime(created));
+    if (updated && updated !== created) dates.push("обновлена " + localTime(updated));
+    if (dates.length) aside.appendChild(el(doc, "p", "box-dates", dates.join(" · ")));
+
+    var sigWrap = el(doc, "div");
+    sigWrap.appendChild(el(doc, "h4", "", "Поведение"));
+    if (sigs.length) {
+      var sl = el(doc, "ul", "signal-list");
+      sigs.forEach(function (s) {
+        var li = el(doc, "li", "", str(s.human) || str(s.kind));
+        if (num(s.seen)) li.appendChild(el(doc, "small", "", "×" + s.seen));
+        sl.appendChild(li);
+      });
+      sigWrap.appendChild(sl);
+    } else {
+      sigWrap.appendChild(el(doc, "p", "box-dates", "Приметы не записаны"));
+    }
+    aside.appendChild(sigWrap);
+
+    var plansWrap = el(doc, "div");
+    plansWrap.appendChild(el(doc, "h4", "", "Планы"));
+    var plans = el(doc, "div", "plans");
+    list(b.plans).forEach(function (p, pi) {
+      var d = el(doc, "details", "plan");
+      d.setAttribute("data-key", "plan:" + str(b.id) + ":" + (p.id || pi));
+      d.setAttribute("data-enabled", String(p.enabled !== false));
+      var sum = el(doc, "summary");
+      add(sum,
+        tag(doc, str(p.proto).toUpperCase() || "—"),
+        el(doc, "span", "plan-gist", str(p.human) || planGist(p.text) || str(p.id)),
+        el(doc, "span", "plan-wins", count(num(p.successes) || 0, "успех", "успеха", "успехов")));
+      var pre = el(doc, "pre", "", (p.id ? "# " + p.id + (p.enabled === false ? " (выключен)" : "") + "\n" : "") + str(p.text));
+      pre.tabIndex = 0;
+      pre.setAttribute("aria-label", "Текст плана " + (str(p.id) || String(pi + 1)));
+      add(d, sum, pre);
+      plans.appendChild(d);
+    });
+    if (!list(b.plans).length) plans.appendChild(el(doc, "p", "box-dates", "Планов нет"));
+    plansWrap.appendChild(plans);
+    aside.appendChild(plansWrap);
+
+    var main = el(doc, "div");
+    main.appendChild(el(doc, "h4", "", count(total, "цель", "цели", "целей")));
+    if (visible.length) {
+      var table = el(doc, "table", "bindings");
+      var cg = el(doc, "colgroup");
+      ["c-target", "c-proto", "c-level", "c-wins", "c-when"].forEach(function (c) { cg.appendChild(el(doc, "col", c)); });
+      table.appendChild(cg);
+      var thead = el(doc, "thead"), hr = el(doc, "tr");
+      ["Цель", "Протокол", "Доказательство", "Успехи", "Подтверждено"].forEach(function (h) { hr.appendChild(el(doc, "th", "", h)); });
+      thead.appendChild(hr);
+      var tb = el(doc, "tbody");
+      var now = self.serverNow();
+      visible.sort(function (a, c) { return (parseTime(c.bd.confirmed) || 0) - (parseTime(a.bd.confirmed) || 0); });
+      visible.forEach(function (v) {
+        var bd = v.bd;
+        var tr = el(doc, "tr");
+        tr.setAttribute("data-enabled", String(bd.enabled !== false));
+        var t = el(doc, "td", "t", targetLabel(bd.target));
+        if (bd.kind === "addr") t.appendChild(el(doc, "small", "", "адрес"));
+        var proto = el(doc, "td", "n c-proto", shapeLabel(bd.shape, bd.transport) + " · " + familyLabel(bd.family));
+        var lv = el(doc, "td", "c-level");
+        add(lv, tag(doc, str(bd.level_name) || "не измерено", (bd.level || 0) >= 3 ? "ok" : (bd.level || 0) > 0 ? "warn" : "mute"));
+        if (bd.recheck) add(lv, " ", tag(doc, "перепроверяется", "live"));
+        if (bd.enabled === false) add(lv, " ", tag(doc, "выключено", "mute"));
+        var nw = num(bd.successes) || 0;
+        var wins = el(doc, "td", "n c-wins", String(nw));
+
+        var c = parseTime(bd.confirmed);
+        var when = el(doc, "td", "n c-when", c ? ago(now - c) : "—");
+        if (c) when.title = localTime(c);
+        proto.setAttribute("data-tail", count(nw, "успех", "успеха", "успехов") + " · " + (c ? ago(now - c) : "время неизвестно"));
+        add(tr, t, proto, lv, wins, when);
+        tb.appendChild(tr);
+      });
+      add(table, thead, tb);
+      main.appendChild(table);
+    } else if (!covered.length) {
+      main.appendChild(el(doc, "p", "box-dates", "Привязанных целей нет"));
+    }
+    if (covered.length) {
+      var det = el(doc, "details", "covered");
+      det.setAttribute("data-key", "covered:" + str(b.id));
+      det.appendChild(el(doc, "summary", "",
+        (visible.length ? "Ещё " : "") + count(covered.length, "цель покрыта", "цели покрыты", "целей покрыты") + " семействами"));
+      var ul = el(doc, "ul");
+      covered.forEach(function (v) { ul.appendChild(el(doc, "li", "", targetLabel(v.bd.target) + " → *." + v.g.suffix)); });
+      det.appendChild(ul);
+      main.appendChild(det);
+    }
+    add(art, aside, main);
+    add(crate, lid, art);
+    return crate;
+  };
+
+  /* ─── Telegram ─── */
+
+  var TG = {
+    connected: { word: "Подключён", lamp: "ok", note: "Туннель установлен и держит соединение с ретранслятором." },
+    connecting: { word: "Подключается", lamp: "warn", note: "Служба запущена и устанавливает соединение с ретранслятором." },
+    stopped: { word: "Остановлен", lamp: "idle", note: "Служба не запущена." },
+    not_configured: { word: "Не настроен", lamp: "idle", note: "В конфигурации не заданы TG_RELAY_URL и TG_RELAY_SECRET (или порт записи). Без них туннель не включить." }
+  };
+
+  /* Туннель: роутер слева, ретранслятор справа. Пакеты идут только при подключении. */
+  function tunnelScene(doc, st) {
+    var fig = el(doc, "figure", "tunnel-scene");
+    fig.setAttribute("aria-hidden", "true");
+    var s = svgEl(doc, "svg", { viewBox: "0 0 640 150", preserveAspectRatio: "xMidYMid meet" }, "tun");
+    var g = function (cls) { var x = svgEl(doc, "g", {}, cls); s.appendChild(x); return x; };
+    var ground = g("tun-ground");
+    ground.appendChild(svgEl(doc, "path", { d: "M0 134H640" }));
+    for (var h = 8; h < 640; h += 22) ground.appendChild(svgEl(doc, "path", { d: "M" + h + " 134l-10 12" }));
+    /* Тело туннеля: свод из колец, уходящих вправо. */
+    var tube = g("tun-tube");
+    tube.appendChild(svgEl(doc, "path", { d: "M92 30H548M92 120H548" }, "tun-wall"));
+    for (var x = 150; x <= 500; x += 50) {
+      tube.appendChild(svgEl(doc, "path", { d: "M" + x + " 30a14 45 0 0 1 0 90" }, "tun-rib"));
+    }
+    /* Порталы. */
+    var inP = g("tun-portal tun-in");
+    inP.appendChild(svgEl(doc, "ellipse", { cx: 92, cy: 75, rx: 20, ry: 45 }, "tun-mouth"));
+    var outP = g("tun-portal tun-out");
+    outP.appendChild(svgEl(doc, "ellipse", { cx: 548, cy: 75, rx: 20, ry: 45 }, "tun-mouth"));
+    /* Узлы. */
+    var router = g("tun-node tun-router");
+    router.appendChild(svgEl(doc, "path", { d: "M20 70V40M54 70V40" }, "tun-detail"));
+    router.appendChild(svgEl(doc, "rect", { x: 8, y: 70, width: 58, height: 20, rx: 4 }));
+    [20, 29, 38].forEach(function (cx) { router.appendChild(svgEl(doc, "circle", { cx: cx, cy: 80, r: 2.4 }, "tun-led")); });
+    var relay = g("tun-node tun-relay");
+    relay.appendChild(svgEl(doc, "circle", { cx: 604, cy: 75, r: 22 }));
+    relay.appendChild(svgEl(doc, "path", { d: "M593 76l22-9-6 20-5-7-5 3z" }, "tun-detail"));
+    /* Пакеты: туда — по верхней полосе, обратно — по нижней. */
+    var routes = g("tun-routes");
+    routes.appendChild(svgEl(doc, "path", { d: "M58 80C72 80 76 62 96 62H540C566 62 572 75 582 75", id: "tun-route-out" }, "tun-route"));
+    routes.appendChild(svgEl(doc, "path", { d: "M582 80C572 80 566 88 540 88H96C76 88 72 84 58 84", id: "tun-route-back" }, "tun-route"));
+    var traffic = g("tun-traffic");
+    for (var i = 0; i < 4; i++) {
+      traffic.appendChild(svgEl(doc, "rect", { x: 100, y: 58, width: 22, height: 9, rx: 4.5 }, "pkt pkt-out pkt-" + i));
+      traffic.appendChild(svgEl(doc, "rect", { x: 518, y: 83, width: 22, height: 9, rx: 4.5 }, "pkt pkt-back pkt-" + i));
+    }
+    /* Шлагбаум на входе, когда служба стоит. */
+    var gate = g("tun-gate");
+    gate.appendChild(svgEl(doc, "path", { d: "M72 36v78M112 36v78M72 56h40M72 94h40" }));
+    fig.appendChild(s);
+    var labels = el(doc, "figcaption", "tun-labels");
+    add(labels, el(doc, "span", "", "Этот роутер"), el(doc, "span", "", "Ретранслятор"));
+    fig.appendChild(labels);
+    void st;
+    return fig;
+  }
+
+  /* Петля туннеля живёт, только пока он на экране и вкладка видна:
+     SVG анимируется в основном потоке, и бесконечная петля за кадром — чистый расход. */
+  function tunnelMotion(body, st, prev) {
+    var g = Motion.g;
+    if (body.__tl) { body.__tl.kill(); body.__tl = null; }
+    if (body.__tick) { g.ticker.remove(body.__tick); body.__tick = null; }
+    if (!Motion.on()) { tunnelWatch(body); return; }
+    var svg = body.querySelector(".tun");
+    if (!svg) return;
+    var q = function (sel) { return [].slice.call(svg.querySelectorAll(sel)); };
+    var tl = g.timeline({ paused: true });
+    if (st === "connected") {
+      var out = q(".pkt-out"), back = q(".pkt-back");
+      g.set(out.concat(back), { x: 0, y: 0, attr: { x: -11, y: -4.5 } });
+      out.forEach(function (pkt, i) {
+        tl.fromTo(pkt, { autoAlpha: 0 }, { keyframes: { autoAlpha: [0, 1, 1, 1, 1, 0] }, duration: 2.8, repeat: -1, ease: "none" }, i * 0.75);
+        tl.to(pkt, { motionPath: { path: "#tun-route-out", align: "#tun-route-out", alignOrigin: [0.5, 0.5] }, duration: 2.8, repeat: -1, ease: "none" }, i * 0.75);
+      });
+      back.forEach(function (pkt, i) {
+        tl.fromTo(pkt, { autoAlpha: 0 }, { keyframes: { autoAlpha: [0, 0.7, 0.7, 0.7, 0.7, 0] }, duration: 3.2, repeat: -1, ease: "none" }, 0.4 + i * 0.85);
+        tl.to(pkt, { motionPath: { path: "#tun-route-back", align: "#tun-route-back", alignOrigin: [0.5, 0.5] }, duration: 3.2, repeat: -1, ease: "none" }, 0.4 + i * 0.85);
+      });
+      if (prev && prev !== "connected") {
+        g.fromTo(q(".tun-rib"), { drawSVG: "50% 50%" }, { drawSVG: "0% 100%", duration: 0.6, stagger: 0.05, ease: "power2.out" });
+        g.from(q(".tun-led"), { autoAlpha: 0, duration: 0.2, stagger: 0.1, repeat: 2, yoyo: true });
+      }
+    } else if (st === "connecting") {
+      tl.fromTo(q(".tun-rib"), { drawSVG: "0% 0%" }, { drawSVG: "0% 100%", duration: 0.5, stagger: 0.12, ease: "power2.out", repeat: -1, repeatDelay: 0.6 }, 0);
+      tl.fromTo(q(".pkt-out.pkt-0"), { autoAlpha: 0.3, x: 0 }, { autoAlpha: 1, x: 14, duration: 0.7, yoyo: true, repeat: -1, ease: "sine.inOut" }, 0);
+    } else if (st === "stopped" && prev && prev !== "stopped") {
+      g.fromTo(q(".tun-gate path"), { y: -70, autoAlpha: 1 }, { y: 0, duration: 0.9, ease: "bounce.out", clearProps: "transform" });
+    }
+    body.__tl = tl;
+    tunnelWatch(body);
+  }
+
+  function tunnelWatch(body) {
+    var win = global;
+    var sync = function () {
+      var visible = body.__onscreen !== false && !(win.document && win.document.hidden);
+      body.setAttribute("data-onscreen", String(visible));
+      if (body.__tl) {
+        /* Петля идёт на 30 кадрах: для фоновой иллюстрации этого достаточно,
+           а работы основного потока вдвое меньше. */
+        var tl = body.__tl, g = Motion.g;
+        tl.pause();
+        if (body.__tick) { g.ticker.remove(body.__tick); body.__tick = null; }
+        if (visible) {
+          var last = g.ticker.time, odd = false;
+          body.__tick = function (time) {
+            odd = !odd;
+            if (odd) return;
+            tl.time(tl.time() + (time - last));
+            last = time;
+          };
+          g.ticker.add(body.__tick);
+        }
+      }
+    };
+    if (!body.__io && typeof win.IntersectionObserver === "function") {
+      body.__io = new win.IntersectionObserver(function (entries) {
+        body.__onscreen = entries[entries.length - 1].isIntersecting;
+        sync();
+      });
+      body.__io.observe(body);
+      win.document.addEventListener("visibilitychange", sync);
+    }
+    sync();
+  }
+
+  App.prototype.renderTelegram = function (m, force) {
+    var doc = this.doc, self = this;
+    if (!m) return;
+    var snap = m.snap;
+    var st = TG[snap.telegram_status] ? snap.telegram_status : (snap.telegram_configured ? "stopped" : "not_configured");
+    var info = TG[st];
+    var busy = snap.control_state === "running" || !!this.pending;
+    var body = this.$("telegram-body");
+    var key = JSON.stringify([st, snap.telegram_enabled, snap.telegram_configured, snap.controls_enabled, busy, this.pending]);
+    if (!force && body.__d2kKey === key) return;
+    var focused = doc.activeElement && body.contains(doc.activeElement) ? doc.activeElement.getAttribute("data-control") : null;
+    body.__d2kKey = key;
+    var state = el(doc, "div", "tunnel-state");
+    var lamp = el(doc, "span", "lamp");
+    lamp.setAttribute("data-tone", info.lamp);
+    add(state, lamp, el(doc, "span", "tunnel-word", info.word));
+    var actions = el(doc, "div", "tunnel-actions");
+    if (snap.controls_enabled) {
+      if (snap.telegram_enabled) {
+        actions.appendChild(this.button("telegram-disable", "Выключить туннель", "stop", null, busy));
+      } else {
+        actions.appendChild(this.button("telegram-enable", "Включить туннель", "send", "primary", busy || !snap.telegram_configured));
       }
     }
-    if (focusedId === "box-filter" && filter.focus) {
-      filter.focus();
-      if (selectionStart !== null && filter.setSelectionRange) filter.setSelectionRange(selectionStart, selectionEnd);
+    var note = info.note;
+    if (snap.telegram_enabled && st === "stopped") note = "Туннель включён в конфигурации, но служба не запущена.";
+    body.setAttribute("data-state", st);
+    var prevState = body.getAttribute("data-prev") || "";
+    var keepScene = body.__scene && body.__sceneState === st ? body.__scene : null;
+    var scene = keepScene || tunnelScene(doc, st);
+    body.replaceChildren(state, actions, scene, el(doc, "p", "tunnel-note", note));
+    if (!keepScene) {
+      body.__scene = scene;
+      body.__sceneState = st;
+      tunnelMotion(body, st, prevState);
     }
-    rootNode.setAttribute("aria-busy", "false");
-    animateSlides(rootNode, doc);
-  }
+    body.setAttribute("data-prev", st);
+    if (focused) {
+      var again = body.querySelector("button");
+      if (again) again.focus();
+    }
+    void self;
+  };
 
-  function networkContext(item) {
-    var family = item.family || 4;
-    var transport = item.transport || 6;
-    return (family === 6 ? "IPv6" : family === 4 ? "IPv4" : "Семейство не определено") +
-      (transport === 6 ? " / TCP" : transport === 17 ? " / UDP" : "");
-  }
+  /* ─── Диагностика ─── */
 
-  function contextKey(item) {
-    return [item.target || "", item.family || 4, item.transport || 6];
-  }
+  App.prototype.drawStages = function () {
+    var body = this.$("diagnostics-body"), win = global;
+    if (!Motion.on()) return;
+    var run = function () {
+      var paths = body.querySelectorAll(".stages svg path");
+      if (paths.length) Motion.g.fromTo(paths, { drawSVG: "0%" }, { drawSVG: "100%", duration: 0.5, stagger: 0.07, ease: "power2.out", clearProps: "strokeDasharray,strokeDashoffset" });
+    };
+    if (body.__seen) { run(); return; }
+    if (typeof win.IntersectionObserver !== "function" || body.__io) return;
+    body.__io = new win.IntersectionObserver(function (entries) {
+      if (!entries[entries.length - 1].isIntersecting) return;
+      body.__seen = true; body.__io.disconnect(); run();
+    }, { threshold: 0.2 });
+    body.__io.observe(body);
+  };
 
-  function renderSearch(doc, parent, search) {
-    var card = append(parent, node(doc, "article", undefined, "search-item"));
-    if (card.style) card.style.setProperty("--name-length", Math.max(8, String(search.target || "").length));
-    setAttr(card, "data-slide-key", JSON.stringify(contextKey(search).concat(
-      [search.shape || 0, search.proto || "", search.ech_origin || "", search.probe_path || "/"])));
-    setAttr(card, "data-slide-stage", search.phase === "подтверждено, смотрим живой трафик"
-      ? "confirmed" : search.phase || "unknown");
-    var content = append(card, node(doc, "div", undefined, "slide-content"));
-    var select = append(content, node(doc, "button", undefined, "slide-select"));
-    append(select, node(doc, "span", "", "slide-number"));
-    append(select, node(doc, "span", "Подбор", "slide-label"));
-    setAttr(select, "type", "button");
-    setAttr(select, "data-select-slide", card.getAttribute("data-slide-key"));
-    setAttr(select, "data-ui-key", "select:" + card.getAttribute("data-slide-key"));
-    setAttr(select, "aria-label", "Выбрать подбор " + (search.target || "без имени"));
-    setAttr(select, "aria-pressed", "false");
-    var top = append(content, node(doc, "div", undefined, "search-top"));
-    var targetLabel = append(top, node(doc, "strong", search.target || "цель без имени", "search-target"));
-    setAttr(targetLabel, "title", search.target || "цель без имени");
-    var stageIndex = ({
-      "ждём форму приветствия":0, "распознаём поведение":0,
-      "спрашиваем коробку о свойствах":0, "выводим планы":1,
-      "проверяем готовое узнанной коробки":2, "проверяем выведенный план":2,
-      "подтверждено, смотрим живой трафик":3
-    })[search.phase];
-    if (stageIndex !== undefined) {
-      var steps = node(doc, "ol", undefined, "slide-stages");
-      setAttr(steps, "aria-label", "Этапы подбора");
-      ["Замер", "Создание", "Проверка", "Сохранено"].forEach(function (label, index) {
-        var step = append(steps, node(doc, "li", label));
-        if (index === stageIndex) setAttr(step, "aria-current", "step");
+  App.prototype.renderDiagnostics = function (m) {
+    var doc = this.doc;
+    var snap = m.snap;
+    var body = this.$("diagnostics-body");
+    var col = this.$("colophon");
+    var meas = m.k.measurements || {};
+    var key = JSON.stringify([snap.stages, snap.absent, snap.config_path, snap.config_exists, snap.mode, snap.state_dir,
+      snap.state_dir_note, snap.queue_num, snap.unknown_keys, snap.engine_running, snap.controller_running,
+      snap.live_fresh, m.linked, m.k.catalog_at, m.k.client_unfit, meas.cores, snap.controls_enabled, snap.control_state]);
+    var redrawn = section(body, key, function () {
+      var wrap = el(doc, "div", "diag");
+
+      var left = el(doc, "div");
+      left.appendChild(el(doc, "h3", "", "Цепочка движка"));
+      var ul = el(doc, "ul", "stages");
+      list(snap.stages).forEach(function (s) {
+        var li = el(doc, "li");
+        li.setAttribute("data-ok", String(!!s.built));
+        add(li, icon(doc, s.built ? "check" : "cross"), el(doc, "b", "", str(s.title)), el(doc, "p", "", str(s.detail)));
+        ul.appendChild(li);
       });
-    }
-    var meta = append(content, node(doc, "div", undefined, "search-meta"));
-    var protocol = search.proto ? protocolName(search.proto) :
-      ({1:"TLS 1.3",2:"TLS 1.2",3:"QUIC",6:"TLS 1.3 с ECH"})[search.shape];
-    append(meta, node(doc, "span", (protocol ? protocol + " · " : "") + networkContext(search)));
-    append(meta, node(doc, "span", "Начато " + safeDate(search.since)));
-    if (steps) append(content, steps);
-    var phase = append(content, node(doc, "p", undefined, "phase-tag"));
-    if (stageIndex === 3) append(phase, icon(doc, "confirmed"));
-    append(phase, node(doc, "span", searchPhase(search.phase)));
-    var counts = append(content, node(doc, "div", undefined, "search-counts"));
-    append(counts, node(doc, "span", "Проверено вариантов: " + (search.attempts || 0)));
-    var detail = append(content, node(doc, "details", undefined, "search-detail"));
-    setAttr(detail, "data-ui-key", "search:" + JSON.stringify(contextKey(search)));
-    var summary = append(detail, node(doc, "summary"));
-    append(summary, icon(doc, "document"));
-    append(summary, node(doc, "span", "Подробности"));
-    append(summary, icon(doc, "arrow"));
-    append(detail, node(doc, "p", "Цель: " + (search.target || "без имени")));
-    append(detail, node(doc, "p", "Исходный сигнал: " + (search.source || "не указан")));
-    append(detail, node(doc, "p", "Текущий этап: " + (search.phase || "не указан")));
-    append(detail, node(doc, "p", "Зондов отправлено: " + (search.probes || 0)));
-    if (search.candidate) append(detail, node(doc, "p", "Текущий вариант: " + search.candidate));
-  }
-
-  function coveredByFamily(binding, groups) {
-    if (binding.kind && binding.kind !== "name") return false;
-    var name = String(binding.target || "").toLowerCase().replace(/\.$/, "");
-    return groups.some(function (group) {
-      var suffix = group.suffix.toLowerCase().replace(/\.$/, "");
-      if (!group.active || (binding.transport || 6) !== group.transport ||
-          (binding.family || 4) !== group.family || (binding.shape || 0) !== group.shape ||
-          (binding.probe_path || "/") !== (group.probe_path || "/") ||
-          (binding.ech_origin || "") !== (group.ech_origin || "")) return false;
-      if (name !== suffix && !name.endsWith("." + suffix)) return false;
-      return !(Array.isArray(group.exceptions) ? group.exceptions : []).some(function (exception) {
-        return exception && String(exception.name || "").toLowerCase().replace(/\.$/, "") === name;
+      list(snap.absent).forEach(function (s) {
+        var li = el(doc, "li");
+        li.setAttribute("data-absent", "true");
+        add(li, icon(doc, "dash"), el(doc, "b", "", str(s.title) + " — не измеряется"), el(doc, "p", "", str(s.detail)));
+        ul.appendChild(li);
       });
-    });
-  }
+      if (!list(snap.stages).length && !list(snap.absent).length) ul.appendChild(el(doc, "li", "", "Сведений о цепочке нет."));
+      left.appendChild(ul);
 
-  function renderFamily(doc, parent, group, linked, index) {
-    var item = append(parent, node(doc, "article", undefined, "family-item"));
-    setAttr(item, "data-active", !!(linked && group.active));
-    var tab = append(item, node(doc, "span", "S" + (index + 1), "family-tab"));
-    setAttr(tab, "aria-hidden", "true");
-    if (linked && group.active) setAttr(item, "data-family-context",
-      JSON.stringify([group.suffix, group.family, group.transport, group.shape,
-        group.ech_origin || "", group.probe_path || "/",
-        (Array.isArray(group.exceptions) ? group.exceptions : []).map(function (item) { return item.name; })]));
-    var head = append(item, node(doc, "header", undefined, "family-header"));
-    heading(doc, head, 3, group.suffix);
-    append(head, node(doc, "span", linked && group.active ? "Применяется" : "Сохранено, применение не подтверждено",
-      "family-state"));
-    var shape = group.shape === 1 ? "TLS 1.3" : group.shape === 2 ? "TLS 1.2" :
-      group.shape === 3 ? "QUIC" : group.shape === 6 ? "TLS 1.3 с ECH" : "Протокол не указан";
-    append(item, node(doc, "p", shape + " · " + (group.family === 6 ? "IPv6" : "IPv4"),
-      "family-context"));
-    var details = append(item, node(doc, "details", undefined, "family-detail"));
-    details.setAttribute("data-ui-key", "family:" + JSON.stringify([group.suffix, group.transport,
-      group.family, group.shape, group.probe_path, group.ech_origin]));
-    var summary = append(details, node(doc, "summary"));
-    append(summary, icon(doc, "document"));
-    append(summary, node(doc, "span", "Подробности"));
-    append(summary, icon(doc, "arrow"));
-    append(details, node(doc, "p", russianCount(group.evidence_count,
-      "исходное подтверждение", "исходных подтверждения", "исходных подтверждений")));
-    append(details, node(doc, "p", "План: " + (group.plan_id || "не записан")));
-    if (group.probe_path) append(details, node(doc, "p", "Проверенный путь: " + group.probe_path));
-    if (group.ech_origin) append(details, node(doc, "p", "ECH-origin: " + group.ech_origin));
-    var evidence = Array.isArray(group.evidence) ? group.evidence : [];
-    if (evidence.length) {
-      append(details, node(doc, "p", "Собственные измерения, на которых обучена область:"));
-      var list = append(details, node(doc, "ul"));
-      evidence.forEach(function (name) { if (typeof name === "string") append(list, node(doc, "li", name)); });
-    }
-    var exceptions = Array.isArray(group.exceptions) ? group.exceptions.filter(function (e) { return e && e.name; }) : [];
-    if (exceptions.length) {
-      append(details, node(doc, "p", "Исключения не используют общий обход:"));
-      var excluded = append(details, node(doc, "ul"));
-      exceptions.forEach(function (e) { append(excluded, node(doc, "li", e.name + " — " + (e.reason || "отдельное решение"))); });
-    }
-  }
-
-  function renderBox(doc, parent, box, index, groups) {
-    var article = append(parent, node(doc, "article", undefined, "box-item"));
-    var head = append(article, node(doc, "header", undefined, "box-header"));
-    var identity = append(head, node(doc, "div"));
-    heading(doc, identity, 3, "Тип блокировки " + (index + 1));
-    append(identity, node(doc, "span", "Сохранено " + safeDate(box.created), "box-created"));
-    var supportDetails = append(article, node(doc, "details", undefined, "box-support-detail"));
-    setAttr(supportDetails, "data-ui-key", "support:" + (box.id || index));
-    append(supportDetails, node(doc, "summary", "Для диагностики"));
-    append(supportDetails, node(doc, "code", "Внутренний код: " + (box.id || "не записан")));
-    var activeCount = (Array.isArray(box.bindings) ? box.bindings : []).filter(function (b) { return b.enabled; }).length;
-    append(head, node(doc, "span", russianCount(activeCount, "результат", "результата", "результатов"), "box-badge"));
-    var signals = Array.isArray(box.signals) ? box.signals : [];
-    if (signals.length) {
-      var signalDetails = append(article, node(doc, "details", undefined, "signal-detail"));
-      setAttr(signalDetails, "data-ui-key", "signals:" + (box.id || index));
-      append(signalDetails, node(doc, "summary", "Как D2K распознал эту блокировку"));
-      var signalList = append(signalDetails, node(doc, "div", undefined, "signal-list"));
-      signals.forEach(function (signal) {
-      var signalRow = append(signalList, node(doc, "div", undefined, "signal-row"));
-      append(signalRow, node(doc, "span", signal.kind || "примета", "signal-kind"));
-      append(signalRow, node(doc, "span", signal.human || "Описание не записано."));
-      append(signalRow, node(doc, "span", "×" + (signal.seen || 0), "signal-seen"));
-      });
-    }
-    var targets = append(article, node(doc, "div", undefined, "target-list"));
-    heading(doc, targets, 4, "Адреса и обходы");
-    (Array.isArray(box.bindings) ? box.bindings : []).filter(function (binding) {
-      return !coveredByFamily(binding, groups);
-    }).forEach(function (binding) {
-      var row = append(targets, node(doc, "div", undefined, "target-row" + (binding.enabled ? "" : " target-disabled")));
-      var target = append(row, node(doc, "div", undefined, "target-identity"));
-      append(target, node(doc, "strong", binding.target || "цель не названа", "target-name"));
-      append(target, node(doc, "span", networkContext(binding), "target-kind"));
-      var evidence = append(row, node(doc, "div", undefined, "evidence"));
-      var meter = append(evidence, node(doc, "span", undefined, "evidence-meter"));
-      meter.setAttribute("role", "img");
-      meter.setAttribute("aria-label", "уровень доказательства " + (binding.level || 0) + " из 5: " + (binding.level_name || "неизвестен"));
-      for (var i = 0; i < 5; i++) append(meter, node(doc, "i", undefined, i < (binding.level || 0) ? "filled" : ""));
-      append(evidence, node(doc, "span", binding.level_name || "уровень не определён", "evidence-label"));
-      var successes = append(row, node(doc, "span", (binding.successes || 0) + " подтверждений", "target-successes"));
-      var copy = append(row, node(doc, "button", "Копировать", "copy-button"));
-      copy.setAttribute("type", "button");
-      copy.setAttribute("data-copy", binding.target || "");
-      copy.setAttribute("data-ui-key", "copy:" + JSON.stringify(
-        [box.id || index, binding.kind || "name", binding.shape || 0].concat(contextKey(binding))));
-      copy.setAttribute("aria-label", "Скопировать адрес " + (binding.target || ""));
-      void successes;
-    });
-    (Array.isArray(box.plans) ? box.plans : []).forEach(function (plan, index) {
-      var planKey = "plan:" + (box.id || "") + ":" + index;
-      var detail = append(article, node(doc, "details", undefined, "plan-detail"));
-      detail.setAttribute("data-ui-key", planKey);
-      var summary = append(detail, node(doc, "summary"));
-      summary.setAttribute("data-ui-key", "summary:" + planKey);
-      append(summary, node(doc, "span", protocolName(plan.proto), "protocol-tag"));
-      append(summary, doc.createTextNode(plan.enabled ? "Проверенный обход" : "Обход отключён"));
-      if (plan.human) append(detail, node(doc, "p", plan.human, "plan-human"));
-      var technical = append(detail, node(doc, "details", undefined, "technical-detail"));
-      technical.setAttribute("data-ui-key", "technical:" + (box.id || "") + ":" + index);
-      var technicalSummary = append(technical, node(doc, "summary", "Технические данные"));
-      technicalSummary.setAttribute("data-ui-key", "technical-summary:" + (box.id || "") + ":" + index);
-      append(technical, node(doc, "pre", plan.text || "План не записан."));
-    });
-    if (!signals.length) append(article, node(doc, "p", "D2K пока не записал признаки этой блокировки.", "quiet"));
-  }
-
-  function filterBoxes(rootNode, query) {
-    var term = String(query || "").trim().toLocaleLowerCase("ru-RU");
-    var list = rootNode.querySelectorAll ? rootNode.querySelectorAll(".box-item") : [];
-    Array.prototype.forEach.call(list, function (item) {
-      item.hidden = !!term && !item.textContent.toLocaleLowerCase("ru-RU").includes(term);
-    });
-  }
-
-  function copyValue(doc, value) {
-    if (root.navigator && root.navigator.clipboard && root.navigator.clipboard.writeText) {
-      return root.navigator.clipboard.writeText(value).then(function () { return true; }).catch(function () { return false; });
-    }
-    if (!doc.body || !doc.execCommand) return Promise.resolve(false);
-    var field = doc.createElement("textarea");
-    field.value = value;
-    field.setAttribute("readonly", "");
-    field.setAttribute("aria-hidden", "true");
-    field.style.position = "fixed";
-    field.style.opacity = "0";
-    doc.body.appendChild(field);
-    field.select();
-    var copied = false;
-    try { copied = doc.execCommand("copy"); } catch (err) { copied = false; }
-    doc.body.removeChild(field);
-    return Promise.resolve(!!copied);
-  }
-
-  async function runControl(action, button, doc) {
-    var result = doc.getElementById("control-result");
-    controlInFlight = true;
-    button.disabled = true;
-    controlMessage = "Выполняется команда службы…";
-    if (result) result.textContent = controlMessage;
-    try {
-      var payload = await requestJSON("/api/control/" + encodeURIComponent(action), {
-        method: "POST", cache: "no-store",
-      }, 10000);
-      if (!payload.ok) throw new Error(payload.message || "Ошибка команды");
-      controlMessage = payload.message || "Команда выполнена.";
-    } catch (err) {
-      controlMessage = "Не удалось получить результат команды. Проверьте состояние службы: " +
-        (err && err.message ? err.message : "ошибка связи с панелью");
-    } finally {
-      controlInFlight = false;
-      await refresh();
-    }
-  }
-
-  async function refresh() {
-    if (refreshInFlight || root.document.hidden) return;
-    root.clearTimeout(refreshTimer);
-    refreshInFlight = true;
-    refreshAbort = new root.AbortController();
-    var deadline = root.setTimeout(function () { refreshAbort.abort(); }, 10000);
-    var app = root.document.getElementById("app");
-    try {
-      var response = await root.fetch("/api/status", { cache: "no-store", signal: refreshAbort.signal });
-      if (!response.ok) throw new Error("HTTP " + response.status);
-      render(app, await response.json(), root.document);
-    } catch (err) {
-      if (root.document.hidden) return;
-      var staleControls = clearContent(app);
-      if (staleControls) {
-        Array.prototype.forEach.call(staleControls.querySelectorAll("button"), function (button) { button.disabled = true; });
+      var right = el(doc, "div");
+      right.appendChild(el(doc, "h3", "", "Запуск и настройки"));
+      var dl = el(doc, "dl", "facts");
+      function fact(label, value, tone, mono) {
+        var dd = el(doc, "dd", mono ? "mono" : "", value);
+        if (tone) dd.setAttribute("data-tone", tone);
+        add(dl, el(doc, "dt", "", label), dd);
       }
-      var warning = node(root.document, "section", undefined, "connection-error");
-      var errorIcon = append(warning, icon(root.document, "error"));
-      errorIcon.setAttribute("class", "ui-icon error-mark");
-      heading(root.document, warning, 1, "Не удалось получить состояние");
-      append(warning, node(root.document, "p", "Проверьте журнал d2kpanel и доступность локального процесса. Последнее состояние не подменяется нулями."));
-      app.appendChild(warning);
-      app.setAttribute("aria-busy", "false");
-      var indicator = root.document.getElementById("live-indicator");
-      if (indicator) {
-        indicator.setAttribute("data-state", "disconnected");
-        var label = indicator.querySelector && indicator.querySelector("span");
-        if (label) label.textContent = "Панель недоступна";
-      }
-      var rail = root.document.getElementById("rail-state");
-      var updated = root.document.getElementById("rail-updated");
-      if (rail) { rail.textContent = "Нет связи с панелью"; rail.setAttribute("data-connected", "false"); }
-      if (updated) updated.textContent = "состояние неизвестно";
-    } finally {
-      root.clearTimeout(deadline);
-      refreshAbort = null;
-      refreshInFlight = false;
-      if (!root.document.hidden) refreshTimer = root.setTimeout(refresh, 5000);
-    }
-  }
+      fact("Режим", (MODES[snap.mode] || str(snap.mode) || "не указан") + (snap.mode ? " (MODE=" + snap.mode + ")" : ""));
+      fact("Движок", snap.engine_running ? "процесс запущен" : "процесс не найден", snap.engine_running ? null : "bad");
+      fact("Контроллер", snap.controller_running ? "процесс запущен" : "процесс не найден", snap.controller_running ? null : "bad");
+      fact("Управление", snap.controls_enabled
+        ? "включено; команды принимаются только со страницы этой панели"
+        : "отключено в конфигурации", null);
+      var last = { idle: "", running: "выполняется", done: "выполнена", failed: "завершилась ошибкой", timeout: "не завершилась вовремя" }[str(snap.control_state)];
+      if (last) fact("Последняя команда", last, snap.control_state === "failed" || snap.control_state === "timeout" ? "warn" : null);
+      if (m.panelUptime) fact("Панель запущена", duration(m.panelUptime * 1000) + " назад");
+      fact("Связь с датапатом", m.linked ? "есть" : "нет", m.linked ? null : "bad");
+      fact("Снимок движка", snap.live_fresh ? "свежий" : "устарел или отсутствует", snap.live_fresh ? null : "warn");
+      fact("Конфигурация", str(snap.config_path) + (snap.config_exists ? "" : " — файла нет, действуют умолчания"),
+        snap.config_exists ? null : "warn", true);
+      fact("Каталог состояния", str(snap.state_dir) + " — " + str(snap.state_dir_note), null, true);
+      if (m.k.catalog_at) fact("Файл каталога", str(m.k.catalog_at), null, true);
+      if (num(snap.queue_num) !== null) fact("Очередь NFQUEUE", String(snap.queue_num), null, true);
+      if (num(m.k.client_unfit) !== null) fact("План не подошёл клиенту", String(m.k.client_unfit), m.k.client_unfit ? "warn" : null);
+      var unknown = list(snap.unknown_keys);
+      if (unknown.length) fact("Непонятные ключи", unknown.join(", ") + " — эта сборка их не читает", "warn", true);
+      right.appendChild(dl);
 
-  var api = { render: render, renderBox: renderBox, renderSearch: renderSearch, filterBoxes: filterBoxes, refresh: refresh,
-    slideEvents: slideEvents };
-  if (typeof module !== "undefined" && module.exports) module.exports = api;
-  if (root.document) {
-    root.document.addEventListener("DOMContentLoaded", function () {
-      refresh();
+      add(wrap, left, right);
+      return [wrap];
     });
-    root.document.addEventListener("visibilitychange", function () {
-      root.clearTimeout(refreshTimer);
-      if (root.document.hidden) { if (refreshAbort) refreshAbort.abort(); }
-      else refresh();
+    if (redrawn) this.drawStages();
+    col.replaceChildren();
+    add(col,
+      el(doc, "span", "", "D2K " + str(snap.version) + (snap.dirty ? " (изменённая сборка)" : "")),
+      snap.commit ? el(doc, "span", "mono", str(snap.commit).slice(0, 12)) : null,
+      parseTime(snap.built) ? el(doc, "span", "", "собран " + localTime(parseTime(snap.built))) : null,
+      parseTime(snap.taken) ? el(doc, "span", "", "снимок " + localTime(parseTime(snap.taken))) : null);
+  };
+
+  /* ─── Навигация ─── */
+
+  App.prototype.renderNav = function (m) {
+    var set = function (id, text, tone) {
+      var n = this.$(id);
+      n.textContent = text;
+      if (tone) n.setAttribute("data-tone", tone); else n.removeAttribute("data-tone");
+    }.bind(this);
+    set("nav-now", !m.engine ? "стоп" : !m.linked ? "нет связи" : m.hunting ? String(m.hunting) : "", m.hunting ? "live" : null);
+    set("nav-families", m.groups.length ? String(m.groups.length) : "");
+    set("nav-boxes", m.boxes.length ? String(m.boxes.length) : "");
+    var tg = m.snap.telegram_status;
+    set("nav-telegram", tg === "connected" ? "вкл" : tg === "connecting" ? "…" : "выкл");
+    var bad = list(m.snap.stages).filter(function (s) { return !s.built; }).length;
+    set("nav-diagnostics", bad ? "!" + bad : "", bad ? "warn" : null);
+  };
+
+  /* Оглавление: плавный переход к разделу с учётом шапки, маркер переезжает
+     к активному пункту, тонкая полоса под шапкой показывает прокрутку страницы. */
+  App.prototype.navMotion = function () {
+    var doc = this.doc, win = this.win, self = this;
+    var nav = doc.querySelector(".index"), mast = doc.getElementById("mast");
+    if (!nav) return;
+    nav.addEventListener("click", function (e) {
+      var a = e.target.closest ? e.target.closest("a[href^='#']") : null;
+      if (!a || !Motion.on() || !win.ScrollToPlugin) return;
+      var target = doc.querySelector(a.getAttribute("href"));
+      if (!target) return;
+      e.preventDefault();
+      var off = (mast ? mast.offsetHeight : 0) + (win.innerWidth <= 1080 ? 72 : 20);
+      Motion.g.to(win, { scrollTo: { y: target, offsetY: off, autoKill: true }, duration: 0.8, ease: "power3.inOut" });
+      if (win.history && win.history.replaceState) win.history.replaceState(null, "", a.getAttribute("href"));
     });
-    root.addEventListener("hashchange", function () {
-      var current = root.location.hash || "#overview";
-      var links = root.document.querySelectorAll(".nav-link");
-      Array.prototype.forEach.call(links, function (link) {
-        if (link.getAttribute("href") === current) link.classList.add("active");
-        else link.classList.remove("active");
+    var marker = el(doc, "span", "index-marker");
+    marker.setAttribute("aria-hidden", "true");
+    nav.insertBefore(marker, nav.firstChild);
+    this.navMarker = marker;
+    var bar = el(doc, "span", "mast-progress");
+    bar.setAttribute("aria-hidden", "true");
+    if (mast) mast.appendChild(bar);
+    var setBar = Motion.g ? Motion.g.quickSetter(bar, "scaleX") : function (v) { bar.style.transform = "scaleX(" + v + ")"; };
+    var ticking = false;
+    var onScroll = function () {
+      if (ticking) return;
+      ticking = true;
+      win.requestAnimationFrame(function () {
+        ticking = false;
+        var max = doc.documentElement.scrollHeight - win.innerHeight;
+        setBar(max > 0 ? Math.min(1, win.pageYOffset / max) : 0);
       });
+    };
+    win.addEventListener("scroll", onScroll, { passive: true });
+    win.addEventListener("resize", function () { onScroll(); self.moveMarker(true); });
+    onScroll();
+  };
+
+  App.prototype.moveMarker = function (instant) {
+    var marker = this.navMarker, nav = marker && marker.parentNode;
+    if (!marker) return;
+    var cur = nav.querySelector("a[aria-current='true']");
+    if (!cur) { marker.style.opacity = "0"; return; }
+    var box = { x: cur.offsetLeft, y: cur.offsetTop, width: cur.offsetWidth, height: cur.offsetHeight, opacity: 1 };
+    if (Motion.on() && !instant && marker.__placed) Motion.g.to(marker, Object.assign({ duration: 0.45, ease: "power3.out" }, box));
+    else if (Motion.g) Motion.g.set(marker, box);
+    else { marker.style.transform = "translate(" + box.x + "px," + box.y + "px)"; marker.style.width = box.width + "px"; marker.style.height = box.height + "px"; marker.style.opacity = "1"; }
+    marker.__placed = true;
+  };
+
+  /* Знак D2K: линия обхода прорисовывается один раз, препятствие садится на место. */
+  App.prototype.drawMark = function () {
+    if (!Motion.on()) return;
+    var d = this.doc;
+    Motion.g.timeline({ delay: 0.1 })
+      .from(d.querySelector(".mark-line"), { drawSVG: "0%", duration: 0.9, ease: "power2.inOut" })
+      .from(d.querySelector(".mark-block"), { y: -10, autoAlpha: 0, duration: 0.6, ease: "bounce.out", svgOrigin: "18 20" }, "-=0.45");
+  };
+
+  App.prototype.spy = function () {
+    var doc = this.doc, self = this;
+    if (typeof IntersectionObserver !== "function") return;
+    var links = doc.querySelectorAll("[data-nav]");
+    var seen = {};
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { seen[e.target.id] = e.isIntersecting ? e.intersectionRatio : 0; });
+      var best = null, score = 0;
+      Object.keys(seen).forEach(function (id) { if (seen[id] > score) { score = seen[id]; best = id; } });
+      if (!best) return;
+      for (var i = 0; i < links.length; i++) {
+        if (links[i].getAttribute("data-nav") === best) links[i].setAttribute("aria-current", "true");
+        else links[i].removeAttribute("aria-current");
+      }
+      self.moveMarker();
+    }, { rootMargin: "-20% 0px -55% 0px", threshold: [0, .1, .3, .6] });
+    ["now", "families", "boxes", "telegram", "diagnostics"].forEach(function (id) {
+      var s = doc.getElementById(id);
+      if (s) io.observe(s);
     });
+  };
+
+  var api = {
+    model: model, coveredBy: coveredBy, trackFor: trackFor, shapeLabel: shapeLabel,
+    planGist: planGist, plural: plural, duration: duration, App: App
+  };
+  if (typeof module === "object" && module.exports) module.exports = api;
+  if (global && global.document && global.document.getElementById) {
+    var boot = function () { new App(global.document, global).start(); };
+    if (global.document.readyState === "loading") global.document.addEventListener("DOMContentLoaded", boot);
+    else boot();
   }
-})(typeof window !== "undefined" ? window : globalThis);
+})(typeof window !== "undefined" ? window : this);

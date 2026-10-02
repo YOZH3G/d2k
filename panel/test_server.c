@@ -450,20 +450,79 @@ static void test_panel_javascript_is_served_same_origin(void) {
     assert(strstr(response, "Content-Type: application/javascript; charset=utf-8") != NULL);
 }
 
-static void test_generated_brand_assets_are_served_as_png(void) {
+static void test_retired_slidoscope_assets_are_not_served(void) {
+    d2k_panel_config cfg = {
+        .live_path = "/absent",
+        .asset_dir = "../internal/web/assets",
+    };
+    static const char *retired[] = {
+        "/assets/logo-d2k.png", "/assets/mascot-d2k.png", "/assets/mascot.svg",
+        "/assets/oswald.ttf", "/assets/ground.webp", "/assets/rack.webp",
+        "/assets/family-rack.webp", "/assets/slide-left.webp", "/assets/slide-center.webp",
+        "/assets/slide-right.webp", "/assets/slide-holder.webp",
+    };
+    char req[256], response[8192];
+    for (size_t i = 0; i < sizeof retired / sizeof retired[0]; i++) {
+        snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: localhost\r\n\r\n", retired[i]);
+        (void)request(&cfg, req, response, sizeof response);
+        assert(strstr(response, "HTTP/1.1 404 Not Found") != NULL);
+    }
+}
+
+static void test_offline_text_fonts_are_served_as_woff2(void) {
     d2k_panel_config cfg = {
         .live_path = "/absent",
         .asset_dir = "../internal/web/assets",
     };
     char response[8192];
-    (void)request(&cfg, "GET /assets/logo-d2k.png HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    (void)request(&cfg, "GET /assets/onest.woff2 HTTP/1.1\r\nHost: localhost\r\n\r\n",
                   response, sizeof response);
     assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
-    assert(strstr(response, "Content-Type: image/png") != NULL);
-    (void)request(&cfg, "GET /assets/mascot-d2k.png HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    assert(strstr(response, "Content-Type: font/woff2") != NULL);
+    (void)request(&cfg, "GET /assets/jbmono.woff2 HTTP/1.1\r\nHost: localhost\r\n\r\n",
                   response, sizeof response);
     assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
-    assert(strstr(response, "Content-Type: image/png") != NULL);
+    assert(strstr(response, "Content-Type: font/woff2") != NULL);
+}
+
+static void test_vendored_animation_library_is_served_same_origin(void) {
+    d2k_panel_config cfg = {
+        .live_path = "/absent",
+        .asset_dir = "../internal/web/assets",
+    };
+    char response[8192];
+    (void)request(&cfg, "GET /assets/gsap.js HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                  response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "Content-Type: application/javascript; charset=utf-8") != NULL);
+}
+
+static void test_static_assets_revalidate_with_etag(void) {
+    d2k_panel_config cfg = {
+        .live_path = "/absent",
+        .asset_dir = "../internal/web/assets",
+    };
+    char response[8192];
+    (void)request(&cfg, "GET /assets/panel.css HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                  response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "Cache-Control: no-cache") != NULL);
+    const char *etag = strstr(response, "ETag: \"");
+    assert(etag != NULL);
+    char tag[64];
+    const char *start = etag + 6, *end = strstr(start, "\r\n");
+    assert(end && (size_t)(end - start) < sizeof tag);
+    memcpy(tag, start, (size_t)(end - start));
+    tag[end - start] = '\0';
+    char req[256];
+    snprintf(req, sizeof req, "GET /assets/panel.css HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: %s\r\n\r\n", tag);
+    size_t n = request(&cfg, req, response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 304 Not Modified") != NULL);
+    assert(strstr(response, "Content-Length: 0") != NULL);
+    assert(n < 1024);
+    (void)request(&cfg, "GET /assets/panel.css HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"0-0\"\r\n\r\n",
+                  response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
 }
 
 static void test_disconnected_client_cannot_sigpipe_server(void) {
@@ -501,7 +560,10 @@ int main(void) {
     test_asset_symlink_cannot_escape_asset_directory();
     test_root_serves_static_offline_panel_shell();
     test_panel_javascript_is_served_same_origin();
-    test_generated_brand_assets_are_served_as_png();
+    test_retired_slidoscope_assets_are_not_served();
+    test_offline_text_fonts_are_served_as_woff2();
+    test_vendored_animation_library_is_served_same_origin();
+    test_static_assets_revalidate_with_etag();
     test_disconnected_client_cannot_sigpipe_server();
     puts("C panel HTTP contract: all checks passed");
     return 0;

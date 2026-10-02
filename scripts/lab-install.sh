@@ -97,13 +97,10 @@ cp builds/d2ktg-linux-arm64 "$REL/builds/d2ktg-linux-$ARCH"
 make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
-cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/logo-d2k.png internal/web/assets/mascot-d2k.png "$REL/internal/web/assets/"
+cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/gsap.js "$REL/internal/web/assets/"
 cp internal/web/assets/favicon.svg "$REL/internal/web/assets/"
 mkdir -p "$REL/internal/web/assets/fonts"
-cp internal/web/assets/fonts/oswald.ttf internal/web/assets/fonts/OFL-oswald.txt "$REL/internal/web/assets/fonts/"
-cp internal/web/assets/slide-left.webp internal/web/assets/slide-center.webp internal/web/assets/slide-right.webp internal/web/assets/slide-holder.webp "$REL/internal/web/assets/"
-cp internal/web/assets/ground.webp "$REL/internal/web/assets/"
-cp internal/web/assets/rack.webp internal/web/assets/family-rack.webp "$REL/internal/web/assets/"
+cp internal/web/assets/fonts/onest.woff2 internal/web/assets/fonts/OFL-onest.txt internal/web/assets/fonts/jbmono.woff2 internal/web/assets/fonts/OFL-jbmono.txt "$REL/internal/web/assets/fonts/"
 cp files/S99d2k files/config files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
 cp files/d2k-tg-firewall.sh files/d2k-tg-watchdog.sh files/d2k-instagram-dns.sh \
     files/d2k-instagram-dns-scheduler.sh files/meta-ranges.txt files/tg-roots.pem "$REL/files/"
@@ -221,7 +218,7 @@ nfq6_direct
 [ "$(stat -c '%a' "$DIR/state/tg.identity")" = 600 ] || fail "ключ установки доступен не только root"
 [ -x /opt/sbin/d2kpanel ] || fail "C-панель не установлена"
 [ ! -x /opt/sbin/d2k ] || fail "legacy Go-панель осталась установленной"
-[ -s "$DIR/panel/index.html" ] && [ -s "$DIR/panel/panel.css" ] && [ -s "$DIR/panel/panel.js" ] && [ -s "$DIR/panel/logo-d2k.png" ] && [ -s "$DIR/panel/mascot-d2k.png" ] || fail "не установлены статические ресурсы панели"
+[ -s "$DIR/panel/index.html" ] && [ -s "$DIR/panel/panel.css" ] && [ -s "$DIR/panel/panel.js" ] && [ -s "$DIR/panel/gsap.js" ] && [ -s "$DIR/panel/fonts/onest.woff2" ] && [ -s "$DIR/panel/fonts/jbmono.woff2" ] || fail "не установлены статические ресурсы панели"
 [ -x "$INIT" ]        || fail "init-скрипт не установлен"
 [ -f "$DIR/run/d2k-panel.pid" ] || fail "C-панель не получила pid-файл"
 PANEL_PID=$(cat "$DIR/run/d2k-panel.pid")
@@ -246,8 +243,8 @@ if grep -q 'TG_RELAY_SECRET\|relay_secret\|telegram.*secret' /tmp/d2k-panel-stat
     fail "API раскрыл поле или значение секрета ретранслятора"
 fi
 panel_curl -fsS http://127.0.0.1:8090/ | grep -q 'id="app"' || fail "C-панель не отдала главную страницу через LAN-привязку"
-panel_curl -fsS http://127.0.0.1:8090/assets/logo-d2k.png -o /tmp/d2k-logo.png || fail "C-панель не отдала знак D2K"
-panel_curl -fsS http://127.0.0.1:8090/assets/mascot-d2k.png -o /tmp/d2k-mascot.png || fail "C-панель не отдала маскота D2K"
+panel_curl -fsS http://127.0.0.1:8090/assets/gsap.js -o /tmp/d2k-gsap.js || fail "C-панель не отдала библиотеку анимаций"
+panel_curl -fsS http://127.0.0.1:8090/assets/onest.woff2 -o /tmp/d2k-onest.woff2 || fail "C-панель не отдала шрифт"
 panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/stop | grep -q '"ok":true' || fail "локальная панель не остановила движок"
 [ -d "/proc/$PANEL_PID" ] || fail "остановка движка погасила панель управления"
 panel_curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-stopped.json || fail "панель недоступна после остановки движка"

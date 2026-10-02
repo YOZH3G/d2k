@@ -11,9 +11,9 @@ const payload = {
     version:'local-design-preview', stages:[], absent:[], taken:'2026-10-01T12:30:00Z' },
   knowledge: {linked:true, targets:3, confirms:8, probes_used:12,
     searches:[
-      {target:'rutracker.org',shape:2,proto:'tls12',family:4,transport:6,phase:'распознаём поведение',since:'2026-10-01T12:29:00Z',attempts:0,probes:1},
-      {target:'meduza.io',shape:1,proto:'tls13',family:4,transport:6,phase:'проверяем выведенный план',since:'2026-10-01T12:29:00Z',attempts:2,probes:4},
-      {target:'googlevideo.com',shape:3,proto:'quic',family:4,transport:17,phase:'подтверждено, смотрим живой трафик',since:'2026-10-01T12:29:00Z',attempts:1,probes:3}
+      {target:'rutracker.org',shape:2,proto:'tls12',family:4,transport:6,ip:'104.21.32.39',port:443,source:'выведен из замера',phase:'распознаём поведение',since:-48,attempts:0,probes:1},
+      {target:'meduza.io',shape:1,proto:'tls13',family:4,transport:6,ip:'172.67.70.12',port:443,source:'выведен из замера',candidate:'план поставлен',phase:'проверяем выведенный план',since:-203,attempts:2,probes:4},
+      {target:'rr3---sn-gvnuxaxjvh-nbjl.googlevideo.com',shape:3,proto:'quic',family:6,transport:17,ip:'2a00:1450:4010:c0e::5e',port:443,source:'готовый план узнанной коробки',phase:'подтверждено, смотрим живой трафик',since:-611,attempts:1,probes:3}
     ],
     groups:[
       {suffix:'googlevideo.com',active:true,shape:3,family:4,transport:17,evidence_count:3,plan_id:'demo-quic',evidence:['demo.googlevideo.com']},
@@ -22,10 +22,18 @@ const payload = {
     ], boxes:[]
   }
 };
+// D2K_PREVIEW_STATUS=file.json — снятый /api/status; поиски демо-набора подмешиваются к нему.
+if (process.env.D2K_PREVIEW_STATUS) {
+  const captured = JSON.parse(fs.readFileSync(process.env.D2K_PREVIEW_STATUS, 'utf8'));
+  payload.snapshot = { ...captured.snapshot, preview: true };
+  payload.knowledge = { ...captured.knowledge, searches: process.env.D2K_PREVIEW_NO_SEARCHES ? [] : payload.knowledge.searches };
+}
 const actions = [];
 const server=http.createServer((req,res)=>{
   const url=new URL(req.url,'http://localhost');
-  if(url.pathname==='/api/status'){res.setHeader('Content-Type','application/json');return res.end(JSON.stringify(payload));}
+  if(url.pathname==='/api/status'){
+    const now=Date.now();payload.snapshot.taken=new Date(now).toISOString();
+    for(const s of payload.knowledge.searches){if(typeof s.since==='number')s.since=new Date(now+s.since*1000).toISOString();}res.setHeader('Content-Type','application/json');return res.end(JSON.stringify(payload));}
   if(url.pathname.startsWith('/api/control/') && req.method==='POST'){
     const action=url.pathname.slice('/api/control/'.length);actions.push(action);
     if(action==='stop')payload.snapshot.engine_running=false;
@@ -42,12 +50,12 @@ const server=http.createServer((req,res)=>{
     res.setHeader('Content-Type','application/json');return res.end('{"ok":true}');
   }
   let relative=url.pathname==='/'?'index.html':url.pathname.replace(/^\/assets\//,'');
-  if(relative==='oswald.ttf')relative='fonts/'+relative;
+  if(/^(onest\.woff2|jbmono\.woff2)$/.test(relative))relative='fonts/'+relative;
   const file=path.resolve(assets,relative);
   if(!file.startsWith(assets+path.sep)){res.writeHead(403);return res.end();}
   fs.readFile(file,(error,data)=>{
     if(error){res.writeHead(404);return res.end();}
-    const types={'.html':'text/html; charset=utf-8','.css':'text/css','.js':'text/javascript','.ttf':'font/ttf','.webp':'image/webp'};
+    const types={'.html':'text/html; charset=utf-8','.css':'text/css','.js':'text/javascript','.ttf':'font/ttf','.woff2':'font/woff2','.svg':'image/svg+xml','.webp':'image/webp'};
     res.setHeader('Content-Type',types[path.extname(file)]||'application/octet-stream');
     if(relative==='index.html')data=data.toString().replace('Автоматический подбор обходов','Демонстрационные данные — локальный стенд');
     res.end(data);

@@ -238,21 +238,28 @@ static int write_all(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-static int response(int fd, int code, const char *reason, const char *type,
-                    const char *body, size_t len) {
+/* extra — дополнительные строки заголовка, каждая с завершающим \r\n. */
+static int response_ex(int fd, int code, const char *reason, const char *type,
+                       const char *extra, const char *body, size_t len) {
     char hdr[1024];
     int n = snprintf(hdr, sizeof hdr,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
+        "%s"
         "Connection: close\r\n"
         "Content-Security-Policy: default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
         "X-Content-Type-Options: nosniff\r\n"
         "Referrer-Policy: no-referrer\r\n\r\n",
-        code, reason, type, len);
+        code, reason, type, len, extra ? extra : "");
     if (n < 0 || (size_t)n >= sizeof hdr) { return -1; }
     if (write_all(fd, hdr, (size_t)n) != 0) { return -1; }
     return len == 0 ? 0 : write_all(fd, body, len);
+}
+
+static int response(int fd, int code, const char *reason, const char *type,
+                    const char *body, size_t len) {
+    return response_ex(fd, code, reason, type, NULL, body, len);
 }
 
 static int header_value(const char *req, const char *wanted,
@@ -708,8 +715,11 @@ static int api_status(int fd, const d2k_panel_config *cfg) {
     return rc;
 }
 
-static int static_file(int fd, const d2k_panel_config *cfg, const char *name,
-                       const char *type) {
+/* Статика отдаётся с ETag из размера и времени изменения и всегда
+   перепроверяется (no-cache): после обновления панели браузер не держит
+   старый файл, а неизменённый получает ответ 304 без тела. */
+static int static_file(int fd, const d2k_panel_config *cfg, const char *req,
+                       const char *name, const char *type) {
     if (!cfg || !cfg->asset_dir) {
         return response(fd, 404, "Not Found", "text/plain; charset=utf-8", "not found\n", 10);
     }
@@ -728,6 +738,17 @@ static int static_file(int fd, const d2k_panel_config *cfg, const char *name,
         close(in);
         return response(fd, 404, "Not Found", "text/plain; charset=utf-8", "not found\n", 10);
     }
+    char etag[64], extra[128];
+    snprintf(etag, sizeof etag, "\"%llx-%llx\"",
+             (unsigned long long)st.st_size, (unsigned long long)st.st_mtime);
+    snprintf(extra, sizeof extra, "Cache-Control: no-cache\r\nETag: %s\r\n", etag);
+    const char *inm = NULL;
+    size_t inm_len = 0;
+    if (req && header_value(req, "If-None-Match", &inm, &inm_len) &&
+        inm_len == strlen(etag) && memcmp(inm, etag, inm_len) == 0) {
+        close(in);
+        return response_ex(fd, 304, "Not Modified", type, extra, NULL, 0);
+    }
     size_t cap = (size_t)st.st_size;
     char *body = malloc(cap ? cap : 1);
     if (!body) { close(in); return -1; }
@@ -739,7 +760,7 @@ static int static_file(int fd, const d2k_panel_config *cfg, const char *name,
         got += (size_t)nr;
     }
     close(in);
-    int rc = response(fd, 200, "OK", type, body, cap);
+    int rc = response_ex(fd, 200, "OK", type, extra, body, cap);
     free(body);
     return rc;
 }
@@ -773,45 +794,25 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     }
     if (strcmp(path, "/api/status") == 0) { return api_status(fd, cfg); }
     if (strcmp(path, "/") == 0) {
-        return static_file(fd, cfg, "index.html", "text/html; charset=utf-8");
+        return static_file(fd, cfg, req, "index.html", "text/html; charset=utf-8");
     }
     if (strcmp(path, "/assets/favicon.svg") == 0) {
-        return static_file(fd, cfg, "favicon.svg", "image/svg+xml");
+        return static_file(fd, cfg, req, "favicon.svg", "image/svg+xml");
     }
     if (strcmp(path, "/assets/panel.css") == 0) {
-        return static_file(fd, cfg, "panel.css", "text/css; charset=utf-8");
+        return static_file(fd, cfg, req, "panel.css", "text/css; charset=utf-8");
     }
     if (strcmp(path, "/assets/panel.js") == 0) {
-        return static_file(fd, cfg, "panel.js", "application/javascript; charset=utf-8");
+        return static_file(fd, cfg, req, "panel.js", "application/javascript; charset=utf-8");
     }
-    if (strcmp(path, "/assets/oswald.ttf") == 0) {
-        return static_file(fd, cfg, "fonts/oswald.ttf", "font/ttf");
+    if (strcmp(path, "/assets/gsap.js") == 0) {
+        return static_file(fd, cfg, req, "gsap.js", "application/javascript; charset=utf-8");
     }
-    static const char *slide_layers[] = {
-        "slide-left.webp", "slide-center.webp", "slide-right.webp", "slide-holder.webp"
-    };
-    for (size_t i = 0; i < sizeof(slide_layers) / sizeof(slide_layers[0]); ++i) {
-        if (strncmp(path, "/assets/", 8) == 0 && strcmp(path + 8, slide_layers[i]) == 0) {
-            return static_file(fd, cfg, slide_layers[i], "image/webp");
-        }
+    if (strcmp(path, "/assets/onest.woff2") == 0) {
+        return static_file(fd, cfg, req, "fonts/onest.woff2", "font/woff2");
     }
-    if (strcmp(path, "/assets/ground.webp") == 0) {
-        return static_file(fd, cfg, "ground.webp", "image/webp");
-    }
-    if (strcmp(path, "/assets/rack.webp") == 0) {
-        return static_file(fd, cfg, "rack.webp", "image/webp");
-    }
-    if (strcmp(path, "/assets/family-rack.webp") == 0) {
-        return static_file(fd, cfg, "family-rack.webp", "image/webp");
-    }
-    if (strcmp(path, "/assets/mascot.svg") == 0) {
-        return static_file(fd, cfg, "mascot.svg", "image/svg+xml; charset=utf-8");
-    }
-    if (strcmp(path, "/assets/logo-d2k.png") == 0) {
-        return static_file(fd, cfg, "logo-d2k.png", "image/png");
-    }
-    if (strcmp(path, "/assets/mascot-d2k.png") == 0) {
-        return static_file(fd, cfg, "mascot-d2k.png", "image/png");
+    if (strcmp(path, "/assets/jbmono.woff2") == 0) {
+        return static_file(fd, cfg, req, "fonts/jbmono.woff2", "font/woff2");
     }
     (void)used;
     return response(fd, 404, "Not Found", "text/plain; charset=utf-8", "not found\n", 10);

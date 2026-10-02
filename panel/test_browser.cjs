@@ -1,9 +1,29 @@
 "use strict";
+// Браузер → настоящий C-сервер панели (HTTP, CSP, API) → изолированная запись команд службы.
+// Ни роутера, ни /opt: всё во временном каталоге.
 const assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {spawn}=require('node:child_process');
 const profile=fs.mkdtempSync(path.join(os.tmpdir(),'d2k-browser-'));
 const chrome=spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
  ['--headless','--no-first-run','--hide-scrollbars','--remote-debugging-port=0','--user-data-dir='+profile,'about:blank'],{stdio:'ignore'});
+const now=Date.now(),iso=s=>new Date(now-s*1000).toISOString();
+const fixture={knowledge:{
+ searches:[
+  {target:'rutracker.org',family:4,transport:6,ip:'104.21.32.39',port:443,phase:'распознаём поведение',since:iso(40),attempts:0,probes:1,candidate:'',source:'выведен из замера'},
+  {target:'video.example',family:6,transport:17,ip:'2001:db8::5',port:443,phase:'проверяем готовое узнанной коробки',since:iso(200),attempts:1,probes:3,candidate:'план поставлен',source:'готовый план узнанной коробки'},
+  {target:'queued.example',family:4,transport:6,ip:'192.0.2.7',port:443,phase:'ожидает безопасного слота замера',since:iso(20),attempts:0,probes:0,candidate:'',source:'выведен из замера'}
+ ],
+ groups:[{suffix:'example.com',transport:6,family:4,shape:1,evidence_count:3,plan_id:'plan-a',probe_path:'/',ech_origin:'',active:true,
+  evidence:['a.example.com','b.example.com','c.example.com'],exceptions:[{name:'skip.example.com'}]}],
+ boxes:[{id:'box-a',created:iso(3600),updated:iso(60),signals:[{kind:'silent',human:'ответа на приветствие не было',seen:3}],
+  plans:[{id:'plan-a',proto:'tls',successes:4,enabled:true,human:'',text:'d2k-plan 1 1\nproto tcp tls\nsplit payload_start +1\norder reverse\n'}],
+  bindings:[
+   {target:'<img src=x onerror=alert(1)>',family:4,transport:6,shape:1,kind:'name',level:2,level_name:'сервер ответил',successes:1,confirmed:iso(90),enabled:true,recheck:false},
+   {target:'a.example.com',family:4,transport:6,shape:1,kind:'name',level:3,level_name:'обмен прошёл',successes:2,confirmed:iso(120),enabled:true,recheck:false},
+   {target:'a.example.com',family:6,transport:6,shape:1,kind:'name',level:3,level_name:'обмен прошёл',successes:1,confirmed:iso(130),enabled:true,recheck:true},
+   {target:'skip.example.com',family:4,transport:6,shape:1,kind:'name',level:3,level_name:'обмен прошёл',successes:1,confirmed:iso(140),enabled:true,recheck:false}
+  ]}],
+ measurements:{active:1,limit:4,queued:0,cores:2,free_pct:80},targets:4,confirms:7,probes_used:30,client_unfit:0}};
 let ws;
 async function main(){
  let port;
@@ -11,184 +31,134 @@ async function main(){
  if(!port)throw Error('Headless browser unavailable');
  const tab=await(await fetch('http://127.0.0.1:'+port+'/json/new?about:blank',{method:'PUT'})).json();
  ws=new WebSocket(tab.webSocketDebuggerUrl);await new Promise((r,j)=>{ws.onopen=r;ws.onerror=j});
- let id=0;const pending=new Map(),exceptions=[];
+ let id=0;const pending=new Map(),exceptions=[],dialogs=[];
  ws.onmessage=e=>{const x=JSON.parse(e.data);if(x.id){const p=pending.get(x.id);pending.delete(x.id);x.error?p.reject(x.error):p.resolve(x.result)}
- else if(x.method==='Page.javascriptDialogOpening')call('Page.handleJavaScriptDialog',{accept:true});
+ else if(x.method==='Page.javascriptDialogOpening'){dialogs.push(x.params.message);call('Page.handleJavaScriptDialog',{accept:true})}
  else if(x.method==='Runtime.exceptionThrown')exceptions.push(x.params.exceptionDetails)};
  const call=(method,params={})=>new Promise((resolve,reject)=>{pending.set(++id,{resolve,reject});ws.send(JSON.stringify({id,method,params}))});
  const evaluate=async(expression)=>{const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw Error(JSON.stringify(r.exceptionDetails));return r.result.value};
+ const wait=ms=>new Promise(r=>setTimeout(r,ms));
+ const until=async(expr,msg)=>{for(let i=0;i<160;i++){if(await evaluate(expr))return;await wait(50)}throw Error(msg)};
  await call('Page.enable');await call('Runtime.enable');
- const out=path.resolve(__dirname,'../.impeccable/review');fs.mkdirSync(out,{recursive:true});
- for(const [name,width,height] of [['desktop',1536,1024],['mobile',390,844]]){
-  await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
-  await call('Page.navigate',{url:'http://127.0.0.1:55941/'});
-  await new Promise(r=>setTimeout(r,600));
+ const out=process.env.D2K_CAPTURE_DIR;
+ const panel=await require('./browser-c-fixture.cjs')(fixture);
+ try{
+  await call('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});
+  await call('Page.navigate',{url:panel.url});
+  await until('document.querySelectorAll(".search").length===2','C API must populate the live searches');
   await evaluate('document.fonts.ready');
-  const metrics=await evaluate('({width:innerWidth,scroll:document.documentElement.scrollWidth,fonts:document.fonts.check("700 24px Slide"),cards:document.querySelectorAll("[data-slide-key]").length,controls:[...document.querySelectorAll("[data-control]")].map(x=>({action:x.dataset.control,disabled:x.disabled,rect:x.getBoundingClientRect().toJSON()}))})');
-  console.log(name,JSON.stringify(metrics));
-  if(metrics.scroll>width)console.log('overflow',await evaluate('[...document.body.querySelectorAll("*")].filter(x=>{const r=x.getBoundingClientRect();return r.width&&r.right>innerWidth}).map(x=>({tag:x.tagName,class:x.className,right:x.getBoundingClientRect().right})).slice(0,25)'));
-  assert.equal(metrics.cards,3);assert.ok(metrics.fonts);assert.ok(metrics.scroll<=width,'Page must not overflow horizontally');
-  if(name==='desktop'){
-   const domainSpacing=await evaluate('[...document.querySelectorAll("[data-slot=left] .search-target,.family-header h3")].map(x=>({name:x.textContent,spacing:parseFloat(getComputedStyle(x).letterSpacing)||0}))');
-   for(const domain of domainSpacing)assert.ok(domain.spacing>=0,'Domain punctuation must retain uncompressed tracking: '+domain.name);
+  assert.equal(await evaluate('document.fonts.check("700 24px Onest")'),true,'C CSP must load the bundled text face');
+  assert.match(await evaluate('document.querySelector("#now-title").textContent'),/Идёт 3 поиска/);
+  assert.equal(await evaluate('document.querySelectorAll(".queue-list li").length'),1,'queued searches are listed compactly');
+  assert.match(await evaluate('document.querySelector("#engine-state").textContent.trim()'),/^Движок работает, идёт подборрежим: применение$/,
+    'panel process uptime must not be shown as engine uptime');
+
+  // Данные из сети — только текст.
+  assert.equal(await evaluate('document.body.textContent.includes("<img src=x onerror=alert(1)>")'),true,'network names are shown literally');
+  assert.equal(await evaluate('[...document.images].some(i=>i.getAttribute("src")==="x")'),false,'network names never become elements');
+  assert.deepEqual(dialogs,[]);
+
+  // Семейство сворачивает покрытые имена, но не исключения и не другой IP-контекст.
+  const rows=await evaluate('[...document.querySelectorAll(".bindings tbody tr")].map(r=>r.querySelector(".t").textContent+"|"+r.querySelector(".n").textContent)');
+  assert.ok(rows.includes('skip.example.com|TLS 1.3 · IPv4'),'family exception stays visible');
+  assert.ok(rows.includes('a.example.com|TLS 1.3 · IPv6'),'IPv6 context stays visible');
+  assert.ok(!rows.includes('a.example.com|TLS 1.3 · IPv4'),'covered IPv4 name is folded into the family');
+  assert.match(await evaluate('document.querySelector(".covered summary").textContent'),/1 цель покрыта/);
+
+  // Коробки свёрнуты по умолчанию; туннель нарисован в своём состоянии.
+  assert.deepEqual(await evaluate('[...document.querySelectorAll(".crate")].map(c=>c.open)'),[false],'boxes start collapsed');
+  assert.match(await evaluate('document.querySelector(".crate-label").textContent'),/4цели · 1 план/);
+  assert.equal(await evaluate('document.querySelector("#telegram-body").dataset.state'),'connected');
+  assert.equal(await evaluate('!!document.querySelector("#telegram-body .tun")'),true,'tunnel drawing is present');
+
+  // GSAP загружен с роутера под CSP; коробка открывается сценой и закрывается обратно.
+  assert.equal(await evaluate('typeof gsap==="object"&&typeof Flip==="function"&&document.documentElement.classList.contains("has-gsap")'),true,'GSAP must load from the panel itself');
+  await evaluate('document.querySelector(".crate-lid").click()');
+  await until('document.querySelector(".crate").open&&!gsap.isTweening(document.querySelector(".crate-body"))','crate opens through its timeline');
+  await wait(400);
+  assert.equal(await evaluate('getComputedStyle(document.querySelector(".crate-body")).height!=="0px"'),true,'opened crate shows its contents');
+  await evaluate('document.querySelector(".crate-lid").click()');
+  await until('!document.querySelector(".crate").open','crate closes after its reverse timeline');
+  assert.equal(await evaluate('document.querySelector(".crate-body").getAttribute("style")||""'),'','animation leaves no inline styles behind');
+
+  // Бирка семейства ведёт к коробке с её планом: прокрутка и раскрытие.
+  assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap").length'),1,'family is drawn as a tag');
+  await evaluate('document.querySelector(".ftag-box").click()');
+  await until('document.querySelector(".crate").open&&!gsap.isTweening(window)','family tag link opens its box');
+  await evaluate('document.querySelector(".crate-lid").click()');
+  await until('!document.querySelector(".crate").open','box closes again');
+  assert.equal(await evaluate('!!document.querySelector(".index-marker")&&getComputedStyle(document.querySelector(".index-marker")).display'),'block','navigation marker is present');
+  assert.match(await evaluate('document.title'),/^(● )?D2K — Движок работает, идёт подбор$/,'title carries the engine state and no theme name');
+  assert.equal(await evaluate('document.body.textContent.includes("Ведомость")'),false,'the theme name is not shown in the interface');
+
+  // Опрос не сбрасывает раскрытые подробности, фокус и фильтр.
+  await evaluate('document.querySelector(".plan").open=true');
+  await evaluate('document.querySelector("[data-control=restart]").focus();window.restartBefore=document.querySelector("[data-control=restart]")');
+  const polls='performance.getEntriesByType("resource").filter(e=>e.name.endsWith("/api/status")).length';
+  const before=await evaluate(polls);
+  await until(polls+'>='+(before+2),'panel must keep polling');
+  assert.equal(await evaluate('document.querySelector(".plan").open'),true,'open plan survives polling');
+  assert.equal(await evaluate('document.activeElement===window.restartBefore'),true,'focused control is not replaced by a poll');
+  await evaluate('(()=>{const i=document.querySelector("#filter");i.value="skip";i.dispatchEvent(new Event("input"))})()');
+  assert.match(await evaluate('document.querySelector("#filter-count").textContent'),/1 цель/);
+  assert.equal(await evaluate('document.querySelector(".crate").open'),true,'a box with filter matches opens itself');
+  await evaluate('(()=>{const i=document.querySelector("#filter");i.value="";i.dispatchEvent(new Event("input"))})()');
+
+  // Шкала фаз совпадает с этапом оригинала.
+  assert.equal(await evaluate('document.querySelector(".search .track-step[data-state=now]").textContent'),'Распознаём');
+
+  // Раскладка на ширинах содержимого.
+  for(const [name,width,height] of [['narrow',320,740],['phone',390,844],['tablet',768,1024],['laptop',1280,800],['wide',1920,1080]]){
+   await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width<600});
+   await evaluate('scrollTo(0,0)');await wait(120);
+   const state=await evaluate('({overflow:document.documentElement.scrollWidth>innerWidth,bad:[...document.querySelectorAll("#engine-actions [data-control]")].filter(x=>{const r=x.getBoundingClientRect();return r.left<0||r.right>innerWidth||r.top<0||r.height<44||r.width<44}).map(x=>x.dataset.control)})');
+   console.log('layout',name,JSON.stringify(state));
+   if(state.overflow)console.log('overflow by',await evaluate('[...document.body.querySelectorAll("*")].filter(x=>{const r=x.getBoundingClientRect();return r.width&&r.right>innerWidth+1}).map(x=>x.tagName+"."+(x.getAttribute("class")||"")+" right="+Math.round(x.getBoundingClientRect().right)+" style="+(x.getAttribute("style")||"")).slice(0,8)'));
+   assert.equal(state.overflow,false,name+' horizontal overflow');
+   assert.deepEqual(state.bad,[],name+' engine controls must be visible 44px targets in the masthead');
+   if(out){const s=await call('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(out,'panel-'+name+'.png'),Buffer.from(s.data,'base64'))}
   }
-  for(const control of metrics.controls){
-   assert.ok(control.rect.left>=0 && control.rect.right<=width,'Control must be fully visible: '+control.action);
-   assert.ok(control.rect.height>=44,'Control must retain a 44px touch target: '+control.action);
+  await call('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});
+
+  // Остановка требует подтверждения; все шесть команд доходят до службы.
+  await evaluate('document.querySelector("[data-control=stop]").click()');
+  assert.equal(await evaluate('document.querySelector("[data-control=stop]").textContent'),'Остановить движок?','stop needs an explicit second press');
+  await evaluate('document.querySelector("[data-control=cancel]").click()');
+  for(const [action,command,presses] of [['stop','engine-stop',2],['start','engine-start',1],['restart','engine-restart',1],['reapply','reapply',1],['telegram-disable','telegram-disable',1],['telegram-enable','telegram-enable',1]]){
+   await until('!!document.querySelector("[data-control='+action+']:not([disabled])")',action+' control must become available');
+   for(let i=0;i<presses;i++)await evaluate('document.querySelector("[data-control='+action+']").click()');
+   await panel.waitFor(command);
+   if(action==='stop'){
+    await until('/остановлен/.test(document.querySelector("#now-title").textContent)','stopped engine must be stated');
+    const s=await(await fetch(panel.url+'api/status')).json();
+    assert.equal(s.snapshot.telegram_enabled,true,'stopping the engine leaves the tunnel alone');
+   }
+   if(action==='telegram-disable'){
+    await until('document.querySelector("#telegram-body").dataset.state==="stopped"','tunnel drawing must show the stopped state');
+    await until('!!document.querySelector("[data-control=telegram-enable]")','tunnel must offer enabling after disable');
+    const s=await(await fetch(panel.url+'api/status')).json();
+    assert.equal(s.snapshot.engine_running,true,'the tunnel toggle leaves the engine alone');
+   }
   }
-  if(!process.env.D2K_SKIP_CAPTURE){
-   const image=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
-   fs.writeFileSync(path.join(out,'integrated-'+name+'.png'),Buffer.from(image.data,'base64'));
-   if(name==='desktop')fs.writeFileSync(path.join(out,'hero-repro.png'),Buffer.from(image.data,'base64'));
-  }
- }
- await evaluate('document.querySelector("[data-select-slide]").click()');
- assert.equal(await evaluate('document.querySelector("[data-select-slide]").getAttribute("aria-pressed")'),'true');
- await new Promise(r=>setTimeout(r,550));
- await evaluate('window.controlBeforePoll=document.querySelector("[data-control=restart]");window.controlBeforePoll.focus()');
- await evaluate('document.dispatchEvent(new Event("DOMContentLoaded"))');
- await new Promise(r=>setTimeout(r,300));
- assert.equal(await evaluate('document.querySelector("[data-select-slide]").getAttribute("aria-pressed")'),'true','Selection must survive polling');
- assert.equal(await evaluate('window.controlBeforePoll===document.querySelector("[data-control=restart]")'),true,
-   'A poll must not replace a service button while the user may be pressing it');
- assert.equal(await evaluate('document.activeElement===window.controlBeforePoll'),true,
-   'Keyboard focus must remain on the same service button');
- assert.equal(await evaluate('document.getAnimations().length'),0,'Unchanged poll must not replay effects');
- await evaluate('document.querySelector("[data-control=telegram-disable]").click()');
- await new Promise(r=>setTimeout(r,300));
- assert.equal(await evaluate('!!document.querySelector("[data-control=telegram-enable]")'),true);
- await evaluate('document.querySelector("[data-control=stop]").click()');
- await new Promise(r=>setTimeout(r,300));
- assert.equal(await evaluate('document.querySelector("#rail-state").textContent'),'D2K не на связи');
- await evaluate('document.querySelector("[data-control=start]").click()');
- await new Promise(r=>setTimeout(r,300));
- assert.equal(await evaluate('document.querySelector("#rail-state").textContent'),'D2K на связи');
- await evaluate('document.querySelector("[data-control=telegram-enable]").click()');
- await new Promise(r=>setTimeout(r,300));
- assert.equal(await evaluate('!!document.querySelector("[data-control=telegram-disable]")'),true);
- const changePhase=async(target,phase)=>{
-   const response=await fetch('http://127.0.0.1:55941/__test/phase?'+new URLSearchParams({target,phase}),{method:'POST'});
-   assert.equal(response.status,200);
-   await evaluate('document.dispatchEvent(new Event("DOMContentLoaded"))');
-   await new Promise(r=>setTimeout(r,90));
- };
- await call('Emulation.setDeviceMetricsOverride',{width:1536,height:1024,deviceScaleFactor:1,mobile:false});
- await evaluate('scrollTo(0,0)');
- await changePhase('googlevideo.com','проверяем выведенный план');
- assert.ok(await evaluate('document.getAnimations().length>0'),'A changed stage must produce feedback');
- await new Promise(r=>setTimeout(r,700));
- await changePhase('googlevideo.com','подтверждено, смотрим живой трафик');
- assert.equal(await evaluate('document.querySelectorAll("body > [aria-hidden=true][data-slide-key]").length'),1,
-   'Confirmed slide must travel to its matching visible family');
- await new Promise(r=>setTimeout(r,800));
- assert.equal(await evaluate('document.querySelectorAll("body > [aria-hidden=true][data-slide-key]").length'),0,
-   'The transfer must release its temporary DOM and animation');
- await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});
- await changePhase('googlevideo.com','проверяем выведенный план');
- assert.equal(await evaluate('document.getAnimations().some(a=>a.effect.getKeyframes().some(k=>k.transform))'),false,
-   'Reduced motion must not translate or scale slides');
- await changePhase('googlevideo.com','подтверждено, смотрим живой трафик');
- assert.equal(await evaluate('document.querySelectorAll("body > [aria-hidden=true][data-slide-key]").length'),0);
- await call('Network.enable');
- await call('Network.setBlockedURLs',{urls:['http://127.0.0.1:55941/api/status']});
- await evaluate('document.querySelector("[data-control=restart]").click()');
- await new Promise(r=>setTimeout(r,300));
- assert.equal(await evaluate('window.controlBeforePoll===document.querySelector("[data-control=restart]")'),true,
-   'Losing the API must not remove the service strip');
- assert.equal(await evaluate('[...document.querySelectorAll("[data-control]")].every(b=>b.disabled)'),true,
-   'An old action promise must not re-enable its button after the status API failed');
- await call('Network.setBlockedURLs',{urls:[]});
- await evaluate('document.dispatchEvent(new Event("DOMContentLoaded"))');
- await new Promise(r=>setTimeout(r,300));
- assert.equal(await evaluate('[...document.querySelectorAll("[data-control]")].every(b=>!b.disabled)'),true,
-   'Recovered API must restore enabled controls from fresh permission flags');
- assert.deepEqual(exceptions,[]);
- // The presentation must hold at the content breakpoints, not just two goldens.
- await call('Emulation.setEmulatedMedia',{features:[]});
- const fixture=await(await fetch('http://127.0.0.1:55941/api/status')).json();
- await evaluate('window.originalFetch=window.fetch');
- for(const [name,width,height] of [['narrow',320,740],['tablet',768,1024],['laptop',1280,800],['wide',1920,1080]]){
-  await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
-  await evaluate('scrollTo(0,0)');
-  const state=await evaluate('({overflow:document.documentElement.scrollWidth>innerWidth,controls:[...document.querySelectorAll("[data-control]")].filter(x=>{const r=x.getBoundingClientRect();return r.left<0||r.right>innerWidth||r.top<0||r.bottom>innerHeight||r.height<44}).map(x=>x.dataset.control)})');
-  console.log('layout',name,state);
-  assert.equal(state.overflow,false,name+' horizontal overflow');
-  assert.deepEqual(state.controls,[],name+' inaccessible controls');
-  assert.equal(await evaluate('(()=>{const r=document.querySelector("[data-selected=true]").getBoundingClientRect();return r.top<document.querySelector("#controls").getBoundingClientRect().top&&r.width>0})()'),true,name+' must show the selected slide before the fixed service strip');
-  if(width<=1100){
-   assert.equal(await evaluate('(()=>{const h=document.querySelector(".page-heading").getBoundingClientRect(),s=document.querySelector("[data-selected=true]").getBoundingClientRect();return h.bottom<=s.top})()'),true,name+' heading must not overlap the selected slide');
-  }
-  if(width<=700){
-   assert.equal(await evaluate('[...document.querySelectorAll("[data-slide-step]")].every(x=>{const r=x.getBoundingClientRect();return r.top>=0&&r.bottom<=document.querySelector("#controls").getBoundingClientRect().top&&r.height>=44})'),true,name+' slide navigation must stay above the service dock');
-  }
-  if(!process.env.D2K_SKIP_CAPTURE && name==='tablet'){
-   const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
-   fs.writeFileSync(path.join(out,'integrated-tablet.png'),Buffer.from(shot.data,'base64'));
-  }
- }
- const scenarios=[
-  ['empty',p=>{p.knowledge.searches=[];p.knowledge.groups=[];p.knowledge.boxes=[];}],
-  ['stopped',p=>{p.snapshot.engine_running=false;p.snapshot.controller_running=false;p.knowledge.linked=false;}],
-  ['many',p=>{p.knowledge.searches=Array.from({length:18},(_,i)=>({...p.knowledge.searches[i%3],target:'long-client-'+i+'.service.example.com'}));p.knowledge.groups=Array.from({length:8},(_,i)=>({...p.knowledge.groups[i%3],suffix:'family-'+i+'.example.com'}));}]
- ];
- for(const [name,mutate] of scenarios){
-  const payload=structuredClone(fixture);mutate(payload);
-  await evaluate('window.fetch=(url,options)=>url==="/api/status"?Promise.resolve({ok:true,json:async()=>('+JSON.stringify(payload)+')}):window.originalFetch(url,options);document.dispatchEvent(new Event("DOMContentLoaded"))');
-  await new Promise(r=>setTimeout(r,120));
-  const state=await evaluate('({overflow:document.documentElement.scrollWidth>innerWidth,visible:[...document.querySelectorAll("[data-slide-key]")].filter(x=>getComputedStyle(x).display!=="none").length,title:document.querySelector("#rail-state").textContent})');
-  console.log('scenario',name,state);assert.equal(state.overflow,false);
-  if(name==='empty'){
-   assert.equal(state.visible,0);
-   assert.equal(await evaluate('(()=>{const a=document.querySelector(".page-heading h1").getBoundingClientRect(),b=document.querySelector("#searches .empty-state").getBoundingClientRect();return a.right<=b.left||b.right<=a.left||a.bottom<=b.top||b.bottom<=a.top})()'),true,
-     'An empty search must not cover the Slidoscope heading');
-  }
-  if(name==='stopped')assert.match(state.title,/не на связи/);
-  if(name==='many'){
-   assert.equal(state.visible,3);
-   for(let i=0;i<18;i++)await evaluate('document.querySelectorAll("[data-slide-step]")[1].click()');
-   assert.equal(await evaluate('document.querySelectorAll("[data-selected=true]").length'),1);
-  }
- }
- await evaluate('window.fetch=window.originalFetch;document.dispatchEvent(new Event("DOMContentLoaded"))');
- assert.deepEqual(exceptions,[]);
- const cPanel=await require('./browser-c-fixture.cjs')(fixture);
- try {
-  await call('Emulation.setDeviceMetricsOverride',{width:1536,height:1024,deviceScaleFactor:1,mobile:false});
-  await call('Page.navigate',{url:cPanel.url});
-  await new Promise(r=>setTimeout(r,500));
-  await evaluate('document.fonts.ready');
-  assert.equal(await evaluate('document.querySelectorAll("[data-slide-key]").length'),3,'C API must populate the actual renderer');
-  assert.equal(await evaluate('document.querySelector("#rail-state").getAttribute("data-connected")'),'true');
-  assert.equal(await evaluate('document.fonts.check("700 24px Slide")'),true,'C CSP must load the bundled font');
-  const assetResults=await evaluate(`Promise.all([
-    "ground.webp", "rack.webp", "family-rack.webp", "slide-left.webp",
-    "slide-center.webp", "slide-right.webp", "slide-holder.webp"
-  ].map(async name=>{
-    const response=await fetch("/assets/"+name);
-    const blob=await response.blob();
-    const bitmap=await createImageBitmap(blob);
-    const result={name,status:response.status,type:blob.type,width:bitmap.width,height:bitmap.height};
-    bitmap.close();
-    return result;
-  }))`);
-  for(const asset of assetResults){
-    assert.equal(asset.status,200,'C server must serve the installed material: '+asset.name);
-    assert.equal(asset.type,'image/webp','Material must carry its correct MIME: '+asset.name);
-    assert.ok(asset.width>0&&asset.height>0,'Material must decode, not merely exist: '+asset.name);
-  }
-  for(const [action,command] of [['stop','engine-stop'],['start','engine-start'],['restart','engine-restart'],['reapply','reapply'],['telegram-disable','telegram-disable'],['telegram-enable','telegram-enable']]){
-   await evaluate('document.querySelector("[data-control='+action+']").click()');
-   await cPanel.waitFor(command);
-   await new Promise(r=>setTimeout(r,100));
-   await evaluate('document.dispatchEvent(new Event("DOMContentLoaded"))');
-   await new Promise(r=>setTimeout(r,150));
-   const status=await(await fetch(cPanel.url+'api/status')).json();
-   if(action==='stop'){assert.equal(status.snapshot.engine_running,false);assert.equal(status.snapshot.telegram_enabled,true);}
-   if(action==='telegram-disable'){assert.equal(status.snapshot.telegram_enabled,false);assert.equal(status.snapshot.engine_running,true);}
-  }
+
+  // Потеря API: последний снимок приглушён и честно подписан.
+  await call('Network.enable');
+  await call('Network.setBlockedURLs',{urls:[panel.url+'api/status']});
+  await wait(11500);
+  assert.equal(await evaluate('document.body.dataset.stale'),'true','lost API must mark the snapshot stale');
+  assert.match(await evaluate('document.querySelector("#notice").textContent'),/Нет ответа от панели/);
+  await call('Network.setBlockedURLs',{urls:[]});
+  await until('document.body.dataset.stale==="false"','recovered API must clear the stale mark');
+  // «Уменьшить движение»: без сцен, но всё работает.
+  await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});
+  await call('Page.reload');
+  await until('document.querySelectorAll(".search").length===2','reduced-motion page renders');
+  await evaluate('document.querySelector(".crate-lid").click()');
+  assert.equal(await evaluate('document.querySelector(".crate").open'),true,'reduced motion opens the crate natively at once');
+  assert.equal(await evaluate('gsap.globalTimeline.getChildren(true,true,false).filter(t=>t.isActive()).length'),0,'reduced motion runs no tweens');
+  await call('Emulation.setEmulatedMedia',{features:[]});
   assert.deepEqual(exceptions,[]);
-  console.log('C integration: browser -> real HTTP/CSP/API -> isolated service fixture, all six commands verified.');
- } finally {await cPanel.close();}
- console.log('Browser: live renderer, selection persistence, quiet polling and independent controls OK (simulated services).');
+  console.log('Browser + C panel: rendering, honesty, polling, layout and all six commands passed.');
+ }finally{await panel.close()}
 }
 main().catch(e=>{console.error(e);process.exitCode=1}).finally(()=>{if(ws)ws.close();chrome.kill()});
