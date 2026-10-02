@@ -571,8 +571,49 @@ static void check_binding_family_persistence(void) {
     d2k_catalog_free(&c);
 }
 
+/* Задача 21: пометка «требует повторной проверки» переживает перезапуск, а
+   старый файл без ключа читается как «не помечена». Монотонная отметка
+   процесса в файл не попадает. */
+static void check_recheck_mark_persistence(void) {
+    const char *path = "/tmp/d2k-cat-recheck.json";
+    const char *out = "/tmp/d2k-cat-recheck-out.json";
+    char err[200];
+    write_tmp(path, "{\"boxes\":[{\"bindings\":["
+        "{\"target\":\"old.example\",\"transport\":6,\"shape\":1},"
+        "{\"target\":\"marked.example\",\"transport\":6,\"shape\":1}]}]}");
+    d2k_catalog c;
+    CHECK(d2k_catalog_load(path, &c, err, sizeof err) == 0, "load recheck fixture");
+    CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 2 &&
+          c.boxes[0].binds[0].recheck_since == 0 && c.boxes[0].binds[1].recheck_since == 0,
+          "old file without recheck_since invented a recheck mark");
+    if (c.n_boxes == 1 && c.boxes[0].n_binds == 2) {
+        c.boxes[0].binds[1].recheck_since = 1790000000;
+        c.boxes[0].binds[1].recheck_mono_ms = 12345;
+    }
+    CHECK(d2k_catalog_save(&c, out, err, sizeof err) == 0, "save recheck fixture");
+    d2k_catalog_free(&c);
+    FILE *f = fopen(out, "r");
+    CHECK(f != NULL, "open saved recheck fixture");
+    if (f) {
+        char buf[4096]; size_t n = fread(buf, 1, sizeof buf - 1, f);
+        buf[n] = 0; fclose(f);
+        const char *first = strstr(buf, "\"recheck_since\"");
+        CHECK(first != NULL && strstr(first + 1, "\"recheck_since\"") == NULL,
+              "recheck_since must be written for the marked binding only");
+        CHECK(strstr(buf, "recheck_mono") == NULL, "process-local recheck time leaked to file");
+    }
+    CHECK(d2k_catalog_load(out, &c, err, sizeof err) == 0, "reload recheck fixture");
+    CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 2 &&
+          c.boxes[0].binds[0].recheck_since == 0 &&
+          c.boxes[0].binds[1].recheck_since == 1790000000 &&
+          c.boxes[0].binds[1].recheck_mono_ms == 0,
+          "recheck mark not preserved across restart (or monotonic stamp survived)");
+    d2k_catalog_free(&c);
+}
+
 int main(void) {
     check_binding_family_persistence();
+    check_recheck_mark_persistence();
     check_time_roundtrip();
     check_transport_default_zero_on_old_file();
     check_shape_default_zero_on_old_file();

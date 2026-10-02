@@ -55,7 +55,11 @@
 /* v8: SET_NAME_PROBE несёт хвостом trial ID опыта (16 байт), ACK возвращает
  * его и на успех, и на отказ: подтверждение установки пробы привязано к своему
  * опыту, отказ исполнителя не принимается за промах кандидата (задача 19). */
-#define D2K_CTL_PROTO_VERSION 8
+/* v9: DEL_NAME несёт транспорт и форму и снимает ровно ПОСТОЯННУЮ запись
+ * (имя, транспорт, форма, семейство). Пробы снимает только DEL_NAME_PROBE;
+ * прямой проход TCP больше не уносит пробу параллельной QUIC-задачи и
+ * подтверждённое знание других форм (задача 21). */
+#define D2K_CTL_PROTO_VERSION 9
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */
@@ -148,7 +152,7 @@
 #define D2K_CMD_SET_ADDR_PROBE 0x0089 /* family+src/dst+ports+proto(38), trial-id(16), lease-ms(u32), Plan */
 #define D2K_CMD_DEL_ADDR_PROBE 0x008A /* flow(38), trial-id(16); stale delete is no-op */
 #define D2K_CMD_SET_ADDR 0x0082  /* family u8, address(16), форма u8, план TLV */
-#define D2K_CMD_DEL_NAME 0x0083  /* длина имени u8, имя, family u8 */
+#define D2K_CMD_DEL_NAME 0x0083  /* длина имени u8, имя, transport u8, форма u8, family u8 (v9) */
 #define D2K_CMD_DEL_ADDR 0x0084  /* family u8, address(16), форма u8 */
 #define D2K_CMD_CLEAR    0x0085  /* убрать все планы */
 #define D2K_CMD_STATS    0x0086  /* прислать счётчики */

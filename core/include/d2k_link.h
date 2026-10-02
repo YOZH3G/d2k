@@ -323,20 +323,18 @@ int  d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
 int d2k_link_arm_shape_family(int fd, const char *name, uint8_t transport,
                               uint8_t family, char *err, size_t errcap);
 
-/* Снимает план с имени цели: команда D2K_CMD_DEL_NAME. Тело на проводе такое
- * же, как у ARM_SHAPE (длина имени u8, имя — d2k_ctl.h), поэтому и код тот
- * же с точностью до кода команды. Как и обе соседние функции, ТОЛЬКО
- * отправляет команду и не ждёт ack — по той же причине (см. выше).
+/* Снимает ПОСТОЯННЫЙ план имени цели ровно по ключу (имя, транспорт, форма,
+ * семейство): команда D2K_CMD_DEL_NAME v9. Как и соседние функции, ТОЛЬКО
+ * отправляет команду и не ждёт ack.
  *
- * Зачем понадобилась: d2k_props_ask ставит план-КАНДИДАТ на каждый вопрос и
- * до этой функции не снимала последний из них. Пока вопрос проходит, это не
- * дефект, а замысел (прошедший план и есть стратегия — см. шапку compose.c
- * про двойное назначение), но когда НЕ прошёл ни один, на боевом датапате
- * оставался стоять план, про который измерение прямо сказало «не работает».
- * Отличие от D2K_CMD_CLEAR: CLEAR сносит ВСЮ таблицу, включая планы чужих
- * целей, которые никто не просил трогать. */
-int  d2k_link_del_name(int fd, const char *name, char *err, size_t errcap);
-int d2k_link_del_name_family(int fd, const char *name, uint8_t family,
+ * Прежде команда снимала ВСЕ записи имени: пробу параллельной задачи другого
+ * транспорта, подтверждённое знание других форм (TLS 1.2, ECH) и QUIC. Теперь
+ * широкого снятия по имени на проводе нет вовсе (задача 21, D2K_SPEC §7):
+ * пробный план снимает только d2k_link_del_name_probe_family своим портом, а
+ * эта функция — одну постоянную запись. shape — форма на проводе (как у
+ * SET_NAME; дедушкина запись — D2K_LINK_SHAPE_GRANDFATHER), ноль отвергается. */
+int d2k_link_del_name_family(int fd, const char *name, uint8_t transport,
+                             uint8_t shape, uint8_t family,
                              char *err, size_t errcap);
 int d2k_link_del_name_probe_family(int fd, const char *name, uint8_t transport,
                                    uint8_t shape, uint16_t sport_be, uint8_t family,

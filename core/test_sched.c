@@ -1195,6 +1195,63 @@ static void skip_ahead(d2k_sched *s, int64_t ms) {
 /* Есть ли байты подстроки в том, что УЖЕ уехало датапату. Нужна там, где
    идентификатор плана не годится: план из каталога несёт идентичность своего
    текста, а не подставленную установкой. */
+/* Постоянные SET_NAME (0x0081) по имени и форме на проводе — тело: длина
+   имени, имя, форма, семейство, план. Задача 21: проход каталога не ставит
+   привязку, ждущую повторной проверки. */
+static size_t sent_set_name_shape(const char *name, uint8_t shape) {
+    size_t count = 0, nl = strlen(name);
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+                     (uint32_t)p[2] << 8 | p[3];
+        if (n < 2 || n > sent_len - off - 4) break;
+        uint16_t cmd = (uint16_t)((uint16_t)p[4] << 8 | p[5]);
+        const uint8_t *body = p + 6;
+        if (cmd == D2K_CMD_SET_NAME && n - 2 >= 3 + nl && body[0] == nl &&
+            !memcmp(body + 1, name, nl) && body[1 + nl] == shape) { count++; }
+        off += 4 + n;
+    }
+    return count;
+}
+
+/* DEL_NAME v9 ровно этого ключа: длина имени, имя, транспорт, форма, семейство. */
+static size_t sent_del_name_key(const char *name, uint8_t transport, uint8_t shape,
+                                uint8_t family) {
+    uint8_t body[300];
+    size_t nl = strlen(name);
+    body[0] = (uint8_t)nl;
+    memcpy(body + 1, name, nl);
+    body[1 + nl] = transport; body[2 + nl] = shape; body[3 + nl] = family;
+    return sent_command_count(D2K_CMD_DEL_NAME, body, nl + 4);
+}
+
+/* Добавляет к коробке копию привязки с другой формой/транспортом — фикстура
+   «то же имя, другие протоколы». */
+static void add_binding_like(d2k_cat_box *b, const d2k_cat_binding *proto,
+                             uint8_t transport, uint8_t shape) {
+    d2k_cat_binding copy = *proto;
+    d2k_cat_binding *nb = realloc(b->binds, (b->n_binds + 1) * sizeof *nb);
+    CHECK(nb != NULL, "fixture binding realloc");
+    if (!nb) return;
+    b->binds = nb;
+    copy.transport = transport;
+    copy.shape = shape;
+    copy.recheck_since = 0;
+    copy.recheck_mono_ms = 0;
+    b->binds[b->n_binds++] = copy;
+}
+
+static d2k_cat_binding *binding_shape(d2k_catalog *c, const char *target,
+                                      uint8_t transport, uint8_t shape) {
+    for (size_t i = 0; i < c->n_boxes; i++)
+        for (size_t j = 0; j < c->boxes[i].n_binds; j++) {
+            d2k_cat_binding *b = &c->boxes[i].binds[j];
+            if (!strcmp(b->target, target) && b->transport == transport && b->shape == shape)
+                return b;
+        }
+    return NULL;
+}
+
 static int sent_has(const char *needle) {
     size_t n = strlen(needle);
     if (n == 0 || sent_len < n) { return 0; }
@@ -1353,8 +1410,9 @@ int main(int argc, char **argv) {
     int shape_only = argc == 2 && strcmp(argv[1], "--shape-only") == 0;
     int groups_only = argc == 2 && strcmp(argv[1], "--groups-only") == 0;
     int retire_only = argc == 2 && strcmp(argv[1], "--retire-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only) {
-        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only]\n");
+    int recheck_only = argc == 2 && strcmp(argv[1], "--recheck-only") == 0;
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only]\n");
         return 2;
     }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
@@ -1708,6 +1766,7 @@ int main(int argc, char **argv) {
     if (rx_only) { goto rx_volume_tests; }
     if (question_only) { goto question_test; }
     if (retire_only) { goto retire_test; }
+    if (recheck_only) { goto recheck_test; }
     if (shape_only) { goto shape_test; }
     {
         d2k_catalog empty = {0};
@@ -2645,9 +2704,13 @@ admission_only_run:
                 d2k_ev su = ev_suspect(6, 41019);
                 d2k_sched_event(s, &su);
                 settle(s);
-                CHECK(b->n_binds == 2, "IPv4 CLEAR removes only IPv4 binding");
-                if (b->n_binds == 2) {
-                    CHECK(b->binds[0].family == 6 && b->binds[1].family == 6,
+                /* Задача 21: один прямой проход помечает, а не удаляет. */
+                CHECK(b->n_binds == 3 && b->binds[0].family == 4 &&
+                      b->binds[0].recheck_since != 0,
+                      "IPv4 CLEAR marks only the IPv4 binding for recheck");
+                if (b->n_binds == 3) {
+                    CHECK(b->binds[1].family == 6 && !b->binds[1].recheck_since &&
+                          b->binds[2].family == 6 && !b->binds[2].recheck_since,
                           "IPv4 CLEAR retains IPv6 knowledge");
                 }
                 d2k_sched_free(s);
@@ -3091,7 +3154,7 @@ admission_only_run:
                 b->binds[0].enabled = 1;
                 b->binds[0].level = 3;
                 b->binds[0].transport = 17;
-                b->binds[0].shape = D2K_SHAPE_LEGACY;
+                b->binds[0].shape = D2K_LINK_SHAPE_QUIC;
                 snprintf(b->binds[1].kind, sizeof b->binds[1].kind, "name");
                 snprintf(b->binds[1].target, sizeof b->binds[1].target,
                          "новый.хост.цдн");
@@ -3123,8 +3186,12 @@ admission_only_run:
                           "при прямом QUIC-проходе проверялся готовый обход");
                     CHECK(!said("готовых планов узнанной коробки"),
                           "готовый обход запускался без подтверждения блокировки");
-                    CHECK(b->n_binds == 1 && b->binds[0].transport == 6,
-                          "прямой проход не удалил старую QUIC-привязку или задел TLS");
+                    /* Задача 21: один прямой проход не удаляет, а помечает
+                       «требует повторной проверки» и снимает с провода. */
+                    CHECK(b->n_binds == 2 && b->binds[0].transport == 17 &&
+                          b->binds[0].recheck_since != 0 &&
+                          b->binds[1].transport == 6 && !b->binds[1].recheck_since,
+                          "прямой проход не пометил старую QUIC-привязку или задел TLS");
                     CHECK(cK.revision > 0,
                           "снятие устаревшей привязки не отметило каталог для сохранения");
                     d2k_sched_free(s);
@@ -4384,6 +4451,243 @@ retire_test:
         ver_answer = D2K_VER_APPLICATION;
     }
     if (retire_only) { goto voice_only_done; }
+recheck_test:
+    /* --- ЗАДАЧА 21: прямой проход снимает с провода ровно свою форму и
+       помечает привязку «требует повторной проверки»; удаляет только второй
+       независимый проход; повторное подтверждение снимает пометку. ------- */
+    {
+        const char *nm = "recheck.example";
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0; vol_direct_complete = 0;
+        confirm_once(&c, sv[0], nm, 40601);
+        d2k_cat_binding *modern = binding_of(&c, nm, 6) ?
+            binding_mut(&c, nm, 6) : NULL;
+        CHECK(modern && modern->shape == D2K_SHAPE_MODERN && !modern->recheck_since,
+              "recheck: fixture TLS1.3 binding not confirmed");
+        if (modern) {
+            d2k_cat_box *box = NULL;
+            for (size_t i = 0; i < c.n_boxes; i++)
+                if (modern >= c.boxes[i].binds &&
+                    modern < c.boxes[i].binds + c.boxes[i].n_binds) box = &c.boxes[i];
+            d2k_cat_binding proto = *modern;
+            add_binding_like(box, &proto, 6, D2K_SHAPE_LEGACY);
+            add_binding_like(box, &proto, 6, D2K_LINK_SHAPE_ECH_TCP);
+            add_binding_like(box, &proto, 17, D2K_LINK_SHAPE_QUIC);
+        }
+        CHECK(total_bindings(&c) == 4, "recheck: four-shape fixture");
+
+        /* 1. Первый прямой проход TCP (профиль TLS 1.3). */
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        drain(); d2k_sched_sync(s); sync_out(s);
+        forget_sent();
+        tcp_answer = D2K_V_CLEAR; tcp_calls = 0;
+        d2k_ev h = ev_hello(6, 40602, nm);
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40602);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(tcp_calls == 1, "recheck: direct measurement did not run");
+        CHECK(total_bindings(&c) == 4,
+              "recheck: a single direct CLEAR deleted a confirmed binding (§9.7)");
+        modern = binding_shape(&c, nm, 6, D2K_SHAPE_MODERN);
+        d2k_cat_binding *legacy = binding_shape(&c, nm, 6, D2K_SHAPE_LEGACY);
+        d2k_cat_binding *ech = binding_shape(&c, nm, 6, D2K_LINK_SHAPE_ECH_TCP);
+        d2k_cat_binding *quic = binding_shape(&c, nm, 17, D2K_LINK_SHAPE_QUIC);
+        CHECK(modern && modern->recheck_since != 0,
+              "recheck: measured TLS1.3 binding not marked «требует повторной проверки»");
+        CHECK(legacy && !legacy->recheck_since && ech && !ech->recheck_since,
+              "recheck: TLS1.3 CLEAR touched TLS1.2/ECH bindings it did not measure");
+        CHECK(quic && !quic->recheck_since, "recheck: TCP CLEAR touched the QUIC binding");
+        CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 1 &&
+              sent_del_name_key(nm, 6, D2K_SHAPE_MODERN, 4) == 1,
+              "recheck: CLEAR must take off the wire exactly (name, TCP, TLS1.3, IPv4)");
+        CHECK(sent_command_count(D2K_CMD_DEL_NAME_PROBE, NULL, 0) == 0,
+              "recheck: CLEAR removed a trial entry it does not own");
+        CHECK(c.revision > 0, "recheck: mark not flagged for persistence");
+        CHECK(said("требуют повторной проверки"), "recheck: mark not reported");
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        CHECK(sent_set_name_shape(nm, D2K_SHAPE_MODERN) == 0,
+              "recheck: catalog sync put the marked binding back on the wire");
+        CHECK(sent_set_name_shape(nm, D2K_SHAPE_LEGACY) == 1 &&
+              sent_set_name_shape(nm, D2K_LINK_SHAPE_ECH_TCP) == 1 &&
+              sent_set_name_shape(nm, D2K_LINK_SHAPE_QUIC) == 1,
+              "recheck: sync lost the other confirmed shapes/transports");
+        {
+            char live_path[] = "/tmp/d2k-recheck-live-XXXXXX";
+            int live_fd = mkstemp(live_path);
+            if (live_fd >= 0) {
+                close(live_fd);
+                CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "recheck live write");
+                FILE *live = fopen(live_path, "r"); char body[32768] = {0};
+                if (live) { fread(body, 1, sizeof body - 1, live); fclose(live); }
+                CHECK(strstr(body, "\"recheck\": true") != NULL,
+                      "recheck: live status hides the recheck mark");
+                unlink(live_path);
+            }
+        }
+
+        /* 2. Перезапуск: пометка переживает его, и проход не ставит привязку. */
+        {
+            char path[] = "/tmp/d2k-recheck-cat-XXXXXX";
+            int fd = mkstemp(path);
+            char err[200];
+            if (fd >= 0) {
+                close(fd);
+                CHECK(d2k_catalog_save(&c, path, err, sizeof err) == 0, "recheck: save");
+                d2k_catalog c2;
+                CHECK(d2k_catalog_load(path, &c2, err, sizeof err) == 0, "recheck: load");
+                d2k_cat_binding *m2 = binding_shape(&c2, nm, 6, D2K_SHAPE_MODERN);
+                CHECK(m2 && m2->recheck_since == modern->recheck_since,
+                      "recheck: mark lost across restart");
+                d2k_sched *s2 = d2k_sched_new(&c2, sv[0], 0x2d);
+                drain(); forget_sent(); d2k_sched_sync(s2); sync_out(s2);
+                CHECK(sent_set_name_shape(nm, D2K_SHAPE_MODERN) == 0 &&
+                      sent_set_name_shape(nm, D2K_SHAPE_LEGACY) == 1,
+                      "recheck: after restart the marked binding went back on the wire");
+                d2k_sched_free(s2);
+                d2k_catalog_free(&c2);
+                unlink(path);
+            }
+        }
+
+        /* 3. Второй независимый прямой проход (отдельный замер после
+           ограничителя) — привязка удаляется; остальное цело. */
+        skip_ahead(s, 61LL * 60 * 1000);
+        saidbuf[0] = '\0';
+        forget_sent();
+        tcp_calls = 0;
+        h = ev_hello(6, 40603, nm);
+        d2k_sched_event(s, &h);
+        su = ev_suspect(6, 40603);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(tcp_calls == 1, "recheck: second direct measurement did not run");
+        CHECK(binding_shape(&c, nm, 6, D2K_SHAPE_MODERN) == NULL,
+              "recheck: second independent CLEAR did not delete the binding");
+        legacy = binding_shape(&c, nm, 6, D2K_SHAPE_LEGACY);
+        ech = binding_shape(&c, nm, 6, D2K_LINK_SHAPE_ECH_TCP);
+        quic = binding_shape(&c, nm, 17, D2K_LINK_SHAPE_QUIC);
+        CHECK(total_bindings(&c) == 3 && legacy && !legacy->recheck_since &&
+              ech && !ech->recheck_since && quic && !quic->recheck_since,
+              "recheck: second CLEAR touched other shapes/transports");
+        CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) <= 1 &&
+              sent_del_name_key(nm, 6, D2K_SHAPE_LEGACY, 4) == 0 &&
+              sent_del_name_key(nm, 6, D2K_LINK_SHAPE_ECH_TCP, 4) == 0 &&
+              sent_del_name_key(nm, 17, D2K_LINK_SHAPE_QUIC, 4) == 0,
+              "recheck: second CLEAR sent a delete outside its measured shape");
+        CHECK(said("второй независимый"), "recheck: deletion not reported");
+        d2k_sched_free(s);
+        d2k_catalog_free(&c);
+    }
+    {
+        /* 4. Повторное подтверждение после пометки снимает её и возвращает
+           привязку на провод (§3.7: перепроверить сохранённое решение). */
+        const char *nm = "recheck-again.example";
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        confirm_once(&c, sv[0], nm, 40611);
+        CHECK(bindings_of(&c, nm, 6) == 1, "recheck/again: fixture not confirmed");
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_CLEAR;
+        d2k_ev h = ev_hello(6, 40612, nm);
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40612);
+        d2k_sched_event(s, &su);
+        settle(s);
+        d2k_sched_free(s);
+        const d2k_cat_binding *b = binding_of(&c, nm, 6);
+        CHECK(b && b->recheck_since, "recheck/again: CLEAR did not mark");
+        tcp_answer = D2K_V_PREFIX;
+        confirm_once(&c, sv[0], nm, 40613);
+        b = binding_of(&c, nm, 6);
+        CHECK(bindings_of(&c, nm, 6) == 1 && b && !b->recheck_since,
+              "recheck/again: reconfirmation did not clear the recheck mark");
+        s = d2k_sched_new(&c, sv[0], 0x2d);
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        CHECK(sent_set_name_shape(nm, b ? (b->shape ? b->shape : D2K_LINK_SHAPE_GRANDFATHER) : 1) == 1,
+              "recheck/again: reconfirmed binding not back on the wire");
+        d2k_sched_free(s);
+        d2k_catalog_free(&c);
+    }
+    {
+        /* 5. QUIC мерится без записанной формы (asked_shape = 0): прямой
+           проход касается только формы замера — QUIC, — не TLS той же цели. */
+        const char *nm = "recheck-quic.example";
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        confirm_once(&c, sv[0], nm, 40621);
+        d2k_cat_binding *modern = binding_mut(&c, nm, 6);
+        CHECK(modern != NULL, "recheck/quic: fixture not confirmed");
+        if (modern) {
+            d2k_cat_binding proto = *modern;
+            add_binding_like(&c.boxes[0], &proto, 6, D2K_SHAPE_LEGACY);
+            add_binding_like(&c.boxes[0], &proto, 6, D2K_LINK_SHAPE_ECH_TCP);
+            add_binding_like(&c.boxes[0], &proto, 17, D2K_LINK_SHAPE_QUIC);
+        }
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        drain(); forget_sent();
+        quic_answer = D2K_V_CLEAR; quic_calls = 0;
+        d2k_ev h = ev_hello(17, 40622, nm);
+        d2k_sched_event(s, &h);
+        d2k_ev sh;
+        CHECK(quic_shape(&sh, nm) == 0, "recheck/quic: snapshot fixture");
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(17, 40622);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(quic_calls == 1, "recheck/quic: direct QUIC measurement did not run");
+        d2k_cat_binding *q = binding_shape(&c, nm, 17, D2K_LINK_SHAPE_QUIC);
+        CHECK(q && q->recheck_since, "recheck/quic: QUIC binding not marked");
+        CHECK(!binding_shape(&c, nm, 6, D2K_SHAPE_MODERN)->recheck_since &&
+              !binding_shape(&c, nm, 6, D2K_SHAPE_LEGACY)->recheck_since &&
+              !binding_shape(&c, nm, 6, D2K_LINK_SHAPE_ECH_TCP)->recheck_since,
+              "recheck/quic: unknown-shape CLEAR touched TLS bindings it did not measure");
+        CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 1 &&
+              sent_del_name_key(nm, 17, D2K_LINK_SHAPE_QUIC, 4) == 1,
+              "recheck/quic: QUIC CLEAR must delete exactly (name, UDP, QUIC)");
+        d2k_sched_free(s);
+        d2k_catalog_free(&c);
+        quic_answer = D2K_V_OPAQUE;
+    }
+    {
+        /* 6. Вопросы о свойствах: после prop_finish заказан проход каталога,
+           и ни одна ветка (в т.ч. prop_sport_be == 0 при props_asked) не
+           шлёт DEL_NAME. */
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        drain(); d2k_sched_sync(s); sync_out(s);
+        CHECK(!d2k_sched_sync_pending(s), "recheck/props: initial sync did not finish");
+        forget_sent();
+        tcp_answer = D2K_V_OPAQUE; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_HANDSHAKE;
+        d2k_ev h = ev_hello(6, 40631, "recheck-props.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40631);
+        d2k_sched_event(s, &su);
+        for (int i = 0; i < 300 && !said("поставил план 1 из"); i++) {
+            skip_ahead(s, 3000);
+            spin(s, 20);
+        }
+        CHECK(said("спрашиваю коробку о свойствах"), "recheck/props: questions not asked");
+        CHECK(said("поставил план 1 из"), "recheck/props: no candidate after questions");
+        CHECK(d2k_sched_sync_pending(s), "recheck/props: prop_finish did not order catalog sync");
+        run_out(s);
+        CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0,
+              "recheck/props: question/candidate cleanup sent a name-wide/permanent DEL_NAME");
+        d2k_sched_free(s);
+        d2k_catalog_free(&c);
+        ver_answer = D2K_VER_APPLICATION;
+    }
+    if (recheck_only) { goto voice_only_done; }
     /* --- узнанная коробка отдаёт свои планы, и успех идёт ЕЙ ----------- */
     {
         d2k_catalog c6;

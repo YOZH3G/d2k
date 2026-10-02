@@ -756,6 +756,7 @@ struct d2k_sched {
     int          sync_active, sync_pending, sync_sent, sync_skipped;
     int          sync_weak;   /* привязки, чьё доказательство слабее обмена */
     int          sync_unshaped; /* адресные привязки без однозначной формы протокола */
+    int          sync_recheck;  /* привязки «требует повторной проверки» (задача 21) */
     installed_area *areas;
     size_t n_areas;
     installed_area area_pending;
@@ -1783,6 +1784,10 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
             d2k_cat_shape_fits(bd->shape, shape)) {
             bd->successes++;
             bd->confirmed = at_s;
+            /* Повторное подтверждение снимает «требует повторной проверки»
+               (задача 21): привязка возвращается на провод проходом каталога. */
+            bd->recheck_since = 0;
+            bd->recheck_mono_ms = 0;
             snprintf(bd->plan_id, sizeof bd->plan_id, "%s", plan_id);
             if (shape) { bd->shape = shape; }
             if (verified_by) { bd->verified_by = verified_by; }
@@ -2111,6 +2116,14 @@ static void prop_finish(d2k_sched *s, task *t) {
     question_retire(s, t);
     prop_close(t);
     t->prop_q = -1;
+    /* Проход каталога после вопросов (задача 21). Снятие вопроса точное и
+       подтверждённое не трогает, но проход — единственный владелец установки
+       постоянных планов (d2k_sched_sync_step), и после опыта знание цели
+       обязано стоять на проводе, что бы ни случилось с таблицей датапата за
+       время опроса (вытеснение LRU пробами вопросов). Кандидату, который
+       встанет следом, проход не мешает: его запись пробная, по своему порту,
+       и постоянная SET_NAME её не затирает (plans.c, find_name_shape_port). */
+    s->sync_pending = 1;
 }
 
 static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
@@ -2134,10 +2147,9 @@ static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
 
        Восстанавливает знание не эта функция, а проход по каталогу: у
        установки планов один владелец (d2k_sched_sync_step), и вторая
-       реализация разошлась бы с ним молча (§2.5). Заказ прохода стоит здесь
-       и только здесь: там, где следом сразу встаёт НОВЫЙ кандидат
-       (prop_finish, исчерпание готовых планов), проход перетёр бы его
-       записью каталога, и испытание мерило бы не то. */
+       реализация разошлась бы с ним молча (§2.5). С пробными записями по
+       порту зонда проход больше не перетирает следующего кандидата, поэтому
+       его заказывает и prop_finish (задача 21). */
     s->sync_pending = 1;
     t->state = T_RESTING;
     t->rest_until_ms = now_ms + SCHED_REST_MS;
@@ -2640,85 +2652,113 @@ static int verdict_proves_block(d2k_verdict verdict) {
 
 static const d2k_cat_plan *plan_by_id(const d2k_cat_box *b, const char *id);
 
-/* A direct CLEAR supersedes a stale learned bypass for this exact name and
-   transport. DEL_NAME is name-wide in the datapath, so replay any surviving
-   protocol/shape bindings for that name immediately after the delete. Plans
-   stay on their box: only the no-longer-justified target binding is removed. */
-static void forget_clear_target_bindings(d2k_sched *s, task *t) {
+/* ФОРМА, КОТОРУЮ ПРЯМОЙ ЗАМЕР ДЕЙСТВИТЕЛЬНО МЕРИЛ (задача 21).
+ *
+ * asked_shape — форма входа замера; ноль у неё — «не записана» (QUIC мерится
+ * без неё, семейный путь берёт форму триггера, которой может не быть). Ноль
+ * в d2k_cat_shape_fits совместим с ЛЮБОЙ формой, и прямой проход, измеренный
+ * профилем TLS 1.3, снимал бы привязки TLS 1.2 и ECH, которых никто не
+ * проверял (§4). Поэтому неизвестная форма заменяется формой профиля
+ * измерения — той же, что легла бы в привязку при успехе (rec_shape в
+ * verify_confirm): QUIC — QUIC, ECH-предложение — ECH, приветствие TLS 1.2 —
+ * LEGACY, иначе профиль зонда (TLS 1.3). */
+static uint8_t clear_measured_shape(const task *t) {
+    if (t->asked_shape) { return t->asked_shape; }
+    if (t->transport == 17) { return (uint8_t)D2K_LINK_SHAPE_QUIC; }
+    if (t->ech_offer) { return (uint8_t)D2K_LINK_SHAPE_ECH_TCP; }
+    return d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY
+               ? (uint8_t)D2K_SHAPE_LEGACY : (uint8_t)SCHED_PROBE_SHAPE;
+}
+
+static int clear_binding_matches(const d2k_cat_binding *bd, const task *t,
+                                 uint8_t measured) {
+    uint8_t tr = bd->transport ? bd->transport : 6;
+    return strcmp(bd->kind, "name") == 0 && strcmp(bd->target, t->name) == 0 &&
+           tr == t->transport && (bd->family ? bd->family : 4) == t->family &&
+           d2k_cat_shape_fits(bd->shape, measured);
+}
+
+/* ОДИН ПРЯМОЙ ПРОХОД НЕ СТИРАЕТ ПОДТВЕРЖДЁННОЕ (задача 21, D2K_SPEC §3.7,
+ * §7, §9.7).
+ *
+ * Прежде первый же CLEAR удалял привязку из каталога и слал широкую DEL_NAME:
+ * та уносила все записи имени в датапате — пробу параллельной QUIC-задачи,
+ * подтверждённое TLS 1.2/ECH — и восстанавливала «выжившие» повтором. Один
+ * transient (коробка на минуту замолчала) стирал знание, оплаченное поиском.
+ *
+ * Теперь:
+ *   1. Первый CLEAR — привязка той формы, что мерилась (clear_measured_shape),
+ *      помечается «требует повторной проверки» (recheck_since), снимается с
+ *      провода ровно своим ключом (DEL_NAME v9: имя, транспорт, форма на
+ *      проводе, семейство; пробы не трогаются) и проходом каталога больше не
+ *      ставится. Цель идёт прямым путём — это и есть «блок исчез — прямой
+ *      путь» до решения. Если блок вернётся, новое подозрение ведёт к замеру,
+ *      и знакомая коробка сначала проверяет свои планы (known_plans,
+ *      rx_saved_bootstrap) — подтверждение того же плана снимает пометку
+ *      (bind_confirmed) и возвращает привязку на провод.
+ *   2. Второй НЕЗАВИСИМЫЙ CLEAR — привязка удаляется из каталога.
+ *
+ * НЕЗАВИСИМОСТЬ — по тому же принципу, что у позднего RST (задача 18:
+ * другой поток, а не повтор того же): второй CLEAR должен прийти из
+ * ОТДЕЛЬНОГО прямого замера. Каждый прямой замер открывает свои соединения
+ * (новые местные порты — другой 4-tuple), а на одну цель одновременно идёт
+ * одна задача; отделённость замеров во времени закреплена порогом
+ * SCHED_RECHECK_GAP_MS от пометки в этом процессе (прямые замеры цели и так
+ * разнесены временным ограничителем CLEAR ≥ 10 мин). Пометка, пережившая
+ * перезапуск (recheck_mono_ms == 0), заведомо поставлена другим замером.
+ * Верхнего окна нет: до решения привязка уже снята с провода, и ждать второго
+ * замера сколько угодно безвредно — ни обход, ни знание не теряются. */
+#define SCHED_RECHECK_GAP_MS (60LL * 1000)
+
+static void forget_clear_target_bindings(d2k_sched *s, task *t, int64_t now_ms) {
     if (!s || !s->cat || !t || t->by_addr) { return; }
-    size_t removed = 0;
-    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
-        d2k_cat_box *b = &s->cat->boxes[bi];
-        for (size_t j = 0; j < b->n_binds; j++) {
-            d2k_cat_binding *bd = &b->binds[j];
-            uint8_t tr = bd->transport ? bd->transport : 6;
-            if (strcmp(bd->kind, "name") == 0 &&
-                strcmp(bd->target, t->name) == 0 && tr == t->transport &&
-                (bd->family ? bd->family : 4) == t->family &&
-                d2k_cat_shape_fits(bd->shape, t->asked_shape)) {
-                removed++;
-            }
-        }
-    }
-    if (removed == 0) { return; }
-
+    uint8_t measured = clear_measured_shape(t);
+    size_t marked = 0, removed = 0, waiting = 0;
     char err[200];
-    if (d2k_link_del_name_family(s->link_fd, t->name, t->family, err, sizeof err) != 0) {
-        say(s, "по %s проходит напрямую, но старую привязку не удалось снять: %s",
-            t->name, err);
-        return;
-    }
-
     for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
         d2k_cat_box *b = &s->cat->boxes[bi];
         for (size_t j = 0; j < b->n_binds;) {
             d2k_cat_binding *bd = &b->binds[j];
-            uint8_t tr = bd->transport ? bd->transport : 6;
-            if (strcmp(bd->kind, "name") == 0 &&
-                strcmp(bd->target, t->name) == 0 && tr == t->transport &&
-                (bd->family ? bd->family : 4) == t->family &&
-                d2k_cat_shape_fits(bd->shape, t->asked_shape)) {
+            if (!clear_binding_matches(bd, t, measured)) { j++; continue; }
+            if (bd->recheck_since &&
+                (bd->recheck_mono_ms == 0 ||
+                 now_ms - bd->recheck_mono_ms >= SCHED_RECHECK_GAP_MS)) {
+                /* Второй независимый прямой проход: привязка не нужна. С
+                   провода она снята ещё при пометке. */
                 memmove(bd, bd + 1, (b->n_binds - j - 1) * sizeof *bd);
                 b->n_binds--;
-                b->updated = (int64_t)time(NULL);
+                b->updated = wall_s(s, now_ms);
+                removed++;
                 continue;
             }
+            if (bd->recheck_since) { waiting++; j++; continue; }
+            bd->recheck_since = wall_s(s, now_ms);
+            bd->recheck_mono_ms = now_ms ? now_ms : 1;
+            uint8_t tr = bd->transport ? bd->transport : 6;
+            uint8_t wire_shape = bd->shape ? bd->shape : (uint8_t)D2K_LINK_SHAPE_GRANDFATHER;
+            if (d2k_link_del_name_family(s->link_fd, t->name, tr, wire_shape,
+                                         t->family, err, sizeof err) != 0) {
+                say(s, "по %s привязку %s не удалось снять с провода: %s",
+                    t->name, bd->plan_id, err);
+            }
+            marked++;
             j++;
         }
     }
-    s->cat->revision++;
-
-    /* Restore any other still-confirmed protocol or ClientHello shape for
-       this name; the datapath delete itself intentionally has broader scope. */
-    char hex[2 * D2K_PLAN_TLV_MAX + 1];
-    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
-        const d2k_cat_box *b = &s->cat->boxes[bi];
-        for (size_t j = 0; j < b->n_binds; j++) {
-            const d2k_cat_binding *bd = &b->binds[j];
-            if (strcmp(bd->target, t->name) != 0 || strcmp(bd->kind, "name") != 0 ||
-                (bd->family ? bd->family : 4) != t->family ||
-                !bd->enabled || (bd->level > 0 && bd->level < 3) ||
-                (bd->transport == 17 && bd->verified_by == D2K_VERBY_CLIENT)) {
-                continue;
-            }
-            const d2k_cat_plan *p = plan_by_id(b, bd->plan_id);
-            if (!p || !p->text ||
-                d2k_plan_text_to_hex(p->text, hex, sizeof hex, err, sizeof err) != 0) {
-                say(s, "по %s оставшаяся привязка %s не восстановлена после снятия: план не найден",
-                    t->name, bd->plan_id);
-                continue;
-            }
-            uint8_t tr = bd->transport ? bd->transport : 6;
-            uint8_t shape = bd->shape ? bd->shape : D2K_LINK_SHAPE_GRANDFATHER;
-            if (d2k_link_set_name_family(s->link_fd, bd->target, tr, hex, shape,
-                                         0, t->family, err, sizeof err) != 0) {
-                say(s, "по %s оставшаяся привязка %s не восстановлена: %s",
-                    t->name, bd->plan_id, err);
-            }
-        }
+    if (marked || removed) { s->cat->revision++; }
+    if (marked) {
+        say(s, "по %s напрямую проходит — привязок требуют повторной проверки: %zu "
+               "(сняты с провода, в каталоге сохранены до второго независимого замера)",
+            t->name, marked);
     }
-    say(s, "по %s проходит напрямую — снял устаревших привязок: %zu",
-        t->name, removed);
+    if (removed) {
+        say(s, "по %s второй независимый прямой проход — удалено привязок: %zu; "
+               "цель идёт прямым путём", t->name, removed);
+    }
+    if (waiting) {
+        say(s, "по %s прямой проход не независим от пометки (тот же замер) — "
+               "привязок ждут второго замера: %zu", t->name, waiting);
+    }
 }
 
 /* Вектор свойств словами. Нужен наружу: иначе «кандидатов 3» ничего не
@@ -3189,7 +3229,8 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
             fputs("\"level_name\": ", f); json_str(f, level_name(bd->level));
             fprintf(f, ", \"successes\": %d, ", bd->successes);
             fputs("\"confirmed\": ", f); json_time(f, bd->confirmed);
-            fprintf(f, ", \"enabled\": %s}", bd->enabled ? "true" : "false");
+            fprintf(f, ", \"enabled\": %s, \"recheck\": %s}", bd->enabled ? "true" : "false",
+                    bd->recheck_since ? "true" : "false");
         }
         fputs("]}", f);
     }
@@ -3296,6 +3337,7 @@ int d2k_sched_sync(d2k_sched *s) {
     s->sync_skipped = 0;
     s->sync_weak = 0;
     s->sync_unshaped = 0;
+    s->sync_recheck = 0;
     s->area_sync_failed = 0;
     return 0;
 }
@@ -3346,7 +3388,7 @@ static int newer_name_binding(const d2k_catalog *cat, const d2k_cat_binding *bd)
         const d2k_cat_box *box = &cat->boxes[bi];
         for (size_t j = 0; j < box->n_binds; j++) {
             const d2k_cat_binding *other = &box->binds[j];
-            if (other == bd || !other->enabled ||
+            if (other == bd || !other->enabled || other->recheck_since ||
                 (other->level > 0 && other->level < 3) ||
                 other->confirmed <= bd->confirmed ||
                 strcmp(other->kind, "name") != 0 ||
@@ -3568,6 +3610,11 @@ int d2k_sched_sync_step(d2k_sched *s) {
         }
         const d2k_cat_binding *bd = &b->binds[s->sync_bind++];
         if (!bd->enabled) { continue; }
+        /* «Требует повторной проверки» (задача 21): прямой замер прошёл без
+           обхода, привязка снята с провода и до повторного подтверждения или
+           второго независимого прямого прохода на него не возвращается —
+           ни этим проходом, ни после перезапуска. Каталог при этом цел. */
+        if (bd->recheck_since) { s->sync_recheck++; continue; }
         if (newer_name_binding(s->cat, bd)) { continue; }
         /* Прежний voice_confirm присваивал UDP CLIENT уровень 3 на любую
            обратную датаграмму. У таких записей нет протокольного
@@ -3689,7 +3736,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
         if (sync_areas(s)) return 1;
         s->sync_active = 0;
         if (s->sync_sent > 0 || s->sync_skipped > 0 || s->sync_weak > 0 ||
-            s->sync_unshaped > 0) {
+            s->sync_unshaped > 0 || s->sync_recheck > 0) {
             say(s, "каталог: поставлено планов по подтверждённым привязкам: %d%s",
                 s->sync_sent, s->sync_skipped ? " (пропущено негодных: см. выше)" : "");
             if (s->sync_weak > 0) {
@@ -3701,6 +3748,10 @@ int d2k_sched_sync_step(d2k_sched *s) {
             if (s->sync_unshaped > 0) {
                 say(s, "каталог: не поставлено адресных привязок без формы протокола: %d "
                        "(требуется повторная проверка)", s->sync_unshaped);
+            }
+            if (s->sync_recheck > 0) {
+                say(s, "каталог: не поставлено привязок, ждущих повторной проверки "
+                       "после прямого прохода: %d", s->sync_recheck);
             }
         }
         return 0;
@@ -5954,7 +6005,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                             D2K_SHAPE_LEGACY : SCHED_PROBE_SHAPE;
                         group_record(s, t, D2K_GROUP_DIRECT_CLEAR, NULL, shape, now_ms);
                     }
-                    forget_clear_target_bindings(s, t);
+                    forget_clear_target_bindings(s, t, now_ms);
                     cooldown_record(s, t, 0);
                     target_cooldown *cool = cooldown_find(s, t->name, t->transport, t->family);
                     int64_t delay_ms = cool

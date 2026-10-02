@@ -663,6 +663,54 @@ int main(void) {
         d2k_plantab_free(t);
     }
 
+    /* ЗАДАЧА 21: снятие по имени — ровно (имя, транспорт, форма, семейство)
+       ПОСТОЯННОЙ записи. Прямой проход TCP не снимает ни пробу параллельной
+       QUIC-задачи того же имени, ни пробу TCP той же формы, ни подтверждённое
+       другой формы (TLS 1.2, ECH) или другого транспорта (QUIC). */
+    {
+        d2k_plantab *t = d2k_plantab_new(16);
+        const uint8_t nm[] = "same.example";
+        size_t nl = sizeof nm - 1;
+        d2k_plan *modern = mkplan(), *legacy = mkplan(), *ech = mkplan(),
+                 *quic = mkplan(), *quic_probe = mkplan(), *tcp_probe = mkplan(),
+                 *v6 = mkplan();
+        CHECK(d2k_plantab_set_name_family(t, nm, nl, 1, modern, D2K_PLAN_SHAPE_MODERN, 0, 4) == 0 &&
+              d2k_plantab_set_name_family(t, nm, nl, 1, legacy, D2K_PLAN_SHAPE_LEGACY, 0, 4) == 0 &&
+              d2k_plantab_set_name_family(t, nm, nl, 1, ech, D2K_PLAN_SHAPE_ECH_TCP, 0, 4) == 0 &&
+              d2k_plantab_set_name_family(t, nm, nl, 1, quic, D2K_PLAN_SHAPE_QUIC, 0, 4) == 0 &&
+              d2k_plantab_set_name_family(t, nm, nl, 1, quic_probe, D2K_PLAN_SHAPE_QUIC, 0x3412, 4) == 0 &&
+              d2k_plantab_set_name_family(t, nm, nl, 1, tcp_probe, D2K_PLAN_SHAPE_MODERN, 0x5612, 4) == 0 &&
+              d2k_plantab_set_name_family(t, nm, nl, 1, v6, D2K_PLAN_SHAPE_MODERN, 0, 6) == 0 &&
+              d2k_plantab_count(t) == 7, "scoped delete fixture");
+        CHECK(d2k_plantab_del_name_shaped(t, nm, nl, 6, D2K_PLAN_SHAPE_MODERN, 4) == 1,
+              "scoped delete did not remove the permanent TCP/TLS1.3 entry");
+        CHECK(d2k_plantab_count(t) == 6, "scoped delete removed more than one entry");
+        CHECK(d2k_plantab_find_family(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_MODERN, 0, 4) == NULL,
+              "permanent TLS1.3 entry still applies after scoped delete");
+        CHECK(d2k_plantab_find_family(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_QUIC, 0x3412, 4) == quic_probe,
+              "TCP delete removed a parallel QUIC trial of the same name");
+        CHECK(d2k_plantab_find_family(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_MODERN, 0x5612, 4) == tcp_probe,
+              "permanent delete removed an exact-flow TCP trial");
+        CHECK(d2k_plantab_find_family(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_LEGACY, 0, 4) == legacy,
+              "TLS1.3 delete removed the TLS1.2 binding");
+        CHECK(d2k_plantab_find_family(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_ECH_TCP, 0, 4) == ech,
+              "TLS1.3 delete removed the ECH binding");
+        CHECK(d2k_plantab_find_family(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_QUIC, 0, 4) == quic,
+              "TCP delete removed the permanent QUIC binding");
+        CHECK(d2k_plantab_find_family(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_MODERN, 0, 6) == v6,
+              "IPv4 delete removed the IPv6 binding");
+        CHECK(d2k_plantab_del_name_shaped(t, nm, nl, 17, D2K_PLAN_SHAPE_MODERN, 4) == 0,
+              "transport mismatch still deleted something");
+        CHECK(d2k_plantab_del_name_shaped(t, nm, nl, 6, D2K_PLAN_SHAPE_QUIC, 4) == 0,
+              "TCP delete with QUIC shape matched the QUIC entry");
+        CHECK(d2k_plantab_del_name_shaped(t, nm, nl, 17, D2K_PLAN_SHAPE_QUIC, 4) == 1 &&
+              d2k_plantab_find_family(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_QUIC, 0x3412, 4) == quic_probe,
+              "QUIC permanent delete must spare the QUIC trial");
+        CHECK(d2k_plantab_del_name_shaped(t, nm, nl, 6, D2K_PLAN_SHAPE_ANY, 4) == 0 &&
+              d2k_plantab_count(t) == 5, "shape ANY is not a wildcard delete");
+        d2k_plantab_free(t);
+    }
+
     if (fails) {
         printf("ПРОВАЛОВ: %d\n", fails);
         return 1;

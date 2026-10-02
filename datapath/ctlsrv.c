@@ -367,12 +367,18 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         return;
     }
     case D2K_CMD_DEL_NAME:
-        if (len < 2 || len != 2u + b[0] ||
-            (b[1u + b[0]] != 4 && b[1u + b[0]] != 6)) {
+        /* v9: длина имени, имя, транспорт, форма, family. Снимает ровно
+           постоянную запись этого ключа; пробы и другие формы/транспорты
+           не трогает (задача 21). Широкого «всё имя» на проводе больше нет. */
+        if (len < 4 || len != 4u + b[0] || !b[0] ||
+            (b[1u + b[0]] != 6 && b[1u + b[0]] != 17) ||
+            b[2u + b[0]] == D2K_PLAN_SHAPE_ANY ||
+            (b[3u + b[0]] != 4 && b[3u + b[0]] != 6)) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
-        d2k_plantab_del_name_family(tab, b + 1, b[0], b[1u + b[0]]);
+        d2k_plantab_del_name_shaped(tab, b + 1, b[0], b[1u + b[0]], b[2u + b[0]],
+                                    b[3u + b[0]]);
         ack(cx, type, 1, D2K_ACK_OK);
         return;
     case D2K_CMD_DEL_NAME_PROBE:

@@ -295,6 +295,13 @@ static void drain_all(int fd) {
  * нечего было бы посчитать). Разница before/after — надёжный способ узнать,
  * сколько РЕАЛЬНО раз d2k_props_ask поставил план за один вызов, не читая
  * события параллельно с ним. */
+static unsigned long long query_plan_total(probe *p) {
+    const char *resp = probe_say(p, "plans");
+    unsigned long long total = 0, ok = 0, bad = 0;
+    (void)sscanf(resp, "planов %llu, команд принято %llu, отвергнуто %llu", &total, &ok, &bad);
+    return total;
+}
+
 static unsigned long long query_ok_cmds(probe *p) {
     const char *resp = probe_say(p, "plans");
     unsigned long long total = 0, ok = 0, bad = 0;
@@ -610,6 +617,8 @@ typedef struct {
     int foreign_before_round;
     int extra_round_seen;
     int closed_early;   /* зонд закрыл соединение до события обмена */
+    int retired;        /* точных DEL_NAME_PROBE не прошедших вопросов (задача 21) */
+    int broad_del;      /* DEL_NAME по имени — не должно быть вовсе */
 } fakeend_args;
 
 static void *fakeend_run(void *arg) {
@@ -621,7 +630,13 @@ static void *fakeend_run(void *arg) {
         uint8_t cmd[4096]; size_t cmdlen = 0;
         uint8_t qid[D2K_PLAN_ID_LEN];
         uint16_t kind;
-        if (drain_one_command_body(a->fd, cmd, sizeof cmd, &cmdlen, &kind) != 0) { return NULL; }
+        /* Не прошедший вопрос снимается своей DEL_NAME_PROBE (задача 21) —
+           это не новый раунд: считаем и читаем дальше. */
+        do {
+            if (drain_one_command_body(a->fd, cmd, sizeof cmd, &cmdlen, &kind) != 0) { return NULL; }
+            if (kind == D2K_CMD_DEL_NAME_PROBE) { a->retired++; }
+            if (kind == D2K_CMD_DEL_NAME) { a->broad_del++; }
+        } while (kind == D2K_CMD_DEL_NAME_PROBE || kind == D2K_CMD_DEL_NAME);
         int have_id = (plan_id_from_setname(kind, cmd, cmdlen, qid) == 0);
         send_ack_ok(a->fd, kind);
 
@@ -679,8 +694,13 @@ static void *fakeend_run(void *arg) {
 
     struct pollfd pfd;
     pfd.fd = a->fd; pfd.events = POLLIN; pfd.revents = 0;
-    if (poll(&pfd, 1, 300) > 0) {
+    while (poll(&pfd, 1, 300) > 0) {
+        uint8_t cmd[4096]; size_t cmdlen = 0; uint16_t kind = 0;
+        if (drain_one_command_body(a->fd, cmd, sizeof cmd, &cmdlen, &kind) != 0) { break; }
+        if (kind == D2K_CMD_DEL_NAME_PROBE) { a->retired++; continue; }
+        if (kind == D2K_CMD_DEL_NAME) { a->broad_del++; continue; }
         a->extra_round_seen = 1;
+        break;
     }
     return NULL;
 }
@@ -1317,6 +1337,8 @@ int main(int argc, char **argv) {
               "(docs/field/2026-09-11-first-c-ask.md)");
 
         CHECK(!fa.extra_round_seen, "b2: опрос продолжился после второго прохода — лишняя команда");
+        CHECK(fa.retired == 4 && fa.broad_del == 0,
+              "b2: четыре не прошедших вопроса не сняты каждый своим ключом (или ушла DEL_NAME)");
         CHECK(pr.counts_duplicates == D2K_P_YES, "b2: счёт дубликатов не записан по проходу");
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN,
               "b2: промах первого вопроса записал что-то — промах обязан не писать НИЧЕГО (§2.4)");
@@ -1402,8 +1424,8 @@ int main(int argc, char **argv) {
 
     /* --- B3: control недоступен — вопросы 2 и 5 пропускаются целиком (SET_NAME
      * для них не отправляется вовсе), оставшиеся три промахиваются, вектор
-     * весь остаётся UNKNOWN; ПОСЛЕ вызова план последнего заданного вопроса
-     * СНЯТ (DEL_NAME), потому что не прошёл ни один вопрос — иначе на боевом
+     * весь остаётся UNKNOWN; ПОСЛЕ вызова план каждого заданного вопроса
+     * СНЯТ своим ключом (DEL_NAME_PROBE, задача 21) — иначе на боевом
      * датапате оставался бы стоять план, про который это же измерение только
      * что сказало «не работает». Что имя при этом бралось ПРАВИЛЬНОЕ (то, что
      * дал d2k_hello_sni, а не подстрока по случайности), проверяет B5: там
@@ -1425,13 +1447,17 @@ int main(int argc, char **argv) {
         CHECK(pthread_create(&th, NULL, driver_run, &da) == 0, "b3: ведущий поток не запустился");
 
         unsigned long long before = query_ok_cmds(&p);
+        unsigned long long plans_before = query_plan_total(&p);
         d2k_props pr = d2k_props_ask(fd, "127.0.0.1", stand_port, trig, nodecoy, 0);
         pthread_join(th, NULL);
         unsigned long long after = query_ok_cmds(&p);
 
-        CHECK(after - before == 5, "b3: без control ожидались четыре SET_NAME (разбор протокола "
-                                    "и разбор протокола — пропущены целиком) и один DEL_NAME "
-                                    "по итогу полного промаха");
+        /* Задача 21: каждый не прошедший вопрос снят СВОИМ ключом
+           (DEL_NAME_PROBE по порту вопроса), а не одной широкой DEL_NAME. */
+        CHECK(after - before == 8, "b3: без control ожидались четыре SET_NAME_PROBE (разбор "
+                                    "протокола пропущен целиком) и четыре точных DEL_NAME_PROBE");
+        CHECK(query_plan_total(&p) == plans_before,
+              "b3: после полного промаха пробные планы вопросов остались в таблице");
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN && pr.tolerates_reorder == D2K_P_UNKNOWN &&
               pr.validates_checksum == D2K_P_UNKNOWN && pr.parses_l7 == D2K_P_UNKNOWN &&
               pr.counts_duplicates == D2K_P_UNKNOWN,
@@ -1452,9 +1478,10 @@ int main(int argc, char **argv) {
      * то, что даёт d2k_hello_sni из триггера. Проверяется в обе стороны на
      * НАСТОЯЩЕМ ctlprobe: сперва план ставится под извлечённым именем вручную
      * и "hello b5.example" получает APPLIED (значит имя извлечено верно и
-     * буквально), затем полный промах d2k_props_ask снимает его и то же
-     * "hello" получает REFUSED (значит DEL_NAME ушёл ПО ТОМУ ЖЕ имени, а не
-     * по какому-нибудь ещё). Проход вопроса здесь показать нечем — ctlprobe
+     * буквально), затем полный промах d2k_props_ask снимает ТОЛЬКО свои пробы
+     * вопросов (число планов вернулось к прежнему — снятие ушло ПО ТОМУ ЖЕ
+     * имени), а постоянный план остаётся: то же "hello" снова APPLIED
+     * (задача 21, D2K_SPEC §7). Проход вопроса здесь показать нечем — ctlprobe
      * строит событие обмена с жёстко зашитым адресом клиента (см. большой
      * комментарий про поддельный конец связи выше), а что проход НЕ приводит
      * к снятию плана, проверяет B4 своим !extra_round_seen. ---------------- */
@@ -1484,6 +1511,7 @@ int main(int argc, char **argv) {
         CHECK(d2k_link_set_name(fd, name, 6, hex, D2K_LINK_SHAPE_GRANDFATHER, err, sizeof err) == 0,
               "b5: SET_NAME по имени из триггера не отправился");
         drain_all(fd);
+        unsigned long long b5_plans_before = query_plan_total(&p);
         (void)probe_say(&p, "hello b5.example");
         d2k_ev ev;
         CHECK(next_of_kind2(fd, D2K_EV_APPLIED, D2K_EV_REFUSED, 6, &ev, err, sizeof err) == 0,
@@ -1522,11 +1550,17 @@ int main(int argc, char **argv) {
               "b5: промах первого вопроса не отмечен в трассе");
         drain_all(fd);
 
+        /* Задача 21 (D2K_SPEC §7): полный промах снимает ТОЛЬКО свои пробы
+           вопросов, точным ключом по тому же имени, — постоянный план цели,
+           поставленный не опросником, остаётся и применяется. Прежде здесь
+           утверждалось обратное: широкая DEL_NAME уносила и его. */
+        CHECK(query_plan_total(&p) == b5_plans_before,
+              "b5: пробы вопросов не сняты по тому же имени или снят чужой постоянный план");
         (void)probe_say(&p, "hello b5.example");
         CHECK(next_of_kind2(fd, D2K_EV_APPLIED, D2K_EV_REFUSED, 6, &ev, err, sizeof err) == 0,
               "b5: ни APPLIED, ни REFUSED не пришли после второго hello");
-        CHECK(ev.kind == D2K_EV_REFUSED,
-              "b5: DEL_NAME ушёл НЕ по тому имени — план всё ещё стоит");
+        CHECK(ev.kind == D2K_EV_APPLIED,
+              "b5: полный промах опросника снял постоянный план цели");
         drain_all(fd);
     }
 

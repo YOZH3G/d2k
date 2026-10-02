@@ -749,7 +749,11 @@ static void fakectl_run(fakectl_args *a) {
     for (size_t i = 0; i < a->n; i++) {
         uint8_t qid[D2K_PLAN_ID_LEN]; int have_id = 0;
         uint16_t kind;
-        if (drain_one_command(a->ctl_fd, qid, &have_id, &kind) != 0) { return; }
+        /* Не прошедший вопрос снимается своей DEL_NAME_PROBE (задача 21) —
+           это не новый раунд. */
+        do {
+            if (drain_one_command(a->ctl_fd, qid, &have_id, &kind) != 0) { return; }
+        } while (kind == D2K_CMD_DEL_NAME_PROBE);
         if (kind != D2K_CMD_SET_NAME && kind != D2K_CMD_SET_NAME_PROBE) { return; }
         send_ack_ok(a->ctl_fd, kind);
 

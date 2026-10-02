@@ -860,6 +860,8 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
     if (strcmp(key, "ech_origin") == 0)
         return jparse_string_fixed(j, out->ech_origin, sizeof out->ech_origin,
                                    "binding.ech_origin", err, errcap);
+    if (strcmp(key, "recheck_since") == 0)
+        return jparse_rfc3339(j, &out->recheck_since, "binding.recheck_since", err, errcap);
     return jskip_value(j, depth + 1, err, errcap);
 }
 static int parse_binding(jctx *j, d2k_cat_binding *out, int depth, char *err, size_t errcap) {
@@ -1260,6 +1262,13 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
     if (bd->ech_origin[0]) {
         fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"ech_origin\": ", f);
         write_json_string(f, bd->ech_origin);
+    }
+    if (bd->recheck_since) {
+        /* Только помеченная: отсутствие ключа и есть «не помечена» (задача 21). */
+        char recheck_s[32];
+        format_rfc3339(bd->recheck_since, recheck_s, sizeof recheck_s);
+        fputs(",\n", f); wr_indent(f, depth + 1);
+        fprintf(f, "\"recheck_since\": \"%s\"", recheck_s);
     }
     fputc('\n', f);
     wr_indent(f, depth); fputc('}', f);

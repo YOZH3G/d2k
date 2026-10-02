@@ -105,6 +105,10 @@ int d2k_plantab_set_name_family(d2k_plantab *, const uint8_t *, size_t,
 int d2k_plantab_del_name_family(d2k_plantab *, const uint8_t *, size_t, uint8_t family);
 int d2k_plantab_del_name_probe_family(d2k_plantab *, const uint8_t *, size_t,
     uint8_t shape, uint16_t sport_be, uint8_t family);
+/* Постоянная запись ровно (имя, транспорт, форма, семейство); пробы не
+ * трогает (задача 21). 1 — что-то снято. */
+int d2k_plantab_del_name_shaped(d2k_plantab *, const uint8_t *, size_t,
+    uint8_t transport, uint8_t shape, uint8_t family);
 const d2k_plan *d2k_plantab_find_family(d2k_plantab *, const uint8_t *, size_t,
     uint32_t addr_be, uint64_t, uint8_t shape, uint16_t sport_be, uint8_t family);
 int d2k_plantab_stream_candidate_family(const d2k_plantab *, const uint8_t *,

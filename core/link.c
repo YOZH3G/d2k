@@ -609,42 +609,6 @@ int d2k_link_area_identified(int fd, uint16_t cmd, const char *name,
     return send_area_key(fd, cmd, name, transport, shape, family, err, errcap, id);
 }
 
-/* Family-scoped name removal. ARM_SHAPE has its own snapshot contract. */
-static int send_name_only(int fd, uint16_t cmd, const char *what,
-                          const char *name, uint8_t family, char *err, size_t errcap) {
-    if (fd < 0 || (family != 4 && family != 6)) {
-        say(err, errcap, "сокет не открыт");
-        return -1;
-    }
-    if (!name) {
-        name = "";
-    }
-    size_t nl = strlen(name);
-    if (nl > 255) {
-        say(err, errcap, "имя цели длиной %zu байт длиннее 255", nl);
-        return -1;
-    }
-
-    size_t o = HDR;
-    g_scratch[o++] = (uint8_t)nl;
-    memcpy(g_scratch + o, name, nl);
-    o += nl;
-    g_scratch[o++] = family;
-    size_t body_len = o - HDR;
-    uint32_t plen = (uint32_t)(2 + body_len);
-    g_scratch[0] = (uint8_t)(plen >> 24);
-    g_scratch[1] = (uint8_t)(plen >> 16);
-    g_scratch[2] = (uint8_t)(plen >> 8);
-    g_scratch[3] = (uint8_t)plen;
-    g_scratch[4] = (uint8_t)(cmd >> 8);
-    g_scratch[5] = (uint8_t)cmd;
-
-    if (write_all(fd, g_scratch, o) != 0) {
-        say(err, errcap, "команда %s не отправилась: %s", what, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
 
 /* Форма адресной привязки (v7): только измеренный протокол — TLS 1.3/1.2,
    ECH, QUIC, STUN/голос. Ноль и дедушкино право означали бы «подходит всем
@@ -844,13 +808,37 @@ int d2k_link_arm_shape_family(int fd, const char *name, uint8_t transport,
     return 0;
 }
 
-int d2k_link_del_name(int fd, const char *name, char *err, size_t errcap) {
-    return d2k_link_del_name_family(fd, name, 4, err, errcap);
-}
-
-int d2k_link_del_name_family(int fd, const char *name, uint8_t family,
+int d2k_link_del_name_family(int fd, const char *name, uint8_t transport,
+                             uint8_t shape, uint8_t family,
                              char *err, size_t errcap) {
-    return send_name_only(fd, D2K_CMD_DEL_NAME, "DEL_NAME", name, family, err, errcap);
+    /* v9: ключ постоянной записи целиком — имя, транспорт, форма, семейство.
+       Пробы этой командой не снимаются (задача 21). */
+    if (fd < 0 || !name || (family != 4 && family != 6) ||
+        (transport != 6 && transport != 17) || shape == 0) {
+        say(err, errcap, "сокет, транспорт, форма или семейство снятия не заданы");
+        return -1;
+    }
+    size_t nl = strlen(name);
+    if (nl == 0 || nl > 255) {
+        say(err, errcap, "недопустимая длина имени снятия");
+        return -1;
+    }
+    size_t o = HDR;
+    g_scratch[o++] = (uint8_t)nl;
+    memcpy(g_scratch + o, name, nl); o += nl;
+    g_scratch[o++] = transport;
+    g_scratch[o++] = shape;
+    g_scratch[o++] = family;
+    uint32_t plen = (uint32_t)(2 + (o - HDR));
+    g_scratch[0] = (uint8_t)(plen >> 24); g_scratch[1] = (uint8_t)(plen >> 16);
+    g_scratch[2] = (uint8_t)(plen >> 8);  g_scratch[3] = (uint8_t)plen;
+    g_scratch[4] = (uint8_t)(D2K_CMD_DEL_NAME >> 8);
+    g_scratch[5] = (uint8_t)D2K_CMD_DEL_NAME;
+    if (write_all(fd, g_scratch, o) != 0) {
+        say(err, errcap, "команда DEL_NAME не отправилась: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 int d2k_link_del_name_probe(int fd, const char *name, uint8_t transport,

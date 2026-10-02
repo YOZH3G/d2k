@@ -804,10 +804,16 @@ int main(void) {
               "IPv4 compatibility command");
         CHECK(read(sv[1], wire, sizeof wire) == 10 && wire[9] == 4,
               "legacy API explicitly encodes IPv4");
-        CHECK(d2k_link_del_name_family(sv[0], "x", 6, err, sizeof err) == 0,
+        CHECK(d2k_link_del_name_family(sv[0], "x", 17, D2K_LINK_SHAPE_QUIC, 6,
+                                       err, sizeof err) == 0,
               "IPv6 delete name");
-        CHECK(read(sv[1], wire, sizeof wire) == 9 && wire[8] == 6,
-              "IPv6 delete is family scoped");
+        CHECK(read(sv[1], wire, sizeof wire) == 11 && wire[5] == D2K_CMD_DEL_NAME &&
+              wire[8] == 17 && wire[9] == D2K_LINK_SHAPE_QUIC && wire[10] == 6,
+              "DEL_NAME v9 carries transport, shape and family");
+        CHECK(d2k_link_del_name_family(sv[0], "x", 6, 0, 4, err, sizeof err) == -1,
+              "DEL_NAME without shape (name-wide delete) rejected");
+        CHECK(d2k_link_del_name_family(sv[0], "x", 0, 1, 4, err, sizeof err) == -1,
+              "DEL_NAME without transport rejected");
         CHECK(d2k_link_set_suffix_family(sv[0], "x.com", 6, "aabb", 1, 6, err, sizeof err) == 0,
               "IPv6 suffix send");
         CHECK(read(sv[1], wire, sizeof wire) == 32 && wire[5] == D2K_CMD_SET_SUFFIX &&

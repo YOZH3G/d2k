@@ -643,6 +643,31 @@ int d2k_plantab_del_name_family(d2k_plantab *t, const uint8_t *name, size_t len,
     return n > 0;
 }
 
+/* Снятие ПОСТОЯННОЙ записи по ключу (имя, транспорт, форма, семейство) —
+   единственное снятие по имени, доступное с управляющего сокета (DEL_NAME
+   v9, задача 21). Пробы (only_sport != 0) не трогает никогда: их снимает
+   только DEL_NAME_PROBE своим портом. Прежнее «все записи имени» уносило
+   пробу параллельной задачи другого транспорта и подтверждённое знание
+   других форм (§7). Форма ANY — не шаблон: снимать нечего. */
+int d2k_plantab_del_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
+    uint8_t transport, uint8_t shape, uint8_t family) {
+    if (!t || !name || len == 0 || shape == D2K_PLAN_SHAPE_ANY ||
+        (transport != 6 && transport != 17)) { return 0; }
+    int n = 0;
+    for (size_t i = 0; i < t->used;) {
+        entry *e = &t->v[i];
+        if (e->kind == KEY_NAME && e->family == family && e->only_sport == 0 &&
+            e->shape == shape && probe_transport(e->plan, e->shape) == transport &&
+            name_eq(e->name, e->name_len, name, len)) {
+            (void)drop(t, e);
+            n++;
+            continue; /* drop() compacted the last entry into slot i */
+        }
+        i++;
+    }
+    return n > 0;
+}
+
 int d2k_plantab_del_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
                                uint8_t shape, uint16_t sport_be) {
     return d2k_plantab_del_name_probe_family(t, name, len, shape, sport_be, 4);

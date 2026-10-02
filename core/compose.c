@@ -768,6 +768,17 @@ void d2k_props_question_passed(int q, d2k_props *pr) {
  * d2k_props_ask — см. большой комментарий в шапке файла.
  * -------------------------------------------------------------------- */
 
+/* Снять пробу ОДНОГО вопроса ровно её ключом: имя, форма, семейство, порт
+   вопроса (DEL_NAME_PROBE). Широкое снятие по имени уносило бы подтверждённое
+   знание цели и пробы чужих задач (задача 21, D2K_SPEC §7). Отказ отправки
+   ничего не меняет в наблюдении о коробке и в вектор не пишется. */
+static void question_retire(int link_fd, const char *name, uint8_t shape,
+                            uint16_t sport_be, uint8_t family) {
+    char derr[128];
+    (void)d2k_link_del_name_probe_family(link_fd, name, 6, shape, sport_be, family,
+                                         derr, sizeof derr);
+}
+
 d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
                         d2k_hello trigger, d2k_hello control, uint32_t mark) {
     return d2k_props_ask_traced(link_fd, ip, port, trigger, control, mark, NULL);
@@ -828,7 +839,6 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
     memcpy(name, trigger.bytes + sni_off, sni_len);
     name[sni_len] = '\0';
 
-    int asked_any = 0, passed_any = 0;
     for (int i = 0; i < D2K_PROPS_QUESTIONS; i++) {
         /* Тело фальшивки — ДВОЙНАЯ длина правды (build_fake_body), а правда
            бывает размером с приветствие браузера. Отсюда потолок: 2 ×
@@ -844,7 +854,6 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
             step_rc(steps, i, D2K_STEP_NOT_ASKED, NULL);
             continue; /* этот вопрос сегодня не собрать — не измерено, дальше */
         }
-        asked_any = 1;
         /* Удостоверяем план: без идентификатора «применён» приписывается
            только по ключу потока, а на том же ключе мог примениться другой
            план. Раскладка не та — вопрос не задаём вовсе: испытание без
@@ -899,6 +908,9 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
            «не измерено». */
         if (wait_for_event(link_fd, D2K_EV_ACK, D2K_CMD_SET_NAME_PROBE, NULL,
                            D2K_PROPS_ASK_WAIT_MS, &ack, err, sizeof err) != 0) {
+            /* Подтверждение могло потеряться при стоящем плане — снимаем
+               ровно свою пробу (имя, форма, семейство, порт вопроса). */
+            question_retire(link_fd, name, qshape, qsport, family);
             close(qfd);
             step_rc(steps, i, D2K_STEP_NO_ACK, err);
             continue; /* ack не пришёл в срок — не измерено */
@@ -927,7 +939,9 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         int contact_fd = -1;
         if (d2k_props_contact_on_family(qfd, ip, port, trigger, family, local_addr,
                                         &local_port, &contact_fd) != 0) {
-            step_rc(steps, i, D2K_STEP_CONTACT_FAIL, strerror(errno));
+            int contact_errno = errno;
+            question_retire(link_fd, name, qshape, qsport, family);
+            step_rc(steps, i, D2K_STEP_CONTACT_FAIL, strerror(contact_errno));
             continue; /* обращение не состоялось (транспорт) — не измерено */
         }
         if (steps) {
@@ -1025,6 +1039,13 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         }
         /* Только теперь — соединение было живо ровно столько, сколько длилось
            ожидание обмена (см. doc-комментарий props_ask_contact). */
+        /* Не прошедший вопрос снимается СРАЗУ и ТОЧНО, до закрытия своего
+           соединения (порт ещё наш): план, про который это же измерение
+           сказало «не работает», не остаётся стоять. Прошедший остаётся —
+           это и есть стратегия (двойное назначение, см. шапку файла). */
+        if (!passed) {
+            question_retire(link_fd, name, qshape, qsport, family);
+        }
         if (contact_fd >= 0) {
             close(contact_fd);
         }
@@ -1053,7 +1074,6 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
                           начинается с if !passed { return }) */
         }
         step_rc(steps, i, D2K_STEP_PASSED, NULL);
-        passed_any = 1;
 
         d2k_props_question_passed(i, &pr);
         /* Вопрос прошёл — это уже стратегия (двойное назначение плана,
@@ -1064,17 +1084,9 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         break;
     }
 
-    /* Ни один вопрос не прошёл — снять план последнего заданного. Пока вопрос
-       проходит, оставленный план И ЕСТЬ стратегия (двойное назначение, см.
-       шапку файла), и снимать его было бы вредительством; но когда не прошёл
-       ни один, на датапате оставался стоять план, про который это же
-       измерение только что сказало «не работает» — на боевом роутере он
-       переживал вызов и мешал следующему поиску. Отказ DEL_NAME здесь ничего
-       не меняет в наблюдении о коробке и потому не пишется в вектор. */
-    if (asked_any && !passed_any) {
-        char derr[128];
-        (void)d2k_link_del_name_family(link_fd, name, family, derr, sizeof derr);
-    }
+    /* Широкого снятия по имени после цикла больше нет (задача 21): каждый
+       не прошедший вопрос снят выше своим ключом. Прежняя DEL_NAME «всё имя»
+       уносила и подтверждённое знание этой цели, и пробы чужих задач. */
 
     return pr;
 }

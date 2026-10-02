@@ -754,12 +754,24 @@ int main(void) {
                     cx.now_ns, D2K_PLAN_SHAPE_QUIC, 0, 4) != NULL, "IPv4 plan retained");
             CHECK(d2k_plantab_find_family(tab, (const uint8_t *)nm, nl, 0,
                     cx.now_ns, D2K_PLAN_SHAPE_QUIC, 0, 6) != NULL, "IPv6 plan installed");
+            uint16_t cmd; int ok; uint8_t reason;
+            /* Прежнее тело v8 (без транспорта и формы) — отказ, а не «снять
+               всё имя»: смешанная пара не превращает точное снятие в широкое. */
             body[0] = (uint8_t)nl; memcpy(body + 1, nm, nl); body[1 + nl] = 6;
             frame(f, D2K_CMD_DEL_NAME, body, nl + 2);
-            CHECK(write(cli, f, nl + 8) == (ssize_t)(nl + 8), "dual DEL write");
+            CHECK(write(cli, f, nl + 8) == (ssize_t)(nl + 8), "old DEL write");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "old DEL parse");
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok &&
+                  reason == D2K_ACK_BAD_ARGS, "v8 DEL_NAME body must be rejected");
+            CHECK(d2k_plantab_find_family(tab, (const uint8_t *)nm, nl, 0,
+                    cx.now_ns, D2K_PLAN_SHAPE_QUIC, 0, 6) != NULL, "rejected DEL removed a plan");
+            /* v9: длина, имя, транспорт, форма, семейство. */
+            body[1 + nl] = 6; body[2 + nl] = D2K_PLAN_SHAPE_GRANDFATHER; body[3 + nl] = 6;
+            frame(f, D2K_CMD_DEL_NAME, body, nl + 4);
+            CHECK(write(cli, f, nl + 10) == (ssize_t)(nl + 10), "dual DEL write");
             CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "dual DEL parse");
             d2k_ctl_flush(c);
-            uint16_t cmd; int ok; uint8_t reason;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok, "dual DEL ack");
             CHECK(d2k_plantab_find_family(tab, (const uint8_t *)nm, nl, 0,
                     cx.now_ns, D2K_PLAN_SHAPE_QUIC, 0, 4) != NULL, "IPv6 delete preserves IPv4");
