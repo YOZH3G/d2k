@@ -250,6 +250,7 @@ static int traffic_keys(const uint8_t secret[32], uint8_t key[16], uint8_t iv[12
 
 static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
     size_t want_wire, const d2k_ech_config *ech,
+    int client_alpn, const uint8_t *alpn_list, size_t alpn_len,
     d2k_tls **out, char *err, size_t errcap) {
     if (err && errcap) { err[0] = '\0'; }
     if (fd < 0 || !out) { say(err, errcap, "нечем поднимать сессию"); return -1; }
@@ -285,7 +286,18 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
     cho.pub = pub;
     cho.random = rnd;
     cho.session_id_len = 32;      /* совместимость: так ходит браузер по TCP */
-    cho.alpn = "http/1.1";
+    /* ALPN — ФОРМА КЛИЕНТА, а не удобная фиксированная (задача 37, F3).
+       Прежде здесь всегда стоял http/1.1, и сервер не-HTTP протокола (MQTT
+       поверх TLS) отвечал тревогой 120 на КАЖДОЕ испытание: план пропускал
+       приветствие, а зонд спрашивал не тот протокол. Без client_alpn —
+       прежний HTTP-зонд. */
+    if (client_alpn) {
+        cho.alpn = NULL;
+        cho.alpn_wire = alpn_len ? alpn_list : NULL;
+        cho.alpn_wire_len = alpn_len;
+    } else {
+        cho.alpn = "http/1.1";
+    }
     /* Добивка у ядра считается БЕЗ заголовка записи — его тут пять байт. */
     cho.pad_to = want_wire > 5 ? want_wire - 5 : 0;
     size_t ch_len;
@@ -479,7 +491,15 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
 
 int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
                     d2k_tls **out, char *err, size_t errcap) {
-    return tls_connect_internal(fd, sni, deadline_ms, want_wire, NULL, out, err, errcap);
+    return tls_connect_internal(fd, sni, deadline_ms, want_wire, NULL, 0, NULL, 0,
+                                out, err, errcap);
+}
+
+int d2k_tls_connect_alpn(int fd, const char *sni, int deadline_ms, size_t want_wire,
+                         const uint8_t *alpn_list, size_t alpn_len,
+                         d2k_tls **out, char *err, size_t errcap) {
+    return tls_connect_internal(fd, sni, deadline_ms, want_wire, NULL, 1,
+                                alpn_list, alpn_len, out, err, errcap);
 }
 
 int d2k_tls_connect_ech(int fd, const char *origin, const d2k_ech_config *config,
@@ -488,7 +508,8 @@ int d2k_tls_connect_ech(int fd, const char *origin, const d2k_ech_config *config
         if (out) *out = NULL;
         say(err, errcap, "ECH требует origin и конфигурацию"); return -1;
     }
-    return tls_connect_internal(fd, origin, deadline_ms, want_wire, config, out, err, errcap);
+    return tls_connect_internal(fd, origin, deadline_ms, want_wire, config, 0, NULL, 0,
+                                out, err, errcap);
 }
 
 int d2k_tls_ech_accepted(const d2k_tls *t) { return t && t->ech_accepted; }

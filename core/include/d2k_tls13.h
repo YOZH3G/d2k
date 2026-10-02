@@ -41,6 +41,11 @@ typedef struct d2k_tls d2k_tls;
  * вовсе — подтверждение достаётся зонду, а не человеку. */
 int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
                     d2k_tls **out, char *err, size_t errcap);
+/* То же, но ALPN — список КЛИЕНТА как на проводе (protocol_name_list без
+ * длины); alpn_len 0 — без расширения ALPN, как у клиента без него. */
+int d2k_tls_connect_alpn(int fd, const char *sni, int deadline_ms, size_t want_wire,
+                         const uint8_t *alpn_list, size_t alpn_len,
+                         d2k_tls **out, char *err, size_t errcap);
 /* ECH rejection is an error, never an ordinary TLS success for public_name. */
 int d2k_tls_connect_ech(int fd, const char *origin, const d2k_ech_config *config,
     int deadline_ms, size_t want_wire, d2k_tls **out, char *err, size_t errcap);

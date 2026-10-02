@@ -376,6 +376,7 @@ d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
 d2k_sched_ver_fn  d2k_sched_rx_ver_hook = verify_rx_default;
 d2k_sched_ver_fn  d2k_sched_rx_gzip_ver_hook = verify_rx_gzip_default;
+d2k_sched_alpn_ver_fn d2k_sched_alpn_ver_hook = d2k_verify_probe_alpn_on;
 
 static d2k_voice_res voice_default(const d2k_voice_opt *opt) {
     return d2k_voice_run(opt);
@@ -804,6 +805,19 @@ typedef struct {
     int        c_fd;
     int        c_ok;
 } task;
+
+/* ПРОТОКОЛ КЛИЕНТА — НЕ HTTP (задача 37, F3). Снимок TLS 1.3 целиком, и в
+   его ALPN нет ни http/1.1, ни h2 (MQTT, XMPP… или ALPN нет вовсе): тогда
+   HTTP-зонд спрашивал бы сервер на чужом языке. 1 — зонд берёт ALPN клиента
+   (list/len), 0 — прежний HTTP-зонд. Неполный снимок — «не измерено», 0. */
+static int client_alpn_nonhttp(const task *t, uint8_t *list, size_t cap, size_t *len) {
+    *len = 0;
+    if (t->transport != 6 || t->ech_offer || t->measure_path[0] ||
+        d2k_hello_shape(t->trig, t->trig_len) != D2K_SHAPE_MODERN) return 0;
+    int rc = d2k_hello_alpn(t->trig, t->trig_len, list, cap, len);
+    if (rc < 0) { *len = 0; return 0; }
+    return !d2k_alpn_is_http(list, *len);
+}
 
 static int fresh_trial_id(uint8_t out[D2K_TRIAL_ID_LEN]) {
     int fd = open("/dev/urandom", O_RDONLY);
@@ -1759,7 +1773,12 @@ static void *worker_run(void *vp) {
                                    t->transport == 6 && (t->vol.rx_cut || layered_rx)
                                   ? d2k_sched_rx_ver_hook : d2k_sched_ver_hook;
         d2k_ver_result vr;
-        if (t->transport == 6 && t->ech_offer) {
+        uint8_t alpn[256];
+        size_t alpn_len = 0;
+        if (client_alpn_nonhttp(t, alpn, sizeof alpn, &alpn_len)) {
+            vr = d2k_sched_alpn_ver_hook(a_use_fd, t->ip, t->port, t->name,
+                                         SCHED_VERIFY_STEP_MS, trig.len, alpn, alpn_len);
+        } else if (t->transport == 6 && t->ech_offer) {
             vr = d2k_verify_probe_ech_origin_on(a_use_fd, t->ip, t->port,
                 t->name, t->ech_origin, SCHED_VERIFY_STEP_MS, trig.len,
                 s->measure_mark, NULL);
@@ -5705,7 +5724,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
                          t->name, t->by_addr ? "addr" : "name", t->transport, t->family, rec_shape,
-                         D2K_VERBY_PROBE, rec_input,
+                         t->ver.handshake_proof ? D2K_VERBY_PROBE_HANDSHAKE
+                                                : D2K_VERBY_PROBE, rec_input,
                          /* Перенос не меняет отпечаток коробки плана: цель
                             этой коробкой не измерялась (задача 32, I1). */
                          wall_s(s, now_ms), transferred ? NULL : &t->fp);
@@ -5759,6 +5779,12 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     /* Запоминаем владельца подтверждённого плана. */
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
     s->confirms++;
+    if (t->ver.handshake_proof)
+        say(s, "по %s (TCP) ПОДТВЕРЖДЕНО собственным зондом на уровне рукопожатия: %s — "
+               "TLS с ALPN клиента завершён (план применён к потоку зонда); протокол "
+               "клиента не HTTP, прикладной уровень не измерен",
+            t->name, plan_id);
+    else
     say(s, "по %s (%s) ПОДТВЕРЖДЕНО собственным зондом: %s, приложение ответило %d "
            "(план применён к потоку зонда)",
         t->name, t->transport == 17 ? "QUIC" : "TCP", plan_id, t->ver.status);
@@ -7290,8 +7316,13 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++;
                 continue;
             }
-            if (layered_rx_result(s, t, now_ms)) { moved++; continue; }
-            if (t->ver.level != D2K_VER_APPLICATION) {
+            if (!t->ver.handshake_proof && layered_rx_result(s, t, now_ms)) { moved++; continue; }
+            /* Доказательство на проводе: полный HTTP-ответ — либо, для
+               не-HTTP протокола клиента, завершённое рукопожатие с его ALPN
+               (задача 37, F3). Второе — уровень рукопожатия, не приложения. */
+            int wire_proof = t->ver.level == D2K_VER_APPLICATION ||
+                (t->ver.handshake_proof && t->ver.level == D2K_VER_HANDSHAKE);
+            if (!wire_proof) {
                 /* СПЕРВА — НАША ЛИ ЭТО НЕУДАЧА. Зонд мог не дойти до
                    приложения просто потому, что воздействия не было: посылка
                    плана не покинула машину, и цель ответила ровно как без
@@ -7398,6 +7429,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        зонда открытым. */
                     t->state = T_VERIFY_WAIT;
                     t->ver_until_ms = now_ms + SCHED_VERIFY_STEP_MS;
+                    if (t->ver.handshake_proof)
+                        say(s, "по %s рукопожатие с ALPN клиента завершено с местного порта %u "
+                               "— жду применения плана к его потоку",
+                            t->name, (unsigned)t->ver.local_port);
+                    else
                     say(s, "по %s зонд дошёл до приложения (%d) с местного порта %u "
                            "— жду применения плана к его потоку",
                         t->name, t->ver.status, (unsigned)t->ver.local_port);

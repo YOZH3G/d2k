@@ -262,7 +262,14 @@ size_t d2k_t13_ch_build(const d2k_t13_ch_opts *o, uint8_t *out, size_t cap) {
        обмена ключами не нужны; практически часть сетей отвечает
        handshake_failure на приветствие, непохожее на браузерное, и тогда
        проба меряла бы нашу непохожесть вместо блока по объёму. */
-    if (o->alpn && o->alpn[0]) {
+    if (o->alpn_wire && o->alpn_wire_len) {
+        size_t al = o->alpn_wire_len;
+        if (al > 256) { return 0; }       /* под cap >= 512 выше */
+        put16(out + p, 0x0010); p += 2;           /* application_layer_protocol_negotiation */
+        put16(out + p, (uint16_t)(al + 2)); p += 2;
+        put16(out + p, (uint16_t)al); p += 2;
+        memcpy(out + p, o->alpn_wire, al); p += al;
+    } else if (o->alpn && o->alpn[0]) {
         size_t al = strlen(o->alpn);
         if (al > 255) { return 0; }
         put16(out + p, 0x0010); p += 2;           /* application_layer_protocol_negotiation */

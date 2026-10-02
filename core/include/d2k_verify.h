@@ -101,6 +101,12 @@ typedef struct {
      * нему не идёт ничего, ни положительного, ни отрицательного (§10). */
     int      unsupported;
     int      ech_accepted; /* own ECH acceptance, not extension presence/GREASE */
+    /* Зонд говорил ALPN клиента, и этот протокол — НЕ HTTP (задача 37, F3).
+       Тогда доказательство на проводе — завершённое рукопожатие TLS (level
+       D2K_VER_HANDSHAKE: ServerHello и проверенный Finished сервера), а
+       прикладной уровень НЕ ИЗМЕРЕН: HTTP-запрос на чужом языке ничего не
+       доказал бы. Это не D2K_VER_APPLICATION и за него не выдаётся. */
+    int      handshake_proof;
     d2k_resource resources[D2K_RESOURCE_COUNT];
     size_t n_resources; /* hints only, from a complete anonymous HTML response */
 } d2k_ver_result;
@@ -138,6 +144,16 @@ d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
  * создать свой сокет, тогда это в точности d2k_verify_probe. */
 d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,
                                    const char *sni, int deadline_ms, size_t hello_wire);
+
+/* Зонд TLS 1.3 с ALPN КЛИЕНТА (alpn_list — protocol_name_list как на проводе,
+ * alpn_len 0 — без ALPN, как у клиента без него) для протокола, который не
+ * HTTP. Ведёт рукопожатие до проверенного Finished сервера и останавливается:
+ * HTTP-запроса нет. Успех — level D2K_VER_HANDSHAKE и handshake_proof = 1;
+ * прикладной уровень не измерен (см. handshake_proof). Сокет — как у
+ * d2k_verify_probe_on. */
+d2k_ver_result d2k_verify_probe_alpn_on(int use_fd, const char *ip, uint16_t port,
+                                        const char *sni, int deadline_ms, size_t hello_wire,
+                                        const uint8_t *alpn_list, size_t alpn_len);
 
 /* То же, но рукопожатием TLS 1.2 — для клиента СТАРОЙ формы.
  *

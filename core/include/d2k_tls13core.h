@@ -65,6 +65,10 @@ typedef struct {
     const uint8_t *random;    /* 32 байта случайного */
     size_t session_id_len;    /* 32 у TLS поверх TCP, 0 у QUIC (RFC 9001 §8.4) */
     const char *alpn;         /* "http/1.1", "h3"; NULL — без ALPN */
+    /* Список ALPN КЛИЕНТА как на проводе (protocol_name_list без длины).
+       Задан — едет вместо alpn (задача 37, F3: зонд говорит формой клиента). */
+    const uint8_t *alpn_wire;
+    size_t alpn_wire_len;
     const uint8_t *extra;     /* готовые байты дополнительных расширений */
     size_t extra_len;         /* туда едет quic_transport_parameters (0x0039) */
     /* Добить СООБЩЕНИЕ рукопожатия расширением padding (RFC 7685) до этой

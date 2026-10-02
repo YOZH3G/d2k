@@ -346,6 +346,46 @@ int d2k_hello_ech_offer(const uint8_t *b, size_t n, uint8_t *config_id) {
     return found;
 }
 
+int d2k_hello_alpn(const uint8_t *b, size_t n, uint8_t *list, size_t cap, size_t *len) {
+    if (!len || !d2k_hello_complete(b, n)) return -1;
+    *len = 0;
+    hello_layout L;
+    parse_hello(b, n, &L);
+    if (!L.have_exts) return 0;
+    size_t p = L.exts_len_off + 2, end = p + rd16(b + L.exts_len_off);
+    while (p < end) {
+        if (end - p < 4) return -1;
+        size_t elen = rd16(b + p + 2);
+        if (elen > end - p - 4) return -1;
+        if (rd16(b + p) == 0x0010) {
+            const uint8_t *e = b + p + 4;
+            if (elen < 2 || (size_t)rd16(e) != elen - 2 || elen - 2 > cap) return -1;
+            /* Каждое имя — непустое, с однобайтной длиной (RFC 7301 §3.1). */
+            for (size_t q = 2; q < elen; ) {
+                if (!e[q] || q + 1 + e[q] > elen) return -1;
+                q += 1 + e[q];
+            }
+            if (list && elen > 2) memcpy(list, e + 2, elen - 2);
+            *len = elen - 2;
+            return 1;
+        }
+        p += 4 + elen;
+    }
+    return 0;
+}
+
+int d2k_alpn_is_http(const uint8_t *list, size_t len) {
+    static const char *http[] = { "http/1.1", "http/1.0", "h2" };
+    for (size_t q = 0; list && q < len; ) {
+        size_t l = list[q];
+        if (q + 1 + l > len) return 0;
+        for (size_t i = 0; i < sizeof http / sizeof http[0]; i++)
+            if (strlen(http[i]) == l && !memcmp(list + q + 1, http[i], l)) return 1;
+        q += 1 + l;
+    }
+    return 0;
+}
+
 /* =========================================================================
  * Сборка приветствия холодного старта из профиля.
  * ========================================================================= */

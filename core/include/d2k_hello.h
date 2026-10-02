@@ -108,6 +108,16 @@ int d2k_hello_sni(const uint8_t *b, size_t n, size_t *off, size_t *len);
  * the same wire structure. 1 present, 0 absent, -1 incomplete/malformed. */
 int d2k_hello_ech_offer(const uint8_t *b, size_t n, uint8_t *config_id);
 
+/* ALPN, которое предложил КЛИЕНТ (задача 37, F3): список protocol_name_list
+ * расширения 0x0010 без его двухбайтной длины, как на проводе. 1 — расширение
+ * есть (list/len заполнены), 0 — приветствие целое и ALPN в нём нет,
+ * -1 — приветствие неполное/битое либо список не помещается в cap: «не
+ * измерено», и зонд сохраняет прежнюю форму. */
+int d2k_hello_alpn(const uint8_t *b, size_t n, uint8_t *list, size_t cap, size_t *len);
+/* Есть ли в списке ALPN протокол HTTP поверх TLS (http/1.1, http/1.0, h2):
+ * только тогда HTTP-запрос зонда говорит на языке клиента. 1 — да. */
+int d2k_alpn_is_http(const uint8_t *list, size_t len);
+
 /* Собирает приветствие холодного старта по профилю вида s, с именем sni.
  *
  * Берёт снятый профиль (core/profiles/modern.hex или legacy.hex, встроены в

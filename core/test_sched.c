@@ -357,6 +357,31 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
     return r;
 }
 
+/* Зонд с ALPN клиента (задача 37, F3): что ему предложили и сколько раз
+   звали. Отвечает завершённым рукопожатием без прикладного уровня. */
+static int alpn_ver_calls;
+static uint8_t alpn_ver_seen[256];
+static size_t alpn_ver_seen_len;
+static d2k_ver_result stub_alpn_ver(int use_fd, const char *ip, uint16_t port,
+                                    const char *sni, int deadline_ms, size_t hello_wire,
+                                    const uint8_t *alpn, size_t alpn_len) {
+    (void)ip; (void)port; (void)sni; (void)deadline_ms; (void)hello_wire;
+    if (use_fd >= 0) close(use_fd);
+    alpn_ver_calls++;
+    alpn_ver_seen_len = alpn_len < sizeof alpn_ver_seen ? alpn_len : sizeof alpn_ver_seen;
+    if (alpn_ver_seen_len) memcpy(alpn_ver_seen, alpn, alpn_ver_seen_len);
+    d2k_ver_result r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1; r.name_ok = -1; r.family = 4;
+    r.level = D2K_VER_HANDSHAKE;
+    r.handshake_proof = 1;
+    memcpy(r.local_ip4, ver_local_ip4, 4);
+    memcpy(r.local_addr, ver_local_ip4, 4);
+    r.local_port = ver_answer_port;
+    snprintf(r.reason, sizeof r.reason, "подменённое рукопожатие с ALPN клиента");
+    return r;
+}
+
 static d2k_vol_result stub_resource_volume(const char *ip, uint16_t port,
     const char *name, int plain, int tls12, size_t wire, uint32_t mark, const char *path) {
     resource_volume_calls++;
@@ -10069,6 +10094,61 @@ measured_test:
         tcp_answer = D2K_V_OPAQUE; tcp_owns_search = tcp_found_arm = 0;
         ver_answer = D2K_VER_APPLICATION;
 
+        /* F3: клиент — MQTT поверх TLS 1.3 (ALPN «mqtt», «mqttv5»). Зонд
+           подтверждения предлагает ЕГО ALPN, а не http/1.1, и засчитывает
+           завершённое рукопожатие как доказательство уровня рукопожатия:
+           привязка — D2K_VERBY_PROBE_HANDSHAKE, не PROBE (приложение не
+           измерено). HTTP-зонд не зовётся. */
+        {
+            d2k_sched_alpn_ver_fn saved_alpn = d2k_sched_alpn_ver_hook;
+            d2k_sched_alpn_ver_hook = stub_alpn_ver;
+            d2k_catalog c = {0};
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 0;
+            ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+            tcp_calls = ver_calls = alpn_ver_calls = 0; alpn_ver_seen_len = 0;
+            const char *nm = "edge-mqtt-alpn.facebook.example";
+            uint16_t cport = 42431;
+            ver_answer_port = cport;
+            d2k_ev sh; memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+            CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, nm, sh.shape, sizeof sh.shape,
+                                         &sh.shape_len) == 0, "t37/F3: снимок не собрался");
+            uint8_t list[256]; size_t ll = 0;
+            CHECK(d2k_hello_alpn(sh.shape, sh.shape_len, list, sizeof list, &ll) == 1 &&
+                  ll == 12, "t37/F3: в профиле нет ожидаемого ALPN h2,http/1.1");
+            static const uint8_t mqtt[12] = { 4,'m','q','t','t', 6,'m','q','t','t','v','5' };
+            for (size_t i = 0; ll == 12 && i + 12 <= sh.shape_len; i++) {
+                if (!memcmp(sh.shape + i, list, 12)) { memcpy(sh.shape + i, mqtt, 12); break; }
+            }
+            CHECK(d2k_hello_alpn(sh.shape, sh.shape_len, list, sizeof list, &ll) == 1 &&
+                  ll == 12 && !memcmp(list, mqtt, 12) && !d2k_alpn_is_http(list, ll),
+                  "t37/F3: ALPN снимка не переписан на mqtt");
+            drain(); forget_sent();
+            d2k_ev h = ev_hello(6, cport, nm); d2k_sched_event(s, &h);
+            d2k_sched_event(s, &sh);
+            d2k_ev su = ev_suspect(6, cport); d2k_sched_event(s, &su);
+            for (int i = 0; i < 60 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 100);
+                d2k_ev ap = ev_applied(6, cport); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            CHECK(alpn_ver_calls >= 1 && alpn_ver_seen_len == 12 &&
+                  !memcmp(alpn_ver_seen, mqtt, 12),
+                  "t37/F3: зонд подтверждения не предложил ALPN клиента");
+            CHECK(ver_calls == 0, "t37/F3: для не-HTTP клиента позван HTTP-зонд");
+            CHECK(said("ПОДТВЕРЖДЕНО собственным зондом на уровне рукопожатия"),
+                  "t37/F3: рукопожатие с ALPN клиента не подтвердило план");
+            const d2k_cat_binding *bd = binding_of(&c, nm, 6);
+            CHECK(bd && bd->verified_by == D2K_VERBY_PROBE_HANDSHAKE,
+                  "t37/F3: привязка не помечена уровнем рукопожатия (выдана за приложение)");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_alpn_ver_hook = saved_alpn;
+            tcp_answer = D2K_V_OPAQUE;
+        }
         if (measured_only) { goto voice_only_done; }
     }
 

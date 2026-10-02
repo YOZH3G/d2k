@@ -885,6 +885,54 @@ d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,
     return verify_probe13_on(use_fd, ip, port, sni, deadline_ms, hello_wire, 2, 0, NULL);
 }
 
+/* ФОРМА КЛИЕНТА — И КРИТЕРИЙ ОРИГИНАЛА (задача 37, F3; D2K_SPEC §4, §7).
+   Классификатор шлёт снимок клиента байт в байт и засчитывает ServerHello
+   (trigger.go); зонд подтверждения прежде всегда предлагал http/1.1 и ждал
+   HTTP-ответа. Для MQTT поверх TLS (edge-mqtt-fallback, поле 02.10.2026)
+   сервер отвечал тревогой 120 на каждое испытание, то есть «приветствие
+   прошло коробку, а зонд спросил не тот протокол». Здесь зонд предлагает
+   ALPN клиента и останавливается на завершённом рукопожатии: свой
+   прикладной обмен на чужом протоколе мы не ведём и его не выдумываем. */
+d2k_ver_result d2k_verify_probe_alpn_on(int use_fd, const char *ip, uint16_t port,
+                                        const char *sni, int deadline_ms, size_t hello_wire,
+                                        const uint8_t *alpn_list, size_t alpn_len) {
+    d2k_ver_result r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1;
+    r.name_ok = -1;
+    snprintf(r.reason, sizeof r.reason, "проба не начиналась");
+    if ((alpn_len && !alpn_list) || alpn_len > 256 || !ip || !ip[0]) {
+        if (use_fd >= 0) close(use_fd);
+        return r;
+    }
+    r.family = strchr(ip, ':') ? 6 : 4;
+    int contact = verify_contact(use_fd, ip, port, 0, r.family,
+                                 r.local_addr, &r.local_port, &r.fd);
+    if (contact != 0) {
+        snprintf(r.reason, sizeof r.reason, "нет TCP");
+        return r;
+    }
+    r.level = D2K_VER_TRANSPORT;
+    if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);
+    snprintf(r.reason, sizeof r.reason, "транспорт встал, рукопожатия нет");
+    char err[160];
+    err[0] = '\0';
+    d2k_tls *t = NULL;
+    if (d2k_tls_connect_alpn(r.fd, sni, deadline_ms, hello_wire, alpn_list, alpn_len,
+                             &t, err, sizeof err) != 0) {
+        snprintf(r.reason, sizeof r.reason, "нет TLS (ALPN клиента): %.140s", err);
+        return r;
+    }
+    r.level = D2K_VER_HANDSHAKE;
+    r.handshake_proof = 1;
+    r.name_ok = d2k_tls_peer_name(t);
+    snprintf(r.reason, sizeof r.reason,
+             "рукопожатие TLS с ALPN клиента завершено; протокол клиента не HTTP — "
+             "прикладной уровень не измерен");
+    d2k_tls_free(t);
+    return r;
+}
+
 /* ТО ЖЕ САМОЕ, НО ПО TLS 1.2 — и это не «вторая проба», а та же проба другим
    протоколом. Зовётся там, где КЛИЕНТ старой формы: подтверждать его обход
    современным рукопожатием значит записывать план под форму, которой у него

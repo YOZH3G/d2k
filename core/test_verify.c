@@ -47,6 +47,7 @@
 #include "d2k_meas.h"   /* d2k_mark_hook — им проверяется «обращение непомеченное» */
 #include "d2k_tls13core.h"
 #include "d2k_verify.h"
+#include "d2k_hello.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -329,6 +330,53 @@ static char stand_request[REC_MAX + 1];
 static int stand_same_origin_redirect;
 static int stand_redirect_followed;
 
+/* ALPN, которого требует мишень (задача 37, F3), и то, что предложил зонд.
+   Требование задано, а в списке зонда его нет — мишень отвечает тревогой
+   120 (no_application_protocol, RFC 7301 §3.2), как сервер MQTT поверх TLS
+   на поле 02.10.2026. stand_alpn_seen: "-" — расширения не было вовсе,
+   иначе имена через запятую. */
+static const char *stand_alpn_need;
+static char stand_alpn_seen[300];
+
+static void stand_read_alpn(const uint8_t *ch, size_t len) {
+    snprintf(stand_alpn_seen, sizeof stand_alpn_seen, "-");
+    size_t q = 4 + 2 + 32;
+    if (q + 1 > len) return;
+    q += 1 + ch[q];
+    if (q + 2 > len) return;
+    q += 2 + get16(ch + q);
+    if (q + 1 > len) return;
+    q += 1 + ch[q];
+    if (q + 2 > len) return;
+    size_t end = q + 2 + get16(ch + q);
+    q += 2;
+    if (end > len) return;
+    while (q + 4 <= end) {
+        uint16_t et = get16(ch + q), el = get16(ch + q + 2);
+        q += 4;
+        if (q + el > end) return;
+        if (et == 0x0010 && el >= 2) {
+            size_t w = 0;
+            stand_alpn_seen[0] = '\0';
+            for (size_t i = 2; i < el && i + 1 + ch[q + i] <= el; i += 1 + ch[q + i]) {
+                int n = snprintf(stand_alpn_seen + w, sizeof stand_alpn_seen - w, "%s%.*s",
+                                 w ? "," : "", (int)ch[q + i], (const char *)ch + q + i + 1);
+                if (n < 0 || (size_t)n >= sizeof stand_alpn_seen - w) break;
+                w += (size_t)n;
+            }
+            return;
+        }
+        q += el;
+    }
+}
+
+static int stand_alpn_offered(const char *name) {
+    size_t n = strlen(name);
+    for (const char *p = stand_alpn_seen; (p = strstr(p, name)) != NULL; p += n)
+        if ((p == stand_alpn_seen || p[-1] == ',') && (p[n] == ',' || p[n] == '\0')) return 1;
+    return 0;
+}
+
 static int stand_handshake(int c, struct dir *rd, struct dir *wr) {
     uint8_t tr[REC_MAX * 2];
     size_t tr_len = 0;
@@ -344,6 +392,12 @@ static int stand_handshake(int c, struct dir *rd, struct dir *wr) {
     const uint8_t *sid = NULL, *peer_pub = NULL;
     size_t sid_len = 0;
     if (parse_client_hello(ch, ch_len, &sid, &sid_len, &peer_pub) != 0) { return -1; }
+    stand_read_alpn(ch, ch_len);
+    if (stand_alpn_need && !stand_alpn_offered(stand_alpn_need)) {
+        static const uint8_t alert120[7] = { 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 120 };
+        (void)wr_all(c, alert120, sizeof alert120);
+        return -1;
+    }
     /* Проводная длина приветствия, какой её увидела МИШЕНЬ: пять байт
        заголовка записи плюс тело. Своё представление о ней сверять не с чем —
        ровно та же причина, по которой местный порт берётся у мишени. */
@@ -853,6 +907,52 @@ int main(void) {
         CHECK(r.level == D2K_VER_HANDSHAKE,
               "молчание после рукопожатия засчитано за ответ приложения");
         CHECK(r.status == 0, "приложение молчало, а код состояния появился");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+    }
+
+    /* --- ЗАДАЧА 37, F3: ALPN КЛИЕНТА ------------------------------------
+       Мишень — сервер MQTT поверх TLS: без «mqtt» в ALPN отвечает тревогой
+       120. Прежний HTTP-зонд (http/1.1) её и получает; зонд с ALPN клиента
+       доводит рукопожатие до конца и засчитывает его уровнем рукопожатия,
+       не приложения. */
+    {
+        uint8_t ch[2048]; size_t chl = 0, ll = 0; uint8_t list[256];
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "alpn.example", ch, sizeof ch, &chl) == 0 &&
+              d2k_hello_alpn(ch, chl, list, sizeof list, &ll) == 1 && d2k_alpn_is_http(list, ll),
+              "ALPN профиля браузера не прочитан как HTTP");
+        CHECK(d2k_hello_alpn(ch, chl - 1, list, sizeof list, &ll) == -1,
+              "обрезанное приветствие выдало ALPN вместо «не измерено»");
+        static const uint8_t mqtt[] = { 4, 'm', 'q', 't', 't' };
+        CHECK(!d2k_alpn_is_http(mqtt, sizeof mqtt), "mqtt принят за HTTP");
+
+        struct stand s;
+        stand_alpn_need = "mqtt";
+        uint16_t port = stand_start(&s, ROLE_SILENT);
+        d2k_ver_result r = d2k_verify_probe_on(-1, "127.0.0.1", port, "mqtt.example", 1500, 0);
+        CHECK(r.level == D2K_VER_TRANSPORT && strstr(r.reason, "120") != NULL &&
+              stand_alpn_offered("http/1.1"),
+              "стенд не воспроизводит поле: HTTP-зонд должен получить тревогу 120");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+
+        port = stand_start(&s, ROLE_SILENT);
+        r = d2k_verify_probe_alpn_on(-1, "127.0.0.1", port, "mqtt.example", 1500, 0,
+                                     mqtt, sizeof mqtt);
+        CHECK(stand_alpn_offered("mqtt") && !stand_alpn_offered("http/1.1"),
+              "зонд с ALPN клиента предложил не mqtt");
+        CHECK(r.level == D2K_VER_HANDSHAKE && r.handshake_proof && r.status == 0 &&
+              strstr(r.reason, "120") == NULL,
+              "рукопожатие с ALPN клиента не завершено или выдано за приложение");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+
+        /* Клиент без ALPN — и зонд без ALPN. */
+        stand_alpn_need = NULL;
+        port = stand_start(&s, ROLE_SILENT);
+        r = d2k_verify_probe_alpn_on(-1, "127.0.0.1", port, "noalpn.example", 1500, 0, NULL, 0);
+        CHECK(!strcmp(stand_alpn_seen, "-") && r.level == D2K_VER_HANDSHAKE && r.handshake_proof,
+              "клиент без ALPN, а зонд его предложил");
         d2k_verify_close(&r);
         stand_stop(&s);
     }
