@@ -10,7 +10,7 @@ static d2k_tally probe(const d2k_quic_arm_question *q, void *u, int *sent) {
     (void)u;
     seen[calls++]=*q;
     d2k_tally t={0}; t.marked=1;
-    if (q->frag && mode!=5 && mode!=6) { *sent=0; t.err=t.fail=3; return t; }
+    if (q->frag && mode!=5 && mode!=6 && mode!=8) { *sent=0; t.err=t.fail=3; return t; }
     *sent=3;
     size_t unused;
     const uint8_t *rut=d2k_quic_original_blob(2,&unused,NULL);
@@ -20,6 +20,7 @@ static d2k_tally probe(const d2k_quic_arm_question *q, void *u, int *sent) {
     if(mode==3) pass=q->blob==def && (q->copies==11 || q->ttl==12);
     if(mode==4) pass=q->ttl==5;
     if(mode==6) pass=q->control || q->frag==3;
+    if(mode==8) pass=q->control;
     if(mode==7)t.marked=0;
     if(pass)t.pass=3;else t.fail=3;
     return t;
@@ -72,6 +73,13 @@ int main(void) {
             CHECK(calls==17 && r.probes==51);
         } else CHECK(r.kind==D2K_QA_FLAKY);
     }
+    /* Longest ladder: no fake, no copies, no TTL, survival passes and every
+       fragment shape is asked and fails. The Run budget (quicprobe.c) is
+       derived from exactly this count. */
+    mode=8;calls=0;c.marked=1;
+    r=d2k_quic_original_arms(&c);
+    CHECK(calls==(int)D2K_QUIC_ARM_QUESTIONS_MAX && r.n_trace==D2K_QUIC_ARM_QUESTIONS_MAX);
+    CHECK(r.kind==D2K_QA_NOT_FOUND && !r.incomplete && r.frag_survives==D2K_PROP_YES);
     mode=0;calls=0;c.marked=1;c.can_ask=one_question;
     r=d2k_quic_original_arms(&c);
     CHECK(calls==1 && r.probes==3 && r.incomplete && r.copies==2);

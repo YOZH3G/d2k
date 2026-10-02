@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -20,6 +21,49 @@ import (
 type localScenario struct {
 	port int
 	stop func()
+	vn   *vnRecorder
+}
+
+// vnRecorder keeps the version-negotiation probes a scenario received, so the
+// donor and the C port can be compared by wire shape (probe.go:303-306,
+// hello.go:99-111): size, DCID/SCID lengths and per-attempt freshness.
+type vnRecorder struct {
+	mu   sync.Mutex
+	pkts [][]byte
+}
+
+func (r *vnRecorder) add(b []byte) {
+	r.mu.Lock()
+	r.pkts = append(r.pkts, append([]byte(nil), b...))
+	r.mu.Unlock()
+}
+
+func (r *vnRecorder) shape() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var parts []string
+	ids := map[string]bool{}
+	dup := false
+	for _, b := range r.pkts {
+		dl := int(b[5])
+		if 7+dl > len(b) {
+			parts = append(parts, fmt.Sprintf("short%d", len(b)))
+			continue
+		}
+		sl := int(b[6+dl])
+		if 7+dl+sl > len(b) {
+			parts = append(parts, fmt.Sprintf("short%d", len(b)))
+			continue
+		}
+		for _, id := range [][]byte{b[6 : 6+dl], b[7+dl : 7+dl+sl]} {
+			if len(id) > 0 && ids[string(id)] {
+				dup = true
+			}
+			ids[string(id)] = true
+		}
+		parts = append(parts, fmt.Sprintf("%d/%d/%d", len(b), dl, sl))
+	}
+	return fmt.Sprintf("%s distinct=%v", strings.Join(parts, ","), !dup)
 }
 
 // Authenticated Initial oracle, NOT an HTTP/3/application server. Both
@@ -97,9 +141,10 @@ func startScenario(t *testing.T, mode string) localScenario {
 	port := c.LocalAddr().(*net.UDPAddr).Port
 	if mode == "closed" {
 		c.Close()
-		return localScenario{port, func() {}}
+		return localScenario{port, func() {}, &vnRecorder{}}
 	}
 	done := make(chan struct{})
+	rec := &vnRecorder{}
 	go func() {
 		defer close(done)
 		baseSeen, targetSeen := 0, 0
@@ -130,6 +175,9 @@ func startScenario(t *testing.T, mode string) localScenario {
 				_, _ = c.WriteToUDP(reply, addr)
 				continue
 			}
+			if n >= 6 && b[0]&0x80 != 0 && binary.BigEndian.Uint32(b[1:5]) == 0x1a2a3a4a {
+				rec.add(b)
+			}
 			if mode != "vn_only" || n < 23 || binary.BigEndian.Uint32(b[1:5]) == 1 {
 				continue
 			}
@@ -150,7 +198,7 @@ func startScenario(t *testing.T, mode string) localScenario {
 			_, _ = c.WriteToUDP(reply, addr)
 		}
 	}()
-	return localScenario{port, func() { c.Close(); <-done }}
+	return localScenario{port, func() { c.Close(); <-done }, rec}
 }
 
 func TestD2KRunTerminalParity(t *testing.T) {
@@ -196,6 +244,16 @@ func TestD2KRunTerminalParity(t *testing.T) {
 			expectedText := fmt.Sprintf("%s %d", want.Verdict, want.Probes)
 			if got != expectedText {
 				t.Fatalf("donor=%q C=%q; donor trace=%+v", expectedText, got, want.Trace)
+			}
+			// Version negotiation probes: same wire shape, fresh 8+8 byte ids
+			// per attempt on both sides (probe.go:303-306).
+			port.stop()
+			if dv, cv := ref.vn.shape(), port.vn.shape(); dv != cv {
+				t.Fatalf("VN probes donor=%q C=%q", dv, cv)
+			} else if mode == "vn_only" || mode == "silent" {
+				if !strings.HasSuffix(dv, "distinct=true") || strings.Count(dv, "1200/8/8") != 3 {
+					t.Fatalf("donor VN probes unexpected: %q", dv)
+				}
 			}
 		})
 	}
@@ -273,7 +331,7 @@ func startReplyScenario(t *testing.T, mode string) localScenario {
 			}
 		}
 	}()
-	return localScenario{c.LocalAddr().(*net.UDPAddr).Port, func() { c.Close(); <-done }}
+	return localScenario{c.LocalAddr().(*net.UDPAddr).Port, func() { c.Close(); <-done }, &vnRecorder{}}
 }
 
 func TestD2KReplyParity(t *testing.T) {

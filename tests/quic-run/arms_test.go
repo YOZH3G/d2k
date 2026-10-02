@@ -90,7 +90,7 @@ func startArmScenario(t *testing.T, residual string) localScenario {
 			delete(seen, a.String())
 		}
 	}()
-	return localScenario{c.LocalAddr().(*net.UDPAddr).Port, func() { c.Close(); <-done }}
+	return localScenario{c.LocalAddr().(*net.UDPAddr).Port, func() { c.Close(); <-done }, &vnRecorder{}}
 }
 
 func TestD2KArmsParity(t *testing.T) {

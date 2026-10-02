@@ -64,7 +64,12 @@ static int donor_neutral_sni(const char *sni) {
     return 1;
 }
 
-static int test_neutral_control_is_fresh_per_attempt(void) {
+typedef int (*neutral_send_fn)(uint16_t port, int *sent);
+
+/* Ships the 3 repeats of one neutral-name question to the local receiver and
+   checks the donor neutralName() discipline (probe.go:230): every repeat
+   carries its own z<10 hex>.example.com, never a fixed decoy, and its own DCID. */
+static int check_neutral_repeats(const char *what, neutral_send_fn send_question) {
     int fails = 0;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
@@ -87,17 +92,6 @@ static int test_neutral_control_is_fresh_per_attempt(void) {
         return 1;
     }
 
-    static const char profile_sni[] = "c0000000000.example.com";
-    uint8_t control_bytes[MAX_PACKET];
-    size_t control_len = 0;
-    if (d2k_quic_hello_rename(d2k_test_v1_initial, sizeof d2k_test_v1_initial,
-                              profile_sni, control_bytes, sizeof control_bytes,
-                              &control_len) != 0) {
-        close(fd);
-        puts("FAIL neutral control profile build");
-        return 1;
-    }
-
     control_receiver r = {.fd = fd};
     pthread_t thread;
     if (pthread_create(&thread, NULL, receive_control_packets, &r) != 0) {
@@ -112,19 +106,17 @@ static int test_neutral_control_is_fresh_per_attempt(void) {
     d2k_quic_allow_local = 1;
     d2k_quic_wait_ms = 30;
     d2k_quic_resolve_hook = resolve_no_extra_addrs;
-    d2k_hello control = {control_bytes, control_len};
     int sent = 0;
-    (void)d2k_quic_ask_control_hook("127.0.0.1", ntohs(addr.sin_port),
-                                    NULL, 0, control, 30, 0, REPEATS,
-                                    NULL, NULL, &sent, NULL);
+    int built = send_question(ntohs(addr.sin_port), &sent);
     d2k_quic_resolve_hook = old_resolve;
     d2k_quic_wait_ms = old_wait_ms;
     d2k_quic_allow_local = old_allow_local;
 
     (void)pthread_join(thread, NULL);
     close(fd);
-    if (sent != REPEATS || r.received != REPEATS) {
-        printf("FAIL neutral control sent/received %d/%d\n", REPEATS, r.received);
+    if (built != 0 || sent != REPEATS || r.received != REPEATS) {
+        printf("FAIL %s built=%d sent=%d received=%d of %d\n", what, built, sent,
+               r.received, REPEATS);
         return 1;
     }
 
@@ -176,11 +168,46 @@ static int test_neutral_control_is_fresh_per_attempt(void) {
         }
     }
     if (fails) {
-        printf("FAIL neutral control freshness: %d\n", fails);
+        printf("FAIL %s freshness: %d\n", what, fails);
         return 1;
     }
-    puts("fresh neutral QUIC control repeats: passed");
+    printf("fresh neutral QUIC %s repeats: passed\n", what);
     return 0;
+}
+
+static int send_control_hook(uint16_t port, int *sent) {
+    static const char profile_sni[] = "c0000000000.example.com";
+    uint8_t control_bytes[MAX_PACKET];
+    size_t control_len = 0;
+    if (d2k_quic_hello_rename(d2k_test_v1_initial, sizeof d2k_test_v1_initial,
+                              profile_sni, control_bytes, sizeof control_bytes,
+                              &control_len) != 0) {
+        return -1;
+    }
+    d2k_hello control = {control_bytes, control_len};
+    (void)d2k_quic_ask_control_hook("127.0.0.1", port, NULL, 0, control, 30, 0,
+                                    REPEATS, NULL, NULL, sent, NULL);
+    return 0;
+}
+
+/* Fragment survival (donor arms.go:204-205): buildInitial(neutralName(), ...)
+   inside the per-attempt closure, so each repeat has a fresh neutral name --
+   never the scheduler decoy (sched.c SCHED_DECOY "disk.rzd.ru") or the
+   control snapshot's name. The caller passes NO name (NULL) for the control
+   question; the wire layer draws the names. The raw-IP fragment send needs
+   CAP_NET_RAW/Linux, so this loopback case asks the same control question
+   unfragmented: the name is chosen before the send path is. */
+static int send_survival_control(uint16_t port, int *sent) {
+    d2k_quic_arm_question q = {.addr = "127.0.0.1", .control = 1};
+    (void)d2k_quic_ask_arm_hook(&q, NULL, port, 30, 0, sent);
+    return 0;
+}
+
+static int test_neutral_control_is_fresh_per_attempt(void) {
+    int fails = 0;
+    fails += check_neutral_repeats("control", send_control_hook);
+    fails += check_neutral_repeats("fragment survival control", send_survival_control);
+    return fails;
 }
 
 typedef struct {

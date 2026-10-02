@@ -52,6 +52,8 @@ typedef char probe_profile_fields_fit[
 /* Наименьшая датаграмма с Initial (RFC 9000 §14.1): сервер обязан отбросить
    всё, что короче, и такой отказ выглядел бы как молчание коробки. */
 #define INITIAL_MIN 1200
+/* Вопрос «длина»: донор questions.go:237, buildInitial(sni, V1, 1300, 0). */
+#define INITIAL_LONGER 1300
 
 /* ГДЕ РЕЗАТЬ ПРИВЕТСТВИЕ — ВНУТРИ ИМЕНИ, А НЕ ПОСЕРЕДИНЕ БУФЕРА.
  *
@@ -332,11 +334,20 @@ int d2k_quic_hello_ask(const uint8_t *in, size_t n, d2k_quic_ask ask,
 
     size_t want = (n > INITIAL_MIN) ? n : INITIAL_MIN;
     if (ask == D2K_QASK_LONGER) {
-        /* СТО БАЙТ — ЧИСЛО ОРИГИНАЛА (questions.go: 1300 против 1200), и
-           берётся оно как наследство, а не как замер: своего замера под эту
-           величину у нас нет, а выдумывать другую значило бы задать другой
-           вопрос и назвать его тем же именем. */
-        want += 100;
+        /* РОВНО 1300 — как у донора: questions.go:237 собирает этот вопрос
+           свежим buildInitial(sni, V1, 1300, 0), то есть длина датаграммы
+           задана числом, а не «снимок плюс сто» (снимок 1250 давал 1350 —
+           другой вопрос под тем же именем). Форма приветствия остаётся
+           снимочной (D2K_SPEC §4), донорская только длина. Не помещается
+           приветствие в 1300 — вопрос не выразим, а не «чуть длиннее». */
+        want = INITIAL_LONGER;
+        size_t made = 0;
+        if (seal_one(&k, ver, dcid, dcid_len, scid, scid_len, body, b, 0, 0, want,
+                     0, out, cap, &made) != 0 || made != INITIAL_LONGER) {
+            return -1;
+        }
+        *out_len = made;
+        return 0;
     }
     return seal_one(&k, ver, dcid, dcid_len, scid, scid_len, body, b, 0, 0, want,
                     ask == D2K_QASK_CLEAR_FIXED_BIT, out, cap, out_len);

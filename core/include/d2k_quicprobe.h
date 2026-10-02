@@ -286,10 +286,23 @@ extern uint32_t d2k_quic_wait_ms;
 #define D2K_QUIC_RTT_WAIT_FLOOR_MS 1500u
 #define D2K_QUIC_RTT_WAIT_CEIL_MS  6000u
 
-/* Бюджет на цель целиком, секунды. §7: "до двух минут на цель". Глобальная
- * переменная по той же причине, что и d2k_quic_wait_ms выше: тест на
- * исчерпание бюджета не должен ждать боевые две минуты. */
+/* Бюджет на цель целиком. По умолчанию (D2K_QUIC_BUDGET_DERIVED) он
+ * ВЫВОДИТСЯ из фактической лестницы Run — см. d2k_quic_budget_ms. Иное
+ * значение — явные секунды, только для тестов (0 — исчерпан всегда):
+ * глобальная переменная по той же причине, что и d2k_quic_wait_ms выше,
+ * тест на исчерпание бюджета не должен ждать боевые минуты. Тест ОБЯЗАН
+ * вернуть прежнее значение. Исчерпание — всегда «не завершено» (вопрос не
+ * задан), никогда не «обхода нет». */
+#define D2K_QUIC_BUDGET_DERIVED 0xFFFFFFFFu
 extern uint32_t d2k_quic_budget_s;
+
+/* Бюджет Run в миллисекундах при измеренном RTT базовой живости. Не круглое
+ * число, а цена худшего пути: база на d2k_quic_wait_ms, затем каждый опрос
+ * лестницы (прямой зонд, повторный контроль, D2K_QUIC_ARM_QUESTIONS_MAX
+ * вопросов askArms, вопросы questions.go) по dyn_wait = 3×RTT в
+ * [D2K_QUIC_RTT_WAIT_FLOOR_MS; D2K_QUIC_RTT_WAIT_CEIL_MS], плюс паузы между
+ * опытами. При явном d2k_quic_budget_s возвращает его в миллисекундах. */
+uint32_t d2k_quic_budget_ms(uint32_t rtt_ms);
 
 /* Задаёт дереву вопросы по QUIC и выносит вердикт.
  *
@@ -368,6 +381,10 @@ typedef enum {
     D2K_QA_FLAKY      /* измерению верить нельзя — расхождение повторов, см. reason */
 } d2k_quic_arm_kind;
 
+/* Longest original askArms ladder (quicarms.c, donor arms.go): 5 intrinsic
+ * fakes + 2 candidates x 2 copy counts + 4 TTLs + fragment survival + 4
+ * fragment shapes = 18 questions. The Run budget is derived from it. */
+#define D2K_QUIC_ARM_QUESTIONS_MAX 18u
 #define D2K_QUIC_ARM_STEPS 20
 typedef struct {
     char label[192];
@@ -420,28 +437,10 @@ d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni,
 int d2k_quic_decoy_from_trigger(d2k_hello trigger, const char *decoy_sni,
                                 uint8_t *out, size_t cap, size_t *out_len);
 
-/* ОКНО РАССТОЯНИЙ ДЛЯ РАЗВЁРТКИ TTL, унаследованное у донора: в живой
- * конфигурации z2k стоит `ip_autottl=-2,3-20`, то есть полезные значения
- * лежат в 3..20 прыжков. Развёртка идёт снизу вверх от единицы, поэтому
- * покрыть окно значит дойти до 20; выше — уже за пределом того, что донор
- * считает осмысленным, и туда лестница идёт только если бюджет ещё цел. */
-#define D2K_QUIC_ARM_TTL_WINDOW_HI 20u
-
 /* Умолчание ожидания ответа — донор, firstTimeout (probe.go:397-402), 3 с.
  * Вынесено в макрос, потому что из него ВЫВОДИТСЯ бюджет: два числа,
  * связанные смыслом, обязаны быть связаны и в коде. */
 #define D2K_QUIC_WAIT_MS_DEFAULT 3000u
-
-/* ЦЕНА ЛЕСТНИЦЫ В ОПЫТАХ — и она НЕ зависит от длины никакого набора, потому
- * что набора нет: приманка одна, выведенная. Ступени такие:
- *    1 — одиночная приманка;
- *    2 — две точки числа копий (донор, arms.go:140: 6 и 11);
- *   20 — окно расстояний донора;
- *    3 — подтверждения найденного плеча.
- * Бюджет выводится отсюда, а не назначается круглым числом: он обязан быть
- * таким, чтобы каждая ОСЬ получила настоящий шанс. Прежние 120 с этого не
- * давали — на живой линии 13.09.2026 развёртка обрывалась на 34-м шаге. */
-#define D2K_QUIC_ARM_LADDER_PROBES (1u + 2u + D2K_QUIC_ARM_TTL_WINDOW_HI + 3u)
 
 /* Переводит результат original askArms в текст плана с теми же байтами.
  * 0 — план собран в buf, -1 — это плечо сегодня не выразимо (IP-фрагментация)

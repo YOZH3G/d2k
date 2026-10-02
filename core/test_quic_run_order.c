@@ -55,13 +55,20 @@ static d2k_tally fragment(const char *ip,uint16_t port,int shape,d2k_hello h,uin
     char sni[256];
     CHECK(shape==1);
     CHECK(d2k_quic_sni(h.bytes,h.len,sni,sizeof sni)==0);
-    CHECK(!strcmp(sni,fragment_calls%2==0?"neutral.example":"target.example"));
+    CHECK(!strcmp(sni,fragment_calls%2==0?"z0123456789.example.com":"target.example"));
     fragment_calls++;
     d2k_tally t={0};t.pass=n;t.marked=1;*sent=n;return t;
 }
 static d2k_tally arm_probe(const d2k_quic_arm_question *q,const char *sni,
     uint16_t port,uint32_t wait,uint32_t mark,int *sent) {
     uint8_t initial[1500];size_t initial_len=0;
+    /* Fragment survival names nothing: the wire layer draws a fresh donor
+       neutralName() per repeat (arms.go:204-205), never the control
+       snapshot's name or the scheduler decoy. */
+    if(q->control) {
+        CHECK(sni==NULL);
+        sni="z0123456789.example.com";
+    }
     if(!sni || d2k_quic_probe_initial(sni,initial,sizeof initial,&initial_len)!=0) {
         d2k_tally t={0};t.fail=t.err=D2K_QUIC_REPEATS;t.marked=(mark==0);*sent=0;return t;
     }

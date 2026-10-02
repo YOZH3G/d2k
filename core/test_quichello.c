@@ -287,19 +287,42 @@ int main(int argc, char **argv) {
      * сервер съест молча, а коробка, отбирающая трафик по размеру, может
      * такую датаграмму и не тронуть.
      *
-     * Сто байт — число оригинала (questions.go: 1300 против 1200). Проверяем
-     * не его, а СВОЙСТВО: датаграмма стала длиннее снимка ровно на столько и
-     * осталась разбираемой. */
+     * 1300 — число оригинала (questions.go:237: buildInitial(sni, V1, 1300,
+     * 0)), фиксированная длина датаграммы, а не «снимок плюс сто»; пакет
+     * обязан остаться разбираемым. */
     {
         CHECK(d2k_quic_hello_ask(d2k_test_v1_initial, sizeof d2k_test_v1_initial,
                                  D2K_QASK_LONGER, "www.microsoft.com",
                                  out, sizeof out, &out_len) == 0,
               "удлинённое приветствие не собралось");
-        CHECK(out_len == sizeof d2k_test_v1_initial + 100,
-              "датаграмма не стала длиннее ровно на сто байт");
+        CHECK(out_len == 1300,
+              "датаграмма вопроса «длина» не 1300 байт донора");
         CHECK(d2k_quic_sni(out, out_len, name, sizeof name) == 0 &&
               strcmp(name, "www.microsoft.com") == 0,
               "удлинённый пакет не разбирается");
+    }
+
+    /* Донор questions.go:237 — buildInitial(sni, V1, 1300, 0): датаграмма
+     * РОВНО 1300 байт, а не «снимок плюс сто». Снимок длиннее 1200 (здесь
+     * 1250) прежде давал 1350 — другой вопрос под тем же именем. */
+    {
+        uint8_t tail_in[sizeof d2k_test_v1_initial + 50];
+        uint8_t snap[D2K_QW_MAX_DGRAM];
+        size_t snap_len = 0;
+        memcpy(tail_in, d2k_test_v1_initial, sizeof d2k_test_v1_initial);
+        memset(tail_in + sizeof d2k_test_v1_initial, 0, 50);
+        CHECK(d2k_quic_hello_ask(tail_in, sizeof tail_in, D2K_QASK_PLAIN,
+                                 "www.microsoft.com", snap, sizeof snap, &snap_len) == 0 &&
+              snap_len == 1250,
+              "не собрался снимок в 1250 байт для вопроса «длина»");
+        CHECK(d2k_quic_hello_ask(snap, snap_len, D2K_QASK_LONGER, "www.microsoft.com",
+                                 out, sizeof out, &out_len) == 0,
+              "удлинённое приветствие из снимка 1250 не собралось");
+        CHECK(out_len == 1300,
+              "вопрос «длина» обязан дать ровно 1300 байт донора (questions.go:237)");
+        CHECK(d2k_quic_sni(out, out_len, name, sizeof name) == 0 &&
+              strcmp(name, "www.microsoft.com") == 0,
+              "удлинённый из 1250 пакет не разбирается");
     }
 
     /* --- круг: собрали, прочитали, вернули имя, сравнили побайтно ------- */

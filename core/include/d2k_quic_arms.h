@@ -26,7 +26,10 @@ typedef struct {
 
 /* Runtime transport for one original askArms question. It receives the SNI
  * and question shape so the wire layer can rebuild a fresh donor Initial for
- * each parallel repeat without changing snapshot-based probes elsewhere. */
+ * each parallel repeat without changing snapshot-based probes elsewhere.
+ * The control question (fragment survival) is called with sni == NULL: the
+ * wire layer draws a fresh donor neutralName() for every repeat
+ * (arms.go:204-205, probe.go:230-234). */
 typedef d2k_tally (*d2k_quic_ask_arm_fn)(const d2k_quic_arm_question *,
     const char *, uint16_t, uint32_t, uint32_t, int *);
 extern d2k_quic_ask_arm_fn d2k_quic_ask_arm_hook;

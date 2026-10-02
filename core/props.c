@@ -24,13 +24,18 @@
 
 typedef struct {
     uint16_t port;
-    char target_sni[256], control_sni[256];
+    char target_sni[256];
     uint32_t wait_ms, mark;
 } original_wire;
 
 static d2k_tally original_probe(const d2k_quic_arm_question *q, void *user, int *sent) {
     original_wire *w=user;
-    const char *sni=q->control?w->control_sni:w->target_sni;
+    /* Fragment survival (q->control) asks on NO caller name: donor
+       arms.go:204-205 calls buildInitial(neutralName(), ...) inside the
+       per-attempt closure, so every repeat gets its own fresh
+       z<10 hex>.example.com. The wire hook draws them (quic_ask_arm); the
+       control snapshot's name (the scheduler decoy) is never reused here. */
+    const char *sni=q->control?NULL:w->target_sni;
     return d2k_quic_ask_arm_hook(q,sni,w->port,w->wait_ms,w->mark,sent);
 }
 
@@ -49,11 +54,9 @@ d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
             }
         }
     }
-    if(control.bytes && control.len) {
-        if(d2k_quic_sni(control.bytes,control.len,wire.control_sni,sizeof wire.control_sni)!=0) {
-            wire.control_sni[0]='\0';
-        }
-    }
+    /* The control snapshot does not name the survival question (see
+       original_probe); it stays in the signature for the Run caller. */
+    (void)control;
     d2k_quic_arm_context local=*ctx;
     local.probe=original_probe; local.user=&wire;
     d2k_quic_arm r=d2k_quic_original_arms(&local);
@@ -434,28 +437,22 @@ static d2k_tally frag_real(const char *addr, uint16_t port, d2k_hello msg, uint3
 d2k_quic_ask_frag_fn d2k_quic_ask_frag_hook = frag_real;
 
 /* =========================================================================
- * Бюджет — своя копия budget_left из quicprobe.c (см. её большой комментарий
- * про гонку на бюджете 0: явный случай снимает гонку совсем). Не экспорт: в
- * отличие от d2k_quic_build_pool/d2k_quic_verify_response выше, здесь нечему
- * разойтись — четыре строки сравнения времени против одной и той же
- * переменной d2k_quic_budget_s, заводить публичный экспорт ради них было бы
- * обобщением на пустом месте.
+ * Бюджет — своя копия budget_left из quicprobe.c (см. её комментарий про
+ * гонку на бюджете 0: явный случай снимает гонку совсем). Предел — тот же
+ * d2k_quic_budget_ms; RTT этому legacy-подбору не известен, поэтому берётся
+ * худший случай (потолок ожидания), а не произвольное число.
  * ========================================================================= */
 
 static int qa_budget_left(const struct timespec *start) {
-    if (d2k_quic_budget_s == 0) {
+    uint32_t limit_ms = d2k_quic_budget_ms(D2K_QUIC_RTT_WAIT_CEIL_MS);
+    if (limit_ms == 0) {
         return 0;
     }
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    time_t deadline = start->tv_sec + (time_t)d2k_quic_budget_s;
-    if (now.tv_sec > deadline) {
-        return 0;
-    }
-    if (now.tv_sec == deadline && now.tv_nsec > start->tv_nsec) {
-        return 0;
-    }
-    return 1;
+    int64_t elapsed_ms = (int64_t)(now.tv_sec - start->tv_sec) * 1000 +
+                         (now.tv_nsec - start->tv_nsec) / 1000000L;
+    return elapsed_ms <= (int64_t)limit_ms;
 }
 
 /* =========================================================================

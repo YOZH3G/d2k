@@ -261,12 +261,20 @@ static d2k_tally mock_arm(const d2k_quic_arm_question *q, const char *sni,
     uint8_t initial[1500]; size_t initial_len = 0;
     char seen_sni[256];
     g_arm_calls++;
-    int built = sni && d2k_quic_probe_initial(sni, initial, sizeof initial,
-                                               &initial_len) == 0;
-    int has_sni = built &&
-        d2k_quic_sni(initial, initial_len, seen_sni, sizeof seen_sni) == 0;
-    if (!built || (q && q->control ? !has_sni : has_sni)) {
-        g_no_sni_failures++;
+    if (q && q->control) {
+        /* Выживаемость фрагментов: имени у вызывающего нет, провод сам
+           берёт свежий neutralName() на каждую попытку (arms.go:204-205). */
+        if (sni) {
+            g_no_sni_failures++;
+        }
+    } else {
+        int built = sni && d2k_quic_probe_initial(sni, initial, sizeof initial,
+                                                   &initial_len) == 0;
+        int has_sni = built &&
+            d2k_quic_sni(initial, initial_len, seen_sni, sizeof seen_sni) == 0;
+        if (!built || has_sni) {
+            g_no_sni_failures++;
+        }
     }
     if (sent_out) { *sent_out = D2K_QUIC_REPEATS; }
     d2k_tally t = {0};
@@ -702,6 +710,11 @@ static volatile int g_vn_should_answer = 1;
  * Единственный писатель — main() ДО vn_start(); единственный читатель —
  * vn_run(), обычный int без атомарности достаточен. */
 static volatile int g_vn_drop_first_n;
+/* Зонды согласования версии, как их увидел стенд (донор probe.go:303-306:
+ * свои случайные DCID и SCID по 8 байт на КАЖДУЮ попытку). */
+static uint8_t g_vn_seen[3][2048];
+static size_t g_vn_seen_len[3];
+static volatile int g_vn_seen_n;
 
 static void *vn_run(void *arg) {
     (void)arg;
@@ -729,6 +742,11 @@ static void *vn_run(void *arg) {
             if (version == 0x00000001u || version == 0x6b3343cfu) {
                 continue;
             }
+        }
+        if (g_vn_seen_n < 3) {
+            memcpy(g_vn_seen[g_vn_seen_n], buf, (size_t)n);
+            g_vn_seen_len[g_vn_seen_n] = (size_t)n;
+            g_vn_seen_n++;
         }
         if (g_vn_drop_first_n > 0) {
             g_vn_drop_first_n--;
@@ -859,6 +877,28 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && (strcmp(argv[1], "--ipv6") == 0 ||
                       strcmp(argv[1], "--ipv6-fragments") == 0)) return fails ? 1 : 0;
+
+    /* --- БЮДЖЕТ ПОКРЫВАЕТ ХУДШИЙ ПУТЬ RUN. Худший путь: база на
+     * d2k_quic_wait_ms (3 с донора), затем 27 опросов по dyn_wait = 3×RTT в
+     * [1,5; 6] с: прямой зонд, повторный контроль, 18 вопросов askArms
+     * (5 фальшивок + 2×2 копии + 4 TTL + выживаемость + 4 формы фрагментов),
+     * 7 вопросов questions.go. Прежние (1+2+20+3)×3000 мс = 78 с обрывали его
+     * уже при RTT 1 с (3 + 27×3 = 84 с). */
+    {
+        uint32_t saved_wait = d2k_quic_wait_ms;
+        d2k_quic_wait_ms = D2K_QUIC_WAIT_MS_DEFAULT;
+        CHECK(d2k_quic_budget_ms(1000) >= 3000u + 27u * 3000u,
+              "бюджет при RTT 1 с меньше худшего пути 3000 + 27×3000 мс");
+        CHECK(d2k_quic_budget_ms(10000) >= 3000u + 27u * D2K_QUIC_RTT_WAIT_CEIL_MS,
+              "бюджет при потолке ожидания меньше худшего пути");
+        CHECK(d2k_quic_budget_ms(0) >= 3000u + 27u * D2K_QUIC_RTT_WAIT_FLOOR_MS,
+              "бюджет при полу ожидания меньше худшего пути");
+        uint32_t saved_budget = d2k_quic_budget_s;
+        d2k_quic_budget_s = 2;
+        CHECK(d2k_quic_budget_ms(1000) == 2000u, "явный тестовый бюджет не соблюдён");
+        d2k_quic_budget_s = saved_budget;
+        d2k_quic_wait_ms = saved_wait;
+    }
 
     /* ===================================================================
      * Часть 1: дисциплина дерева (подмена d2k_quic_ask_hook).
@@ -1723,10 +1763,37 @@ int main(int argc, char **argv) {
      * Нельзя ни добавлять вопрос ради формулировки, ни объявлять его заданным. */
     {
         g_vn_should_answer = 1;
+        g_vn_seen_n = 0;
         uint16_t port = vn_start();
         d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
         CHECK(r.verdict == D2K_V_NO_QUIC,
               "путь жив (VN ответило), контроль молчит — потерян NO_QUIC оригинала");
+        /* Донор probe.go:303-306 + hello.go:99-111: на каждую попытку
+           randomID(8) для DCID и для SCID, 1200 байт. Шесть идентификаторов
+           трёх попыток — все разные (постоянный D0..D7 и пустой SCID делали
+           три повтора одной датаграммой). */
+        CHECK(g_vn_seen_n == 3, "стенд не увидел три зонда согласования версии");
+        {
+            const uint8_t *ids[6];
+            int shape_ok = 1;
+            for (int i = 0; i < g_vn_seen_n && i < 3; i++) {
+                const uint8_t *p = g_vn_seen[i];
+                if (g_vn_seen_len[i] != 1200 || p[5] != 8 || p[14] != 8 || p[23] != 0) {
+                    shape_ok = 0;
+                    continue;
+                }
+                ids[2 * i] = p + 6;
+                ids[2 * i + 1] = p + 15;
+            }
+            CHECK(shape_ok, "зонд VN: не 1200 байт либо DCID/SCID не по 8 байт (hello.go:99-111)");
+            int distinct = shape_ok && g_vn_seen_n == 3;
+            for (int i = 0; distinct && i < 6; i++) {
+                for (int j = i + 1; j < 6; j++) {
+                    if (memcmp(ids[i], ids[j], 8) == 0) { distinct = 0; break; }
+                }
+            }
+            CHECK(distinct, "зонд VN: шесть DCID/SCID трёх попыток обязаны быть разными (probe.go:303-306)");
+        }
         CHECK(r.probes == 2 * D2K_QUIC_REPEATS,
               "ветка NO_QUIC добавила третью серию, которой нет в оригинале");
         CHECK(strstr(r.reason, "не спрашивалось") != NULL && strstr(r.reason, "ОБА имени") == NULL,

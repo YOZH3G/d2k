@@ -206,17 +206,12 @@ d2k_quic_resolve_fn d2k_quic_resolve_hook = resolve_real;
  * d2k_quicprobe.h). */
 uint32_t d2k_quic_wait_ms = D2K_QUIC_WAIT_MS_DEFAULT;
 
-/* БЮДЖЕТ ВЫВЕДЕН ИЗ ЛЕСТНИЦЫ, а не назначен круглым числом: столько времени,
- * сколько нужно, чтобы каждая ось подбора успела быть пройденной при самом
- * медленном исходе (каждый опыт ждёт ответа до d2k_quic_wait_ms и не получает
- * его). Прежние 120 с были меньше цены лестницы, и последняя ось — развёртка
- * расстояния — обрывалась на трети: 13.09.2026 на живой линии «бюджет
- * исчерпан на развёртке TTL (успели до 34)», и так каждый раз.
- *
- * Число растёт само вместе с каталогом приманок — иначе каждое пополнение
- * каталога молча съедало бы хвост лестницы. */
-uint32_t d2k_quic_budget_s =
-    (D2K_QUIC_ARM_LADDER_PROBES * D2K_QUIC_WAIT_MS_DEFAULT + 999u) / 1000u;
+/* БЮДЖЕТ ВЫВОДИТСЯ ИЗ ЛЕСТНИЦЫ RUN, а не назначается круглым числом — см.
+ * d2k_quic_budget_ms рядом с таблицей вопросов. Прежнее выражение
+ * (1+2+20+3)×3000 мс = 78 с описывало давно не существующую развёртку TTL
+ * 1..20 и не покрывало настоящий худший путь уже при RTT 1 с (84 с).
+ * Явное число здесь — только тестовое переопределение. */
+uint32_t d2k_quic_budget_s = D2K_QUIC_BUDGET_DERIVED;
 
 /* Пауза 60 мс (§7: "пауза 60 мс между кусками"). У TCP-дерева "кусок" —
  * сегмент разрезанного потока; у QUIC разрезать нечего (датаграмма атомарна,
@@ -574,9 +569,16 @@ static size_t qp_build_vn_trigger(uint8_t *out, size_t cap) {
        large enough to initiate a new connection", а §14.1 задаёт этот порог
        ровно в 1200 байт (правка ревью 2026-09-06 круг 3, находка E —
        предыдущая редакция называла это неизмеренным гаданием, хотя цитата
-       была доступна). */
-    size_t need = 1 + 4 + 1 + 8 + 1;
-    if (need > cap) {
+       была доступна).
+
+       Раскладка — донорская versionNegotiationProbe (hello.go:99-111): 0xc0,
+       версия, DCID 8, SCID 8, пустой токен (varint 0), нули до 1200. DCID и
+       SCID — СВОИ СЛУЧАЙНЫЕ НА КАЖДЫЙ ВЫЗОВ, как randomID(8), randomID(8) в
+       замыкании попытки (probe.go:303-306): три повтора — три разных
+       соединения, а не одна и та же датаграмма трижды (прежние постоянные
+       D0..D7 и пустой SCID). */
+    const size_t total = 1200;
+    if (!out || cap < total) {
         return 0;
     }
     size_t off = 0;
@@ -586,17 +588,17 @@ static size_t qp_build_vn_trigger(uint8_t *out, size_t cap) {
     out[off++] = (uint8_t)(QP_GREASE_VERSION >> 8);
     out[off++] = (uint8_t)(QP_GREASE_VERSION);
     out[off++] = 0x08; /* dcid_len */
-    for (int i = 0; i < 8; i++) {
-        out[off++] = (uint8_t)(0xD0 + i);
+    if (d2k_t13_random(out + off, 8) != 0) {
+        return 0;
     }
-    out[off++] = 0x00; /* scid_len */
-    size_t total = off < 1200 && cap >= 1200 ? 1200 : off;
-    if (total > cap) {
-        total = off;
+    off += 8;
+    out[off++] = 0x08; /* scid_len */
+    if (d2k_t13_random(out + off, 8) != 0) {
+        return 0;
     }
-    if (total > off) {
-        memset(out + off, 0, total - off);
-    }
+    off += 8;
+    out[off++] = 0x00; /* пустой токен, varint 0 */
+    memset(out + off, 0, total - off);
     return total;
 }
 
@@ -1111,7 +1113,13 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
         size_t clen = 0, tlen = 0;
         pfx[i] = prefix;
         pfx_len[i] = prefix_len;
-        if (fresh_sni && fresh_sni[0]) {
+        if (verify == qp_verify_vn) {
+            /* Зонд согласования версии: свои случайные DCID/SCID на каждую
+               попытку (донор probe.go:303-306). Не собрался — попытка не
+               отправляется, а не повторяет чужие идентификаторы. */
+            clen = qp_build_vn_trigger(copies[i], COPY_CAP);
+            sent[i] = clen ? (d2k_hello){copies[i], clen} : (d2k_hello){NULL, 0};
+        } else if (fresh_sni && fresh_sni[0]) {
             if (d2k_quic_probe_initial(fresh_sni, copies[i], COPY_CAP, &clen) == 0) {
                 sent[i].bytes = copies[i];
                 sent[i].len = clen;
@@ -1351,7 +1359,11 @@ static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
     d2k_tally bad={0};
     bad.marked=(mark==0);
     bad.fail=bad.err=D2K_QUIC_REPEATS;
-    if(!q || !q->addr || !sni || !sni[0]) {
+    /* The control question (fragment survival) carries no caller name:
+       donor arms.go:204-205 builds buildInitial(neutralName(), ...) per
+       attempt, so each repeat draws a fresh neutral name below. */
+    int neutral=q && q->control;
+    if(!q || !q->addr || (!neutral && (!sni || !sni[0]))) {
         if(sent_out)*sent_out=0;
         return bad;
     }
@@ -1375,7 +1387,7 @@ static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
     d2k_hello no_snapshot={NULL,0};
     return quic_ask_ex(q->addr,port,prefix,prefix_len,ttl,copies,0,NULL,
         no_snapshot,wait_ms,mark,D2K_QUIC_REPEATS,NULL,NULL,sent_out,NULL,
-        qp_verify_aead,fragment,sni,0);
+        qp_verify_aead,fragment,neutral?NULL:sni,neutral);
 }
 d2k_quic_ask_arm_fn d2k_quic_ask_arm_hook=quic_ask_arm;
 
@@ -1404,11 +1416,9 @@ static d2k_tally quic_ask(const char *addr, uint16_t port,
    127.0.0.1 — адресная ротация этому зонду не нужна, он до неё не доходит. */
 static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, uint32_t mark,
                             int *sent_out) {
-    uint8_t trig_buf[1200];
-    size_t tlen = qp_build_vn_trigger(trig_buf, sizeof trig_buf);
-    d2k_hello msg;
-    msg.bytes = (tlen > 0) ? trig_buf : NULL;
-    msg.len = tlen;
+    /* Датаграмму собирает quic_ask_ex — свою на каждую попытку (см.
+       qp_build_vn_trigger); общего снимка у этого вопроса нет. */
+    d2k_hello msg = {NULL, 0};
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, NULL, msg, wait_ms, mark,
                         D2K_QUIC_REPEATS, NULL, NULL, sent_out, NULL, qp_verify_vn, NULL,NULL,0);
 }
@@ -1508,28 +1518,30 @@ static void reason_append(d2k_vres *r, const char *fmt, ...) {
     va_end(ap);
 }
 
-/* now < deadline (в секундах монотонных часов, целочисленно — §"плавающей
-   арифметики нет"). */
-static int budget_left(const struct timespec *start) {
-    /* Бюджет 0 — это НОЛЬ секунд, а не "проверить и посмотреть": он обязан
+/* Бюджет одного Run: начало и предел в миллисекундах. Предел уточняется,
+   когда базовая живость измерила RTT (до неё — по полу ожидания). */
+typedef struct {
+    struct timespec start;
+    uint32_t limit_ms;
+} qp_budget;
+
+/* elapsed <= limit (монотонные часы, целочисленно — §"плавающей арифметики
+   нет"). */
+static int budget_left(const qp_budget *b) {
+    /* Бюджет 0 — это НОЛЬ, а не "проверить и посмотреть": он обязан
        значить "исчерпан всегда", а не зависеть от разрешения часов — иначе
        на очень быстром (мок) пути now успевает совпасть со start вплоть до
        наносекунды, и результат становится гонкой (найдено повторным
        прогоном `sh scripts/check.sh` при разработке задачи 5, круг 1).
        Явный случай снимает гонку совсем. */
-    if (d2k_quic_budget_s == 0) {
+    if (b->limit_ms == 0) {
         return 0;
     }
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    time_t deadline = start->tv_sec + (time_t)d2k_quic_budget_s;
-    if (now.tv_sec > deadline) {
-        return 0;
-    }
-    if (now.tv_sec == deadline && now.tv_nsec > start->tv_nsec) {
-        return 0;
-    }
-    return 1;
+    int64_t elapsed_ms = (int64_t)(now.tv_sec - b->start.tv_sec) * 1000 +
+                         (now.tv_nsec - b->start.tv_nsec) / 1000000L;
+    return elapsed_ms <= (int64_t)b->limit_ms;
 }
 
 /* Адрес для СЛЕДУЮЩЕГО вопроса — ОДНО правило на ВСЕ вопросы дерева после
@@ -1602,6 +1614,31 @@ static const qp_question qp_list[] = {
 };
 #define QP_N_QUESTIONS (sizeof qp_list / sizeof qp_list[0])
 
+/* ОПРОСЫ ХУДШЕГО ПУТИ RUN после базовой живости, каждый ждёт dyn_wait:
+   прямой зонд и повторный контроль (probe.go:322-355), вся лестница askArms
+   (D2K_QUIC_ARM_QUESTIONS_MAX) и все вопросы таблицы выше. Сейчас
+   2 + 18 + 7 = 27. Из этого числа — и только из него — выводится бюджет. */
+#define QP_RUN_DYN_POLLS (2u + D2K_QUIC_ARM_QUESTIONS_MAX + (unsigned)QP_N_QUESTIONS)
+
+/* deriveTimeout донора (probe.go:404-418): 3×RTT в [пол; потолок]. */
+static uint32_t qp_dyn_wait(uint32_t rtt_ms) {
+    uint32_t w = rtt_ms > D2K_QUIC_RTT_WAIT_CEIL_MS ? D2K_QUIC_RTT_WAIT_CEIL_MS : rtt_ms * 3u;
+    if (w < D2K_QUIC_RTT_WAIT_FLOOR_MS) w = D2K_QUIC_RTT_WAIT_FLOOR_MS;
+    if (w > D2K_QUIC_RTT_WAIT_CEIL_MS) w = D2K_QUIC_RTT_WAIT_CEIL_MS;
+    return w;
+}
+
+uint32_t d2k_quic_budget_ms(uint32_t rtt_ms) {
+    if (d2k_quic_budget_s != D2K_QUIC_BUDGET_DERIVED) {
+        return d2k_quic_budget_s > UINT32_MAX / 1000u ? UINT32_MAX : d2k_quic_budget_s * 1000u;
+    }
+    /* Паузы между опытами (D2K_QUIC_GAP_US) и местная работа — по паузе на
+       опрос: это не запас «на всякий случай», а явная цена шагов, которые
+       тоже идут по часам бюджета. */
+    uint32_t per_poll = qp_dyn_wait(rtt_ms) + D2K_QUIC_GAP_US / 1000u;
+    return d2k_quic_wait_ms + QP_RUN_DYN_POLLS * per_poll;
+}
+
 /* Исход одного вопроса -> значение свойства. ЕДИНОГЛАСИЕ ИЛИ НИЧЕГО (см.
    d2k_quic_props): разошедшиеся повторы — это «не измерено», а не «не
    помогает». Сбой отправки (err) — тоже: он про нашу сторону, не про
@@ -1617,7 +1654,7 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
                                size_t *next_addr, int residual_detected, uint16_t port,
                                const char *sni, d2k_hello trigger,
                                uint32_t wait_ms, uint32_t mark, int *all_marked,
-                               const struct timespec *start) {
+                               const qp_budget *start) {
     /* Ровно 16 нулей — тот же мусор, что и у оригинала (questions.go:97), и
        ровно те байты, которые потом уйдут в строке стратегии
        (blob=0x000...0): слать случайное, а рекомендовать нули значило бы
@@ -1782,7 +1819,7 @@ int d2k_quic_props_findings(const d2k_quic_props *p, char *out, size_t cap) {
     return found;
 }
 
-static int arm_budget_left(void *start) { return budget_left(start); }
+static int arm_budget_left(void *budget) { return budget_left(budget); }
 
 static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                             d2k_hello trigger, d2k_hello control, uint32_t mark,
@@ -1851,8 +1888,11 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
         }
     }
 
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    /* До базовой живости RTT не измерен: предел — по полу ожидания; после
+       неё уточняется измеренным RTT (d2k_quic_budget_ms). */
+    qp_budget start;
+    clock_gettime(CLOCK_MONOTONIC, &start.start);
+    start.limit_ms = d2k_quic_budget_ms(0);
 
     /* Пул адресов: ip — первый и гарантированный (это ровно тот адрес, для
        которого нас позвали), остальное — из резолвера, с отбросом дублей
@@ -1985,13 +2025,8 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                Единогласие требуется от прямого зонда, не от контроля. RTT
                измерен — потолок ожидания для всего остального дерева
                выводится из него (см. d2k_quicprobe.h). */
-            uint32_t dyn_wait = rtt_ms * 3;
-            if (dyn_wait < D2K_QUIC_RTT_WAIT_FLOOR_MS) {
-                dyn_wait = D2K_QUIC_RTT_WAIT_FLOOR_MS;
-            }
-            if (dyn_wait > D2K_QUIC_RTT_WAIT_CEIL_MS) {
-                dyn_wait = D2K_QUIC_RTT_WAIT_CEIL_MS;
-            }
+            uint32_t dyn_wait = qp_dyn_wait(rtt_ms);
+            start.limit_ms = d2k_quic_budget_ms(rtt_ms);
 
             /* ===== ШАГ 1: прямой зонд (тот же адрес — живость уже подтверждена) ===== */
             int base_sent2 = 0;
