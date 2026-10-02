@@ -1662,6 +1662,43 @@ int main(int argc, char **argv) {
                   "foreign refusal installs no bypass over own exact plan");
         }
         d2k_sched_free(s);
+        {
+            /* Final review #6: a legacy grandfathered (shape 0) confirmed
+               name binding is the member's own exact plan for any TCP TLS
+               shape; a family exception must not be installed over it. */
+            d2k_catalog cg = {0};
+            static const char *gm[4] = {"a.gf.net", "b.gf.net", "c.gf.net", "d.gf.net"};
+            tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+            int gf_sendbuf = 256 * 1024;
+            (void)setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &gf_sendbuf, sizeof gf_sendbuf);
+            for (int i = 0; i < 4; i++) confirm_once(&cg, sv[0], gm[i], (uint16_t)(40391 + i));
+            const d2k_domain_group *gg = d2k_group_match(cg.groups, "new.gf.net", &key);
+            d2k_cat_binding *legacy = binding_mut(&cg, "d.gf.net", 6);
+            CHECK(gg && legacy && legacy->level >= 3 && !strcmp(legacy->plan_id, gg->plan_id),
+                  "fixture: gf family learned and member d holds own confirmed binding");
+            if (gg && legacy) {
+                legacy->shape = 0;
+                d2k_sched *sg = d2k_sched_new(&cg, sv[0], 0x2d);
+                drain(); forget_sent(); d2k_sched_sync(sg); sync_out(sg);
+                d2k_ev gack = {0}; gack.kind = D2K_EV_ACK;
+                for (unsigned i = 0; i < 8; i++) {
+                    gack.code = last_area_command(); if (!gack.code) break;
+                    gack.num = 1u << 8; area_ack_id(&gack); d2k_sched_event(sg, &gack);
+                    forget_sent(); sync_out(sg);
+                }
+                d2k_group_observation gf_fail = {0};
+                strcpy(gf_fail.name, "d.gf.net"); strcpy(gf_fail.plan_id, gg->plan_id);
+                gf_fail.key = key; gf_fail.evidence = D2K_GROUP_PLAN_FAILED; gf_fail.at = gg->at + 1;
+                CHECK(d2k_group_learn(cg.groups, &gf_fail) > 0, "legacy member failure recorded");
+                CHECK(d2k_group_match(cg.groups, "new.gf.net", &key) != NULL,
+                      "fixture: one member failure keeps the family");
+                drain(); forget_sent(); d2k_sched_sync(sg); sync_out(sg);
+                CHECK(!sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0),
+                      "family bypass installed over a grandfathered own exact name binding");
+                d2k_sched_free(sg);
+            }
+            d2k_catalog_free(&cg);
+        }
         s=d2k_sched_new(&c,sv[0],0x2d); spin(s,1);
         tcp_block_until_stop=1;
         for (uint16_t port=40311; port<40313; port++) {
@@ -5043,11 +5080,18 @@ lifecycle_test:
            WWW.Mixed.NET. — восстановление обязано найти их планы. Второй
            каталог: формы привязок братьев не измерены (0), что совместимо
            с формой ключа семейства. */
-        for (int variant = 0; variant < 2; variant++) {
+        /* Вариант 2 (финальное ревью, п.2): все братья помечены к
+           перепроверке (recheck_since). Такая привязка — не подтверждённое
+           покрытие: быстрый путь «собственных планов семейства» на ней не
+           строится (как own_exact_confirmed и sync), план остаётся лишь
+           кандидатом обычного поиска. */
+        for (int variant = 0; variant < 3; variant++) {
             static const char *mixed[4] = {"A.Mixed.NET", "b.MIXED.net.", "C.mixed.Net", "d.Mixed.net"};
             static const char *plain[4] = {"a.shape.net", "b.shape.net", "c.shape.net", "d.shape.net"};
-            const char **names = variant == 0 ? mixed : plain;
-            const char *member = variant == 0 ? "WWW.Mixed.NET." : "www.shape.net";
+            static const char *rechk[4] = {"a.rechk.net", "b.rechk.net", "c.rechk.net", "d.rechk.net"};
+            const char **names = variant == 0 ? mixed : variant == 1 ? plain : rechk;
+            const char *member = variant == 0 ? "WWW.Mixed.NET." :
+                                 variant == 1 ? "www.shape.net" : "www.rechk.net";
             int saved_buf = 256 * 1024;
             (void)setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &saved_buf, sizeof saved_buf);
             tcp_answer = D2K_V_PREFIX; tcp_found_arm = 0; tcp_owns_search = 0; ver_fail_first = 0;
@@ -5058,6 +5102,13 @@ lifecycle_test:
                     d2k_cat_binding *m = binding_mut(&c5, names[i], 6);
                     CHECK(m != NULL, "lifecycle/family: привязка брата не найдена");
                     if (m) m->shape = 0;
+                }
+            }
+            if (variant == 2) {
+                for (int i = 0; i < 4; i++) {
+                    d2k_cat_binding *m = binding_mut(&c5, names[i], 6);
+                    CHECK(m != NULL, "lifecycle/family: привязка брата не найдена");
+                    if (m) { m->recheck_since = 1790000000; m->recheck_mono_ms = 0; }
                 }
             }
             d2k_group_key key = {0}; key.transport = 6; key.family = 4; key.shape = 1;
@@ -5079,6 +5130,12 @@ lifecycle_test:
             su.code = D2K_SUSPECT_SILENT; su.client_shape = D2K_SHAPE_MODERN;
             d2k_sched_event(s, &su);
             settle(s);
+            if (variant == 2) {
+                CHECK(!said("собственных планов семейства"),
+                      "lifecycle/family: помеченный к перепроверке брат засчитан подтверждённым покрытием");
+                d2k_sched_free(s); d2k_catalog_free(&c5);
+                continue;
+            }
             CHECK(said("собственных планов семейства"),
                   variant == 0 ? "lifecycle/family: регистр имени брата скрыл его план"
                                : "lifecycle/family: совместимая форма привязки брата отвергнута");
@@ -6372,6 +6429,30 @@ rx_volume_tests:
         CHECK(tcp_calls == 0, "поздний RST без RX-cut запустил общий перебор");
         CHECK(!sent_contains_plan_payload("hcaptcha.com"),
               "кандидат отправлен без подтверждения RX-volume");
+        /* Финальное ревью, п.4: неубедительная пара поздних RST глушит
+           только повторные поздние RST/объёмные триггеры этой цели, а не
+           блокировку на рукопожатии (обычный RST/таймаут SNI). */
+        vol_calls = tcp_calls = 0;
+        skip_ahead(s, 3 * 60 * 1000);           /* отдых задачи (2 мин) прошёл */
+        spin(s, 5);
+        saidbuf[0] = '\0';
+        prime_late_rst(s, h.name, 40184);
+        su = ev_suspect(6, 40085);
+        su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_ev h3 = ev_hello(6, 40085, h.name);
+        d2k_sched_event(s, &h3);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(vol_calls == 0 && tcp_calls == 0 && said("замер отложен"),
+              "повторная пара поздних RST не отложена после неубедительного замера");
+        saidbuf[0] = '\0';
+        d2k_ev h4 = ev_hello(6, 40086, h.name);
+        d2k_sched_event(s, &h4);
+        d2k_ev su4 = ev_suspect(6, 40086);       /* обычный сброс на рукопожатии */
+        d2k_sched_event(s, &su4);
+        settle(s);
+        CHECK(!said("замер отложен") && said("источник нового замера"),
+              "неубедительный поздний RST заглушил блокировку на рукопожатии на 10 мин");
         vol_calls = tcp_calls = 0;
         d2k_sched_free(s);
         d2k_catalog_free(&cLate);
@@ -8025,6 +8106,76 @@ voice_only_run:
         }
         d2k_catalog_free(&cD);
 
+        /* Финальное ревью, п.1: пока единственная задача @discord-voice ждёт
+           следующего разговора (T_VOICE_TRIAL) к точке A, подозрение голоса
+           к ДРУГОЙ точке B не теряется: опыт A снимается точно (свой trial
+           ID), и B получает свой замер в том же окне тиков. Истечение опыта
+           «не проверено» не ставит общий 10-минутный запрет: новое
+           подозрение после него снова мерится. */
+        d2k_catalog cR;
+        memset(&cR, 0, sizeof cR);
+        saidbuf[0] = '\0';
+        s = d2k_sched_new(&cR, sv[0], 0x2d);
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            forget_sent();
+            voice_calls = 0;
+            g_server_port = 50004;
+            d2k_ev h = ev_hello(17, 52040, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 52040);
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            drain();
+            uint8_t adst[2][4], atrial[2][D2K_TRIAL_ID_LEN];
+            CHECK(voice_calls == 1 &&
+                  collect_addr_probes(adst, atrial, NULL, 2) == 1,
+                  "голосовой опыт к точке A не поставлен");
+            forget_sent();
+            g_server_port = 50008;              /* другая точка сервера B */
+            h = ev_hello(17, 52041, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            su = ev_suspect(17, 52041);
+            d2k_sched_event(s, &su);
+            /* Общий интервал запуска замеров (1 с) может поставить B в
+               очередь — это и есть начало работы, не потеря. */
+            spin(s, 400);
+            drain();
+            uint8_t bdst[2][4], btrial[2][D2K_TRIAL_ID_LEN];
+            uint16_t bsport[2] = {1, 1};
+            size_t nb = collect_addr_probes(bdst, btrial, bsport, 2);
+            CHECK(voice_calls == 2,
+                  "подозрение голоса к другой точке сервера потеряно, пока опыт ждал разговора");
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1,
+                  "опыт точки A не снят при переходе к точке B");
+            CHECK(nb == 1 && bsport[0] == 0 &&
+                  memcmp(btrial[0], atrial[0], D2K_TRIAL_ID_LEN) != 0,
+                  "точка B не получила собственного опыта с новым trial ID");
+            /* Та же точка B, пока её опыт ждёт: подозрение не дублирует замер. */
+            h = ev_hello(17, 52042, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            su = ev_suspect(17, 52042);
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            CHECK(voice_calls == 2,
+                  "подозрение к той же точке сбросило ждущий опыт");
+            /* Опыт истёк «не проверено» — общий запрет не ставится. */
+            skip_ahead(s, 10 * 60 * 1000 + 1);
+            CHECK(said("не проверено"), "истечение голосового опыта не названо");
+            forget_sent();
+            h = ev_hello(17, 52043, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            su = ev_suspect(17, 52043);
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            drain();
+            CHECK(voice_calls == 3 && !said("замер отложен"),
+                  "истёкший «не проверено» голосовой опыт заморозил голос на 10 мин");
+            d2k_sched_free(s);
+            g_server_port = 50004;
+        }
+        d2k_catalog_free(&cR);
+
         /* Датапат отверг опыт (NAK) — местный отказ, а не провал кандидата. */
         d2k_catalog cN;
         memset(&cN, 0, sizeof cN);
@@ -8804,6 +8955,18 @@ voice_only_run:
               "страница Cloudflare challenge записана как подтверждённый обход");
         CHECK(ver_calls == 1,
               "после challenge был испытан ещё один кандидат и послан лишний запрос");
+        /* Финальное ревью, п.5: как у соседней ветки D2K_VER_CHALLENGE,
+           цель получает антибот-паузу, а не только 2-минутный отдых. */
+        skip_ahead(s, 3 * 60 * 1000);
+        spin(s, 5);
+        saidbuf[0] = '\0';
+        h = ev_hello(6, 40176, "challenge.example");
+        d2k_sched_event(s, &h);
+        su = ev_suspect(6, 40176);
+        d2k_sched_event(s, &su);
+        spin(s, 5);
+        CHECK(said("замер отложен после антибот-ответа"),
+              "Cloudflare challenge не поставил антибот-паузу цели");
 
         ver_cloudflare_challenge = 0;
         d2k_sched_free(s);

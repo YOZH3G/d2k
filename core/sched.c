@@ -722,6 +722,7 @@ typedef struct {
     int        challenge;
     int        exhausted;
     int        ech_input;
+    int        late_rst_only; /* глушит только поздние RST/объёмные триггеры */
     int        used;
 } target_cooldown;
 
@@ -1201,6 +1202,13 @@ static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
     target_cooldown *c = cooldown_find(s, name, transport, family);
     if (!c) { return 0; }
     if (s->now_ms >= c->until_ms) { return 0; }
+    /* Неубедительная пара поздних RST (вид 3) говорит только о позднем
+       обрыве ответа. Блокировка на рукопожатии (обычный RST, таймаут SNI) —
+       другое наблюдение и мерится сразу (финальное ревью, п.4). */
+    if (c->late_rst_only && !c->challenge &&
+        signal_code != D2K_SUSPECT_RST_AFTER_APP && signal_code != D2K_SUSPECT_FIN_RETRY) {
+        return 0;
+    }
     /* A changed symptom after a direct CLEAR is fresh evidence. Do not let a
        stale negative suppress it. A bot challenge is different: stay quiet
        for this exact origin even if the datapath reports another symptom. */
@@ -1220,7 +1228,8 @@ static int64_t clear_backoff_ms(unsigned streak) {
     return SCHED_CLEAR_BACKOFF_MAX_MS;
 }
 
-/* kind: 0 = direct CLEAR, 1 = anti-bot challenge, 2 = exhausted/incomplete search. */
+/* kind: 0 = direct CLEAR, 1 = anti-bot challenge, 2 = exhausted/incomplete search,
+   3 = inconclusive late-RST pair (suppresses only late-RST/volume triggers). */
 static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     if (!s || !t || !t->name[0]) { return; }
     target_cooldown *c = cooldown_find(s, t->name, t->transport, t->family);
@@ -1236,11 +1245,20 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     if (kind == 1) {
         c->challenge = 1;
         c->exhausted = 0;
+        c->late_rst_only = 0;
         c->until_ms = s->now_ms + SCHED_CHALLENGE_BACKOFF_MS;
         c->signal_code = t->trigger_code;
         return;
     }
     if (c->challenge && s->now_ms < c->until_ms) { return; }
+    if (kind == 3) {
+        /* Не ослаблять уже действующий общий запрет вида 2. */
+        if (c->exhausted && !c->late_rst_only && s->now_ms < c->until_ms) { return; }
+        kind = 2;
+        c->late_rst_only = 1;
+    } else {
+        c->late_rst_only = 0;
+    }
     if (kind == 2) {
         /* Incomplete/exhausted work is a different observation from a clean
            direct CLEAR. Cap retries at one fixed interval; do not inherit
@@ -3498,7 +3516,14 @@ static int own_exact_confirmed(const d2k_catalog *cat, const char *name,
                 !strcmp(bd->kind, "name") && !strcmp(bd->target, name) &&
                 (bd->transport ? bd->transport : 6) == key->transport &&
                 (bd->family ? bd->family : 4) == key->family &&
-                bd->shape == key->shape) return 1;
+                (bd->shape == key->shape ||
+                 /* Старая подтверждённая привязка имени без формы (дедушкино
+                    право) — своё точное решение участника для любой формы
+                    TCP TLS; датапат так же ставит её выше BYPASS
+                    (финальное ревью, п.6). */
+                 (bd->shape == 0 && key->transport == 6 &&
+                  (key->shape == D2K_SHAPE_MODERN || key->shape == D2K_SHAPE_LEGACY ||
+                   key->shape == D2K_LINK_SHAPE_ECH_TCP)))) return 1;
         }
     return 0;
 }
@@ -4173,6 +4198,21 @@ static int voice_trial_owned(const task *t) {
            t->addr_probe_src_port_be == 0 && t->addr_probe_dst_port_be != 0;
 }
 
+/* Подозрение голоса относится к контексту ждущего опыта: та же точка
+   сервера (IP:порт) и тот же клиент LAN. Клиентский порт не сравнивается —
+   опыт ждёт любого следующего потока этого клиента (задача 15). */
+static int voice_trial_same_context(const task *t, const d2k_ev *ev) {
+    if ((ev->family ? ev->family : 4) != 4) { return 0; }
+    uint16_t dport = ntohs(t->addr_probe_dst_port_be);
+    if (memcmp(ev->low_ip, t->addr_probe_dst_ip, 4) == 0 && ev->low_port == dport) {
+        return memcmp(ev->high_ip, t->addr_probe_src_ip, 4) == 0;
+    }
+    if (memcmp(ev->high_ip, t->addr_probe_dst_ip, 4) == 0 && ev->high_port == dport) {
+        return memcmp(ev->low_ip, t->addr_probe_src_ip, 4) == 0;
+    }
+    return 0;
+}
+
 static void voice_start(d2k_sched *s, task *t) {
     t->n_plans = 0;
     t->next_plan = 0;
@@ -4397,7 +4437,12 @@ static int family_recovery_start(d2k_sched *s, task *t) {
                        сравнение сырых строк теряло брата, подтверждённого
                        под «B.Example.COM.» (задача 24). */
                     char bd_name[256];
-                    if(!bd->enabled || bd->level<3 || strcmp(bd->kind,"name") ||
+                    /* Помеченная к перепроверке привязка (задача 21) снята с
+                       провода и подтверждённым покрытием не считается — как в
+                       own_exact_confirmed и sync (финальное ревью, п.2). Её
+                       план остаётся кандидатом обычного поиска коробки. */
+                    if(!bd->enabled || bd->level<3 || bd->recheck_since ||
+                       strcmp(bd->kind,"name") ||
                        d2k_domain_normalize(bd->target,bd_name)) continue;
                     if(!strcmp(bd_name,o->name) && !strcmp(bd->plan_id,o->plan_id) &&
                        (bd->transport?bd->transport:6)==key.transport &&
@@ -4652,6 +4697,24 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     int ordinary_tcp_rst = ev->transport == 6 && ev->code == D2K_SUSPECT_RST;
     const int late_app_rst = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
         ev->code == D2K_SUSPECT_FIN_RETRY;
+    if (t && t->state == T_VOICE_TRIAL && voice_trial_owned(t) &&
+        is_voice_class(t->name, t->transport) && !voice_trial_same_context(t, ev)) {
+        /* ОПЫТ ЖДЁТ РАЗГОВОРА К ДРУГОЙ ТОЧКЕ (финальное ревью, п.1). Задача
+           голоса одна на класс, и раньше подозрение к новой точке сервера
+           молча терялось на всё время ожидания (до 10 мин) — голос замирал.
+           Ждущий опыт снимается точно (свой trial ID, кандидат не судим), и
+           новая точка получает свой замер. Подозрение к той же точке и тому
+           же клиенту ниже по-прежнему не дублирует замер. */
+        char srv[INET6_ADDRSTRLEN];
+        uint16_t sport = 0;
+        server_of(ev, srv, sizeof srv, &sport);
+        say(s, "по %s (голос) подозрение к другой точке %s:%u, пока опыт ждал "
+               "разговора — снимаю ждущий опыт (не проверено, кандидат не судим) "
+               "и меряю новую точку", t->name, srv, (unsigned)sport);
+        trial_retire(s, t);
+        task_done(t);
+        t = NULL;
+    }
     if (t && t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
         /* Поток разговора, к которому применился приём, остался без ответа —
            решает тик (записи и снятию нужны часы). */
@@ -5985,8 +6048,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 say(s, "по %s (голос) не проверено: за %d мин опыт не дождался "
                        "разговора с протокольным ответом — снимаю опыт, "
                        "кандидат не судим", t->name, SCHED_TASK_LIFE_MS / 60000);
+                /* Общий запрет поиска (cooldown вида 2) здесь не ставится:
+                   он глушил бы любое подозрение голоса на 10 мин, хотя
+                   кандидата никто не судил (финальное ревью, п.1). Новый
+                   замер возможен только по новому подозрению из датапата. */
                 trial_retire(s, t);
-                if (t->probes > 0) { cooldown_record(s, t, 2); }
                 task_done(t);
             } else {
                 /* СРОК ЗАДАЧИ ИСТЁК — И ЕСЛИ ЗАМЕР ЕЩЁ ШЁЛ, ЭТО НАДО СКАЗАТЬ.
@@ -6089,8 +6155,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     /* Не блок: неубедительный замер, как у прямого вердикта
                        без доказательства. Без cooldown здоровый трафик с
                        поздними RST повторял пару каждые две минуты. */
-                    cooldown_record(s, t, 2);
-                    say(s, "по %s повторный замер отложен на %lld мин",
+                    cooldown_record(s, t, 3);
+                    say(s, "по %s повторный замер позднего обрыва отложен на %lld мин",
                         t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
                     task_fail(s, t, now_ms);
                     moved++;
@@ -6527,6 +6593,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 say(s, "по %s получен Cloudflare challenge (cf-mitigated: challenge) — "
                        "это не обход; останавливаю поиск и даю цели отдохнуть",
                     t->name);
+                /* Как у соседней ветки D2K_VER_CHALLENGE: антибот-пауза цели,
+                   а не только 2-минутный отдых задачи (финальное ревью, п.5). */
+                cooldown_record(s, t, 1);
+                say(s, "по %s антибот-ответ: активный замер этой цели поставлен на паузу на %lld мин",
+                    t->name, (long long)(SCHED_CHALLENGE_BACKOFF_MS / 60000));
                 task_fail(s, t, now_ms);
                 moved++;
                 continue;
