@@ -611,6 +611,58 @@ int main(void) {
         d2k_plantab_free(t);
     }
 
+    /* --- адресная привязка различает протокол (задача 16, §5) ---------------
+     * Один IP может нести и QUIC, и STUN/голос. Подтверждённый на одном
+     * протоколе план не должен ни затирать подтверждённый на другом, ни
+     * применяться к его пакетам. */
+    {
+        d2k_plantab *t = d2k_plantab_new(8);
+        uint32_t ip = addr(198, 51, 100, 9);
+        const uint8_t voice[] = D2K_VOICE_CLASS;
+        d2k_plan *quic = mkplan(), *stun = mkplan();
+        CHECK(d2k_plantab_set_addr_shaped(t, (const uint8_t *)&ip, 4, 1, quic,
+                                          D2K_PLAN_SHAPE_QUIC) == 0,
+              "QUIC address binding not installed");
+        CHECK(d2k_plantab_set_addr_shaped(t, (const uint8_t *)&ip, 4, 2, stun,
+                                          D2K_PLAN_SHAPE_VOICE) == 0,
+              "voice address binding not installed");
+        CHECK(d2k_plantab_count(t) == 2, "voice address binding replaced the QUIC one");
+        CHECK(d2k_plantab_find(t, NULL, 0, ip, 3, D2K_PLAN_SHAPE_QUIC) == quic,
+              "QUIC Initial to the IP did not get the QUIC plan");
+        CHECK(d2k_plantab_find(t, voice, sizeof voice - 1, ip, 3,
+                               D2K_PLAN_SHAPE_VOICE) == stun,
+              "STUN/voice request to the IP did not get the voice plan");
+        size_t misses = d2k_plantab_shape_misses(t);
+        CHECK(d2k_plantab_find(t, NULL, 0, ip, 3, D2K_PLAN_SHAPE_MODERN) == NULL &&
+              d2k_plantab_find(t, NULL, 0, ip, 3, D2K_PLAN_SHAPE_ANY) == NULL,
+              "UDP address binding applied to a TCP/unknown hello");
+        CHECK(d2k_plantab_shape_misses(t) == misses + 2,
+              "known address with another protocol not counted as shape miss");
+        CHECK(d2k_plantab_set_addr_shaped(t, (const uint8_t *)&ip, 4, 4, NULL,
+                                          D2K_PLAN_SHAPE_ANY) == -2,
+              "address binding without protocol shape accepted");
+        d2k_plan *quic2 = mkplan();
+        CHECK(d2k_plantab_set_addr_shaped(t, (const uint8_t *)&ip, 4, 5, quic2,
+                                          D2K_PLAN_SHAPE_QUIC) == 0 &&
+              d2k_plantab_count(t) == 2 &&
+              d2k_plantab_find(t, NULL, 0, ip, 6, D2K_PLAN_SHAPE_QUIC) == quic2 &&
+              d2k_plantab_find(t, voice, sizeof voice - 1, ip, 6,
+                               D2K_PLAN_SHAPE_VOICE) == stun,
+              "same-shape replacement touched the other protocol");
+        CHECK(d2k_plantab_del_addr_shaped(t, (const uint8_t *)&ip, 4,
+                                          D2K_PLAN_SHAPE_VOICE) == 1,
+              "voice address binding not removed");
+        CHECK(d2k_plantab_find(t, NULL, 0, ip, 7, D2K_PLAN_SHAPE_QUIC) == quic2 &&
+              d2k_plantab_find(t, voice, sizeof voice - 1, ip, 7,
+                               D2K_PLAN_SHAPE_VOICE) == NULL &&
+              d2k_plantab_count(t) == 1,
+              "removing the voice address binding touched the QUIC one");
+        CHECK(d2k_plantab_del_addr_shaped(t, (const uint8_t *)&ip, 4,
+                                          D2K_PLAN_SHAPE_VOICE) == 0,
+              "repeated shaped delete found something");
+        d2k_plantab_free(t);
+    }
+
     if (fails) {
         printf("ПРОВАЛОВ: %d\n", fails);
         return 1;

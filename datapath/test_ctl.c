@@ -905,6 +905,59 @@ int main(void) {
             CHECK(reason == D2K_ACK_BAD_ARGS, "пустое имя не помечено D2K_ACK_BAD_ARGS");
         }
 
+        /* SET_ADDR/DEL_ADDR несут форму протокола (v7, задача 16): QUIC и
+           голос одного IP — две записи; привязка без формы не принимается;
+           снятие одной формы не трогает другую. Таблица возвращается к одной
+           записи — блок ниже считает от неё. */
+        {
+            d2k_plantab *tab = d2k_session_plans(sess);
+            const uint8_t voice[] = D2K_VOICE_CLASS;
+            uint8_t ip[4] = {198, 51, 100, 23};
+            uint32_t ip_be; memcpy(&ip_be, ip, 4);
+            uint8_t body[64];
+            uint16_t cmd; int ok; uint8_t reason;
+            size_t before = d2k_session_plan_count(sess);
+            const uint8_t shapes[4] = {D2K_PLAN_SHAPE_QUIC, D2K_PLAN_SHAPE_VOICE,
+                                       D2K_PLAN_SHAPE_ANY, D2K_PLAN_SHAPE_GRANDFATHER};
+            for (int i = 0; i < 4; i++) {
+                memset(body, 0, sizeof body);
+                body[0] = 4; memcpy(body + 1, ip, 4); body[17] = shapes[i];
+                memcpy(body + 18, tiny, sizeof tiny);
+                d2k_ctlsrv_command(&cx, D2K_CMD_SET_ADDR, body, 18 + sizeof tiny);
+                d2k_ctl_flush(c);
+                CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && cmd == D2K_CMD_SET_ADDR,
+                      "SET_ADDR ack missing");
+                CHECK(ok == (i < 2) && reason == (i < 2 ? D2K_ACK_OK : D2K_ACK_BAD_ARGS),
+                      "SET_ADDR shape validation wrong (unshaped/grandfather must be refused)");
+            }
+            CHECK(d2k_session_plan_count(sess) == before + 2,
+                  "QUIC and voice address bindings of one IP did not coexist");
+            const d2k_plan *q = d2k_plantab_find(tab, NULL, 0, ip_be, 1, D2K_PLAN_SHAPE_QUIC);
+            const d2k_plan *v = d2k_plantab_find(tab, voice, sizeof voice - 1, ip_be, 1,
+                                                 D2K_PLAN_SHAPE_VOICE);
+            CHECK(q && v && q != v, "address bindings not separated by protocol shape");
+            CHECK(!d2k_plantab_find(tab, NULL, 0, ip_be, 1, D2K_PLAN_SHAPE_MODERN),
+                  "UDP address binding served to TCP hello");
+            body[17] = D2K_PLAN_SHAPE_VOICE;
+            d2k_ctlsrv_command(&cx, D2K_CMD_DEL_ADDR, body, 18);
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && cmd == D2K_CMD_DEL_ADDR && ok,
+                  "shaped DEL_ADDR not acknowledged");
+            CHECK(d2k_plantab_find(tab, NULL, 0, ip_be, 1, D2K_PLAN_SHAPE_QUIC) == q &&
+                  !d2k_plantab_find(tab, voice, sizeof voice - 1, ip_be, 1,
+                                    D2K_PLAN_SHAPE_VOICE),
+                  "DEL_ADDR(voice) touched the QUIC binding or kept the voice one");
+            d2k_ctlsrv_command(&cx, D2K_CMD_DEL_ADDR, body, 17);
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok && reason == D2K_ACK_BAD_ARGS,
+                  "DEL_ADDR without shape accepted");
+            body[17] = D2K_PLAN_SHAPE_QUIC;
+            d2k_ctlsrv_command(&cx, D2K_CMD_DEL_ADDR, body, 18);
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok, "DEL_ADDR(QUIC) not acknowledged");
+            CHECK(d2k_session_plan_count(sess) == before, "address bindings not cleaned up");
+        }
+
         /* Главное: таблица полна — новая цель встаёт ВЫТЕСНЕНИЕМ, а не
            отказом. До вытеснения именно так на живом роутере отказывала
            КАЖДАЯ следующая цель после заполнения (см. d2k_plans.h).

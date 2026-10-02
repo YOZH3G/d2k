@@ -344,12 +344,17 @@ int  d2k_link_del_name_probe(int fd, const char *name, uint8_t transport,
  * (d2k_cat_binding.kind), и цель без имени — это НЕ вырожденный случай цели с
  * именем, а отдельный вид знания. Ставить её планы по имени нечем, пропускать
  * их — терять подтверждённое. */
-int  d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
-                       char *err, size_t errcap);
+/* shape — ФОРМА ПРОТОКОЛА привязки (D2K_LINK_SHAPE_*, v7): адресная запись
+ * датапата — ключ (адрес, семейство, форма). QUIC, STUN/голос и TLS одного IP
+ * не затирают друг друга и не применяются к чужим пакетам (D2K_SPEC §5).
+ * Ноль и D2K_LINK_SHAPE_GRANDFATHER отвергаются (-1): «подходит всем
+ * протоколам адреса» по сокету не ставится. DEL_ADDR снимает ровно эту форму. */
+int  d2k_link_set_addr(int fd, const uint8_t ip4[4], uint8_t shape,
+                       const char *plan_text, char *err, size_t errcap);
 int d2k_link_set_addr_family(int fd, const uint8_t *ip, uint8_t family,
-    const char *plan_text, char *err, size_t errcap);
+    uint8_t shape, const char *plan_text, char *err, size_t errcap);
 int d2k_link_del_addr_family(int fd, const uint8_t *ip, uint8_t family,
-    char *err, size_t errcap);
+    uint8_t shape, char *err, size_t errcap);
 
 /* Временная адресная проба для одного UDP 5-tuple. Адреса/порты передаются
  * байтами сетевого порядка; trial_id — случайный ненулевой токен поколения,
@@ -373,7 +378,8 @@ int  d2k_link_del_addr_probe(int fd, const uint8_t src_ip4[4], uint16_t src_port
 
 /* Снимает только адресную запись (DEL_ADDR, четыре байта сетевого порядка).
  * Текстовый IP в DEL_NAME адресную таблицу не затрагивает. */
-int  d2k_link_del_addr(int fd, const uint8_t ip4[4], char *err, size_t errcap);
+int  d2k_link_del_addr(int fd, const uint8_t ip4[4], uint8_t shape,
+                       char *err, size_t errcap);
 
 /* Типы TLS-записей, встречающиеся в EXCHANGE (§8 спецификации,
  * docs/spec/2026-09-06-c-engine-design.md). Это НЕ протокол управляющего

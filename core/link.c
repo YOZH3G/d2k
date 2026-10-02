@@ -634,19 +634,31 @@ static int send_name_only(int fd, uint16_t cmd, const char *what,
     return 0;
 }
 
-int d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
-                      char *err, size_t errcap) {
-    return d2k_link_set_addr_family(fd, ip4, 4, plan_text, err, errcap);
+/* Форма адресной привязки (v7): только измеренный протокол — TLS 1.3/1.2,
+   ECH, QUIC, STUN/голос. Ноль и дедушкино право означали бы «подходит всем
+   протоколам IP» (задача 16, D2K_SPEC §5); такая команда не собирается. */
+static int addr_shape_ok(uint8_t shape) {
+    return shape == 1 || shape == 2 || shape == D2K_LINK_SHAPE_QUIC ||
+           shape == D2K_LINK_SHAPE_VOICE || shape == D2K_LINK_SHAPE_ECH_TCP;
+}
+
+int d2k_link_set_addr(int fd, const uint8_t ip4[4], uint8_t shape,
+                      const char *plan_text, char *err, size_t errcap) {
+    return d2k_link_set_addr_family(fd, ip4, 4, shape, plan_text, err, errcap);
 }
 
 int d2k_link_set_addr_family(int fd, const uint8_t *ip4, uint8_t family,
-    const char *plan_text, char *err, size_t errcap) {
+    uint8_t shape, const char *plan_text, char *err, size_t errcap) {
     if (fd < 0 || (family != 4 && family != 6)) {
         say(err, errcap, "сокет не открыт");
         return -1;
     }
     if (!ip4) {
         say(err, errcap, "адрес цели не задан");
+        return -1;
+    }
+    if (!addr_shape_ok(shape)) {
+        say(err, errcap, "у адресной привязки нет формы протокола (%u)", (unsigned)shape);
         return -1;
     }
     if (!plan_text) {
@@ -663,6 +675,7 @@ int d2k_link_set_addr_family(int fd, const uint8_t *ip4, uint8_t family,
     memset(g_scratch + o, 0, 16);
     memcpy(g_scratch + o, ip4, family == 6 ? 16 : 4);
     o += 16;
+    g_scratch[o++] = shape;
     long planlen = hex_decode(plan_text, g_scratch + o, sizeof g_scratch - o);
     if (planlen < 0) {
         say(err, errcap, "план не hex: недопустимый символ");
@@ -865,20 +878,26 @@ int d2k_link_del_name_probe_family(int fd, const char *name, uint8_t transport,
     return 0;
 }
 
-int d2k_link_del_addr(int fd, const uint8_t ip4[4], char *err, size_t errcap) {
-    return d2k_link_del_addr_family(fd, ip4, 4, err, errcap);
+int d2k_link_del_addr(int fd, const uint8_t ip4[4], uint8_t shape,
+                      char *err, size_t errcap) {
+    return d2k_link_del_addr_family(fd, ip4, 4, shape, err, errcap);
 }
 
 int d2k_link_del_addr_family(int fd, const uint8_t *ip4, uint8_t family,
-    char *err, size_t errcap) {
+    uint8_t shape, char *err, size_t errcap) {
     if (fd < 0 || !ip4 || (family != 4 && family != 6)) {
         say(err, errcap, "сокет не открыт или адрес цели не задан");
         return -1;
     }
-    uint8_t frame[HDR + 17] = {0, 0, 0, 19,
+    if (!addr_shape_ok(shape)) {
+        say(err, errcap, "у адресной привязки нет формы протокола (%u)", (unsigned)shape);
+        return -1;
+    }
+    uint8_t frame[HDR + 18] = {0, 0, 0, 20,
         (uint8_t)(D2K_CMD_DEL_ADDR >> 8), (uint8_t)D2K_CMD_DEL_ADDR};
     frame[HDR] = family;
     memcpy(frame + HDR + 1, ip4, family == 6 ? 16 : 4);
+    frame[HDR + 17] = shape;
     if (write_all(fd, frame, sizeof frame) != 0) {
         say(err, errcap, "команда DEL_ADDR не отправилась: %s", strerror(errno));
         return -1;

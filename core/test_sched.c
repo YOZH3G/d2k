@@ -678,6 +678,26 @@ static size_t sent_command_count(uint16_t kind, const uint8_t *body, size_t len)
     return count;
 }
 
+/* SET_ADDR v7: [family][address 16][форма][план]. Сколько ушло на этот
+   адрес с этой формой протокола (задача 16). */
+static size_t sent_set_addr_shape(uint8_t family, const uint8_t *ip, uint8_t shape) {
+    size_t count = 0;
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3];
+        if (n < 2 || n > sent_len - off - 4) { break; }
+        uint16_t type = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
+        const uint8_t *body = p + 6;
+        if (type == D2K_CMD_SET_ADDR && n >= 2 + 18 && body[0] == family &&
+            !memcmp(body + 1, ip, family == 6 ? 16 : 4) && body[17] == shape) {
+            count++;
+        }
+        off += 4 + n;
+    }
+    return count;
+}
+
 static int last_addr_probe_endpoint(uint8_t src[4], uint16_t *sport_be,
                                     uint8_t trial[D2K_TRIAL_ID_LEN]) {
     for (size_t off = 0; off + 6 <= sent_len;) {
@@ -737,7 +757,7 @@ static int last_plan_id(uint8_t out[16]) {
         if ((type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) && len) {
             start = 3u + body[0] + (type == D2K_CMD_SET_NAME_PROBE ? 2u : 0u);
         } else if (type == D2K_CMD_SET_ADDR) {
-            start = 17;
+            start = 18; /* v7: family, address(16), форма */
         } else if (type == D2K_CMD_SET_ADDR_PROBE) {
             start = 58;
         }
@@ -2062,6 +2082,10 @@ admission_only_run:
                   "native address proof saved as IPv6 address binding");
             CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) >= 1,
                   "native address proof promotes persistent datapath plan");
+            CHECK(sent_set_addr_shape(6, endpoint + 17, D2K_LINK_SHAPE_QUIC) >= 1 &&
+                  sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) ==
+                      sent_set_addr_shape(6, endpoint + 17, D2K_LINK_SHAPE_QUIC),
+                  "QUIC address promotion not keyed by the QUIC protocol shape");
             }
         }
         settle(s); d2k_sched_free(s); drain();
@@ -3758,8 +3782,16 @@ question_test:
             drain();
             CHECK(rounds < 1000, "проход по каталогу не закончился");
             CHECK(!d2k_sched_sync_pending(s), "проход по каталогу остался незакрытым");
-            CHECK(said("поставлено планов по подтверждённым привязкам: 2"),
+            /* Задача 16: адресная привязка 1.2.3.4 без формы протокола (TCP,
+               старый файл) — неизвестный контекст (§7): общей совместимости
+               ей не выдаём, на провод не едет, требуется повторная проверка.
+               Имя без формы по-прежнему ставится дедушкиным правом. */
+            CHECK(said("поставлено планов по подтверждённым привязкам: 1"),
                   "проход по каталогу не сказал, сколько поставил");
+            CHECK(said("адресных привязок без формы протокола: 1"),
+                  "адресная привязка без формы поставлена как общая либо пропала молча");
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 0,
+                  "адресная привязка без формы ушла на провод");
             CHECK(said("не поставлено привязок со слабым доказательством: 1"),
                   "привязка уровня «сервер ответил» ушла на провод наравне с "
                   "подтверждённой либо пропала молча");
@@ -3819,6 +3851,12 @@ question_test:
                                   sent_command_count(D2K_CMD_SET_NAME, NULL, 0);
                     CHECK(sent == (size_t)(proof == 2),
                           "старый UDP CLIENT восстановлен без доказательства либо потерян PROBE");
+                    if (by_addr && proof == 2) {
+                        uint8_t ip7[4] = {192, 0, 2, 7};
+                        CHECK(sent_set_addr_shape(4, ip7, D2K_LINK_SHAPE_QUIC) == 1,
+                              "старая адресная UDP-привязка зонда без формы не восстановлена "
+                              "однозначной формой QUIC");
+                    }
                     CHECK(proof == 2 || said("UDP CLIENT"),
                           "пропуск старого UDP-подтверждения не объяснён");
                     CHECK(memcmp(bd, &before, sizeof before) == 0 && p->successes == 1,
@@ -6075,6 +6113,145 @@ voice_only_run:
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cS);
+
+        /* Задача 16: подтверждённый STUN/голос того же IP не затирает
+           подтверждённую QUIC-привязку по адресу. Каждая едет со своей формой
+           протокола, DEL_ADDR не посылается, обе переживают перезапуск. */
+        d2k_catalog cQ;
+        memset(&cQ, 0, sizeof cQ);
+        cQ.boxes = calloc(1, sizeof *cQ.boxes);
+        CHECK(cQ.boxes != NULL, "каталог QUIC-по-адресу не создан");
+        if (cQ.boxes) {
+            cQ.n_boxes = 1;
+            d2k_cat_box *qb = &cQ.boxes[0];
+            snprintf(qb->id, sizeof qb->id, "quic-addr-box");
+            qb->plans = calloc(1, sizeof *qb->plans);
+            qb->binds = calloc(1, sizeof *qb->binds);
+            if (qb->plans && qb->binds) {
+                qb->n_plans = qb->n_binds = 1;
+                snprintf(qb->plans[0].id, sizeof qb->plans[0].id, "quic-addr-plan");
+                snprintf(qb->plans[0].proto, sizeof qb->plans[0].proto, "quic");
+                qb->plans[0].enabled = 1;
+                qb->plans[0].successes = 1;
+                qb->plans[0].text = strdup("d2k-plan 1 6\nid 00000000000000000000000000000000\n"
+                                           "proto udp quic\ndelay 15000\n");
+                d2k_cat_binding *qbd = &qb->binds[0];
+                snprintf(qbd->kind, sizeof qbd->kind, "addr");
+                snprintf(qbd->target, sizeof qbd->target, "127.0.0.1");
+                snprintf(qbd->plan_id, sizeof qbd->plan_id, "quic-addr-plan");
+                qbd->enabled = 1; qbd->level = 3; qbd->confirmed = 42; qbd->successes = 1;
+                qbd->transport = 17; qbd->family = 4;
+                qbd->shape = D2K_LINK_SHAPE_QUIC; qbd->verified_by = D2K_VERBY_PROBE;
+            }
+            const uint8_t lo[4] = {127, 0, 0, 1};
+            d2k_cat_binding quic_before = qb->binds ? qb->binds[0] : (d2k_cat_binding){0};
+            saidbuf[0] = '\0';
+            s = d2k_sched_new(&cQ, sv[0], 0x2d);
+            if (s) {
+                d2k_sched_set_say(s, collect_say, NULL);
+                forget_sent();
+                (void)d2k_sched_sync(s);
+                int rounds = 0;
+                while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+                drain();
+                CHECK(sent_set_addr_shape(4, lo, D2K_LINK_SHAPE_QUIC) == 1,
+                      "QUIC-привязка по адресу не восстановлена со своей формой");
+                forget_sent();
+                d2k_ev h = ev_hello(17, 52005, D2K_LINK_VOICE_CLASS);
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(17, 52005);
+                d2k_sched_event(s, &su);
+                spin(s, 20);
+                drain();
+                uint8_t ssrc_ip[4], strial[D2K_TRIAL_ID_LEN];
+                uint16_t ssport = 0;
+                CHECK(last_addr_probe_endpoint(ssrc_ip, &ssport, strial),
+                      "STUN-опыт рядом с QUIC-привязкой не поставлен");
+                d2k_ev ap = ev_applied(17, 52005);
+                memcpy(ap.trial_id, strial, sizeof strial);
+                d2k_sched_event(s, &ap);
+                d2k_ev ex = ev_exchange(17, 52005, 0);
+                ex.code = D2K_UDP_PROOF_STUN;
+                d2k_sched_event(s, &ex);
+                spin(s, 20);
+                drain();
+                CHECK(sent_set_addr_shape(4, lo, D2K_LINK_SHAPE_VOICE) == 1 &&
+                      sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 1,
+                      "подтверждённый STUN ушёл не формой голоса");
+                CHECK(sent_command_count(D2K_CMD_DEL_ADDR, NULL, 0) == 0,
+                      "подтверждение STUN сняло адресную привязку");
+                CHECK(bindings_of(&cQ, "127.0.0.1", 17) == 2,
+                      "STUN-привязка слилась с QUIC-привязкой того же IP");
+                /* box_ensure мог переложить массив коробок — берём заново. */
+                const d2k_cat_binding *qnow = cQ.boxes[0].binds;
+                CHECK(qnow && !strcmp(qnow->plan_id, quic_before.plan_id) &&
+                      qnow->shape == D2K_LINK_SHAPE_QUIC &&
+                      qnow->verified_by == D2K_VERBY_PROBE &&
+                      qnow->successes == quic_before.successes,
+                      "подтверждение STUN переписало QUIC-привязку");
+                forget_sent();
+                (void)d2k_sched_sync(s);
+                rounds = 0;
+                while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+                drain();
+                CHECK(sent_set_addr_shape(4, lo, D2K_LINK_SHAPE_QUIC) == 1 &&
+                      sent_set_addr_shape(4, lo, D2K_LINK_SHAPE_VOICE) == 1,
+                      "после перезапуска QUIC и STUN одного IP не восстановлены раздельно");
+                d2k_sched_free(s);
+            }
+        }
+        d2k_catalog_free(&cQ);
+
+        /* Старые адресные привязки без формы: форма выводится только там, где
+           она однозначна (STUN-подтверждение — голос, UDP-зонд по адресу —
+           QUIC, см. выше); прочие не получают «подходит всем» (§7, §9.11). */
+        for (int legacy = 0; legacy < 2; legacy++) {
+            d2k_catalog cL;
+            memset(&cL, 0, sizeof cL);
+            cL.boxes = calloc(1, sizeof *cL.boxes);
+            if (!cL.boxes) { continue; }
+            cL.n_boxes = 1;
+            d2k_cat_box *lb = &cL.boxes[0];
+            snprintf(lb->id, sizeof lb->id, "legacy-addr-box");
+            lb->plans = calloc(1, sizeof *lb->plans);
+            lb->binds = calloc(1, sizeof *lb->binds);
+            if (lb->plans && lb->binds) {
+                lb->n_plans = lb->n_binds = 1;
+                snprintf(lb->plans[0].id, sizeof lb->plans[0].id, "legacy-plan");
+                snprintf(lb->plans[0].proto, sizeof lb->plans[0].proto, "stun");
+                lb->plans[0].enabled = 1;
+                lb->plans[0].text = strdup("d2k-plan 1 6\nid 00000000000000000000000000000000\n"
+                                           "proto udp quic\ndelay 15000\n");
+                d2k_cat_binding *lbd = &lb->binds[0];
+                snprintf(lbd->kind, sizeof lbd->kind, "addr");
+                snprintf(lbd->target, sizeof lbd->target, "203.0.113.5");
+                snprintf(lbd->plan_id, sizeof lbd->plan_id, "legacy-plan");
+                lbd->enabled = 1; lbd->level = 3; lbd->transport = 17;
+                lbd->verified_by = legacy == 0 ? D2K_VERBY_STUN : 0;
+            }
+            saidbuf[0] = '\0';
+            s = d2k_sched_new(&cL, sv[0], 0x2d);
+            if (s) {
+                d2k_sched_set_say(s, collect_say, NULL);
+                forget_sent();
+                (void)d2k_sched_sync(s);
+                int rounds = 0;
+                while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+                drain();
+                const uint8_t ip5[4] = {203, 0, 113, 5};
+                if (legacy == 0) {
+                    CHECK(sent_set_addr_shape(4, ip5, D2K_LINK_SHAPE_VOICE) == 1 &&
+                          sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 1,
+                          "старая STUN-привязка без формы не восстановлена формой голоса");
+                } else {
+                    CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 0 &&
+                          said("адресных привязок без формы протокола: 1"),
+                          "неоднозначная адресная привязка без формы поставлена как общая");
+                }
+                d2k_sched_free(s);
+            }
+            d2k_catalog_free(&cL);
+        }
 
         /* Задача 15, сквозной путь Дискорда: опыт на пятёрке разговора →
            APPLIED с trial ID → настоящий IP Discovery response → постоянная

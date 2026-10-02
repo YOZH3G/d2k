@@ -370,15 +370,27 @@ static entry *find_name_shape(d2k_plantab *t, const uint8_t *name, size_t len,
     return find_name_shape_port(t, name, len, shape, 0, family);
 }
 
-static entry *find_addr(d2k_plantab *t, const uint8_t *addr, uint8_t family) {
+/* Адресная запись — КЛЮЧ (адрес, семейство, форма протокола). Один IP может
+   нести и QUIC, и STUN/голос, и TLS: подтверждённое на одном протоколе к
+   другому отношения не имеет (D2K_SPEC §5), и одна запись на адрес давала
+   голосовому плану затирать QUIC-привязку того же IP и применяться ко всем
+   его Initial. find_addr — любая форма (снятие адреса целиком, учёт промаха),
+   find_addr_shape — ровно одна. */
+static entry *find_addr_shape(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+                              int any_shape, uint8_t shape) {
     if (!addr || (family != 4 && family != 6)) { return NULL; }
     for (size_t i = 0; i < t->used; i++) {
         if (t->v[i].kind == KEY_ADDR && t->v[i].family == family &&
+            (any_shape || t->v[i].shape == shape) &&
             memcmp(t->v[i].addr, addr, family == 6 ? 16 : 4) == 0) {
             return &t->v[i];
         }
     }
     return NULL;
+}
+
+static entry *find_addr(d2k_plantab *t, const uint8_t *addr, uint8_t family) {
+    return find_addr_shape(t, addr, family, 1, 0);
 }
 
 /* Кандидат на вытеснение — запись с самой старой отметкой обращения.
@@ -549,14 +561,25 @@ int d2k_plantab_set_addr(d2k_plantab *t, uint32_t addr_be, uint64_t now_ns,
     return d2k_plantab_set_addr_family(t, (const uint8_t *)&addr_be, 4, now_ns, p);
 }
 
+/* Без формы — дедушкино право: отдельная запись того же адреса, подходящая
+   любой форме. С управляющего сокета так не ставится (SET_ADDR v7 требует
+   форму, ctlsrv.c) — это вход для внутренних тестов датапата. */
 int d2k_plantab_set_addr_family(d2k_plantab *t, const uint8_t *addr, uint8_t family,
                                 uint64_t now_ns, d2k_plan *p) {
-    if (!t || !addr || (family != 4 && family != 6)) {
+    return d2k_plantab_set_addr_shaped(t, addr, family, now_ns, p,
+                                       D2K_PLAN_SHAPE_GRANDFATHER);
+}
+
+int d2k_plantab_set_addr_shaped(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+                                uint64_t now_ns, d2k_plan *p, uint8_t shape) {
+    if (!t || !addr || (family != 4 && family != 6) || shape == D2K_PLAN_SHAPE_ANY) {
         d2k_plan_free(p);
         return -2;
     }
     t->revision++;
-    entry *e = find_addr(t, addr, family);
+    /* Своя запись на каждую форму: замена плана одной формы не трогает
+       подтверждённое на другой (§7 — чужое знание не задевать). */
+    entry *e = find_addr_shape(t, addr, family, 0, shape);
     if (!e) {
         e = take_free_or_evict(t);
         if (!e) {
@@ -568,10 +591,8 @@ int d2k_plantab_set_addr_family(d2k_plantab *t, const uint8_t *addr, uint8_t fam
         e->family = family;
         memset(e->addr, 0, sizeof e->addr);
         memcpy(e->addr, addr, family == 6 ? 16 : 4);
+        e->shape = shape;
     }
-    /* Адрес не приветствие: формы у него нет по построению, и лечится это не
-       проверкой при поиске, а честно названным исключением. */
-    e->shape = D2K_PLAN_SHAPE_GRANDFATHER;
     e->last_used_ns = now_ns;
     d2k_plan_free(e->plan);
     e->plan = p;
@@ -648,8 +669,20 @@ int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be) {
     return d2k_plantab_del_addr_family(t, (const uint8_t *)&addr_be, 4);
 }
 
+/* Без формы — снять адрес целиком, все формы (как del_name снимает все
+   формы имени). С управляющего сокета этот путь недоступен: DEL_ADDR v7
+   несёт форму и снимает ровно её (d2k_plantab_del_addr_shaped). */
 int d2k_plantab_del_addr_family(d2k_plantab *t, const uint8_t *addr, uint8_t family) {
-    return t ? drop(t, find_addr(t, addr, family)) : 0;
+    if (!t) { return 0; }
+    int n = 0;
+    while (drop(t, find_addr(t, addr, family))) { n++; }
+    return n > 0;
+}
+
+int d2k_plantab_del_addr_shaped(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+                                uint8_t shape) {
+    if (!t || shape == D2K_PLAN_SHAPE_ANY) { return 0; }
+    return drop(t, find_addr_shape(t, addr, family, 0, shape));
 }
 
 static int trial_id_valid(const uint8_t id[D2K_TRIAL_ID_LEN]) {
@@ -823,9 +856,9 @@ size_t d2k_plantab_probe_count(const d2k_plantab *t) {
  * а не арифметика нулей.
  *
  *   совпало           — форма записи и форма наблюдения одна и та же;
- *   дедушкино право   — у записи формы не было (старый каталог, план по
- *                       адресу), и отказать значило бы выключить работающий
- *                       у человека обход;
+ *   дедушкино право   — у записи формы не было (старый каталог по имени), и
+ *                       отказать значило бы выключить работающий у человека
+ *                       обход (адресные записи с v7 несут форму, задача 16);
  *   не подходит       — всё остальное, и в первую очередь ОБЪЯВЛЕННАЯ форма
  *                       записи против НЕИЗМЕРЕННОГО наблюдения.
  *
@@ -972,12 +1005,23 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
     }
     /* Только теперь по адресу: обратный порядок дал бы плану соседа по CDN
        перебить план, подтверждённый для этого имени. */
-    entry *e = find_addr(t, addr, family);
+    /* Запись СВОЕЙ формы; ECH без своей — запись TLS 1.3 (как у имени);
+       затем дедушкино право. Запись адреса другой формы не подходит: план,
+       подтверждённый на STUN/голосе, QUIC Initial этого IP не достаётся, и
+       наоборот (§5). */
+    entry *e = seen_shape == D2K_PLAN_SHAPE_ANY ? NULL
+             : find_addr_shape(t, addr, family, 0, seen_shape);
+    if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP)
+        e = find_addr_shape(t, addr, family, 0, D2K_PLAN_SHAPE_MODERN);
+    if (!e)
+        e = find_addr_shape(t, addr, family, 0, D2K_PLAN_SHAPE_GRANDFATHER);
     if (e) {
         e->last_used_ns = now_ns;
-        if (shape_fits(e->shape, seen_shape)) {
-            return e->plan;
-        }
+        return e->plan;
+    }
+    if (find_addr(t, addr, family)) {
+        /* Адрес знаем, а протокола такого у него нет — тот же отдельный
+           факт, что и у имени. */
         t->shape_misses++;
     }
     return NULL;

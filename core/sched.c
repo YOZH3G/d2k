@@ -723,6 +723,7 @@ struct d2k_sched {
     size_t       sync_box, sync_bind;
     int          sync_active, sync_pending, sync_sent, sync_skipped;
     int          sync_weak;   /* привязки, чьё доказательство слабее обмена */
+    int          sync_unshaped; /* адресные привязки без однозначной формы протокола */
     installed_area *areas;
     size_t n_areas;
     installed_area area_pending;
@@ -3154,12 +3155,46 @@ int d2k_sched_sync(d2k_sched *s) {
     s->sync_sent = 0;
     s->sync_skipped = 0;
     s->sync_weak = 0;
+    s->sync_unshaped = 0;
     s->area_sync_failed = 0;
     return 0;
 }
 
 int d2k_sched_sync_pending(const d2k_sched *s) {
     return (s && (s->sync_active || s->sync_pending)) ? 1 : 0;
+}
+
+/* Форма протокола адресной привязки на проводе (SET_ADDR v7), 0 — нет
+ * однозначной.
+ *
+ * Адресная запись датапата — ключ (адрес, семейство, форма): QUIC и STUN/голос
+ * одного IP не должны затирать друг друга и доставаться чужим пакетам
+ * (D2K_SPEC §5). Записанная форма едет как есть, если согласна с транспортом.
+ * Формы нет (файл до появления поля) — выводим ТОЛЬКО однозначное из того,
+ * что записали сами пути подтверждения: UDP + STUN-доказательство пишет лишь
+ * voice_confirm (форма голоса), UDP + собственный зонд по адресу — лишь
+ * QUIC-поиск без SNI (форма QUIC). Остальное (TCP по адресу из старых
+ * каталогов, UDP без доказательства) — неизвестный контекст: дедушкино право
+ * сделало бы его рабочим для всех протоколов IP, а §7/§9.11 требуют проверки.
+ * Каталог при этом не правится — запись просто не ставится, и это говорится. */
+static uint8_t addr_binding_shape(const d2k_cat_binding *bd) {
+    uint8_t tr = bd->transport;
+    switch (bd->shape) {
+    case D2K_LINK_SHAPE_QUIC:
+    case D2K_LINK_SHAPE_VOICE:
+        return tr == 17 ? bd->shape : 0;
+    case D2K_SHAPE_MODERN:
+    case D2K_SHAPE_LEGACY:
+    case D2K_LINK_SHAPE_ECH_TCP:
+        return tr == 6 || tr == 0 ? bd->shape : 0;
+    case 0:
+        if (tr != 17) return 0;
+        if (bd->verified_by == D2K_VERBY_STUN) return D2K_LINK_SHAPE_VOICE;
+        if (bd->verified_by == D2K_VERBY_PROBE) return D2K_LINK_SHAPE_QUIC;
+        return 0;
+    default:
+        return 0;
+    }
 }
 
 /* Several measured boxes may retain the history of one target. SET_NAME
@@ -3454,6 +3489,15 @@ int d2k_sched_sync_step(d2k_sched *s) {
             continue;
         }
         if (strcmp(bd->kind, "addr") == 0) {
+            uint8_t addr_shape = addr_binding_shape(bd);
+            if (!addr_shape) {
+                s->sync_unshaped++;
+                say(s, "каталог: %s — адресная привязка без однозначной формы протокола "
+                       "(транспорт %u, форма %u); общей для всех протоколов адреса не ставлю, "
+                       "требуется повторная проверка", bd->target,
+                    (unsigned)bd->transport, (unsigned)bd->shape);
+                continue;
+            }
             uint8_t addr[16] = {0};
             if (strchr(bd->target, '%') ||
                 inet_pton(family == 6 ? AF_INET6 : AF_INET, bd->target, addr) != 1) {
@@ -3461,7 +3505,8 @@ int d2k_sched_sync_step(d2k_sched *s) {
                 s->sync_skipped++;
                 continue;
             }
-            rc = d2k_link_set_addr_family(s->link_fd, addr, family, hex, err, sizeof err);
+            rc = d2k_link_set_addr_family(s->link_fd, addr, family, addr_shape,
+                                          hex, err, sizeof err);
         } else {
             /* transport привязки проверяется, но на провод не едет: у SET_NAME
                сегодня нет места под него (d2k_link.h). Ноль — старый файл,
@@ -3503,7 +3548,8 @@ int d2k_sched_sync_step(d2k_sched *s) {
     if (s->sync_box >= s->cat->n_boxes) {
         if (sync_areas(s)) return 1;
         s->sync_active = 0;
-        if (s->sync_sent > 0 || s->sync_skipped > 0 || s->sync_weak > 0) {
+        if (s->sync_sent > 0 || s->sync_skipped > 0 || s->sync_weak > 0 ||
+            s->sync_unshaped > 0) {
             say(s, "каталог: поставлено планов по подтверждённым привязкам: %d%s",
                 s->sync_sent, s->sync_skipped ? " (пропущено негодных: см. выше)" : "");
             if (s->sync_weak > 0) {
@@ -3511,6 +3557,10 @@ int d2k_sched_sync_step(d2k_sched *s) {
                        "%d (уровень ниже «обмен прошёл» либо старый UDP CLIENT "
                        "без протокольного доказательства)",
                     s->sync_weak);
+            }
+            if (s->sync_unshaped > 0) {
+                say(s, "каталог: не поставлено адресных привязок без формы протокола: %d "
+                       "(требуется повторная проверка)", s->sync_unshaped);
             }
         }
         return 0;
@@ -4145,7 +4195,8 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         if (is_stun) {
             uint8_t ip4[4];
             if (inet_pton(AF_INET, t->ip, ip4) == 1) {
-                install_rc = d2k_link_set_addr(s->link_fd, ip4, hex, err, sizeof err);
+                install_rc = d2k_link_set_addr(s->link_fd, ip4, D2K_LINK_SHAPE_VOICE,
+                                               hex, err, sizeof err);
             } else {
                 snprintf(err, sizeof err, "адрес STUN-цели не является IPv4");
             }
@@ -4739,7 +4790,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
             d2k_plan_text_to_hex(permanent_wire, permanent_hex,
                                  sizeof permanent_hex, err, sizeof err) != 0 ||
             inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, addr) != 1 ||
-            d2k_link_set_addr_family(s->link_fd, addr, t->family, permanent_hex, err, sizeof err) != 0) {
+            d2k_link_set_addr_family(s->link_fd, addr, t->family, rec_shape,
+                                     permanent_hex, err, sizeof err) != 0) {
             if (!err[0]) { snprintf(err, sizeof err, "неверный адрес цели или отсутствует REC_ID"); }
             say(s, "по %s адресный план подтверждён, но не удалось продвинуть его в постоянную таблицу: %s",
                 t->name, err);

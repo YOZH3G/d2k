@@ -49,7 +49,10 @@
  * событий и команды привязок. Смешанная пара останавливается на приветствии. */
 /* v5: learned suffix areas and exact context bypass commands. */
 /* v6: area command correlation IDs, safe retry after lost/late ACK. */
-#define D2K_CTL_PROTO_VERSION 6
+/* v7: SET_ADDR/DEL_ADDR несут форму протокола (D2K_PLAN_SHAPE_*): адресная
+ * привязка — ключ (адрес, семейство, форма), QUIC и STUN/голос одного IP не
+ * затирают друг друга. Без формы и с дедушкиным правом команда отвергается. */
+#define D2K_CTL_PROTO_VERSION 7
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */
@@ -140,9 +143,9 @@
 #define D2K_CMD_SET_NAME_PROBE 0x0088
 #define D2K_CMD_SET_ADDR_PROBE 0x0089 /* family+src/dst+ports+proto(38), trial-id(16), lease-ms(u32), Plan */
 #define D2K_CMD_DEL_ADDR_PROBE 0x008A /* flow(38), trial-id(16); stale delete is no-op */
-#define D2K_CMD_SET_ADDR 0x0082  /* family u8, address(16), план TLV */
+#define D2K_CMD_SET_ADDR 0x0082  /* family u8, address(16), форма u8, план TLV */
 #define D2K_CMD_DEL_NAME 0x0083  /* длина имени u8, имя, family u8 */
-#define D2K_CMD_DEL_ADDR 0x0084  /* family u8, address(16) */
+#define D2K_CMD_DEL_ADDR 0x0084  /* family u8, address(16), форма u8 */
 #define D2K_CMD_CLEAR    0x0085  /* убрать все планы */
 #define D2K_CMD_STATS    0x0086  /* прислать счётчики */
 /* Поймать форму следующего приветствия: длина имени u8, имя, transport u8, family u8.

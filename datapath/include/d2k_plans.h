@@ -88,6 +88,16 @@ int d2k_plantab_has_ech_target(const d2k_plantab *, const uint8_t *, size_t,
 int d2k_plantab_set_addr_family(d2k_plantab *, const uint8_t *, uint8_t family,
     uint64_t now_ns, d2k_plan *);
 int d2k_plantab_del_addr_family(d2k_plantab *, const uint8_t *, uint8_t family);
+/* Адресная привязка С ФОРМОЙ ПРОТОКОЛА (D2K_PLAN_SHAPE_*, не ANY): ключ —
+ * (адрес, семейство, форма). QUIC, STUN/голос и TLS одного IP — разные
+ * записи; план одной формы к пакетам другой не применяется (D2K_SPEC §5).
+ * set — владение p переходит таблице на любом исходе; -2 при форме ANY.
+ * del_shaped снимает ровно эту форму. Без формы (set/del_addr_family) —
+ * внутренний вход: дедушкино право / снятие всех форм адреса. */
+int d2k_plantab_set_addr_shaped(d2k_plantab *, const uint8_t *, uint8_t family,
+    uint64_t now_ns, d2k_plan *, uint8_t shape);
+int d2k_plantab_del_addr_shaped(d2k_plantab *, const uint8_t *, uint8_t family,
+    uint8_t shape);
 const d2k_plan *d2k_plantab_find_target(d2k_plantab *, const uint8_t *name, size_t,
     const uint8_t *addr, uint8_t family, uint64_t now_ns, uint8_t shape, uint16_t sport_be);
 int d2k_plantab_set_name_family(d2k_plantab *, const uint8_t *, size_t,
@@ -155,10 +165,12 @@ void         d2k_plantab_clear_probes(d2k_plantab *t);
  * исключение обязано быть названо явно, чтобы было видно, КТО его выдал и на
  * каком основании, а не спрятано в арифметике нулей.
  *
- * Ставят его ровно два источника, каждый по своей причине:
- *   синхронизация каталога, когда в записи формы нет (весь каталог заведён до
- *   появления поля: в снятом с роутера состоянии ни одной записи с формой);
- *   план по АДРЕСУ — адрес не приветствие, формы он не несёт по построению.
+ * Ставит его синхронизация каталога для привязки ПО ИМЕНИ, когда в записи
+ * формы нет (каталог заведён до появления поля). План по АДРЕСУ с управляющего
+ * сокета так больше не ставится (v7, задача 16): адресная привязка несёт
+ * форму протокола, иначе голосовой план одного IP доставался бы его QUIC
+ * Initial (D2K_SPEC §5); d2k_plantab_set_addr/_family без формы — только
+ * внутренний вход тестов датапата.
  *
  * Молча перестать применять такие планы нельзя: это работающий у человека
  * обход, и его миграция — задача каталога с повторной проверкой, а не
