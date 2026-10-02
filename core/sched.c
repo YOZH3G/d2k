@@ -1207,10 +1207,9 @@ static int fill_hellos(d2k_sched *s, task *t) {
                 : d2k_quic_hello_rename(t->trig, t->trig_len, SCHED_DECOY,
                                         t->ctrl, sizeof t->ctrl, &t->ctrl_len);
             if (control_rc != 0) {
-                /* Снимок не пересобирается под другое имя — так бывает на
-                   приветствии, не поместившемся в одну датаграмму (браузер с
-                   постквантовым key_share; см. d2k_quichello.h). Контроль
-                   тогда — собственный Initial донора с именем приманки, как
+                /* Вход цели не пересобирается под другое имя (обрывок
+                   приветствия сюда уже не доходит — его отсекает on_shape).
+                   Контроль тогда — собственный Initial донора с именем приманки, как
                    у ветки by_addr: донор контроль всегда строит сам
                    (quicprobe/probe.go:280-321). Пустой контроль превращал
                    опыт в INCONCLUSIVE «нет контрольного имени», и плечо не
@@ -1219,8 +1218,8 @@ static int fill_hellos(d2k_sched *s, task *t) {
                 t->ctrl_len = 0;
                 if (d2k_quic_probe_initial(SCHED_DECOY, t->ctrl, sizeof t->ctrl,
                                            &t->ctrl_len) == 0) {
-                    say(s, "по %s контроль — PROFILE, снимок не в одной датаграмме",
-                        t->name);
+                    say(s, "по %s контроль — PROFILE: вход цели не пересобирается "
+                           "под имя приманки", t->name);
                 } else {
                     t->ctrl_len = 0;
                 }
@@ -4344,6 +4343,20 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
     char name[256];
     if (ev->transport == 17) {
         if (d2k_quic_sni(ev->shape, ev->shape_len, name, sizeof name) != 0) { return; }
+        /* ОБРЫВОК ПРИВЕТСТВИЯ — не снимок, как и у TCP выше. Датапат отдаёт
+           датаграмму, на которой сборка дала имя; если ClientHello едет двумя
+           Initial, в ней только начало. Сервер такой Initial не дочитает и
+           промолчит, контроль ответит — и молчание стало бы D2K_V_OPAQUE,
+           «доказанной» блокировкой от пакета, которого клиент не слал. Ни
+           вход цели, ни общий quic_shape, ни перемер им не заменяются: цель
+           мерится собственным Initial донора (PROFILE, trig_snapped=0, в
+           привязке D2K_INPUT_PROFILE), как без снимка. */
+        if (d2k_quic_hello_incomplete(ev->shape, ev->shape_len)) {
+            say(s, "снимок QUIC по %s (%zu байт) — обрывок ClientHello, приветствие "
+                   "не в одной датаграмме; не заменяю им вход измерителя, цель "
+                   "мерится собственным Initial (PROFILE)", name, ev->shape_len);
+            return;
+        }
     } else {
         size_t off = 0, len = 0;
         if (d2k_hello_sni(ev->shape, ev->shape_len, &off, &len) != 0 || len == 0) { return; }

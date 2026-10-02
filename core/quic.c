@@ -585,6 +585,21 @@ int d2k_quic_client_hello(const uint8_t *p, size_t n,
     return 0;
 }
 
+int d2k_quic_hello_incomplete(const uint8_t *p, size_t n) {
+    if (!p) {
+        return 0;
+    }
+    uint8_t stream[D2K_QUIC_MAX_DGRAM];
+    size_t filled = crypto_stream_of(p, n, stream, sizeof stream);
+    if (filled < HS_HDR || stream[0] != HS_CLIENT_HELLO) {
+        return 0;
+    }
+    size_t claimed = ((size_t)stream[1] << 16) | ((size_t)stream[2] << 8) | stream[3];
+    /* Тот же признак, что в d2k_quic_client_hello: заявлено больше, чем
+       собралось из этой датаграммы. */
+    return HS_HDR + claimed > filled ? 1 : 0;
+}
+
 int d2k_quic_sni(const uint8_t *p, size_t n, char *out, size_t cap) {
     if (!p || !out || cap == 0) {
         return -1;

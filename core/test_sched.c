@@ -3188,6 +3188,7 @@ shape_test:
         d2k_sched_set_say(s, collect_say, NULL);
         tcp_calls = quic_calls = 0;
         quic_last_ctl[0] = '\0';
+        memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
         d2k_ev sh;
         char got[256];
         CHECK(quic_shape_first_of_two(&sh, "две.датаграммы.example") == 0 &&
@@ -3208,8 +3209,38 @@ shape_test:
         CHECK(quic_calls == 1, "QUIC-поиск по снимку из двух датаграмм не запущен");
         CHECK(strcmp(quic_last_ctl, "disk.rzd.ru") == 0,
               "контроль пуст/не QUIC, когда снимок не в одной датаграмме");
-        CHECK(said("контроль — PROFILE"),
-              "контроль из собственного Initial не помечен PROFILE в трассе");
+        /* ЦЕЛЬ — ТОЖЕ PROFILE, а не обрывок. Обрывок CRYPTO сервер не
+           дочитает и промолчит; контроль ответит — и молчание цели станет
+           D2K_V_OPAQUE, «доказанной» блокировкой от пакета, который клиент
+           никогда не слал. Проверяется то, что ушло в зонд: целый Initial с
+           именем цели, не байты снимка. */
+        {
+            uint8_t ch[2048];
+            size_t ch_len = 0;
+            CHECK(quic_seen_trigger_lens[0] > 0 &&
+                  d2k_quic_client_hello(quic_seen_triggers[0], quic_seen_trigger_lens[0],
+                                        ch, sizeof ch, &ch_len) == 0 &&
+                  strcmp(quic_seen_targets[0], "две.датаграммы.example") == 0,
+                  "зонд цели получил не целый Initial с именем цели");
+            CHECK(!(quic_seen_trigger_lens[0] == sh.shape_len &&
+                    memcmp(quic_seen_triggers[0], sh.shape, sh.shape_len) == 0),
+                  "зонд цели ушёл обрывком приветствия из снимка");
+        }
+        CHECK(said("не в одной датаграмме") && said("PROFILE"),
+              "обрывок приветствия не назван, PROFILE-вход не помечен в трассе");
+        CHECK(!said("контроль — PROFILE, снимок не в одной датаграмме"),
+              "контроль приписан снимку, которым цель не мерили");
+        {
+            d2k_ev whole;
+            CHECK(d2k_quic_hello_incomplete(sh.shape, sh.shape_len) == 1 &&
+                  quic_shape(&whole, "две.датаграммы.example") == 0 &&
+                  d2k_quic_hello_incomplete(whole.shape, whole.shape_len) == 0,
+                  "признак обрывка приветствия перепутан с целым Initial");
+        }
+        /* Поздний обрывок не заводит «перемер снимком клиента». */
+        d2k_sched_event(s, &sh);
+        settle(s);
+        CHECK(quic_calls == 1, "обрывок приветствия запустил перемер как снимок клиента");
         d2k_sched_free(s);
     }
 

@@ -122,6 +122,13 @@ D2K_WARN_UNUSED
 int d2k_quic_client_hello(const uint8_t *p, size_t n,
                           uint8_t *out, size_t cap, size_t *out_len);
 
+/* 1 — датаграмма это расшифровываемый Initial, чьи кадры CRYPTO начинают
+ * ClientHello, но его заявленная длина больше собранного: остаток приветствия
+ * едет следующей датаграммой (браузер с постквантовым key_share). Такой
+ * снимок — обрывок, а не форма клиента: мерить им цель нельзя. 0 — всё
+ * остальное (целое приветствие, не Initial, не ClientHello). */
+int d2k_quic_hello_incomplete(const uint8_t *p, size_t n);
+
 /* Stateful counterpart for a real UDP flow. Feed Initial datagrams in any
  * order; return 0 while the contiguous CRYPTO prefix has no SNI, 1 when the
  * ClientHello contains a complete SNI, and -1 for a packet that cannot belong
