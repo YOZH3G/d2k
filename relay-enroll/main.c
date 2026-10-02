@@ -35,6 +35,11 @@
 #define RESOLVE_MAX_NAMES 32
 #define RESOLVE_MAX_ADDRESSES 8
 #define RESOLVE_DEADLINE_SECONDS 10
+/* glibc resolver bound per lookup: 2 s per server, one attempt. With at most
+   two configured servers a lookup ends within RESOLVE_NAME_BUDGET seconds. */
+#define RESOLVE_RES_OPTIONS "timeout:2 attempts:1"
+#define RESOLVE_NAME_BUDGET 4
+#define LOCK_WAIT_MS 1000
 #define RESOLVE_REPLY_LIMIT 8192
 #define REGISTER_PER_IP 6
 #define REGISTER_TOTAL 120
@@ -60,8 +65,9 @@ static const char *const resolve_hosts[]={
 typedef struct { uint32_t ip; unsigned count; } ip_bucket;
 typedef struct { time_t minute; unsigned total,used; ip_bucket ips[RATE_SLOTS]; } rate_limit;
 /* Children decide by route after reading the request line, so the counters
-   live in memory shared with every forked child. */
-typedef struct { atomic_flag lock; rate_limit registration,resolution; } shared_limits;
+   live in memory shared with every forked child. owner is the PID holding
+   the lock (0: free). */
+typedef struct { atomic_int owner; rate_limit registration,resolution; } shared_limits;
 static volatile sig_atomic_t stopping;
 
 static int rate_allow(rate_limit *limit,uint32_t ip,time_t now,unsigned per_ip,unsigned total) {
@@ -78,20 +84,41 @@ static int rate_allow(rate_limit *limit,uint32_t ip,time_t now,unsigned per_ip,u
 static shared_limits *shared_limits_create(void) {
     shared_limits *limits=mmap(NULL,sizeof(*limits),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     if(limits==MAP_FAILED)return NULL;
-    memset(limits,0,sizeof(*limits));atomic_flag_clear(&limits->lock);return limits;
+    memset(limits,0,sizeof(*limits));atomic_init(&limits->owner,0);return limits;
+}
+
+/* Signals are held only while the lock is owned, so the alarm can always end
+   a waiting child. The critical section is a few instructions: a holder that
+   is dead (SIGKILL, OOM) or that keeps the lock for the whole wait has lost
+   it, and the lock is taken over instead of wedging every later child. */
+static void limits_lock(shared_limits *limits,sigset_t *old) {
+    sigset_t all;sigfillset(&all);
+    int me=(int)getpid(),seen=0;
+    for(int waited=0;;waited++){
+        sigprocmask(SIG_BLOCK,&all,old);
+        int expected=0;
+        if(atomic_compare_exchange_strong(&limits->owner,&expected,me))return;
+        if(waited==0)seen=expected;
+        int stale=expected!=seen?0:(kill(expected,0)!=0&&errno==ESRCH)||waited>=LOCK_WAIT_MS;
+        if(expected!=seen){seen=expected;waited=0;}
+        if(stale&&atomic_compare_exchange_strong(&limits->owner,&expected,me))return;
+        sigprocmask(SIG_SETMASK,old,NULL);
+        struct timespec pause_ms={0,1000000};nanosleep(&pause_ms,NULL);
+    }
+}
+static void limits_unlock(shared_limits *limits,const sigset_t *old) {
+    atomic_store(&limits->owner,0);sigprocmask(SIG_SETMASK,old,NULL);
 }
 
 /* 200 when the route may proceed, 429 when its own counter is exhausted.
-   /health is not counted. Signals are held so the alarm cannot kill a child
-   while it owns the lock. */
+   /health is not counted. */
 static int route_status(shared_limits *limits,int route,uint32_t ip,time_t now) {
     if(route!=ROUTE_REGISTER&&route!=ROUTE_RESOLVE)return 200;
-    sigset_t all,old;sigfillset(&all);sigprocmask(SIG_BLOCK,&all,&old);
-    while(atomic_flag_test_and_set(&limits->lock))sched_yield();
+    sigset_t old;limits_lock(limits,&old);
     int ok=route==ROUTE_REGISTER?
         rate_allow(&limits->registration,ip,now,REGISTER_PER_IP,REGISTER_TOTAL):
         rate_allow(&limits->resolution,ip,now,RESOLVE_PER_IP,RESOLVE_TOTAL);
-    atomic_flag_clear(&limits->lock);sigprocmask(SIG_SETMASK,&old,NULL);
+    limits_unlock(limits,&old);
     return ok?200:429;
 }
 
@@ -158,6 +185,7 @@ static resolve_fn resolver=system_resolve; /* replaced by the tests */
 static time_t monotonic_seconds(void) {
     struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts)!=0)return 0;return ts.tv_sec;
 }
+static time_t (*clock_now)(void)=monotonic_seconds; /* replaced by the tests */
 
 static void json_space(const char **p,const char *end) {
     while(*p<end&&(**p==' '||**p=='\t'||**p=='\r'||**p=='\n'))(*p)++;
@@ -184,7 +212,9 @@ static int allowed_host(const char *name,size_t len) {
 }
 
 /* Strict body {"hosts":[...]} → {"results":{"host":["a.b.c.d",...],...}}.
-   deadline is a monotonic second (0: none); names left after it get []. */
+   deadline is a monotonic second (0: none). A name is looked up only while a
+   whole bounded lookup still fits before it; the rest get [], so the reply is
+   always sent before the connection's hard alarm. */
 static int handle_resolve(const char *body,size_t length,char *out,size_t cap,size_t *out_len,time_t deadline) {
     const char *p=body,*end=body+length,*name;size_t name_len;
     int order[RESOLVE_MAX_NAMES];size_t count=0;int seen[sizeof(resolve_hosts)/sizeof(resolve_hosts[0])]={0};
@@ -206,7 +236,7 @@ static int handle_resolve(const char *body,size_t length,char *out,size_t cap,si
     for(size_t i=0;i<count;i++){
         const char *host=resolve_hosts[order[i]];
         uint32_t raw[32],unique[RESOLVE_MAX_ADDRESSES];size_t got=0,kept=0;
-        if(!deadline||monotonic_seconds()<deadline){
+        if(!deadline||clock_now()+RESOLVE_NAME_BUDGET<=deadline){
             int r=resolver(host,raw,sizeof(raw)/sizeof(raw[0]));got=r>0?(size_t)r:0;
         }
         for(size_t j=0;j<got&&kept<RESOLVE_MAX_ADDRESSES;j++){
@@ -355,6 +385,8 @@ int main(int argc,char **argv) {
     SSL_CTX_free(check);
     struct sigaction sa;memset(&sa,0,sizeof(sa));sa.sa_handler=stop_server;
     (void)sigaction(SIGTERM,&sa,NULL);(void)sigaction(SIGINT,&sa,NULL);
+    /* Children read it on their first lookup; an operator's value wins. */
+    (void)setenv("RES_OPTIONS",RESOLVE_RES_OPTIONS,0);
     sa.sa_handler=child_exited;(void)sigaction(SIGCHLD,&sa,NULL);(void)signal(SIGPIPE,SIG_IGN);
     int listener=socket(AF_INET,SOCK_STREAM,0),one=1;if(listener<0)return 1;
     (void)setsockopt(listener,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));

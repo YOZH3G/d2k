@@ -41,7 +41,11 @@ secret embedded in public router code would protect nothing. Protection is the
 name allowlist, body limit, the existing child/deadline limits and a separate rate
 limit — 4 requests per source IP/minute and 60 total/minute — that never shares a
 counter with `/register` (6/IP, 120 total). Counters are per route and live in
-memory shared with the forked children; `/health` is not counted.
+memory shared with the forked children; `/health` is not counted. A child that
+dies holding the counter lock cannot wedge the service: the lock is taken over
+from a dead holder, or after one second. Lookups are bounded (`RES_OPTIONS`
+`timeout:2 attempts:1` unless the unit sets its own) and a name is started only
+while it can finish before the deadline, so a reply is always sent.
 The router still checks Meta ranges and the certificate of every address.
 
 Build with `make` (C11 compiler and OpenSSL development libraries required).
