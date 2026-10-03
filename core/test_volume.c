@@ -38,6 +38,19 @@ int main(void) {
           out.rx_compressed_complete,
           "RX-примета не содержит измеренный размер и завершённый контроль");
 
+    CHECK(out.rx_cut_packets == 0,
+          "бюджет коробки выдуман без счёта пакетов (задача 55)");
+    /* Задача 55: на обрыве identity замер видит и ПАКЕТЫ — это бюджет
+       коробки (поле 04.10: 25–26 пакетов с данными обеих сторон). */
+    a.data_packets = 26; b.data_packets = 25;
+    memset(&out, 0, sizeof out);
+    CHECK(d2k_volume_rx_evidence(&a, &b, &gz, &out) && out.rx_cut_packets == 25,
+          "пакеты на обрыве identity не записаны бюджетом коробки");
+    a.data_packets = 0; b.data_packets = 27;
+    memset(&out, 0, sizeof out);
+    CHECK(d2k_volume_rx_evidence(&a, &b, &gz, &out) && out.rx_cut_packets == 27,
+          "бюджет не взят из единственного посчитанного обрыва");
+
     a = identity_cut(23900, 0, 0, 1);
     b = identity_cut(24020, 0, 0, 1);
     memset(&out, 0, sizeof out);

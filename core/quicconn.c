@@ -151,6 +151,9 @@ struct d2k_qc {
     /* Сколько байт датаграмм принято всего: по нему проверка отличает
        «сервер замолчал» от «сервер говорит, но не отвечает на запрос». */
     uint64_t rx_wire_bytes;
+    /* Датаграммы связи в обе стороны (задача 55): коробка считает бюджет
+       потока пакетами, и проверка бюджета подтверждения считает так же. */
+    uint64_t tx_dgrams, rx_dgrams;
 
     uint8_t  local_addr[16];
     uint8_t  family;
@@ -295,6 +298,7 @@ static int send_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
         say(err, errcap, "датаграмма не ушла: %s", strerror(errno));
         return -1;
     }
+    c->tx_dgrams++;
     return 0;
 }
 
@@ -537,6 +541,7 @@ static int recv_dgram(d2k_qc *c, int wait_ms, char *err, size_t errcap) {
         return -1;
     }
     c->rx_wire_bytes += (uint64_t)n;
+    c->rx_dgrams++;
 
     size_t off = 0;
     int any = 0;
@@ -869,6 +874,7 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
             say(err, errcap, "датаграмма не ушла: %s", strerror(errno));
             d2k_qc_close(c); return -1;
         }
+        c->tx_dgrams++;
     }
 
     int64_t deadline = now_ms() + (o->deadline_ms > 0 ? o->deadline_ms : 5000);
@@ -1088,6 +1094,10 @@ void d2k_qc_app_progress(const d2k_qc *c, uint64_t *bytes, int *complete) {
 
 int d2k_qc_peer_name(const d2k_qc *c) { return c ? c->peer_name : -1; }
 uint64_t d2k_qc_rx_wire_bytes(const d2k_qc *c) { return c ? c->rx_wire_bytes : 0; }
+void d2k_qc_datagrams(const d2k_qc *c, uint64_t *tx, uint64_t *rx) {
+    if (tx) { *tx = c ? c->tx_dgrams : 0; }
+    if (rx) { *rx = c ? c->rx_dgrams : 0; }
+}
 int d2k_qc_handshake_done(const d2k_qc *c) { return c ? c->handshake_done : 0; }
 int d2k_qc_fd(const d2k_qc *c) { return c ? c->fd : -1; }
 

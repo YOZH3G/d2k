@@ -89,6 +89,12 @@ int d2k_volume_rx_evidence(const d2k_ver_result *a,
         out->rx_expected_kb = (int)(a->body_expected / 1024);
     }
     out->rx_compressed_complete = 1;
+    /* Бюджет потока коробки (задача 55): пакеты с данными обеих сторон, на
+       которых identity оборвался. Из двух посчитанных — меньший: коробка
+       режет не позже него. Не посчитан ни один — 0, бюджета не выдумываем. */
+    unsigned pa = a->data_packets, pb = b->data_packets;
+    unsigned pk = pa && pb ? (pa < pb ? pa : pb) : (pa ? pa : pb);
+    out->rx_cut_packets = pk > INT_MAX ? INT_MAX : (int)pk;
     if (out->rx_expected_kb > 0) {
         snprintf(out->reason, sizeof out->reason,
                  "identity-тело повторно оборвалось около %d/%d КБ; gzip завершился",

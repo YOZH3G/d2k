@@ -612,6 +612,47 @@ static void check_recheck_mark_persistence(void) {
     d2k_catalog_free(&c);
 }
 
+/* Задача 55: отметка «бюджет пройден/не проверен» привязки и бюджет коробки
+   (пакеты на обрыве rx-volume) переживают перезапуск; старый файл без ключей
+   читается как «не проверено» и «не измерено», ничего не выдумывая. */
+static void check_budget_persistence(void) {
+    const char *path = "/tmp/d2k-cat-budget.json";
+    const char *out = "/tmp/d2k-cat-budget-out.json";
+    char err[200];
+    write_tmp(path, "{\"boxes\":[{\"id\":\"box-b\",\"fingerprint\":{\"method\":2,\"signals\":["
+        "{\"kind\":\"rx-volume\",\"volume\":20,\"seen\":1}]},\"bindings\":["
+        "{\"target\":\"old.example\",\"transport\":6,\"shape\":1},"
+        "{\"target\":\"passed.example\",\"transport\":6,\"shape\":1},"
+        "{\"target\":\"unchecked.example\",\"transport\":6,\"shape\":1}]}]}");
+    d2k_catalog c;
+    CHECK(d2k_catalog_load(path, &c, err, sizeof err) == 0, "load budget fixture");
+    CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 3 && c.boxes[0].binds[0].budget == 0 &&
+          c.boxes[0].fp.n_sig == 1 && c.boxes[0].fp.sig[0].packets == 0,
+          "old file invented a budget mark or a box budget");
+    if (c.n_boxes == 1 && c.boxes[0].n_binds == 3) {
+        c.boxes[0].binds[1].budget = D2K_CAT_BUDGET_PASSED;
+        c.boxes[0].binds[2].budget = D2K_CAT_BUDGET_UNCHECKED;
+        c.boxes[0].fp.sig[0].packets = 25;
+    }
+    CHECK(d2k_catalog_save(&c, out, err, sizeof err) == 0, "save budget fixture");
+    d2k_catalog_free(&c);
+    FILE *f = fopen(out, "r");
+    if (f) {
+        char buf[8192]; size_t n = fread(buf, 1, sizeof buf - 1, f);
+        buf[n] = 0; fclose(f);
+        int keys = 0;
+        for (const char *q = buf; (q = strstr(q, "\"budget\"")) != NULL; q++) keys++;
+        CHECK(keys == 2, "budget key must be written only for checked bindings");
+    }
+    CHECK(d2k_catalog_load(out, &c, err, sizeof err) == 0, "reload budget fixture");
+    CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 3 && c.boxes[0].binds[0].budget == 0 &&
+          c.boxes[0].binds[1].budget == D2K_CAT_BUDGET_PASSED &&
+          c.boxes[0].binds[2].budget == D2K_CAT_BUDGET_UNCHECKED &&
+          c.boxes[0].fp.sig[0].packets == 25,
+          "budget mark or box budget not preserved across restart");
+    d2k_catalog_free(&c);
+}
+
 /* Объёмные коробки (задача 23): направление (род приметы) и порог (volume)
  * переживают круговой обход — по ним коробку узнают и называют. Старая
  * запись объёмной приметы без поля volume грузится и остаётся с порогом 0
@@ -655,6 +696,7 @@ int main(void) {
     check_volume_box_fingerprint_persistence();
     check_binding_family_persistence();
     check_recheck_mark_persistence();
+    check_budget_persistence();
     check_time_roundtrip();
     check_transport_default_zero_on_old_file();
     check_shape_default_zero_on_old_file();

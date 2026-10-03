@@ -62,6 +62,9 @@ typedef struct {
     int      rx_cut;      /* пара identity/gzip доказала повторяемый обрыв тела ответа */
     int      rx_at_kb;    /* входящее тело оборвалось около этого объёма */
     int      rx_expected_kb; /* Content-Length, если известен */
+    /* Пакеты с данными обеих сторон на обрыве identity (TCP_INFO) — бюджет
+       потока коробки (задача 55); 0 — не посчитаны. */
+    int      rx_cut_packets;
     int      rx_compressed_complete; /* контроль gzip дошёл до конца */
     int      rtt_ms;      /* измеренный RTT до мишени */
     char     reason[160]; /* человеческая причина, заполняется всегда */
