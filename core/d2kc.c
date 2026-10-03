@@ -148,30 +148,49 @@ static void http_portal(d2k_httpsprobe *hp, int fd, const d2k_ev *ev, int64_t no
     }
 }
 
-static void http_probe_done(d2k_httpsprobe *hp, int fd, int64_t now) {
+static void http_push(int fd, const char *host, uint32_t ttl) {
+    char err[200];
+    if (d2k_link_set_https(fd, host, ttl, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
+    }
+}
+
+static void http_save(d2k_httpsprobe *hp, const char *path, int64_t now) {
+    char err[300];
+    if (path && d2k_httpsprobe_save(hp, path, now, (int64_t)time(NULL), err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: кэш HTTPS не сохранён: %s\n", err);
+    }
+}
+
+static void http_probe_done(d2k_httpsprobe *hp, int fd, int64_t now, const char *cache_path) {
     d2k_httpsprobe_result r[8];
-    size_t n;
+    size_t n, total = 0;
     while ((n = d2k_httpsprobe_done(hp, now, r, sizeof r / sizeof r[0])) > 0) {
+        total += n;
         for (size_t i = 0; i < n; i++) {
             char line[1200];
-            int served = r[i].state == D2K_HTTPS_SERVED;
-            snprintf(line, sizeof line, "HTTP %.255s: HTTPS %s (%.255s) — %s", r[i].host,
-                     served ? "подтверждён" :
-                     r[i].state == D2K_HTTPS_CLOSED ? "у источника нет (443 закрыт)" :
-                     r[i].state == D2K_HTTPS_OTHER_NAME ? "отдаёт сертификат другого имени" :
-                                                          "не подтверждён",
+            int up = d2k_https_upgrade(r[i].state);
+            snprintf(line, sizeof line, "HTTP %.255s: %s (%.255s) — %s", r[i].host,
+                     r[i].state == D2K_HTTPS_SERVED ? "TLS к 443 прошёл, имя в листе сертификата" :
+                     r[i].state == D2K_HTTPS_TLS_BLOCKED ? "443 принимает, TLS срезан на линии" :
+                     r[i].state == D2K_HTTPS_CLOSED ? "HTTPS у источника нет (443 закрыт)" :
+                     r[i].state == D2K_HTTPS_OTHER_NAME ? "на 443 сертификат другого имени" :
+                                                          "HTTPS не решён",
                      r[i].why,
-                     served ? "вставку провайдера датапат заменит на 307 → https"
-                            : "вставка провайдера идёт клиенту как есть: перевод на https "
-                              "был бы тупиком");
+                     up ? "вставку провайдера датапат заменит на 307 → https"
+                        : "вставка провайдера идёт клиенту как есть: перевод на https "
+                          "был бы тупиком");
             sched_say(NULL, line);
-            if (served) {
-                char err[200];
-                if (d2k_link_set_https(fd, r[i].host, r[i].ttl_s, err, sizeof err) != 0) {
-                    fprintf(stderr, "d2kc: %s\n", err);
-                }
-            }
+            if (up) { http_push(fd, r[i].host, r[i].ttl_s); }
         }
+    }
+    if (total) { http_save(hp, cache_path, now); }
+    static uint64_t lost_told;
+    uint64_t lost = d2k_httpsprobe_lost(hp);
+    if (lost != lost_told) {
+        fprintf(stderr, "d2kc: ответов зонда HTTPS потеряно %llu (имена перепроверятся)\n",
+                (unsigned long long)lost);
+        lost_told = lost;
     }
 }
 
@@ -182,6 +201,7 @@ static void usage(void) {
         "  --catalog  где держать знание (умолчание /opt/d2k/catalog.json)\n"
         "  --live     куда писать вид для панели (умолчание — рядом с каталогом)\n"
         "  --log      куда писать журнал (умолчание — стандартный вывод)\n"
+        "  --https-cache  кэш HTTPS имён для вставки провайдера (умолчание — рядом с каталогом)\n"
         "  --mark     метка verifier-зондов; они идут через NFQUEUE (умолчание 0x2d)\n"
         "  --measure-mark метка измерений; обычно обходит собственную NFQUEUE (по умолчанию --mark)\n");
 }
@@ -191,6 +211,7 @@ int main(int argc, char **argv) {
     const char *catpath = "/opt/d2k/catalog.json";
     const char *livepath = NULL;
     const char *logpath = NULL;
+    const char *https_path = NULL;
     uint32_t mark = 0x2d;
     uint32_t measure_mark = 0;
     int have_measure_mark = 0;
@@ -201,6 +222,7 @@ int main(int argc, char **argv) {
         else if (strcmp(f, "--catalog") == 0 && i + 1 < argc) { catpath = argv[++i]; }
         else if (strcmp(f, "--live") == 0 && i + 1 < argc) { livepath = argv[++i]; }
         else if (strcmp(f, "--log") == 0 && i + 1 < argc) { logpath = argv[++i]; }
+        else if (strcmp(f, "--https-cache") == 0 && i + 1 < argc) { https_path = argv[++i]; }
         else if (strcmp(f, "--mark") == 0 && i + 1 < argc) {
             mark = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(f, "--measure-mark") == 0 && i + 1 < argc) {
@@ -293,6 +315,33 @@ int main(int argc, char **argv) {
     if (!hp) {
         fprintf(stderr, "d2kc: зонд HTTPS не завёлся — вставка провайдера в HTTP "
                         "будет идти клиенту как есть\n");
+    }
+    /* Кэш HTTPS переживает перезапуск (ревью I2): иначе первый заход после
+       каждого перезапуска снова видел бы портал. Рядом с каталогом. */
+    char https_buf[CATPATH_MAX + 32];
+    if (!https_path) {
+        const char *slash = strrchr(catpath, '/');
+        size_t dirlen = slash ? (size_t)(slash - catpath + 1) : 0;
+        if (dirlen < sizeof https_buf - 20) {
+            memcpy(https_buf, catpath, dirlen);
+            snprintf(https_buf + dirlen, sizeof https_buf - dirlen, "https-cache.txt");
+            https_path = https_buf;
+        }
+    }
+    if (hp && https_path) {
+        static d2k_httpsprobe_result push[D2K_HTTPSPROBE_NAMES];
+        size_t np = 0, nl = 0;
+        char herr[300];
+        if (d2k_httpsprobe_load(hp, https_path, now_ms(), (int64_t)time(NULL), push,
+                                D2K_HTTPSPROBE_NAMES, &np, &nl, herr, sizeof herr) != 0) {
+            fprintf(stderr, "d2kc: кэш HTTPS не прочитан, начинаю с пустого: %s\n", herr);
+        } else {
+            for (size_t i = 0; i < np; i++) { http_push(fd, push[i].host, push[i].ttl_s); }
+            if (nl) {
+                printf("d2kc: кэш HTTPS %s: имён %zu, к датапату с 307 — %zu\n",
+                       https_path, nl, np);
+            }
+        }
     }
 
     /* ИЗМЕРИТЕЛЬ TCP — ПЕРЕНЕСЁННЫЙ «ПОИСК ПО ДОМЕНУ», а не прежнее дерево.
@@ -425,7 +474,7 @@ int main(int argc, char **argv) {
             }
         }
         if (hp && pr > 0 && (pfd[2].revents & POLLIN)) {
-            http_probe_done(hp, fd, now_ms());
+            http_probe_done(hp, fd, now_ms(), https_path);
         }
         /* PID живого контроллера ещё не означает, что он связан с датапатом:
            закрытый AF_UNIX peer даёт POLLHUP один раз. Не выходя здесь,

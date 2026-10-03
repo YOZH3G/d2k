@@ -92,8 +92,8 @@ TESTS += test_http_reply
 TESTS += test_httpsprobe
 check: test-httpsprobe
 .PHONY: test-httpsprobe
-test_httpsprobe: test_httpsprobe.c httpsprobe.c tls13.o tls12.o tls13core.o x25519.o crypto.o include/d2k_httpsprobe.h
-	$(CC) $(CFLAGS) -o $@ test_httpsprobe.c httpsprobe.c tls13.o tls12.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_httpsprobe: test_httpsprobe.c httpsprobe.c hello.o tls13.o tls12.o tls13core.o x25519.o crypto.o include/d2k_httpsprobe.h
+	$(CC) $(CFLAGS) -o $@ test_httpsprobe.c httpsprobe.c hello.o tls13.o tls12.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 test-httpsprobe: test_httpsprobe
 	./test_httpsprobe
 TESTS += test_verify_http
