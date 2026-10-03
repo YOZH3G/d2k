@@ -42,7 +42,9 @@ static int write_status(const char *path,const char *value) {
     char tmp[600];if(!path||!*path||snprintf(tmp,sizeof(tmp),"%s.tmp.%ld",path,(long)getpid())>=(int)sizeof(tmp))return -1;
     int fd=open(tmp,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0644);if(fd<0)return -1;
     size_t len=strlen(value);ssize_t n=write(fd,value,len);int ok=n==(ssize_t)len&&fsync(fd)==0;
-    if(close(fd)!=0)ok=0;if(!ok||rename(tmp,path)!=0){unlink(tmp);return -1;}return 0;
+    if(close(fd)!=0)ok=0;
+    if(!ok||rename(tmp,path)!=0){unlink(tmp);return -1;}
+    return 0;
 }
 
 static int create_listener(uint16_t port) {
@@ -158,7 +160,9 @@ static int run_daemon(const char *config_path) {
     }
     (void)write_status(cfg.status_path,"stopped\n");rc=0;
 done:
-    if(listener>=0)close(listener);if(ctx)SSL_CTX_free(ctx);tg_identity_cleanup(&identity);tg_config_clean(&cfg);return rc;
+    if(listener>=0)close(listener);
+    if(ctx)SSL_CTX_free(ctx);
+    tg_identity_cleanup(&identity);tg_config_clean(&cfg);return rc;
 }
 
 static int check_config(const char *path) {
@@ -182,7 +186,8 @@ static int redirect_log(const char *path) {
    (scripts/test-instagram-dns.sh compares all three). Measured 03.10.2026
    with SNI example.com: Instagram edges present *.instagram.com and
    *.cdninstagram.com; fbcdn edges *.facebook.com with *.xx.fbcdn.net in SAN;
-   WhatsApp edges *.whatsapp.net with *.whatsapp.com in SAN. So every name is
+   WhatsApp edges *.whatsapp.net with *.whatsapp.com in SAN (static/mmg/pps
+   .whatsapp.net match *.whatsapp.net). So every name is
    verified as itself, except the c10r alias below. */
 static const char *const meta_hosts[]={
     /* META_HOSTS_BEGIN */
@@ -190,7 +195,7 @@ static const char *const meta_hosts[]={
     "i.instagram.com","instagram.c10r.instagram.com","static.cdninstagram.com",
     "scontent.cdninstagram.com","static.xx.fbcdn.net","scontent.xx.fbcdn.net",
     "web.whatsapp.com","www.whatsapp.com","scontent.whatsapp.net","graph.whatsapp.com",
-    "v.whatsapp.com"
+    "v.whatsapp.com","static.whatsapp.net","mmg.whatsapp.net","pps.whatsapp.net"
     /* META_HOSTS_END */
 };
 
@@ -220,7 +225,7 @@ static int check_instagram_ip(const char *host,const char *ip,const char *ca) {
 
 int main(int argc,char **argv) {
     const char *config="/opt/d2k/config",*log_path=NULL;
-    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=per-install-enrollment,instagram-ip-probe,meta-hosts-v2");return 0;}
+    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3");return 0;}
     if(argc==5&&strcmp(argv[1],"--check-instagram-ip")==0)return check_instagram_ip(argv[2],argv[3],argv[4]);
     if(argc==2&&strcmp(argv[1],"--help")==0){puts("d2ktg [--config FILE]");return 0;}
     if(argc==3&&strcmp(argv[1],"--check-config")==0)return check_config(argv[2]);

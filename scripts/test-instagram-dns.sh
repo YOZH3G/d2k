@@ -16,7 +16,7 @@ ok() { echo "PASS: $*"; }
 
 # One host list: the router script, the d2ktg certificate check and the VPS
 # allowlist must carry exactly the same names in the same order.
-EXPECTED='instagram.com www.instagram.com graph.instagram.com api.instagram.com i.instagram.com instagram.c10r.instagram.com static.cdninstagram.com scontent.cdninstagram.com static.xx.fbcdn.net scontent.xx.fbcdn.net web.whatsapp.com www.whatsapp.com scontent.whatsapp.net graph.whatsapp.com v.whatsapp.com'
+EXPECTED='instagram.com www.instagram.com graph.instagram.com api.instagram.com i.instagram.com instagram.c10r.instagram.com static.cdninstagram.com scontent.cdninstagram.com static.xx.fbcdn.net scontent.xx.fbcdn.net web.whatsapp.com www.whatsapp.com scontent.whatsapp.net graph.whatsapp.com v.whatsapp.com static.whatsapp.net mmg.whatsapp.net pps.whatsapp.net'
 c_hosts() {
     sed -n '/META_HOSTS_BEGIN/,/META_HOSTS_END/p' "$1" | grep -o '"[a-z0-9.-]*"' | tr -d '"' | tr '\n' ' ' | sed 's/ $//'
 }
@@ -24,9 +24,9 @@ script_hosts=$(sed -n "s/^HOSTS='\(.*\)'$/\1/p" "$SCRIPT")
 [ "$script_hosts" = "$EXPECTED" ] || fail "router script host list differs: $script_hosts"
 [ "$(c_hosts "$ROOT/telegram/src/main.c")" = "$EXPECTED" ] || fail "d2ktg check list differs: $(c_hosts "$ROOT/telegram/src/main.c")"
 [ "$(c_hosts "$ROOT/relay-enroll/main.c")" = "$EXPECTED" ] || fail "VPS /resolve allowlist differs: $(c_hosts "$ROOT/relay-enroll/main.c")"
-[ "$(echo "$EXPECTED" | wc -w | tr -d ' ')" = 15 ] || fail "host list must contain 15 names"
+[ "$(echo "$EXPECTED" | wc -w | tr -d ' ')" = 18 ] || fail "host list must contain 18 names"
 ! grep -n 'instagram.com|www.instagram.com|' "$SCRIPT" >/dev/null || fail "managed_host carries a second hand-written host list"
-ok "router script, d2ktg and VPS allowlist share one 15-name list"
+ok "router script, d2ktg and VPS allowlist share one 18-name list"
 
 mkdir -p "$TMP/bin" "$TMP/d2k/state" "$TMP/d2k/files" "$TMP/d2k/log"
 printf 'D2K_RESOLVE_SECRET="test-secret"\nZ2K_RESOLVE_SECRET="old-secret"\n' > "$TMP/d2k/config"
@@ -75,7 +75,7 @@ case "$*" in
         [ "${RESOLVE_FAIL:-0}" = 1 ] && exit 22
         calls=$(grep -c '/resolve' "$CURL_CALLS" 2>/dev/null || echo 0)
         [ "$calls" -le "${RESOLVE_FAIL_FIRST:-0}" ] && exit 28
-        printf '{"results":{"instagram.com":["%s","8.8.8.8","%s","157.240.9.177","157.240.9.178"],"www.instagram.com":["157.240.9.175"],"not-instagram.example":["157.240.9.179"],"i.instagram.com":["157.240.9.63"],"static.xx.fbcdn.net":["%s"],"scontent.xx.fbcdn.net":["%s"],"web.whatsapp.com":["%s","57.144.245.33"],"v.whatsapp.com":[],"evil.whatsapp.com":["57.144.245.40"]}}' \
+        printf '{"results":{"instagram.com":["%s","8.8.8.8","%s","157.240.9.177","157.240.9.178"],"www.instagram.com":["157.240.9.175"],"not-instagram.example":["157.240.9.179"],"i.instagram.com":["157.240.9.63"],"static.xx.fbcdn.net":["%s"],"scontent.xx.fbcdn.net":["%s"],"web.whatsapp.com":["%s","57.144.245.33"],"v.whatsapp.com":[],"static.whatsapp.net":["57.144.245.32"],"evil.whatsapp.com":["57.144.245.40"]}}' \
             "${VPS_IP1:-157.240.9.174}" "${VPS_IP2:-157.240.9.176}" "${FB_IP:-157.240.205.11}" "${FB_IP:-157.240.205.11}" "${WA_IP:-57.144.245.32}"
         ;;
     *)
@@ -121,12 +121,14 @@ grep -q '^instagram.com 157.240.9.176$' "$TMP/d2k/state/instagram-ip-hosts.tsv" 
 ! grep -qi 'X-Z2K-Auth\|hmac\|test-secret\|old-secret' "$TMP/curl-calls" || fail "d2k resolver request still carries z2k HMAC authentication"
 [ ! -e "$TMP/openssl-key" ] || fail "refresh still computes an HMAC with openssl"
 body=$(printf '{"hosts":["%s"]}' "$(echo "$EXPECTED" | sed 's/ /","/g')")
-grep -qF -- "--data $body" "$TMP/curl-calls" || fail "VPS request did not contain all 15 names in order"
+grep -qF -- "--data $body" "$TMP/curl-calls" || fail "VPS request did not contain all 18 names in order"
 grep -q '^ip host i.instagram.com 157.240.9.63$' "$TMP/ndmc-state" || fail "i.instagram.com was not pinned"
 grep -q '^ip host static.xx.fbcdn.net 157.240.205.11$' "$TMP/ndmc-state" || fail "static.xx.fbcdn.net was not pinned"
 grep -q '^ip host scontent.xx.fbcdn.net 157.240.205.11$' "$TMP/ndmc-state" || fail "scontent.xx.fbcdn.net was not pinned"
 grep -q '^ip host web.whatsapp.com 57.144.245.32$' "$TMP/ndmc-state" || fail "WhatsApp Web address was not pinned"
 grep -q '^ip host web.whatsapp.com 57.144.245.33$' "$TMP/ndmc-state" || fail "second WhatsApp Web edge was not pinned"
+grep -q '^ip host static.whatsapp.net 57.144.245.32$' "$TMP/ndmc-state" || fail "WhatsApp Web static assets host was not pinned"
+grep -q -- '--check-instagram-ip static.whatsapp.net 57.144.245.32' "$TMP/curl-calls" || fail "static.whatsapp.net skipped the certificate check"
 grep -q '^web.whatsapp.com 57.144.245.32$' "$TMP/d2k/state/instagram-ip-hosts.tsv" || fail "manifest does not own the WhatsApp pin"
 grep -q '^static.xx.fbcdn.net 157.240.205.11$' "$TMP/d2k/state/instagram-ip-hosts.tsv" || fail "manifest does not own the fbcdn pin"
 ! grep -q 'evil.whatsapp.com\|57.144.245.40' "$TMP/ndmc-calls" "$TMP/curl-calls" || fail "a name outside the list reached ndmc or the certificate check"

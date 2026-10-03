@@ -15,7 +15,7 @@ LOG=${D2K_INSTAGRAM_LOG:-$DIR/log/instagram-dns.log}
 RELAY_URL=${D2K_RELAY_URL:-https://213.176.74.63.nip.io:9443/resolve}
 # The only list: d2ktg --check-instagram-ip and the VPS allowlist carry the
 # same names (scripts/test-instagram-dns.sh compares them).
-HOSTS='instagram.com www.instagram.com graph.instagram.com api.instagram.com i.instagram.com instagram.c10r.instagram.com static.cdninstagram.com scontent.cdninstagram.com static.xx.fbcdn.net scontent.xx.fbcdn.net web.whatsapp.com www.whatsapp.com scontent.whatsapp.net graph.whatsapp.com v.whatsapp.com'
+HOSTS='instagram.com www.instagram.com graph.instagram.com api.instagram.com i.instagram.com instagram.c10r.instagram.com static.cdninstagram.com scontent.cdninstagram.com static.xx.fbcdn.net scontent.xx.fbcdn.net web.whatsapp.com www.whatsapp.com scontent.whatsapp.net graph.whatsapp.com v.whatsapp.com static.whatsapp.net mmg.whatsapp.net pps.whatsapp.net'
 mkdir -p "$(dirname "$LOG")" "$(dirname "$MANIFEST")" 2>/dev/null || true
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$LOG"; }
 mark_refresh_success() {

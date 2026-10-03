@@ -28,7 +28,8 @@ at most 32 names, each exactly one of the fixed list:
 `instagram.com www.instagram.com graph.instagram.com api.instagram.com i.instagram.com
 instagram.c10r.instagram.com static.cdninstagram.com scontent.cdninstagram.com
 static.xx.fbcdn.net scontent.xx.fbcdn.net web.whatsapp.com www.whatsapp.com
-scontent.whatsapp.net graph.whatsapp.com v.whatsapp.com`
+scontent.whatsapp.net graph.whatsapp.com v.whatsapp.com static.whatsapp.net
+mmg.whatsapp.net pps.whatsapp.net`
 
 Any other name, escape, extra key or trailing data → 400; nothing is resolved.
 Reply 200 `{"results":{"host":["a.b.c.d",…],…}}`: IPv4 A records from the VPS's

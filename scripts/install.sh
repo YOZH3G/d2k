@@ -137,10 +137,10 @@ case "$TG_VERSION" in
     *instagram-ip-probe*) ;;
     *) die "скачанный d2ktg устарел: нет проверки доступности Instagram IP" ;;
 esac
-# The DNS helper pins 15 Instagram/fbcdn/WhatsApp names; an older d2ktg knows
-# only 7 and would silently reject the rest.
+# The DNS helper pins 18 Instagram/fbcdn/WhatsApp names; an older d2ktg knows
+# fewer and would silently reject the rest.
 case "$TG_VERSION" in
-    *meta-hosts-v2*) ;;
+    *meta-hosts-v3*) ;;
     *) die "скачанный d2ktg устарел: нет проверки сертификатов WhatsApp и fbcdn" ;;
 esac
 # d2kc без обязательного --control печатает использование и выходит кодом 2 —
@@ -258,7 +258,7 @@ if [ "$TG_INSTALL_URL" = wss://213.176.74.63.nip.io/ws ] &&
     printf 'TG_ENROLL_PORT=9443\n' >> "$DIR/config"
 fi
 # Instagram/WhatsApp DNS pins come from d2k's own C resolver on the VPS.
-# Checking 15 names can wait on silent edges, so the installer does not run it:
+# Checking 18 names can wait on silent edges, so the installer does not run it:
 # clearing the success mark makes the service's scheduler refresh right after
 # start, in the background. A resolver/VPS outage never fails the install.
 rm -f "$DIR/state/instagram-dns-last-success" /tmp/d2k-instagram-dns-last-attempt

@@ -88,7 +88,7 @@ static void test_resolve(void) {
     for(size_t i=0;i<sizeof(resolve_hosts)/sizeof(resolve_hosts[0]);i++){
         if(i)strcat(all,",");
         strcat(all,"\"");strcat(all,resolve_hosts[i]);strcat(all,"\"");}
-    strcat(all,"]}");assert(sizeof(resolve_hosts)/sizeof(resolve_hosts[0])==15);
+    strcat(all,"]}");assert(sizeof(resolve_hosts)/sizeof(resolve_hosts[0])==18);
     assert(resolve_json(all,out,sizeof(out))==200);
     for(size_t i=0;i<sizeof(resolve_hosts)/sizeof(resolve_hosts[0]);i++){
         char key[96];snprintf(key,sizeof(key),"\"%s\":[",resolve_hosts[i]);assert(strstr(out,key));}

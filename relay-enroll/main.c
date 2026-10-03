@@ -58,7 +58,7 @@ static const char *const resolve_hosts[]={
     "i.instagram.com","instagram.c10r.instagram.com","static.cdninstagram.com",
     "scontent.cdninstagram.com","static.xx.fbcdn.net","scontent.xx.fbcdn.net",
     "web.whatsapp.com","www.whatsapp.com","scontent.whatsapp.net","graph.whatsapp.com",
-    "v.whatsapp.com"
+    "v.whatsapp.com","static.whatsapp.net","mmg.whatsapp.net","pps.whatsapp.net"
     /* META_HOSTS_END */
 };
 
