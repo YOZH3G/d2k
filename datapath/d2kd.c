@@ -45,6 +45,7 @@
 #include "d2k_udp_path.h"
 #include "d2k_routemark.h"
 #include "d2k_packet.h"
+#include "d2k_http80.h"
 
 #define RECV_BUF   65536
 #define MAX_PKT     1600
@@ -495,6 +496,36 @@ static int out_send_at_owned(void *ctx, uint64_t at, const uint8_t *p, size_t n,
     return 0;
 }
 
+/* --- вставка провайдера в открытый HTTP (задача 51) -----------------------
+ * Узнаётся по первым пакетам потока порта 80 (d2k_http80.h). Строка журнала
+ * на каждую узнанную вставку: они редки (только заблокированные имена), а
+ * без строки «HTTP не открылся» не отличить от «сайт лежит». */
+static d2k_http80 *http80;
+
+static void http80_log(const d2k_http80_res *r) {
+    char srv[64] = "?";
+    d2k_addr a;
+    memset(&a, 0, sizeof a);
+    a.family = r->family;
+    memcpy(a.bytes, r->server, sizeof a.bytes);
+    (void)d2k_addr_text(&a, srv, sizeof srv);
+    fprintf(stderr, "d2kd: HTTP %s (%s:%u): вставка провайдера — 30x на %s через %" PRIu64
+                    " мкс после запроса при RTT потока %" PRIu64 " мкс; %s\n",
+            r->host, srv, (unsigned)r->server_port, r->portal,
+            r->reply_ns / 1000u, r->rtt_ns / 1000u,
+            "пропущена клиенту как есть");
+}
+
+/* Пакет очереди глазами http80. 1 — пакет обработан здесь (вердикт уже
+   отправлен), 0 — дальше обычным путём. */
+static int http80_step(const uint8_t *p, size_t n, uint64_t t) {
+    if (!http80) { return 0; }
+    d2k_http80_res r;
+    d2k_http80_packet(http80, p, n, t, &r);
+    if (r.injection) { http80_log(&r); }
+    return 0;
+}
+
 static const char *MODE_NAMES[] = {"observe", "apply"};
 enum { MODE_OBSERVE = 0, MODE_APPLY = 1 };
 
@@ -555,6 +586,14 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
            secs ? cpu_ms / (secs * 10) : 0,
            secs ? (cpu_ms * 10 / secs) % 100 : 0,
            rss_kb);
+    if (http80) {
+        d2k_http80_stats hst = d2k_http80_get_stats(http80);
+        if (hst.requests || hst.injections) {
+            printf("HTTP: запросов %" PRIu64 ", вставок провайдера %" PRIu64
+                   ", потоков вытеснено %" PRIu64 "\n",
+                   hst.requests, hst.injections, hst.evicted);
+        }
+    }
     d2k_hold_stats hs;
     d2k_hold_get_stats(holding, &hs);
     printf("составной вход: начато=%" PRIu64 " собрано=%" PRIu64
@@ -923,6 +962,10 @@ int main(int argc, char **argv) {
     }
 
     d2k_session *sess = d2k_session_new(flows, journal);
+    http80 = d2k_http80_new();
+    if (!http80) {
+        fprintf(stderr, "d2kd: нет памяти для разбора HTTP — вставка провайдера не узнаётся\n");
+    }
     if (sess && udp_reverse_hook) {
         d2k_session_set_udp_reverse_hook(sess, 1);
     }
@@ -1188,6 +1231,10 @@ int main(int argc, char **argv) {
 
                     st.seen++;
                     st.bytes += np.payload_len;
+                    if (np.have_payload && !np.truncated &&
+                        http80_step(np.payload, np.payload_len, t)) {
+                        continue;
+                    }
 
                     d2k_hold_batch batch;
                     memset(&batch, 0, sizeof batch);
@@ -1819,6 +1866,7 @@ int main(int argc, char **argv) {
     d2k_udp_follow_free(udp_follow);
     if (routes_fd >= 0) { close(routes_fd); }
     udp_follow = NULL;
+    d2k_http80_free(http80);
     d2k_session_free(sess);
     d2k_nfq_close(q);
     d2k_raw_close(raw);

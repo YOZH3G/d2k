@@ -24,24 +24,24 @@ MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 # путь, каждый считал бы файл своим, и несовпадение mtime/флагов одного билда
 # портило бы зависимости другого молча.
 CORE_DIR = ../core
-CORESRC  = $(CORE_DIR)/quic.c $(CORE_DIR)/quicwire.c $(CORE_DIR)/crypto.c $(CORE_DIR)/ipfrag.c
-COREOBJ  = core_quic.o core_quicwire.o core_crypto.o core_ipfrag.o
-COREHDR  = $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_quicwire.h $(CORE_DIR)/include/d2k_crypto.h $(CORE_DIR)/include/d2k_ipfrag.h
+CORESRC  = $(CORE_DIR)/quic.c $(CORE_DIR)/quicwire.c $(CORE_DIR)/crypto.c $(CORE_DIR)/ipfrag.c $(CORE_DIR)/httpup_logic.c
+COREOBJ  = core_quic.o core_quicwire.o core_crypto.o core_ipfrag.o core_httpup_logic.o
+COREHDR  = $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_quicwire.h $(CORE_DIR)/include/d2k_crypto.h $(CORE_DIR)/include/d2k_ipfrag.h $(CORE_DIR)/include/d2k_httpup.h
 QUIC_FIXTURE_OBJ = core_quichello.o core_hello.o core_tls13core.o core_x25519.o
 
 # Переносимый датапат: собирается и проверяется на любой машине.
-SRC     = addr.c plan_parse.c plan_apply.c tls.c capture.c hold.c udp_hold.c udp_release.c udp_path.c routemark.c wire.c wire_udp.c track.c session.c nat.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
+SRC     = http80.c addr.c plan_parse.c plan_apply.c tls.c capture.c hold.c udp_hold.c udp_release.c udp_path.c routemark.c wire.c wire_udp.c track.c session.c nat.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
 # Системный слой: только Linux. На маке не собирается намеренно — подделывать
 # сокеты ядра ради сборки значило бы проверять подделку. Проверяется целью
 # cross, которая линкует ПОЛНУЮ службу под обе целевые арки: полная сборка
 # доказывает больше, чем компиляция объектников.
 LINUXSRC = nfq.c raw.c routemark_nl.c
 DAEMON   = d2kd.c
-HDR     = include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h include/d2k_udp_path.h include/d2k_routemark.h include/d2k_capture.h include/d2k_plan.h include/d2k_nat.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h plan_internal.h $(COREHDR)
+HDR     = include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h include/d2k_udp_path.h include/d2k_routemark.h include/d2k_capture.h include/d2k_plan.h include/d2k_nat.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h include/d2k_http80.h plan_internal.h $(COREHDR)
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_addr test_hold test_udp_hold test_udp_release test_udp_path test_routemark test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session
+TESTS   = test_addr test_hold test_udp_hold test_udp_release test_udp_path test_routemark test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session test_http80
 
 .PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release test-udp-path test-routemark cross clean
 
@@ -160,6 +160,24 @@ core_crypto.o: $(CORE_DIR)/crypto.c $(COREHDR)
 
 core_ipfrag.o: $(CORE_DIR)/ipfrag.c $(COREHDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Узнавание портала блокировки в ответе — тот же разбор, что был у d2khttp
+# (задача 51): датапат видит запрос и ответ разными пакетами.
+core_httpup_logic.o: $(CORE_DIR)/httpup_logic.c $(COREHDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Вставка провайдера в открытый HTTP (задача 51).
+http80.o: http80.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test_http80: test_http80.c http80.o wire.o core_httpup_logic.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_http80.c http80.o wire.o core_httpup_logic.o $(LDFLAGS)
+
+.PHONY: test-http80
+test-http80: test_http80
+	./test_http80
+
+check: test-http80
 
 core_quichello.o: $(CORE_DIR)/quichello.c $(COREHDR) $(CORE_DIR)/include/d2k_quichello.h $(CORE_DIR)/include/d2k_hello.h
 	$(CC) $(CFLAGS) -c -o $@ $<
