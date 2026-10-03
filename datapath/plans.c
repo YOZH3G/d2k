@@ -797,7 +797,10 @@ static void probe_drop(d2k_plantab *t, probe_entry *e) {
 void d2k_plantab_clear_probes(d2k_plantab *t) {
     if (!t) return;
     for (size_t i = 0; i < t->used;) {
-        if (t->v[i].kind == KEY_NAME && t->v[i].only_sport) {
+        /* Опыты контроллера и запрет QUIC (задача 50, раунд 4): ни то, ни
+           другое не знание каталога; без контроллера снимать их некому. */
+        if (t->v[i].kind == KEY_NAME &&
+            (t->v[i].only_sport || d2k_plan_quic_deny(t->v[i].plan))) {
             (void)drop(t, &t->v[i]);
         } else {
             i++;
