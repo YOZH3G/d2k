@@ -7707,7 +7707,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            прикладного обмена, и в каталог не идёт ничего (§10). */
                         say(s, "по %s план %zu: зонд не дошёл до приложения (%s) — беру следующего кандидата",
                             t->name, t->next_plan, t->ver.reason);
-                        if(t->family_fast==1 && touched &&
+                        /* Неуспех по НАШЕМУ пределу или нашей ошибке чтения (заголовки
+                           длиннее предела, нет памяти) — не поведение линии и не
+                           улика против плана семьи (задача 44, поле 03.10.2026:
+                           web.whatsapp.com). */
+                        if(t->family_fast==1 && touched && !t->ver.local_limit &&
                            s->dropped_seen==t->ver_dropped0 &&
                            t->ver.level>=D2K_VER_TRANSPORT) {
                             char failed_id[40]; uint8_t wire_id[D2K_PLAN_ID_LEN];

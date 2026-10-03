@@ -50,6 +50,11 @@
 #include "d2k_http_reply.h"
 #include "d2k_tls13core.h"
 
+/* Предел заголовков ответа, байт. Поле 03.10.2026: край Meta отдаёт ~8,4 КБ,
+   прежние 8 КБ браковали рабочие планы. Выше — ответ не принимается с
+   названием предела; curl держит 100 КБ, этого с запасом хватает зонду. */
+#define D2K_VERIFY_HEADER_LIMIT 65536
+
 typedef enum {
     D2K_VER_NOT_MEASURED = 0, /* обращение не состоялось — про линию не сказано ничего */
     D2K_VER_TRANSPORT,        /* TCP встал, рукопожатие не дошло до конца */
@@ -107,6 +112,10 @@ typedef struct {
        прикладной уровень НЕ ИЗМЕРЕН: HTTP-запрос на чужом языке ничего не
        доказал бы. Это не D2K_VER_APPLICATION и за него не выдаётся. */
     int      handshake_proof;
+    /* Неуспех вызван НАШИМ пределом или нашей ошибкой чтения (заголовки длиннее
+       D2K_VERIFY_HEADER_LIMIT, нет памяти), а не поведением линии. Такой
+       неуспех не улика против плана и не записывается ему как провал. */
+    int      local_limit;
     d2k_resource resources[D2K_RESOURCE_COUNT];
     size_t n_resources; /* hints only, from a complete anonymous HTML response */
 } d2k_ver_result;

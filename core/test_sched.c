@@ -223,6 +223,7 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
    движется сама, без пользователя. */
 static int ver_calls;
 static int ver_fail_first;
+static int ver_local_limit; /* неуспех зонда из-за нашего предела чтения (задача 44) */
 static int ver_app_after_tcp_search;
 static uint8_t ver_last_transport;
 static d2k_ver_level ver_answer = D2K_VER_APPLICATION;
@@ -333,6 +334,7 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
                (ver_app_after_tcp_search && tcp_calls == 0))
                   ? D2K_VER_HANDSHAKE : ver_answer;
     r.status = (r.level == D2K_VER_APPLICATION) ? 200 : 0;
+    r.local_limit = r.level == D2K_VER_APPLICATION ? 0 : ver_local_limit;
     /* Тот же местный конец, что в ключах событий этого теста (ev_hello). */
     memcpy(r.local_ip4, ver_local_ip4, sizeof r.local_ip4);
     r.family = ver_socket_family == AF_INET6 ? 6 : 4;
@@ -2156,7 +2158,38 @@ int main(int argc, char **argv) {
         CHECK(said("по priority.recovery.net ожидание в очереди") &&
               !said("по fresh-research.example ожидание в очереди"),
               "saved family recovery must precede older unrelated queued classification");
-        d2k_sched_free(s); d2k_catalog_free(&recovery); tcp_answer=D2K_V_PREFIX;
+        d2k_sched_free(s); tcp_answer=D2K_V_PREFIX;
+        /* Задача 44: неуспех зонда из-за НАШЕГО предела чтения при применённом
+           плане не засчитывается плану семьи как провал на проводе; тот же
+           неуспех без признака предела — засчитывается (контроль). */
+        for (int limit = 1; limit >= 0; limit--) {
+            const char *nm = limit ? "lim.recovery.net" : "ctl.recovery.net";
+            uint16_t pt = limit ? 40519 : 40520;
+            s=d2k_sched_new(&recovery,sv[0],0x2d);
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            ack.code=D2K_CMD_SET_SUFFIX; ack.num=1u<<8; area_ack_id(&ack);
+            d2k_sched_event(s,&ack); sync_out(s);
+            tcp_calls=vol_calls=ver_calls=0; ver_fail_first=1; ver_local_limit=limit;
+            ver_answer_port=pt;
+            h=ev_hello(6,pt,nm); d2k_sched_event(s,&h);
+            su=ev_suspect(6,pt); su.planned=D2K_LINK_PLANNED_YES;
+            su.code=D2K_SUSPECT_SILENT; su.client_shape=D2K_SHAPE_MODERN;
+            d2k_sched_event(s,&su);
+            for(int i=0;i<800;i++) {
+                tick_once(s);
+                d2k_ev applied=ev_applied(6,pt); d2k_sched_event(s,&applied);
+            }
+            int failed_votes=0;
+            for(size_t i=0;i<recovery.groups->n_observations;i++)
+                if(!strcmp(recovery.groups->observations[i].name,nm) &&
+                   (recovery.groups->observations[i].evidence&D2K_GROUP_PLAN_FAILED)) failed_votes++;
+            if(limit) CHECK(ver_calls>=1 && failed_votes==0,
+                  "verifier failure from our own reader limit is not recorded as a plan failure");
+            else CHECK(ver_calls>=1 && failed_votes>=1,
+                  "control: the same verifier failure from the wire is recorded as a plan failure");
+            d2k_sched_free(s); ver_fail_first=0; ver_local_limit=0;
+        }
+        d2k_catalog_free(&recovery);
         d2k_catalog qc = {0};
         quic_answer = D2K_V_OPAQUE;
         confirm_transport(&qc, sv[0], "q-a.googlevideo.com", 40401, 17);

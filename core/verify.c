@@ -25,6 +25,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <string.h>
 #include <time.h>
@@ -412,17 +413,29 @@ static int read_http_body(body_stream *s, int status, int has_length,
     }
 }
 
-static int read_status_rd(read_fn rd, void *sess, int wait_ms,
+static int read_status_buf(uint8_t *buf, size_t capacity,
+                          read_fn rd, void *sess, int wait_ms,
                           int *cloudflare_challenge, uint64_t *body_bytes,
                           uint64_t *body_expected, int *body_complete,
                           int *body_has_length, int *body_chunked,
                           int *body_framing_valid, int *body_encoding,
                           char *location, size_t location_cap,
                           d2k_resource *resources, size_t *n_resources,
-                          d2k_http_reply_result *http_reply,
+                          d2k_http_reply_result *http_reply, int *local_limit,
+                          char *err, size_t errcap);
+static int read_status_buf(uint8_t *buf, size_t capacity,
+                          read_fn rd, void *sess, int wait_ms,
+                          int *cloudflare_challenge, uint64_t *body_bytes,
+                          uint64_t *body_expected, int *body_complete,
+                          int *body_has_length, int *body_chunked,
+                          int *body_framing_valid, int *body_encoding,
+                          char *location, size_t location_cap,
+                          d2k_resource *resources, size_t *n_resources,
+                          d2k_http_reply_result *http_reply, int *local_limit,
                           char *err, size_t errcap) {
-    uint8_t buf[8193];
     size_t used = 0;
+    if (local_limit) { *local_limit = 0; }
+    if (err && errcap) { err[0] = '\0'; }
     *http_reply = (d2k_http_reply_result){D2K_HTTP_NEUTRAL, ""};
     if (n_resources) *n_resources = 0;
     if (cloudflare_challenge) { *cloudflare_challenge = 0; }
@@ -440,21 +453,31 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
         if (end) {
             size_t hdr_len = (size_t)(end - buf);
             /* Ноль ВНУТРИ заголовков — ответ битый, а не «ещё не всё». */
-            if (memchr(buf, 0, hdr_len)) { return 0; }
+            if (memchr(buf, 0, hdr_len)) {
+                snprintf(err, errcap, "в заголовках ответа нулевой байт");
+                return 0;
+            }
             /* With no header fields, the status line's CRLF is the first
              * half of CRLFCRLF. Include it in the line search, but keep
              * the body excluded from the header/NUL validation above. */
             const uint8_t *eol = find_eol(buf, hdr_len + 2);
-            if (!eol) { return 0; }
+            if (!eol) {
+                snprintf(err, errcap, "в заголовках ответа нет строки статуса");
+                return 0;
+            }
             size_t line_len = (size_t)(eol - buf);
             if (line_len < 13 || memcmp(buf, "HTTP/1.", 7) != 0 ||
                 (buf[7] != '0' && buf[7] != '1') || buf[8] != ' ' ||
                 buf[9] < '1' || buf[9] > '5' || buf[10] < '0' || buf[10] > '9' ||
                 buf[11] < '0' || buf[11] > '9' || buf[12] != ' ') {
+                snprintf(err, errcap, "строка статуса не HTTP/1.x с кодом 100-599");
                 return 0;
             }
             for (size_t p = 13; p < line_len; p++) {
-                if ((buf[p] < 32 && buf[p] != '\t') || buf[p] == 127) { return 0; }
+                if ((buf[p] < 32 && buf[p] != '\t') || buf[p] == 127) {
+                    snprintf(err, errcap, "в строке статуса управляющий символ");
+                    return 0;
+                }
             }
             int code = (buf[9] - '0') * 100 + (buf[10] - '0') * 10 + buf[11] - '0';
             if (code >= 200) {
@@ -489,11 +512,17 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
                             uint64_t x = 0; size_t digits = 0;
                             while (v < ln && line[v] >= '0' && line[v] <= '9') {
                                 unsigned d = (unsigned)(line[v++] - '0');
-                                if (x > (UINT64_MAX - d) / 10) { return code; }
+                                if (x > (UINT64_MAX - d) / 10) {
+                                    snprintf(err, errcap, "Content-Length вне диапазона");
+                                    return code;
+                                }
                                 x = x * 10 + d; digits++;
                             }
                             while (v < ln && (line[v] == ' ' || line[v] == '\t')) { v++; }
-                            if (!digits || v != ln || (has_length && x != length)) { return code; }
+                            if (!digits || v != ln || (has_length && x != length)) {
+                                snprintf(err, errcap, "Content-Length неоднозначный или не число");
+                                return code;
+                            }
                             has_length = 1; length = x;
                         } else if (span_eq_ascii_ci(line, kn, "transfer-encoding")) {
                             size_t end = ln;
@@ -567,7 +596,10 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
                 }
                 return code;
             }
-            if (code == 101) { return 0; } /* upgrade не запрашивали */
+            if (code == 101) { /* upgrade не запрашивали */
+                snprintf(err, errcap, "сервер прислал 101 Switching Protocols без запроса");
+                return 0;
+            }
             /* Промежуточный ответ (1xx) — отбрасываем его вместе с
                заголовками и ждём окончательного. */
             size_t consumed = hdr_len + 4;
@@ -575,13 +607,61 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
             used -= consumed;
             continue;
         }
-        if (used >= sizeof buf - 1) { return 0; }
+        if (used >= capacity - 1) {
+            if (local_limit) { *local_limit = 1; }
+            snprintf(err, errcap, "заголовки ответа длиннее %d байт", D2K_VERIFY_HEADER_LIMIT);
+            return 0;
+        }
         int64_t left = until - verify_now_ms();
-        if (left <= 0) { return 0; }
-        long got = rd(sess, buf + used, sizeof buf - 1 - used, (int)left, err, errcap);
-        if (got <= 0) { return 0; }
+        if (left <= 0) {
+            snprintf(err, errcap, "тайм-аут ожидания заголовков ответа%s",
+                     used ? " (пришла только их часть)" : " (ничего не пришло)");
+            return 0;
+        }
+        err[0] = '\0';
+        long got = rd(sess, buf + used, capacity - 1 - used, (int)left, err, errcap);
+        if (got <= 0) {
+            if (!err[0]) {
+                if (got == 0) {
+                    snprintf(err, errcap, "сервер закрыл соединение до конца заголовков ответа%s",
+                             used ? " (пришла только их часть)" : " (ничего не пришло)");
+                } else {
+                    snprintf(err, errcap, "ошибка чтения TLS до конца заголовков ответа");
+                }
+            }
+            return 0;
+        }
         used += (size_t)got;
     }
+}
+
+static int read_status_rd(read_fn rd, void *sess, int wait_ms,
+                          int *cloudflare_challenge, uint64_t *body_bytes,
+                          uint64_t *body_expected, int *body_complete,
+                          int *body_has_length, int *body_chunked,
+                          int *body_framing_valid, int *body_encoding,
+                          char *location, size_t location_cap,
+                          d2k_resource *resources, size_t *n_resources,
+                          d2k_http_reply_result *http_reply, int *local_limit,
+                          char *err, size_t errcap) {
+    /* Буфер на куче: заголовки Meta ~8,4 КБ не влезали в прежние 8 КБ на
+       стеке (задача 44). Тело читается теми же 8192 байтами с начала. */
+    size_t capacity = D2K_VERIFY_HEADER_LIMIT + 1;
+    uint8_t *buf = malloc(capacity);
+    if (!buf) {
+        *http_reply = (d2k_http_reply_result){D2K_HTTP_NEUTRAL, ""};
+        if (n_resources) *n_resources = 0;
+        if (local_limit) *local_limit = 1;
+        snprintf(err, errcap, "не хватило памяти под заголовки ответа");
+        return 0;
+    }
+    int code_out = read_status_buf(buf, capacity, rd, sess, wait_ms,
+        cloudflare_challenge, body_bytes, body_expected, body_complete,
+        body_has_length, body_chunked, body_framing_valid, body_encoding,
+        location, location_cap, resources, n_resources, http_reply,
+        local_limit, err, errcap);
+    free(buf);
+    return code_out;
 }
 
 d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
@@ -692,7 +772,7 @@ static void request_complete_page(read_fn rd, write_fn wr, void *sess,
                                   &r->body_has_length, &r->body_chunked,
                                   &r->body_framing_valid, &r->body_encoding, r->location,
                                   sizeof r->location, r->resources, &r->n_resources,
-                                  &http_reply, err, errcap);
+                                  &http_reply, &r->local_limit, err, errcap);
         r->status = code;
         r->http_outcome = http_reply.outcome;
         snprintf(r->http_evidence, sizeof r->http_evidence, "%s", http_reply.evidence);
@@ -1085,6 +1165,36 @@ static void quic_app_silent(d2k_ver_result *r, size_t got, uint64_t wire,
     }
 }
 
+/* Чтение заголовков ответа HTTP/3 из потока 0 до целого кадра HEADERS.
+   recv отдаёт n>0 байт, 0 — пока ничего, <0 — соединение закрыто. Возвращает
+   1, если буфер cap заполнен, а кадр HEADERS так и не разобран: это НАШ
+   предел, а не поведение линии. Выделено из зонда ради теста без сокетов. */
+typedef long (*h3_recv_fn)(void *ctx, uint8_t *buf, size_t cap, char *err,
+                           size_t errcap);
+static int h3_read_headers(h3_recv_fn recv, void *ctx, uint8_t *rx, size_t cap,
+                           int64_t until, size_t *got, int *status, int *closed,
+                           char *err, size_t errcap) {
+    *got = 0; *status = 0; *closed = 0;
+    while (*got < cap && verify_now_ms() < until) {
+        long n = recv(ctx, rx + *got, cap - *got, err, errcap);
+        if (n < 0) { *closed = 1; break; }
+        if (n > 0) { *got += (size_t)n; }
+        int st = 0;
+        if (*got > 0 && d2k_h3_status(rx, *got, &st) == 0) { *status = st; break; }
+    }
+    return *status == 0 && *got >= cap;
+}
+
+typedef struct { d2k_qc *c; } quic_recv_ctx;
+/* Куски по 200 мс безопасны: срок повтора запроса живёт в соединении
+   (d2k_qc_stream_recv), а не в куске. */
+static long quic_recv_chunk(void *ctx, uint8_t *buf, size_t cap, char *err,
+                            size_t errcap) {
+    uint64_t sid = 0;
+    return d2k_qc_stream_recv(((quic_recv_ctx *)ctx)->c, &sid, buf, cap, 200,
+                              err, errcap);
+}
+
 /* use_fd — УЖЕ ЗАНЯТЫЙ сокет UDP (d2k_props_bind_udp), под чей местный порт
    поставлен пробный план. Меньше единицы — завести свой. */
 d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t port,
@@ -1172,29 +1282,31 @@ d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_
         return r;
     }
 
-    uint8_t rx[8192];
+    /* Буфер ответа на куче: заголовки HTTP/3 края Meta бывают длиннее 8 КБ,
+       а d2k_h3_status берёт кадр HEADERS только целиком (задача 44). */
+    uint8_t *rx = malloc(D2K_VERIFY_HEADER_LIMIT);
+    if (!rx) {
+        r.local_limit = 1;
+        snprintf(r.reason, sizeof r.reason, "не хватило памяти под заголовки ответа HTTP/3");
+        r.fd = d2k_qc_release(c);
+        return r;
+    }
     size_t got = 0;
     int closed = 0;
     uint64_t wire_before = d2k_qc_rx_wire_bytes(c);
     int64_t until = verify_now_ms() + (deadline_ms > 0 ? deadline_ms : 5000);
-    while (got < sizeof rx && verify_now_ms() < until) {
-        uint64_t sid = 0;
-        /* Куски по 200 мс безопасны: срок повтора запроса живёт в соединении
-           (d2k_qc_stream_recv), а не в куске. */
-        long n = d2k_qc_stream_recv(c, &sid, rx + got, sizeof rx - got, 200,
-                                    err, sizeof err);
-        if (n < 0) { closed = 1; break; }
-        if (n > 0) { got += (size_t)n; }
-        int st = 0;
-        if (got > 0 && d2k_h3_status(rx, got, &st) == 0) {
-            r.status = st;
-            if (st == 451) {
-                r.level = D2K_VER_DENIED;
-                r.http_outcome = D2K_HTTP_LEGAL_DENIAL;
-                snprintf(r.http_evidence, sizeof r.http_evidence, "HTTP 451");
-                snprintf(r.reason, sizeof r.reason, "HTTP отказ: HTTP 451");
-            }
-            break;
+    quic_recv_ctx rctx = { c };
+    int h3_status = 0;
+    int headers_too_long = h3_read_headers(quic_recv_chunk, &rctx, rx,
+        D2K_VERIFY_HEADER_LIMIT, until, &got, &h3_status, &closed, err, sizeof err);
+    free(rx);
+    if (h3_status != 0) {
+        r.status = h3_status;
+        if (h3_status == 451) {
+            r.level = D2K_VER_DENIED;
+            r.http_outcome = D2K_HTTP_LEGAL_DENIAL;
+            snprintf(r.http_evidence, sizeof r.http_evidence, "HTTP 451");
+            snprintf(r.reason, sizeof r.reason, "HTTP отказ: HTTP 451");
         }
     }
     /* ЗАГОЛОВКИ — ЕЩЁ НЕ ПРИЛОЖЕНИЕ (задача 39). Поле 02.10.2026 (задача 33):
@@ -1232,6 +1344,10 @@ d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_
                      "до %u и до конца ответа%s%.60s", r.status, (unsigned long long)bytes,
                      D2K_QUIC_ARM_DATA_BYTES, closed ? ": " : "", closed ? err : "");
         }
+    } else if (headers_too_long) {
+        r.local_limit = 1;
+        snprintf(r.reason, sizeof r.reason,
+                 "заголовки ответа HTTP/3 длиннее %d байт", D2K_VERIFY_HEADER_LIMIT);
     } else if (r.level != D2K_VER_DENIED) {
         quic_app_silent(&r, got, d2k_qc_rx_wire_bytes(c) - wire_before,
                         closed ? err : NULL);
