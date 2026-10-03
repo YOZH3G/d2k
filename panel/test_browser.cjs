@@ -71,6 +71,42 @@ async function main(){
   assert.equal(await evaluate('document.querySelector("#telegram-body").dataset.state'),'connected');
   assert.equal(await evaluate('!!document.querySelector("#telegram-body .tun")'),true,'tunnel drawing is present');
 
+  // Туннель: одна сцена на все состояния, переходы идут на ней же; каждое состояние читается.
+  await evaluate('document.querySelector("#telegram").scrollIntoView({block:"center"})');
+  const shots=process.env.D2K_TUNNEL_SHOTS;
+  if(shots)fs.mkdirSync(shots,{recursive:true});
+  const tunnelShot=async name=>{if(!shots)return;
+   const b=await evaluate('(()=>{const r=document.querySelector("#telegram-body").getBoundingClientRect();return {x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}})()');
+   const s=await call('Page.captureScreenshot',{format:'png',clip:{...b,scale:2}});fs.writeFileSync(path.join(shots,name+'.png'),Buffer.from(s.data,'base64'))};
+  const tunnelState=async st=>{panel.telegram(st);await until('document.querySelector("#telegram-body").dataset.state==="'+st+'"','tunnel must reach '+st)};
+  const visiblePkts='[...document.querySelectorAll("#telegram-body .pkt")].filter(p=>+gsap.getProperty(p,"opacity")>0.5)';
+  await evaluate('window.tunScene=document.querySelector("#telegram-body .tun")');
+  assert.equal(await evaluate('document.querySelector("#telegram-body").dataset.motion'),'live','tunnel runs its scene');
+  await until(visiblePkts+'.length>=2','connected tunnel carries live traffic');
+  const widths=new Set();
+  for(let i=0;i<24;i++){(await evaluate(visiblePkts+'.map(p=>Math.round(p.width.baseVal.value))')).forEach(w=>widths.add(w));await wait(150)}
+  assert.ok(widths.size>=4,'packets vary in size: '+[...widths]);
+  await tunnelShot('1-connected');
+  await tunnelState('stopped');
+  await wait(650);await tunnelShot('2-connected-to-stopped');
+  await until('getComputedStyle(document.querySelector(".gate-post")).opacity==="1"&&!gsap.getProperty(document.querySelector(".gate-post"),"y")','the gate settles down');
+  await until(visiblePkts+'.length===0','traffic drains when the tunnel stops');
+  await wait(400);await tunnelShot('3-stopped');
+  await tunnelState('connecting');
+  await until('+gsap.getProperty(document.querySelector(".tun-probe"),"opacity")>0.5','connecting tunnel sends a call');
+  await wait(300);await tunnelShot('4-connecting');
+  assert.equal(await evaluate(visiblePkts+'.length'),0,'no traffic before the relay answers');
+  await tunnelState('connected');
+  await wait(1050);await tunnelShot('5-handshake-relay-answers');
+  await wait(1300);await tunnelShot('6-handshake-tunnel-opens');
+  await until(visiblePkts+'.length>=1','traffic starts after the handshake');
+  await wait(1500);await tunnelShot('7-connected-flow');
+  await tunnelState('not_configured');
+  await wait(2200);await tunnelShot('8-not-configured');
+  assert.notEqual(await evaluate('getComputedStyle(document.querySelector(".tun-wall")).strokeDasharray'),'none','sketch is dotted again after transitions');
+  assert.equal(await evaluate('window.tunScene===document.querySelector("#telegram-body .tun")'),true,'state changes animate the same drawing');
+  await tunnelState('connected');
+
   // GSAP загружен с роутера под CSP; коробка открывается сценой и закрывается обратно.
   assert.equal(await evaluate('typeof gsap==="object"&&typeof Flip==="function"&&document.documentElement.classList.contains("has-gsap")'),true,'GSAP must load from the panel itself');
   await evaluate('document.querySelector(".crate-lid").click()');
@@ -163,6 +199,11 @@ async function main(){
   await evaluate('document.querySelector(".crate-lid").click()');
   assert.equal(await evaluate('document.querySelector(".crate").open'),true,'reduced motion opens the crate natively at once');
   assert.equal(await evaluate('gsap.globalTimeline.getChildren(true,true,false).filter(t=>t.isActive()).length'),0,'reduced motion runs no tweens');
+  assert.equal(await evaluate('document.querySelector("#telegram-body").dataset.motion'),'still','reduced motion shows a still tunnel frame');
+  assert.equal(await evaluate('getComputedStyle(document.querySelector(".tun-still-flow")).display'),'inline','the still frame still shows traffic');
+  if(process.env.D2K_TUNNEL_SHOTS){await evaluate('document.querySelector("#telegram").scrollIntoView({block:"center"})');await wait(200);
+   const b=await evaluate('(()=>{const r=document.querySelector("#telegram-body").getBoundingClientRect();return {x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}})()');
+   const s=await call('Page.captureScreenshot',{format:'png',clip:{...b,scale:2}});fs.writeFileSync(path.join(process.env.D2K_TUNNEL_SHOTS,'9-reduced-motion-connected.png'),Buffer.from(s.data,'base64'))}
   await call('Emulation.setEmulatedMedia',{features:[]});
   assert.deepEqual(exceptions,[]);
   console.log('Browser + C panel: rendering, honesty, polling, layout and all six commands passed.');

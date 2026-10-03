@@ -794,57 +794,68 @@ main { min-width: 0; padding-bottom: 80px; }
   fill: none; stroke: var(--ink); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
 }
-.tun-route { stroke: none !important; }
-.tun-ground path { stroke: var(--rule); stroke-width: 1.5; }
-.tun-wall { stroke-width: 2.4; }
-.tun-rib { stroke: var(--ink-3); stroke-width: 1.4; }
-.tun-mouth { fill: var(--hole) !important; }
-.tun-out .tun-mouth { fill: var(--paper-3) !important; }
-.tun-node rect, .tun-node circle { fill: var(--paper) !important; }
-.tun-detail { stroke-width: 1.6; }
-.tun-node .tun-led { fill: var(--ok) !important; stroke: none !important; }
-.tunnel[data-state="stopped"] .tun-node .tun-led, .tunnel[data-state="not_configured"] .tun-node .tun-led { fill: var(--ink-3) !important; }
-.tun-relay .tun-detail { fill: var(--ink) !important; stroke: none; }
-.pkt { fill: var(--ok) !important; stroke: none !important; opacity: 0; }
-.tun-gate path { stroke: var(--bad); stroke-width: 3; opacity: 0; }
+.tun .tun-route { stroke: none; }
+.tun .tun-ground path { stroke: var(--rule); stroke-width: 1.5; }
+.tun .tun-wall { stroke-width: 2.4; }
+.tun .tun-rib { stroke: var(--ink-3); stroke-width: 1.4; }
+.tun .tun-mouth { fill: var(--hole); }
+.tun .tun-out .tun-mouth { fill: var(--paper-3); }
+.tun .tun-node rect, .tun .tun-node > circle:not(.tun-led) { fill: var(--paper); }
+.tun .tun-detail { stroke-width: 1.6; }
+.tun .tun-relay .tun-detail { fill: var(--ink); stroke: none; }
+
+/* Свет: рёбра и зевы подсвечиваются проходящими пакетами (непрозрачность ведёт сцена). */
+.tun .tun-rib-lit { stroke: var(--ok); stroke-width: 2.4; opacity: 0; }
+.tun .tun-mouth-lit { stroke: var(--ok); stroke-width: 3; opacity: 0; }
+.tun .tun-ring { stroke: var(--ok); stroke-width: 1.6; opacity: 0; }
+.tun .tun-wave { stroke: var(--warn); stroke-width: 2; opacity: 0; }
+.tunnel[data-state="connecting"] .tun-ring-relay { stroke: var(--warn); stroke-dasharray: 2 5; opacity: .75; }
+.tunnel[data-state="connecting"] .tun-rib-lit, .tunnel[data-state="connecting"] .tun-mouth-lit { stroke: var(--warn); }
+
+/* Огни роутера: питание, передача, приём. */
+.tun .tun-led { fill: var(--ink-3); stroke: none; }
+.tunnel[data-state="connected"] .tun-led { fill: var(--ok); }
+.tunnel[data-state="connecting"] .led-pwr { fill: var(--ink-2); }
+.tunnel[data-state="connecting"] .led-tx { fill: var(--warn); }
+.tunnel[data-state="stopped"] .led-pwr { fill: var(--ink-2); }
+
+/* Пакеты: зелёный поток туда и обратно; янтарный вызов; зелёный ответ ретранслятора. */
+.tun .pkt, .tun .tun-reply, .tun .pkt-still { fill: var(--ok); stroke: none; }
+.tun .pkt, .tun .tun-probe, .tun .tun-reply { opacity: 0; }
+.tun .tun-probe, .tun .tun-still-probe circle { fill: var(--warn); stroke: none; }
+.tun .pkt-still-back { opacity: .78; }
+.tun-still, .tun-still-flow, .tun-still-probe { display: none; }
+
+/* Шлагбаум на входе. */
+.tun .tun-gate path { stroke: var(--bad); stroke-width: 3; opacity: 0; }
 
 .tun-labels {
   display: flex; justify-content: space-between;
   font-size: 0.8125rem; color: var(--ink-2); margin-top: 2px;
 }
 
-/* Подключён: пакеты идут в обе стороны. */
-html:not(.has-gsap) .tunnel[data-onscreen="true"][data-state="connected"] .pkt-out { animation: pkt-out 3.2s linear infinite; }
-html:not(.has-gsap) .tunnel[data-onscreen="true"][data-state="connected"] .pkt-back { animation: pkt-back 3.2s linear infinite; }
-html:not(.has-gsap) .tunnel[data-onscreen="true"][data-state="connected"] .pkt-1 { animation-delay: -.8s; }
-html:not(.has-gsap) .tunnel[data-onscreen="true"][data-state="connected"] .pkt-2 { animation-delay: -1.6s; }
-html:not(.has-gsap) .tunnel[data-onscreen="true"][data-state="connected"] .pkt-3 { animation-delay: -2.4s; }
-@keyframes pkt-out {
-  0% { transform: translateX(0); opacity: 0; } 8% { opacity: 1; }
-  92% { opacity: 1; } 100% { transform: translateX(418px); opacity: 0; }
-}
-@keyframes pkt-back {
-  0% { transform: translateX(0); opacity: 0; } 8% { opacity: .7; }
-  92% { opacity: .7; } 100% { transform: translateX(-418px); opacity: 0; }
-}
-
-/* Подключается: свод прорисовывается, один пакет ждёт у входа. */
-html:not(.has-gsap) .tunnel[data-onscreen="true"][data-state="connecting"] .tun-wall { stroke-dasharray: 10 8; animation: dig 1.2s linear infinite; }
+/* Подключается: свод ещё не держит, ретранслятор не ответил. */
 .tunnel[data-state="connecting"] .tun-rib { opacity: .5; }
-html:not(.has-gsap) .tunnel[data-onscreen="true"][data-state="connecting"] .pkt-out.pkt-0 { animation: knock 1.4s var(--ease-out) infinite; }
-.tunnel[data-state="connecting"] .pkt-out.pkt-0 { fill: var(--warn) !important; }
-@keyframes dig { to { stroke-dashoffset: -36; } }
-@keyframes knock { 0%, 100% { opacity: .2; transform: translateX(0); } 50% { opacity: 1; transform: translateX(14px); } }
+.tunnel[data-state="connecting"] .tun-relay { opacity: .7; }
 
-/* Остановлен: шлагбаум, туннель пуст. */
+/* Остановлен: шлагбаум опущен, туннель пуст и приглушён. */
 .tunnel[data-state="stopped"] .tun-gate path { opacity: 1; }
 .tunnel[data-state="stopped"] .tun-tube, .tunnel[data-state="stopped"] .tun-out { opacity: .45; }
+.tunnel[data-state="stopped"] .tun-relay { opacity: .6; }
 
 /* Не настроен: только набросок. */
 .tunnel[data-state="not_configured"] .tun-tube path,
 .tunnel[data-state="not_configured"] .tun-portal ellipse { stroke-dasharray: 3 6; stroke: var(--ink-3); }
-.tunnel[data-state="not_configured"] .tun-mouth { fill: transparent !important; }
+.tunnel[data-state="not_configured"] .tun .tun-mouth { fill: transparent; }
+.tunnel[data-state="not_configured"] .tun-mouth-lit, .tunnel[data-state="not_configured"] .tun-ring { display: none; }
 .tunnel[data-state="not_configured"] .tun-relay { opacity: .4; }
+
+/* Без сцены (нет GSAP или «уменьшить движение»): один ясный кадр на состояние. */
+.tunnel[data-motion="still"] .tun-still { display: inline; }
+.tunnel[data-motion="still"][data-state="connected"] .tun-still-flow { display: inline; }
+.tunnel[data-motion="still"][data-state="connected"] .tun-mouth-lit { opacity: .55; }
+.tunnel[data-motion="still"][data-state="connecting"] .tun-still-probe { display: inline; }
+.tunnel[data-motion="still"][data-state="connecting"] .tun-wave { opacity: .8; }
 
 /* ─── Диагностика ─── */
 

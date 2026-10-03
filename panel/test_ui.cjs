@@ -131,4 +131,24 @@ assert.equal(ui.duration(3725000), '1 ч 2 мин');
   assert.equal(blind.short, 'предел по умолчанию');
   assert.match(blind.note, /Данных о нагрузке/);
 }
+// Трафик туннеля: не метроном, а запросы с пачками ответов разного размера; петля бесшовна.
+{
+  const plan = ui.tunnelTraffic(0xD2C7, 12);
+  assert.deepEqual(ui.tunnelTraffic(0xD2C7, 12), plan, 'the schedule is deterministic');
+  assert.equal(plan.dropped, 0, 'every packet gets a pool element');
+  assert.ok(plan.out.length >= 8 && plan.back.length >= 8, 'both lanes carry traffic');
+  for (const lane of [plan.out, plan.back]) {
+    const gaps = lane.slice(1).map((p, i) => +(p.t - lane[i].t).toFixed(2));
+    assert.ok(new Set(gaps).size > lane.length / 2, 'launch spacing varies');
+    assert.ok(Math.max(...lane.map(p => p.w)) - Math.min(...lane.map(p => p.w)) > 5, 'packet sizes vary');
+    for (const a of lane) for (const b of lane) {
+      if (a === b || a.slot !== b.slot) continue;
+      const ahead = (b.t - a.t + plan.period) % plan.period;
+      assert.ok(ahead >= a.d, 'a pool element is never reused before its packet lands, across the loop seam too');
+    }
+  }
+  const backMean = plan.back.reduce((s, p) => s + p.w, 0) / plan.back.length;
+  const outMean = plan.out.reduce((s, p) => s + p.w, 0) / plan.out.length;
+  assert.ok(backMean > outMean, 'responses are larger than requests');
+}
 console.log('panel model: all checks passed');

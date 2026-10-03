@@ -1408,52 +1408,318 @@
     not_configured: { word: "Не настроен", lamp: "idle", note: "В конфигурации не заданы TG_RELAY_URL и TG_RELAY_SECRET (или порт записи). Без них туннель не включить." }
   };
 
-  /* Туннель: роутер слева, ретранслятор справа. Пакеты идут только при подключении. */
-  function tunnelScene(doc, st) {
+  /* Туннель: роутер слева, ретранслятор справа. Сцена строится один раз и живёт
+     между состояниями, чтобы переходы шли из того, что уже на экране. */
+  var TUN = { ribs: [150, 200, 250, 300, 350, 400, 450, 500], inX: 92, outX: 548, routerX: 112, poolOut: 7, poolBack: 9 };
+
+  function tunnelScene(doc) {
     var fig = el(doc, "figure", "tunnel-scene");
     fig.setAttribute("aria-hidden", "true");
     var s = svgEl(doc, "svg", { viewBox: "0 0 640 150", preserveAspectRatio: "xMidYMid meet" }, "tun");
-    var g = function (cls) { var x = svgEl(doc, "g", {}, cls); s.appendChild(x); return x; };
+    var g = function (cls, parent) { var x = svgEl(doc, "g", {}, cls); (parent || s).appendChild(x); return x; };
     var ground = g("tun-ground");
     ground.appendChild(svgEl(doc, "path", { d: "M0 134H640" }));
     for (var h = 8; h < 640; h += 22) ground.appendChild(svgEl(doc, "path", { d: "M" + h + " 134l-10 12" }));
-    /* Тело туннеля: свод из колец, уходящих вправо. */
+    /* Тело туннеля: свод из колец; поверх каждого — его же подсветка от проходящих пакетов. */
     var tube = g("tun-tube");
-    tube.appendChild(svgEl(doc, "path", { d: "M92 30H548M92 120H548" }, "tun-wall"));
-    for (var x = 150; x <= 500; x += 50) {
-      tube.appendChild(svgEl(doc, "path", { d: "M" + x + " 30a14 45 0 0 1 0 90" }, "tun-rib"));
-    }
-    /* Порталы. */
+    tube.appendChild(svgEl(doc, "path", { d: "M92 30H548" }, "tun-wall"));
+    tube.appendChild(svgEl(doc, "path", { d: "M92 120H548" }, "tun-wall"));
+    var lit = g("tun-lit");
+    TUN.ribs.forEach(function (x) {
+      var d = "M" + x + " 30a14 45 0 0 1 0 90";
+      tube.appendChild(svgEl(doc, "path", { d: d }, "tun-rib"));
+      lit.appendChild(svgEl(doc, "path", { d: d }, "tun-rib-lit"));
+    });
+    /* Порталы: зев, его подсветка и кольцо рукопожатия. */
     var inP = g("tun-portal tun-in");
-    inP.appendChild(svgEl(doc, "ellipse", { cx: 92, cy: 75, rx: 20, ry: 45 }, "tun-mouth"));
+    inP.appendChild(svgEl(doc, "ellipse", { cx: TUN.inX, cy: 75, rx: 20, ry: 45 }, "tun-mouth"));
+    inP.appendChild(svgEl(doc, "ellipse", { cx: TUN.inX, cy: 75, rx: 20, ry: 45 }, "tun-mouth-lit"));
+    inP.appendChild(svgEl(doc, "ellipse", { cx: TUN.inX, cy: 75, rx: 20, ry: 45 }, "tun-ring tun-ring-in"));
     var outP = g("tun-portal tun-out");
-    outP.appendChild(svgEl(doc, "ellipse", { cx: 548, cy: 75, rx: 20, ry: 45 }, "tun-mouth"));
-    /* Узлы. */
+    outP.appendChild(svgEl(doc, "ellipse", { cx: TUN.outX, cy: 75, rx: 20, ry: 45 }, "tun-mouth"));
+    outP.appendChild(svgEl(doc, "ellipse", { cx: TUN.outX, cy: 75, rx: 20, ry: 45 }, "tun-mouth-lit"));
+    /* Роутер: антенны с волнами вызова, корпус, огни питания, передачи и приёма. */
     var router = g("tun-node tun-router");
     router.appendChild(svgEl(doc, "path", { d: "M20 70V40M54 70V40" }, "tun-detail"));
+    [20, 54].forEach(function (x) {
+      router.appendChild(svgEl(doc, "path", { d: "M" + (x - 5) + " 35a7 7 0 0 1 10 0" }, "tun-wave"));
+      router.appendChild(svgEl(doc, "path", { d: "M" + (x - 9) + " 31a13 13 0 0 1 18 0" }, "tun-wave"));
+    });
     router.appendChild(svgEl(doc, "rect", { x: 8, y: 70, width: 58, height: 20, rx: 4 }));
-    [20, 29, 38].forEach(function (cx) { router.appendChild(svgEl(doc, "circle", { cx: cx, cy: 80, r: 2.4 }, "tun-led")); });
+    ["pwr", "tx", "rx"].forEach(function (k, i) { router.appendChild(svgEl(doc, "circle", { cx: 20 + i * 9, cy: 80, r: 2.4 }, "tun-led led-" + k)); });
     var relay = g("tun-node tun-relay");
     relay.appendChild(svgEl(doc, "circle", { cx: 604, cy: 75, r: 22 }));
     relay.appendChild(svgEl(doc, "path", { d: "M593 76l22-9-6 20-5-7-5 3z" }, "tun-detail"));
-    /* Пакеты: туда — по верхней полосе, обратно — по нижней. */
+    s.appendChild(svgEl(doc, "circle", { cx: 604, cy: 75, r: 29 }, "tun-ring tun-ring-relay"));
+    /* Полосы: туда — верхняя, обратно — нижняя. */
     var routes = g("tun-routes");
     routes.appendChild(svgEl(doc, "path", { d: "M58 80C72 80 76 62 96 62H540C566 62 572 75 582 75", id: "tun-route-out" }, "tun-route"));
     routes.appendChild(svgEl(doc, "path", { d: "M582 80C572 80 566 88 540 88H96C76 88 72 84 58 84", id: "tun-route-back" }, "tun-route"));
+    /* Пакеты — пул, центрированный в начале координат: размер меняется на каждом запуске. */
     var traffic = g("tun-traffic");
-    for (var i = 0; i < 4; i++) {
-      traffic.appendChild(svgEl(doc, "rect", { x: 100, y: 58, width: 22, height: 9, rx: 4.5 }, "pkt pkt-out pkt-" + i));
-      traffic.appendChild(svgEl(doc, "rect", { x: 518, y: 83, width: 22, height: 9, rx: 4.5 }, "pkt pkt-back pkt-" + i));
-    }
+    var i;
+    for (i = 0; i < TUN.poolOut; i++) traffic.appendChild(svgEl(doc, "rect", { x: -6, y: -4.5, width: 12, height: 9, rx: 4.5 }, "pkt pkt-out"));
+    for (i = 0; i < TUN.poolBack; i++) traffic.appendChild(svgEl(doc, "rect", { x: -9, y: -4.5, width: 18, height: 9, rx: 4.5 }, "pkt pkt-back"));
+    traffic.appendChild(svgEl(doc, "circle", { cx: 0, cy: 0, r: 4.5 }, "tun-probe"));
+    traffic.appendChild(svgEl(doc, "circle", { cx: 0, cy: 0, r: 4.5 }, "tun-reply"));
+    /* Неподвижный кадр для «уменьшить движение»: поток или вызов у входа. */
+    var still = g("tun-still");
+    var flow = g("tun-still-flow", still);
+    [[170, 14], [292, 22], [326, 11], [452, 17]].forEach(function (p) { flow.appendChild(svgEl(doc, "rect", { x: p[0] - p[1] / 2, y: 57.5, width: p[1], height: 9, rx: 4.5 }, "pkt-still")); });
+    [[214, 24], [246, 16], [396, 20]].forEach(function (p) { flow.appendChild(svgEl(doc, "rect", { x: p[0] - p[1] / 2, y: 83.5, width: p[1], height: 9, rx: 4.5 }, "pkt-still pkt-still-back")); });
+    g("tun-still-probe", still).appendChild(svgEl(doc, "circle", { cx: 214, cy: 62, r: 4.5 }));
     /* Шлагбаум на входе, когда служба стоит. */
     var gate = g("tun-gate");
-    gate.appendChild(svgEl(doc, "path", { d: "M72 36v78M112 36v78M72 56h40M72 94h40" }));
+    gate.appendChild(svgEl(doc, "path", { d: "M72 36v78M112 36v78" }, "gate-post"));
+    gate.appendChild(svgEl(doc, "path", { d: "M72 56h40" }, "gate-bar"));
+    gate.appendChild(svgEl(doc, "path", { d: "M72 94h40" }, "gate-bar"));
     fig.appendChild(s);
     var labels = el(doc, "figcaption", "tun-labels");
     add(labels, el(doc, "span", "", "Этот роутер"), el(doc, "span", "", "Ретранслятор"));
     fig.appendChild(labels);
-    void st;
     return fig;
+  }
+
+  /* Расписание живого трафика на кольце длиной period секунд: запрос уходит,
+     пачка ответов разного размера возвращается, паузы неровные. Каждый пакет
+     получает элемент пула, не занятый на кольце, поэтому петля бесшовна. */
+  function tunnelTraffic(seed, period) {
+    var a = seed >>> 0;
+    var r = function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    var out = [], back = [], t = 0.1;
+    while (t < period) {
+      var d = 2.3 + r() * 0.45;
+      out.push({ t: t, w: 12 + r() * 6, d: d });
+      var n = 1 + Math.floor(Math.pow(r(), 1.7) * 4), at = t + d + 0.08 + r() * 0.12;
+      for (var i = 0; i < n; i++) {
+        var bw = 16 + r() * 16;
+        back.push({ t: at, w: bw, d: 2.5 + (bw - 16) / 16 * 0.5 + r() * 0.25 });
+        at += 0.13 + r() * 0.22;
+      }
+      if (r() < 0.3) out.push({ t: t + 0.35 + r() * 0.3, w: 9, d: 2.2 + r() * 0.3 });
+      t += 0.5 + r() * 1.2 + (r() < 0.15 ? 1.1 : 0);
+    }
+    var place = function (list, pool) {
+      var slots = [], placed = [];
+      list.forEach(function (p) { p.t = p.t % period; });
+      list.sort(function (x, y) { return x.t - y.t; });
+      var clash = function (x, y) {
+        var gap = 0.06;
+        return ((x.t - y.t + period) % period) < y.d + gap || ((y.t - x.t + period) % period) < x.d + gap;
+      };
+      list.forEach(function (p) {
+        for (var s = 0; s < pool; s++) {
+          var busy = slots[s] || (slots[s] = []);
+          if (busy.some(function (q) { return clash(p, q); })) continue;
+          busy.push(p); p.slot = s; placed.push(p); return;
+        }
+      });
+      return placed;
+    };
+    var po = place(out, TUN.poolOut), pb = place(back, TUN.poolBack);
+    return { period: period, out: po, back: pb, dropped: out.length + back.length - po.length - pb.length };
+  }
+
+  /* Что CSS показывает в каждом состоянии и от чего отталкиваются переходы. */
+  var TUN_LOOK = {
+    connected: { tube: 1, ribs: 1, relay: 1, pwr: 1, tx: 0.3, rx: 0.3 },
+    connecting: { tube: 1, ribs: 0.5, relay: 0.7, pwr: 1, tx: 0.2, rx: 0.5 },
+    stopped: { tube: 0.45, ribs: 1, relay: 0.6, pwr: 0.8, tx: 1, rx: 1 },
+    not_configured: { tube: 1, ribs: 1, relay: 0.4, pwr: 1, tx: 1, rx: 1 }
+  };
+
+  /* Оснастка сцены: элементы и «свет», который каждый кадр читает положение
+     пакетов и подсвечивает рёбра, зевы и огни роутера рядом с ними. */
+  function tunnelRig(svg) {
+    var g = Motion.g;
+    var q = function (sel) { return [].slice.call(svg.querySelectorAll(sel)); };
+    var R = {
+      svg: svg, ribs: q(".tun-rib"), lit: q(".tun-rib-lit"), walls: q(".tun-wall"), tube: svg.querySelector(".tun-tube"),
+      mouths: q(".tun-mouth"), mouthLit: q(".tun-mouth-lit"), out: svg.querySelector(".tun-out"),
+      ringIn: svg.querySelector(".tun-ring-in"), ringRelay: svg.querySelector(".tun-ring-relay"),
+      relay: svg.querySelector(".tun-relay"), waves: q(".tun-wave"),
+      led: { pwr: svg.querySelector(".led-pwr"), tx: svg.querySelector(".led-tx"), rx: svg.querySelector(".led-rx") },
+      pktOut: q(".pkt-out"), pktBack: q(".pkt-back"), probe: svg.querySelector(".tun-probe"), reply: svg.querySelector(".tun-reply"),
+      posts: q(".gate-post"), bars: q(".gate-bar"),
+      boost: TUN.ribs.map(function () { return { v: 0 }; }),
+      G: { pwr: 1, tx: 0.3, rx: 0.3, link: 0, mIn: 0, mOut: 0 }
+    };
+    R.movers = R.pktOut.map(function (e) { return { el: e, lane: 1 }; })
+      .concat(R.pktBack.map(function (e) { return { el: e, lane: -1 }; }))
+      .concat([{ el: R.probe, lane: 1 }, { el: R.reply, lane: -1 }]);
+    var lights = R.lit.concat(R.mouthLit, [R.led.pwr, R.led.tx, R.led.rx]);
+    var set = lights.map(function (e) { return g.quickSetter(e, "opacity"); });
+    var last = lights.map(function () { return -1; });
+    var inf = new Array(lights.length);
+    var nr = TUN.ribs.length;
+    R.glow = function () {
+      var i, G = R.G;
+      for (i = 0; i < inf.length; i++) inf[i] = 0;
+      var tx = 0, rx = 0;
+      for (var m = 0; m < R.movers.length; m++) {
+        var e = R.movers[m].el;
+        var o = +g.getProperty(e, "opacity");
+        if (!(o > 0.02)) continue;
+        var x = +g.getProperty(e, "x");
+        var w = e.width ? e.width.baseVal.value : 12;
+        var wv = o * Math.min(1.15, 0.55 + w / 40);
+        for (i = 0; i < nr; i++) {
+          var d = Math.abs(x - TUN.ribs[i]);
+          if (d < 36) inf[i] = Math.max(inf[i], (1 - d / 36) * wv);
+        }
+        var di = Math.abs(x - TUN.inX), dout = Math.abs(x - TUN.outX);
+        if (di < 44) inf[nr] = Math.max(inf[nr], (1 - di / 44) * wv);
+        if (dout < 44) inf[nr + 1] = Math.max(inf[nr + 1], (1 - dout / 44) * wv);
+        if (x < TUN.routerX) { if (R.movers[m].lane > 0) tx = Math.max(tx, o); else rx = Math.max(rx, o); }
+      }
+      for (i = 0; i < nr; i++) inf[i] = Math.max(R.boost[i].v, inf[i] * 0.85);
+      inf[nr] = Math.max(G.mIn, inf[nr] * 0.9);
+      inf[nr + 1] = Math.max(G.mOut, inf[nr + 1] * 0.9);
+      inf[nr + 2] = G.pwr;
+      inf[nr + 3] = Math.max(G.tx, G.link, tx);
+      inf[nr + 4] = Math.max(G.rx, rx);
+      for (i = 0; i < lights.length; i++) {
+        var v = Math.round(Math.min(1, inf[i]) * 100) / 100;
+        if (v !== last[i]) { last[i] = v; set[i](v); }
+      }
+    };
+    R.reset = function () {
+      last = lights.map(function () { return -1; });
+    };
+    return R;
+  }
+
+  var TUN_PATH = {
+    out: { path: "#tun-route-out", align: "#tun-route-out", alignOrigin: [0.5, 0.5], autoRotate: true },
+    back: { path: "#tun-route-back", align: "#tun-route-back", alignOrigin: [0.5, 0.5], autoRotate: true }
+  };
+  function tunPath(lane, start, end) {
+    var p = Object.assign({}, TUN_PATH[lane]);
+    if (start !== undefined) p.start = start;
+    if (end !== undefined) p.end = end;
+    return p;
+  }
+
+  /* Уход из прошлого состояния: трафик стекает, шлагбаум поднимается,
+     свет и огни возвращаются к виду нового состояния. Возвращает время конца. */
+  function tunnelLeave(tl, R, from, st) {
+    var g = Motion.g, end = 0;
+    var live = R.movers.filter(function (m) { return +g.getProperty(m.el, "opacity") > 0.02; });
+    if (live.length) {
+      tl.to(live.map(function (m) { return m.el; }), {
+        x: function (i) { return "+=" + live[i].lane * (40 + i * 6); }, autoAlpha: 0,
+        duration: 0.55, ease: "power2.in", stagger: 0.025
+      }, 0);
+      end = 0.45;
+    }
+    tl.to(R.boost, { v: 0, duration: 0.4, ease: "power2.out" }, 0);
+    tl.to(R.waves, { autoAlpha: 0, duration: 0.25 }, 0)
+      .set([R.ringIn, R.ringRelay], { clearProps: "transform,opacity,visibility" }, 0);
+    var to = TUN_LOOK[st], was = TUN_LOOK[from];
+    tl.to(R.G, { pwr: to.pwr, tx: to.tx, rx: to.rx, link: 0, mIn: 0, mOut: 0, duration: 0.5, ease: "power2.out" }, 0.1);
+    if (from === "stopped") {
+      tl.to(R.posts, { y: -64, autoAlpha: 0, duration: 0.45, ease: "back.in(1.6)" }, 0)
+        .to(R.bars, { drawSVG: "50% 50%", duration: 0.25, ease: "power2.in" }, 0)
+        .set(R.posts.concat(R.bars), { clearProps: "transform,opacity,visibility,strokeDasharray,strokeDashoffset" }, 0.5);
+      end = Math.max(end, 0.4);
+    }
+    if (was && st !== "not_configured") {
+      /* CSS уже показывает новое состояние; держим старый вид и уводим к новому. */
+      tl.fromTo([R.tube, R.out], { opacity: was.tube }, { opacity: to.tube, duration: 0.7, ease: "power2.inOut", clearProps: "opacity" }, 0.15);
+      tl.fromTo(R.relay, { opacity: was.relay }, { opacity: to.relay, duration: 0.7, ease: "power2.inOut", clearProps: "opacity" }, 0.15);
+      if (st !== "connected") tl.fromTo(R.ribs, { opacity: was.ribs }, { opacity: to.ribs, duration: 0.5, stagger: 0.04, clearProps: "opacity" }, 0.1);
+    }
+    return end;
+  }
+
+  /* Свод прорисовывается от входа к выходу: первый показ и выход из наброска. */
+  function tunnelDrawIn(tl, R, at) {
+    /* clearProps внутри твина DrawSVG не срабатывает (плагин пишет после очистки):
+       штрих снимается отдельной установкой в конце. */
+    tl.fromTo(R.walls, { drawSVG: "0% 0%" }, { drawSVG: "0% 100%", duration: 0.9, ease: "power2.inOut" }, at)
+      .fromTo(R.ribs, { drawSVG: "50% 50%" }, { drawSVG: "0% 100%", duration: 0.45, stagger: 0.07, ease: "power2.out" }, at + 0.15)
+      .set(R.walls.concat(R.ribs), { clearProps: "strokeDasharray,strokeDashoffset" }, at + 1.15)
+      .fromTo(R.mouths, { scaleY: 0.2, autoAlpha: 0, transformOrigin: "50% 50%" }, { scaleY: 1, autoAlpha: 1, duration: 0.6, stagger: 0.35, ease: "back.out(1.8)", clearProps: "transform,opacity,visibility" }, at);
+    return at + 0.9;
+  }
+
+  /* Рукопожатие: вызов доходит до ретранслятора, тот отвечает, ответ
+     возвращается — и туннель «открывается»: рёбра загораются по очереди. */
+  function tunnelHandshake(tl, R, at) {
+    var g = Motion.g;
+    tl.fromTo(R.waves, { autoAlpha: 0.9, scale: 0.6, transformOrigin: "50% 100%" },
+      { autoAlpha: 0, scale: 1.3, duration: 0.7, stagger: 0.08, ease: "power2.out", immediateRender: false }, at)
+      .set(R.probe, { autoAlpha: 1 }, at + 0.1)
+      .to(R.probe, { motionPath: tunPath("out", 0, 1), duration: 0.95, ease: "power2.inOut" }, at + 0.1)
+      .to(R.probe, { autoAlpha: 0, scale: 2.2, transformOrigin: "50% 50%", duration: 0.25, ease: "power2.out" }, at + 1.02)
+      .fromTo(R.ringRelay, { scale: 1, autoAlpha: 0.9, transformOrigin: "50% 50%" }, { scale: 1.55, autoAlpha: 0, duration: 0.8, ease: "power2.out", immediateRender: false }, at + 1.02)
+      .fromTo(R.relay, { scale: 1, transformOrigin: "50% 50%" }, { scale: 1.08, duration: 0.14, yoyo: true, repeat: 1, ease: "power2.out", immediateRender: false }, at + 1.02)
+      .to(R.G, { mOut: 1, duration: 0.15 }, at + 1.0)
+      .to(R.G, { mOut: 0, duration: 0.7, ease: "power2.out" }, at + 1.2)
+      .set(R.reply, { autoAlpha: 1, scale: 1 }, at + 1.1)
+      .to(R.reply, { motionPath: tunPath("back", 0, 1), duration: 0.8, ease: "power2.inOut" }, at + 1.1)
+      .to(R.reply, { autoAlpha: 0, duration: 0.2 }, at + 1.82)
+      .set([R.probe, R.reply], { clearProps: "transform", autoAlpha: 0 }, at + 2.1)
+      .fromTo(R.ringIn, { scale: 1, autoAlpha: 0.9, transformOrigin: "50% 50%" }, { scale: 1.4, autoAlpha: 0, duration: 0.7, ease: "power2.out", immediateRender: false }, at + 1.85)
+      .to(R.G, { mIn: 1, duration: 0.12 }, at + 1.85)
+      .to(R.G, { mIn: 0, duration: 0.8, ease: "power2.out" }, at + 2.0)
+      .fromTo(R.G, { tx: 1, rx: 1 }, { tx: TUN_LOOK.connected.tx, rx: TUN_LOOK.connected.rx, duration: 0.6, immediateRender: false }, at + 1.9);
+    var open = at + 1.9;
+    R.boost.forEach(function (b, i) {
+      tl.to(b, { v: 1, duration: 0.12, ease: "power2.out" }, open + i * 0.06)
+        .to(b, { v: 0, duration: 0.6, ease: "power2.in" }, open + i * 0.06 + 0.14);
+    });
+    tl.fromTo(R.ribs, { drawSVG: "50% 50%", opacity: 0.5 }, { drawSVG: "0% 100%", opacity: 1, duration: 0.4, stagger: 0.06, ease: "power2.out", immediateRender: false }, open)
+      .set(R.ribs, { clearProps: "strokeDasharray,strokeDashoffset,opacity" }, open + 0.9);
+    void g;
+    return open + 0.35;
+  }
+
+  /* Подключён: живой трафик. Обход на 30 кадрах по бесшовному кольцу:
+     первый круг начинается с пустого туннеля, дальше крутится окно второго круга. */
+  function tunnelTrafficLoop(tl, R, at) {
+    var g = Motion.g;
+    var plan = tunnelTraffic(0xD2C7, 12), L = plan.period;
+    var loop = g.timeline({ paused: true });
+    var launch = function (p, el, lane, off) {
+      var t = p.t + off, h = p.w > 20 ? 10 : 9, op = lane === "out" ? 1 : 0.78;
+      loop.set(el, { attr: { width: p.w, height: h, x: -p.w / 2, y: -h / 2, rx: h / 2 } }, t)
+        .to(el, { motionPath: tunPath(lane, 0, 1), duration: p.d, ease: "power1.inOut" }, t)
+        .fromTo(el, { autoAlpha: 0 }, { autoAlpha: op, duration: 0.22, ease: "none", immediateRender: false }, t)
+        .to(el, { autoAlpha: 0, duration: 0.28, ease: "none" }, t + p.d - 0.28);
+    };
+    [0, L].forEach(function (off) {
+      plan.out.forEach(function (p) { launch(p, R.pktOut[p.slot], "out", off); });
+      plan.back.forEach(function (p) { launch(p, R.pktBack[p.slot], "back", off); });
+    });
+    tl.add(loop.tweenFromTo(0, L, { ease: "none" }), at)
+      .add(loop.tweenFromTo(L, 2 * L, { ease: "none", repeat: -1 }), at + L);
+  }
+
+  /* Подключается: роутер зовёт, вызов уходит в туннель и гаснет без ответа;
+     попытки повторяются с растущей паузой и каждый раз заходят дальше. */
+  function tunnelSearchLoop(tl, R, at) {
+    var g = Motion.g;
+    var loop = g.timeline({ repeat: -1 });
+    [[0, 0.42], [1.7, 0.58], [3.9, 0.74]].forEach(function (a) {
+      var t = a[0], reach = a[1], d = 0.7 + reach * 1.1;
+      loop.to(R.G, { link: 1, duration: 0.1, ease: "power2.out" }, t)
+        .to(R.G, { link: 0, duration: 0.7, ease: "power2.in" }, t + 0.12)
+        .fromTo(R.waves, { autoAlpha: 0.85, scale: 0.6, transformOrigin: "50% 100%" },
+          { autoAlpha: 0, scale: 1.35, duration: 0.8, stagger: { each: 0.1, from: "start" }, ease: "power2.out", immediateRender: false }, t)
+        .to(R.probe, { motionPath: tunPath("out", 0, reach), duration: d, ease: "power2.out" }, t + 0.15)
+        .fromTo(R.probe, { autoAlpha: 0, scale: 1 }, { autoAlpha: 1, duration: 0.15, immediateRender: false }, t + 0.15)
+        .to(R.probe, { autoAlpha: 0, scale: 0.4, transformOrigin: "50% 50%", duration: 0.45, ease: "power2.in" }, t + 0.15 + d - 0.35);
+    });
+    loop.to({}, { duration: 1.4 });
+    tl.add(loop, at)
+      /* Ретранслятор ещё не ответил: его пунктирное кольцо медленно «ищет». */
+      .fromTo(R.ringRelay, { rotation: 0, transformOrigin: "50% 50%" }, { rotation: 360, duration: 14, ease: "none", repeat: -1, immediateRender: false }, at);
   }
 
   /* Петля туннеля живёт, только пока он на экране и вкладка видна:
@@ -1461,32 +1727,46 @@
   function tunnelMotion(body, st, prev) {
     var g = Motion.g;
     if (body.__tl) { body.__tl.kill(); body.__tl = null; }
-    if (body.__tick) { g.ticker.remove(body.__tick); body.__tick = null; }
-    if (!Motion.on()) { tunnelWatch(body); return; }
+    if (g && body.__tick) { g.ticker.remove(body.__tick); body.__tick = null; }
     var svg = body.querySelector(".tun");
-    if (!svg) return;
-    var q = function (sel) { return [].slice.call(svg.querySelectorAll(sel)); };
-    var tl = g.timeline({ paused: true });
+    if (!Motion.on() || !svg) {
+      if (g && svg) g.set(svg.querySelectorAll("*"), { clearProps: "all" });
+      body.__rig = null;
+      body.setAttribute("data-motion", "still");
+      tunnelWatch(body);
+      return;
+    }
+    body.setAttribute("data-motion", "live");
+    var R = body.__rig && body.__rig.svg === svg ? body.__rig : (body.__rig = tunnelRig(svg));
+    R.reset();
+    var tl = g.timeline({ paused: true, onUpdate: R.glow });
+    var at = prev ? tunnelLeave(tl, R, prev, st) : 0;
+    if (!prev) {
+      var look = TUN_LOOK[st];
+      g.set(R.G, { pwr: look.pwr, tx: look.tx, rx: look.rx, link: 0, mIn: 0, mOut: 0 });
+    }
     if (st === "connected") {
-      var out = q(".pkt-out"), back = q(".pkt-back");
-      g.set(out.concat(back), { x: 0, y: 0, attr: { x: -11, y: -4.5 } });
-      out.forEach(function (pkt, i) {
-        tl.fromTo(pkt, { autoAlpha: 0 }, { keyframes: { autoAlpha: [0, 1, 1, 1, 1, 0] }, duration: 2.8, repeat: -1, ease: "none" }, i * 0.75);
-        tl.to(pkt, { motionPath: { path: "#tun-route-out", align: "#tun-route-out", alignOrigin: [0.5, 0.5] }, duration: 2.8, repeat: -1, ease: "none" }, i * 0.75);
-      });
-      back.forEach(function (pkt, i) {
-        tl.fromTo(pkt, { autoAlpha: 0 }, { keyframes: { autoAlpha: [0, 0.7, 0.7, 0.7, 0.7, 0] }, duration: 3.2, repeat: -1, ease: "none" }, 0.4 + i * 0.85);
-        tl.to(pkt, { motionPath: { path: "#tun-route-back", align: "#tun-route-back", alignOrigin: [0.5, 0.5] }, duration: 3.2, repeat: -1, ease: "none" }, 0.4 + i * 0.85);
-      });
-      if (prev && prev !== "connected") {
-        g.fromTo(q(".tun-rib"), { drawSVG: "50% 50%" }, { drawSVG: "0% 100%", duration: 0.6, stagger: 0.05, ease: "power2.out" });
-        g.from(q(".tun-led"), { autoAlpha: 0, duration: 0.2, stagger: 0.1, repeat: 2, yoyo: true });
-      }
+      if (!prev || prev === "not_configured") at = tunnelDrawIn(tl, R, at);
+      if (prev) at = tunnelHandshake(tl, R, at);
+      tunnelTrafficLoop(tl, R, at);
     } else if (st === "connecting") {
-      tl.fromTo(q(".tun-rib"), { drawSVG: "0% 0%" }, { drawSVG: "0% 100%", duration: 0.5, stagger: 0.12, ease: "power2.out", repeat: -1, repeatDelay: 0.6 }, 0);
-      tl.fromTo(q(".pkt-out.pkt-0"), { autoAlpha: 0.3, x: 0 }, { autoAlpha: 1, x: 14, duration: 0.7, yoyo: true, repeat: -1, ease: "sine.inOut" }, 0);
-    } else if (st === "stopped" && prev && prev !== "stopped") {
-      g.fromTo(q(".tun-gate path"), { y: -70, autoAlpha: 1 }, { y: 0, duration: 0.9, ease: "bounce.out", clearProps: "transform" });
+      if (!prev || prev === "not_configured") at = tunnelDrawIn(tl, R, at);
+      tunnelSearchLoop(tl, R, at + 0.2);
+    } else if (st === "stopped") {
+      if (!prev || prev === "not_configured") at = tunnelDrawIn(tl, R, at) - 0.3;
+      /* Шлагбаум падает с отскоком, перекладины прочерчиваются, когда стойки встали. */
+      tl.fromTo(R.posts, { y: -70, autoAlpha: 0 }, { y: 0, autoAlpha: 1, duration: 0.9, ease: "bounce.out", immediateRender: true }, at)
+        .fromTo(R.bars, { drawSVG: "50% 50%", autoAlpha: 0 }, { drawSVG: "0% 100%", autoAlpha: 1, duration: 0.35, stagger: 0.1, ease: "power2.out", immediateRender: true }, at + 0.55)
+        .set(R.posts.concat(R.bars), { clearProps: "transform,opacity,visibility,strokeDasharray,strokeDashoffset" }, at + 1.1)
+        /* Роутер жив, туннель нет: питание дышит медленно. */
+        .to(R.G, { pwr: 0.35, duration: 1.8, ease: "sine.inOut", yoyo: true, repeat: -1 }, at + 1.2);
+    } else {
+      /* Не настроен: набросок проступает карандашом; на месте ретранслятора — призрак. */
+      var sketch = [R.tube, R.out, svg.querySelector(".tun-in"), R.relay];
+      if (prev) { tl.to(sketch, { autoAlpha: 0, duration: 0.35, ease: "power2.in" }, 0); at = Math.max(at, 0.4); }
+      tl.fromTo(sketch, { autoAlpha: 0, y: 4 }, { autoAlpha: function (i) { return i === 3 ? 0.4 : 1; }, y: 0, duration: 0.6, stagger: 0.12, ease: "power2.out", immediateRender: !prev }, at)
+        .set(sketch, { clearProps: "transform,opacity,visibility" }, at + 1.1)
+        .fromTo(R.relay, { opacity: 0.4 }, { opacity: 0.22, duration: 2.2, ease: "sine.inOut", yoyo: true, repeat: -1, immediateRender: false }, at + 1.15);
     }
     body.__tl = tl;
     tunnelWatch(body);
@@ -1508,7 +1788,8 @@
           body.__tick = function (time) {
             odd = !odd;
             if (odd) return;
-            tl.time(tl.time() + (time - last));
+            /* После долгой паузы кадра (фон, отладчик) не перепрыгиваем полсцены. */
+            tl.time(tl.time() + Math.min(time - last, 0.1));
             last = time;
           };
           g.ticker.add(body.__tick);
@@ -1553,16 +1834,14 @@
     var note = info.note;
     if (snap.telegram_enabled && st === "stopped") note = "Туннель включён в конфигурации, но служба не запущена.";
     body.setAttribute("data-state", st);
-    var prevState = body.getAttribute("data-prev") || "";
-    var keepScene = body.__scene && body.__sceneState === st ? body.__scene : null;
-    var scene = keepScene || tunnelScene(doc, st);
+    /* Сцена одна на все состояния: смена состояния — переход на том же рисунке. */
+    var prevState = body.__sceneState || "";
+    var scene = body.__scene || (body.__scene = tunnelScene(doc));
     body.replaceChildren(state, actions, scene, el(doc, "p", "tunnel-note", note));
-    if (!keepScene) {
-      body.__scene = scene;
+    if (prevState !== st) {
       body.__sceneState = st;
       tunnelMotion(body, st, prevState);
     }
-    body.setAttribute("data-prev", st);
     if (focused) {
       var again = body.querySelector("button");
       if (again) again.focus();
@@ -1760,7 +2039,7 @@
 
   var api = {
     model: model, coveredBy: coveredBy, slotsView: slotsView, trackFor: trackFor, shapeLabel: shapeLabel,
-    planGist: planGist, plural: plural, duration: duration, App: App
+    planGist: planGist, plural: plural, duration: duration, tunnelTraffic: tunnelTraffic, App: App
   };
   if (typeof module === "object" && module.exports) module.exports = api;
   if (global && global.document && global.document.getElementById) {
