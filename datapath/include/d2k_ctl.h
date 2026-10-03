@@ -61,7 +61,10 @@
  * подтверждённое знание других форм (задача 21). */
 /* v10: открытый HTTP без прокси (задача 51) — событие D2K_EV_HTTP_PORTAL и
  * команда D2K_CMD_SET_HTTPS. */
-#define D2K_CTL_PROTO_VERSION 10
+/* v11: форма имени D2K_PLAN_SHAPE_HTTP (7) в SET_NAME/SET_NAME_PROBE/
+ * DEL_NAME/DEL_NAME_PROBE и планы протокола http (задача 51, шаг 4). Старый
+ * датапат принял бы такую запись как обычную. */
+#define D2K_CTL_PROTO_VERSION 11
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */

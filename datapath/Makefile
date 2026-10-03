@@ -41,7 +41,7 @@ HDR     = include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h in
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_addr test_hold test_udp_hold test_udp_release test_udp_path test_routemark test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session test_http80
+TESTS   = test_addr test_hold test_udp_hold test_udp_release test_udp_path test_routemark test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session test_http80 test_http_hello
 
 .PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release test-udp-path test-routemark cross clean
 
@@ -101,8 +101,8 @@ udp_path.o: udp_path.c $(HDR)
 
 # Владение ID в обвязке d2kd (задача 46, ревью M4): сессия, удержание и
 # выпуск — настоящие модули, сокеты заменены записью вызовов.
-test_udp_path: test_udp_path.c udp_path.o udp_hold.o udp_release.o routemark.o nl.o session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_udp_path.c udp_path.o udp_hold.o udp_release.o routemark.o nl.o session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
+test_udp_path: test_udp_path.c udp_path.o udp_hold.o udp_release.o routemark.o nl.o session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_udp_path.c udp_path.o udp_hold.o udp_release.o routemark.o nl.o session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
 
 test-udp-path: test_udp_path
 	./test_udp_path
@@ -179,6 +179,16 @@ test-http80: test_http80
 
 check: test-http80
 
+# Запрос HTTP как вход плана (задача 51, шаг 4).
+test_http_hello: test_http_hello.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_http_hello.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(LDFLAGS)
+
+.PHONY: test-http-hello
+test-http-hello: test_http_hello
+	./test_http_hello
+
+check: test-http-hello
+
 core_quichello.o: $(CORE_DIR)/quichello.c $(COREHDR) $(CORE_DIR)/include/d2k_quichello.h $(CORE_DIR)/include/d2k_hello.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -227,18 +237,18 @@ test_journal: test_journal.c journal.o track.o $(HDR)
 # wire_udp.o и core_quic.o/core_crypto.o добавлены задачей 4: session.c теперь
 # зовёт d2k_wire_build_udp и разбор QUIC на UDP-ветке пакетного пути, и без
 # них линковка падает неопределёнными ссылками.
-test_session: test_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(LDFLAGS)
+test_session: test_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(LDFLAGS)
 
 # test_quic_session.c (задача 4) — то же самое дерево модулей, что и
 # test_session, тем же списком объектников: обе проверяют d2k_session_packet
 # целиком, только на разных транспортах.
-test_quic_session: test_quic_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
+test_quic_session: test_quic_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
 
 # Keep the STUN datapath proof independently runnable while QUIC acceptance is deferred.
-test_stun_session: test_stun_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_stun_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
+test_stun_session: test_stun_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_stun_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
 
 track.o: track.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<

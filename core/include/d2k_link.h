@@ -282,6 +282,8 @@ int  d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap);
  * адрес, — там же. */
 #define D2K_LINK_SHAPE_VOICE 5
 #define D2K_LINK_SHAPE_ECH_TCP 6
+/* Открытый HTTP (v11, задача 51, шаг 4) — то же число, что D2K_PLAN_SHAPE_HTTP. */
+#define D2K_LINK_SHAPE_HTTP 7
 #define D2K_LINK_VOICE_CLASS "@discord-voice"
 
 /* Имя с подтверждённым HTTPS на ttl_s секунд (D2K_CMD_SET_HTTPS, v10,

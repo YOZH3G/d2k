@@ -110,4 +110,13 @@ int d2k_http80_swap(d2k_http80 *h, d2k_http80_res *r, const uint8_t *out, const 
 
 d2k_http80_stats d2k_http80_get_stats(const d2k_http80 *h);
 
+/* ЗАПРОС HTTP КАК ВХОД ПЛАНА (задача 51, шаг 4). 1 — нагрузка начинается
+ * запросом GET/HEAD в origin-form с версией HTTP/1.x, и в ней есть ровно
+ * одна строка «Host:» целиком (до CRLF) с именем по синтаксису DNS и,
+ * быть может, портом :80. host_off и host_len — где в нагрузке имя (без
+ * порта и точки в конце): от него считаются разрезы плана, им же ищется
+ * план. Остальной заголовок может быть в следующих сегментах. 0 — не наш
+ * вход: пакет идёт как есть. */
+int d2k_http_hello(const uint8_t *p, size_t n, size_t *host_off, size_t *host_len);
+
 #endif /* D2K_HTTP80_H */

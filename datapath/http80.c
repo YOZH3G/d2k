@@ -361,3 +361,67 @@ int d2k_http80_swap(d2k_http80 *h, d2k_http80_res *r, const uint8_t *out, const 
     (void)io->send_rst(io->ctx, rst, r->rst_len);
     return 1;
 }
+
+/* --- запрос HTTP как вход плана (шаг 4) ----------------------------------- */
+
+static int lc(uint8_t c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
+int d2k_http_hello(const uint8_t *p, size_t n, size_t *host_off, size_t *host_len) {
+    if (!p || !host_off || !host_len) { return 0; }
+    size_t m;
+    if (n >= 5 && !memcmp(p, "GET /", 5)) { m = 4; }
+    else if (n >= 6 && !memcmp(p, "HEAD /", 6)) { m = 5; }
+    else { return 0; }
+    /* Строка запроса: путь без пробелов и управляющих, затем HTTP/1.x. */
+    size_t i = m;
+    while (i < n && p[i] > 0x20 && p[i] != 0x7f) { i++; }
+    if (i + 10 > n || memcmp(p + i, " HTTP/1.", 8) || (p[i + 8] != '0' && p[i + 8] != '1') ||
+        p[i + 9] != '\r' || i + 10 >= n || p[i + 10] != '\n') { return 0; }
+    i += 11;
+    int found = 0;
+    size_t off = 0, len = 0;
+    /* Строки заголовка, пока они целиком в этом сегменте. */
+    while (i < n) {
+        size_t e = i;
+        while (e + 1 < n && !(p[e] == '\r' && p[e + 1] == '\n')) { e++; }
+        if (e + 1 >= n) { break; }            /* строка не кончилась здесь */
+        if (e == i) { break; }                /* конец заголовка */
+        if (e - i >= 5 && lc(p[i]) == 'h' && lc(p[i + 1]) == 'o' && lc(p[i + 2]) == 's' &&
+            lc(p[i + 3]) == 't' && p[i + 4] == ':') {
+            if (found++) { return 0; }
+            size_t v = i + 5;
+            while (v < e && (p[v] == ' ' || p[v] == '\t')) { v++; }
+            size_t ve = e;
+            while (ve > v && (p[ve - 1] == ' ' || p[ve - 1] == '\t')) { ve--; }
+            size_t colon = v;
+            while (colon < ve && p[colon] != ':') { colon++; }
+            if (colon < ve && (ve - colon != 3 || p[colon + 1] != '8' || p[colon + 2] != '0')) {
+                return 0;                     /* порт не 80 */
+            }
+            size_t hl = colon - v;
+            if (hl && p[v + hl - 1] == '.') { hl--; }
+            if (hl == 0 || hl > 253) { return 0; }
+            size_t label = 0;
+            for (size_t k = 0; k < hl; k++) {
+                uint8_t c = p[v + k];
+                if (c == '.') {
+                    if (!label || p[v + k - 1] == '-') { return 0; }
+                    label = 0;
+                } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') || c == '-') {
+                    if ((!label && c == '-') || ++label > 63) { return 0; }
+                } else {
+                    return 0;
+                }
+            }
+            if (!label || p[v + hl - 1] == '-') { return 0; }
+            off = v;
+            len = hl;
+        }
+        i = e + 2;
+    }
+    if (found != 1) { return 0; }
+    *host_off = off;
+    *host_len = len;
+    return 1;
+}

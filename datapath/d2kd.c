@@ -586,7 +586,9 @@ static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
     d2k_http80_res r;
     d2k_http80_packet(http80, p, n, t, kstamp, raw ? out : NULL, raw ? sizeof out : 0,
                       rst, sizeof rst, &r);
-    if (r.injection) { http80_event(ctl, &r); }
+    /* Событие — после исхода замены (ревью N1): признак «307 ушёл» в нём
+       верный, и контроллер не повторяет SET_HTTPS зря. */
+    if (r.injection && (r.action != D2K_HTTP80_REPLACE || !raw)) { http80_event(ctl, &r); }
     if (r.action == D2K_HTTP80_DROP && raw) {
         if (d2k_nfq_verdict(q, id, D2K_NF_DROP, err, sizeof err) != 0) {
             st.verdict_fail++;
@@ -607,7 +609,9 @@ static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
        ушёл, или что ядро не приняло вердикт и ушла сама вставка. */
     http80_ctx x = {q, raw, id};
     d2k_http80_io io = {http80_io_payload, http80_io_accept, http80_io_rst, &x};
-    if (d2k_http80_swap(http80, &r, out, rst, &io)) {
+    int swapped = d2k_http80_swap(http80, &r, out, rst, &io);
+    http80_event(ctl, &r);
+    if (swapped) {
         http80_log(&r, "замена: клиенту 307 на https, серверу RST");
     } else {
         http80_log(&r, "замена НЕ ушла (вердикт с заменой отвергнут) — вставка пропущена как есть, "
@@ -1334,7 +1338,12 @@ int main(int argc, char **argv) {
 
                     st.seen++;
                     st.bytes += np.payload_len;
+                    /* Зонды контроллера (метка зондов) — не трафик человека:
+                       их вставку не заменяем и о ней не сообщаем, иначе
+                       собственный замер HTTP (шаг 4) мерил бы нашу же
+                       замену. */
                     if (np.have_payload && !np.truncated &&
+                        !(probe_mark && np.have_mark && np.mark == probe_mark) &&
                         http80_step(q, mode == MODE_APPLY ? raw : NULL, ctl, np.id,
                                     np.payload, np.payload_len, t,
                                     np.have_tstamp ? np.tstamp_ns : 0)) {

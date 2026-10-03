@@ -466,6 +466,41 @@ static void test_set_https(void) {
     d2k_ctl_flush(c);
     CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok,
           "SET_HTTPS без таблицы HTTP подтверждён как исполненный");
+    /* SET_NAME формы HTTP (v11, шаг 4): только план протокола http. */
+    {
+        static const uint8_t http_plan[] = {
+            'D', '2', 'K', 'P', 0, 1, 0, 11, 0, 0, 0, 2,
+            0x00, 0x02, 0x00, 0x02, 6, 4,                  /* proto tcp http */
+            0x01, 0x00, 0x00, 0x04, 0x00, 0x05, 0x00, 0x00 /* split sni_middle */
+        };
+        static const uint8_t tls_plan[] = {
+            'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 2,
+            0x00, 0x02, 0x00, 0x02, 6, 1,
+            0x01, 0x00, 0x00, 0x04, 0x00, 0x05, 0x00, 0x00
+        };
+        const char *nm = "rutracker.org";
+        size_t l = strlen(nm);
+        uint8_t nb[128];
+        nb[0] = (uint8_t)l; memcpy(nb + 1, nm, l); nb[1 + l] = 7; nb[2 + l] = 4;
+        memcpy(nb + 3 + l, http_plan, sizeof http_plan);
+        d2k_ctlsrv_command(&cx, D2K_CMD_SET_NAME, nb, 3 + l + sizeof http_plan);
+        d2k_ctl_flush(c);
+        CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && cmd == D2K_CMD_SET_NAME && ok,
+              "SET_NAME формы HTTP с HTTP-планом не принят");
+        CHECK(d2k_plantab_find_http(d2k_session_plans(sess), (const uint8_t *)nm, l, 4, 0, 1) != NULL,
+              "HTTP-план имени не встал в таблицу");
+        memcpy(nb + 3 + l, tls_plan, sizeof tls_plan);
+        d2k_ctlsrv_command(&cx, D2K_CMD_SET_NAME, nb, 3 + l + sizeof tls_plan);
+        d2k_ctl_flush(c);
+        CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok && reason == D2K_ACK_BAD_ARGS,
+              "TLS-план под формой HTTP принят");
+        nb[1 + l] = 1;   /* MODERN */
+        memcpy(nb + 3 + l, http_plan, sizeof http_plan);
+        d2k_ctlsrv_command(&cx, D2K_CMD_SET_NAME, nb, 3 + l + sizeof http_plan);
+        d2k_ctl_flush(c);
+        CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok && reason == D2K_ACK_BAD_ARGS,
+              "HTTP-план под формой TLS принят");
+    }
     d2k_http80_free(h);
     d2k_session_free(sess);
     close(cli);

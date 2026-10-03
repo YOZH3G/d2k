@@ -202,8 +202,9 @@ static int area_set(d2k_plantab *t, area_entry *v, size_t *used, size_t cap,
 int d2k_plantab_set_suffix_family(d2k_plantab *t, const uint8_t *name, size_t len,
     uint64_t now_ns, d2k_plan *p, uint8_t shape, uint8_t family) {
     (void)now_ns;
-    if (!t || !p || (d2k_plan_transport(p) && d2k_plan_transport(p) != shape_transport(shape))) {
-        d2k_plan_free(p); return -2;
+    if (!t || !p || (d2k_plan_transport(p) && d2k_plan_transport(p) != shape_transport(shape)) ||
+        shape == D2K_PLAN_SHAPE_HTTP || d2k_plan_proto(p) == D2K_PLAN_PROTO_HTTP) {
+        d2k_plan_free(p); return -2;   /* HTTP — только точное имя */
     }
     return area_set(t, t->suffixes, &t->suffix_used, D2K_PLAN_SUFFIX_MAX,
         name, len, shape_transport(shape), shape, family, p);
@@ -361,11 +362,21 @@ static entry *find_name_port(d2k_plantab *t, const uint8_t *name, size_t len,
     if (!sport_be) { return NULL; }
     for (size_t i = 0; i < t->used; i++) {
         if (t->v[i].kind == KEY_NAME && t->v[i].family == family && t->v[i].only_sport == sport_be &&
+            t->v[i].shape != D2K_PLAN_SHAPE_HTTP &&
             name_eq(t->v[i].name, t->v[i].name_len, name, len)) {
             return &t->v[i];
         }
     }
     return NULL;
+}
+
+const d2k_plan *d2k_plantab_find_http(d2k_plantab *t, const uint8_t *name, size_t len,
+                                      uint8_t family, uint16_t sport_be, uint64_t now_ns) {
+    if (!t || !name || !len) { return NULL; }
+    entry *e = find_name_shape_port(t, name, len, D2K_PLAN_SHAPE_HTTP, sport_be, family);
+    if (!e || d2k_plan_proto(e->plan) != D2K_PLAN_PROTO_HTTP) { return NULL; }
+    e->last_used_ns = now_ns;
+    return e->plan;
 }
 
 /* Адресная запись — КЛЮЧ (адрес, семейство, форма протокола). Один IP может
@@ -407,6 +418,9 @@ static void scan_name(d2k_plantab *t, const uint8_t *name, size_t len,
         entry *e = &t->v[i];
         if (e->kind != KEY_NAME || e->family != family || e->only_sport != 0 ||
             !name_eq(e->name, e->name_len, name, len)) continue;
+        /* Запись HTTP — не знание о TLS этого имени: «имя знаем, формы нет»
+           из-за неё заслонило бы приветствию адресный план. */
+        if (e->shape == D2K_PLAN_SHAPE_HTTP) continue;
         if (!h->any) h->any = e;
         if (!h->shaped && e->shape == seen_shape) h->shaped = e;
         if (!h->modern && e->shape == D2K_PLAN_SHAPE_MODERN) h->modern = e;
@@ -523,6 +537,12 @@ int d2k_plantab_set_name_family(d2k_plantab *t, const uint8_t *name, size_t len,
         d2k_plan_free(p);
         return -2;
     }
+    /* Форма HTTP и протокол http — только вместе (шаг 4 задачи 51). */
+    if ((shape == D2K_PLAN_SHAPE_HTTP) != (d2k_plan_proto(p) == D2K_PLAN_PROTO_HTTP) ||
+        (shape == D2K_PLAN_SHAPE_HTTP && d2k_plan_transport(p) != 6)) {
+        d2k_plan_free(p);
+        return -2;
+    }
     t->revision++;
     /* The controller reserves this local port exclusively. Reuse transfers
        ownership, even if the previous task missed its cleanup. Do not leave
@@ -609,8 +629,9 @@ int d2k_plantab_set_addr_family(d2k_plantab *t, const uint8_t *addr, uint8_t fam
 
 int d2k_plantab_set_addr_shaped(d2k_plantab *t, const uint8_t *addr, uint8_t family,
                                 uint64_t now_ns, d2k_plan *p, uint8_t shape) {
-    if (!t || !addr || (family != 4 && family != 6) || shape == D2K_PLAN_SHAPE_ANY) {
-        d2k_plan_free(p);
+    if (!t || !addr || (family != 4 && family != 6) || shape == D2K_PLAN_SHAPE_ANY ||
+        shape == D2K_PLAN_SHAPE_HTTP || d2k_plan_proto(p) == D2K_PLAN_PROTO_HTTP) {
+        d2k_plan_free(p);   /* HTTP — только точное имя, не адрес */
         return -2;
     }
     t->revision++;
