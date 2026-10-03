@@ -98,8 +98,9 @@ int d2k_udp_follow_mark(d2k_udp_follow *f, const uint8_t *pkt, size_t len,
                         uint64_t now_ns, uint64_t at_ns, uint64_t seq);
 /* One when pkt is a whole (unfragmented) UDP datagram of a marked tuple in the
  * client's direction, read in the head's receive batch or inside the window.
- * *at_ns (optional) gets the head's deferred emit time: a late tail must not
- * overtake it (review M1). */
+ * seq 0 (D2K_UDP_SEQ_NONE: released with no read to follow) matches by time
+ * only.  *at_ns (optional) gets the head's deferred emit time: a late tail is
+ * queued behind it even once it is due (review M1, N3). */
 int d2k_udp_follow_match(const d2k_udp_follow *f, const uint8_t *pkt, size_t len,
                          uint64_t now_ns, uint64_t seq, uint64_t *at_ns);
 

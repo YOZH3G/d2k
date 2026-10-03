@@ -10,6 +10,8 @@
 #include "d2k_udp_path.h"
 #include "d2k_nl.h"
 #include "d2k_quichello.h"
+#include "d2k_plan.h"
+#include "d2k_plans.h"
 
 static int fails;
 #define CHECK(x, m) do { if (!(x)) { fprintf(stderr, "udp_path:%d: %s\n", __LINE__, m); fails++; } } while (0)
@@ -93,6 +95,7 @@ static size_t unnamed_initial(uint8_t *pay, uint8_t salt) {
 
 static d2k_udp_out out;
 static d2k_udp_path path;
+static int last_replay_applied;
 
 /* d2kd's per-packet order, minus plan execution (no plan installed). */
 static int run_packet(d2k_session *s, uint32_t id, const uint8_t *pkt, size_t n,
@@ -100,7 +103,7 @@ static int run_packet(d2k_session *s, uint32_t id, const uint8_t *pkt, size_t n,
     uint8_t obuf[4096];
     d2k_key key;
     memset(&key, 0, sizeof key);
-    path.seq = seq;
+    if (seq) { path.seq = seq; }  /* 0: d2kd's own numbering (d2k_udp_path_read) */
     int fed = d2k_udp_path_pre(&path, id, pkt, n, t, &key);
     d2k_result r;
     d2k_session_packet(s, pkt, n, t, obuf, sizeof obuf, &r);
@@ -108,10 +111,13 @@ static int run_packet(d2k_session *s, uint32_t id, const uint8_t *pkt, size_t n,
     int how = d2k_udp_path_post(&path, fed, &key, &r, &b);
     if (how == D2K_UDP_PATH_REPLAY) {
         d2k_session_packet(s, b.packets[0], b.len[0], t, obuf, sizeof obuf, &r);
-        (void)d2k_udp_out_batch(&out, &b, D2K_NF_ACCEPT, 0, t, t, seq);
+        last_replay_applied = r.applied;
+        (void)d2k_udp_out_batch(&out, &b, D2K_NF_ACCEPT, 0, t, t, path.seq);
     } else if (how == D2K_UDP_PATH_NORMAL || how == D2K_UDP_PATH_LOST) {
         int vf = 0;
-        if (!d2k_udp_out_late(&out, id, pkt, n, t, seq, &vf)) {
+        /* d2kd's gate: only a datagram the kernel would get plainly. */
+        if (r.applied || r.verdict != D2K_VERDICT_ACCEPT ||
+            !d2k_udp_out_late(&out, id, pkt, n, t, path.seq, &vf)) {
             (void)rec_verdict(NULL, id, D2K_NF_ACCEPT);
         }
     }
@@ -308,7 +314,117 @@ static void test_ordering_guards(void) {
     done(s, h, f);
 }
 
+/* N2: an expiry on a poll wake with no read must not lend its read number to
+ * the next read.  Follows d2kd's own numbering (read / expire). */
+static void test_expiry_read_numbering(void) {
+    for (int read_follows = 0; read_follows <= 1; read_follows++) {
+        d2k_udp_hold *h; d2k_udp_follow *f;
+        d2k_session *s = fresh(&h, &f);
+        reset();
+        uint8_t pay[1300], pkt[1400], late[200];
+        memset(late, 0xD1, sizeof late);
+        size_t pn = unnamed_initial(pay, 1);
+        size_t n = build(pkt, 1, 50500, pay, pn);
+        d2k_udp_path_read(&path, 1000);
+        CHECK(run_packet(s, 1, pkt, n, 1000, 0) == D2K_UDP_PATH_HELD, "unnamed head held");
+        uint64_t deadline = 1000 + D2K_UDP_HOLD_WAIT_NS;
+        CHECK(d2k_udp_path_expire(&path, deadline, read_follows) == 1, "expired on the wake");
+        CHECK(last_verdict[1] == D2K_NF_ACCEPT, "expired head ACCEPT");
+        uint64_t later = deadline + 150000000;
+        d2k_udp_path_read(&path, later);
+        n = build(pkt, 2, 50500, late, sizeof late);
+        (void)run_packet(s, 2, pkt, n, later, 0);
+        CHECK(verdicts_of[2] == 1, "one verdict");
+        if (read_follows) {
+            CHECK(last_verdict[2] == D2K_NF_DROP && sends_of[2] == 1,
+                  "read right after the expiry: queued before it, re-sent");
+        } else {
+            CHECK(last_verdict[2] == D2K_NF_ACCEPT && sends_of[2] == 0,
+                  "a read 150 ms after a poll-wake expiry is NOT re-sent");
+        }
+        done(s, h, f);
+    }
+}
+
+/* N1: a slot expiring inside the next feed must not turn an applied plan into
+ * a reclaimed ACCEPT with nothing on the wire. */
+static const uint8_t plan_bytes[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 4,
+    0x00, 0x10, 0x00, 0x05, 0x00, 0x01, 0xDE, 0xAD, 0xBE,
+    0x00, 0x11, 0x00, 0x08, 0x00, 0x01, 0x03, 0x00, 0, 0, 0, 0,
+    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00,
+                            0x00, 0x01, 0x30, 0xB0,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
+static void test_expiry_inside_feed_keeps_plan(void) {
+    uint8_t probe[1600], head[2048], tail[2048], pkt[2200];
+    size_t pl = 0, hn = 0, tn = 0;
+    CHECK(d2k_quic_probe_initial("www.example.com", probe, sizeof probe, &pl) == 0 &&
+          d2k_quic_hello_split(probe, pl, "www.example.com", head, sizeof head, &hn,
+                               tail, sizeof tail, &tn) == 0, "split fixture");
+    if (!hn || !tn) { return; }
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    d2k_plan *p = NULL;
+    char err[160];
+    CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_name_shaped(d2k_session_plans(s),
+              (const uint8_t *)"www.example.com", 15, 1, p, D2K_PLAN_SHAPE_QUIC) == 0,
+          "plan installed");
+    reset();
+    last_replay_applied = 0;
+    size_t n = build(pkt, 1, 50600, tail, tn);
+    d2k_udp_path_read(&path, 6000);
+    CHECK(run_packet(s, 1, pkt, n, 6000, 0) == D2K_UDP_PATH_HELD, "tail held");
+    /* The next datagram is read after the slot's deadline, before any
+       top-of-loop flush caught it. */
+    uint64_t t = 6000 + D2K_UDP_HOLD_WAIT_NS;
+    d2k_udp_path_read(&path, t);
+    n = build(pkt, 2, 50600, head, hn);
+    int how = run_packet(s, 2, pkt, n, t, 0);
+    CHECK(how == D2K_UDP_PATH_REPLAY, "the completing datagram is replayed, not reclaimed");
+    CHECK(last_replay_applied, "the plan is applied through the replay path");
+    CHECK(verdicts_of[1] == 1 && last_verdict[1] == D2K_NF_ACCEPT,
+          "the expired tail was released once, before");
+    CHECK(verdicts_of[2] == 1, "the replayed head got exactly one verdict");
+    done(s, h, f);
+}
+
+/* N3: a late tail never overtakes a deferred head that is due but not yet
+ * popped from the deferred queue; N4: wait without ownership is not HELD. */
+static void test_due_head_and_unfed_wait(void) {
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    uint8_t pay[100], pkt[200];
+    memset(pay, 0x55, sizeof pay);
+    d2k_udp_hold_batch b;
+    memset(&b, 0, sizeof b);
+    b.count = 1;
+    b.ids[0] = 20; b.len[0] = build(b.packets[0], 20, 50700, pay, sizeof pay);
+    reset();
+    uint64_t now = 7000, at = 7000 + 20000000;
+    (void)d2k_udp_out_batch(&out, &b, D2K_NF_DROP, 1, at, now, 3);
+    size_t n = build(pkt, 21, 50700, pay, sizeof pay);
+    int vf = 0;
+    CHECK(d2k_udp_out_late(&out, 21, pkt, n, at + 500000, 4, &vf) == 1, "late tail matched");
+    CHECK(sends_of[21] == 1 && send_at_of[21] == at,
+          "head due but not popped: the tail still queues behind it");
+
+    d2k_result r;
+    memset(&r, 0, sizeof r);
+    r.udp_hold_wait = 1;
+    d2k_key key;
+    memset(&key, 0, sizeof key);
+    CHECK(d2k_udp_path_post(&path, 0, &key, &r, &b) == D2K_UDP_PATH_NORMAL,
+          "wait for a packet the hold does not own: the caller keeps the ID");
+    done(s, h, f);
+}
+
 int main(void) {
+    test_expiry_read_numbering();
+    test_expiry_inside_feed_keeps_plan();
+    test_due_head_and_unfed_wait();
     test_unnamed_past_window();
     test_reclaim_guard();
     test_named_unplanned();

@@ -795,9 +795,9 @@ int main(int argc, char **argv) {
     udp_path.sess = sess;
     udp_path.hold = udp_holding;
     udp_path.out = &udp_out;
-    /* Номер пачки приёма: всё, что прочитано в одной пачке с выпуском головы,
-       стояло в очереди до её вердикта (окно столкновения, d2k_udp_follow). */
-    uint64_t rseq = 1;
+    /* Номер пачки приёма ведёт udp_path (d2k_udp_path_read/expire): всё,
+       что прочитано в одной пачке с выпуском головы, стояло в очереди до её
+       вердикта (окно столкновения, d2k_udp_follow). */
 
     static uint8_t rbuf[RECV_BUF];
     static uint8_t obuf[OUT_BUF];
@@ -888,24 +888,28 @@ int main(int argc, char **argv) {
 
         d2k_hold_flush(holding, now_ns(), d2k_session_plan_revision(sess), 0,
                         release_original, &hc);
-        udp_path.now_ns = now_ns(); udp_path.seq = rseq + 1;
-        d2k_udp_hold_flush(udp_holding, udp_path.now_ns, d2k_udp_path_release, &udp_path);
-        if (pr > 0 && (pfd[iq].revents & POLLIN)) {
+        /* Номер следующего чтения истёкшая ячейка получает, только если это
+           чтение будет в этом же проходе: иначе её окно открылось бы для
+           чтения через сколько угодно времени (ревью N2). */
+        int read_follows = pr > 0 && (pfd[iq].revents & POLLIN);
+        (void)d2k_udp_path_expire(&udp_path, now_ns(), read_follows);
+        if (read_follows) {
             ssize_t n = d2k_nfq_recv(q, rbuf, sizeof rbuf, err, sizeof err);
             if (n == -1) {
                 st.recv_err++;
                 fprintf(stderr, "d2kd: %s\n", err);
                 d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
-                udp_path.now_ns = now_ns(); udp_path.seq = rseq + 1;
-                d2k_udp_hold_flush(udp_holding, udp_path.now_ns, d2k_udp_path_release, &udp_path);
+                /* Чтения не было: его номер не достаётся никому. */
+                d2k_udp_path_read(&udp_path, now_ns());
+                (void)d2k_udp_path_expire(&udp_path, now_ns(), 0);
             } else if (n == -2) {
                 d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
-                udp_path.now_ns = now_ns(); udp_path.seq = rseq + 1;
-                d2k_udp_hold_flush(udp_holding, udp_path.now_ns, d2k_udp_path_release, &udp_path);
+                /* Чтения не было: его номер не достаётся никому. */
+                d2k_udp_path_read(&udp_path, now_ns());
+                (void)d2k_udp_path_expire(&udp_path, now_ns(), 0);
             } else if (n > 0) {
                 t = now_ns();
-                rseq++;
-                udp_path.seq = rseq;
+                d2k_udp_path_read(&udp_path, t);
                 d2k_nl_iter it;
                 d2k_nl_msg m;
                 d2k_nl_iter_init(&it, rbuf, (size_t)n);
@@ -1289,12 +1293,12 @@ int main(int argc, char **argv) {
                            input and must remain in the stream: they follow
                            the head out through the raw path. */
                         original_failed = d2k_udp_out_batch(&udp_out, &udp_batch, verdict,
-                                                            owned_batch, at, t, rseq) != 0;
+                                                            owned_batch, at, t, udp_path.seq) != 0;
                     } else if (!delayed_originals && !batch.count &&
                                verdict == D2K_NF_ACCEPT && !res.applied &&
                                np.have_payload && !np.truncated &&
                                d2k_udp_out_late(&udp_out, np.id, np.payload,
-                                                np.payload_len, t, rseq,
+                                                np.payload_len, t, udp_path.seq,
                                                 &original_failed)) {
                         /* ЗАПОЗДАВШИЙ ХВОСТ (задача 46): голова потока уже
                            выпущена одна (имя собралось на ней), а эта
@@ -1421,8 +1425,7 @@ int main(int argc, char **argv) {
     }
 
     d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
-    udp_path.now_ns = now_ns(); udp_path.seq = rseq + 1;
-    d2k_udp_hold_flush(udp_holding, udp_path.now_ns, d2k_udp_path_release, &udp_path);
+    (void)d2k_udp_path_expire(&udp_path, now_ns(), 0);
     if (udp_releases) {
         (void)d2k_udp_release_flush(udp_releases, UINT64_MAX,
                                      send_delayed_verdict,
@@ -1449,8 +1452,10 @@ int main(int argc, char **argv) {
     print_journal(sess, start);
 
     d2k_ctl_close(ctl);
-    /* The hold first: releasing it may still queue tails (ревью M3). */
+    /* The hold first, while the scheduler still exists (ревью M3); its
+       release sends now (at == now). */
     udp_path.now_ns = now_ns();
+    udp_path.seq = D2K_UDP_SEQ_NONE;
     d2k_udp_hold_free(udp_holding, d2k_udp_path_release, &udp_path);
     udp_holding = NULL;
     udp_path.hold = NULL;

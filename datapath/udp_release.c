@@ -255,7 +255,7 @@ int d2k_udp_follow_match(const d2k_udp_follow *f, const uint8_t *pkt, size_t len
     for (size_t i = 0; i < D2K_UDP_FOLLOW_SLOTS; i++) {
         const follow_entry *e = &f->e[i];
         if (!e->used || !same_tuple(e, &t)) { continue; }
-        if (e->seq == seq || now_ns < e->until_ns) {
+        if ((e->seq && e->seq == seq) || now_ns < e->until_ns) {
             if (at_ns) { *at_ns = e->at_ns; }
             return 1;
         }
@@ -304,7 +304,9 @@ int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
         !d2k_udp_follow_match(o->follow, pkt, len, now_ns, seq, &at)) {
         return 0;
     }
-    out_tail c = {o, at, now_ns};
+    /* A deferred head stays deferred until the queue pops it, even once due:
+       queue the tail at its time whenever there is one (review N3). */
+    out_tail c = {o, at, at ? 0 : now_ns};
     uint32_t v = out_resend(&c, pkt, len) == 0 ? D2K_NF_DROP : D2K_NF_ACCEPT;
     int rc = o->verdict(o->ctx, id, v);
     if (verdict_failed) { *verdict_failed = rc != 0; }

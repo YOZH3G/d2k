@@ -21,7 +21,21 @@ typedef struct {
     const d2k_udp_out *out;
     uint64_t now_ns;   /* set by the caller before d2k_udp_hold_flush */
     uint64_t seq;      /* receive batch of the packets now being read */
+    uint64_t rseq;     /* last receive batch number handed out */
 } d2k_udp_path;
+
+/* No read ever gets this number (reads start at 1). */
+#define D2K_UDP_SEQ_NONE 0
+
+/* A new NFQUEUE receive batch is about to be processed. */
+void d2k_udp_path_read(d2k_udp_path *pp, uint64_t now_ns);
+
+/* Releases expired slots outside packet processing (the poll wake, a receive
+ * error, shutdown).  Their datagrams' clash window is the next read only if a
+ * read follows in this same loop pass (read_follows): what is queued now is
+ * read then.  Otherwise the release gets D2K_UDP_SEQ_NONE, and a later read
+ * matches by time only (review N2).  Returns released IDs. */
+size_t d2k_udp_path_expire(d2k_udp_path *pp, uint64_t now_ns, int read_follows);
 
 enum {
     D2K_UDP_PATH_NORMAL = 0,  /* caller issues the verdict for its packet */
