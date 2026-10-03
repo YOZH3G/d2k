@@ -1,6 +1,9 @@
 /* Exercise the production HTTP reader with fragmented byte streams, no sockets. */
+#include "quicconn.c" /* настоящее соединение: удержание ответа в нём — часть проверки */
 #include "verify.c"
 #include <stdio.h>
+#include <assert.h>
+#include <fcntl.h>
 
 typedef struct { const char *reply; size_t pos, fragment; int eof_err; size_t len; } fixture;
 static long fixture_read(void *ctx, uint8_t *buf, size_t cap, int wait,
@@ -50,6 +53,64 @@ static size_t h3_headers_frame(uint8_t *out, size_t section_len) {
     memcpy(out + o, sec, k); o += k;
     free(sec);
     return o;
+}
+
+/* Задача 44, раунд 1 (I1): ответ HTTP/3 идёт через НАСТОЯЩЕЕ соединение
+   quicconn с ключами из постоянного секрета: проверяется то, сколько байт
+   потока оно удерживает, а не поддельный приёмник. */
+static d2k_qc *real_h3_conn(int *server, struct sockaddr_in *client_addr) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(s >= 0);
+    int rb = 1 << 20;
+    (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(s, (struct sockaddr *)&a, sizeof a) == 0);
+    socklen_t len = sizeof a;
+    assert(getsockname(s, (struct sockaddr *)&a, &len) == 0);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(fd >= 0);
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
+    assert(connect(fd, (struct sockaddr *)&a, sizeof a) == 0);
+    len = sizeof *client_addr;
+    assert(getsockname(fd, (struct sockaddr *)client_addr, &len) == 0);
+    d2k_qc *c = calloc(1, sizeof *c);
+    assert(c);
+    c->fd = fd; c->peer_name = -1; c->version = D2K_QW_V1;
+    c->dcid_len = 8; memset(c->dcid, 0x5a, 8);
+    c->scid_len = 8; memset(c->scid, 0x3c, 8);
+    uint8_t secret[32];
+    memset(secret, 0x42, sizeof secret);
+    assert(d2k_qw_keys_from_secret(c->version, secret, &c->lv[D2K_QW_LEVEL_APP].tx) == 0);
+    assert(d2k_qw_keys_from_secret(c->version, secret, &c->lv[D2K_QW_LEVEL_APP].rx) == 0);
+    *server = s;
+    return c;
+}
+/* Сервер: кадр HEADERS длиной section_len на потоке 0, пакетами по ~1100 байт. */
+static void real_h3_serve(int server, const struct sockaddr_in *to, const uint8_t *data, size_t n) {
+    uint8_t secret[32];
+    memset(secret, 0x42, sizeof secret);
+    d2k_qw_keys sk;
+    assert(d2k_qw_keys_from_secret(D2K_QW_V1, secret, &sk) == 0);
+    uint64_t pn = 0;
+    for (size_t off = 0; off < n; ) {
+        size_t take = n - off > 1100 ? 1100 : n - off;
+        uint8_t fr[1200], hdr[16], pkt[1500];
+        size_t o = 0;
+        fr[o++] = 0x0e; /* STREAM: OFF | LEN, без FIN */
+        o += d2k_qw_varint_write(fr + o, sizeof fr - o, 0);
+        o += d2k_qw_varint_write(fr + o, sizeof fr - o, off);
+        o += d2k_qw_varint_write(fr + o, sizeof fr - o, take);
+        memcpy(fr + o, data + off, take); o += take;
+        hdr[0] = 0x40; memset(hdr + 1, 0x3c, 8);
+        size_t pl = d2k_qw_pn_len(pn, -1);
+        size_t m = d2k_qw_seal(&sk, 0, hdr, 9, pn, pl, fr, o, pkt, sizeof pkt);
+        assert(m > 0);
+        assert(sendto(server, pkt, m, 0, (const struct sockaddr *)to, sizeof *to) == (ssize_t)m);
+        pn++; off += take;
+    }
 }
 int main(void) {
     struct { const char *reply; d2k_ver_level level; } cases[] = {
@@ -227,6 +288,82 @@ int main(void) {
             verify_now_ms() + 100000, &got, &st, &closed, err, sizeof err);
         if (!too_long || st != 0) {
             fprintf(stderr, "H3 header limit: too_long %d status %d\n", too_long, st); fails++;
+        }
+    }
+    /* Задача 44, раунд 1 (I1): через настоящее соединение заголовки HTTP/3
+       ~20 КБ проходят, а больше предела — наш предел, не «приложение молчит». */
+    {
+        static uint8_t frame[D2K_VERIFY_HEADER_LIMIT + 8192], rx[D2K_VERIFY_HEADER_LIMIT];
+        size_t sizes[] = {20000, D2K_VERIFY_HEADER_LIMIT + 4000};
+        for (size_t k = 0; k < 2; k++) {
+            int server = -1; struct sockaddr_in to;
+            d2k_qc *c = real_h3_conn(&server, &to);
+            char err[100] = "";
+            static const uint8_t req[] = {1, 2, 3};
+            assert(d2k_qc_stream_send(c, 0, req, sizeof req, 1, err, sizeof err) == 0);
+            size_t fl = h3_headers_frame(frame, sizes[k]);
+            real_h3_serve(server, &to, frame, fl);
+            quic_recv_ctx rc = { c };
+            size_t got = 0; int st = 0, closed = 0;
+            int too_long = h3_read_headers(quic_recv_chunk, &rc, rx, sizeof rx,
+                verify_now_ms() + 20000, &got, &st, &closed, err, sizeof err);
+            if (k == 0 ? (too_long || st != 200) : (!too_long || st != 0)) {
+                fprintf(stderr, "real quicconn H3 headers %zu: too_long %d status %d got %zu\n",
+                    sizes[k], too_long, st, got); fails++;
+            }
+            d2k_qc_close(c); close(server);
+        }
+    }
+    /* Раунд 1: сбои чтения ТЕЛА тоже называют причину (после двоеточия не пусто). */
+    {
+        struct { const char *reply; int eof_err; const char *needle; } bad[] = {
+            {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 0, "не шестнадцатеричный"},
+            {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXY0\r\n\r\n", 0, "нет CRLF"},
+            {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\n", 0, "без CR"},
+            {"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 0, "вместе с Transfer-Encoding"},
+            {"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nabc", 0, "закрыл соединение посреди тела"},
+            {"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nabc", 1, "ошибка чтения"},
+            {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nx\r\n0\r\n\r\n", 0, "наш предел"},
+        };
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            fixture f = {bad[i].reply, 0, 64, bad[i].eof_err, 0};
+            d2k_ver_result r = {0}; char err[200] = "";
+            r.level = D2K_VER_HANDSHAKE;
+            request_complete_page(fixture_read, fixture_write, &f, "example.com",
+                0, NULL, 1000, 0, &r, err, sizeof err);
+            const char *colon = strstr(r.reason, "байт): ");
+            if (r.level == D2K_VER_APPLICATION || !colon || colon[strlen("байт): ")] == '\0' ||
+                !strstr(r.reason, bad[i].needle) ||
+                r.local_limit != (strstr(bad[i].needle, "предел") != NULL)) {
+                fprintf(stderr, "body failure reason %zu: [%s] local %d\n", i, r.reason, r.local_limit); fails++;
+            }
+        }
+    }
+    /* Раунд 1: 1xx с длинными заголовками, затем длинный окончательный ответ. */
+    {
+        static char early[40 * 1024];
+        size_t o = (size_t)snprintf(early, sizeof early, "HTTP/1.1 103 Early Hints\r\n");
+        for (; o < 8500;) {
+            o += (size_t)snprintf(early + o, sizeof early - o, "link: ");
+            memset(early + o, 'l', 400); o += 400; early[o++] = '\r'; early[o++] = '\n';
+        }
+        o += (size_t)snprintf(early + o, sizeof early - o, "\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n");
+        for (; o < 20000;) {
+            o += (size_t)snprintf(early + o, sizeof early - o, "x-pad: ");
+            memset(early + o, 'p', 400); o += 400; early[o++] = '\r'; early[o++] = '\n';
+        }
+        o += (size_t)snprintf(early + o, sizeof early - o, "\r\nbody");
+        size_t frags[] = {1, 7, 1460, sizeof early};
+        for (size_t k = 0; k < 4; k++) {
+            fixture f = {early, 0, frags[k], 0, 0};
+            d2k_ver_result r = {0}; char err[200] = "";
+            r.level = D2K_VER_HANDSHAKE;
+            request_complete_page(fixture_read, fixture_write, &f, "example.com",
+                2, NULL, 1000, 0, &r, err, sizeof err);
+            if (r.level != D2K_VER_APPLICATION || r.status != 200 || !r.body_complete) {
+                fprintf(stderr, "1xx then long final, fragment %zu: level %d (%s)\n",
+                    frags[k], r.level, r.reason); fails++;
+            }
         }
     }
     if (fails) return 1;

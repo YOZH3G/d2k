@@ -316,6 +316,15 @@ static void test_judge(void) {
           "порог данных без заголовков — не прошло");
     CHECK(d2k_quic_arm_data_judge(1, 451, 3000, 1) == D2K_QAD_CUT,
           "HTTP 451 — отказ, не успех плеча");
+    /* Задача 44: заголовки длиннее нашего буфера — не измеренный обрыв. */
+    CHECK(d2k_quic_arm_data_judge_limited(1, 0, 70000, 0, 1) == D2K_QAD_NOT_RUN,
+          "заголовки не поместились в наш буфер — этап не проведён, не CUT");
+    CHECK(d2k_quic_arm_data_judge_limited(1, 0, 3000, 0, 0) == D2K_QAD_CUT,
+          "без признака предела пустые заголовки по-прежнему обрыв");
+    CHECK(d2k_quic_arm_data_judge_limited(1, 200, 40000, 0, 1) == D2K_QAD_PASS,
+          "разобранные заголовки признак предела не отменяет");
+    CHECK(d2k_quic_arm_data_judge_limited(0, 0, 0, 0, 1) == D2K_QAD_NO_HANDSHAKE,
+          "без рукопожатия предел заголовков ничего не меняет");
     CHECK(D2K_QUIC_ARM_DATA_BYTES >= 16384 && D2K_QUIC_ARM_DATA_BYTES <= 32768,
           "порог в пределах 16–32 КБ");
 }

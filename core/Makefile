@@ -93,8 +93,8 @@ check: test-verify-http
 .PHONY: test-verify-http
 test-verify-http: test_verify_http
 	./test_verify_http
-test_verify_http: test_verify_http.c verify.c tls12.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< tls12.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_verify_http: test_verify_http.c verify.c quicconn.c tls12.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< tls12.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 check: test-http-reply
 .PHONY: test-http-reply
 test-http-reply: test_http_reply
@@ -506,7 +506,7 @@ test-d2kc-proto: test_d2kc_proto d2kc
 test_d2kc_proto: test_d2kc_proto.c $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_d2kc_proto.c $(TEST_LDFLAGS)
 
-check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify test-volume test-httpup-logic test-measured
+check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-sched-modes test-verify test-volume test-httpup-logic test-measured
 
 test_measured: test_measured.c compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h ../datapath/wire.c ../datapath/include/d2k_session.h
 	$(CC) $(CFLAGS) -o $@ test_measured.c compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
@@ -539,8 +539,11 @@ san-measured: hello_profiles.inc
 san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask san-measured
 	@set -e; for t in $(filter-out test_measured,$(TESTS)); do \
 		echo "== $$t =="; \
-		$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-$$t $$t.c \
-			$$(echo "$(SRC)" | tr ' ' '\n' | grep -v '^$$') -lpthread ; \
+		srcs=$$(echo "$(SRC)" | tr ' ' '\n' | grep -v '^$$'); \
+		for inc in $$(grep -o '#include "[A-Za-z0-9_]*\.c"' $$t.c | sed 's/#include "//; s/"//'); do \
+			srcs=$$(echo "$$srcs" | grep -vx "$$inc" || true); \
+		done; \
+		$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-$$t $$t.c $$srcs -lpthread ; \
 		/tmp/d2k-core-san-$$t; \
 	done
 	@echo "== d2kask (санитайзер самой утилиты, не только теста) =="
@@ -762,6 +765,13 @@ test-rst-trigger: test_sched sched.o quichello.o plantlv.o verify.o tls12.o quic
 
 test-voice-sched: test_sched sched.o quichello.o plantlv.o verify.o tls12.o quicconn.o quicwire.o h3.o
 	./test_sched --voice-only
+
+# Все режимы test_sched входят в check (задача 44, раунд 1): режим --groups-only
+# месяц стоял красным, потому что check его не запускал.
+SCHED_MODES = --voice-only --rst-only --rx-volume-only --admission-only --question-only --shape-only --groups-only --retire-only --recheck-only --lifecycle-only --own-first-only --measured-only --ech-only
+.PHONY: test-sched-modes
+test-sched-modes: test_sched sched.o quichello.o plantlv.o verify.o tls12.o quicconn.o quicwire.o h3.o
+	@for m in $(SCHED_MODES); do echo "== test_sched $$m =="; ./test_sched $$m || exit 1; done
 
 # verify.o tls12.o quicconn.o quicwire.o h3.o — с 12.09 планировщик испытывает кандидата САМ (d2k_sched_ver_hook,
 # умолчание verify_default зовёт d2k_verify_probe). Тест зонд подменяет, но

@@ -2155,8 +2155,13 @@ int main(int argc, char **argv) {
         tcp_release_waiters=1; spin(s,40); tcp_wait_until_stop=0;
         saidbuf[0]=0;
         skip_ahead(s,15000); spin(s,100);
-        CHECK(said("по priority.recovery.net ожидание в очереди") &&
-              !said("по fresh-research.example ожидание в очереди"),
+        /* Порядок, а не окно времени: сколько задач успеет стартовать за 100
+           тиков, зависит от SCHED_START_GAP_MS (1000→250 мс сломало прежнее
+           «fresh ещё не выпущен»). Свойство — семейное восстановление
+           выпускается РАНЬШЕ старой несвязанной классификации. */
+        const char *prio_line = strstr(saidbuf, "по priority.recovery.net ожидание в очереди");
+        const char *fresh_line = strstr(saidbuf, "по fresh-research.example ожидание в очереди");
+        CHECK(prio_line && (!fresh_line || prio_line < fresh_line),
               "saved family recovery must precede older unrelated queued classification");
         d2k_sched_free(s); tcp_answer=D2K_V_PREFIX;
         /* Задача 44: неуспех зонда из-за НАШЕГО предела чтения при применённом

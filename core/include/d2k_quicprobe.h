@@ -441,6 +441,15 @@ static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge(int handshake, i
     return D2K_QAD_CUT;
 }
 
+/* То же, но с признаком «заголовки ответа не поместились в НАШ буфер»
+ * (D2K_VERIFY_HEADER_LIMIT, задача 44): без кода ответа это не обрыв линии, а
+ * наш предел — этап НЕ проведён, измеренным обрывом он быть не вправе. */
+static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge_limited(
+        int handshake, int status, uint64_t app_bytes, int complete, int headers_too_long) {
+    if (handshake && status <= 0 && headers_too_long) return D2K_QAD_NOT_RUN;
+    return d2k_quic_arm_data_judge(handshake, status, app_bytes, complete);
+}
+
 /* Longest original askArms ladder (quicarms.c, donor arms.go): 5 intrinsic
  * fakes + 2 candidates x 2 copy counts + 4 TTLs + fragment survival + 4
  * fragment shapes = 18 questions. The Run budget is derived from it. */

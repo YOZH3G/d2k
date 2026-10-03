@@ -133,6 +133,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -144,6 +145,7 @@
 #include "d2k_quichello.h"
 #include "d2k_quicwire.h"
 #include "d2k_quicprobe.h"
+#include "d2k_verify.h" /* D2K_VERIFY_HEADER_LIMIT */
 #include "d2k_ip6frag_send.h"
 #include "d2k_quic_arms.h"
 #include "d2k_ipfrag.h"
@@ -1703,31 +1705,47 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
     int complete = 0, closed = 0, status = 0;
     /* Начало ответа — ради HEADERS: тот же разбор кода, что у проверки
        плана (verify.c), чтобы правило было одно и в предусловии. */
-    uint8_t head[8192];
+    /* Буфер заголовков на куче и того же размера, что у проверки плана: прежние
+       8 КБ обрезали длинный HEADERS, и рабочее плечо становилось «обрывом». */
+    uint8_t *head = malloc(D2K_VERIFY_HEADER_LIMIT);
     size_t head_len = 0;
+    int head_full = 0;
+    if (!head) {
+        d.verdict = D2K_QAD_NOT_RUN;
+        snprintf(d.reason, sizeof d.reason, "не хватило памяти под заголовки ответа HTTP/3");
+        d2k_qc_close(c);
+        return d;
+    }
     int64_t start = qp_now_ms(), progress_at = start;
     while (!(complete && status) && (bytes < D2K_QUIC_ARM_DATA_BYTES || !status)) {
         int64_t now = qp_now_ms();
         if (now - progress_at >= (int64_t)step || now - start >= (int64_t)(4u * step)) break;
         long n = d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 200, err, sizeof err);
         if (n < 0) { closed = 1; }
-        if (n > 0 && head_len < sizeof head) {
-            size_t take = (size_t)n < sizeof head - head_len ? (size_t)n : sizeof head - head_len;
+        if (n > 0 && head_len < D2K_VERIFY_HEADER_LIMIT) {
+            size_t room = D2K_VERIFY_HEADER_LIMIT - head_len;
+            size_t take = (size_t)n < room ? (size_t)n : room;
             memcpy(head + head_len, buf, take);
             head_len += take;
         }
         if (!status && head_len > 0) {
             int st = 0;
             if (d2k_h3_status(head, head_len, &st) == 0) status = st;
+            else if (head_len >= D2K_VERIFY_HEADER_LIMIT) { head_full = 1; break; }
         }
         d2k_qc_app_progress(c, &bytes, &complete);
         if (bytes > last) { last = bytes; progress_at = qp_now_ms(); }
         if (closed) break;
     }
+    free(head);
     d2k_qc_app_progress(c, &bytes, &complete);
     d.app_bytes = bytes;
-    d.verdict = d2k_quic_arm_data_judge(1, status, bytes, complete);
-    if (d.verdict == D2K_QAD_PASS) {
+    d.verdict = d2k_quic_arm_data_judge_limited(1, status, bytes, complete, head_full);
+    if (d.verdict == D2K_QAD_NOT_RUN) {
+        snprintf(d.reason, sizeof d.reason,
+                 "заголовки ответа HTTP/3 длиннее %d байт — наш предел, не обрыв линии",
+                 D2K_VERIFY_HEADER_LIMIT);
+    } else if (d.verdict == D2K_QAD_PASS) {
         snprintf(d.reason, sizeof d.reason, "рукопожатие, HTTP %d и %llu байт данных%s",
                  status, (unsigned long long)bytes, complete ? ", ответ целиком" : "");
     } else if (!status || status == 451) {

@@ -282,9 +282,21 @@ typedef struct {
     char *err;
     size_t errcap;
     d2k_resource_scan *scan;
+    int local_limit; /* отказ по нашему пределу (строка chunk длиннее буфера) */
     uint8_t prefix[4096];
     size_t prefix_len;
 } body_stream;
+
+/* Причина обрыва чтения тела, если сам TLS её не назвал. */
+static void body_read_reason(body_stream *s, long n) {
+    if (s->err && s->errcap && !s->err[0]) {
+        snprintf(s->err, s->errcap, "%s", n == 0 ? "сервер закрыл соединение посреди тела"
+                                                : "ошибка чтения TLS в теле");
+    }
+}
+static void body_say(body_stream *s, const char *msg) {
+    if (s->err && s->errcap) snprintf(s->err, s->errcap, "%s", msg);
+}
 
 static void body_feed(body_stream *s, const uint8_t *p, size_t n) {
     size_t take = sizeof s->prefix - s->prefix_len;
@@ -299,8 +311,9 @@ static int body_byte(body_stream *s, uint8_t *out) {
     if (s->pos == s->used) {
         int64_t left = s->until - verify_now_ms();
         if (left <= 0) { snprintf(s->err, s->errcap, "тайм-аут чтения тела"); return -1; }
+        if (s->err && s->errcap) s->err[0] = '\0';
         long n = s->rd(s->sess, s->buf, 8192, (int)left, s->err, s->errcap);
-        if (n <= 0) { return (int)n; }
+        if (n <= 0) { body_read_reason(s, n); return n == 0 ? -1 : (int)n; }
         s->used = (size_t)n;
         s->pos = 0;
     }
@@ -313,8 +326,9 @@ static int body_exact(body_stream *s, uint64_t n, uint64_t *bytes) {
         if (s->pos == s->used) {
             int64_t left = s->until - verify_now_ms();
             if (left <= 0) { snprintf(s->err, s->errcap, "тайм-аут чтения тела"); return -1; }
+            if (s->err && s->errcap) s->err[0] = '\0';
             long got = s->rd(s->sess, s->buf, 8192, (int)left, s->err, s->errcap);
-            if (got <= 0) { return -1; }
+            if (got <= 0) { body_read_reason(s, got); return -1; }
             s->used = (size_t)got;
             s->pos = 0;
         }
@@ -336,12 +350,19 @@ static int body_line(body_stream *s, char *line, size_t cap) {
         int r = body_byte(s, &c);
         if (r <= 0) { return -1; }
         if (cr) {
-            if (c != '\n') { return -1; }
+            if (c != '\n') { body_say(s, "chunked: после CR нет LF"); return -1; }
             line[n] = '\0';
             return 0;
         }
         if (c == '\r') { cr = 1; continue; }
-        if (c == '\n' || n + 1 >= cap) { return -1; }
+        if (c == '\n') { body_say(s, "chunked: строка оканчивается LF без CR"); return -1; }
+        if (n + 1 >= cap) {
+            s->local_limit = 1;
+            char m[96];
+            snprintf(m, sizeof m, "chunked: строка длиннее %zu байт (наш предел)", cap - 1);
+            body_say(s, m);
+            return -1;
+        }
         line[n++] = (char)c;
     }
 }
@@ -376,12 +397,13 @@ static int read_http_body(body_stream *s, int status, int has_length,
                 if (c >= '0' && c <= '9') { v = c - '0'; }
                 else if (c >= 'a' && c <= 'f') { v = c - 'a' + 10; }
                 else if (c >= 'A' && c <= 'F') { v = c - 'A' + 10; }
-                else { return 0; }
-                if (chunk > (UINT64_MAX - v) / 16) { return 0; }
+                else { body_say(s, "chunked: размер не шестнадцатеричный"); return 0; }
+                if (chunk > (UINT64_MAX - v) / 16) { body_say(s, "chunked: размер вне диапазона"); return 0; }
                 chunk = chunk * 16 + v;
                 digits++;
             }
-            if (!digits || UINT64_MAX - *body_bytes < chunk) { return 0; }
+            if (!digits) { body_say(s, "chunked: пустой размер чанка"); return 0; }
+            if (UINT64_MAX - *body_bytes < chunk) { body_say(s, "chunked: тело вне диапазона"); return 0; }
             if (chunk == 0) {
                 do {
                     if (body_line(s, line, sizeof line) != 0) { return 0; }
@@ -392,6 +414,7 @@ static int read_http_body(body_stream *s, int status, int has_length,
             if (body_exact(s, chunk, body_bytes) != 0) { return 0; }
             uint8_t a, b;
             if (body_byte(s, &a) != 1 || body_byte(s, &b) != 1 || a != '\r' || b != '\n') {
+                body_say(s, "chunked: после данных чанка нет CRLF");
                 return 0;
             }
         }
@@ -404,10 +427,11 @@ static int read_http_body(body_stream *s, int status, int has_length,
     for (;;) {
         int64_t left = s->until - verify_now_ms();
         if (left <= 0) { snprintf(s->err, s->errcap, "тайм-аут чтения тела"); return 0; }
+        if (s->err && s->errcap) s->err[0] = '\0';
         long got = s->rd(s->sess, s->buf, 8192, (int)left, s->err, s->errcap);
         if (got == 0) { *body_expected = *body_bytes; return 1; }
-        if (got < 0) { return 0; }
-        if (UINT64_MAX - *body_bytes < (uint64_t)got) { return 0; }
+        if (got < 0) { body_read_reason(s, got); return 0; }
+        if (UINT64_MAX - *body_bytes < (uint64_t)got) { body_say(s, "тело вне диапазона"); return 0; }
         body_feed(s, s->buf, (size_t)got);
         *body_bytes += (uint64_t)got;
     }
@@ -576,9 +600,18 @@ static int read_status_buf(uint8_t *buf, size_t capacity,
                 /* Ambiguous framing must never be accepted as a complete
                    response: intermediaries disagree about TE vs CL and can
                    otherwise make a truncated body look whole. */
+                if (has_length && chunked) {
+                    snprintf(err, errcap, "Content-Length вместе с Transfer-Encoding: chunked");
+                } else if (!framing_valid) {
+                    snprintf(err, errcap, "неоднозначный Transfer-Encoding или Location");
+                }
                 int complete = framing_valid && !(has_length && chunked) &&
                     read_http_body(&bs, code, has_length, length,
                                    chunked, &got, &expected);
+                if (!complete && err[0] == '\0') {
+                    snprintf(err, errcap, "тело не дочитано по HTTP framing");
+                }
+                if (local_limit && bs.local_limit) { *local_limit = 1; }
                 if (body_bytes) { *body_bytes = got; }
                 if (body_expected) { *body_expected = expected; }
                 if (body_complete) { *body_complete = complete; }
