@@ -362,4 +362,18 @@ grep -q '^ip host graph.whatsapp.com 57.144.245.32$' "$FAM/ndmc-state" || fail "
 [ "$(grep -c '^ip host static.whatsapp.net ' "$FAM/ndmc-state")" -le 2 ] || fail "family fallback pinned more than two addresses"
 ok "family fallback pins only same-family addresses verified for this very name"
 
+# Addresses outside Meta ranges do not use up the per-name probe tries: a Meta
+# address after four junk answers is still tried and pinned.
+JUNK="$TMP/junk"
+mkdir -p "$JUNK/d2k/state" "$JUNK/d2k/files" "$JUNK/d2k/log"
+cp "$TMP/d2k/files/meta-ranges.txt" "$JUNK/d2k/files/"
+printf 'system name test-router\n' > "$JUNK/ndmc-state"
+env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$JUNK/d2k" D2K_META_RANGES="$JUNK/d2k/files/meta-ranges.txt" \
+    D2K_RELAY_URL=https://resolve.example/resolve D2K_IP_PROBE_ATTEMPTS=1 \
+    RESOLVE_BODY='{"results":{"instagram.com":["8.8.8.8","8.8.4.4","1.1.1.1","9.9.9.9","157.240.9.174"]}}' \
+    NDMC_STATE="$JUNK/ndmc-state" NDMC_CALLS="$JUNK/ndmc-calls" CURL_CALLS="$JUNK/curl-calls" \
+    D2K_INSTAGRAM_LOG="$JUNK/refresh.log" sh "$SCRIPT" refresh || { cat "$JUNK/refresh.log" >&2; fail "refresh with junk answers failed"; }
+grep -q '^ip host instagram.com 157.240.9.174$' "$JUNK/ndmc-state" || fail "non-Meta answers pushed out the real Meta address"
+ok "non-Meta answers do not use up the probe tries"
+
 echo "Instagram DNS lifecycle: all checks passed"

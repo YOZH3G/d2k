@@ -146,9 +146,11 @@ refresh() {
         tried=0
         kept=0
         for ip in $(printf '%s\n' "$parsed" | awk -v h="$host" '$1==h{print $2}' | head -8); do
+            # Only Meta-range candidates spend one of the 4 probe tries, so junk
+            # answers cannot push the real edges out.
+            is_meta_ip "$ip" || { log "отброшен адрес вне диапазонов Meta: $host $ip"; continue; }
             [ "$tried" -lt 4 ] || break
             tried=$((tried + 1))
-            is_meta_ip "$ip" || { log "отброшен адрес вне диапазонов Meta: $host $ip"; continue; }
             if edge_verified "$host" "$ip"; then
                 filtered="${filtered}${host} ${ip}\n"
                 kept=$((kept + 1))
