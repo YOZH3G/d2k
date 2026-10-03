@@ -5623,8 +5623,11 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         const char *reason = cool && cool->challenge ? "антибот-ответа" :
                              cool && cool->exhausted ? "неподтверждённого прошлого замера" :
                              "повторного CLEAR";
-        say(s, "по %s замер отложен после %s ещё примерно %lld мин",
-            name, reason,
+        /* Транспорт — часть ключа отдыха и называется вслух: поле 03.10,
+           Discord — отдых QUIC-повторов приложения читался как отложенный
+           TCP-поиск того же имени, который на деле шёл своим ходом. */
+        say(s, "по %s (%s) замер отложен после %s ещё примерно %lld мин",
+            name, ev->transport == 17 ? "QUIC" : "TCP", reason,
             (long long)((cooldown_left_ms + 59999) / 60000));
         return 0;
     }

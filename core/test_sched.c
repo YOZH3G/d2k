@@ -2399,6 +2399,76 @@ int main(int argc, char **argv) {
         d2k_sched_ech_resolve_hook = d2k_ech_resolve;
         tcp_answer = D2K_V_OPAQUE;
     }
+
+    /* ПОЛЕ 03.10.2026, Discord: QUIC-поиск discord.com кончился «кандидатов
+     * нет» (отдых 10 мин — для QUIC), приложение ушло на TCP с GREASE ECH.
+     * TCP-поиск того же имени шёл до конца (18:50:33 → 18:52:14, план
+     * подтверждён в 18:52:28), но журнал между ними показывал только
+     * «замер отложен после неподтверждённого прошлого замера» — без
+     * транспорта, и это читалось как подавление TCP отдыхом QUIC. Свойства:
+     * отдых QUIC не откладывает TCP того же имени; решение «GREASE» не
+     * снимает свой идущий поиск; отложенное подозрение называет свой
+     * транспорт. */
+    {
+        const char *nm = "discord-fallback.test";
+        d2k_catalog cd = {0};
+        d2k_sched *s = d2k_sched_new(&cd, sv[0], 0x2d);
+        CHECK(s != NULL, "QUIC→TCP: планировщик не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            quic_answer = D2K_V_PREFIX;
+            arm_kind = D2K_QA_FLAKY;
+            quic_calls = 0;
+            d2k_ev qh = ev_hello(17, 41070, nm); d2k_sched_event(s, &qh);
+            d2k_ev qs = ev_suspect(17, 41070); d2k_sched_event(s, &qs);
+            settle(s);
+            CHECK(quic_calls == 1 && said("кандидатов нет"),
+                  "QUIC→TCP: пустой QUIC-поиск не воспроизведён");
+            uint8_t eb[2048]; size_t el = 0;
+            CHECK(ech_offer_hello(nm, eb, sizeof eb, &el) == 0 &&
+                  d2k_hello_ech_offer(eb, el, NULL) == 1, "QUIC→TCP: fixture GREASE");
+            d2k_sched_ech_resolve_hook = stub_ech_resolve;
+            tcp_calls = 0; tcp_answer = D2K_V_CLEAR;
+            tcp_wait_until_stop = 1; tcp_release_waiters = 0;
+            saidbuf[0] = '\0';
+            d2k_ev th = ev_hello(6, 41071, nm); d2k_sched_event(s, &th);
+            d2k_ev sh; memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+            memcpy(sh.shape, eb, el); sh.shape_len = el;
+            d2k_sched_event(s, &sh);
+            d2k_ev ts = ev_suspect(6, 41071); ts.code = D2K_SUSPECT_REPEAT;
+            d2k_sched_event(s, &ts);
+            for (int i = 0; i < 200 && tcp_calls == 0; i++) spin(s, 5);
+            CHECK(said("(TCP) начинаю поиск") && said("GREASE") && tcp_calls == 1,
+                  "QUIC→TCP: отдых QUIC отложил TCP-поиск того же имени");
+            /* Пока TCP-поиск идёт: новый TCP-поток того же имени и повтор
+               QUIC приложением (поле: каждые ~30 с). */
+            d2k_ev th2 = ev_hello(6, 41072, nm); d2k_sched_event(s, &th2);
+            d2k_ev ts2 = ev_suspect(6, 41072); ts2.code = D2K_SUSPECT_REPEAT;
+            d2k_sched_event(s, &ts2);
+            d2k_ev qh2 = ev_hello(17, 41073, nm); d2k_sched_event(s, &qh2);
+            d2k_ev qs2 = ev_suspect(17, 41073); d2k_sched_event(s, &qs2);
+            spin(s, 20);
+            CHECK(!said("(TCP) замер отложен"),
+                  "QUIC→TCP: TCP-подозрение отложено отдыхом QUIC");
+            CHECK(said("(QUIC) замер отложен после неподтверждённого прошлого замера"),
+                  "QUIC→TCP: отложенное подозрение не называет свой транспорт");
+            CHECK(quic_calls == 1, "QUIC→TCP: повтор QUIC в отдыхе запустил замер");
+            tcp_release_waiters = 1;
+            settle(s);
+            CHECK(tcp_calls == 1 && said("напрямую проходит"),
+                  "QUIC→TCP: TCP-поиск после GREASE не дошёл до своего итога");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cd);
+        d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+        tcp_answer = D2K_V_OPAQUE;
+        tcp_wait_until_stop = 0; tcp_release_waiters = 0;
+        quic_answer = D2K_V_OPAQUE;
+        arm_kind = D2K_QA_BLOB;
+    }
     if (ech_only) { goto voice_only_done; }
 
     /* A completed domain-search provider is not a bare classifier. Its
