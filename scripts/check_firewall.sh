@@ -95,6 +95,24 @@ for tool in iptables ip6tables; do
     done
 done
 
+# Broadcast and multicast never enter the queue (field 03.10: raw re-send to a
+# broadcast destination fails with EACCES; there is no NAT clash to cure).
+iptables -t mangle -C D2K_OUT -m addrtype --dst-type BROADCAST -j RETURN \
+    || fail "IPv4 broadcast queued"
+iptables -t mangle -C D2K_OUT -d 224.0.0.0/4 -j RETURN || fail "IPv4 multicast queued"
+ip6tables -t mangle -C D2K_OUT -d ff00::/8 -j RETURN || fail "IPv6 multicast queued"
+for tool in iptables ip6tables; do
+    OUT_RULES=$("$tool" -t mangle -S D2K_OUT)
+    first_q=$(echo "$OUT_RULES" | grep -n NFQUEUE | head -1 | cut -d: -f1)
+    last_bm=$(echo "$OUT_RULES" | grep -nE -- '--dst-type BROADCAST|-d (224\.0\.0\.0/4|ff00::/8)' \
+        | tail -1 | cut -d: -f1)
+    [ -n "$first_q" ] && [ -n "$last_bm" ] && [ "$last_bm" -lt "$first_q" ] \
+        || fail "$tool: broadcast/multicast RETURN не стоит раньше NFQUEUE"
+done
+if iptables -t mangle -S D2K_IN | grep -qE -- 'addrtype|224\.0\.0\.0/4'; then
+    fail "исключение broadcast/multicast попало в D2K_IN (ответы)"
+fi
+
 echo "$RULES" | grep -qE -- '-A D2K_OUT -p udp .*--dports 0:65535.*--queue-bypass' \
     || fail "нет исходящего UDP-правила полного диапазона с --queue-bypass"
 echo "$RULES" | grep -qE -- '-A D2K_IN -p udp .*--sports 0:65535.*--queue-bypass' \
@@ -129,7 +147,9 @@ echo "$MARK_LINE" | grep -q -- '--mark 0x2f' || fail "измерительный
 echo "== fw_up повторно (идемпотентность) =="
 fw_up
 COUNT_OUT=$(iptables -t mangle -S D2K_OUT | wc -l)
-[ "$COUNT_OUT" -eq 11 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 11 включая -N)"
+# -N, 2 loopback, broadcast + multicast, 2 marks, 2 DNS, TCP/UDP queue, late
+# RST/FIN, voice UDP. (The old 11 predates the voice and late-close rules.)
+[ "$COUNT_OUT" -eq 14 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 14 включая -N)"
 
 echo "== пустые цепочки с сохранёнными переходами — НЕ работающий firewall =="
 iptables -t mangle -F D2K_OUT
@@ -171,6 +191,15 @@ done
 iptables -t mangle -D D2K_OUT -m mark --mark "$MARK" -j RETURN
 if fw_installed; then fail "потеря исключения собственных пакетов не обнаружена"; fi
 fw_up
+iptables -t mangle -D D2K_OUT -m addrtype --dst-type BROADCAST -j RETURN
+if fw_installed; then fail "потеря исключения IPv4 broadcast не обнаружена"; fi
+fw_up
+iptables -t mangle -D D2K_OUT -d 224.0.0.0/4 -j RETURN
+if fw_installed; then fail "потеря исключения IPv4 multicast не обнаружена"; fi
+fw_up
+ip6tables -t mangle -D D2K_OUT -d ff00::/8 -j RETURN
+if fw_installed; then fail "потеря исключения IPv6 multicast не обнаружена"; fi
+fw_up
 
 # Соседний случай выше доказывает, что пропажа ВИДНА. Здесь — вторая половина
 # того же отказа: что восстановление её ЛЕЧИТ, и после него правила снова
@@ -193,7 +222,7 @@ if fw_installed; then fail "потеря IPv6 ответов не обнаруж
 fw_up
 fw_installed || fail "IPv6 не восстановлен"
 COUNT6=$(ip6tables -t mangle -S D2K_OUT | wc -l)
-[ "$COUNT6" -eq 11 ] || fail "IPv6 дубли после восстановления"
+[ "$COUNT6" -eq 13 ] || fail "IPv6 дубли после восстановления (строк: $COUNT6, ждали 13: как IPv4, но одно multicast-исключение)"
 
 echo "== fw_down =="
 fw_down

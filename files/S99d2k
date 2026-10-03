@@ -196,6 +196,19 @@ fw_family_up() (
         "$fw_tool" -t mangle -A "$chain" -d $loopback -j RETURN || return 1
     done
 
+    # Broadcast and multicast never enter the queue: there is no NAT clash to
+    # cure and no plan for them, and a raw re-send to a broadcast address is
+    # refused (EACCES; field 03.10.2026, router-local 192.168.1.255:3517/3518
+    # and the like). The router's own unicast UDP stays queued: the Telegram
+    # tunnel and controller probes may need d2k. Before every NFQUEUE jump.
+    if [ "$fw_tool" = iptables ]; then
+        "$fw_tool" -t mangle -A "$CHAIN_OUT" -m addrtype --dst-type BROADCAST \
+            -j RETURN || return 1
+        "$fw_tool" -t mangle -A "$CHAIN_OUT" -d 224.0.0.0/4 -j RETURN || return 1
+    else
+        "$fw_tool" -t mangle -A "$CHAIN_OUT" -d ff00::/8 -j RETURN || return 1
+    fi
+
     # Собственные сырые посылки датапата и измерительные запросы контроллера
     # исключаются. Активные verifier-зонды
     # контроллера помечаются отдельным PROBE_MARK: им нужно попасть в очередь,
@@ -496,6 +509,13 @@ fw_family_installed() (
         "$fw_tool" -t mangle -C "$chain" -s $loopback -j RETURN 2>/dev/null || return 1
         "$fw_tool" -t mangle -C "$chain" -d $loopback -j RETURN 2>/dev/null || return 1
     done
+    if [ "$fw_tool" = iptables ]; then
+        "$fw_tool" -t mangle -C "$CHAIN_OUT" -m addrtype --dst-type BROADCAST \
+            -j RETURN 2>/dev/null || return 1
+        "$fw_tool" -t mangle -C "$CHAIN_OUT" -d 224.0.0.0/4 -j RETURN 2>/dev/null || return 1
+    else
+        "$fw_tool" -t mangle -C "$CHAIN_OUT" -d ff00::/8 -j RETURN 2>/dev/null || return 1
+    fi
     "$fw_tool" -t mangle -C POSTROUTING -j "$CHAIN_OUT" 2>/dev/null || return 1
     "$fw_tool" -t mangle -C FORWARD -j "$CHAIN_IN" 2>/dev/null || return 1
     "$fw_tool" -t mangle -C INPUT -j "$CHAIN_IN" 2>/dev/null || return 1
