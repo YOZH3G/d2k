@@ -28,6 +28,8 @@
 #include <unistd.h>
 
 #include "d2k_sched.h"
+#include "d2k_httpsprobe.h"
+#include "d2k_link.h"
 
 /* Переходник к перенесённому измерителю (detect/bridge.c). Объявлен здесь, а
  * не в заголовке ядра: ядро о detect/ не знает и знать не должно — связь
@@ -123,6 +125,54 @@ static void sched_say(void *ctx, const char *line) {
     localtime_r(&now, &tmv);
     printf("%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, line);
     fflush(stdout);
+}
+
+/* --- открытый HTTP: вставка провайдера → HTTPS имени (задача 51) -------- */
+
+/* Датапат узнал вставку провайдера. Проверить HTTPS имени на том же адресе;
+   подтверждённое, но забытое датапатом — повторить. */
+static void http_portal(d2k_httpsprobe *hp, int fd, const d2k_ev *ev, int64_t now) {
+    char line[512];
+    uint32_t ttl = 0;
+    int rc = d2k_httpsprobe_portal(hp, ev->name, ev->family, ev->high_ip, ev->code == 1,
+                                   now, &ttl);
+    if (rc == 1) {
+        snprintf(line, sizeof line, "HTTP %.255s: провайдер подменяет ответ порталом блокировки — "
+                 "проверяю HTTPS имени", ev->name);
+        sched_say(NULL, line);
+    } else if (rc == 2) {
+        char err[200];
+        if (d2k_link_set_https(fd, ev->name, ttl, err, sizeof err) != 0) {
+            fprintf(stderr, "d2kc: %s\n", err);
+        }
+    }
+}
+
+static void http_probe_done(d2k_httpsprobe *hp, int fd, int64_t now) {
+    d2k_httpsprobe_result r[8];
+    size_t n;
+    while ((n = d2k_httpsprobe_done(hp, now, r, sizeof r / sizeof r[0])) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            char line[1200];
+            int served = r[i].state == D2K_HTTPS_SERVED;
+            snprintf(line, sizeof line, "HTTP %.255s: HTTPS %s (%.255s) — %s", r[i].host,
+                     served ? "подтверждён" :
+                     r[i].state == D2K_HTTPS_CLOSED ? "у источника нет (443 закрыт)" :
+                     r[i].state == D2K_HTTPS_OTHER_NAME ? "отдаёт сертификат другого имени" :
+                                                          "не подтверждён",
+                     r[i].why,
+                     served ? "вставку провайдера датапат заменит на 307 → https"
+                            : "вставка провайдера идёт клиенту как есть: перевод на https "
+                              "был бы тупиком");
+            sched_say(NULL, line);
+            if (served) {
+                char err[200];
+                if (d2k_link_set_https(fd, r[i].host, r[i].ttl_s, err, sizeof err) != 0) {
+                    fprintf(stderr, "d2kc: %s\n", err);
+                }
+            }
+        }
+    }
 }
 
 static void usage(void) {
@@ -237,6 +287,14 @@ int main(int argc, char **argv) {
 
     d2k_sched_set_say(s, sched_say, NULL);
 
+    /* Зонд HTTPS — с меткой зондов контроллера: через очередь, с уже
+       подтверждённым планом имени, без нового обнаружения. */
+    d2k_httpsprobe *hp = d2k_httpsprobe_new(mark, NULL);
+    if (!hp) {
+        fprintf(stderr, "d2kc: зонд HTTPS не завёлся — вставка провайдера в HTTP "
+                        "будет идти клиенту как есть\n");
+    }
+
     /* ИЗМЕРИТЕЛЬ TCP — ПЕРЕНЕСЁННЫЙ «ПОИСК ПО ДОМЕНУ», а не прежнее дерево.
      *
      * Прежнее (core/verdict.c) отвечало только на вопрос «какого класса
@@ -297,9 +355,10 @@ int main(int argc, char **argv) {
     int link_lost = 0;
 
     while (!stop_asked) {
-        struct pollfd pfd[2];
+        struct pollfd pfd[3];
         pfd[0].fd = fd;                       pfd[0].events = POLLIN; pfd[0].revents = 0;
         pfd[1].fd = d2k_sched_wake_fd(s);     pfd[1].events = POLLIN; pfd[1].revents = 0;
+        pfd[2].fd = d2k_httpsprobe_wake_fd(hp); pfd[2].events = POLLIN; pfd[2].revents = 0;
 
         int64_t t = now_ms();
         int wait = (int)(TICK_MS - (t - last_tick));
@@ -309,7 +368,7 @@ int main(int argc, char **argv) {
                порция обязана идти сразу за чтением событий. */
             wait = 0;
         }
-        int pr = poll(pfd, 2, wait);
+        int pr = poll(pfd, hp ? 3 : 2, wait);
         if (pr < 0 && errno != EINTR) {
             fprintf(stderr, "d2kc: poll: %s\n", strerror(errno));
             break;
@@ -332,6 +391,9 @@ int main(int argc, char **argv) {
                     case D2K_EV_EXCHANGE: seen_exchange++; break;
                     case D2K_EV_APPLIED:  seen_applied++; break;
                     case D2K_EV_REFUSED:  seen_refused++; break;
+                    case D2K_EV_HTTP_PORTAL:
+                        if (hp) { http_portal(hp, fd, &ev, now_ms()); }
+                        break;
                     case D2K_EV_PROTO:
                         /* ВЕРСИЯ ПРОВОДА. Чужая — работать нельзя: смешанная пара
                            не падает и не ругается, она молча не даёт
@@ -361,6 +423,9 @@ int main(int argc, char **argv) {
                    пачка наблюдений теряется перед сохранением каталога. */
                 if (drained < 256 || d2k_link_peer_closed(fd) != 1) { break; }
             }
+        }
+        if (hp && pr > 0 && (pfd[2].revents & POLLIN)) {
+            http_probe_done(hp, fd, now_ms());
         }
         /* PID живого контроллера ещё не означает, что он связан с датапатом:
            закрытый AF_UNIX peer даёт POLLHUP один раз. Не выходя здесь,
@@ -438,6 +503,7 @@ int main(int argc, char **argv) {
        «останавливаюсь» не видно ровно тогда, когда его и ищут. */
     fflush(stdout);
     d2k_detect_stop_all();
+    d2k_httpsprobe_free(hp);
     d2k_sched_free(s);
     if (cat.revision != dirty) {
         if (save_atomic(&cat, catpath, err, sizeof err) != 0) {

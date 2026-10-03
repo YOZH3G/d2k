@@ -220,6 +220,33 @@ static d2k_ev ev_with_seen(uint8_t seen_types) {
 }
 
 int main(void) {
+    /* v10 (задача 51): вставка провайдера в HTTP и имя с HTTPS. */
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "HTTP portal socketpair");
+        const uint8_t rest[] = {1, 13, 'r','u','t','r','a','c','k','e','r','.','o','r','g'};
+        send_synthetic(sv[0], D2K_EV_HTTP_PORTAL, rest, sizeof rest);
+        d2k_ev ev;
+        char err[256];
+        CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == 0 &&
+              ev.kind == D2K_EV_HTTP_PORTAL && ev.code == 1 &&
+              strcmp(ev.name, "rutracker.org") == 0, "HTTP_PORTAL разобран не так");
+        const uint8_t cut[] = {0, 13, 'r','u'};
+        send_synthetic(sv[0], D2K_EV_HTTP_PORTAL, cut, sizeof cut);
+        CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == -1,
+              "HTTP_PORTAL с обрезанным именем принят");
+        CHECK(d2k_link_set_https(sv[0], "RuTracker.org", 21600, err, sizeof err) == 0,
+              "SET_HTTPS не отправился");
+        uint8_t f[64];
+        ssize_t n = read(sv[1], f, sizeof f);
+        CHECK(n == 6 + 1 + 13 + 4 && f[3] == 2 + 1 + 13 + 4 &&
+              f[4] == (uint8_t)(D2K_CMD_SET_HTTPS >> 8) && f[5] == (uint8_t)D2K_CMD_SET_HTTPS &&
+              f[6] == 13 && memcmp(f + 7, "RuTracker.org", 13) == 0 &&
+              f[20] == 0 && f[21] == 0 && f[22] == 0x54 && f[23] == 0x60,
+              "кадр SET_HTTPS собран не так");
+        CHECK(d2k_link_set_https(sv[0], "", 1, err, sizeof err) != 0, "SET_HTTPS с пустым именем ушёл");
+        close(sv[0]); close(sv[1]);
+    }
     {
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "IPv6 event socketpair");

@@ -21,6 +21,7 @@
 
 #include "d2k_ctl.h"
 #include "d2k_ctlsrv.h"
+#include "d2k_http80.h"
 #include "d2k_plan.h"
 
 static int fails;
@@ -411,9 +412,71 @@ static void test_probe_owner_disconnect(void) {
     d2k_session_free(sess);
 }
 
+/* SET_HTTPS (v10, задача 51): контроллер сообщает имя с подтверждённым
+   HTTPS и срок; датапат держит его в таблице http80 и подтверждает. */
+static void test_set_https(void) {
+    unlink(SOCK);
+    char err[160];
+    d2k_ctl *c = d2k_ctl_open(SOCK, err, sizeof err);
+    CHECK(c != NULL, "сокет для SET_HTTPS не создался");
+    if (!c) { return; }
+    int cli = dial();
+    d2k_ctl_accept(c);
+    d2k_session *sess = d2k_session_new(16, 16);
+    d2k_http80 *h = d2k_http80_new();
+    d2k_ctlsrv cx;
+    memset(&cx, 0, sizeof cx);
+    cx.sess = sess;
+    cx.ctl = c;
+    cx.http80 = h;
+    cx.now_ns = 1000u * 1000000000ull;
+    uint8_t body[64];
+    uint16_t cmd = 0;
+    int ok = 0;
+    uint8_t reason = 0;
+    const char *name = "RuTracker.org";
+    size_t nl = strlen(name);
+    body[0] = (uint8_t)nl;
+    memcpy(body + 1, name, nl);
+    wr32(body + 1 + nl, 3600);
+    d2k_ctlsrv_command(&cx, D2K_CMD_SET_HTTPS, body, 1 + nl + 4);
+    d2k_ctl_flush(c);
+    CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && cmd == D2K_CMD_SET_HTTPS && ok,
+          "SET_HTTPS не подтверждён");
+    CHECK(d2k_http80_https(h, "rutracker.org", cx.now_ns + 3599ull * 1000000000ull) &&
+          !d2k_http80_https(h, "rutracker.org", cx.now_ns + 3600ull * 1000000000ull),
+          "SET_HTTPS поставил имя не на тот срок");
+    wr32(body + 1 + nl, 0);
+    d2k_ctlsrv_command(&cx, D2K_CMD_SET_HTTPS, body, 1 + nl + 4);
+    d2k_ctl_flush(c);
+    CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok &&
+          !d2k_http80_https(h, "rutracker.org", cx.now_ns),
+          "SET_HTTPS с нулевым сроком не снял имя");
+    d2k_ctlsrv_command(&cx, D2K_CMD_SET_HTTPS, body, nl + 4);
+    d2k_ctl_flush(c);
+    CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok && reason == D2K_ACK_BAD_ARGS,
+          "обрезанный SET_HTTPS принят");
+    body[1] = ' ';
+    d2k_ctlsrv_command(&cx, D2K_CMD_SET_HTTPS, body, 1 + nl + 4);
+    d2k_ctl_flush(c);
+    CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok, "негодное имя в SET_HTTPS принято");
+    cx.http80 = NULL;
+    body[1] = 'R';
+    d2k_ctlsrv_command(&cx, D2K_CMD_SET_HTTPS, body, 1 + nl + 4);
+    d2k_ctl_flush(c);
+    CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok,
+          "SET_HTTPS без таблицы HTTP подтверждён как исполненный");
+    d2k_http80_free(h);
+    d2k_session_free(sess);
+    close(cli);
+    d2k_ctl_close(c);
+    unlink(SOCK);
+}
+
 int main(void) {
     test_probe_owner_disconnect();
     check_proto_greeting();
+    test_set_https();
     char err[160];
     d2k_ctl *c = d2k_ctl_open(SOCK, err, sizeof err);
     unsigned disconnects = 0;

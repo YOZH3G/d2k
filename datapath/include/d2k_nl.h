@@ -150,6 +150,13 @@ int d2k_nl_errno(const d2k_nl_msg *m, int32_t *err);
 size_t d2k_nl_verdict(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
                       uint32_t pkt_id, uint32_t verdict);
 
+/* Вердикт с заменой пакета (NFQA_PAYLOAD): ядро выпускает вместо пришедшего
+ * пакета эти байты (задача 51 — 307 вместо вставки провайдера). Пустая
+ * замена — ошибка сборки, а не «без замены». */
+size_t d2k_nl_verdict_payload(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
+                              uint32_t pkt_id, uint32_t verdict,
+                              const uint8_t *payload, size_t len);
+
 size_t d2k_nl_cfg_cmd(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
                       uint8_t cmd, uint16_t pf);
 

@@ -211,10 +211,10 @@ ctl.o: ctl.c $(HDR)
 # настоящим кадром вовсе — отказ «нет места» от отказа «план негоден»
 # различимы на уровне ЭТОГО разбора, и подделывать его нельзя (см. шапку
 # файла). Тот же список объектников, что у test_session/ctlprobe.
-test_ctl: test_ctl.c ctl.o ctlsrv.o session.o hold.o capture.o nat.o journal.o track.o tls.o wire.o \
+test_ctl: test_ctl.c ctl.o ctlsrv.o http80.o session.o hold.o capture.o nat.o journal.o track.o tls.o wire.o \
           wire_udp.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o \
           core_crypto.o core_ipfrag.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_ctl.c ctl.o ctlsrv.o session.o hold.o capture.o nat.o journal.o \
+	$(CC) $(CFLAGS) -o $@ test_ctl.c ctl.o ctlsrv.o http80.o session.o hold.o capture.o nat.o journal.o \
 	    track.o tls.o wire.o wire_udp.o plans.o plan_parse.o plan_apply.o \
 	    $(COREOBJ) $(LDFLAGS)
 

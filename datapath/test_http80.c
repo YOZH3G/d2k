@@ -10,6 +10,7 @@
 
 #include "d2k_http80.h"
 #include "d2k_wire.h"
+#include "d2k_httpup.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -79,18 +80,20 @@ static const char INJECT[] =
 #define SISN 5000000u
 
 static uint8_t b[4096];
+#define PKT(h, p, n, t, res) d2k_http80_packet((h), (p), (n), (t), out, sizeof out, rst, sizeof rst, (res))
 static d2k_http80_res r;
+static uint8_t out[2048], rst[128];
 
 /* Рукопожатие и запрос в моменты захвата: SYN 0, SYN/ACK 98 мс, запрос 99 мс. */
 static void open_flow(d2k_http80 *h, const flow *f, uint64_t t0, const char *req) {
     size_t n = pkt(f, 1, F_SYN, CISN, 0, NULL, b);
-    d2k_http80_packet(h, b, n, t0, &r);
+    PKT(h, b, n, t0, &r);
     CHECK(r.action == D2K_HTTP80_PASS && !r.injection, "SYN не проходит как есть");
     n = pkt(f, 0, F_SYN | F_ACK, SISN, CISN + 1, NULL, b);
-    d2k_http80_packet(h, b, n, t0 + 98 * MS, &r);
+    PKT(h, b, n, t0 + 98 * MS, &r);
     CHECK(r.action == D2K_HTTP80_PASS, "SYN/ACK не проходит как есть");
     n = pkt(f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, req, b);
-    d2k_http80_packet(h, b, n, t0 + 99 * MS, &r);
+    PKT(h, b, n, t0 + 99 * MS, &r);
     CHECK(r.action == D2K_HTTP80_PASS && !r.injection, "запрос не проходит как есть");
 }
 
@@ -119,7 +122,7 @@ static void test_field_injection(int v6) {
     uint32_t req_end = CISN + 1 + (uint32_t)strlen(GET);
     open_flow(h, &f, 1000 * MS, GET);
     size_t n = pkt(&f, 0, F_ACK | F_PSH | F_FIN, SISN + 1, req_end, INJECT, b);
-    d2k_http80_packet(h, b, n, 1000 * MS + 99 * MS + 700000ull, &r);
+    PKT(h, b, n, 1000 * MS + 99 * MS + 700000ull, &r);
     CHECK(r.injection, v6 ? "IPv6: вставка 302→lawfilter через 0,7 мс не узнана"
                           : "вставка 302→lawfilter через 0,7 мс не узнана");
     CHECK(r.action == D2K_HTTP80_PASS, "без знания об HTTPS вставка обязана пройти как есть");
@@ -130,7 +133,7 @@ static void test_field_injection(int v6) {
           memcmp(r.server, f.server, v6 ? 16 : 4) == 0 &&
           memcmp(r.client, f.client, v6 ? 16 : 4) == 0, "адреса потока не те");
     /* Вторая копия — та же вставка, о ней второй раз не сообщаем. */
-    d2k_http80_packet(h, b, n, 1000 * MS + 99 * MS + 900000ull, &r);
+    PKT(h, b, n, 1000 * MS + 99 * MS + 900000ull, &r);
     CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "вторая копия вставки сообщена повторно");
     d2k_http80_stats st = d2k_http80_get_stats(h);
     CHECK(st.injections == 1 && st.requests == 1, "счётчики вставок/запросов не те");
@@ -158,7 +161,7 @@ static void test_not_injection(void) {
         open_flow(h, &f, 0, GET);
         size_t n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1 + cases[i].seq_shift,
                        CISN + 1 + (uint32_t)strlen(GET), cases[i].reply, b);
-        d2k_http80_packet(h, b, n, 99 * MS + cases[i].after, &r);
+        PKT(h, b, n, 99 * MS + cases[i].after, &r);
         CHECK(!r.injection && r.action == D2K_HTTP80_PASS, cases[i].what);
         d2k_http80_free(h);
     }
@@ -167,9 +170,9 @@ static void test_not_injection(void) {
     d2k_http80 *h = d2k_http80_new();
     flow f = flow4(53000);
     size_t n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
-    d2k_http80_packet(h, b, n, 99 * MS, &r);
+    PKT(h, b, n, 99 * MS, &r);
     n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, CISN + 1 + (uint32_t)strlen(GET), INJECT, b);
-    d2k_http80_packet(h, b, n, 99 * MS + 700000ull, &r);
+    PKT(h, b, n, 99 * MS + 700000ull, &r);
     CHECK(!r.injection, "вставка без замеренного RTT признана вставкой");
     d2k_http80_free(h);
 
@@ -179,7 +182,7 @@ static void test_not_injection(void) {
     f.sport = 8080;
     open_flow(h, &f, 0, GET);
     n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, CISN + 1 + (uint32_t)strlen(GET), INJECT, b);
-    d2k_http80_packet(h, b, n, 99 * MS + 700000ull, &r);
+    PKT(h, b, n, 99 * MS + 700000ull, &r);
     CHECK(!r.injection, "поток не на порт 80 разобран как HTTP");
     d2k_http80_free(h);
 
@@ -189,7 +192,7 @@ static void test_not_injection(void) {
     static const char post[] = "POST / HTTP/1.1\r\nHost: rutracker.org\r\nContent-Length: 0\r\n\r\n";
     open_flow(h, &f, 0, post);
     n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, CISN + 1 + (uint32_t)strlen(post), INJECT, b);
-    d2k_http80_packet(h, b, n, 99 * MS + 700000ull, &r);
+    PKT(h, b, n, 99 * MS + 700000ull, &r);
     CHECK(!r.injection, "ответ на POST разобран как вставка в навигацию");
     d2k_http80_free(h);
 }
@@ -203,7 +206,7 @@ static void test_table_bound(void) {
     }
     flow f = flow4((uint16_t)(10000 + D2K_HTTP80_FLOWS * 3 - 1));
     size_t n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, CISN + 1 + (uint32_t)strlen(GET), INJECT, b);
-    d2k_http80_packet(h, b, n, (uint64_t)(D2K_HTTP80_FLOWS * 3 - 1) * MS + 99 * MS + 700000ull, &r);
+    PKT(h, b, n, (uint64_t)(D2K_HTTP80_FLOWS * 3 - 1) * MS + 99 * MS + 700000ull, &r);
     CHECK(r.injection, "свежий поток потерян при переполнении таблицы");
     CHECK(d2k_http80_get_stats(h).evicted > 0, "вытеснение не посчитано");
     d2k_http80_free(h);
@@ -215,9 +218,132 @@ static void test_garbage(void) {
     flow f = flow4(56000);
     size_t n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
     for (size_t cut = 0; cut < n; cut++) {
-        d2k_http80_packet(h, b, cut, 0, &r);
+        PKT(h, b, cut, 0, &r);
         CHECK(r.action == D2K_HTTP80_PASS, "обрезанный пакет не прошёл как есть");
     }
+    d2k_http80_free(h);
+}
+
+static int ip4_header_ok(const uint8_t *p) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < 20; i += 2) { acc += rd16(p + i); }
+    while (acc >> 16) { acc = (acc & 0xffffu) + (acc >> 16); }
+    return acc == 0xffffu;
+}
+
+/* HTTPS подтверждён: клиент получает 307 в том же потоке, сервер — RST,
+   остальное от сервера снимается. */
+static void test_answer(int v6) {
+    d2k_http80 *h = d2k_http80_new();
+    const uint64_t T = 5000 * MS;
+    CHECK(d2k_http80_set_https(h, "rutracker.org.", 14, T + 3600 * 1000 * MS) == 0,
+          "имя с HTTPS не принято");
+    flow f = v6 ? flow6(51500) : flow4(51500);
+    uint32_t req_end = CISN + 1 + (uint32_t)strlen(GET);
+    open_flow(h, &f, T, GET);
+    size_t n = pkt(&f, 0, F_ACK | F_PSH | F_FIN, SISN + 1, req_end, INJECT, b);
+    PKT(h, b, n, T + 99 * MS + 700000ull, &r);
+    CHECK(r.injection && r.answered && r.action == D2K_HTTP80_REPLACE,
+          v6 ? "IPv6: вставка при подтверждённом HTTPS не заменена" :
+               "вставка при подтверждённом HTTPS не заменена");
+
+    char want[1024];
+    size_t wl = d2k_httpup_redirect_https("RuTracker.org", "/forum/index.php", want, sizeof want);
+    CHECK(wl > 0 && strstr(want, "HTTP/1.1 307 Temporary Redirect\r\n") == want &&
+          strstr(want, "Location: https://RuTracker.org/forum/index.php\r\n") &&
+          strstr(want, "Content-Length: 0\r\n") && strstr(want, "Connection: close\r\n"),
+          "307 собран не тем");
+    size_t ip = v6 ? 40 : 20;
+    CHECK(r.len == ip + 20 + wl, "длина пакета-замены не та");
+    const uint8_t *o = out, *t = out + ip;
+    if (v6) {
+        CHECK(o[0] >> 4 == 6 && rd16(o + 4) == 20 + wl && o[6] == 6, "IPv6-заголовок замены не тот");
+        CHECK(memcmp(o + 8, f.server, 16) == 0 && memcmp(o + 24, f.client, 16) == 0,
+              "IPv6: адреса замены не те");
+    } else {
+        CHECK(o[0] == 0x45 && rd16(o + 2) == 20 + 20 + wl && o[9] == 6, "IPv4-заголовок замены не тот");
+        CHECK(memcmp(o + 12, f.server, 4) == 0 && memcmp(o + 16, f.client, 4) == 0,
+              "IPv4: адреса замены не те");
+        CHECK(ip4_header_ok(o), "сумма IPv4-заголовка замены неверна");
+    }
+    CHECK(rd16(t) == 80 && rd16(t + 2) == 51500, "порты замены не те");
+    CHECK(rd32(t + 4) == SISN + 1, "seq замены не начало потока сервера");
+    CHECK(rd32(t + 8) == req_end, "ack замены не конец запроса");
+    CHECK(t[13] == (F_FIN | F_PSH | F_ACK), "флаги замены не FIN|PSH|ACK");
+    CHECK(memcmp(t + 20, want, wl) == 0, "нагрузка замены не 307");
+    CHECK(d2k_wire_tcp_checksum_ok(out, r.len), "TCP-сумма замены неверна");
+
+    /* RST к серверу: от клиента, с конца запроса. */
+    CHECK(r.rst_len == ip + 20, "RST к серверу не собран");
+    const uint8_t *q = rst + ip;
+    if (v6) {
+        CHECK(memcmp(rst + 8, f.client, 16) == 0 && memcmp(rst + 24, f.server, 16) == 0,
+              "IPv6: адреса RST не те");
+    } else {
+        CHECK(memcmp(rst + 12, f.client, 4) == 0 && memcmp(rst + 16, f.server, 4) == 0,
+              "IPv4: адреса RST не те");
+        CHECK(ip4_header_ok(rst), "сумма IPv4-заголовка RST неверна");
+    }
+    CHECK(rd16(q) == 51500 && rd16(q + 2) == 80, "порты RST не те");
+    CHECK(rd32(q + 4) == req_end && (q[13] & F_RST), "RST не с конца запроса");
+    CHECK(d2k_wire_tcp_checksum_ok(rst, r.rst_len), "TCP-сумма RST неверна");
+
+    /* Вторая копия, отдельный FIN вставки, поздний настоящий ответ — снимаются. */
+    PKT(h, b, n, T + 99 * MS + 900000ull, &r);
+    CHECK(r.action == D2K_HTTP80_DROP && !r.injection, "вторая копия вставки не снята");
+    n = pkt(&f, 0, F_ACK | F_FIN, SISN + 1 + (uint32_t)strlen(INJECT), req_end, NULL, b);
+    PKT(h, b, n, T + 99 * MS + 950000ull, &r);
+    CHECK(r.action == D2K_HTTP80_DROP, "FIN вставки не снят");
+    n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, req_end, "HTTP/1.1 200 OK\r\n\r\n", b);
+    PKT(h, b, n, T + 200 * MS, &r);
+    CHECK(r.action == D2K_HTTP80_DROP, "поздний пакет сервера не снят");
+    /* Клиент закрывает своё — это не наше дело. */
+    n = pkt(&f, 1, F_ACK | F_FIN, req_end, SISN + 2 + (uint32_t)wl, NULL, b);
+    PKT(h, b, n, T + 200 * MS, &r);
+    CHECK(r.action == D2K_HTTP80_PASS, "пакет клиента после замены снят");
+    d2k_http80_stats st = d2k_http80_get_stats(h);
+    CHECK(st.answered == 1 && st.dropped == 3, "счётчики замены не те");
+    d2k_http80_free(h);
+}
+
+static void test_https_table(void) {
+    d2k_http80 *h = d2k_http80_new();
+    CHECK(d2k_http80_set_https(h, "", 0, 10) != 0, "пустое имя принято");
+    CHECK(d2k_http80_set_https(h, "bad name", 8, 10) != 0, "имя с пробелом принято");
+    CHECK(d2k_http80_set_https(h, "Example.COM", 11, 100) == 0, "имя не принято");
+    CHECK(d2k_http80_https(h, "example.com", 99), "имя не найдено без учёта регистра");
+    CHECK(!d2k_http80_https(h, "example.com", 100), "имя живёт дольше срока");
+    CHECK(!d2k_http80_https(h, "www.example.com", 1), "поддомен принят за имя");
+    CHECK(d2k_http80_set_https(h, "example.com", 11, 0) == 0 && !d2k_http80_https(h, "example.com", 1),
+          "имя не снимается нулевым сроком");
+    char name[32];
+    for (unsigned i = 0; i < D2K_HTTP80_NAMES + 20; i++) {
+        int k = snprintf(name, sizeof name, "n%u.example", i);
+        CHECK(d2k_http80_set_https(h, name, (size_t)k, 1000 + i) == 0, "полная таблица отказала");
+    }
+    int k = snprintf(name, sizeof name, "n%u.example", D2K_HTTP80_NAMES + 19);
+    (void)k;
+    CHECK(d2k_http80_https(h, name, 1), "свежее имя вытеснено");
+    CHECK(!d2k_http80_https(h, "n0.example", 1), "вытеснено не самое раннее");
+
+    /* Срок вышел — вставка снова проходит как есть. */
+    CHECK(d2k_http80_set_https(h, "rutracker.org", 13, 10 * MS) == 0, "имя не принято");
+    flow f = flow4(57000);
+    open_flow(h, &f, 0, GET);
+    size_t n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, CISN + 1 + (uint32_t)strlen(GET), INJECT, b);
+    PKT(h, b, n, 99 * MS + 700000ull, &r);
+    CHECK(r.injection && !r.answered && r.action == D2K_HTTP80_PASS,
+          "истёкшее знание об HTTPS всё ещё переводит на https");
+    d2k_http80_free(h);
+
+    /* Замена не помещается в буфер — вставка проходит, а не теряется. */
+    h = d2k_http80_new();
+    CHECK(d2k_http80_set_https(h, "rutracker.org", 13, 1000 * MS) == 0, "имя не принято");
+    f = flow4(57001);
+    open_flow(h, &f, 0, GET);
+    n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, CISN + 1 + (uint32_t)strlen(GET), INJECT, b);
+    d2k_http80_packet(h, b, n, 99 * MS + 700000ull, out, 64, rst, sizeof rst, &r);
+    CHECK(r.injection && r.action == D2K_HTTP80_PASS, "замена без места не прошла как есть");
     d2k_http80_free(h);
 }
 
@@ -227,7 +353,9 @@ int main(void) {
     test_not_injection();
     test_table_bound();
     test_garbage();
-    (void)rd16; (void)rd32;
+    test_answer(0);
+    test_answer(1);
+    test_https_table();
     if (fails) {
         printf("test_http80: провалов %d\n", fails);
         return 1;

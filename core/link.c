@@ -292,6 +292,15 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
             out->name[nl] = '\0';
         }
         break;
+    case D2K_EV_HTTP_PORTAL:
+        if (rlen < 2 || rlen < 2u + rest[1]) {
+            say(err, errcap, "вставка HTTP без признака или с обрезанным именем");
+            return -1;
+        }
+        out->code = rest[0];
+        memcpy(out->name, rest + 2, rest[1]);
+        out->name[rest[1]] = '\0';
+        break;
     case D2K_EV_SUSPECT:
         if (rlen < 1) {
             say(err, errcap, "подозрение без кода причины");
@@ -559,6 +568,27 @@ int d2k_link_set_suffix_family(int fd, const char *name, uint8_t transport,
     }
     return send_name_plan(fd, name, transport, plan_text, shape, 0, family,
         err, errcap, D2K_CMD_SET_SUFFIX, NULL);
+}
+
+int d2k_link_set_https(int fd, const char *name, uint32_t ttl_s, char *err, size_t errcap) {
+    size_t nl = name ? strlen(name) : 0;
+    if (fd < 0 || nl == 0 || nl > 253) {
+        say(err, errcap, "имя для HTTPS пусто или длиннее 253");
+        return -1;
+    }
+    size_t o = HDR;
+    g_scratch[o++] = (uint8_t)nl; memcpy(g_scratch + o, name, nl); o += nl;
+    g_scratch[o++] = (uint8_t)(ttl_s >> 24); g_scratch[o++] = (uint8_t)(ttl_s >> 16);
+    g_scratch[o++] = (uint8_t)(ttl_s >> 8); g_scratch[o++] = (uint8_t)ttl_s;
+    uint32_t plen = (uint32_t)(o - HDR + 2);
+    g_scratch[0] = (uint8_t)(plen >> 24); g_scratch[1] = (uint8_t)(plen >> 16);
+    g_scratch[2] = (uint8_t)(plen >> 8); g_scratch[3] = (uint8_t)plen;
+    g_scratch[4] = (uint8_t)(D2K_CMD_SET_HTTPS >> 8); g_scratch[5] = (uint8_t)D2K_CMD_SET_HTTPS;
+    if (write_all(fd, g_scratch, o) != 0) {
+        say(err, errcap, "SET_HTTPS не отправился: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 static int send_area_key(int fd, uint16_t cmd, const char *name,

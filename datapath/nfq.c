@@ -259,6 +259,25 @@ int d2k_nfq_verdict(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
     return 0;
 }
 
+int d2k_nfq_verdict_payload(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
+                            const uint8_t *payload, size_t len, char *err, size_t errcap) {
+    if (!q) {
+        return -1;
+    }
+    uint8_t msg[64 + 2048];
+    size_t n = d2k_nl_verdict_payload(msg, sizeof msg, q->queue, q->seq++, pkt_id, verdict,
+                                      payload, len);
+    if (n == 0) {
+        say(err, errcap, "вердикт с заменой не собрался");
+        return -1;
+    }
+    if (nl_write(q->fd, msg, n) != 0) {
+        say(err, errcap, "отправка вердикта с заменой: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 uint64_t d2k_nfq_lost(const d2k_nfq *q) {
     return q ? q->lost : 0;
 }

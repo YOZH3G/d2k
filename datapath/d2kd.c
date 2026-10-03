@@ -502,7 +502,7 @@ static int out_send_at_owned(void *ctx, uint64_t at, const uint8_t *p, size_t n,
  * без строки «HTTP не открылся» не отличить от «сайт лежит». */
 static d2k_http80 *http80;
 
-static void http80_log(const d2k_http80_res *r) {
+static void http80_log(const d2k_http80_res *r, const char *outcome) {
     char srv[64] = "?";
     d2k_addr a;
     memset(&a, 0, sizeof a);
@@ -512,18 +512,77 @@ static void http80_log(const d2k_http80_res *r) {
     fprintf(stderr, "d2kd: HTTP %s (%s:%u): вставка провайдера — 30x на %s через %" PRIu64
                     " мкс после запроса при RTT потока %" PRIu64 " мкс; %s\n",
             r->host, srv, (unsigned)r->server_port, r->portal,
-            r->reply_ns / 1000u, r->rtt_ns / 1000u,
-            "пропущена клиенту как есть");
+            r->reply_ns / 1000u, r->rtt_ns / 1000u, outcome);
+}
+
+/* Событие контроллеру: по нему он проверяет HTTPS имени (D2K_EV_HTTP_PORTAL). */
+static void http80_event(d2k_ctl *ctl, const d2k_http80_res *r) {
+    if (!ctl) { return; }
+    uint8_t body[D2K_KEY_WIRE_LEN + 2 + 255];
+    size_t hl = strlen(r->host);
+    if (hl > 255) { return; }
+    memset(body, 0, D2K_KEY_WIRE_LEN);
+    body[0] = r->family == 6 ? 6 : 4;
+    memcpy(body + 1, r->client, r->family == 6 ? 16 : 4);
+    memcpy(body + 17, r->server, r->family == 6 ? 16 : 4);
+    body[33] = (uint8_t)(r->client_port >> 8); body[34] = (uint8_t)r->client_port;
+    body[35] = (uint8_t)(r->server_port >> 8); body[36] = (uint8_t)r->server_port;
+    body[37] = 6;
+    body[D2K_KEY_WIRE_LEN] = r->answered ? 1 : 0;
+    body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)hl;
+    memcpy(body + D2K_KEY_WIRE_LEN + 2, r->host, hl);
+    d2k_ctl_event(ctl, D2K_EV_HTTP_PORTAL, body, D2K_KEY_WIRE_LEN + 2 + hl);
 }
 
 /* Пакет очереди глазами http80. 1 — пакет обработан здесь (вердикт уже
-   отправлен), 0 — дальше обычным путём. */
-static int http80_step(const uint8_t *p, size_t n, uint64_t t) {
+   отправлен), 0 — дальше обычным путём. Заменять и снимать — только в
+   режиме apply с сырым сокетом: в наблюдении трафик не трогается. */
+static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
+                       const uint8_t *p, size_t n, uint64_t t) {
     if (!http80) { return 0; }
+    static uint8_t out[D2K_HTTP80_TARGET_MAX + 1024];
+    static uint8_t rst[128];
+    char err[200];
     d2k_http80_res r;
-    d2k_http80_packet(http80, p, n, t, &r);
-    if (r.injection) { http80_log(&r); }
-    return 0;
+    d2k_http80_packet(http80, p, n, t, raw ? out : NULL, raw ? sizeof out : 0,
+                      rst, sizeof rst, &r);
+    if (r.injection) { http80_event(ctl, &r); }
+    if (r.action == D2K_HTTP80_DROP && raw) {
+        if (d2k_nfq_verdict(q, id, D2K_NF_DROP, err, sizeof err) != 0) {
+            st.verdict_fail++;
+            fprintf(stderr, "d2kd: %s\n", err);
+        } else {
+            st.dropped++;
+        }
+        return 1;
+    }
+    if (r.action != D2K_HTTP80_REPLACE || !raw) {
+        if (r.injection) {
+            http80_log(&r, raw ? "HTTPS имени не подтверждён — пропущена клиенту как есть"
+                               : "наблюдение — пропущена как есть");
+        }
+        return 0;
+    }
+    if (d2k_nfq_verdict_payload(q, id, D2K_NF_ACCEPT, out, r.len, err, sizeof err) != 0) {
+        /* Замена не ушла — значит, ядро выпустит вставку как есть. RST к
+           серверу тогда не нужен: поток клиента цел. */
+        st.verdict_fail++;
+        fprintf(stderr, "d2kd: %s\n", err);
+        http80_log(&r, "замена на 307 не ушла — пропущена как есть");
+        if (d2k_nfq_verdict(q, id, D2K_NF_ACCEPT, err, sizeof err) != 0) {
+            fprintf(stderr, "d2kd: %s\n", err);
+        }
+        return 1;
+    }
+    st.accepted++;
+    if (d2k_raw_send(raw, rst, r.rst_len, err, sizeof err) != 0) {
+        st.send_fail++;
+        log_send_fail("RST к серверу после 307: ", err, errno);
+    } else {
+        st.emitted++;
+    }
+    http80_log(&r, "HTTPS имени подтверждён — клиенту 307 на https, серверу RST");
+    return 1;
 }
 
 static const char *MODE_NAMES[] = {"observe", "apply"};
@@ -1012,6 +1071,7 @@ int main(int argc, char **argv) {
     memset(&cx, 0, sizeof cx);
     cx.sess = sess;
     cx.ctl = ctl;
+    cx.http80 = http80;
     d2k_ctl_set_disconnect_hook(ctl, d2k_ctlsrv_peer_closed, &cx);
     cx.send_limits = raw ? d2k_raw_limits(raw) : 0;
     /* Ноль без сырого сокета — «предел не объявлен»: в режиме наблюдения на
@@ -1232,7 +1292,8 @@ int main(int argc, char **argv) {
                     st.seen++;
                     st.bytes += np.payload_len;
                     if (np.have_payload && !np.truncated &&
-                        http80_step(np.payload, np.payload_len, t)) {
+                        http80_step(q, mode == MODE_APPLY ? raw : NULL, ctl, np.id,
+                                    np.payload, np.payload_len, t)) {
                         continue;
                     }
 

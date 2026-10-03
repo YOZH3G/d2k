@@ -50,6 +50,10 @@ ssize_t d2k_nfq_recv(d2k_nfq *q, uint8_t *buf, size_t cap, char *err, size_t err
 int d2k_nfq_verdict(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
                     char *err, size_t errcap);
 
+/* Вердикт, выпускающий вместо пакета payload (до 2048 байт). */
+int d2k_nfq_verdict_payload(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
+                            const uint8_t *payload, size_t len, char *err, size_t errcap);
+
 /* Сколько раз ядро сообщало о потерянных сообщениях. */
 uint64_t d2k_nfq_lost(const d2k_nfq *q);
 
