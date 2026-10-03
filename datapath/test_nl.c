@@ -176,6 +176,12 @@ int main(void) {
         wn32(mark, 0x1234);
         pos = put(buf, pos, D2K_NFQA_MARK, mark, sizeof mark, 1);
 
+        /* Выходной интерфейс (финальное ревью I-1): по нему видно, что поток
+           уходит не туда, куда ушла бы сырая посылка. */
+        uint8_t odev[4];
+        wn32(odev, 7);
+        pos = put(buf, pos, D2K_NFQA_IFINDEX_OUTDEV, odev, sizeof odev, 1);
+
         uint8_t pay[40];
         for (size_t i = 0; i < sizeof pay; i++) {
             pay[i] = (uint8_t)i;
@@ -197,6 +203,7 @@ int main(void) {
         CHECK(p.hw_protocol == 0x0800, "hw_protocol потерян");
         CHECK(p.hook == 3, "hook потерян");
         CHECK(p.have_mark && p.mark == 0x1234, "метка потеряна");
+        CHECK(p.have_outdev && p.outdev == 7, "выходной интерфейс потерян");
         CHECK(p.have_payload && p.payload_len == 40, "нагрузка потеряна");
         CHECK(p.payload && p.payload[0] == 0 && p.payload[39] == 39,
               "содержимое нагрузки не то");

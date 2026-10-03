@@ -128,7 +128,8 @@ size_t d2k_raw_route_maxlen_family(d2k_raw *r, const uint8_t *dst, uint8_t famil
 size_t d2k_raw_maxlen(const d2k_raw *r);
 
 /* Отправляет готовый IPv4-пакет. Адрес назначения берётся из его заголовка.
- * 0 — отправлено, -1 — ошибка (причина в err). */
+ * 0 — отправлено, -1 — ошибка (причина в err, errno сохранён). Никогда не
+ * ждёт: полный сокет — -1 с EAGAIN/EWOULDBLOCK/ENOBUFS (d2k_raw_busy). */
 int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
                  char *err, size_t errcap);
 /* Prepare required socket options without sending. Call for EVERY packet
@@ -139,5 +140,7 @@ int d2k_raw_prepare(d2k_raw *r, const uint8_t *pkt, size_t len,
 
 uint64_t d2k_raw_sent(const d2k_raw *r);
 uint64_t d2k_raw_errors(const d2k_raw *r);
+/* Отказы полного сокета (EAGAIN/ENOBUFS) — входят и в d2k_raw_errors. */
+uint64_t d2k_raw_busy(const d2k_raw *r);
 
 #endif /* D2K_RAW_H */

@@ -53,6 +53,7 @@
 #define D2K_NFQA_PACKET_HDR   1
 #define D2K_NFQA_VERDICT_HDR  2
 #define D2K_NFQA_MARK         3
+#define D2K_NFQA_IFINDEX_OUTDEV 6
 #define D2K_NFQA_PAYLOAD     10
 #define D2K_NFQA_CAP_LEN     13
 #define D2K_NFQA_SKB_INFO    14
@@ -122,6 +123,10 @@ typedef struct {
     int have_hdr;      /* без него вердикт послать не о чем */
     int have_payload;
     int have_mark;
+    /* Выходной интерфейс (NFQA_IFINDEX_OUTDEV): есть у пакетов POSTROUTING,
+       OUTPUT и FORWARD. Нужен шлюзу маршрута (d2k_routemark_gate). */
+    uint32_t outdev;
+    int have_outdev;
     /* Ядро отдало меньше, чем было на проводе: copy_range обрезал. Работать с
      * таким пакетом нельзя — мы рассуждали бы о куске, считая его целым. */
     int truncated;

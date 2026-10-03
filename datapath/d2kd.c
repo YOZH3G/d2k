@@ -18,6 +18,7 @@
 
 #include <errno.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <sys/socket.h>
 #include <inttypes.h>
 #include <signal.h>
@@ -192,7 +193,22 @@ static struct {
     uint64_t send_fail;
     uint64_t recv_err;
     uint64_t udp_marked_kept;  /* потоков UDP с меткой клиента: хвосты не переизданы */
+    uint64_t busy_lines;       /* строк «сокет полон» в журнале (первые 16) */
+    uint64_t routes_watch;     /* уведомлений о правилах/маршрутах */
 } st;
+
+/* Отказ сырой посылки плана — строка журнала. Полный сокет (EAGAIN/ENOBUFS,
+   финальное ревью M-3) под забитым аплинком повторяется на каждом плане:
+   первые 16 строк, дальше счётчик d2k_raw_busy в сводке. */
+static void log_send_fail(const char *what, const char *err, int e) {
+    if (d2k_udp_send_busy(e)) {
+        if (++st.busy_lines > 16) { return; }
+        fprintf(stderr, "d2kd: %s%s%s\n", what, err,
+                st.busy_lines == 16 ? " (дальше только счётчик «сокет полон»)" : "");
+        return;
+    }
+    fprintf(stderr, "d2kd: %s%s\n", what, err);
+}
 
 /* raw/sched are set only in apply mode with a raw socket: without them held
    UDP tails go back to the kernel as before (observe mode). */
@@ -213,41 +229,71 @@ static int routes_routed(const void *r, uint8_t ipver, uint32_t mark) {
     return d2k_routemark_routed(r, ipver, mark);
 }
 
+static void describe_oifs(char *buf, size_t cap, const uint32_t *o, size_t n, int read) {
+    size_t w = 0;
+    buf[0] = 0;
+    if (!read) { snprintf(buf, cap, "не прочитаны"); return; }
+    if (!n) { snprintf(buf, cap, "нет"); return; }
+    for (size_t i = 0; i < n && w < cap; i++) {
+        char name[IF_NAMESIZE] = "";
+        if (!if_indextoname(o[i], name)) { snprintf(name, sizeof name, "#%u", o[i]); }
+        int k = snprintf(buf + w, cap - w, "%s%s", i ? ", " : "", name);
+        if (k < 0) { break; }
+        w += (size_t)k;
+    }
+}
+
+/* Правила по метке и выходы маршрутов по умолчанию главной таблицы
+   (финальное ревью I-1, M-2). Каждая часть читается сама по себе; не
+   прочитанная держит прежнее значение. Каждое состояние пишется в журнал
+   один раз, при смене, а не раз в 30 с. */
 static void routes_refresh(void) {
-    /* Каждое состояние пишется в журнал один раз, при смене, а не раз в 30 с. */
-    static int last_fail = 0, last_v6 = 1, last_trunc = 0;
-    char err[256];
-    d2k_routemark_status st;
-    int rc = d2k_routemark_load(&routes, &st, err, sizeof err);
+    static int last_fail = 0, last_v4 = 1, last_v6 = 1, last_r4 = 1, last_r6 = 1;
+    static int last_trunc = 0, first = 1;
+    char err[256] = "";
+    d2k_routemark_status st_rm;
+    int r4 = 0, r6 = 0;
+    int rc = d2k_routemark_load(&routes, &st_rm, &r4, &r6, err, sizeof err);
     if (rc < 0) {
-        /* Не прочли — держим прежний набор: пропажа правил не должна
+        /* Не прочли ничего — держим прежнее: пропажа правил не должна
            выключать d2k, их появление не должно молча пропасть навсегда. */
         if (!last_fail) {
-            fprintf(stderr, "d2kd: правила маршрутизации по метке не прочитаны: %s\n", err);
+            fprintf(stderr, "d2kd: правила и маршруты не прочитаны: %s — держу прежние%s\n",
+                    err, first ? " (до первого чтения клиент с чужой меткой идёт ядром)" : "");
         }
         last_fail = 1;
+        first = 0;
         return;
     }
-    if (last_fail) { fprintf(stderr, "d2kd: правила маршрутизации по метке снова читаются\n"); }
+    if (last_fail) { fprintf(stderr, "d2kd: правила и маршруты снова читаются\n"); }
     last_fail = 0;
-    if (st.v6_ok != last_v6) {
-        fprintf(stderr, st.v6_ok ? "d2kd: правила IPv6 по метке снова читаются\n"
-                                 : "d2kd: правил IPv6 по метке нет или они не читаются — "
-                                   "действуют только правила IPv4\n");
-        last_v6 = st.v6_ok;
+    first = 0;
+    int now[4] = {st_rm.v4_ok, st_rm.v6_ok, r4, r6};
+    int *last[4] = {&last_v4, &last_v6, &last_r4, &last_r6};
+    static const char *what[4] = {"правила IPv4 по метке", "правила IPv6 по метке",
+                                  "маршруты IPv4", "маршруты IPv6"};
+    for (int i = 0; i < 4; i++) {
+        if (now[i] == *last[i]) { continue; }
+        if (now[i]) { fprintf(stderr, "d2kd: %s снова читаются\n", what[i]); }
+        else { fprintf(stderr, "d2kd: %s не прочитаны: %s — держу прежние\n", what[i], err); }
+        *last[i] = now[i];
     }
-    if (st.truncated != last_trunc) {
-        if (st.truncated) {
+    if (st_rm.truncated != last_trunc) {
+        if (st_rm.truncated) {
             fprintf(stderr, "d2kd: правил по метке %zu, учтены первые %d\n",
-                    st.found, D2K_ROUTEMARK_MAX);
+                    st_rm.found, D2K_ROUTEMARK_MAX);
         }
-        last_trunc = st.truncated;
+        last_trunc = st_rm.truncated;
     }
     if (rc == 1) {
-        char text[512];
+        char text[512], o4[256], o6[256];
         (void)d2k_routemark_describe(&routes, text, sizeof text);
-        fprintf(stderr, "d2kd: метки маршрута по ip rule (клиент с такой меткой — без плана): %s\n",
-                text);
+        describe_oifs(o4, sizeof o4, routes.oif4, routes.n_oif4, routes.oifs_read4);
+        describe_oifs(o6, sizeof o6, routes.oif6, routes.n_oif6, routes.oifs_read6);
+        fprintf(stderr, "d2kd: метки маршрута по ip rule (клиент с такой меткой — без плана): %s; "
+                        "выходы по умолчанию главной таблицы IPv4: %s, IPv6: %s "
+                        "(клиент, уходящий через другой интерфейс, — без плана)\n",
+                text, o4, o6);
     }
 }
 static d2k_udp_path udp_path;
@@ -386,9 +432,13 @@ static void out_resend_failed(void *ctx, const uint8_t *p, size_t n, int err) {
         sport = port_of(p + v.l4);
         dport = port_of(p + v.l4 + 2);
     }
+    /* Вызывается для первых D2K_UDP_REFUSED_LOG потоков (финальное ревью
+       M-7); остальные — счётчик в сводке. */
     fprintf(stderr, "d2kd: поток UDP %s:%u -> %s:%u (IPv%d, %zu байт): хвост не переиздан, "
-                    "отдаю ядру, поток дальше без переиздания: %s\n",
-            src, sport, dst, dport, fam, n, strerror(err));
+                    "отдаю ядру, поток дальше без переиздания: %s%s\n",
+            src, sport, dst, dport, fam, n, strerror(err),
+            d2k_udp_follow_refused(udp_follow) == D2K_UDP_REFUSED_LOG
+                ? " (дальше только счётчик)" : "");
 }
 
 static int out_send_now(void *ctx, const uint8_t *p, size_t n) {
@@ -564,8 +614,13 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
     printf("потоков клиентов с меткой маршрутизации (ядром, без плана): %" PRIu64 "\n",
            d2k_session_routed_flows(s));
     printf("UDP с меткой клиента, хвосты ядром: %" PRIu64 " потоков\n", st.udp_marked_kept);
-    printf("сырым сокетом отправлено %" PRIu64 ", ошибок %" PRIu64 "\n",
-               d2k_raw_sent(r), d2k_raw_errors(r));
+    printf("сырым сокетом отправлено %" PRIu64 ", ошибок %" PRIu64
+           " (из них сокет полон %" PRIu64 ")\n",
+               d2k_raw_sent(r), d2k_raw_errors(r), d2k_raw_busy(r));
+    printf("UDP переиздание: отказано потоков %" PRIu64 ", сокет полон %" PRIu64
+           " раз; уведомлений о правилах/маршрутах %" PRIu64 "\n",
+           d2k_udp_follow_refused(udp_follow), d2k_udp_follow_busy(udp_follow),
+           st.routes_watch);
     }
     printf("отказов по форме приветствия %zu\n",
            d2k_plantab_shape_misses(d2k_session_plans((d2k_session *)s)));
@@ -917,8 +972,22 @@ int main(int argc, char **argv) {
     udp_out.routed = routes_routed;
     udp_out.routes = &routes;
     d2k_routemark_init(&routes);
+    /* Изменения правил и маршрутов — сразу, по уведомлению (финальное ревью
+       M-2): правило, добавленное при работающей службе (включили политику
+       VPN, переподключение), иначе было бы неизвестно до 30 с. Опрос раз в
+       30 с остаётся страховкой. */
+    int routes_fd;
+    {
+        char werr[256];
+        routes_fd = d2k_routemark_watch_open(werr, sizeof werr);
+        if (routes_fd < 0) {
+            fprintf(stderr, "d2kd: уведомления о правилах/маршрутах недоступны: %s — "
+                            "только опрос раз в 30 с\n", werr);
+        }
+    }
     routes_refresh();
-    uint64_t next_routes = now_ns() + D2K_ROUTEMARK_REFRESH_NS;
+    uint64_t last_routes = now_ns();
+    uint64_t next_routes = last_routes + D2K_ROUTEMARK_REFRESH_NS;
     udp_path.sess = sess;
     udp_path.hold = udp_holding;
     udp_path.out = &udp_out;
@@ -967,6 +1036,7 @@ int main(int argc, char **argv) {
         if (due && due < wake) { wake = due; }
         if (next_stats && next_stats < wake) { wake = next_stats; }
         if (next_expire < wake) { wake = next_expire; }
+        if (next_routes < wake) { wake = next_routes; }
 
         int timeout_ms = 0;
         if (wake > t) {
@@ -974,12 +1044,19 @@ int main(int argc, char **argv) {
             timeout_ms = (d > 200) ? 200 : (int)d;
         }
 
-        struct pollfd pfd[3];
+        struct pollfd pfd[4];
         nfds_t nfd = 0;
         pfd[nfd].fd = d2k_nfq_fd(q);
         pfd[nfd].events = POLLIN;
         pfd[nfd].revents = 0;
         const nfds_t iq = nfd++;
+        nfds_t iw = (nfds_t)-1;
+        if (routes_fd >= 0) {
+            pfd[nfd].fd = routes_fd;
+            pfd[nfd].events = POLLIN;
+            pfd[nfd].revents = 0;
+            iw = nfd++;
+        }
 
         nfds_t il = (nfds_t)-1, ip = (nfds_t)-1;
         if (ctl) {
@@ -999,6 +1076,22 @@ int main(int argc, char **argv) {
         int pr = poll(pfd, nfd, timeout_ms);
         if (pr < 0 && errno != EINTR) {
             st.recv_err++;
+        }
+
+        /* Правило или маршрут изменились: перечитать до следующего пакета —
+           после пачки уведомлений, не чаще раза в D2K_ROUTEMARK_SETTLE_NS. */
+        if (pr > 0 && iw != (nfds_t)-1 && (pfd[iw].revents & (POLLIN | POLLERR)) &&
+            d2k_routemark_watch_drain(routes_fd)) {
+            st.routes_watch++;
+            uint64_t soon = last_routes + D2K_ROUTEMARK_SETTLE_NS;
+            uint64_t tn = now_ns();
+            if (soon < tn) { soon = tn; }
+            if (soon < next_routes) { next_routes = soon; }
+        }
+        if (now_ns() >= next_routes) {
+            routes_refresh();
+            last_routes = now_ns();
+            next_routes = last_routes + D2K_ROUTEMARK_REFRESH_NS;
         }
 
         if (ctl) {
@@ -1081,12 +1174,24 @@ int main(int argc, char **argv) {
                        поток идёт ядром, без плана и удержания. Метка без
                        правила (PPPoE, QoS, чужая) d2k не выключает. Ставится
                        на КАЖДЫЙ пакет — единственное место. */
-                    d2k_session_set_route_mark(sess,
-                        d2k_routemark_client(&routes,
-                                             (np.have_payload && np.payload_len)
-                                                 ? (uint8_t)(np.payload[0] >> 4) : 4,
-                                             np.have_mark, np.mark,
-                                             probe_mark, mark));
+                    /* ВЫХОДНОЙ ИНТЕРФЕЙС (финальное ревью I-1): клиент,
+                       которого увели в другую таблицу по адресу, iif, tos или
+                       uidrange, метки не несёт, а сырая посылка такие правила
+                       не проходит и идёт по главной таблице. Исходящий пакет,
+                       уходящий не через выход маршрута по умолчанию главной
+                       таблицы, — тоже поток ядра. */
+                    const int outbound = np.hook == D2K_HOOK_POSTROUTING ||
+                                         np.hook == D2K_HOOK_OUTPUT;
+                    const uint32_t route_gate = d2k_routemark_gate(&routes,
+                        (np.have_payload && np.payload_len)
+                            ? (uint8_t)(np.payload[0] >> 4) : 4,
+                        outbound, np.have_mark, np.mark, probe_mark, mark,
+                        np.have_outdev, np.outdev);
+                    d2k_session_set_route_mark(sess, route_gate);
+                    /* Метка для UDP-выпуска: решение шлюза, если он сказал
+                       «маршрут», иначе метка пакета как есть. */
+                    const uint32_t umark = route_gate ? route_gate
+                                                      : (np.have_mark ? np.mark : 0);
 
                     /* QUIC split hold starts before session inspection, so the
                        first tail cannot escape while the ClientHello is still
@@ -1094,7 +1199,7 @@ int main(int argc, char **argv) {
                        concatenates these datagrams. */
                     int udp_fed = udp_holding && np.have_payload && !np.truncated &&
                         d2k_udp_path_pre(&udp_path, np.id, np.payload, np.payload_len,
-                                         np.have_mark ? np.mark : 0, t, &udp_key);
+                                         umark, t, &udp_key);
                     if (holding && np.have_payload && !np.truncated) {
                         /* НАЧАЛО ПОТОКА — ИЗ САМОГО ПОТОКА, а не из первого
                            байта куска: куски приветствия приходят в любом
@@ -1225,7 +1330,16 @@ int main(int argc, char **argv) {
 
                     if (res.routed_first) {
                         uint64_t rf = d2k_session_routed_flows(sess);
-                        if (rf <= 16) {
+                        if (rf <= 16 && res.routed_mark == D2K_ROUTE_OTHER_DEV) {
+                            char dev[IF_NAMESIZE] = "?";
+                            if (!np.have_outdev || !if_indextoname(np.outdev, dev)) {
+                                snprintf(dev, sizeof dev, "#%u", np.outdev);
+                            }
+                            fprintf(stderr, "d2kd: поток клиента уходит через %s — не выход "
+                                            "маршрута по умолчанию главной таблицы; идёт "
+                                            "ядром, без плана%s\n", dev,
+                                    rf == 16 ? " (дальше только счётчик)" : "");
+                        } else if (rf <= 16) {
                             fprintf(stderr, "d2kd: поток клиента с меткой маршрутизации 0x%x "
                                             "идёт ядром, без плана%s\n", res.routed_mark,
                                     rf == 16 ? " (дальше только счётчик)" : "");
@@ -1338,10 +1452,14 @@ int main(int argc, char **argv) {
                         size_t plen = res.out[k].len;
                         if (at <= t) {
                             if (d2k_raw_send(raw, p, plen, err, sizeof err) != 0) {
-                                uint8_t failure = refuse_of_errno(errno);
+                                int send_errno = errno;
+                                uint8_t failure = refuse_of_errno(send_errno);
                                 st.send_fail++;
                                 output_failed = 1;
-                                fprintf(stderr, "d2kd: %s\n", err);
+                                /* Полный сокет: план не исполняется дальше,
+                                   оригинал — общей политикой ниже (пока ушли
+                                   одни фальшивки, он проходит ядром). */
+                                log_send_fail("", err, send_errno);
                                 /* НАША неудача — не свойство коробки. Пока её
                                    знал только этот счётчик, контроллер видел
                                    «план применён» и делал из неё вывод о
@@ -1444,7 +1562,7 @@ int main(int argc, char **argv) {
                                verdict == D2K_NF_ACCEPT && !res.applied &&
                                np.have_payload && !np.truncated &&
                                d2k_udp_out_late(&udp_out, np.id, np.payload,
-                                                np.payload_len, np.have_mark ? np.mark : 0,
+                                                np.payload_len, umark,
                                                 t, udp_path.seq,
                                                 &original_failed)) {
                         /* ЗАПОЗДАВШИЙ ХВОСТ (задача 46): голова потока уже
@@ -1469,8 +1587,7 @@ int main(int argc, char **argv) {
                         if (!batch.count && !original_failed && verdict == D2K_NF_ACCEPT &&
                             !res.applied && np.have_payload && !np.truncated) {
                             (void)d2k_udp_path_passed(&udp_path, np.payload,
-                                                      np.payload_len,
-                                                      np.have_mark ? np.mark : 0, t);
+                                                      np.payload_len, umark, t);
                         }
                         /* UDP-ПЛАН БЕЗ УДЕРЖАНИЯ (голос/STUN, задача 47): план
                            забрал датаграмму и выпустил её после своих сырых
@@ -1480,8 +1597,7 @@ int main(int argc, char **argv) {
                             mode == MODE_APPLY && res.applied && verdict == D2K_NF_DROP &&
                             np.have_payload && !np.truncated) {
                             (void)d2k_udp_path_planned(&udp_path, np.payload,
-                                                       np.payload_len,
-                                                       np.have_mark ? np.mark : 0, at, t);
+                                                       np.payload_len, umark, at, t);
                         }
                     }
                     if (original_failed) {
@@ -1518,9 +1634,10 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 if (d2k_raw_send(raw, sbuf, slen, err, sizeof err) != 0) {
-                    uint8_t failure = refuse_of_errno(errno);
+                    int send_errno = errno;
+                    uint8_t failure = refuse_of_errno(send_errno);
                     st.send_fail++;
-                    fprintf(stderr, "d2kd: отложенная посылка: %s\n", err);
+                    log_send_fail("отложенная посылка: ", err, send_errno);
                     if (named) {
                         /* Вердикт этой попытки ядру уже ушёл: оригинал либо на
                            проводе, либо уничтожен, и копии у нас нет. Хранить
@@ -1551,16 +1668,15 @@ int main(int argc, char **argv) {
                                          delayed_verdict_done, &hc);
         }
 
-        if (t >= next_routes) {
-            routes_refresh();
-            next_routes = t + D2K_ROUTEMARK_REFRESH_NS;
-        }
         if (t >= next_expire) {
             /* Сперва заметить молчание, потом забывать. Обратный порядок
                означал бы, что о молчании узнаём только при забвении потока —
                через две минуты, когда человек уже ушёл со страницы. */
             d2k_session_sweep(sess, t);
             d2k_session_expire(sess, t, idle_ns);
+            /* Окно следования — миллисекунды: всё старше и из прежних пачек
+               приёма убирается (финальное ревью M-5). */
+            d2k_udp_follow_age(udp_follow, t, udp_path.rseq + 1);
             next_expire = t + NS_PER_S;
         }
         if (ctl) {
@@ -1638,6 +1754,7 @@ int main(int argc, char **argv) {
     d2k_udp_release_free(udp_releases);
     udp_releases = NULL;
     d2k_udp_follow_free(udp_follow);
+    if (routes_fd >= 0) { close(routes_fd); }
     udp_follow = NULL;
     d2k_session_free(sess);
     d2k_nfq_close(q);

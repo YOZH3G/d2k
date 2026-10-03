@@ -13,6 +13,7 @@
 #include "d2k_quichello.h"
 #include "d2k_plan.h"
 #include "d2k_plans.h"
+#include "d2k_routemark.h"
 
 static int fails;
 #define CHECK(x, m) do { if (!(x)) { fprintf(stderr, "udp_path:%d: %s\n", __LINE__, m); fails++; } } while (0)
@@ -40,7 +41,8 @@ static int rec_verdict(void *ctx, uint32_t id, uint32_t v) {
     return id == verdict_fail_id ? -1 : 0;
 }
 
-static int fail_sends;              /* rec_now refuses (EACCES-like) */
+static int fail_sends;              /* rec_now refuses with fail_errno */
+static int fail_errno = EACCES;
 static unsigned failed_reports;
 static void rec_failed(void *ctx, const uint8_t *p, size_t n, int err) {
     (void)ctx; (void)p; (void)n; (void)err;
@@ -48,7 +50,7 @@ static void rec_failed(void *ctx, const uint8_t *p, size_t n, int err) {
 }
 static int rec_now(void *ctx, const uint8_t *p, size_t n) {
     (void)ctx;
-    if (fail_sends) { errno = EACCES; return -1; }
+    if (fail_sends) { errno = fail_errno; return -1; }
     uint32_t id = id_in(p, n);
     if (id < MAXID) { sends_of[id]++; send_at_of[id] = 0; }
     if (order_n < sizeof order - 1) { order[order_n++] = 's';  order[order_n] = 0; }
@@ -191,6 +193,7 @@ static d2k_session *fresh(d2k_udp_hold **h, d2k_udp_follow **f) {
     out.defer_verdict = rec_defer;
     out.resend_failed = rec_failed;
     fail_sends = 0;
+    fail_errno = EACCES;
     failed_reports = 0;
     cur_mark = 0;
     marked_calls = 0;
@@ -804,7 +807,134 @@ static void test_refused_resend_reported_once(void) {
     done(s, h, f);
 }
 
+/* A QUIC-looking opening datagram that never parses as a whole Initial (not
+ * held): the unheld opening-burst path. */
+static size_t opening(uint8_t *pkt, uint32_t id, uint16_t sport) {
+    uint8_t pay[1200];
+    memset(pay, (int)(0x30 + id), sizeof pay);
+    pay[0] = 0xC5; pay[1] = 0; pay[2] = 0; pay[3] = 0; pay[4] = 1;
+    pay[5] = 8; pay[16] = 0x7F; pay[17] = 0xFF;
+    return build(pkt, id, sport, pay, sizeof pay);
+}
+
+/* Final review I-1: a client routed by source/iif (not by fwmark) leaves
+ * through a device that is not a main-table default; d2kd hands the path
+ * D2K_ROUTE_OTHER_DEV as its route mark.  Nothing of the flow is held or
+ * re-sent raw, and the session reports it once as routed. */
+static d2k_routemark gate_routes;
+static int gate_routed(const void *r, uint8_t ipver, uint32_t mark) {
+    return d2k_routemark_routed(r, ipver, mark);
+}
+static void test_device_routed_flow_keeps_kernel_path(void) {
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    reset();
+    d2k_routemark_init(&gate_routes);
+    (void)d2k_routemark_merge(&gate_routes, NULL, 0, 1, NULL, 0, 1, NULL);
+    uint32_t ppp0 = 5;
+    (void)d2k_routemark_set_oifs(&gate_routes, 2, &ppp0, 1, 1);
+    out.routed = gate_routed;
+    out.routes = &gate_routes;
+    /* The packet is unmarked and leaves through ifindex 9 (a VPN device). */
+    cur_mark = d2k_routemark_gate(&gate_routes, 4, 1, 0, 0, 0x2e, 0x2d, 1, 9);
+    CHECK(cur_mark == D2K_ROUTE_OTHER_DEV, "gate: another device");
+    uint8_t pkt[1300];
+    d2k_udp_path_read(&path, 70000);
+    for (uint32_t id = 1; id <= 4; id++) {
+        size_t n = opening(pkt, id, 51700);
+        (void)run_packet(s, id, pkt, n, 70000 + id, 0);
+    }
+    for (uint32_t id = 1; id <= 4; id++) {
+        CHECK(verdicts_of[id] == 1 && last_verdict[id] == D2K_NF_ACCEPT && sends_of[id] == 0,
+              "device-routed flow: kernel path, never re-sent");
+    }
+    CHECK(d2k_session_routed_flows(s) == 1, "reported once as routed");
+    CHECK(d2k_udp_hold_next_ns(h) == 0, "nothing held");
+
+    /* The same router, a client through the default device: d2k works. */
+    cur_mark = d2k_routemark_gate(&gate_routes, 4, 1, 0, 0, 0x2e, 0x2d, 1, 5);
+    CHECK(cur_mark == 0, "gate: default device");
+    d2k_udp_path_read(&path, 80000);
+    for (uint32_t id = 11; id <= 13; id++) {
+        size_t n = opening(pkt, id, 51800);
+        (void)run_packet(s, id, pkt, n, 80000 + id, 0);
+    }
+    CHECK(sends_of[12] == 1 && sends_of[13] == 1 && last_verdict[12] == D2K_NF_DROP,
+          "default device: followers re-sent as before");
+    out.routed = NULL;
+    out.routes = NULL;
+    done(s, h, f);
+}
+
+/* Final review M-3: a re-send refused because the socket is busy (EAGAIN,
+ * ENOBUFS under a full uplink) is transient: the copy goes to the kernel, it
+ * is counted, not logged per flow, and the flow is not given up. */
+static void test_busy_resend_is_transient(void) {
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    reset();
+    uint8_t pkt[1300];
+    fail_sends = 1;
+    fail_errno = EAGAIN;
+    d2k_udp_path_read(&path, 90000);
+    for (uint32_t id = 1; id <= 3; id++) {
+        size_t n = opening(pkt, id, 51900);
+        (void)run_packet(s, id, pkt, n, 90000 + id, 0);
+    }
+    for (uint32_t id = 1; id <= 3; id++) {
+        CHECK(verdicts_of[id] == 1 && last_verdict[id] == D2K_NF_ACCEPT,
+              "busy socket: the queued copy is ACCEPTed");
+    }
+    CHECK(failed_reports == 0, "busy is not a per-flow refusal line");
+    CHECK(d2k_udp_follow_busy(f) == 2, "both busy re-sends counted");
+    /* The socket drains: the next follower in the window is re-sent. */
+    fail_sends = 0;
+    size_t n = opening(pkt, 4, 51900);
+    (void)run_packet(s, 4, pkt, n, 90004, 0);
+    CHECK(sends_of[4] == 1 && last_verdict[4] == D2K_NF_DROP,
+          "the flow keeps its follow entry after a busy refusal");
+
+    /* ENOBUFS behaves the same in a held batch. */
+    d2k_udp_hold_batch b;
+    memset(&b, 0, sizeof b);
+    uint8_t pay[100];
+    memset(pay, 1, sizeof pay);
+    b.count = 2;
+    for (uint32_t i = 0; i < 2; i++) { b.ids[i] = 20 + i; b.len[i] = build(b.packets[i], 20 + i, 52000, pay, 100); }
+    fail_sends = 1;
+    fail_errno = ENOBUFS;
+    (void)d2k_udp_out_batch(&out, &b, D2K_NF_ACCEPT, 0, 95000, 95000, 9);
+    CHECK(last_verdict[21] == D2K_NF_ACCEPT && failed_reports == 0 && d2k_udp_follow_busy(f) == 3,
+          "batch tail on ENOBUFS: ACCEPT, counted, no report");
+    fail_sends = 0;
+    done(s, h, f);
+}
+
+/* Final review M-7: "not re-sent" lines are capped at the first
+ * D2K_UDP_REFUSED_LOG flows; the rest is a counter. */
+static void test_refused_lines_capped(void) {
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    reset();
+    uint8_t pkt[1300];
+    fail_sends = 1;
+    for (uint32_t k = 0; k < 20; k++) {
+        d2k_udp_path_read(&path, 100000 + k * 100000000ull);
+        for (uint32_t id = 1; id <= 2; id++) {
+            size_t n = opening(pkt, id, (uint16_t)(53000 + k));
+            (void)run_packet(s, id, pkt, n, 100000 + k * 100000000ull + id, 0);
+        }
+    }
+    CHECK(failed_reports == D2K_UDP_REFUSED_LOG, "only the first flows are reported");
+    CHECK(d2k_udp_follow_refused(f) == 20, "every refused flow is counted");
+    fail_sends = 0;
+    done(s, h, f);
+}
+
 int main(void) {
+    test_device_routed_flow_keeps_kernel_path();
+    test_busy_resend_is_transient();
+    test_refused_lines_capped();
     test_refused_resend_reported_once();
     test_unrouted_mark_is_neutral();
     test_deferred_plan_owns_head();

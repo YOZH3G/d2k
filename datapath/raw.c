@@ -9,6 +9,7 @@
 #define _DEFAULT_SOURCE 1
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +47,7 @@ struct d2k_raw {
     size_t   maxlen;
     uint64_t sent;
     uint64_t errors;
+    uint64_t busy;     /* EAGAIN/ENOBUFS: the socket is full, nothing waited */
     uint32_t mark;
     int      maxlen_declared;  /* предел назван оператором (--iface), а не угадан */
     route_entry route[ROUTE_CACHE];
@@ -179,10 +181,12 @@ static void say(char *err, size_t cap, const char *fmt, ...) {
     if (!err || cap == 0) {
         return;
     }
+    int saved = errno;   /* callers read errno after the message */
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(err, cap, fmt, ap);
     va_end(ap);
+    errno = saved;
 }
 
 d2k_raw *d2k_raw_open(uint32_t mark, const char *ifname, char *err, size_t errcap) {
@@ -389,7 +393,16 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
     }
     if(d2k_raw_prepare(r,pkt,len,err,errcap)<0) {r->errors++;return -1;}
     if (family == 6 && pkt[6] == 44) {
+        /* The AF_PACKET socket is opened by prepare; it must not block the
+           packet loop either (final review M-3). */
+        if (r->fragments6.fd >= 0) {
+            int fl = fcntl(r->fragments6.fd, F_GETFL);
+            if (fl >= 0 && !(fl & O_NONBLOCK)) {
+                (void)fcntl(r->fragments6.fd, F_SETFL, fl | O_NONBLOCK);
+            }
+        }
         if (d2k_ip6frag_send(&r->fragments6, pkt, len, r->mark) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) { r->busy++; }
             r->errors++;
             say(err, errcap, "IPv6 fragment send: %s", strerror(errno));
             return -1;
@@ -413,7 +426,12 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
     }
 
     for (;;) {
-        ssize_t n = sendto(fd, pkt, len, 0, (struct sockaddr *)&to, to_len);
+        /* НИКОГДА НЕ ЖДАТЬ (финальное ревью M-3). Под забитым аплинком
+           (раздача торрента, глубокая очередь ppp0) блокирующий sendto
+           усыплял единственный поток датапата: очередь NFQUEUE вставала для
+           всего роутера. Полный сокет — EAGAIN/ENOBUFS сразу; вызывающий
+           отдаёт копию ядру (переиздание) или отказывается от плана. */
+        ssize_t n = sendto(fd, pkt, len, MSG_DONTWAIT, (struct sockaddr *)&to, to_len);
         if (n >= 0) {
             if ((size_t)n != len) {
                 r->errors++;
@@ -429,6 +447,7 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
         }
         int failure = errno;
         r->errors++;
+        if (failure == EAGAIN || failure == EWOULDBLOCK || failure == ENOBUFS) { r->busy++; }
         if (failure == EMSGSIZE && len > (family == 6 ? 1280u : D2K_RAW_MTU_FLOOR)) {
             /* ПРЕДЕЛ ПРИШЁЛ ЗАМЕРОМ, А НЕ ИЗ КОНФИГУРАЦИИ.
                Объявленный предел взят с интерфейса при старте, а настоящий
@@ -473,4 +492,8 @@ uint64_t d2k_raw_sent(const d2k_raw *r) {
 
 uint64_t d2k_raw_errors(const d2k_raw *r) {
     return r ? r->errors : 0;
+}
+
+uint64_t d2k_raw_busy(const d2k_raw *r) {
+    return r ? r->busy : 0;
 }

@@ -299,6 +299,34 @@ int main(void) {
               "multicast is never followed");
         d2k_udp_follow_free(f);
     }
+
+    /* Final review M-5: the follow table ages.  Entries past the window and
+       from an earlier receive batch are expired, and an empty table answers
+       without parsing or scanning. */
+    {
+        d2k_udp_follow *f = d2k_udp_follow_new();
+        uint8_t a[40], b2[40];
+        build_udp4(a, 0xC0A80143u, 0x3990F8C0u, 50000, 443);
+        build_udp4(b2, 0xC0A80143u, 0x3990F8C0u, 50001, 443);
+        CHECK(d2k_udp_follow_live(f) == 0, "a new table is empty");
+        (void)d2k_udp_follow_mark(f, a, sizeof a, 1000, 0, 1);
+        (void)d2k_udp_follow_mark(f, b2, sizeof b2, 1000, 0, 1);
+        (void)d2k_udp_follow_mark(f, a, sizeof a, 1001, 0, 1);   /* same flow again */
+        CHECK(d2k_udp_follow_live(f) == 2, "two flows followed");
+        CHECK(d2k_udp_follow_match(f, a, sizeof a, 1000 + 10 * D2K_UDP_FOLLOW_NS, 1, NULL) &&
+              d2k_udp_follow_live(f) == 2, "the head's own batch still matches past the window");
+        CHECK(!d2k_udp_follow_match(f, a, sizeof a, 1000 + 10 * D2K_UDP_FOLLOW_NS, 2, NULL),
+              "a later batch past the window: no match");
+        CHECK(d2k_udp_follow_live(f) == 0, "stale entries are expired by the scan");
+        d2k_udp_follow_age(f, 0, 0);
+        CHECK(d2k_udp_follow_live(f) == 0, "aging an empty table is a no-op");
+        (void)d2k_udp_follow_mark(f, a, sizeof a, 5000, 0, 3);
+        d2k_udp_follow_age(f, 5000 + D2K_UDP_FOLLOW_NS - 1, 4);
+        CHECK(d2k_udp_follow_live(f) == 1, "inside the window: kept");
+        d2k_udp_follow_age(f, 5000 + D2K_UDP_FOLLOW_NS, 4);
+        CHECK(d2k_udp_follow_live(f) == 0, "past the window, later batch: aged out");
+        d2k_udp_follow_free(f);
+    }
     if (!fails) puts("UDP release: due ordering and bounded ownership passed");
     return fails != 0;
 }

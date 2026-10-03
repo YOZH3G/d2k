@@ -128,6 +128,12 @@ int d2k_nl_packet(const d2k_nl_msg *m, d2k_nl_pkt *out) {
                 out->have_mark = 1;
             }
             break;
+        case D2K_NFQA_IFINDEX_OUTDEV:
+            if (vlen >= 4) {
+                out->outdev = n32(val);
+                out->have_outdev = 1;
+            }
+            break;
         default:
             break;
         }

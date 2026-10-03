@@ -101,8 +101,8 @@ udp_path.o: udp_path.c $(HDR)
 
 # Владение ID в обвязке d2kd (задача 46, ревью M4): сессия, удержание и
 # выпуск — настоящие модули, сокеты заменены записью вызовов.
-test_udp_path: test_udp_path.c udp_path.o udp_hold.o udp_release.o session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_udp_path.c udp_path.o udp_hold.o udp_release.o session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
+test_udp_path: test_udp_path.c udp_path.o udp_hold.o udp_release.o routemark.o nl.o session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_udp_path.c udp_path.o udp_hold.o udp_release.o routemark.o nl.o session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
 
 test-udp-path: test_udp_path
 	./test_udp_path

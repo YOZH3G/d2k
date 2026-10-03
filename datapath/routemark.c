@@ -12,6 +12,17 @@
 #define RM_FRA_FWMARK  10
 #define RM_FRA_FWMASK  16
 #define RM_FIB_RULE_INVERT 0x2u
+/* linux/rtnetlink.h: struct rtmsg and its attributes */
+#define RM_RTM_NEWROUTE 24
+#define RM_RTM_GETROUTE 26
+#define RM_RTMSG       12u
+#define RM_RTA_OIF      4
+#define RM_RTA_MULTIPATH 9
+#define RM_RTA_TABLE   15
+#define RM_RT_TABLE_MAIN 254
+#define RM_RTN_UNICAST  1
+#define RM_RTM_F_CLONED 0x200u
+#define RM_RTNH_LEN     8u      /* struct rtnexthop */
 
 static uint16_t rd16h(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 static uint32_t rd32h(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -34,8 +45,14 @@ size_t d2k_routemark_request(uint8_t *o, size_t cap, uint8_t family, uint32_t se
     return len;
 }
 
+/* Kernel errno of an NLMSG_ERROR body (negative), 0 when unreadable. */
+static int32_t nl_error(const d2k_nl_msg *m) {
+    return m->body_len >= 4 ? (int32_t)rd32h(m->body) : 0;
+}
+
 int d2k_routemark_parse(d2k_fwsel *out, size_t cap, size_t *n,
-                        const uint8_t *buf, size_t len) {
+                        const uint8_t *buf, size_t len, int32_t *kerr) {
+    if (kerr) { *kerr = 0; }
     if (!out || !n || !buf) { return -1; }
     d2k_nl_iter it;
     d2k_nl_msg m;
@@ -44,7 +61,10 @@ int d2k_routemark_parse(d2k_fwsel *out, size_t cap, size_t *n,
     while (d2k_nl_next(&it, &m)) {
         consumed = (size_t)(m.body - buf) + m.body_len;
         if (m.type == D2K_NLMSG_DONE) { return 1; }
-        if (m.type == D2K_NLMSG_ERROR) { return -1; }
+        if (m.type == D2K_NLMSG_ERROR) {
+            if (kerr) { *kerr = nl_error(&m); }
+            return -1;
+        }
         if (m.type != RM_RTM_NEWRULE || m.body_len < RM_FIB_HDR) { continue; }
         uint8_t family = m.body[0];
         uint32_t rflags = rd32h(m.body + 8);
@@ -74,8 +94,91 @@ int d2k_routemark_parse(d2k_fwsel *out, size_t cap, size_t *n,
     return (len - consumed) < 4 ? 0 : -1;   /* at most an alignment tail */
 }
 
+size_t d2k_routemark_routes_request(uint8_t *o, size_t cap, uint8_t family, uint32_t seq) {
+    size_t len = D2K_NLMSG_HDRLEN + RM_RTMSG;
+    if (!o || cap < len) { return 0; }
+    memset(o, 0, len);
+    wr32h(o, (uint32_t)len);
+    wr16h(o + 4, RM_RTM_GETROUTE);
+    wr16h(o + 6, D2K_NLM_F_REQUEST | RM_NLM_F_DUMP);
+    wr32h(o + 8, seq);
+    o[D2K_NLMSG_HDRLEN] = family;
+    return len;
+}
+
+static void add_oif(uint32_t *oifs, size_t cap, size_t *n, uint32_t oif) {
+    if (!oif) { return; }
+    size_t have = *n < cap ? *n : cap;
+    for (size_t i = 0; i < have; i++) { if (oifs[i] == oif) { return; } }
+    if (*n < cap) { oifs[*n] = oif; }
+    (*n)++;
+}
+
+int d2k_routemark_routes_parse(uint32_t *oifs, size_t cap, size_t *n,
+                               const uint8_t *buf, size_t len, int32_t *kerr) {
+    if (kerr) { *kerr = 0; }
+    if (!oifs || !n || !buf) { return -1; }
+    d2k_nl_iter it;
+    d2k_nl_msg m;
+    d2k_nl_iter_init(&it, buf, len);
+    size_t consumed = 0;
+    while (d2k_nl_next(&it, &m)) {
+        consumed = (size_t)(m.body - buf) + m.body_len;
+        if (m.type == D2K_NLMSG_DONE) { return 1; }
+        if (m.type == D2K_NLMSG_ERROR) {
+            if (kerr) { *kerr = nl_error(&m); }
+            return -1;
+        }
+        if (m.type != RM_RTM_NEWROUTE || m.body_len < RM_RTMSG) { continue; }
+        const uint8_t *b = m.body;
+        uint32_t table = b[4];
+        uint32_t oif = 0;
+        const uint8_t *mp = NULL;
+        size_t mp_len = 0;
+        size_t off = RM_RTMSG;
+        while (off + D2K_NLA_HDRLEN <= m.body_len) {
+            uint16_t alen = rd16h(b + off);
+            uint16_t atype = rd16h(b + off + 2) & D2K_NLA_TYPE_MASK;
+            if (alen < D2K_NLA_HDRLEN || alen > m.body_len - off) { return -1; }
+            if (alen >= 8 && atype == RM_RTA_TABLE) { table = rd32h(b + off + 4); }
+            if (alen >= 8 && atype == RM_RTA_OIF) { oif = rd32h(b + off + 4); }
+            if (atype == RM_RTA_MULTIPATH) { mp = b + off + 4; mp_len = (size_t)alen - 4; }
+            off += ((size_t)alen + 3u) & ~(size_t)3u;
+        }
+        /* dst/0 and src/0, unicast, the main table, not a cached clone. */
+        if (b[1] != 0 || b[2] != 0 || b[7] != RM_RTN_UNICAST || table != RM_RT_TABLE_MAIN ||
+            (rd32h(b + 8) & RM_RTM_F_CLONED)) {
+            continue;
+        }
+        add_oif(oifs, cap, n, oif);
+        size_t h = 0;
+        while (mp && h + RM_RTNH_LEN <= mp_len) {
+            uint16_t nl = rd16h(mp + h);
+            if (nl < RM_RTNH_LEN || nl > mp_len - h) { return -1; }
+            add_oif(oifs, cap, n, rd32h(mp + h + 4));
+            h += ((size_t)nl + 3u) & ~(size_t)3u;
+        }
+    }
+    return (len - consumed) < 4 ? 0 : -1;
+}
+
+int d2k_routemark_set_oifs(d2k_routemark *r, uint8_t family, const uint32_t *oifs,
+                           size_t n, int ok) {
+    if (!r || !ok || (family != 2 && family != 10)) { return 0; }
+    if (n > D2K_ROUTEMARK_OIF_MAX) { n = D2K_ROUTEMARK_OIF_MAX; }
+    uint32_t *dst = family == 10 ? r->oif6 : r->oif4;
+    size_t *dn = family == 10 ? &r->n_oif6 : &r->n_oif4;
+    uint8_t *read = family == 10 ? &r->oifs_read6 : &r->oifs_read4;
+    int changed = !*read || *dn != n || (n && memcmp(dst, oifs, n * sizeof *oifs) != 0);
+    *dn = n;
+    if (n) { memcpy(dst, oifs, n * sizeof *oifs); }
+    *read = 1;
+    return changed;
+}
+
 int d2k_routemark_set(d2k_routemark *r, const d2k_fwsel *sel, size_t n) {
     if (!r) { return 0; }
+    r->rules_read4 = r->rules_read6 = 1;
     if (n > D2K_ROUTEMARK_MAX) { n = D2K_ROUTEMARK_MAX; }
     int changed = n != r->n;
     for (size_t i = 0; !changed && i < n; i++) {
@@ -93,21 +196,45 @@ int d2k_routemark_merge(d2k_routemark *r, const d2k_fwsel *v4, size_t n4, int ok
     d2k_routemark_status local;
     if (!st) { st = &local; }
     memset(st, 0, sizeof *st);
+    st->v4_ok = ok4;
     st->v6_ok = ok6;
-    if (!r || !ok4) { return -1; }
-    if (!ok6) { n6 = 0; }
-    st->found = n4 + n6;
-    st->truncated = st->found > D2K_ROUTEMARK_MAX;
+    if (!r) { return -1; }
+    /* A failed family keeps what it had: take its previous selectors. */
+    d2k_fwsel prev[D2K_ROUTEMARK_MAX];
+    size_t np = r->n;
+    memcpy(prev, r->sel, np * sizeof *prev);
     d2k_fwsel all[D2K_ROUTEMARK_MAX];
-    size_t k = 0;
-    for (size_t i = 0; i < n4 && k < D2K_ROUTEMARK_MAX; i++) { all[k++] = v4[i]; }
-    for (size_t i = 0; i < n6 && k < D2K_ROUTEMARK_MAX; i++) { all[k++] = v6[i]; }
-    return d2k_routemark_set(r, all, k);
+    size_t k = 0, found = 0;
+    if (ok4) {
+        found += n4;
+        for (size_t i = 0; i < n4 && k < D2K_ROUTEMARK_MAX; i++) { all[k++] = v4[i]; }
+    } else {
+        for (size_t i = 0; i < np; i++) {
+            if (prev[i].family != 10) { found++; if (k < D2K_ROUTEMARK_MAX) { all[k++] = prev[i]; } }
+        }
+    }
+    if (ok6) {
+        found += n6;
+        for (size_t i = 0; i < n6 && k < D2K_ROUTEMARK_MAX; i++) { all[k++] = v6[i]; }
+    } else {
+        for (size_t i = 0; i < np; i++) {
+            if (prev[i].family == 10) { found++; if (k < D2K_ROUTEMARK_MAX) { all[k++] = prev[i]; } }
+        }
+    }
+    st->found = found;
+    st->truncated = found > D2K_ROUTEMARK_MAX;
+    uint8_t r4 = r->rules_read4 || ok4, r6 = r->rules_read6 || ok6;
+    int changed = d2k_routemark_set(r, all, k);
+    r->rules_read4 = r4;
+    r->rules_read6 = r6;
+    return changed;
 }
 
 int d2k_routemark_routed(const d2k_routemark *r, uint8_t ipver, uint32_t mark) {
     if (!r || !mark) { return 0; }
+    if (mark == D2K_ROUTE_OTHER_DEV) { return 1; }
     uint8_t family = ipver == 6 ? 10 : 2;
+    if (!(family == 10 ? r->rules_read6 : r->rules_read4)) { return 1; }   /* fail closed */
     for (size_t i = 0; i < r->n; i++) {
         if (r->sel[i].family == family &&
             ((mark ^ r->sel[i].mark) & r->sel[i].mask) == 0) { return 1; }
@@ -119,6 +246,19 @@ uint32_t d2k_routemark_client(const d2k_routemark *r, uint8_t ipver, int have_ma
                               uint32_t mark, uint32_t probe_mark, uint32_t own_mark) {
     if (!have_mark || !mark || mark == probe_mark || mark == own_mark) { return 0; }
     return d2k_routemark_routed(r, ipver, mark) ? mark : 0;
+}
+
+uint32_t d2k_routemark_gate(const d2k_routemark *r, uint8_t ipver, int outbound,
+                            int have_mark, uint32_t mark, uint32_t probe_mark,
+                            uint32_t own_mark, int have_outdev, uint32_t outdev) {
+    uint32_t m = d2k_routemark_client(r, ipver, have_mark, mark, probe_mark, own_mark);
+    if (m || !r || !outbound || !have_outdev) { return m; }
+    int v6 = ipver == 6;
+    if (!(v6 ? r->oifs_read6 : r->oifs_read4)) { return 0; }   /* nothing to compare */
+    const uint32_t *o = v6 ? r->oif6 : r->oif4;
+    size_t n = v6 ? r->n_oif6 : r->n_oif4;
+    for (size_t i = 0; i < n; i++) { if (o[i] == outdev) { return 0; } }
+    return D2K_ROUTE_OTHER_DEV;
 }
 
 size_t d2k_routemark_describe(const d2k_routemark *r, char *buf, size_t cap) {

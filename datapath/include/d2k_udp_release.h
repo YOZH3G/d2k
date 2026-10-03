@@ -101,8 +101,26 @@ int d2k_udp_follow_mark(d2k_udp_follow *f, const uint8_t *pkt, size_t len,
  * seq 0 (D2K_UDP_SEQ_NONE: released with no read to follow) matches by time
  * only.  *at_ns (optional) gets the head's deferred emit time: a late tail is
  * queued behind it even once it is due (review M1, N3). */
-int d2k_udp_follow_match(const d2k_udp_follow *f, const uint8_t *pkt, size_t len,
+int d2k_udp_follow_match(d2k_udp_follow *f, const uint8_t *pkt, size_t len,
                          uint64_t now_ns, uint64_t seq, uint64_t *at_ns);
+
+/* AGING (final review M-5).  An entry past its window and from an earlier
+ * receive batch can never match again; matching expires such entries as it
+ * scans, and an empty table answers without parsing the datagram at all.
+ * d2k_udp_follow_age expires them without a datagram (seq: the next receive
+ * batch's number, or 0 to expire only entries released with none). */
+void d2k_udp_follow_age(d2k_udp_follow *f, uint64_t now_ns, uint64_t seq);
+size_t d2k_udp_follow_live(const d2k_udp_follow *f);
+
+/* A raw re-send refused by a full socket (EAGAIN/EWOULDBLOCK/ENOBUFS: the
+ * socket never blocks the packet loop, final review M-3) is transient: that
+ * copy is ACCEPTed, the flow keeps its entry, and it is only counted here. */
+int d2k_udp_send_busy(int err);
+uint64_t d2k_udp_follow_busy(const d2k_udp_follow *f);
+/* Flows whose re-send was refused for any other reason (resend_failed is
+ * told only for the first D2K_UDP_REFUSED_LOG of them, final review M-7). */
+#define D2K_UDP_REFUSED_LOG 16
+uint64_t d2k_udp_follow_refused(const d2k_udp_follow *f);
 
 /* THE SERVICE'S UDP OUTPUT, AS ONE TESTABLE PIECE (review M4).
  *
@@ -136,8 +154,10 @@ typedef struct {
        it never reaches conntrack before the head (task 46 rereview4 I3). */
     int (*defer_verdict)(void *ctx, uint64_t at_ns, uint32_t id, uint32_t verdict);
     /* Optional: a raw re-send was refused (err = errno).  Told once per flow
-       with the refused datagram; that flow's later datagrams are not retried
-       and keep the kernel path (field 03.10: EACCES, no flow named). */
+       with the refused datagram, for the first D2K_UDP_REFUSED_LOG flows
+       only; that flow's later datagrams are not retried and keep the kernel
+       path (field 03.10: EACCES, no flow named).  A busy socket
+       (d2k_udp_send_busy) is not a refusal: counted, never told. */
     void (*resend_failed)(void *ctx, const uint8_t *pkt, size_t len, int err);
 } d2k_udp_out;
 
