@@ -235,6 +235,10 @@ typedef struct {
      * самопроверкой решает, не пора ли перепроверить сам слой. */
     int  raw_probes_ok;
     int  raw_probes_err;
+    /* Счётчик отказов правила подавления RST на старте прогона: прогон
+     * недостоверен, только если отказ случился в НЁМ (d2kc живёт сутками,
+     * и один давний отказ не должен метить все последующие прогоны). */
+    unsigned long rst_fail_base;
 
     d2k_obs trace[D2K_TRACE_MAX];
     int     ntrace;
@@ -314,7 +318,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
 /* --- сырой слой (raw.c) ------------------------------------------------- */
 
 int  d2k_raw_supported(void);
-int  d2k_raw_rst_rule_failed(void);
+unsigned long d2k_raw_rst_fail_count(void);
 /* Запуск команды правила подавления RST (iptables -I/-D). По умолчанию
  * system(); тест подменяет, чтобы проверить зонд без root и iptables.
  * Есть только там, где есть сырой слой (Linux или тестовая сборка). */

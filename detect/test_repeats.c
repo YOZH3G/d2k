@@ -12,7 +12,7 @@
 #define d2k_raw_probe_handshake_family fake_handshake
 #define d2k_raw_probe_poison_family    fake_poison
 #define d2k_raw_supported              fake_raw_supported
-#define d2k_raw_rst_rule_failed        fake_rst_rule_failed
+#define d2k_raw_rst_fail_count         fake_rst_fail_count
 #include "classify.c"
 #include "props.c"
 
@@ -57,7 +57,7 @@ static int next_rep(void)
 }
 
 int fake_raw_supported(void) { return 1; }
-int fake_rst_rule_failed(void) { return 0; }
+unsigned long fake_rst_fail_count(void) { return 0; }
 
 int fake_handshake(const uint8_t *ip, uint8_t family, uint16_t port, int timeout_ms,
                    uint32_t mark, const d2k_detect_stop *cancel, char *err, size_t errcap)

@@ -698,7 +698,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
     /* Если правило подавления ядерного RST не встало, отрицательные исходы
      * сырых зондов ничего не значат: RST мог прилететь от нашего же ядра.
      * Сказать об этом обязаны — иначе своя поломка читается как свойство сети. */
-    if (d2k_raw_rst_rule_failed()) {
+    if (d2k_raw_rst_fail_count() != res->rst_fail_base) {
         d2k_obs *o = d2k_trace_add(res, "внимание:правило подавления RST не встало");
         snprintf(o->err, sizeof(o->err),
                  "iptables отверг вставку; отрицательные исходы сырых зондов недостоверны");
@@ -853,6 +853,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     d2k_opts_defaults(opt);
     start = d2k_now_ms();
     memset(res, 0, sizeof(*res));
+    res->rst_fail_base = d2k_raw_rst_fail_count();
     snprintf(res->target, sizeof(res->target), "%s", addr);
     res->repeats = opt->repeats;
     res->trigger_len = (int)tr->len;

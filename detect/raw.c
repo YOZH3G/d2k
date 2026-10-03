@@ -190,9 +190,12 @@ typedef struct {
     raw_buffers *buffers; /* heap-owned: do not grow the router worker stack */
 } raw_conn;
 
-/* rstRuleFailed — хоть раз не удалось закрыть ядру рот. Взводится навсегда:
- * один отказ уже делает отрицательные результаты сырых зондов недостоверными. */
-static int g_rst_rule_failed;
+/* Сколько раз не удалось закрыть ядру рот. Счётчик, а не вечный флаг: отказ
+ * делает недостоверными отрицательные исходы ТОГО прогона, в котором случился
+ * (прогон сравнивает счётчик со своим стартом, res->rst_fail_base); d2kc
+ * живёт сутками, и давний отказ под чужим замком xtables не должен метить
+ * все последующие прогоны. */
+static unsigned long g_rst_rule_failures;
 
 /* Запуск команды правила iptables. Крючок — для теста без root и iptables;
  * в работе это system(). */
@@ -210,7 +213,13 @@ static int raw_rule_system(const char *cmd)
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
+        /* Только async-signal-safe вызовы: процесс многопоточный. Дескрипторы
+         * d2kc (NFQUEUE, сокеты зондов, журналы) команде правила не нужны и не
+         * должны пережить её в iptables — закрываем всё, кроме 0–2. */
         setpgid(0, 0);
+        long maxfd = sysconf(_SC_OPEN_MAX);
+        if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+        for (int fd = 3; fd < maxfd; fd++) close(fd);
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
@@ -237,13 +246,13 @@ static pthread_once_t g_seed_once = PTHREAD_ONCE_INIT;
 static pthread_once_t g_sweep_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_raw_state = PTHREAD_MUTEX_INITIALIZER;
 
-int d2k_raw_rst_rule_failed(void)
+unsigned long d2k_raw_rst_fail_count(void)
 {
-    int failed;
+    unsigned long n;
     pthread_mutex_lock(&g_raw_state);
-    failed = g_rst_rule_failed;
+    n = g_rst_rule_failures;
     pthread_mutex_unlock(&g_raw_state);
-    return failed;
+    return n;
 }
 
 static void seed_init(void)
@@ -382,7 +391,7 @@ static int suppress_kernel_rst(uint16_t sport, uint8_t family)
     retry_pending_releases();
     rc = rst_rule_cmd("-I", sport, family);
     if (rc != 0) {
-        g_rst_rule_failed = 1;
+        g_rst_rule_failures++;
     }
     pthread_mutex_unlock(&g_raw_state);
     return rc == 0;
@@ -965,8 +974,8 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
      * пишет данные. Отказ iptables (нет бинарника, роутер только на nft) —
      * своя поломка, а не свойство сети: вернув ошибку, мы роняли
      * самопроверку, и цель уходила в «обойти нечем». Факт отказа не молчит:
-     * он взводит g_rst_rule_failed (единственный источник: трасса вердикта и
-     * адаптер планировщика читают d2k_raw_rst_rule_failed). */
+     * он считается в g_rst_rule_failures (трасса вердикта и адаптер
+     * планировщика сравнивают d2k_raw_rst_fail_count со стартом прогона). */
     c->rule_up = suppress_kernel_rst(c->sport, family);
 
     if (raw_handshake(c, timeout_ms, cancel, err, errcap) != 0) {
@@ -1304,7 +1313,7 @@ senderr:
  * результат отравления без сырых сокетов не означает ничего, и вердикт обязан
  * это сказать (см. res.RawUsable в эталоне), а не промолчать. */
 int d2k_raw_supported(void) { return 0; }
-int d2k_raw_rst_rule_failed(void) { return 0; }
+unsigned long d2k_raw_rst_fail_count(void) { return 0; }
 
 int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,

@@ -25,7 +25,7 @@ static int base_stop_before, base_stop_other, base_stop_after;
 
 /* raw.o is not linked here: the adapter only asks whether the kernel-RST
  * suppression rule ever failed in this process. */
-int d2k_raw_rst_rule_failed(void) { return rule_failed; }
+unsigned long d2k_raw_rst_fail_count(void) { return (unsigned long)rule_failed; }
 
 /* Ход измерителя (задача 48): sched.o здесь не линкуется, приёмник
  * планировщика подменён записью вызовов. */
@@ -238,6 +238,17 @@ int main(void)
     answer.hit.seqovl = 1;
     r = measure();
     CHECK(r.have_arm && r.owns_search); /* a hit is a finished search */
+    rule_failed = 0;
+    memset(&answer, 0, sizeof answer);
+    /* Отказ правила случился ДО этого прогона (счётчик на старте уже 1): пустой
+       поиск этого прогона честный и владеет поиском — прошлый отказ не метит
+       прогоны навсегда (ревью задачи 49). */
+    rule_failed = 1;
+    answer.rst_fail_base = 1;
+    answer.raw_usable = 1;
+    snprintf(answer.reason, sizeof answer.reason, "содержимое важно");
+    r = measure();
+    CHECK(r.owns_search && strstr(r.reason, "не подавлен") == NULL);
     rule_failed = 0;
     memset(&answer, 0, sizeof answer);
 

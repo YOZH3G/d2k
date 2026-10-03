@@ -304,7 +304,7 @@ static void test_dial_survives_missing_rst_rule(void)
     CHECK(rule_count == 1 && strstr(rule_cmds[0], "iptables -w -I OUTPUT") != NULL);
     raw_close(&c);
     CHECK(rule_count == 2 && strstr(rule_cmds[1], "iptables -w -D OUTPUT") != NULL);
-    CHECK(!d2k_raw_rst_rule_failed());
+    unsigned long fails0 = d2k_raw_rst_fail_count();
     {
         /* Задача 49: правило несёт pid владельца, снимается той же формой;
            замок xtables ждётся (-w), а не проигрывается молча. */
@@ -319,7 +319,9 @@ static void test_dial_survives_missing_rst_rule(void)
     CHECK(outgoing_count == 2); /* SYN and the final ACK: probe went on */
     raw_close(&c);
     CHECK(rule_count == 1); /* nothing installed, nothing to delete */
-    CHECK(d2k_raw_rst_rule_failed()); /* still reaches the verdict trace */
+    /* Отказ считается, а не взводит флаг навсегда: прогон сравнивает счётчик
+       со своим стартом, поэтому прошлый отказ не метит будущие прогоны. */
+    CHECK(d2k_raw_rst_fail_count() == fails0 + 1); /* still reaches the verdict trace */
 
     outgoing_count = 0; dial_recv_fd = -1;
     CHECK(d2k_raw_probe_handshake_family(dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 1);
@@ -415,6 +417,16 @@ static void test_rule_command_is_bounded(void)
     CHECK(rc != 0 && took < 3000);
     CHECK(raw_rule_system("exit 0") == 0);
     CHECK(raw_rule_system("exit 1") != 0);
+    /* Ребёнок не наследует дескрипторы процесса (сокеты, NFQUEUE, журналы
+       d2kc): открытый без CLOEXEC канал в команде правила не виден. */
+    {
+        int p[2];
+        CHECK(pipe(p) == 0);
+        char probe[64];
+        snprintf(probe, sizeof probe, "test -e /dev/fd/%d", p[1]);
+        CHECK(raw_rule_system(probe) != 0);
+        close(p[0]); close(p[1]);
+    }
     g_rule_deadline_ms = saved;
 }
 
