@@ -381,6 +381,15 @@ static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n)
  * сокетов); здесь только сами сокеты. Посылка, которой положено ждать
  * отложенных посылок плана, встаёт в их очередь без ключа: это байты клиента,
  * и уйти они обязаны при любом исходе плана. */
+/* Счётчики потока у ядра по кортежу (детектор «QUIC замолчал», задача 50,
+   раунд 3): один неблокирующий запрос ctnetlink на наблюдаемый поток. */
+typedef struct { int fd; uint32_t seq; } ct_link;
+static int ct_query(void *ctx, const d2k_ct_tuple *t, uint64_t *o, uint64_t *r) {
+    ct_link *c = ctx;
+    if (++c->seq == 0) { c->seq = 1; }
+    return d2k_ct_query_fd(c->fd, c->seq, t, o, r);
+}
+
 static int out_verdict(void *ctx, uint32_t id, uint32_t verdict) {
     return send_original_verdict(ctx, id, verdict);
 }
@@ -925,6 +934,14 @@ int main(int argc, char **argv) {
     d2k_session *sess = d2k_session_new(flows, journal);
     if (sess && udp_reverse_hook) {
         d2k_session_set_udp_reverse_hook(sess, 1);
+    }
+    static ct_link ctl_ct = { -1, 0 };
+    ctl_ct.fd = d2k_ct_open();
+    if (sess && ctl_ct.fd >= 0) {
+        d2k_session_set_ct_query(sess, ct_query, &ctl_ct);
+    } else if (sess) {
+        fprintf(stderr, "d2kd: ctnetlink недоступен — детектор «QUIC замолчал после "
+                        "рукопожатия» выключен (пакеты не задерживаются)\n");
     }
     /* Вместимость ячейки — «сколько байт унесёт способ отправки», а не
        «сколько байт пакета мы берём у ядра» (--copy-range): посылка плана

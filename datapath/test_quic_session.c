@@ -1588,26 +1588,25 @@ static int frag_nat6(const char *path, uint8_t proto, const uint8_t *src,
  * сервер присылает ещё несколько пакетов данных и замолкает НАСОВСЕМ (на ppp0
  * пусто), клиент повторяет короткие пакеты по PTO (1, 2, 3, 4, 6, 10… с).
  * Очередь видит лишь первые 8 пакетов каждой стороны; остальное видно только
- * по счётчикам conntrack: прямой растёт, обратный стоит. Подделка таблицы —
- * файлом, как у d2k_nat. */
-static char ct_path[] = "/tmp/d2k-t50-ct-XXXXXX";
+ * по счётчикам conntrack: прямой растёт, обратный стоит. Раунд 3: счётчики
+ * спрашиваются у ядра по кортежу (ctnetlink, d2k_ctq.h), только для
+ * наблюдаемых потоков; здесь запрос подменён. */
+static struct { uint16_t cport; uint64_t orig, reply; int acct; } fake_ct;
+static unsigned ct_queries;
 static void ct_write(uint16_t cport, uint64_t orig, uint64_t reply, int acct) {
-    FILE *f = fopen(ct_path, "w");
-    if (!f) return;
-    fprintf(f, "ipv4     2 udp      17 29 src=10.0.0.9 dst=1.2.3.4 sport=40000 dport=443 "
-               "packets=3 bytes=100 src=1.2.3.4 dst=88.87.93.11 sport=443 dport=40000 "
-               "packets=3 bytes=100 mark=0 use=2\n");
-    if (acct)
-        fprintf(f, "ipv4     2 udp      17 112 src=192.168.1.67 dst=1.2.3.4 sport=%u dport=443 "
-                   "packets=%llu bytes=6974 src=1.2.3.4 dst=88.87.93.11 sport=443 dport=%u "
-                   "packets=%llu bytes=8308 [ASSURED] mark=0 use=2\n",
-                (unsigned)cport, (unsigned long long)orig, (unsigned)cport,
-                (unsigned long long)reply);
-    else
-        fprintf(f, "ipv4     2 udp      17 112 src=192.168.1.67 dst=1.2.3.4 sport=%u dport=443 "
-                   "src=1.2.3.4 dst=88.87.93.11 sport=443 dport=%u [ASSURED] mark=0 use=2\n",
-                (unsigned)cport, (unsigned)cport);
-    fclose(f);
+    fake_ct.cport = cport; fake_ct.orig = orig; fake_ct.reply = reply; fake_ct.acct = acct;
+}
+static int fake_ct_query(void *ctx, const d2k_ct_tuple *t, uint64_t *orig, uint64_t *reply) {
+    (void)ctx;
+    ct_queries++;
+    static const uint8_t cli[4] = {192, 168, 1, 67}, srv[4] = {1, 2, 3, 4};
+    uint16_t sp = (uint16_t)(t->sport_be[0] << 8 | t->sport_be[1]);
+    uint16_t dp = (uint16_t)(t->dport_be[0] << 8 | t->dport_be[1]);
+    /* Прямой кортеж — клиент → сервер, как его ведёт conntrack. */
+    if (t->family != 4 || t->proto != 17 || memcmp(t->src, cli, 4) || memcmp(t->dst, srv, 4) ||
+        dp != 443 || sp != fake_ct.cport || !fake_ct.acct) return -1;
+    *orig = fake_ct.orig; *reply = fake_ct.reply;
+    return 0;
 }
 
 static uint8_t last_suspect_code(const d2k_session *s) {
@@ -1625,7 +1624,7 @@ static d2k_session *stall_flow(uint16_t cport, int rev) {
     const uint64_t S = 1000000000ull;
     d2k_session *s = d2k_session_new(64, 64);
     if (!s) return NULL;
-    d2k_session_set_ct_path(s, ct_path);
+    d2k_session_set_ct_query(s, fake_ct_query, NULL);
     uint8_t pkt[1300], buf[4096];
     d2k_result r;
     size_t n = build_udp_pkt(pkt, cport, 443, v1_initial, sizeof v1_initial);
@@ -1640,10 +1639,22 @@ static d2k_session *stall_flow(uint16_t cport, int rev) {
 
 static void test_quic_post_handshake_stall(void) {
     const uint64_t S = 1000000000ull;
-    int fd = mkstemp(ct_path);
-    CHECK(fd >= 0, "временный файл таблицы соединений");
-    if (fd < 0) return;
-    close(fd);
+    /* Нечего смотреть — ядро не спрашивается вовсе. */
+    {
+        d2k_session *s0 = d2k_session_new(64, 64);
+        d2k_session_set_ct_query(s0, fake_ct_query, NULL);
+        ct_queries = 0;
+        d2k_session_sweep(s0, 5 * S);
+        uint8_t p0[1300], b0[4096];
+        d2k_result r0;
+        /* Initial без ответа сервера — тоже не кандидат (молчание
+           рукопожатия — забота SILENT). */
+        size_t n0 = build_udp_pkt(p0, 50399, 443, v1_initial, sizeof v1_initial);
+        d2k_session_packet(s0, p0, n0, 6 * S, b0, sizeof b0, &r0);
+        d2k_session_sweep(s0, 7 * S);
+        CHECK(ct_queries == 0, "conntrack спрошен, хотя наблюдать нечего");
+        d2k_session_free(s0);
+    }
 
     /* Обрыв: сервер дал 14 пакетов (очередь видела 8), дальше молчит; клиент
        шлёт повторы. */
@@ -1710,7 +1721,13 @@ static void test_quic_post_handshake_stall(void) {
     CHECK(d2k_session_suspects(s) == 0, "тишина короче PTO объявлена обрывом");
     d2k_session_free(s);
 
-    unlink(ct_path);
+    /* Один наблюдаемый поток — один запрос на обход, не чтение таблицы. */
+    s = stall_flow(50406, 8);
+    ct_write(50406, 12, 14, 1);
+    ct_queries = 0;
+    d2k_session_sweep(s, 2 * S);
+    CHECK(ct_queries == 1, "на обход ушло не по одному запросу на наблюдаемый поток");
+    d2k_session_free(s);
 }
 
 /* --- QUIC ДЛЯ ИМЕНИ НЕ ПРОПУСКАЕТСЯ (задача 50, раунд 2, требование 5c) ----

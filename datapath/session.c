@@ -147,8 +147,9 @@ struct d2k_session {
      * разные строки, и наличие одной ничего не говорит о другой. */
     int      rev_seen[4];
     int      udp_reverse_hook;
-    /* Таблица соединений для счётчиков QUIC (NULL — D2K_NAT_PROC). */
-    const char *ct_path;
+    /* Счётчики потока у ядра по кортежу (d2k_ctq.h); NULL — не спрашивать. */
+    d2k_ct_query_fn ct_query;
+    void *ct_query_ctx;
 
     int      shape_armed[4];
     uint8_t  shape_name[4][256];
@@ -2236,8 +2237,8 @@ void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed) {
     if (s) { s->udp_reverse_hook = installed != 0; }
 }
 
-void d2k_session_set_ct_path(d2k_session *s, const char *path) {
-    if (s) { s->ct_path = path; }
+void d2k_session_set_ct_query(d2k_session *s, d2k_ct_query_fn fn, void *ctx) {
+    if (s) { s->ct_query = fn; s->ct_query_ctx = ctx; }
 }
 
 int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
@@ -2693,12 +2694,6 @@ static void sweep_udp_one(void *ctx, d2k_flow *f) {
  *     пакет, требующий подтверждения, ответил бы за RTT + max_ack_delay.
  * Это подозрение, не диагноз: контроллер обязан воспроизвести остановку
  * своим запросом HTTP/3, прежде чем что-то подбирать. */
-struct ct_ctx {
-    d2k_session *s;
-    uint64_t now_ns;
-    size_t told;
-};
-
 static int quic_watch(const d2k_flow *f) {
     return f->key.proto == 17 && (f->saw_hello || f->saw_initial) &&
            f->rev_after_hello > 0 && !f->suspected && !f->controller_probe &&
@@ -2706,23 +2701,39 @@ static int quic_watch(const d2k_flow *f) {
            !f->voice_ssrc_valid && !f->stun_txid_valid;
 }
 
-static void want_ct(void *ctx, d2k_flow *f) {
-    if (quic_watch(f)) { *(int *)ctx = 1; }
+/* Прямой кортеж потока, как его ведёт conntrack: клиент → сервер. Для
+   транзита очередь стоит до SNAT, и адрес клиента в нём локальный — ровно
+   такой же, как в прямом кортеже записи. */
+static void flow_tuple(const d2k_flow *f, d2k_ct_tuple *t) {
+    memset(t, 0, sizeof *t);
+    int v6 = f->key.family == 6;
+    t->family = v6 ? 6 : 4;
+    t->proto = 17;
+    const uint8_t *lo = v6 ? f->key.low_ip6 : (const uint8_t *)&f->key.low_ip;
+    const uint8_t *hi = v6 ? f->key.high_ip6 : (const uint8_t *)&f->key.high_ip;
+    size_t al = v6 ? 16 : 4;
+    int cl = f->init_low;
+    memcpy(t->src, cl ? lo : hi, al);
+    memcpy(t->dst, cl ? hi : lo, al);
+    memcpy(t->sport_be, cl ? (const void *)&f->key.low_port : (const void *)&f->key.high_port, 2);
+    memcpy(t->dport_be, cl ? (const void *)&f->key.high_port : (const void *)&f->key.low_port, 2);
 }
 
-static void ct_line(void *ctx, uint8_t family, const uint8_t *src,
-                    const uint8_t *sport_be, const uint8_t *dst,
-                    const uint8_t *dport_be, uint64_t orig, uint64_t reply) {
+struct ct_ctx {
+    d2k_session *s;
+    uint64_t now_ns;
+    size_t told;
+};
+
+/* Один запрос ядру на наблюдаемый поток (раунд 3: не чтение всей таблицы).
+   Нет ответа — не знаем, и подозрения нет. */
+static void ct_flow(void *ctx, d2k_flow *f) {
     struct ct_ctx *c = ctx;
-    d2k_addr a, b;
-    memset(&a, 0, sizeof a); memset(&b, 0, sizeof b);
-    a.family = b.family = family;
-    memcpy(a.bytes, src, family == 6 ? 16 : 4);
-    memcpy(b.bytes, dst, family == 6 ? 16 : 4);
-    d2k_key k;
-    if (d2k_key_make_addr(&k, 17, &a, &b, sport_be, dport_be) < 0) { return; }
-    d2k_flow *f = d2k_track_find(c->s->uflows, &k);
-    if (!f || !quic_watch(f)) { return; }
+    if (!quic_watch(f)) { return; }
+    d2k_ct_tuple t;
+    flow_tuple(f, &t);
+    uint64_t orig = 0, reply = 0;
+    if (c->s->ct_query(c->s->ct_query_ctx, &t, &orig, &reply) != 0) { return; }
     if (!f->ct_known || reply != f->ct_reply) {
         f->ct_known = 1;
         f->ct_reply = reply;
@@ -2747,12 +2758,12 @@ size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns) {
     struct sweep_ctx c = { s, now_ns, 0 };
     d2k_track_walk(s->flows, sweep_one, &c);
     d2k_track_walk(s->uflows, sweep_udp_one, &c);
-    /* Таблица соединений читается, только когда есть кого смотреть. */
-    int want = 0;
-    d2k_track_walk(s->uflows, want_ct, &want);
-    if (want) {
+    /* Счётчики — только наблюдаемых потоков, по одному запросу ядру на
+       поток (ctnetlink по кортежу, ~10 мкс на роутере). Нет наблюдаемых —
+       ни одного запроса. */
+    if (s->ct_query) {
         struct ct_ctx cc = { s, now_ns, 0 };
-        (void)d2k_ct_walk(s->ct_path ? s->ct_path : D2K_NAT_PROC, 17, ct_line, &cc);
+        d2k_track_walk(s->uflows, ct_flow, &cc);
         c.told += cc.told;
     }
     return c.told;
