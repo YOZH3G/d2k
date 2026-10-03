@@ -135,6 +135,10 @@ typedef struct {
        marked datagram behind a deferred planned head is ACCEPTed this way so
        it never reaches conntrack before the head (task 46 rereview4 I3). */
     int (*defer_verdict)(void *ctx, uint64_t at_ns, uint32_t id, uint32_t verdict);
+    /* Optional: a raw re-send was refused (err = errno).  Told once per flow
+       with the refused datagram; that flow's later datagrams are not retried
+       and keep the kernel path (field 03.10: EACCES, no flow named). */
+    void (*resend_failed)(void *ctx, const uint8_t *pkt, size_t len, int err);
 } d2k_udp_out;
 
 /* Releases a batch (d2k_udp_release_batch) with tails sent now when at_ns <=

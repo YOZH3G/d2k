@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -228,6 +229,7 @@ typedef struct {
     uint64_t seq;
     uint8_t used;
     uint8_t noted;     /* a marked follower of this flow was reported */
+    uint8_t failed;    /* a re-send of this flow was refused: no more tries */
     uint8_t family;
     uint8_t src[16], dst[16];
     uint8_t ports[4];
@@ -245,6 +247,10 @@ static int follow_tuple(const uint8_t *pkt, size_t len, follow_entry *out) {
     /* d2k_packet_parse refuses later fragments; the first one still parses.
        Neither is a whole datagram to re-send. */
     if (v.family == 4 && (v.fragment & 0x2000u)) { return -1; }
+    /* Broadcast and multicast are never followed: a raw socket may not send
+       to a broadcast address (EACCES), and there is no NAT clash to cure. */
+    if (v.family == 4 && v.dst.bytes[0] >= 224) { return -1; }
+    if (v.family == 6 && v.dst.bytes[0] == 0xff) { return -1; }
     memset(out, 0, sizeof *out);
     out->family = v.family;
     size_t alen = v.family == 6 ? 16 : 4;
@@ -307,14 +313,26 @@ int d2k_udp_follow_match(const d2k_udp_follow *f, const uint8_t *pkt, size_t len
 typedef struct {
     const d2k_udp_out *o;
     uint64_t at, now;
+    const uint8_t *failed_pkt;   /* first refused re-send */
+    size_t failed_len;
+    int failed_err;
 } out_tail;
 
 static int out_resend(void *ctx, const uint8_t *pkt, size_t len) {
     out_tail *c = ctx;
+    errno = 0;
+    int rc;
     if (c->at > c->now) {
-        return c->o->send_at ? c->o->send_at(c->o->ctx, c->at, pkt, len) : -1;
+        rc = c->o->send_at ? c->o->send_at(c->o->ctx, c->at, pkt, len) : -1;
+    } else {
+        rc = c->o->send_now ? c->o->send_now(c->o->ctx, pkt, len) : -1;
     }
-    return c->o->send_now ? c->o->send_now(c->o->ctx, pkt, len) : -1;
+    if (rc != 0 && !c->failed_pkt) {
+        c->failed_pkt = pkt;
+        c->failed_len = len;
+        c->failed_err = errno;
+    }
+    return rc;
 }
 
 static int out_verdict(void *ctx, uint32_t id, uint32_t verdict) {
@@ -331,7 +349,7 @@ int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,
                       uint32_t head_verdict, int owned,
                       uint64_t at_ns, uint64_t now_ns, uint64_t seq) {
     if (!o || !o->verdict || !b || !b->count || b->count > D2K_UDP_HOLD_PACKETS) { return 0; }
-    out_tail c = {o, at_ns, now_ns};
+    out_tail c = {o, at_ns, now_ns, NULL, 0, 0};
     int can = o->can_resend && o->send_now;
     int vfail = 0;
     size_t rfail = 0;
@@ -350,10 +368,14 @@ int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,
         while (i < b->count && may[i]) { i++; }
         o->marked(o->ctx, b->packets[i], b->len[i], b->marks[i]);
     }
+    if (c.failed_pkt && o->resend_failed) {
+        o->resend_failed(o->ctx, c.failed_pkt, c.failed_len, c.failed_err);
+    }
     if (can && o->follow && may[0]) {
         follow_entry *e = follow_put(o->follow, b->packets[0], b->len[0], now_ns, at_ns, seq);
         /* Counted once per flow, batch or late datagram (rereview4 N9). */
         if (e && marked_tail) { e->noted = 1; }
+        if (e && c.failed_pkt) { e->failed = 1; }
     }
     return vfail;
 }
@@ -375,7 +397,7 @@ int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
                      int *verdict_failed) {
     if (!o || !o->verdict || !o->can_resend || !o->send_now || !o->follow) { return 0; }
     follow_entry *e = follow_find(o->follow, pkt, len, now_ns, seq);
-    if (!e) { return 0; }
+    if (!e || e->failed) { return 0; }   /* refused before: the kernel path */
     if (!d2k_udp_out_neutral(o, mark, (uint8_t)(pkt[0] >> 4))) {
         if (!e->noted && o->marked) { o->marked(o->ctx, pkt, len, mark); }
         e->noted = 1;
@@ -390,8 +412,12 @@ int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
     }
     /* A deferred head stays deferred until the queue pops it, even once due:
        queue the tail at its time whenever there is one (review N3). */
-    out_tail c = {o, e->at_ns, e->at_ns ? 0 : now_ns};
+    out_tail c = {o, e->at_ns, e->at_ns ? 0 : now_ns, NULL, 0, 0};
     uint32_t v = out_resend(&c, pkt, len) == 0 ? D2K_NF_DROP : D2K_NF_ACCEPT;
+    if (c.failed_pkt) {
+        e->failed = 1;
+        if (o->resend_failed) { o->resend_failed(o->ctx, pkt, len, c.failed_err); }
+    }
     int rc = o->verdict(o->ctx, id, v);
     if (verdict_failed) { *verdict_failed = rc != 0; }
     return 1;

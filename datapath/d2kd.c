@@ -17,6 +17,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
@@ -327,9 +329,11 @@ static int out_verdict(void *ctx, uint32_t id, uint32_t verdict) {
     return send_original_verdict(ctx, id, verdict);
 }
 
-static int out_fail(const char *err) {
+/* Отказ переиздания считается здесь; строка журнала — одна на поток, с
+   адресом, семейством и длиной (out_resend_failed). errno сохраняется для неё. */
+static int out_fail(int err) {
     st.send_fail++;
-    fprintf(stderr, "d2kd: хвост потока UDP не переиздан, отдаю ядру: %s\n", err);
+    errno = err;
     return -1;
 }
 
@@ -367,13 +371,33 @@ static int out_defer(void *ctx, uint64_t at, uint32_t id, uint32_t verdict) {
     return send_original_verdict(ctx, id, verdict);
 }
 
+/* Одна строка на поток (поле 03.10: «sendto: Permission denied» 17 раз за
+   35 мин без единого адреса). */
+static void out_resend_failed(void *ctx, const uint8_t *p, size_t n, int err) {
+    (void)ctx;
+    d2k_packet_view v;
+    char src[64] = "?", dst[64] = "?";
+    unsigned sport = 0, dport = 0;
+    int fam = 0;
+    if (d2k_packet_parse(p, n, &v) && v.l4 + 4 <= n) {
+        fam = v.family;
+        (void)inet_ntop(fam == 6 ? AF_INET6 : AF_INET, v.src.bytes, src, sizeof src);
+        (void)inet_ntop(fam == 6 ? AF_INET6 : AF_INET, v.dst.bytes, dst, sizeof dst);
+        sport = port_of(p + v.l4);
+        dport = port_of(p + v.l4 + 2);
+    }
+    fprintf(stderr, "d2kd: поток UDP %s:%u -> %s:%u (IPv%d, %zu байт): хвост не переиздан, "
+                    "отдаю ядру, поток дальше без переиздания: %s\n",
+            src, sport, dst, dport, fam, n, strerror(err));
+}
+
 static int out_send_now(void *ctx, const uint8_t *p, size_t n) {
     hold_context *c = ctx;
     char err[256];
-    if (!c->raw) { return out_fail("нет сырого сокета"); }
+    if (!c->raw) { return out_fail(ENOTSOCK); }
     if (d2k_raw_prepare(c->raw, p, n, err, sizeof err) != 0 ||
         d2k_raw_send(c->raw, p, n, err, sizeof err) != 0) {
-        return out_fail(err);
+        return out_fail(errno ? errno : EIO);
     }
     st.emitted++;
     st.emitted_now++;
@@ -383,10 +407,10 @@ static int out_send_now(void *ctx, const uint8_t *p, size_t n) {
 static int out_send_at(void *ctx, uint64_t at, const uint8_t *p, size_t n) {
     hold_context *c = ctx;
     char err[256];
-    if (!c->raw || !c->sched) { return out_fail("нет сырого сокета или очереди"); }
-    if (d2k_raw_prepare(c->raw, p, n, err, sizeof err) != 0) { return out_fail(err); }
+    if (!c->raw || !c->sched) { return out_fail(ENOTSOCK); }
+    if (d2k_raw_prepare(c->raw, p, n, err, sizeof err) != 0) { return out_fail(errno ? errno : EIO); }
     if (d2k_sched_push_serial(c->sched, at, p, n, NULL, 0) != 0) {
-        return out_fail("очередь отложенных полна");
+        return out_fail(ENOBUFS);
     }
     st.deferred++;
     return 0;
@@ -889,6 +913,7 @@ int main(int argc, char **argv) {
     udp_out.neutral_mark = probe_mark;
     udp_out.marked = out_marked;
     udp_out.defer_verdict = out_defer;
+    udp_out.resend_failed = out_resend_failed;
     udp_out.routed = routes_routed;
     udp_out.routes = &routes;
     d2k_routemark_init(&routes);

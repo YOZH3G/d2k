@@ -285,6 +285,18 @@ int main(void) {
         }
         CHECK(d2k_udp_follow_match(f, other, sizeof other, 5001, 10, NULL),
               "a full table still takes the newest head");
+        /* Field 03.10 (EACCES on raw re-send): broadcast and multicast
+           destinations are never followed — a raw socket may not send to a
+           broadcast address, and no NAT clash exists for them. */
+        uint8_t bc[40], mc[40];
+        build_udp4(bc, 0xC0A80101u, 0xFFFFFFFFu, 3517, 3517);
+        build_udp4(mc, 0xC0A80101u, 0xEFFFFFFAu, 3702, 3702);
+        CHECK(d2k_udp_follow_mark(f, bc, sizeof bc, 6000, 0, 11) != 0 &&
+              !d2k_udp_follow_match(f, bc, sizeof bc, 6000, 11, NULL),
+              "limited broadcast is never followed");
+        CHECK(d2k_udp_follow_mark(f, mc, sizeof mc, 6000, 0, 11) != 0 &&
+              !d2k_udp_follow_match(f, mc, sizeof mc, 6000, 11, NULL),
+              "multicast is never followed");
         d2k_udp_follow_free(f);
     }
     if (!fails) puts("UDP release: due ordering and bounded ownership passed");

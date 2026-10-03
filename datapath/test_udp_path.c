@@ -6,6 +6,7 @@
  * run_packet() is d2kd's: pre -> session -> post -> (late tail | verdict). */
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 
 #include "d2k_udp_path.h"
 #include "d2k_nl.h"
@@ -39,8 +40,15 @@ static int rec_verdict(void *ctx, uint32_t id, uint32_t v) {
     return id == verdict_fail_id ? -1 : 0;
 }
 
+static int fail_sends;              /* rec_now refuses (EACCES-like) */
+static unsigned failed_reports;
+static void rec_failed(void *ctx, const uint8_t *p, size_t n, int err) {
+    (void)ctx; (void)p; (void)n; (void)err;
+    failed_reports++;
+}
 static int rec_now(void *ctx, const uint8_t *p, size_t n) {
     (void)ctx;
+    if (fail_sends) { errno = EACCES; return -1; }
     uint32_t id = id_in(p, n);
     if (id < MAXID) { sends_of[id]++; send_at_of[id] = 0; }
     if (order_n < sizeof order - 1) { order[order_n++] = 's';  order[order_n] = 0; }
@@ -181,6 +189,9 @@ static d2k_session *fresh(d2k_udp_hold **h, d2k_udp_follow **f) {
     out.neutral_mark = 0x2e;
     out.marked = rec_marked;
     out.defer_verdict = rec_defer;
+    out.resend_failed = rec_failed;
+    fail_sends = 0;
+    failed_reports = 0;
     cur_mark = 0;
     marked_calls = 0;
     memset(&path, 0, sizeof path);
@@ -755,7 +766,46 @@ static void test_unrouted_mark_is_neutral(void) {
     done(s, h, f);
 }
 
+/* Field 03.10 after 34970f6: "хвост потока UDP не переиздан ... sendto:
+ * Permission denied" 17 times in 35 min, no flow named.  A refused re-send
+ * is reported once per flow (with the datagram, so the log can name dst:port,
+ * family and length), and that flow is not retried: later datagrams keep the
+ * kernel path. */
+static void test_refused_resend_reported_once(void) {
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    reset();
+    uint8_t pay[1200], pkt[1300];
+    fail_sends = 1;
+    d2k_udp_path_read(&path, 50000);
+    for (uint32_t id = 1; id <= 4; id++) {
+        memset(pay, (int)(0x30 + id), sizeof pay);
+        pay[0] = 0xC5; pay[1] = 0; pay[2] = 0; pay[3] = 0; pay[4] = 1;
+        pay[5] = 8; pay[16] = 0x7F; pay[17] = 0xFF;
+        size_t n = build(pkt, id, 51500, pay, sizeof pay);
+        (void)run_packet(s, id, pkt, n, 50000 + id, 0);
+    }
+    for (uint32_t id = 1; id <= 4; id++) {
+        CHECK(verdicts_of[id] == 1 && last_verdict[id] == D2K_NF_ACCEPT,
+              "refused re-send: the kernel path, one verdict");
+    }
+    CHECK(failed_reports == 1, "reported once for the flow, not per datagram");
+
+    /* A held batch whose two tails are refused: one report. */
+    d2k_udp_hold_batch b;
+    memset(&b, 0, sizeof b);
+    b.count = 3;
+    for (uint32_t i = 0; i < 3; i++) { b.ids[i] = 10 + i; b.len[i] = build(b.packets[i], 10 + i, 51600, pay, 100); }
+    failed_reports = 0;
+    (void)d2k_udp_out_batch(&out, &b, D2K_NF_ACCEPT, 0, 60000, 60000, 9);
+    CHECK(last_verdict[11] == D2K_NF_ACCEPT && last_verdict[12] == D2K_NF_ACCEPT &&
+          failed_reports == 1, "batch: tails ACCEPTed, one report");
+    fail_sends = 0;
+    done(s, h, f);
+}
+
 int main(void) {
+    test_refused_resend_reported_once();
     test_unrouted_mark_is_neutral();
     test_deferred_plan_owns_head();
     test_unheld_voice_plan_followers();
