@@ -144,6 +144,8 @@ int d2k_rst_rule_stale(const char *line, int *port, long *pid)
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef SO_MARK
@@ -194,7 +196,41 @@ static int g_rst_rule_failed;
 
 /* Запуск команды правила iptables. Крючок — для теста без root и iptables;
  * в работе это system(). */
-static int raw_rule_system(const char *cmd) { return system(cmd); }
+/* КОМАНДА ПРАВИЛА — СО СВОИМ СРОКОМ (ревью 49, решение 3). Голый -w (на
+ * 1.4.21 «-w N» отвергается, rc=2) ждёт замок xtables без срока, а ждём мы
+ * под g_raw_state — с ним стоят все рабочие потоки. Поэтому не system(), а
+ * fork/exec своей группой процессов и ожидание с дедлайном: зависшая команда
+ * убивается целиком (sh и iptables), вызов отвечает отказом. Код возврата —
+ * как у system(): статус waitpid. */
+#define RST_RULE_DEADLINE_MS 5000
+static int g_rule_deadline_ms = RST_RULE_DEADLINE_MS;
+
+static int raw_rule_system(const char *cmd)
+{
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        setpgid(0, 0);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    setpgid(pid, pid);
+    long deadline = d2k_now_ms() + g_rule_deadline_ms;
+    for (;;) {
+        int st = 0;
+        pid_t w = waitpid(pid, &st, WNOHANG);
+        if (w == pid) return st;
+        if (w < 0 && errno != EINTR) return -1;
+        if (d2k_now_ms() >= deadline) {
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+            while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+            return -1;
+        }
+        struct timespec ts = {0, 10 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+}
 d2k_raw_rule_fn d2k_raw_rule_hook = raw_rule_system;
 static uint32_t g_sport_counter;
 static pthread_once_t g_seed_once = PTHREAD_ONCE_INIT;
@@ -264,7 +300,7 @@ static void sweep_stale_rst_rules(void)
             snprintf(cmd, sizeof(cmd),
                      "%s -w -D OUTPUT -p tcp --sport %d --tcp-flags RST RST%s -j DROP"
                      " >/dev/null 2>&1", tables[family], port, tag);
-            (void)system(cmd);
+            (void)raw_rule_system(cmd);
         }
     }
     pclose(f);
@@ -286,8 +322,14 @@ static void sweep_stale_rst_rules(void)
  * без единого поиска). Неудавшееся удаление повторяется сразу, затем
  * запоминается и повторяется перед каждой следующей правкой правил. */
 #define RST_PENDING_MAX 64
-static struct { uint16_t sport; uint8_t family; } g_rst_pending[RST_PENDING_MAX];
+/* Сколько всего попыток снять одно правило (две сразу и отложенные), прежде
+ * чем бросить запись. С -w отказ «замок занят» не возвращается, и прочие
+ * отказы (истёк срок команды, iptables не запустился) повтором не лечатся
+ * бесконечно; брошенное правило снимет уборка следующего процесса. */
+#define RST_RELEASE_ATTEMPTS 5
+static struct { uint16_t sport; uint8_t family; int attempts; } g_rst_pending[RST_PENDING_MAX];
 static size_t g_rst_pending_n;
+static int g_rst_abandon_said;
 
 static int rst_rule_cmd(const char *op, uint16_t sport, uint8_t family)
 {
@@ -300,16 +342,34 @@ static int rst_rule_cmd(const char *op, uint16_t sport, uint8_t family)
     return d2k_raw_rule_hook(cmd);
 }
 
+/* -D снял правило или правила уже нет (exit 1, «Bad rule»: NDM перестроил
+ * netfilter) — в обоих случаях снимать больше нечего. */
+static int rst_release_done(int rc)
+{
+    return rc == 0 || (rc > 0 && WIFEXITED(rc) && WEXITSTATUS(rc) == 1);
+}
+
+static void rst_abandon(uint16_t sport, uint8_t family)
+{
+    if (g_rst_abandon_said) return;
+    g_rst_abandon_said = 1;
+    fprintf(stderr, "d2k: правило подавления RST (%s, порт %u) не снято за %d попыток — "
+                    "его снимет уборка следующего процесса\n",
+            family == 6 ? "ip6tables" : "iptables", (unsigned)sport, RST_RELEASE_ATTEMPTS);
+}
+
 /* Под g_raw_state. */
 static void retry_pending_releases(void)
 {
     size_t k = 0;
     while (k < g_rst_pending_n) {
-        if (rst_rule_cmd("-D", g_rst_pending[k].sport, g_rst_pending[k].family) == 0) {
-            g_rst_pending[k] = g_rst_pending[--g_rst_pending_n];
-        } else {
+        int rc = rst_rule_cmd("-D", g_rst_pending[k].sport, g_rst_pending[k].family);
+        if (!rst_release_done(rc) && ++g_rst_pending[k].attempts < RST_RELEASE_ATTEMPTS) {
             k++;
+            continue;
         }
+        if (!rst_release_done(rc)) rst_abandon(g_rst_pending[k].sport, g_rst_pending[k].family);
+        g_rst_pending[k] = g_rst_pending[--g_rst_pending_n];
     }
 }
 
@@ -331,12 +391,16 @@ static int suppress_kernel_rst(uint16_t sport, uint8_t family)
 static void release_kernel_rst(uint16_t sport, uint8_t family)
 {
     pthread_mutex_lock(&g_raw_state);
-    if (rst_rule_cmd("-D", sport, family) != 0 &&
-        rst_rule_cmd("-D", sport, family) != 0 &&
-        g_rst_pending_n < RST_PENDING_MAX) {
-        g_rst_pending[g_rst_pending_n].sport = sport;
-        g_rst_pending[g_rst_pending_n].family = family;
-        g_rst_pending_n++;
+    if (!rst_release_done(rst_rule_cmd("-D", sport, family)) &&
+        !rst_release_done(rst_rule_cmd("-D", sport, family))) {
+        if (g_rst_pending_n < RST_PENDING_MAX) {
+            g_rst_pending[g_rst_pending_n].sport = sport;
+            g_rst_pending[g_rst_pending_n].family = family;
+            g_rst_pending[g_rst_pending_n].attempts = 2;
+            g_rst_pending_n++;
+        } else {
+            rst_abandon(sport, family);
+        }
     }
     pthread_mutex_unlock(&g_raw_state);
 }

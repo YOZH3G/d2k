@@ -331,10 +331,11 @@ static void test_dial_survives_missing_rst_rule(void)
  * удалось (замок xtables у NDM/сторожа), и о нём забыли. Неснятое правило
  * повторяется сразу и потом перед каждой следующей правкой правил. */
 static int del_fail_left;
+static int del_fail_code = 4 << 8;
 static int flaky_del_hook(const char *cmd)
 {
     test_rule_hook(cmd);
-    if (strstr(cmd, " -D OUTPUT") && del_fail_left > 0) { del_fail_left--; return 4 << 8; }
+    if (strstr(cmd, " -D OUTPUT") && del_fail_left > 0) { del_fail_left--; return del_fail_code; }
     return 0;
 }
 
@@ -365,7 +366,56 @@ static void test_failed_release_is_retried(void)
     CHECK(rule_count == 2 && strstr(rule_cmds[0], want) != NULL &&
           strstr(rule_cmds[1], " -I OUTPUT") != NULL);
     raw_close(&c);
+
+    /* Ревью 49, Important 1: с -w отказ удаления — почти всегда «правила
+       нет» (exit 1: NDM перестроил netfilter). Такое не повторяется ни
+       сразу, ни потом — иначе каждая вставка вечно гоняла бы заведомо
+       неудачный -D под общим мьютексом. */
+    del_fail_code = 1 << 8;
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 100;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    raw_close(&c);
+    CHECK(rule_count == 2); /* -I и один -D: правила нет — снимать нечего */
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 0;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(rule_count == 1 && strstr(rule_cmds[0], " -I OUTPUT") != NULL);
+    raw_close(&c);
+
+    /* Прочий отказ повторяется, но ограниченно: после RST_RELEASE_ATTEMPTS
+       попыток запись бросается, и вставки больше не тянут за собой -D. */
+    del_fail_code = 4 << 8;
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 1000;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    raw_close(&c);
+    for (int round = 0; round < RST_RELEASE_ATTEMPTS + 2; round++) {
+        rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+        CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+        c.rule_up = 0; /* только вставка: смотрим, сколько -D идёт перед ней */
+        raw_close(&c);
+    }
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(rule_count == 1 && strstr(rule_cmds[0], " -I OUTPUT") != NULL);
+    c.rule_up = 0;
+    raw_close(&c);
+    del_fail_left = 0;
     d2k_raw_rule_hook = raw_rule_system;
+}
+
+/* Ревью 49 (решение 3): голый -w ждёт замок без срока, а ждём мы под общим
+ * мьютексом сырого слоя. Команда правила идёт со своим сроком: зависшая
+ * убивается, и вызов возвращает отказ, а не держит все рабочие потоки. */
+static void test_rule_command_is_bounded(void)
+{
+    int saved = g_rule_deadline_ms;
+    g_rule_deadline_ms = 200;
+    long t0 = d2k_now_ms();
+    int rc = raw_rule_system("exec sleep 30");
+    long took = d2k_now_ms() - t0;
+    CHECK(rc != 0 && took < 3000);
+    CHECK(raw_rule_system("exit 0") == 0);
+    CHECK(raw_rule_system("exit 1") != 0);
+    g_rule_deadline_ms = saved;
 }
 
 int main(void)
@@ -412,6 +462,7 @@ int main(void)
     test_disorder_pos2_emits_exact_reverse_segments();
     test_dial_survives_missing_rst_rule();
     test_failed_release_is_retried();
+    test_rule_command_is_bounded();
     if (failures) { return 1; }
     puts("raw: checksum, connection-owned receives and concurrent ports passed (no network)");
     return 0;

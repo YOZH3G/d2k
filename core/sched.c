@@ -158,9 +158,12 @@
 /* Сколько выведенных планов держит задача. Это же потолок, который
    d2k_compose получает под свои плечи. */
 #define SCHED_MAX_PLANS 8
-/* Не больше трёх своих подтверждённых планов до полного замера (задача 32):
-   лишних зондов — не больше трёх (плюс повторы RX-пути и местных отказов). */
-#define SCHED_OWN_FIRST_MAX 3
+/* Своих подтверждённых планов до полного замера пробуются ВСЕ подходящие
+   (задача 49: потолок «три» из задачи 32 ничем не измерен, а свой план — одна
+   проверка за секунды против ~100 зондов полного замера). В очередь задачи
+   они идут порциями по SCHED_MAX_PLANS, свежие первыми; own_seen помнит, какие
+   уже ставились в очередь, чтобы порции не повторялись. */
+#define SCHED_OWN_SEEN_MAX 256
 
 /* Зондов на задачу. ЗАМЕРЕНО на живой линии 11.09 (accounts.youtube.com, та
    самая тяжёлая цель, из-за которой ревью 06.09 сказало «восьми мало»):
@@ -833,11 +836,13 @@ typedef struct {
     int        skip_volume_once; /* resume classifier with existing baseline */
     /* СВОИ ПОДТВЕРЖДЁННЫЕ ПЛАНЫ ДО ПОЛНОГО ЗАМЕРА (задача 32, ТЗ §3.4).
        1 — задан только базовый вопрос донора (триггер целиком); 2 — он
-       подтвердил блокировку на рукопожатии, и испытываются не больше
-       SCHED_OWN_FIRST_MAX своих планов той же формы; 3 — шаг пройден (план
+       подтвердил блокировку на рукопожатии, и испытываются все свои планы
+       той же формы, порциями очереди; 3 — шаг пройден (план
        не подтвердился, своих нет или база не показала блокировки), дальше
        полный прогон ровно как прежде. 0 — шага нет. */
     int        own_first;
+    uint32_t   own_seen[SCHED_OWN_SEEN_MAX]; /* fnv1a текстов, уже поставленных в очередь */
+    size_t     n_own_seen;
     /* Испытан ли на проводе i-й свой план (бит i): только такие уходят в
        tried — отвергнутый исполнителем опыта не имел (задача 32, M1). */
     unsigned   own_probed;
@@ -3242,8 +3247,9 @@ static size_t known_plans(d2k_sched *s, task *t) {
    уже привязанный к этой цели, не предлагается снова: он и не помог.
    Уже испытанные в этой задаче тексты (tried) не повторяются.
 
-   Порядок — по числу успехов плана, затем по свежести подтверждения; не
-   больше SCHED_OWN_FIRST_MAX. fill — записать отобранное в очередь задачи.
+   Порядок — по свежести подтверждения (задача 49), порция — не больше
+   очереди задачи (SCHED_MAX_PLANS); уже поставленные в очередь (own_seen) не
+   повторяются. fill — записать порцию в очередь задачи.
    В tried план попадает, только если реально испытан на проводе
    (own_first_continue): отвергнутый исполнителем опыта не имел. */
 static int own_plan_bound_here(const d2k_sched *s, const task *t, const char *plan_id) {
@@ -3268,9 +3274,9 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
     uint8_t want = quic ? (uint8_t)D2K_LINK_SHAPE_QUIC :
                    d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY
                    ? (uint8_t)D2K_SHAPE_LEGACY : (uint8_t)SCHED_PROBE_SHAPE;
-    const d2k_cat_plan *pick[SCHED_OWN_FIRST_MAX];
-    const d2k_cat_box *owner[SCHED_OWN_FIRST_MAX];
-    int64_t fresh[SCHED_OWN_FIRST_MAX];
+    const d2k_cat_plan *pick[SCHED_MAX_PLANS];
+    const d2k_cat_box *owner[SCHED_MAX_PLANS];
+    int64_t fresh[SCHED_MAX_PLANS];
     size_t n = 0;
     for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
         const d2k_cat_box *b = &s->cat->boxes[bi];
@@ -3299,12 +3305,12 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
             uint32_t h = fnv1a(p->text);
             int tried = 0;
             for (size_t k = 0; k < t->n_tried && !tried; k++) tried = t->tried[k] == h;
+            for (size_t k = 0; k < t->n_own_seen && !tried; k++) tried = t->own_seen[k] == h;
             if (tried) continue;
             /* Тот же текст в другой коробке — тот же план: остаётся лучший. */
             size_t dup = n;
             for (size_t k = 0; k < n; k++) if (!strcmp(pick[k]->text, p->text)) dup = k;
-            int better_than_dup = dup < n && (p->successes > pick[dup]->successes ||
-                (p->successes == pick[dup]->successes && newest > fresh[dup]));
+            int better_than_dup = dup < n && newest > fresh[dup];
             if (dup < n && !better_than_dup) continue;
             if (dup < n) {
                 for (size_t k = dup; k + 1 < n; k++) {
@@ -3313,11 +3319,9 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
                 n--;
             }
             size_t at = n;
-            while (at > 0 && (p->successes > pick[at - 1]->successes ||
-                              (p->successes == pick[at - 1]->successes && newest > fresh[at - 1])))
-                at--;
-            if (at >= SCHED_OWN_FIRST_MAX) continue;
-            if (n == SCHED_OWN_FIRST_MAX) n--;
+            while (at > 0 && newest > fresh[at - 1]) at--;
+            if (at >= SCHED_MAX_PLANS) continue;
+            if (n == SCHED_MAX_PLANS) n--;
             for (size_t k = n; k > at; k--) {
                 pick[k] = pick[k - 1]; owner[k] = owner[k - 1]; fresh[k] = fresh[k - 1];
             }
@@ -3330,6 +3334,7 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
     for (size_t k = 0; k < n; k++) {
         snprintf(t->plans[k], sizeof t->plans[k], "%s", pick[k]->text);
         snprintf(t->plan_boxes[k], sizeof t->plan_boxes[k], "%s", owner[k]->id);
+        if (t->n_own_seen < SCHED_OWN_SEEN_MAX) t->own_seen[t->n_own_seen++] = fnv1a(pick[k]->text);
     }
     t->own_probed = 0;
     return n;
@@ -7949,6 +7954,28 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             }
             if (inst != 0) {
                 if (t->own_first == 2) {
+                    /* Порция кончилась: следующие свои планы по свежести,
+                       пока они есть (задача 49). Испытанные на проводе — в
+                       tried, как в own_first_continue. */
+                    for (size_t k = 0; k < t->n_plans && k < 32; k++) {
+                        if (!(t->own_probed & (1u << k))) continue;
+                        if (t->n_tried < sizeof t->tried / sizeof t->tried[0])
+                            t->tried[t->n_tried++] = fnv1a(t->plans[k]);
+                    }
+                    t->own_probed = 0;
+                    trial_retire(s, t);
+                    ver_close(t);
+                    size_t more = own_first_plans(s, t, 1);
+                    if (more > 0) {
+                        t->n_plans = t->n_known = more;
+                        t->next_plan = 0;
+                        t->exec_refused = t->exec_probed = 0;
+                        t->rx_phase = 0;
+                        say(s, "по %s следующие свои подтверждённые планы до полного замера: %zu",
+                            t->name, more);
+                        moved++;
+                        continue;
+                    }
                     /* Свои планы кончились (или все отвергнуты исполнителем —
                        это местный отказ, не повод хоронить поиск). */
                     say(s, "по %s свои подтверждённые планы не подтвердились — "

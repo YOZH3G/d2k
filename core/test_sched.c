@@ -94,6 +94,7 @@ static int snapshot_enabled, snapshot_entered, snapshot_release, snapshot_ok;
    со счётом проверки),
    как настоящий через on_obs, и только потом ждёт отпуска на snapshot_cv. */
 static int tcp_progress_notes;
+static int quic_progress_notes; /* задача 49: то же для QUIC */
 static int ver_snapshot_enabled, ver_snapshot_entered, ver_snapshot_release;
 
 static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
@@ -513,6 +514,10 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
         snprintf(quic_seen_snis[call_index], sizeof quic_seen_snis[call_index], "%s", sni ? sni : "");
         snprintf(quic_seen_targets[call_index], sizeof quic_seen_targets[call_index], "%s", quic_last_trig);
         snprintf(quic_seen_controls[call_index], sizeof quic_seen_controls[call_index], "%s", quic_last_ctl);
+    }
+    if (quic_progress_notes && d2k_quic_progress_hook) {
+        d2k_quic_progress_hook("контроль живости", 3);
+        d2k_quic_progress_hook("прямой зонд", 3);
     }
     if (snapshot_enabled) {
         uint8_t before[2048];
@@ -2667,6 +2672,32 @@ int main(int argc, char **argv) {
         d2k_sched_free(s); d2k_catalog_free(&empty);
         snapshot_enabled = 0; tcp_progress_notes = 0; tcp_answer = D2K_V_OPAQUE;
     }
+    /* Задача 49: QUIC-поиск отдаёт ход тем же путём (через настоящий
+       рабочий поток и d2k_quic_progress_hook). */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        snapshot_enabled = 1; snapshot_entered = snapshot_release = snapshot_ok = 0;
+        quic_progress_notes = 1;
+        d2k_ev h = ev_hello(17, 39975, "quic-progress.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 39975);
+        d2k_sched_event(s, &su);
+        pthread_mutex_lock(&snapshot_mu);
+        while (!snapshot_entered) { pthread_cond_wait(&snapshot_cv, &snapshot_mu); }
+        pthread_mutex_unlock(&snapshot_mu);
+        const char *e = live_task_entry(s, "quic-progress.example");
+        CHECK(strstr(e, "\"probes\": 6,") != NULL &&
+              strstr(e, "\"question\": \"прямой зонд\"") != NULL,
+              "running QUIC classifier progress is not visible in live.json");
+        pthread_mutex_lock(&snapshot_mu);
+        snapshot_release = 1; pthread_cond_broadcast(&snapshot_cv);
+        pthread_mutex_unlock(&snapshot_mu);
+        settle(s);
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        snapshot_enabled = 0; quic_progress_notes = 0;
+    }
+
     /* Complete cached input is used; an observable SNI prefix is not.
        Neither case needs a second visit to obtain the cached observation. */
     for (int partial = 0; partial < 2; partial++) {
@@ -10788,6 +10819,49 @@ own_first_test:
             d2k_sched_ech_resolve_hook = d2k_ech_resolve;
         }
 
+        /* (a3) GREASE, свой план не помог: ровно один полный прогон с ответом
+           базы, HTTPS RR второй раз не спрашивается. */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-cf-grease-miss", pid, 2, 3, "rutracker.grease-miss", 6,
+                    D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_HANDSHAKE;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched_tcp_seeded_hook = stub_tcp_seeded;
+            seeded_calls = 0;
+            d2k_sched_ech_resolve_hook = stub_ech_resolve;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            uint8_t eb[2048]; size_t el = 0;
+            CHECK(ech_offer_hello("grease-miss.example", eb, sizeof eb, &el) == 0,
+                  "own-first GREASE miss: fixture");
+            d2k_ev h = ev_hello(6, 42106, "grease-miss.example"); d2k_sched_event(s, &h);
+            d2k_ev sh; memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+            memcpy(sh.shape, eb, el); sh.shape_len = el;
+            d2k_sched_event(s, &sh);
+            ech_resolve_calls = 0;
+            d2k_ev su = ev_suspect(6, 42106); d2k_sched_event(s, &su);
+            for (int i = 0; i < 30 && tcp_calls == 0; i++) { skip_ahead(s, 6000); spin(s, 40); }
+            settle(s);
+            int resolves = ech_resolve_calls;
+            CHECK(base_calls == 1 && tcp_calls == 1 && seeded_calls == 1,
+                  "own-first GREASE miss: не ровно одна база и один полный прогон с её ответом");
+            /* Одно решение «GREASE» (имя + свидетели адреса) — и только одно:
+               перезапуск после regrade ECH-ветку не повторяет. */
+            CHECK(resolves >= 1 && said_count("ECH offer — GREASE") == 1,
+                  "own-first GREASE miss: HTTPS RR спрошен повторно после regrade");
+            CHECK(said("свои подтверждённые планы не подтвердились"),
+                  "own-first GREASE miss: неудача своих планов не видна");
+            d2k_sched_tcp_seeded_hook = NULL;
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+        }
+
         /* (b) Свой план не подтвердился: классификация продолжается как
            прежде, её вердикт и её кандидаты — те же, что без этого шага. */
         {
@@ -10831,8 +10905,10 @@ own_first_test:
             ver_app_after_tcp_search = 0;
         }
 
-        /* (c) Не больше трёх своих планов; порядок — по числу успехов, затем
-           по свежести подтверждения. */
+        /* (c) ЗАДАЧА 49: БЕЗ ПОТОЛКА «ТРИ». Свой план — одна проверка за
+           секунды, полный замер — ~100 зондов и минуты (meduza.io IPv6 03.10),
+           поэтому пробуются ВСЕ подходящие свои планы, свежие первыми;
+           классификатор — только когда не подтвердился ни один. */
         {
             d2k_catalog c = {0};
             char p1[40], p5[40], p3[40], p4a[40], p4b[40];
@@ -10854,20 +10930,67 @@ own_first_test:
             d2k_ev su = ev_suspect(6, 42121); d2k_sched_event(s, &su);
             for (int i = 0; i < 30 && tcp_calls == 0; i++) { skip_ahead(s, 6000); spin(s, 40); }
             settle(s);
-            CHECK(said("пробую свои подтверждённые планы до полного замера: 3"),
-                  "own-first: своих планов взято не три");
-            CHECK(said_count("поставил план") == 3 && ver_calls == 3,
-                  "own-first: лишних зондов своих планов больше трёх");
-            CHECK(sent_first_split_index(15) == 0 && sent_first_split_index(16) == 1 &&
-                  sent_first_split_index(14) == 2,
-                  "own-first: порядок не «успехи, затем свежесть»");
-            CHECK(sent_first_split_index(13) < 0 && sent_first_split_index(11) < 0,
-                  "own-first: испытан четвёртый свой план");
-            CHECK(tcp_calls == 1, "own-first: полный замер не продолжился после трёх неудач");
+            CHECK(said("пробую свои подтверждённые планы до полного замера: 5"),
+                  "own-first: свои планы взяты не все");
+            CHECK(said_count("поставил план") == 5 && ver_calls == 5,
+                  "own-first: испытаны не все свои планы ровно по разу");
+            CHECK(sent_first_split_index(13) == 0 && sent_first_split_index(11) == 1 &&
+                  sent_first_split_index(16) == 2 && sent_first_split_index(14) == 3 &&
+                  sent_first_split_index(15) == 4,
+                  "own-first: порядок не «свежее подтверждение первым»");
+            CHECK(tcp_calls == 1, "own-first: полный замер не продолжился после неудачи всех своих");
             CHECK(!binding_of(&c, "new.limit-target.own", 6),
                   "own-first: неподтверждённый план привязан");
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+
+        /* (c2) Нужный — четвёртый по свежести (прежний потолок «три» его не
+           брал): подтверждён без классификатора. (c3) Своих планов больше
+           очереди задачи (SCHED_MAX_PLANS): очередь пополняется следующими
+           по свежести, нужный девятый тоже подтверждается без классификатора. */
+        for (int variant = 0; variant < 2; variant++) {
+            int n_own = variant == 0 ? 4 : 10;
+            d2k_catalog c = {0};
+            char ids[10][40];
+            for (int k = 0; k < n_own; k++) {
+                char box[32], tgt[48];
+                snprintf(box, sizeof box, "box-many-%d", k);
+                snprintf(tgt, sizeof tgt, "m%d.many.own", k);
+                own_box(&c, box, ids[k], (unsigned)(30 + k), 1, tgt, 6, D2K_SHAPE_MODERN, 4,
+                        1790001000 - k * 10, 0); /* k = место по свежести */
+            }
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+            ver_fail_first = n_own - 1; ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5);
+            forget_sent();
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            uint16_t port = (uint16_t)(42141 + variant);
+            ver_answer_port = port;
+            char tgt[48];
+            snprintf(tgt, sizeof tgt, "many%d.target.own", variant);
+            d2k_ev h = ev_hello(6, port, tgt); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+            for (int i = 0; i < 60 && !said("ПОДТВЕРЖДЕНО") && tcp_calls == 0; i++) {
+                skip_ahead(s, 6000); spin(s, 40);
+                d2k_ev ap = ev_applied(6, port); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            settle(s);
+            const d2k_cat_binding *bd = binding_of(&c, tgt, 6);
+            CHECK(tcp_calls == 0, "own-first: классификатор пошёл, хотя подходящий свой план был");
+            CHECK(bd != NULL && !strcmp(bd->plan_id, ids[n_own - 1]),
+                  "own-first: подтверждён не тот свой план (не последний по свежести)");
+            CHECK(bd && bd->shape == D2K_SHAPE_MODERN && bd->family == 4 &&
+                  (bd->transport ? bd->transport : 6) == 6,
+                  "own-first: привязка не той формы/семейства/транспорта");
+            CHECK(ver_calls == n_own, "own-first: свои планы испытаны не ровно по разу до подтверждения");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_fail_first = 0;
         }
 
         /* (d) Формы, транспорты и семейства не смешиваются; помеченная к
