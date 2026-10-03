@@ -1723,9 +1723,24 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
         return d;
     }
     int64_t start = qp_now_ms(), progress_at = start;
-    while (!(complete && status) && (bytes < D2K_QUIC_ARM_DATA_BYTES || !status)) {
+    /* Раунд 3 (задача 50): «встал» решает молчание транспорта, проверенное
+       PING (d2k_qstall), а не пауза в ответе. Медленный первый байт и
+       потерянный пакет — не обрыв; живой сервер, не успевший ответить, — «не
+       измерено». Общий предел — четыре срока или три RTO с запасом, что
+       больше: обрыву нужно RTO тишины и два PING без ответа. */
+    d2k_qstall st;
+    d2k_qstall_init(&st, d2k_qc_rtt_ms(c), start, d2k_qc_rx_wire_bytes(c));
+    int stalled = 0;
+    int64_t limit = (int64_t)(4u * step);
+    if (limit < 4 * st.rto_ms) limit = 4 * st.rto_ms;
+    (void)progress_at;
+    while (!(complete && status) &&
+           (q->need_complete || bytes < D2K_QUIC_ARM_DATA_BYTES || !status)) {
         int64_t now = qp_now_ms();
-        if (now - progress_at >= (int64_t)step || now - start >= (int64_t)(4u * step)) break;
+        if (now - start >= limit) break;
+        int act = d2k_qstall_step(&st, now, d2k_qc_rx_wire_bytes(c));
+        if (act == D2K_QSTALL_STALLED) { stalled = 1; break; }
+        if (act == D2K_QSTALL_PROBE) { (void)d2k_qc_ping(c, err, sizeof err); }
         long n = d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 200, err, sizeof err);
         if (n < 0) { closed = 1; }
         if (n > 0 && head_len < D2K_VERIFY_HEADER_LIMIT) {
@@ -1746,11 +1761,20 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
     free(head);
     d2k_qc_app_progress(c, &bytes, &complete);
     d.app_bytes = bytes;
-    d.verdict = d2k_quic_arm_data_judge_limited(1, status, bytes, complete, head_full);
-    if (d.verdict == D2K_QAD_NOT_RUN) {
+    /* Соединение оборвалось ошибкой посреди ответа — тоже не «медленно». */
+    if (closed && !complete) stalled = 1;
+    d.verdict = d2k_quic_arm_data_judge3(1, status, bytes, complete, stalled,
+                                         q->need_complete, head_full);
+    if (d.verdict == D2K_QAD_NOT_RUN && head_full && status <= 0) {
         snprintf(d.reason, sizeof d.reason,
                  "заголовки ответа HTTP/3 длиннее %d байт — наш предел, не обрыв линии",
                  D2K_VERIFY_HEADER_LIMIT);
+    } else if (d.verdict == D2K_QAD_NOT_RUN) {
+        snprintf(d.reason, sizeof d.reason,
+                 "сервер жив (отвечает на PING), но ответ за %lld мс не %s (HTTP %d, %llu байт) — "
+                 "не обрыв, не измерено", (long long)limit,
+                 q->need_complete ? "пришёл целиком" : "донёс порог", status,
+                 (unsigned long long)bytes);
     } else if (d.verdict == D2K_QAD_PASS) {
         snprintf(d.reason, sizeof d.reason, "рукопожатие, HTTP %d и %llu байт данных%s",
                  status, (unsigned long long)bytes, complete ? ", ответ целиком" : "");
@@ -1761,6 +1785,11 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
     } else {
         snprintf(d.reason, sizeof d.reason, "рукопожатие есть, поток оборван на %llu байт%s%.80s",
                  (unsigned long long)bytes, closed ? ": " : "", closed ? err : "");
+    }
+    if (d.verdict == D2K_QAD_CUT && stalled) {
+        size_t rl = strlen(d.reason);
+        snprintf(d.reason + rl, sizeof d.reason - rl,
+                 "; сервер молчит: два PING без ответа (RTO %lld мс)", (long long)st.rto_ms);
     }
     d2k_qc_close(c);
     return d;
@@ -2559,15 +2588,37 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                        ответе. Своё соединение без воздействия, запрос HTTP/3
                        к тому же ресурсу, что у плеч; правило то же
                        (d2k_quic_arm_data_judge). */
+                    /* Раунд 3: ДВА своих запроса на свежих соединениях,
+                       оба обязаны встать (молчание транспорта, d2k_qstall);
+                       засчитывается только ответ целиком — как и у плеч,
+                       с которыми их сравнивают на том же пути. */
                     d2k_quic_arm_question dq;
                     memset(&dq, 0, sizeof dq);
                     dq.addr = pool[0];
                     dq.label = "прямой запрос HTTP/3";
+                    dq.need_complete = 1;
                     d2k_quic_arm_data dd = d2k_quic_arm_data_hook(&dq, sni,
                         arm_path[0] ? arm_path : NULL, port, dyn_wait, mark);
                     r.probes += 1;
                     qp_progress("прямой запрос HTTP/3", 1);
-                    if (dd.verdict == D2K_QAD_PASS) {
+                    d2k_quic_arm_data dd2;
+                    memset(&dd2, 0, sizeof dd2);
+                    if (dd.verdict == D2K_QAD_CUT) {
+                        dd2 = d2k_quic_arm_data_hook(&dq, sni,
+                            arm_path[0] ? arm_path : NULL, port, dyn_wait, mark);
+                        r.probes += 1;
+                        qp_progress("прямой запрос HTTP/3, повтор", 1);
+                    }
+                    if (dd.verdict == D2K_QAD_CUT && dd2.verdict == D2K_QAD_PASS) {
+                        r.verdict = D2K_V_FLAKY;
+                        reason_set(&r, "Initial проходит (%d/%d), свой запрос HTTP/3 встал один раз "
+                                       "из двух (второй: %.100s) — обрыв не воспроизводится",
+                                   base.pass, D2K_QUIC_REPEATS, dd2.reason);
+                    } else if (dd.verdict == D2K_QAD_CUT && dd2.verdict != D2K_QAD_CUT) {
+                        r.verdict = D2K_V_INCONCLUSIVE;
+                        reason_set(&r, "Initial проходит (%d/%d), второй свой запрос HTTP/3 не "
+                                       "измерен: %.120s", base.pass, D2K_QUIC_REPEATS, dd2.reason);
+                    } else if (dd.verdict == D2K_QAD_PASS) {
                         r.verdict = D2K_V_CLEAR;
                         reason_set(&r, "Initial проходит (%d/%d), ответ на свой запрос HTTP/3 "
                                        "приходит (%.120s) — обрыв после рукопожатия не воспроизвёлся",
@@ -2583,15 +2634,17 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                            вопрос здесь не задаётся). */
                         r.verdict = D2K_V_OPAQUE;
                         reason_set(&r, "Initial проходит (%d/%d), ответ на свой запрос HTTP/3 "
-                                       "встаёт после рукопожатия (%llu байт: %.100s)",
+                                       "встаёт после рукопожатия дважды из двух (%llu и %llu байт: %.100s)",
                                    base.pass, D2K_QUIC_REPEATS,
-                                   (unsigned long long)dd.app_bytes, dd.reason);
+                                   (unsigned long long)dd.app_bytes,
+                                   (unsigned long long)dd2.app_bytes, dd.reason);
                         d2k_quic_arm_context context = {.pool=pool, .n_pool=n_pool,
                             .next=next_addr, .residual=0, .marked=all_marked,
                             .can_ask=arm_budget_left, .limit_user=&start,
                             .spent=arm_budget_spent,
                             .path=arm_path[0]?arm_path:NULL,
-                            .no_split=arm_split_unfit};
+                            .no_split=arm_split_unfit,
+                            .need_complete=1};
                         if (budget_left(&start)) {
                             char why[sizeof r.reason];
                             snprintf(why, sizeof why, "%s", r.reason);

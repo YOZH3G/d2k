@@ -110,21 +110,76 @@ static d2k_quic_arm_data data_pass(const d2k_quic_arm_question *q,const char *sn
 }
 /* Задача 50, раунд 2: прямой этап данных — без воздействия. Обрыв после
    рукопожатия: сам по себе ответ встаёт, плечо с воздействием проходит. */
-static int direct_data_calls, direct_cut;
+static int direct_data_calls, direct_cut, direct_seq[4], arm_need_complete = -1;
 static d2k_quic_arm_data data_cut(const d2k_quic_arm_question *q,const char *sni,
     const char *path,uint16_t port,uint32_t wait,uint32_t mark) {
     (void)path;(void)port;(void)wait;(void)mark;(void)sni;
     d2k_quic_arm_data d; memset(&d,0,sizeof d);
     int plain=!q->blob && q->copies<=1 && !q->ttl && !q->frag && !q->benign && !q->split;
     if(plain) {
+        /* direct_seq: 1 — обрыв, 2 — ответ целиком; 0 — по direct_cut. */
+        int v = direct_data_calls < 4 && direct_seq[direct_data_calls] ?
+                direct_seq[direct_data_calls] : (direct_cut ? 1 : 2);
+        CHECK(q->need_complete == 1);
         direct_data_calls++;
-        d.verdict=direct_cut?D2K_QAD_CUT:D2K_QAD_PASS;
-        d.app_bytes=direct_cut?1169:D2K_QUIC_ARM_DATA_BYTES;
+        d.verdict=v==1?D2K_QAD_CUT:D2K_QAD_PASS;
+        d.app_bytes=v==1?1169:D2K_QUIC_ARM_DATA_BYTES;
     } else {
+        arm_need_complete = q->need_complete;
         data_calls++;
         d.verdict=D2K_QAD_PASS; d.app_bytes=D2K_QUIC_ARM_DATA_BYTES;
     }
     return d;
+}
+
+/* Раунд 3: «встал» — это молчание ТРАНСПОРТА, проверенное нашими пакетами,
+   требующими подтверждения (PING), а не медленный первый байт. */
+static void stall_machine(void) {
+    d2k_qstall st;
+    /* Медленный первый байт: сервер подтверждает PING, данных ещё нет. */
+    d2k_qstall_init(&st, 50, 0, 1000);
+    int stalled = 0, pings = 0;
+    uint64_t rx = 1000;
+    for (int64_t t = 0; t <= 6000; t += 50) {
+        if (t >= 4000) rx += 1200;                  /* ответ пошёл на 4-й секунде */
+        int a = d2k_qstall_step(&st, t, rx);
+        if (a == D2K_QSTALL_PROBE) { pings++; rx += 40; } /* ACK на PING через RTT */
+        if (a == D2K_QSTALL_STALLED) stalled = 1;
+    }
+    CHECK(!stalled && pings >= 2);
+    /* Один потерянный пакет: секунда тишины, PING, сервер жив — поток идёт. */
+    d2k_qstall_init(&st, 50, 0, 1000);
+    rx = 1000; stalled = 0;
+    for (int64_t t = 0; t <= 6000; t += 50) {
+        if (t < 500 || t >= 1500) rx += 1200;
+        if (d2k_qstall_step(&st, t, rx) == D2K_QSTALL_STALLED) stalled = 1;
+    }
+    CHECK(!stalled);
+    /* Настоящий обрыв: данные шли, затем ни одного пакета, два PING без ответа. */
+    d2k_qstall_init(&st, 50, 0, 1000);
+    rx = 1000; stalled = 0; pings = 0;
+    int64_t at = -1;
+    for (int64_t t = 0; t <= 6000 && at < 0; t += 50) {
+        if (t < 300) rx += 1200;
+        int a = d2k_qstall_step(&st, t, rx);
+        if (a == D2K_QSTALL_PROBE) pings++;
+        if (a == D2K_QSTALL_STALLED) at = t;
+    }
+    CHECK(at >= 3000 && at <= 3400 && pings == 2);
+    /* RTO растёт с измеренным RTT: 3×500 мс. */
+    d2k_qstall_init(&st, 500, 0, 1000);
+    CHECK(st.rto_ms == 1500);
+
+    /* Вердикт этапа данных (раунд 3). */
+    CHECK(d2k_quic_arm_data_judge3(1, 200, 5000, 1, 0, 1, 0) == D2K_QAD_PASS);   /* ответ целиком */
+    CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 1, 1, 0) == D2K_QAD_CUT);         /* встал до заголовков */
+    CHECK(d2k_quic_arm_data_judge3(1, 200, 9000, 0, 1, 1, 0) == D2K_QAD_CUT);    /* встал посреди */
+    CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 0, 1, 0) == D2K_QAD_NOT_RUN);     /* жив, но не успел */
+    CHECK(d2k_quic_arm_data_judge3(1, 200, 40000, 0, 0, 1, 0) == D2K_QAD_NOT_RUN); /* нужен целый */
+    CHECK(d2k_quic_arm_data_judge3(1, 200, 40000, 0, 0, 0, 0) == D2K_QAD_PASS);  /* прежнее правило */
+    CHECK(d2k_quic_arm_data_judge3(1, 451, 300, 1, 0, 1, 0) == D2K_QAD_CUT);
+    CHECK(d2k_quic_arm_data_judge3(0, 0, 0, 0, 0, 1, 0) == D2K_QAD_NO_HANDSHAKE);
+    CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 0, 1, 1) == D2K_QAD_NOT_RUN);     /* наш предел заголовков */
 }
 
 static void post_handshake_stall(void) {
@@ -146,7 +201,10 @@ static void post_handshake_stall(void) {
     memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
-    CHECK(r.verdict==D2K_V_OPAQUE && direct_data_calls==1 && data_calls>=1);
+    /* Раунд 3: два своих запроса на свежих соединениях, оба встали. Плечо
+       засчитывается только полным ответом (need_complete). */
+    CHECK(r.verdict==D2K_V_OPAQUE && direct_data_calls==2 && data_calls>=1);
+    CHECK(arm_need_complete==1);
     CHECK(arm.original && arm.kind!=D2K_QA_NOT_FOUND && arm.kind!=D2K_QA_FLAKY);
     CHECK(strstr(r.reason,"после рукопожатия")!=NULL);
     CHECK(arm.data_cut==1);
@@ -158,6 +216,15 @@ static void post_handshake_stall(void) {
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
     CHECK(r.verdict==D2K_V_CLEAR && direct_data_calls==1 && data_calls==0);
     CHECK(strstr(r.reason,"не воспроизв")!=NULL);
+    /* Первый встал, второй прошёл целиком — не воспроизводится: плечи не
+       меряются, ни плана, ни снятия QUIC. */
+    memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
+    direct_seq[0]=1; direct_seq[1]=2;
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(r.verdict==D2K_V_FLAKY && direct_data_calls==2 && data_calls==0);
+    CHECK(arm.kind==D2K_QA_NOT_FOUND || !arm.original);
+    direct_seq[0]=direct_seq[1]=0;
     all_pass=0;
     d2k_quic_arm_data_hook=saved;
 }
@@ -227,6 +294,7 @@ int main(void) {
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},99,&arm);
     CHECK(!r.marked && arm.kind==D2K_QA_FLAKY);
     lose_base_mark=0; calls=0;
+    stall_machine();
     post_handshake_stall();
     if(fails)return 1;
     puts("original Run order: passed");return 0;

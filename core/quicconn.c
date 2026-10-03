@@ -151,6 +151,10 @@ struct d2k_qc {
     /* Сколько байт датаграмм принято всего: по нему проверка отличает
        «сервер замолчал» от «сервер говорит, но не отвечает на запрос». */
     uint64_t rx_wire_bytes;
+    /* Задача 50, раунд 3: RTT рукопожатия (первая датаграмма сервера после
+       первого Initial) — основа RTO для «встал». */
+    int64_t  sent0_ms;
+    int64_t  rtt_ms;
 
     uint8_t  local_addr[16];
     uint8_t  family;
@@ -537,6 +541,10 @@ static int recv_dgram(d2k_qc *c, int wait_ms, char *err, size_t errcap) {
         return -1;
     }
     c->rx_wire_bytes += (uint64_t)n;
+    if (!c->rtt_ms && c->sent0_ms) {
+        int64_t d = now_ms() - c->sent0_ms;
+        c->rtt_ms = d > 0 ? d : 1;
+    }
 
     size_t off = 0;
     int any = 0;
@@ -871,6 +879,7 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
         }
     }
 
+    c->sent0_ms = now_ms();
     int64_t deadline = now_ms() + (o->deadline_ms > 0 ? o->deadline_ms : 5000);
     int64_t pto = now_ms() + 333;      /* RFC 9002 §6.2.2: стартовый RTT до замера */
     int tries = 0;
@@ -1089,6 +1098,13 @@ void d2k_qc_app_progress(const d2k_qc *c, uint64_t *bytes, int *complete) {
 int d2k_qc_peer_name(const d2k_qc *c) { return c ? c->peer_name : -1; }
 uint64_t d2k_qc_rx_wire_bytes(const d2k_qc *c) { return c ? c->rx_wire_bytes : 0; }
 int d2k_qc_handshake_done(const d2k_qc *c) { return c ? c->handshake_done : 0; }
+int64_t d2k_qc_rtt_ms(const d2k_qc *c) { return c ? c->rtt_ms : 0; }
+
+int d2k_qc_ping(d2k_qc *c, char *err, size_t errcap) {
+    if (!c) return -1;
+    uint8_t fr[1] = { FR_PING };
+    return send_level(c, D2K_QW_LEVEL_APP, fr, sizeof fr, 0, err, errcap);
+}
 int d2k_qc_fd(const d2k_qc *c) { return c ? c->fd : -1; }
 
 void d2k_qc_local(const d2k_qc *c, uint8_t ip4[4], uint16_t *port) {

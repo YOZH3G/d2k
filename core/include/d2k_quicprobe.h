@@ -455,6 +455,78 @@ static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge_limited(
     return d2k_quic_arm_data_judge(handshake, status, app_bytes, complete);
 }
 
+/* «ВСТАЛ» — ЭТО МОЛЧАНИЕ ТРАНСПОРТА (задача 50, раунд 3).
+ *
+ * Прежде этап данных объявлял обрыв, если ответ не рос step мс (1,5–6 с):
+ * медленный первый байт и один потерянный пакет становились «обрывом», а
+ * ими — свой запрос, ворота поиска и снятия QUIC. Теперь вопрос задаётся
+ * самому серверу: когда от него нет ни одной датаграммы RTO, уходит PING
+ * (кадр, требующий подтверждения, RFC 9000 §19.2). Живой сервер подтверждает
+ * его за RTT + max_ack_delay даже в долгой паузе перед ответом; второй PING
+ * без ответа за RTO — обрыв. RTO = 3 × RTT рукопожатия, пол 1 с (RFC 9002
+ * §6.2: первый PTO = 3R) — как у детектора датапата.
+ *
+ * Поле 04.10: на rua.gr свой запрос не получил НИ ОДНОГО байта ответа —
+ * коробка рвёт сразу за рукопожатием нашего клиента. Поэтому «начались
+ * данные ответа» обрыву НЕ нужно: медленный первый байт отличается от
+ * обрыва ответом сервера на PING, а не наличием данных. */
+typedef struct {
+    int64_t rto_ms;
+    int64_t last_rx_ms;   /* когда последний раз пришла датаграмма */
+    int64_t probe_ms;     /* когда ушёл PING, на который ждём ответ; 0 — нет */
+    uint64_t rx_seen;
+    int unanswered;
+} d2k_qstall;
+
+#define D2K_QSTALL_GOING   0
+#define D2K_QSTALL_PROBE   1  /* послать PING сейчас */
+#define D2K_QSTALL_STALLED 2
+
+static inline void d2k_qstall_init(d2k_qstall *st, int64_t rtt_ms, int64_t now_ms,
+                                   uint64_t rx_bytes) {
+    st->rto_ms = 3 * (rtt_ms > 0 ? rtt_ms : 0);
+    if (st->rto_ms < 1000) st->rto_ms = 1000;
+    st->last_rx_ms = now_ms;
+    st->probe_ms = 0;
+    st->rx_seen = rx_bytes;
+    st->unanswered = 0;
+}
+
+static inline int d2k_qstall_step(d2k_qstall *st, int64_t now_ms, uint64_t rx_bytes) {
+    if (rx_bytes != st->rx_seen) {
+        st->rx_seen = rx_bytes;
+        st->last_rx_ms = now_ms;
+        st->probe_ms = 0;
+        st->unanswered = 0;
+        return D2K_QSTALL_GOING;
+    }
+    if (st->probe_ms == 0) {
+        if (now_ms - st->last_rx_ms >= st->rto_ms) { st->probe_ms = now_ms; return D2K_QSTALL_PROBE; }
+        return D2K_QSTALL_GOING;
+    }
+    if (now_ms - st->probe_ms < st->rto_ms) return D2K_QSTALL_GOING;
+    if (++st->unanswered >= 2) return D2K_QSTALL_STALLED;
+    st->probe_ms = now_ms;
+    return D2K_QSTALL_PROBE;
+}
+
+/* Вердикт этапа данных с признаком обрыва транспорта (раунд 3).
+ * stalled — d2k_qstall сказал «встал»; need_complete — засчитывается только
+ * ответ целиком (поиск по обрыву после рукопожатия: свой прямой запрос и
+ * плечи на ТОМ ЖЕ пути сравниваются полным ответом). Сервер жив, а ответ не
+ * успел — НЕ обрыв: этап не измерен (NOT_RUN), как и наш предел заголовков. */
+static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge3(int handshake, int status,
+        uint64_t app_bytes, int complete, int stalled, int need_complete,
+        int headers_too_long) {
+    if (!handshake) return D2K_QAD_NO_HANDSHAKE;
+    if (status == 451) return D2K_QAD_CUT;
+    if (status > 0 && complete) return D2K_QAD_PASS;
+    if (stalled) return D2K_QAD_CUT;
+    if (status <= 0 && headers_too_long) return D2K_QAD_NOT_RUN;
+    if (!need_complete && status > 0 && app_bytes >= D2K_QUIC_ARM_DATA_BYTES) return D2K_QAD_PASS;
+    return D2K_QAD_NOT_RUN;
+}
+
 /* Longest original askArms ladder (quicarms.c, donor arms.go): 5 intrinsic
  * fakes + 2 candidates x 2 copy counts + 4 TTLs + fragment survival + 4
  * fragment shapes = 18 questions. The Run budget is derived from it. */
