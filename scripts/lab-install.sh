@@ -62,7 +62,14 @@ panel_post() {
         sleep 1
     done
     cat /tmp/d2k-panel-post.json
-    grep -q '"ok":true' /tmp/d2k-panel-post.json
+    grep -q '"ok":true' /tmp/d2k-panel-post.json || return 1
+    # Принятая команда идёт фоном: ждём её итога (control_state != running),
+    # чтобы следующие проверки читали результат, а не полпути.
+    for _ in $(seq 1 60); do
+        panel_curl -fsS http://127.0.0.1:8090/api/status 2>/dev/null | grep -q '"control_state":"running"' || return 0
+        sleep 1
+    done
+    return 0
 }
 rules() {
     iptables -t mangle -S 2>/dev/null | sort
