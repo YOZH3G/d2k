@@ -168,6 +168,14 @@ size_t d2k_udp_release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
     if (!resend) { can_resend = 0; owned = 0; }
     (void)d2k_udp_replay_fates(b->count, head_verdict, owned, can_resend, v, again);
     for (size_t i = 0; i < b->count; i++) {
+        if (again[i] && vfail && !owned) {
+            /* The head's verdict did not reach the kernel: it is still queued
+               and its entry unconfirmed.  A raw tail now would overtake it
+               and create the entry itself (review M2). */
+            again[i] = 0;
+            v[i] = D2K_NF_ACCEPT;
+            fell_back++;
+        }
         if (again[i]) {
             if (resend(ctx, b->packets[i], b->len[i]) == 0) {
                 resent++;
@@ -185,6 +193,9 @@ size_t d2k_udp_release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
 
 typedef struct {
     uint64_t until_ns;
+    uint64_t at_ns;
+    uint64_t seq;
+    uint8_t used;
     uint8_t family;
     uint8_t src[16], dst[16];
     uint8_t ports[4];
@@ -217,27 +228,85 @@ static int same_tuple(const follow_entry *a, const follow_entry *b) {
 }
 
 int d2k_udp_follow_mark(d2k_udp_follow *f, const uint8_t *pkt, size_t len,
-                        uint64_t now_ns) {
+                        uint64_t now_ns, uint64_t at_ns, uint64_t seq) {
     follow_entry t;
     if (!f || follow_tuple(pkt, len, &t) != 0) { return -1; }
-    t.until_ns = now_ns + D2K_UDP_FOLLOW_NS;
-    follow_entry *slot = NULL;
-    for (size_t i = 0; i < D2K_UDP_FOLLOW_SLOTS; i++) {
+    uint64_t out = at_ns > now_ns ? at_ns : now_ns;
+    t.until_ns = out + D2K_UDP_FOLLOW_NS;
+    t.at_ns = at_ns > now_ns ? at_ns : 0;
+    t.seq = seq;
+    t.used = 1;
+    follow_entry *slot = NULL, *spare = NULL;
+    for (size_t i = 0; i < D2K_UDP_FOLLOW_SLOTS && !slot; i++) {
         follow_entry *e = &f->e[i];
-        if (e->until_ns && same_tuple(e, &t)) { slot = e; break; }
-        if (!slot || e->until_ns < slot->until_ns) { slot = e; }
+        if (e->used && same_tuple(e, &t)) { slot = e; }
+        else if (!spare || (spare->used && (!e->used || e->until_ns < spare->until_ns))) {
+            spare = e;
+        }
     }
-    *slot = t;
+    *(slot ? slot : spare) = t;
     return 0;
 }
 
 int d2k_udp_follow_match(const d2k_udp_follow *f, const uint8_t *pkt, size_t len,
-                         uint64_t now_ns) {
+                         uint64_t now_ns, uint64_t seq, uint64_t *at_ns) {
     follow_entry t;
     if (!f || follow_tuple(pkt, len, &t) != 0) { return 0; }
     for (size_t i = 0; i < D2K_UDP_FOLLOW_SLOTS; i++) {
         const follow_entry *e = &f->e[i];
-        if (e->until_ns > now_ns && same_tuple(e, &t)) { return 1; }
+        if (!e->used || !same_tuple(e, &t)) { continue; }
+        if (e->seq == seq || now_ns < e->until_ns) {
+            if (at_ns) { *at_ns = e->at_ns; }
+            return 1;
+        }
     }
     return 0;
+}
+
+typedef struct {
+    const d2k_udp_out *o;
+    uint64_t at, now;
+} out_tail;
+
+static int out_resend(void *ctx, const uint8_t *pkt, size_t len) {
+    out_tail *c = ctx;
+    if (c->at > c->now) {
+        return c->o->send_at ? c->o->send_at(c->o->ctx, c->at, pkt, len) : -1;
+    }
+    return c->o->send_now ? c->o->send_now(c->o->ctx, pkt, len) : -1;
+}
+
+static int out_verdict(void *ctx, uint32_t id, uint32_t verdict) {
+    out_tail *c = ctx;
+    return c->o->verdict(c->o->ctx, id, verdict);
+}
+
+int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,
+                      uint32_t head_verdict, int owned,
+                      uint64_t at_ns, uint64_t now_ns, uint64_t seq) {
+    if (!o || !o->verdict || !b || !b->count) { return 0; }
+    out_tail c = {o, at_ns, now_ns};
+    int can = o->can_resend && o->send_now;
+    int vfail = 0;
+    size_t rfail = 0;
+    (void)d2k_udp_release_batch(b, head_verdict, can ? owned : 0, can, out_verdict,
+                                can ? out_resend : NULL, &c, &vfail, &rfail);
+    if (can && o->follow) {
+        (void)d2k_udp_follow_mark(o->follow, b->packets[0], b->len[0], now_ns, at_ns, seq);
+    }
+    return vfail;
+}
+
+int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
+                     size_t len, uint64_t now_ns, uint64_t seq, int *verdict_failed) {
+    uint64_t at = 0;
+    if (!o || !o->verdict || !o->can_resend || !o->send_now || !o->follow ||
+        !d2k_udp_follow_match(o->follow, pkt, len, now_ns, seq, &at)) {
+        return 0;
+    }
+    out_tail c = {o, at, now_ns};
+    uint32_t v = out_resend(&c, pkt, len) == 0 ? D2K_NF_DROP : D2K_NF_ACCEPT;
+    int rc = o->verdict(o->ctx, id, v);
+    if (verdict_failed) { *verdict_failed = rc != 0; }
+    return 1;
 }

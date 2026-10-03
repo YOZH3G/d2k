@@ -239,7 +239,9 @@ int main(void) {
         vfail = 0;
         (void)d2k_udp_release_batch(&b, D2K_NF_ACCEPT, 0, 1, log_verdict, log_resend,
                                     NULL, &vfail, &rfail);
-        CHECK(vfail && log_n == 5, "verdict failure reported; tails not abandoned");
+        CHECK(vfail && log_n == 3 && log_kind[1] == 'v' && log_v[1] == D2K_NF_ACCEPT &&
+              log_kind[2] == 'v' && log_v[2] == D2K_NF_ACCEPT && rfail == 2,
+              "head verdict failed: tails ACCEPTed, never sent ahead of a queued head");
         verdict_fail_id = 0;
     }
 
@@ -257,24 +259,31 @@ int main(void) {
         tcp[9] = 6;
         build_udp4(frag, 0xC0A80143u, 0x3990F8C0u, 50000, 443);
         frag[6] = 0x20; /* MF */
-        CHECK(!d2k_udp_follow_match(f, a, sizeof a, 1000), "nothing marked yet");
-        CHECK(d2k_udp_follow_mark(f, a, sizeof a, 1000) == 0, "mark the released head");
-        CHECK(d2k_udp_follow_match(f, a, sizeof a, 1000 + D2K_UDP_FOLLOW_NS - 1),
-              "a later datagram of the same client flow follows the head");
-        CHECK(!d2k_udp_follow_match(f, rev, sizeof rev, 1001),
+        CHECK(!d2k_udp_follow_match(f, a, sizeof a, 1000, 1, NULL), "nothing marked yet");
+        CHECK(d2k_udp_follow_mark(f, a, sizeof a, 1000, 0, 1) == 0, "mark the released head");
+        CHECK(d2k_udp_follow_match(f, a, sizeof a, 1000 + D2K_UDP_FOLLOW_NS - 1, 2, NULL),
+              "a datagram of the same client flow inside the clash window follows the head");
+        CHECK(d2k_udp_follow_match(f, a, sizeof a, 1000 + 10 * D2K_UDP_FOLLOW_NS, 1, NULL),
+              "read in the head's own receive batch: queued before its verdict");
+        CHECK(!d2k_udp_follow_match(f, rev, sizeof rev, 1001, 1, NULL),
               "the server's direction is never re-sent");
-        CHECK(!d2k_udp_follow_match(f, other, sizeof other, 1001),
+        CHECK(!d2k_udp_follow_match(f, other, sizeof other, 1001, 1, NULL),
               "another client port is another flow");
-        CHECK(!d2k_udp_follow_match(f, tcp, sizeof tcp, 1001), "TCP never matches");
-        CHECK(!d2k_udp_follow_match(f, frag, sizeof frag, 1001),
+        CHECK(!d2k_udp_follow_match(f, tcp, sizeof tcp, 1001, 1, NULL), "TCP never matches");
+        CHECK(!d2k_udp_follow_match(f, frag, sizeof frag, 1001, 1, NULL),
               "an IP fragment is not re-sent as a whole datagram");
-        CHECK(!d2k_udp_follow_match(f, a, sizeof a, 1000 + D2K_UDP_FOLLOW_NS),
-              "the window closes");
+        CHECK(!d2k_udp_follow_match(f, a, sizeof a, 1000 + D2K_UDP_FOLLOW_NS, 2, NULL),
+              "a later batch past the window goes to the kernel");
+        uint64_t at = 7;
+        CHECK(d2k_udp_follow_mark(f, a, sizeof a, 2000, 2000 + 30000000, 3) == 0 &&
+              d2k_udp_follow_match(f, a, sizeof a, 2000 + 30000000 + D2K_UDP_FOLLOW_NS - 1,
+                                   4, &at) && at == 2000 + 30000000,
+              "a deferred head: window counts from its emit, which is reported");
         for (uint16_t p = 0; p < 200; p++) {
             build_udp4(other, 0xC0A80143u, 0x3990F8C0u, (uint16_t)(1000 + p), 443);
-            (void)d2k_udp_follow_mark(f, other, sizeof other, 5000);
+            (void)d2k_udp_follow_mark(f, other, sizeof other, 5000, 0, 9);
         }
-        CHECK(d2k_udp_follow_match(f, other, sizeof other, 5001),
+        CHECK(d2k_udp_follow_match(f, other, sizeof other, 5001, 10, NULL),
               "a full table still takes the newest head");
         d2k_udp_follow_free(f);
     }

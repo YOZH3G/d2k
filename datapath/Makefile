@@ -30,20 +30,20 @@ COREHDR  = $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_quicwire.h $(C
 QUIC_FIXTURE_OBJ = core_quichello.o core_hello.o core_tls13core.o core_x25519.o
 
 # Переносимый датапат: собирается и проверяется на любой машине.
-SRC     = addr.c plan_parse.c plan_apply.c tls.c capture.c hold.c udp_hold.c udp_release.c wire.c wire_udp.c track.c session.c nat.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
+SRC     = addr.c plan_parse.c plan_apply.c tls.c capture.c hold.c udp_hold.c udp_release.c udp_path.c wire.c wire_udp.c track.c session.c nat.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
 # Системный слой: только Linux. На маке не собирается намеренно — подделывать
 # сокеты ядра ради сборки значило бы проверять подделку. Проверяется целью
 # cross, которая линкует ПОЛНУЮ службу под обе целевые арки: полная сборка
 # доказывает больше, чем компиляция объектников.
 LINUXSRC = nfq.c raw.c
 DAEMON   = d2kd.c
-HDR     = include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h include/d2k_capture.h include/d2k_plan.h include/d2k_nat.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h plan_internal.h $(COREHDR)
+HDR     = include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h include/d2k_udp_path.h include/d2k_capture.h include/d2k_plan.h include/d2k_nat.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h plan_internal.h $(COREHDR)
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_addr test_hold test_udp_hold test_udp_release test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session
+TESTS   = test_addr test_hold test_udp_hold test_udp_release test_udp_path test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session
 
-.PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release cross clean
+.PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release test-udp-path cross clean
 
 all: planlab ctlprobe
 
@@ -95,6 +95,17 @@ udp_release.o: udp_release.c $(HDR)
 
 test_udp_hold: test_udp_hold.c udp_hold.o udp_release.o hold.o capture.o track.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_udp_hold.c udp_hold.o udp_release.o hold.o capture.o track.o $(LDFLAGS)
+
+udp_path.o: udp_path.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Владение ID в обвязке d2kd (задача 46, ревью M4): сессия, удержание и
+# выпуск — настоящие модули, сокеты заменены записью вызовов.
+test_udp_path: test_udp_path.c udp_path.o udp_hold.o udp_release.o session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_udp_path.c udp_path.o udp_hold.o udp_release.o session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
+
+test-udp-path: test_udp_path
+	./test_udp_path
 
 test_udp_release: test_udp_release.c udp_release.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_udp_release.c udp_release.o $(LDFLAGS)
@@ -314,7 +325,7 @@ SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=al
 san:
 	@set -e; for t in $(TESTS); do \
 		echo "== $$t =="; \
-		extra=; if [ "$$t" = test_quic_session ] || [ "$$t" = test_stun_session ]; then extra="$(CORE_DIR)/quichello.c $(CORE_DIR)/hello.c $(CORE_DIR)/tls13core.c $(CORE_DIR)/x25519.c"; fi; \
+		extra=; if [ "$$t" = test_quic_session ] || [ "$$t" = test_stun_session ] || [ "$$t" = test_udp_path ]; then extra="$(CORE_DIR)/quichello.c $(CORE_DIR)/hello.c $(CORE_DIR)/tls13core.c $(CORE_DIR)/x25519.c"; fi; \
 		$(CC) $(SANFLAGS) -o /tmp/d2k-san-$$t $$t.c \
 			$$(echo "$(SRC)" | tr ' ' '\n' | grep -v '^$$') $(CORESRC) $$extra; \
 		/tmp/d2k-san-$$t; \
@@ -399,7 +410,7 @@ test-ctlprobe: test_ctlprobe
 
 .PHONY: test-ctlprobe
 
-check: all test-hold test-udp-hold test-udp-release test-capture test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-stun-session test-quic-session test-ctlprobe
+check: all test-hold test-udp-hold test-udp-release test-udp-path test-capture test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-stun-session test-quic-session test-ctlprobe
 
 clean:
 	rm -f *.o $(TESTS) test_ctlprobe planlab ctlprobe d2kd

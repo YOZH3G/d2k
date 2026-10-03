@@ -2127,7 +2127,12 @@ int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
     (void)d2k_key_make_addr(&key, 17, &ip.src, &ip.dst, u, u + 2);
     d2k_flow *fl = d2k_track_get(s->uflows, &key, now_ns);
     if (!fl) { return 0; }
-    if (fl->plan_done || fl->damaged || fl->saw_hello) { return 0; }
+    /* За окном поиска сессия выходит раньше блока удержания (ни wait, ни
+       ready), и датаграмма осталась бы и в ячейке, и под обычным вердиктом:
+       два вердикта на один ID и повторная посылка уже ушедшего (задача 46,
+       ревью I1). fwd_pkts растёт уже после этого вызова. */
+    if (fl->plan_done || fl->damaged || fl->saw_hello ||
+        fl->fwd_pkts >= D2K_HELLO_WINDOW) { return 0; }
     fl->udp_hold_active = 1;
     if (key_out) { *key_out = key; }
     return 1;

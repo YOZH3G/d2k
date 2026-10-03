@@ -58,6 +58,10 @@ typedef int (*d2k_udp_resend)(void *ctx, const uint8_t *pkt, size_t len);
  * for each tail in arrival order its re-send and then the DROP of its queued
  * copy.  A tail whose re-send fails is ACCEPTed instead (fail open, logged by
  * the caller).  Every ID gets exactly one verdict; the head is never re-sent.
+ * If the head's own verdict fails on an unowned batch, the head is still in
+ * the queue and no entry was confirmed: the tails are not re-sent ahead of it
+ * but ACCEPTed (the old behaviour).  An owned head already left as the plan's
+ * emit, so its tails still follow it.
  * *verdict_failed is set when any verdict could not be sent; *resend_failed
  * counts tails that fell back to ACCEPT.  Returns the number of tails re-sent. */
 size_t d2k_udp_release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
@@ -65,28 +69,67 @@ size_t d2k_udp_release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
                              d2k_udp_release_send verdict, d2k_udp_resend resend,
                              void *ctx, int *verdict_failed, size_t *resend_failed);
 
-/* Datagrams of a released flow that were already queued but not in its batch
- * (the head was ready alone; 0-RTT, a split-ClientHello tail or a PTO repeat
- * arriving right behind it) carry the same unconfirmed-entry clash.  The
- * caller marks each released head; a later queued client datagram of the same
- * 5-tuple and direction inside D2K_UDP_FOLLOW_NS is re-sent the same way.
- * Re-sending one whose entry is already confirmed is harmless: the raw copy
- * finds that entry and keeps its NAT mapping (router 03.10.2026, tail on the
- * same external port).  The window only bounds the cost. */
+/* LATE TAILS — ONLY INSIDE THE CLASH WINDOW (task 46, review I2).
+ *
+ * Datagrams of a released flow that were already queued but not in its batch
+ * (the head was ready alone: SNI in the first datagram, 0-RTT, a PTO repeat
+ * right behind it) carry the same unconfirmed-entry clash.  Only datagrams
+ * that reached conntrack before the head's entry was confirmed can clash:
+ *   - every datagram read in the same NFQUEUE receive batch as the head's
+ *     release was queued before its verdict (seq match), and
+ *   - a datagram read later qualifies only within D2K_UDP_FOLLOW_NS of the
+ *     moment the head left (or of the plan's deferred head, at_ns).
+ * Field 03.10.2026: clashing tails reached conntrack +0.04..0.2 ms after the
+ * head, while the head left ~1 ms after arrival; a 0-RTT at +2.06 ms (after the
+ * head's confirm) passed on its own.  5 ms covers that plus the service's own
+ * latency in reading the rest of the queue, and stays far below the client's
+ * next flight (server RTT 40+ ms), which therefore goes the normal ACCEPT path
+ * (its entry is confirmed, its conntrack accounting and routing untouched). */
 #define D2K_UDP_FOLLOW_SLOTS 64
-#define D2K_UDP_FOLLOW_NS UINT64_C(100000000)
+#define D2K_UDP_FOLLOW_NS UINT64_C(5000000)
 
 typedef struct d2k_udp_follow d2k_udp_follow;
 d2k_udp_follow *d2k_udp_follow_new(void);
 void d2k_udp_follow_free(d2k_udp_follow *f);
-/* Remembers the head's client tuple until now_ns + D2K_UDP_FOLLOW_NS.  A full
- * table drops the entry closest to expiry.  Non-zero for a non-UDP packet. */
+/* Remembers the head's client tuple: released at now_ns (its own deferred
+ * emit at at_ns when later), in receive batch seq.  A full table drops the
+ * entry closest to expiry.  Non-zero for a non-UDP packet. */
 int d2k_udp_follow_mark(d2k_udp_follow *f, const uint8_t *pkt, size_t len,
-                        uint64_t now_ns);
+                        uint64_t now_ns, uint64_t at_ns, uint64_t seq);
 /* One when pkt is a whole (unfragmented) UDP datagram of a marked tuple in the
- * client's direction and the window is still open. */
+ * client's direction, read in the head's receive batch or inside the window.
+ * *at_ns (optional) gets the head's deferred emit time: a late tail must not
+ * overtake it (review M1). */
 int d2k_udp_follow_match(const d2k_udp_follow *f, const uint8_t *pkt, size_t len,
-                         uint64_t now_ns);
+                         uint64_t now_ns, uint64_t seq, uint64_t *at_ns);
+
+/* THE SERVICE'S UDP OUTPUT, AS ONE TESTABLE PIECE (review M4).
+ *
+ * d2kd fills it with its NFQUEUE verdict, raw socket and deferred queue;
+ * tests fill it with recorders.  can_resend == 0 (observe mode, no raw socket):
+ * every datagram goes to the kernel as before. */
+typedef struct {
+    d2k_udp_release_send verdict;                                   /* (ctx, id, v) */
+    int (*send_now)(void *ctx, const uint8_t *pkt, size_t len);      /* raw, now */
+    int (*send_at)(void *ctx, uint64_t at_ns, const uint8_t *pkt, size_t len); /* behind deferred emits */
+    void *ctx;
+    d2k_udp_follow *follow;
+    int can_resend;
+} d2k_udp_out;
+
+/* Releases a batch (d2k_udp_release_batch) with tails sent now when at_ns <=
+ * now_ns, else queued at at_ns behind the plan's deferred emits, and marks the
+ * flow for late tails.  Returns non-zero when a verdict failed. */
+int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,
+                      uint32_t head_verdict, int owned,
+                      uint64_t at_ns, uint64_t now_ns, uint64_t seq);
+
+/* A queued datagram that would otherwise be ACCEPTed: when it is a late tail
+ * (d2k_udp_follow_match), re-send it (queued behind a deferred head) and DROP
+ * its copy, or ACCEPT it if the re-send fails.  Returns 1 when it issued the
+ * verdict (*verdict_failed set on failure), 0 when the caller keeps the ID. */
+int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
+                     size_t len, uint64_t now_ns, uint64_t seq, int *verdict_failed);
 
 /* Absolute deadline of the earliest pending batch; zero when empty. */
 uint64_t d2k_udp_release_next_ns(const d2k_udp_release *q);
