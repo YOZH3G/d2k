@@ -123,6 +123,10 @@ typedef struct {
        with d2k's own mark would bypass: such datagrams go to the kernel as
        before, clash or not (task 46 field round 2). */
     uint32_t neutral_mark;
+    /* Optional (task 47): a mark no policy rule selects does not route the
+       client either, so it is neutral too.  NULL: only 0 and neutral_mark. */
+    int (*routed)(const void *routes, uint32_t mark);
+    const void *routes;
     /* Optional: told once per flow when a marked datagram kept the kernel
        path. */
     void (*marked)(void *ctx, const uint8_t *pkt, size_t len, uint32_t mark);

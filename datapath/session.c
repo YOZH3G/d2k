@@ -1324,7 +1324,8 @@ static void note_tcp_hello(d2k_session *s, d2k_flow *fl, int ack,
  * уликой для контроллера быть не могут. Помечается поток (обе стороны), а не
  * пакет: ответы сервера приходят без метки клиента. */
 static int routed_flow(d2k_session *s, const uint8_t *pkt, size_t len,
-                       const d2k_packet_view *ip, uint64_t now_ns, d2k_result *out) {
+                       const d2k_packet_view *ip, uint64_t now_ns, uint32_t route_mark,
+                       d2k_result *out) {
     if ((ip->protocol != 6 && ip->protocol != 17) || len < ip->l4 + 4 ||
         (ip->fragment & 0x1fff)) {
         return 0;
@@ -1334,17 +1335,24 @@ static int routed_flow(d2k_session *s, const uint8_t *pkt, size_t len,
     (void)d2k_key_make_addr(&key, ip->protocol, &ip->src, &ip->dst, l4, l4 + 2);
     d2k_table *t = ip->protocol == 6 ? s->flows : s->uflows;
     d2k_flow *fl;
-    if (s->route_mark) {
+    if (route_mark) {
         fl = d2k_track_get(t, &key, now_ns);
         if (fl && !fl->routed) {
             fl->routed = 1;
             s->routed_flows++;
             out->routed_first = 1;
-            out->routed_mark = s->route_mark;
+            out->routed_mark = route_mark;
         }
     } else {
         fl = d2k_track_find(t, &key);
         if (!fl || !fl->routed) { return 0; }
+        /* Новый SYN без метки на том же кортеже — новое соединение (ревью M1):
+           флаг прежнего не переживает его, дальше обычный путь SYN. */
+        if (ip->protocol == 6 && len >= ip->l4 + 14 &&
+            (l4[13] & 0x12) == 0x02) {
+            fl->routed = 0;
+            return 0;
+        }
     }
     out->skipped = "клиент с меткой маршрутизации — поток идёт ядром";
     return 1;
@@ -1381,7 +1389,10 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         out->skipped = "заголовок не помещается";
         return 0;
     }
-    if (routed_flow(s, pkt, len, &ip, now_ns, out)) {
+    /* Метка — только у пакета, ради которого её поставили: отпущенные
+       удержанием сегменты (observe_only) идут с нулём, даже если вызов пришёл
+       между пакетами (ревью I1). */
+    if (routed_flow(s, pkt, len, &ip, now_ns, observe_only ? 0 : s->route_mark, out)) {
         return 0;
     }
     if (ip.protocol == 17) {
@@ -2151,6 +2162,10 @@ void d2k_session_set_hook(d2k_session *s, uint8_t hook) {
 
 void d2k_session_set_route_mark(d2k_session *s, uint32_t mark) {
     if (s) { s->route_mark = mark; }
+}
+
+uint32_t d2k_session_route_mark(const d2k_session *s) {
+    return s ? s->route_mark : 0;
 }
 
 uint64_t d2k_session_routed_flows(const d2k_session *s) {

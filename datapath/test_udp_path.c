@@ -738,7 +738,25 @@ static void test_marked_follower_of_unmarked_head(void) {
     done(s, h, f);
 }
 
+static int only_aaa(const void *routes, uint32_t mark) { (void)routes; return mark == 0xffffaaa; }
+
+/* Task 47 fix round 1 (I2): a mark no policy rule selects is neutral — the
+ * Task 46 raw re-send still applies to it. */
+static void test_unrouted_mark_is_neutral(void) {
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    out.routed = only_aaa;
+    CHECK(d2k_udp_out_neutral(&out, 0x1) && d2k_udp_out_neutral(&out, 0x989),
+          "unrouted marks are neutral");
+    CHECK(!d2k_udp_out_neutral(&out, 0xffffaaa), "a routed mark is not");
+    CHECK(d2k_udp_out_neutral(&out, 0x2e), "the probe mark stays neutral");
+    out.routed = NULL;
+    CHECK(!d2k_udp_out_neutral(&out, 0x1), "without the oracle: only 0 and the probe mark");
+    done(s, h, f);
+}
+
 int main(void) {
+    test_unrouted_mark_is_neutral();
     test_deferred_plan_owns_head();
     test_unheld_voice_plan_followers();
     test_marked_follower_of_unmarked_head();

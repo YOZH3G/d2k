@@ -40,6 +40,7 @@
 #include "d2k_udp_hold.h"
 #include "d2k_udp_release.h"
 #include "d2k_udp_path.h"
+#include "d2k_routemark.h"
 #include "d2k_packet.h"
 
 #define RECV_BUF   65536
@@ -202,6 +203,30 @@ static d2k_udp_hold *udp_holding;
 static d2k_udp_release *udp_releases;
 static d2k_udp_follow *udp_follow;
 static d2k_udp_out udp_out;
+/* Селекторы ip rule по метке (задача 47): клиент, чья метка выбирает
+   маршрут по политике, идёт ядром без плана. */
+static d2k_routemark routes;
+
+static int routes_routed(const void *r, uint32_t mark) {
+    return d2k_routemark_routed(r, mark);
+}
+
+static void routes_refresh(void) {
+    char err[256];
+    int rc = d2k_routemark_load(&routes, err, sizeof err);
+    if (rc < 0) {
+        /* Не прочли — держим прежний набор: пропажа правил не должна
+           выключать d2k, их появление не должно молча пропасть навсегда. */
+        fprintf(stderr, "d2kd: правила маршрутизации по метке не прочитаны: %s\n", err);
+        return;
+    }
+    if (rc == 1) {
+        char text[512];
+        (void)d2k_routemark_describe(&routes, text, sizeof text);
+        fprintf(stderr, "d2kd: метки маршрута по ip rule (клиент с такой меткой — без плана): %s\n",
+                text);
+    }
+}
 static d2k_udp_path udp_path;
 static int send_original_verdict(void *ctx, uint32_t id, uint32_t verdict) {
     hold_context *c = ctx;
@@ -246,6 +271,11 @@ static void delayed_verdict_done(void *ctx, const d2k_key *key,
  * таймаутов=1») нельзя было сказать, ЧЕЙ это поток. Теперь можно. */
 static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n) {
     hold_context *c = ctx;
+    /* A released segment is never marked (holds refuse marked packets), and
+       the mark of whatever packet is being processed must not reach it, nor
+       be lost for that packet (task 47 review I1). */
+    uint32_t keep_mark = d2k_session_route_mark(c->sess);
+    d2k_session_set_route_mark(c->sess, 0);
     d2k_key udp_key;
     /* A timeout/flush must close the UDP hold transaction as well as release
        the NFQUEUE ID; otherwise the next packet on the same 5-tuple would be
@@ -255,6 +285,7 @@ static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n)
     }
     d2k_session_note_unassembled(c->sess, p, n, now_ns());
     d2k_session_observe_tcp(c->sess, p, n, now_ns());
+    d2k_session_set_route_mark(c->sess, keep_mark);
     (void)send_original_verdict(ctx, id, D2K_NF_ACCEPT);
 }
 
@@ -837,6 +868,11 @@ int main(int argc, char **argv) {
     udp_out.neutral_mark = probe_mark;
     udp_out.marked = out_marked;
     udp_out.defer_verdict = out_defer;
+    udp_out.routed = routes_routed;
+    udp_out.routes = &routes;
+    d2k_routemark_init(&routes);
+    routes_refresh();
+    uint64_t next_routes = now_ns() + D2K_ROUTEMARK_REFRESH_NS;
     udp_path.sess = sess;
     udp_path.hold = udp_holding;
     udp_path.out = &udp_out;
@@ -994,14 +1030,14 @@ int main(int argc, char **argv) {
                        non-443 client Initials are accepted only when NFQUEUE
                        supplied OUTPUT/POSTROUTING. */
                     d2k_session_set_hook(sess, np.have_hdr ? np.hook : D2K_HOOK_UNKNOWN);
-                    /* МЕТКА МАРШРУТИЗАЦИИ КЛИЕНТА (задача 47): любая ненулевая,
-                       кроме собственных меток d2k (зонды контроллера; свои
-                       сырые посылки в очередь не попадают), — поток идёт
-                       ядром, без плана и удержания. */
-                    uint32_t client_mark = np.have_mark ? np.mark : 0;
+                    /* МЕТКА МАРШРУТИЗАЦИИ КЛИЕНТА (задача 47): метка, которую
+                       выбирает правило ip rule (кроме собственных меток d2k), —
+                       поток идёт ядром, без плана и удержания. Метка без
+                       правила (PPPoE, QoS, чужая) d2k не выключает. Ставится
+                       на КАЖДЫЙ пакет — единственное место. */
                     d2k_session_set_route_mark(sess,
-                        (client_mark && client_mark != probe_mark && client_mark != mark)
-                            ? client_mark : 0);
+                        d2k_routemark_client(&routes, np.have_mark, np.mark,
+                                             probe_mark, mark));
 
                     /* QUIC split hold starts before session inspection, so the
                        first tail cannot escape while the ClientHello is still
@@ -1466,6 +1502,10 @@ int main(int argc, char **argv) {
                                          delayed_verdict_done, &hc);
         }
 
+        if (t >= next_routes) {
+            routes_refresh();
+            next_routes = t + D2K_ROUTEMARK_REFRESH_NS;
+        }
         if (t >= next_expire) {
             /* Сперва заметить молчание, потом забывать. Обратный порядок
                означал бы, что о молчании узнаём только при забвении потока —

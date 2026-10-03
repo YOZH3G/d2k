@@ -738,7 +738,66 @@ static void test_routed_client_gets_no_plan_tcp(void) {
     d2k_session_free(g);
 }
 
+/* ЗАДАЧА 47, ревью I1: метка одного пакета не переходит на другой. Отпуск
+ * удержанного сегмента (observe_tcp из release_original) шёл сразу после
+ * пакета клиента с меткой и метил ЧУЖОЙ поток. Воспроизведение ревьюера:
+ * «routed flows after release: 2 (expect 1)». */
+static void test_route_mark_does_not_leak(void) {
+    uint8_t hello[512], pkt[1024], buf[8192];
+    char err[128];
+    size_t hlen = build_hello(hello);
+    d2k_result r;
+    d2k_session *g = d2k_session_new(8, 8);
+    d2k_plan *gp = NULL;
+    CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &gp, err, sizeof err) == 0, "plan");
+    d2k_session_set_plan(g, gp);
+    size_t n = build_pkt(pkt, 41500, 0x02, NULL, 0);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);   /* A, unmarked */
+    d2k_session_set_route_mark(g, 0xffffaaa);
+    n = build_pkt(pkt, 41600, 0x02, NULL, 0);
+    d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);   /* B, marked */
+    /* A's held segment is released (no mark is set for it). */
+    n = build_pkt(pkt, 41500, 0x10, hello, 100);
+    d2k_session_observe_tcp(g, pkt, n, 1200);
+    CHECK(d2k_session_routed_flows(g) == 1, "routed flows after release: 1");
+    d2k_session_set_route_mark(g, 0);           /* d2kd sets it per packet */
+    n = build_pkt(pkt, 41500, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 1300, buf, sizeof buf, &r);
+    CHECK(!r.routed_first && (r.skipped == NULL || strstr(r.skipped, "меткой") == NULL),
+          "A is not treated as a routed flow");
+    d2k_session_free(g);
+}
+
+/* ЗАДАЧА 47, ревью M1: новый SYN на том же кортеже — новое соединение; флаг
+ * «с меткой» прежнего не переживает его. */
+static void test_routed_flag_reset_on_new_syn(void) {
+    uint8_t hello[512], pkt[1024], buf[8192];
+    char err[128];
+    size_t hlen = build_hello(hello);
+    d2k_result r;
+    d2k_session *g = d2k_session_new(8, 8);
+    d2k_plan *gp = NULL;
+    CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &gp, err, sizeof err) == 0, "plan");
+    d2k_session_set_plan(g, gp);
+    d2k_session_set_route_mark(g, 0xffffaaa);
+    size_t n = build_pkt(pkt, 41700, 0x02, NULL, 0);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(r.routed_first, "first connection routed");
+    /* Policy changed; the client reuses the port for a new connection. */
+    d2k_session_set_route_mark(g, 0);
+    n = build_pkt(pkt, 41700, 0x02, NULL, 0);
+    d2k_session_packet(g, pkt, n, 2000, buf, sizeof buf, &r);
+    CHECK(r.skipped == NULL || strstr(r.skipped, "меткой") == NULL,
+          "an unmarked SYN starts a new, unrouted connection");
+    n = build_pkt(pkt, 41700, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 3000, buf, sizeof buf, &r);
+    CHECK(r.n_out > 0, "the new connection is planned");
+    d2k_session_free(g);
+}
+
 int main(void) {
+    test_route_mark_does_not_leak();
+    test_routed_flag_reset_on_new_syn();
     test_tcp_plan_skips_conntrack_read();
     test_routed_client_gets_no_plan_tcp();
     test_reply_hidden_by_accelerator();

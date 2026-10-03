@@ -323,7 +323,8 @@ static int out_verdict(void *ctx, uint32_t id, uint32_t verdict) {
 }
 
 int d2k_udp_out_neutral(const d2k_udp_out *o, uint32_t mark) {
-    return mark == 0 || (o && o->neutral_mark && mark == o->neutral_mark);
+    if (mark == 0 || (o && o->neutral_mark && mark == o->neutral_mark)) { return 1; }
+    return o && o->routed && !o->routed(o->routes, mark);
 }
 
 int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,

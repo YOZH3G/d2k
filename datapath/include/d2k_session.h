@@ -162,6 +162,7 @@ void d2k_session_set_hook(d2k_session *s, uint8_t hook);
  * наблюдения — его поведение принадлежит чужому пути. Собственные метки d2k
  * (зонды контроллера) вызывающий сюда не передаёт. */
 void d2k_session_set_route_mark(d2k_session *s, uint32_t mark);
+uint32_t d2k_session_route_mark(const d2k_session *s);
 uint64_t d2k_session_routed_flows(const d2k_session *s);
 /* Явное подтверждение конфигурации: правило обратного направления UDP
    установлено. Нужен для распознавания полной тишины на заблокированном QUIC,
