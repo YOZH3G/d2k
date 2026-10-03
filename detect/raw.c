@@ -302,7 +302,7 @@ static void sweep_stale_rst_rules(void)
         int port;
         long owner = 0;
         if (d2k_rst_rule_stale(line, &port, &owner)) {
-            char cmd[224], tag[48] = "";
+            char cmd[256], tag[64] = ""; /* " -m comment --comment d2k-rst:" + 20 цифр long */
             if (owner > 0) snprintf(tag, sizeof tag, " -m comment --comment %s%ld", RST_OWNED_TAG, owner);
             snprintf(cmd, sizeof(cmd),
                      "%s -w -D OUTPUT -p tcp --sport %d --tcp-flags RST RST%s -j DROP"
