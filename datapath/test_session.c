@@ -586,9 +586,11 @@ static size_t cut_seq(uint8_t *pkt, size_t n, uint32_t seq, uint32_t ack) {
     return n;
 }
 
-static void cut_handshake(d2k_session *s, uint16_t port, const uint8_t *hello,
-                          size_t hlen, uint8_t *pkt, uint8_t *buf, size_t cap,
-                          d2k_result *r) {
+/* isn — начальный номер СЕРВЕРА (данные идут с isn + 1); t0 — время SYN,
+   rtt — от SYN до SYN-ACK. Остальные пакеты рукопожатия — сразу после. */
+static void cut_handshake_at(d2k_session *s, uint16_t port, const uint8_t *hello,
+                             size_t hlen, uint8_t *pkt, uint8_t *buf, size_t cap,
+                             d2k_result *r, uint32_t isn, uint64_t t0, uint64_t rtt) {
     /* ServerHello: запись 0x16, тело 40 байт (минимум 38), и продолжение
        зашифрованной записи без заголовка — ровно как в поле. */
     uint8_t sh[49];
@@ -598,17 +600,23 @@ static void cut_handshake(d2k_session *s, uint16_t port, const uint8_t *hello,
     uint8_t cont[100];
     memset(cont, 0x5a, sizeof cont);
     size_t n = cut_seq(pkt, build_pkt(pkt, port, 0x02, NULL, 0), 999, 0);
-    d2k_session_packet(s, pkt, n, 1000, buf, cap, r);
-    n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x12, NULL, 0), 4999, 1000);
-    d2k_session_packet(s, pkt, n, 1100, buf, cap, r);
-    n = cut_seq(pkt, build_pkt(pkt, port, 0x18, hello, hlen), 1000, 5000);
-    d2k_session_packet(s, pkt, n, 1200, buf, cap, r);
-    n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x18, sh, sizeof sh), 5000,
+    d2k_session_packet(s, pkt, n, t0, buf, cap, r);
+    n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x12, NULL, 0), isn, 1000);
+    d2k_session_packet(s, pkt, n, t0 + rtt, buf, cap, r);
+    n = cut_seq(pkt, build_pkt(pkt, port, 0x18, hello, hlen), 1000, isn + 1);
+    d2k_session_packet(s, pkt, n, t0 + rtt + 100, buf, cap, r);
+    n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x18, sh, sizeof sh), isn + 1,
                 1000 + (uint32_t)hlen);
-    d2k_session_packet(s, pkt, n, 1300, buf, cap, r);
+    d2k_session_packet(s, pkt, n, t0 + rtt + 200, buf, cap, r);
     n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x10, cont, sizeof cont),
-                5000 + (uint32_t)sizeof sh, 1000 + (uint32_t)hlen);
-    d2k_session_packet(s, pkt, n, 1400, buf, cap, r);
+                isn + 1 + (uint32_t)sizeof sh, 1000 + (uint32_t)hlen);
+    d2k_session_packet(s, pkt, n, t0 + rtt + 300, buf, cap, r);
+}
+
+static void cut_handshake(d2k_session *s, uint16_t port, const uint8_t *hello,
+                          size_t hlen, uint8_t *pkt, uint8_t *buf, size_t cap,
+                          d2k_result *r) {
+    cut_handshake_at(s, port, hello, hlen, pkt, buf, cap, r, 4999, 1000, 100);
 }
 
 static void test_silent_cut_fin_retry(void) {
@@ -664,6 +672,130 @@ static void test_silent_cut_fin_retry(void) {
     d2k_session_packet(s, pkt, n, 40440, buf, sizeof buf, &r);
     CHECK(d2k_session_suspects(s) == 0,
           "повтор FIN без ответа сверх рукопожатия принят за обрыв ответа");
+    d2k_session_free(s);
+}
+
+/* Задача 50, раунд правок 1.
+ *
+ * (1) Тот же глухой обрыв, но клиент кончает ожидание RST, а не FIN (чем
+ *     кончит Safari — не снято). Свидетельство «ответ шёл дальше
+ *     рукопожатия» то же, что у FIN: подтверждение клиента за видимыми
+ *     байтами. Подтверждение в RST СЕРВЕРА — про данные клиента, и уликой
+ *     ответа не считается.
+ * (2) Поток под планом: повтор FIN после того же глухого обрыва (без пакета
+ *     0x17 в окне) — FIN_RETRY с planned=YES.
+ * (3) Запись, оставленная после FIN клиента, живёт ровно окно повтора FIN
+ *     (RFC 6298: RTO = 3R, не меньше 1 с; окно — первый повтор и ещё один
+ *     после удвоения, 3 RTO), а не 120 с молчания.
+ * (4) Номера сервера через 2^32. */
+static void test_silent_cut_round1(void) {
+    uint8_t hello[512], pkt[1024], buf[8192];
+    size_t hlen = build_hello(hello);
+    d2k_result r;
+    const uint32_t fin_seq = 1000 + (uint32_t)hlen + 24;
+    const uint64_t S = 1000000000ull;
+
+    /* (1) RST клиента после глухого обрыва — узкий RX-сигнал. */
+    d2k_session *s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "сессия RST после обрыва не создалась");
+    if (!s) { return; }
+    cut_handshake(s, 47830, hello, hlen, pkt, buf, sizeof buf, &r);
+    size_t n = cut_seq(pkt, build_pkt(pkt, 47830, 0x14, NULL, 0), fin_seq, 5000 + 19923);
+    d2k_session_packet(s, pkt, n, 40000, buf, sizeof buf, &r);
+    const d2k_jrn_entry *e = last_suspect(s);
+    CHECK(e && e->code == D2K_SUSPECT_RST_AFTER_APP && e->d_planned == D2K_PLANNED_NO,
+          "RST клиента после глухого обрыва TLS 1.3 (без 0x17 в окне) не дал узкого RX-сигнала");
+    d2k_session_free(s);
+
+    /* RST клиента после одного рукопожатия — не обрыв ответа. */
+    s = d2k_session_new(64, 64);
+    if (!s) { return; }
+    cut_handshake(s, 47831, hello, hlen, pkt, buf, sizeof buf, &r);
+    n = cut_seq(pkt, build_pkt(pkt, 47831, 0x14, NULL, 0), fin_seq, 5000 + 149);
+    d2k_session_packet(s, pkt, n, 40000, buf, sizeof buf, &r);
+    CHECK(d2k_session_suspects(s) == 0,
+          "RST клиента без ответа сверх рукопожатия принят за обрыв ответа");
+    d2k_session_free(s);
+
+    /* RST сервера: его подтверждение — про байты клиента, не про ответ. */
+    s = d2k_session_new(64, 64);
+    if (!s) { return; }
+    cut_handshake(s, 47832, hello, hlen, pkt, buf, sizeof buf, &r);
+    n = cut_seq(pkt, build_rev_pkt(pkt, 47832, 0x14, NULL, 0), 5000 + 149, 5000 + 19923);
+    d2k_session_packet(s, pkt, n, 40000, buf, sizeof buf, &r);
+    CHECK(d2k_session_suspects(s) == 0,
+          "подтверждение в RST сервера принято за свидетельство ответа");
+    d2k_session_free(s);
+
+    /* (2) Под планом: тот же обрыв, повтор FIN — сигнал с planned=YES. */
+    s = d2k_session_new(64, 64);
+    if (!s) { return; }
+    d2k_plan *guard = NULL;
+    char err[200];
+    CHECK(d2k_plan_load(plan_guard, sizeof plan_guard, &guard, err, sizeof err) == 0,
+          "план для планового обрыва не загрузился");
+    d2k_session_set_plan(s, guard);
+    cut_handshake(s, 47833, hello, hlen, pkt, buf, sizeof buf, &r);
+    n = cut_seq(pkt, build_pkt(pkt, 47833, 0x11, NULL, 0), fin_seq, 5000 + 19923);
+    d2k_session_packet(s, pkt, n, 40000, buf, sizeof buf, &r);
+    CHECK(!last_suspect(s), "первый FIN планового потока уже подозрение");
+    d2k_session_packet(s, pkt, n, 40440, buf, sizeof buf, &r);
+    e = last_suspect(s);
+    CHECK(e && e->code == D2K_SUSPECT_FIN_RETRY && e->d_planned == D2K_PLANNED_YES,
+          "повтор FIN под планом после глухого обрыва TLS 1.3 не дал сигнала с planned=YES");
+    d2k_session_free(s);
+
+    /* (3) Окно удержания после FIN: RTT 100 нс -> пол 1 с -> окно 3 с. */
+    s = d2k_session_new(64, 64);
+    if (!s) { return; }
+    cut_handshake_at(s, 47834, hello, hlen, pkt, buf, sizeof buf, &r, 4999, S, 100);
+    n = cut_seq(pkt, build_pkt(pkt, 47834, 0x11, NULL, 0), fin_seq, 5000 + 19923);
+    d2k_session_packet(s, pkt, n, 2 * S, buf, sizeof buf, &r);
+    d2k_session_expire(s, 2 * S + 3 * S - 1, 120 * S);
+    CHECK(d2k_session_flows_tcp(s) == 1, "запись после FIN снята раньше окна повтора");
+    d2k_session_expire(s, 2 * S + 3 * S, 120 * S);
+    CHECK(d2k_session_flows_tcp(s) == 0,
+          "запись после FIN без повтора держит место дольше окна повтора FIN");
+    d2k_session_free(s);
+
+    /* Измеренный RTT 1 с: первый RTO 3 с, окно 9 с; повтор на 8-й секунде
+       ещё ловится. */
+    s = d2k_session_new(64, 64);
+    if (!s) { return; }
+    cut_handshake_at(s, 47835, hello, hlen, pkt, buf, sizeof buf, &r, 4999, S, S);
+    n = cut_seq(pkt, build_pkt(pkt, 47835, 0x11, NULL, 0), fin_seq, 5000 + 19923);
+    d2k_session_packet(s, pkt, n, 3 * S, buf, sizeof buf, &r);
+    d2k_session_expire(s, 11 * S, 120 * S);
+    CHECK(d2k_session_flows_tcp(s) == 1, "окно повтора FIN не учло измеренный RTT");
+    d2k_session_packet(s, pkt, n, 11 * S, buf, sizeof buf, &r);
+    e = last_suspect(s);
+    CHECK(e && e->code == D2K_SUSPECT_FIN_RETRY,
+          "повтор FIN в окне медленной линии потерян");
+    d2k_session_expire(s, 12 * S, 120 * S);
+    CHECK(d2k_session_flows_tcp(s) == 0, "запись после FIN пережила окно повтора");
+    d2k_session_free(s);
+
+    /* (4) Сервер начал у самого 2^32: подтверждение переходит через ноль. */
+    s = d2k_session_new(64, 64);
+    if (!s) { return; }
+    const uint32_t isn = 0xFFFFFF00u;
+    cut_handshake_at(s, 47836, hello, hlen, pkt, buf, sizeof buf, &r, isn, 1000, 100);
+    n = cut_seq(pkt, build_pkt(pkt, 47836, 0x11, NULL, 0), fin_seq, isn + 1 + 19923);
+    d2k_session_packet(s, pkt, n, 40000, buf, sizeof buf, &r);
+    d2k_session_packet(s, pkt, n, 40440, buf, sizeof buf, &r);
+    e = last_suspect(s);
+    CHECK(e && e->code == D2K_SUSPECT_FIN_RETRY,
+          "обрыв не замечен, когда номера сервера перешли через 2^32");
+    d2k_session_free(s);
+
+    s = d2k_session_new(64, 64);
+    if (!s) { return; }
+    cut_handshake_at(s, 47837, hello, hlen, pkt, buf, sizeof buf, &r, isn, 1000, 100);
+    n = cut_seq(pkt, build_pkt(pkt, 47837, 0x11, NULL, 0), fin_seq, isn + 1 + 149);
+    d2k_session_packet(s, pkt, n, 40000, buf, sizeof buf, &r);
+    d2k_session_packet(s, pkt, n, 40440, buf, sizeof buf, &r);
+    CHECK(d2k_session_suspects(s) == 0,
+          "переход через 2^32 превратил закрытие после рукопожатия в обрыв ответа");
     d2k_session_free(s);
 }
 
@@ -936,6 +1068,7 @@ int main(void) {
     test_suspect_tells_planned();
     test_late_rst_after_tls_appdata();
     test_silent_cut_fin_retry();
+    test_silent_cut_round1();
     d2k_session *s = d2k_session_new(64, 32);
     CHECK(s != NULL, "сессия не создалась");
     if (!s) {

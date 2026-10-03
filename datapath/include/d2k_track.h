@@ -266,6 +266,9 @@ struct d2k_flow {
     int plan_done;
     uint32_t pending_fin_seq;
     uint8_t pending_fin;
+    /* Когда пришёл первый FIN с этим концом: запись после него живёт окно
+       повтора FIN (session.c, fin_retry_window), а не 120 с молчания. */
+    uint64_t pending_fin_ns;
 
     /* Внешняя транзакция удержания split QUIC: классифицировать поток можно,
        применять план к текущей датаграмме нельзя до replay первого оригинала. */
@@ -364,6 +367,11 @@ void d2k_track_remove(d2k_table *t, const d2k_key *k);
 size_t d2k_track_expire(d2k_table *t, uint64_t now_ns, uint64_t idle_ns,
                         void (*on_expire)(void *ctx, const d2k_flow *f),
                         void *ctx);
+
+/* Освобождает потоки, для которых gone() вернул не ноль. Возвращает сколько
+   освободил. Для записей со своим сроком, короче общего молчания. */
+size_t d2k_track_remove_if(d2k_table *t, int (*gone)(void *ctx, const d2k_flow *f),
+                           void *ctx);
 
 /* Обойти живые потоки, ничего не удаляя. Нужно, чтобы заметить молчание НЕ
    дожидаясь забвения потока: ждать 120 секунд ради вывода «ответа не было»

@@ -1648,8 +1648,10 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
            Второе нужно потому, что очередь видит только начало ответа
            (connbytes 0:8): у TLS 1.3 там ServerHello-полёт и чистые ACK, а
            первая запись 0x17 приходит позже (поле 03.10.2026, rua.gr — пакет
-           №10). Без него глухой обрыв Cloudflare не виден ничем. */
-        const int ack_beyond = ack && fl->hello_ack_valid && fl->rev_server_hello &&
+           №10). Без него глухой обрыв Cloudflare не виден ничем.
+           Только подтверждение КЛИЕНТА: в пакете сервера оно считает байты
+           клиента и об ответе ничего не говорит. */
+        const int ack_beyond = fwd && ack && fl->hello_ack_valid && fl->rev_server_hello &&
             (int32_t)(rd32(t + 8) - fl->hello_ack) > 0 &&
             rd32(t + 8) - fl->hello_ack > fl->rev_payload_after_hello;
         const int response_went_on =
@@ -1672,6 +1674,9 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                 det.server_hello = fl->rev_server_hello;
                 suspect(s, now_ns, &key, fl, D2K_SUSPECT_FIN_RETRY, &det);
             }
+            if (!fl->pending_fin || fl->pending_fin_seq != fin_seq) {
+                fl->pending_fin_ns = now_ns; /* окно повтора — от первого FIN */
+            }
             fl->pending_fin = 1; fl->pending_fin_seq = fin_seq;
             d2k_capture_forget(&s->capture, &key);
             out->skipped = "клиент закрывает поток после ответа; ждём подтверждение или повтор FIN";
@@ -1689,8 +1694,11 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             det.tos = pkt[1];
             det.ipid = ip.ip_id;
             suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST, &det);
-        } else if (rst && fl->saw_hello && rev_before > 0 &&
-                   (fl->rev_types & (uint8_t)(1u << (23 - 20)))) {
+        } else if (rst && fl->saw_hello && rev_before > 0 && response_went_on) {
+            /* response_went_on, а не только пакет 0x17: клиент, бросивший
+               глухо оборванный ответ, может кончить ожидание RST, а не FIN, и
+               на TLS 1.3 за окном 0:8 запись 0x17 не видна (задача 50, раунд
+               правок 1). Свидетельство то же, что у FIN выше. */
             /* Поздний RST после TLS app-data сам по себе НЕ диагноз: сбросить
                мог сервер или клиент (например, браузер, прекративший ждать
                оборванный ответ). Это лишь дешёвый сигнал, после которого
@@ -2516,6 +2524,30 @@ static uint64_t silence_deadline(const d2k_flow *f) {
     return d;
 }
 
+/* ОКНО ПОВТОРА FIN — сколько держать запись после FIN клиента.
+ *
+ * Сигнал один: повтор того же FIN, то есть ретрансмиссия по таймеру. Таймер
+ * задаёт RFC 6298: первый RTO по измеренному R — SRTT + 4·RTTVAR = R + 2R =
+ * 3R (§2.2), не меньше секунды (§2.4); без измерения — секунда (§2.1). Окно
+ * — первый повтор и ещё один после удвоения (§5.5): RTO + 2·RTO = 3·RTO, чтобы
+ * один потерянный повтор не стоил сигнала. Linux и macOS шлют повтор раньше
+ * (пол RTO 200 мс; в поле 03.10 macOS — через 0,44 с), значит окно с запасом.
+ * Повтор, пришедший позже (RTO, раздутый очередью), теряется — это пропуск
+ * сигнала, а не ложное срабатывание. После окна запись не говорит ничего и
+ * только занимает место в таблице, которая выше трёх четвертей отказывает
+ * новым потокам. */
+static uint64_t fin_retry_window(const d2k_flow *f) {
+    uint64_t rto = 3 * f->rtt_ns;
+    if (rto < NS_PER_S) { rto = NS_PER_S; }
+    return 3 * rto;
+}
+
+static int fin_window_over(void *ctx, const d2k_flow *f) {
+    const uint64_t now_ns = *(const uint64_t *)ctx;
+    return f->pending_fin && now_ns >= f->pending_fin_ns &&
+           now_ns - f->pending_fin_ns >= fin_retry_window(f);
+}
+
 struct sweep_ctx {
     d2k_session *s;
     uint64_t     now_ns;
@@ -2632,7 +2664,10 @@ size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns) {
        объявить молчанием всякий забытый UDP-поток с приветствием значило бы
        обойти условие про повтор через заднюю дверь. NULL как on_expire —
        штатный случай самого d2k_track_expire. */
-    size_t freed = d2k_track_expire(s->flows, now_ns, idle_ns, on_flow_expire, s);
+    /* Записи после FIN клиента — по своему окну (fin_retry_window), не по
+       молчанию: ответ у них был, и on_flow_expire им сказать нечего. */
+    size_t freed = d2k_track_remove_if(s->flows, fin_window_over, &now_ns);
+    freed += d2k_track_expire(s->flows, now_ns, idle_ns, on_flow_expire, s);
     freed += d2k_track_expire(s->uflows, now_ns, idle_ns, NULL, NULL);
     return freed;
 }
