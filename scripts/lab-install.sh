@@ -53,6 +53,17 @@ sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 # Действия панели асинхронны (POST отвечает «запущено», S99d2k идёт фоном):
 # итог проверяем, дав ему до 30 с, а не в ту же миллисекунду.
 await() { for _ in $(seq 1 30); do sh -c "$1" && return 0; sleep 1; done; sh -c "$1"; }
+# POST действия панели. Пока предыдущее действие идёт, панель отвечает 409
+# «Предыдущая команда ещё выполняется» — это не отказ, ждём и повторяем.
+panel_post() {
+    for _ in $(seq 1 60); do
+        panel_curl -sS -X POST -H 'Origin: http://127.0.0.1:8090' "http://127.0.0.1:8090/api/control/$1" >/tmp/d2k-panel-post.json 2>/dev/null || true
+        grep -q 'Предыдущая команда ещё выполняется' /tmp/d2k-panel-post.json || break
+        sleep 1
+    done
+    cat /tmp/d2k-panel-post.json
+    grep -q '"ok":true' /tmp/d2k-panel-post.json
+}
 rules() {
     iptables -t mangle -S 2>/dev/null | sort
     ip6tables -t mangle -S 2>/dev/null | sort
@@ -262,7 +273,7 @@ fi
 panel_curl -fsS http://127.0.0.1:8090/ | grep -q 'id="app"' || fail "C-панель не отдала главную страницу через LAN-привязку"
 panel_curl -fsS http://127.0.0.1:8090/assets/gsap.js -o /tmp/d2k-gsap.js || fail "C-панель не отдала библиотеку анимаций"
 panel_curl -fsS http://127.0.0.1:8090/assets/onest.woff2 -o /tmp/d2k-onest.woff2 || fail "C-панель не отдала шрифт"
-panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/stop | grep -q '"ok":true' || fail "локальная панель не остановила движок"
+panel_post stop | grep -q '"ok":true' || fail "локальная панель не остановила движок"
 [ -d "/proc/$PANEL_PID" ] || fail "остановка движка погасила панель управления"
 # Действие панели асинхронно: POST отвечает «запущено», S99d2k stop идёт фоном.
 # Ждём его итога (до 30 с), а не опрашиваем статус в ту же миллисекунду.
@@ -274,7 +285,7 @@ done
 grep -q '"engine_running":false' /tmp/d2k-panel-stopped.json || fail "после остановки API продолжает считать движок работающим"
 grep -q '"controller_running":false' /tmp/d2k-panel-stopped.json || fail "после остановки API продолжает считать контроллер работающим"
 grep -Eq '"linked"[[:space:]]*:[[:space:]]*false' /tmp/d2k-panel-stopped.json || fail "API сохранил linked=true после остановки движка"
-panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/start | grep -q '"ok":true' || fail "локальная панель не запустила движок"
+panel_post start | grep -q '"ok":true' || fail "локальная панель не запустила движок"
 await "\"$INIT\" status | grep -q 'датапат: работает'" || fail "движок не восстановился из панели"
 echo "== параллельное восстановление правил =="
 REAPPLY_PIDS=
@@ -286,9 +297,9 @@ REAPPLY_FAILED=0
 for pid in $REAPPLY_PIDS; do wait "$pid" || REAPPLY_FAILED=1; done
 [ "$REAPPLY_FAILED" = 0 ] || fail "параллельное восстановление завершилось ошибкой"
 "$INIT" status | grep -q "правила: стоят" || fail "параллельное восстановление оставило firewall частичным"
-panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-disable | grep -q '"ok":true' || fail "панель не выключила Telegram"
+panel_post telegram-disable | grep -q '"ok":true' || fail "панель не выключила Telegram"
 sed -i '/^TG_RELAY_URL=/d; /^TG_ENROLL_PORT=/d' "$DIR/config"
-if panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-enable >/tmp/d2k-telegram-enable.json; then
+if panel_post telegram-enable >/tmp/d2k-telegram-enable.json; then
     fail "панель включила Telegram без URL и relay secret"
 fi
 panel_curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-telegram-unconfigured.json || fail "панель недоступна после отказа включить Telegram"
@@ -300,8 +311,8 @@ echo "== Telegram: локальный старт, redirect, отключение
 # внешний health-probe.
 printf '\nTG_RELAY_URL=wss://127.0.0.1:11443/ws\nTG_RELAY_SECRET=lab-only-not-a-real-secret\n' >> "$DIR/config"
 chmod -x "$DIR/d2k-tg-watchdog.sh"
-panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-enable | grep -q '"ok":true' || fail "панель не включила настроенный Telegram-туннель"
-[ -f "$DIR/run/d2ktg.pid" ] || fail "d2ktg не создал pid-файл после включения"
+panel_post telegram-enable | grep -q '"ok":true' || fail "панель не включила настроенный Telegram-туннель"
+await "[ -f \"$DIR/run/d2ktg.pid\" ]" || fail "d2ktg не создал pid-файл после включения"
 TG_PID_NOW=$(cat "$DIR/run/d2ktg.pid")
 [ -d "/proc/$TG_PID_NOW" ] || fail "d2ktg завершился после включения"
 await "\"$INIT\" status | grep -q 'Telegram tunnel: работает'" || fail "служба не показывает активный Telegram-туннель"
@@ -331,12 +342,12 @@ else
 fi
 rm -f /opt/sbin/curl
 iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "watchdog не восстановил Telegram redirect"
-panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/telegram-disable | grep -q '"ok":true' || fail "панель не отключила Telegram-туннель"
+panel_post telegram-disable | grep -q '"ok":true' || fail "панель не отключила Telegram-туннель"
 [ ! -e "$DIR/run/d2ktg.pid" ] || fail "pid-файл d2ktg остался после отключения"
 ! iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "PREROUTING redirect остался после отключения"
 ! iptables -t nat -C OUTPUT -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "OUTPUT redirect остался после отключения"
 await "grep -q '^TG_ENABLED=0\$' \"$DIR/config\"" || fail "disable не сохранил TG_ENABLED=0"
-panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/reapply | grep -q '"ok":true' || fail "локальная панель не восстановила правила"
+panel_post reapply | grep -q '"ok":true' || fail "локальная панель не восстановила правила"
 echo "установлено и работает"
 
 echo "== 2. переход версии =="
