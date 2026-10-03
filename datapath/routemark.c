@@ -11,6 +11,7 @@
 #define RM_FIB_HDR     12u      /* struct fib_rule_hdr */
 #define RM_FRA_FWMARK  10
 #define RM_FRA_FWMASK  16
+#define RM_FIB_RULE_INVERT 0x2u
 
 static uint16_t rd16h(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 static uint32_t rd32h(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -46,6 +47,7 @@ int d2k_routemark_parse(d2k_fwsel *out, size_t cap, size_t *n,
         if (m.type == D2K_NLMSG_ERROR) { return -1; }
         if (m.type != RM_RTM_NEWRULE || m.body_len < RM_FIB_HDR) { continue; }
         uint8_t family = m.body[0];
+        uint32_t rflags = rd32h(m.body + 8);
         int have_mark = 0, have_mask = 0;
         uint32_t mark = 0, mask = 0;
         size_t off = RM_FIB_HDR;
@@ -59,12 +61,13 @@ int d2k_routemark_parse(d2k_fwsel *out, size_t cap, size_t *n,
         }
         if (!have_mask && have_mark && mark) { mask = 0xffffffffu; }
         if ((!have_mark && !have_mask) || mask == 0) { continue; }
+        if (rflags & RM_FIB_RULE_INVERT) { continue; }   /* `not fwmark` */
         if (*n < cap) {
             out[*n].mark = mark & mask;
             out[*n].mask = mask;
             out[*n].family = family;
-            (*n)++;
         }
+        (*n)++;
     }
     /* The iterator stops on garbage as well as at the end: anything left
        unread is malformed. */
@@ -84,18 +87,38 @@ int d2k_routemark_set(d2k_routemark *r, const d2k_fwsel *sel, size_t n) {
     return changed;
 }
 
-int d2k_routemark_routed(const d2k_routemark *r, uint32_t mark) {
+int d2k_routemark_merge(d2k_routemark *r, const d2k_fwsel *v4, size_t n4, int ok4,
+                        const d2k_fwsel *v6, size_t n6, int ok6,
+                        d2k_routemark_status *st) {
+    d2k_routemark_status local;
+    if (!st) { st = &local; }
+    memset(st, 0, sizeof *st);
+    st->v6_ok = ok6;
+    if (!r || !ok4) { return -1; }
+    if (!ok6) { n6 = 0; }
+    st->found = n4 + n6;
+    st->truncated = st->found > D2K_ROUTEMARK_MAX;
+    d2k_fwsel all[D2K_ROUTEMARK_MAX];
+    size_t k = 0;
+    for (size_t i = 0; i < n4 && k < D2K_ROUTEMARK_MAX; i++) { all[k++] = v4[i]; }
+    for (size_t i = 0; i < n6 && k < D2K_ROUTEMARK_MAX; i++) { all[k++] = v6[i]; }
+    return d2k_routemark_set(r, all, k);
+}
+
+int d2k_routemark_routed(const d2k_routemark *r, uint8_t ipver, uint32_t mark) {
     if (!r || !mark) { return 0; }
+    uint8_t family = ipver == 6 ? 10 : 2;
     for (size_t i = 0; i < r->n; i++) {
-        if (((mark ^ r->sel[i].mark) & r->sel[i].mask) == 0) { return 1; }
+        if (r->sel[i].family == family &&
+            ((mark ^ r->sel[i].mark) & r->sel[i].mask) == 0) { return 1; }
     }
     return 0;
 }
 
-uint32_t d2k_routemark_client(const d2k_routemark *r, int have_mark, uint32_t mark,
-                              uint32_t probe_mark, uint32_t own_mark) {
+uint32_t d2k_routemark_client(const d2k_routemark *r, uint8_t ipver, int have_mark,
+                              uint32_t mark, uint32_t probe_mark, uint32_t own_mark) {
     if (!have_mark || !mark || mark == probe_mark || mark == own_mark) { return 0; }
-    return d2k_routemark_routed(r, mark) ? mark : 0;
+    return d2k_routemark_routed(r, ipver, mark) ? mark : 0;
 }
 
 size_t d2k_routemark_describe(const d2k_routemark *r, char *buf, size_t cap) {

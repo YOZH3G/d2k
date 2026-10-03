@@ -322,9 +322,9 @@ static int out_verdict(void *ctx, uint32_t id, uint32_t verdict) {
     return c->o->verdict(c->o->ctx, id, verdict);
 }
 
-int d2k_udp_out_neutral(const d2k_udp_out *o, uint32_t mark) {
+int d2k_udp_out_neutral(const d2k_udp_out *o, uint32_t mark, uint8_t ipver) {
     if (mark == 0 || (o && o->neutral_mark && mark == o->neutral_mark)) { return 1; }
-    return o && o->routed && !o->routed(o->routes, mark);
+    return o && o->routed && !o->routed(o->routes, ipver, mark);
 }
 
 int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,
@@ -338,7 +338,7 @@ int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,
     uint8_t may[D2K_UDP_HOLD_PACKETS];
     int marked_tail = 0;
     for (size_t i = 0; i < b->count; i++) {
-        may[i] = (uint8_t)d2k_udp_out_neutral(o, b->marks[i]);
+        may[i] = (uint8_t)d2k_udp_out_neutral(o, b->marks[i], (uint8_t)(b->packets[i][0] >> 4));
         if (i > 0 && !may[i]) { marked_tail = 1; }
     }
     defer_op d = {o->defer_verdict, o->ctx, at_ns};
@@ -376,7 +376,7 @@ int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
     if (!o || !o->verdict || !o->can_resend || !o->send_now || !o->follow) { return 0; }
     follow_entry *e = follow_find(o->follow, pkt, len, now_ns, seq);
     if (!e) { return 0; }
-    if (!d2k_udp_out_neutral(o, mark)) {
+    if (!d2k_udp_out_neutral(o, mark, (uint8_t)(pkt[0] >> 4))) {
         if (!e->noted && o->marked) { o->marked(o->ctx, pkt, len, mark); }
         e->noted = 1;
         if (e->at_ns && o->defer_verdict) {

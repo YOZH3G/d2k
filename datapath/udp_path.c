@@ -80,7 +80,7 @@ int d2k_udp_path_passed(d2k_udp_path *pp, const uint8_t *pkt, size_t len,
         !d2k_session_udp_opening(pp->sess, pkt, len)) {
         return 0;
     }
-    if (!d2k_udp_out_neutral(pp->out, mark)) {
+    if (!d2k_udp_out_neutral(pp->out, mark, 4)) {
         if (pp->out->marked) { pp->out->marked(pp->out->ctx, pkt, len, mark); }
         return 0;
     }
@@ -90,7 +90,7 @@ int d2k_udp_path_passed(d2k_udp_path *pp, const uint8_t *pkt, size_t len,
 int d2k_udp_path_planned(d2k_udp_path *pp, const uint8_t *pkt, size_t len,
                          uint32_t mark, uint64_t at_ns, uint64_t now_ns) {
     if (!pp || !pp->out || !pp->out->can_resend || !pp->out->follow ||
-        !pkt || len < 20 || (pkt[0] >> 4) != 4 || !d2k_udp_out_neutral(pp->out, mark)) {
+        !pkt || len < 20 || (pkt[0] >> 4) != 4 || !d2k_udp_out_neutral(pp->out, mark, 4)) {
         return 0;
     }
     return d2k_udp_follow_mark(pp->out->follow, pkt, len, now_ns, at_ns, pp->seq) == 0;

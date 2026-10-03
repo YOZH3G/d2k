@@ -125,7 +125,7 @@ typedef struct {
     uint32_t neutral_mark;
     /* Optional (task 47): a mark no policy rule selects does not route the
        client either, so it is neutral too.  NULL: only 0 and neutral_mark. */
-    int (*routed)(const void *routes, uint32_t mark);
+    int (*routed)(const void *routes, uint8_t ipver, uint32_t mark);
     const void *routes;
     /* Optional: told once per flow when a marked datagram kept the kernel
        path. */
@@ -153,7 +153,7 @@ int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
                      int *verdict_failed);
 
 /* 1 when a datagram with this nfmark may be re-sent raw (see neutral_mark). */
-int d2k_udp_out_neutral(const d2k_udp_out *o, uint32_t mark);
+int d2k_udp_out_neutral(const d2k_udp_out *o, uint32_t mark, uint8_t ipver);
 
 /* Absolute deadline of the earliest pending batch; zero when empty. */
 uint64_t d2k_udp_release_next_ns(const d2k_udp_release *q);

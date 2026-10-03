@@ -207,18 +207,39 @@ static d2k_udp_out udp_out;
    маршрут по политике, идёт ядром без плана. */
 static d2k_routemark routes;
 
-static int routes_routed(const void *r, uint32_t mark) {
-    return d2k_routemark_routed(r, mark);
+static int routes_routed(const void *r, uint8_t ipver, uint32_t mark) {
+    return d2k_routemark_routed(r, ipver, mark);
 }
 
 static void routes_refresh(void) {
+    /* Каждое состояние пишется в журнал один раз, при смене, а не раз в 30 с. */
+    static int last_fail = 0, last_v6 = 1, last_trunc = 0;
     char err[256];
-    int rc = d2k_routemark_load(&routes, err, sizeof err);
+    d2k_routemark_status st;
+    int rc = d2k_routemark_load(&routes, &st, err, sizeof err);
     if (rc < 0) {
         /* Не прочли — держим прежний набор: пропажа правил не должна
            выключать d2k, их появление не должно молча пропасть навсегда. */
-        fprintf(stderr, "d2kd: правила маршрутизации по метке не прочитаны: %s\n", err);
+        if (!last_fail) {
+            fprintf(stderr, "d2kd: правила маршрутизации по метке не прочитаны: %s\n", err);
+        }
+        last_fail = 1;
         return;
+    }
+    if (last_fail) { fprintf(stderr, "d2kd: правила маршрутизации по метке снова читаются\n"); }
+    last_fail = 0;
+    if (st.v6_ok != last_v6) {
+        fprintf(stderr, st.v6_ok ? "d2kd: правила IPv6 по метке снова читаются\n"
+                                 : "d2kd: правил IPv6 по метке нет или они не читаются — "
+                                   "действуют только правила IPv4\n");
+        last_v6 = st.v6_ok;
+    }
+    if (st.truncated != last_trunc) {
+        if (st.truncated) {
+            fprintf(stderr, "d2kd: правил по метке %zu, учтены первые %d\n",
+                    st.found, D2K_ROUTEMARK_MAX);
+        }
+        last_trunc = st.truncated;
     }
     if (rc == 1) {
         char text[512];
@@ -1036,7 +1057,10 @@ int main(int argc, char **argv) {
                        правила (PPPoE, QoS, чужая) d2k не выключает. Ставится
                        на КАЖДЫЙ пакет — единственное место. */
                     d2k_session_set_route_mark(sess,
-                        d2k_routemark_client(&routes, np.have_mark, np.mark,
+                        d2k_routemark_client(&routes,
+                                             (np.have_payload && np.payload_len)
+                                                 ? (uint8_t)(np.payload[0] >> 4) : 4,
+                                             np.have_mark, np.mark,
                                              probe_mark, mark));
 
                     /* QUIC split hold starts before session inspection, so the

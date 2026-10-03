@@ -14,12 +14,15 @@ static void w32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
 /* One RTM_NEWRULE message: fib_rule_hdr + optional FRA_FWMARK/FRA_FWMASK +
  * FRA_TABLE (always, to prove unrelated attributes are skipped). */
+static uint32_t next_flags;          /* fib_rule_hdr.flags of the next rule_msg */
 static size_t rule_msg(uint8_t *o, uint8_t family, int have_mark, uint32_t mark,
                        int have_mask, uint32_t mask, uint8_t action) {
     size_t n = 16 + 12;
     memset(o, 0, 128);
     w16(o + 4, 32);                 /* RTM_NEWRULE */
     o[16] = family;
+    w32(o + 16 + 8, next_flags);
+    next_flags = 0;
     o[16 + 4] = 252;                /* table (compat byte) */
     o[16 + 7] = action;             /* FR_ACT_TO_TBL=1, BLACKHOLE=6 */
     w16(o + n, 8); w16(o + n + 2, 15); w32(o + n + 4, 4096); n += 8;  /* FRA_TABLE */
@@ -54,16 +57,16 @@ int main(void) {
 
     d2k_routemark rm;
     d2k_routemark_init(&rm);
-    CHECK(!d2k_routemark_routed(&rm, 0xffffaaa), "no rules loaded: nothing is routed");
+    CHECK(!d2k_routemark_routed(&rm, 4, 0xffffaaa), "no rules loaded: nothing is routed");
     CHECK(d2k_routemark_set(&rm, sel, n) == 1, "first load is a change");
     CHECK(d2k_routemark_set(&rm, sel, n) == 0, "same set again: no change (no log line)");
-    CHECK(d2k_routemark_routed(&rm, 0xffffaaa), "DNSRT mark with its rule: routed");
-    CHECK(!d2k_routemark_routed(&rm, 0x1), "PPPoE-style 0x1 without a rule: not routed");
-    CHECK(!d2k_routemark_routed(&rm, 0x989), "a stray mark without a rule: not routed");
-    CHECK(!d2k_routemark_routed(&rm, 0), "no mark: never routed");
-    CHECK(d2k_routemark_routed(&rm, 0x1ff), "masked selector 0x100/0xff00 matches 0x1ff");
-    CHECK(!d2k_routemark_routed(&rm, 0x2ff), "masked selector does not match 0x2ff");
-    CHECK(d2k_routemark_routed(&rm, 0x200) && !d2k_routemark_routed(&rm, 0x201),
+    CHECK(d2k_routemark_routed(&rm, 4, 0xffffaaa), "DNSRT mark with its rule: routed");
+    CHECK(!d2k_routemark_routed(&rm, 4, 0x1), "PPPoE-style 0x1 without a rule: not routed");
+    CHECK(!d2k_routemark_routed(&rm, 4, 0x989), "a stray mark without a rule: not routed");
+    CHECK(!d2k_routemark_routed(&rm, 4, 0), "no mark: never routed");
+    CHECK(d2k_routemark_routed(&rm, 6, 0x1ff), "masked selector 0x100/0xff00 matches 0x1ff");
+    CHECK(!d2k_routemark_routed(&rm, 6, 0x2ff), "masked selector does not match 0x2ff");
+    CHECK(d2k_routemark_routed(&rm, 4, 0x200) && !d2k_routemark_routed(&rm, 4, 0x201),
           "a mark without a mask attribute is matched exactly");
 
     char text[256];
@@ -71,9 +74,9 @@ int main(void) {
           "selectors can be logged");
 
     /* The caller's gate: own marks never count, routed marks pass through. */
-    CHECK(d2k_routemark_client(&rm, 1, 0xffffaaa, 0x2e, 0x2d) == 0xffffaaa, "routed client mark");
-    CHECK(d2k_routemark_client(&rm, 1, 0x1, 0x2e, 0x2d) == 0, "unrouted mark: d2k works");
-    CHECK(d2k_routemark_client(&rm, 0, 0xffffaaa, 0x2e, 0x2d) == 0, "no mark attribute");
+    CHECK(d2k_routemark_client(&rm, 4, 1, 0xffffaaa, 0x2e, 0x2d) == 0xffffaaa, "routed client mark");
+    CHECK(d2k_routemark_client(&rm, 4, 1, 0x1, 0x2e, 0x2d) == 0, "unrouted mark: d2k works");
+    CHECK(d2k_routemark_client(&rm, 4, 0, 0xffffaaa, 0x2e, 0x2d) == 0, "no mark attribute");
 
     /* Rule removed: refresh with a dump that lacks it. */
     len = 0;
@@ -83,7 +86,7 @@ int main(void) {
     CHECK(d2k_routemark_parse(sel, D2K_ROUTEMARK_MAX, &n, buf, len) == 1 && n == 0,
           "dump without fwmark rules");
     CHECK(d2k_routemark_set(&rm, sel, n) == 1, "removal is a change");
-    CHECK(!d2k_routemark_routed(&rm, 0xffffaaa), "rule removed: no longer routed after refresh");
+    CHECK(!d2k_routemark_routed(&rm, 4, 0xffffaaa), "rule removed: no longer routed after refresh");
 
     /* Malformed input never reads past the buffer and is reported. */
     uint8_t bad[24];
@@ -94,6 +97,78 @@ int main(void) {
     uint8_t req[64];
     size_t rl = d2k_routemark_request(req, sizeof req, 2, 7);
     CHECK(rl >= 28 && req[16] == 2, "dump request for AF_INET");
+
+    /* --- fix round 2 ---------------------------------------------------- */
+    d2k_fwsel v4[D2K_ROUTEMARK_MAX], v6[D2K_ROUTEMARK_MAX];
+    size_t n4 = 0, n6 = 0;
+
+    /* m1: `not fwmark X` (FIB_RULE_INVERT) does not route X. */
+    len = 0;
+    next_flags = 0x2;
+    len += rule_msg(buf + len, 2, 1, 0x77, 1, 0xffffffff, 1);
+    len += rule_msg(buf + len, 2, 1, 0xffffaaa, 1, 0xffffffff, 1);
+    len += done_msg(buf + len);
+    CHECK(d2k_routemark_parse(v4, D2K_ROUTEMARK_MAX, &n4, buf, len) == 1 && n4 == 1 &&
+          v4[0].mark == 0xffffaaa, "an inverted fwmark rule is not a selector");
+
+    /* m5: a dump split over two reads; then NLMSG_ERROR; overrun; mask-only. */
+    n4 = 0;
+    size_t l1 = rule_msg(buf, 2, 1, 0xffffaaa, 1, 0xffffffff, 1);
+    CHECK(d2k_routemark_parse(v4, D2K_ROUTEMARK_MAX, &n4, buf, l1) == 0 && n4 == 1,
+          "first part of a multipart dump: more to come");
+    size_t l2 = rule_msg(buf, 2, 1, 0x300, 1, 0xff00, 1);
+    l2 += done_msg(buf + l2);
+    CHECK(d2k_routemark_parse(v4, D2K_ROUTEMARK_MAX, &n4, buf, l2) == 1 && n4 == 2,
+          "second part ends with DONE");
+    uint8_t er[36];
+    memset(er, 0, sizeof er);
+    w32(er, 36); w16(er + 4, 2); w32(er + 16, (uint32_t)-97);   /* -EAFNOSUPPORT */
+    n6 = 0;
+    CHECK(d2k_routemark_parse(v6, D2K_ROUTEMARK_MAX, &n6, er, sizeof er) == -1,
+          "NLMSG_ERROR fails that family's dump");
+    uint8_t ov[128];
+    size_t ol = rule_msg(ov, 2, 1, 0x5, 1, 0xff, 1);
+    w16(ov + 28, 200);                       /* first attribute claims 200 bytes */
+    size_t on = 0;
+    CHECK(d2k_routemark_parse(v6, D2K_ROUTEMARK_MAX, &on, ov, ol) == -1,
+          "an attribute overrunning its message is refused");
+    len = rule_msg(buf, 2, 0, 0, 1, 0xff00, 1);          /* fwmark 0/0xff00 */
+    len += done_msg(buf + len);
+    on = 0;
+    CHECK(d2k_routemark_parse(v6, D2K_ROUTEMARK_MAX, &on, buf, len) == 1 && on == 1 &&
+          v6[0].mark == 0 && v6[0].mask == 0xff00, "mask-only selector kept");
+
+    /* I-A: an IPv6 dump failure keeps the IPv4 selectors. */
+    d2k_routemark_init(&rm);
+    d2k_routemark_status st;
+    v4[0].mark = 0xffffaaa; v4[0].mask = 0xffffffff; v4[0].family = 2; n4 = 1;
+    CHECK(d2k_routemark_merge(&rm, v4, n4, 1, v6, 0, 0, &st) == 1 && !st.v6_ok,
+          "v4 loaded although v6 failed");
+    CHECK(d2k_routemark_routed(&rm, 4, 0xffffaaa), "the IPv4 gate survives a v6 failure");
+    CHECK(d2k_routemark_merge(&rm, v4, n4, 0, v6, 0, 1, &st) == -1 &&
+          d2k_routemark_routed(&rm, 4, 0xffffaaa), "a v4 failure keeps the previous set");
+
+    /* m2: the family of the rule is the family of the packet. */
+    CHECK(!d2k_routemark_routed(&rm, 6, 0xffffaaa), "a v4-only selector does not route IPv6");
+    v6[0].mark = 0x500; v6[0].mask = 0xffffffff; v6[0].family = 10;
+    CHECK(d2k_routemark_merge(&rm, v4, n4, 1, v6, 1, 1, &st) == 1 && st.v6_ok, "v4+v6");
+    CHECK(d2k_routemark_routed(&rm, 6, 0x500) && !d2k_routemark_routed(&rm, 4, 0x500),
+          "a v6 selector routes only IPv6");
+
+    /* m4: more selectors than the table holds is reported. */
+    d2k_fwsel many[D2K_ROUTEMARK_MAX + 3];
+    for (size_t i = 0; i < D2K_ROUTEMARK_MAX + 3; i++) {
+        many[i].mark = (uint32_t)(0x1000 + i); many[i].mask = 0xffffffff; many[i].family = 2;
+    }
+    (void)d2k_routemark_merge(&rm, many, D2K_ROUTEMARK_MAX + 3, 1, v6, 0, 1, &st);
+    CHECK(st.truncated && st.found == D2K_ROUTEMARK_MAX + 3 && rm.n == D2K_ROUTEMARK_MAX,
+          "truncation reported");
+    len = 0;
+    for (int i = 0; i < 3; i++) { len += rule_msg(buf + len, 2, 1, (uint32_t)(0x10 + i), 1, 0xffffffff, 1); }
+    len += done_msg(buf + len);
+    n4 = 0;
+    CHECK(d2k_routemark_parse(v4, 2, &n4, buf, len) == 1 && n4 == 3,
+          "parse counts selectors past its cap");
 
     if (!fails) puts("routemark: selectors, matcher and refresh passed");
     return fails != 0;

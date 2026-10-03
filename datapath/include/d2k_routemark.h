@@ -37,28 +37,50 @@ void d2k_routemark_init(d2k_routemark *r);
 size_t d2k_routemark_request(uint8_t *o, size_t cap, uint8_t family, uint32_t seq);
 
 /* Appends the fwmark selectors found in rtnetlink messages to out[*n..cap).
- * Returns 1 when NLMSG_DONE was seen, 0 when more messages are expected, -1
- * on an error message or malformed input.  A rule without FRA_FWMASK has the
- * kernel's default mask: all ones for a nonzero mark. */
+ * *n counts every selector found, also those past cap (truncation is the
+ * caller's to report).  Returns 1 when NLMSG_DONE was seen, 0 when more
+ * messages are expected, -1 on an error message (e.g. -EAFNOSUPPORT for a
+ * family without policy rules) or malformed input.  A rule without
+ * FRA_FWMASK has the kernel's default mask: all ones for a nonzero mark.
+ * A `not fwmark` rule (FIB_RULE_INVERT) is not a selector: it routes every
+ * mark but that one, and d2k cannot tell those apart from unmarked traffic. */
 int d2k_routemark_parse(d2k_fwsel *out, size_t cap, size_t *n,
                         const uint8_t *buf, size_t len);
 
 /* Replaces the selector set.  Returns 1 when it differs from the previous one. */
 int d2k_routemark_set(d2k_routemark *r, const d2k_fwsel *sel, size_t n);
 
-/* 1 when a nonzero mark is selected by some rule ((mark ^ sel) & mask == 0). */
-int d2k_routemark_routed(const d2k_routemark *r, uint32_t mark);
+typedef struct {
+    int v6_ok;        /* the IPv6 dump succeeded */
+    int truncated;    /* more selectors than D2K_ROUTEMARK_MAX */
+    size_t found;     /* selectors found in both dumps */
+} d2k_routemark_status;
+
+/* Combines the two family dumps.  A failed IPv4 dump keeps the previous set
+ * (returns -1).  A failed IPv6 dump counts as no IPv6 selectors — a kernel
+ * without IPv6 policy rules answers -EAFNOSUPPORT, and that must not discard
+ * the IPv4 gate (task 47 rereview I-A).  Returns 1 when the set changed. */
+int d2k_routemark_merge(d2k_routemark *r, const d2k_fwsel *v4, size_t n4, int ok4,
+                        const d2k_fwsel *v6, size_t n6, int ok6,
+                        d2k_routemark_status *st);
+
+/* 1 when a nonzero mark of an IPv4 (ipver 4) or IPv6 (ipver 6) packet is
+ * selected by a rule of that family ((mark ^ sel) & mask == 0). */
+int d2k_routemark_routed(const d2k_routemark *r, uint8_t ipver, uint32_t mark);
 
 /* The route mark d2kd hands the session for one queued packet: the client's
  * mark when it is routed and not one of d2k's own marks, else 0. */
-uint32_t d2k_routemark_client(const d2k_routemark *r, int have_mark, uint32_t mark,
-                              uint32_t probe_mark, uint32_t own_mark);
+uint32_t d2k_routemark_client(const d2k_routemark *r, uint8_t ipver, int have_mark,
+                              uint32_t mark, uint32_t probe_mark, uint32_t own_mark);
 
 /* "0xffffaaa/0xffffffff v4, ..." or "нет"; returns the length written. */
 size_t d2k_routemark_describe(const d2k_routemark *r, char *buf, size_t cap);
 
-/* Linux (routemark_nl.c): reads both families and sets r.  Returns 1 when the
- * set changed, 0 when unchanged, -1 on failure (r untouched, err filled). */
-int d2k_routemark_load(d2k_routemark *r, char *err, size_t errcap);
+/* Linux (routemark_nl.c): reads both families and merges them into r.
+ * Returns 1 when the set changed, 0 when unchanged, -1 on failure (r
+ * untouched, err filled).  Never blocks: a socket without a receive timeout
+ * is not read at all. */
+int d2k_routemark_load(d2k_routemark *r, d2k_routemark_status *st,
+                       char *err, size_t errcap);
 
 #endif
