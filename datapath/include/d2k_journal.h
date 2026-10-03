@@ -39,7 +39,8 @@
 #define D2K_SUSPECT_SILENT   3  /* ответа на приветствие не было */
 #define D2K_SUSPECT_RST_CUT  4  /* чужой сброс снят защитой */
 #define D2K_SUSPECT_RST_AFTER_APP 5 /* RST после TLS app-data в любом направлении; измерить RX */
-#define D2K_SUSPECT_FIN_RETRY 6 /* повтор FIN под планом после ответа; только RX-замер */
+#define D2K_SUSPECT_FIN_RETRY 6 /* повтор FIN клиента без ответа после ответа сервера
+                                  (с планом и без); только RX-замер */
 
 const char *d2k_suspect_text(uint8_t code);
 

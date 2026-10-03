@@ -566,6 +566,107 @@ static void test_late_rst_after_tls_appdata(void) {
     d2k_session_free(s);
 }
 
+/* ГЛУХОЙ ОБРЫВ ОТВЕТА БЕЗ RST/FIN (задача 50, поле 03.10.2026, rua.gr).
+ *
+ * Коробка молча перестаёт пропускать ответ сервера после ~20 КБ: ни RST, ни
+ * FIN, ни повторов с той стороны. Клиент по таймауту шлёт FIN и повторяет его
+ * с тем же номером — подтверждения нет. Очередь видит только первые восемь
+ * ответных пакетов (connbytes 0:8): ServerHello-полёт TLS 1.3 и чистые ACK,
+ * ни одного пакета, НАЧИНАЮЩЕГОСЯ с записи 0x17. Что ответ шёл дальше, видно
+ * по подтверждению в самом FIN клиента: оно ушло далеко за байты, которые
+ * видела очередь. Плана для цели нет (поиск ещё не запускался).
+ *
+ * Пара исходов: повтор FIN без ответа — подозрение FIN_RETRY (только узкий
+ * RX-замер в контроллере, с повторяемостью); обычное закрытие, на которое
+ * сервер ответил своим FIN, и закрытие после одного рукопожатия — не
+ * подозрение. */
+static size_t cut_seq(uint8_t *pkt, size_t n, uint32_t seq, uint32_t ack) {
+    wr32(pkt + 24, seq);
+    wr32(pkt + 28, ack);
+    return n;
+}
+
+static void cut_handshake(d2k_session *s, uint16_t port, const uint8_t *hello,
+                          size_t hlen, uint8_t *pkt, uint8_t *buf, size_t cap,
+                          d2k_result *r) {
+    /* ServerHello: запись 0x16, тело 40 байт (минимум 38), и продолжение
+       зашифрованной записи без заголовка — ровно как в поле. */
+    uint8_t sh[49];
+    memset(sh, 0, sizeof sh);
+    sh[0] = 0x16; sh[1] = 0x03; sh[2] = 0x03; sh[3] = 0x00; sh[4] = 44;
+    sh[5] = 0x02; sh[6] = 0x00; sh[7] = 0x00; sh[8] = 40;
+    uint8_t cont[100];
+    memset(cont, 0x5a, sizeof cont);
+    size_t n = cut_seq(pkt, build_pkt(pkt, port, 0x02, NULL, 0), 999, 0);
+    d2k_session_packet(s, pkt, n, 1000, buf, cap, r);
+    n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x12, NULL, 0), 4999, 1000);
+    d2k_session_packet(s, pkt, n, 1100, buf, cap, r);
+    n = cut_seq(pkt, build_pkt(pkt, port, 0x18, hello, hlen), 1000, 5000);
+    d2k_session_packet(s, pkt, n, 1200, buf, cap, r);
+    n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x18, sh, sizeof sh), 5000,
+                1000 + (uint32_t)hlen);
+    d2k_session_packet(s, pkt, n, 1300, buf, cap, r);
+    n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x10, cont, sizeof cont),
+                5000 + (uint32_t)sizeof sh, 1000 + (uint32_t)hlen);
+    d2k_session_packet(s, pkt, n, 1400, buf, cap, r);
+}
+
+static void test_silent_cut_fin_retry(void) {
+    uint8_t hello[512], pkt[1024], buf[8192];
+    size_t hlen = build_hello(hello);
+    d2k_result r;
+    const uint32_t fin_seq = 1000 + (uint32_t)hlen + 24;
+    const uint32_t seen = 49 + 100;
+
+    /* Обрыв: клиент подтвердил 19 923 байта ответа, очередь видела 149. */
+    d2k_session *s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "сессия глухого обрыва не создалась");
+    if (!s) { return; }
+    cut_handshake(s, 47820, hello, hlen, pkt, buf, sizeof buf, &r);
+    CHECK(d2k_session_suspects(s) == 0, "рукопожатие с ответом объявлено подозрением");
+    size_t n = cut_seq(pkt, build_pkt(pkt, 47820, 0x11, NULL, 0), fin_seq, 5000 + 19923);
+    d2k_session_packet(s, pkt, n, 40000, buf, sizeof buf, &r);
+    CHECK(!last_suspect(s) && r.verdict == D2K_VERDICT_ACCEPT,
+          "первый FIN после обрыва уже подозрение или задержан");
+    /* Повтор — FIN с нагрузкой close_notify, конец тот же. */
+    const uint8_t alert[24] = {0x17, 0x03, 0x03, 0x00, 0x13};
+    n = cut_seq(pkt, build_pkt(pkt, 47820, 0x19, alert, sizeof alert), fin_seq - 24,
+                5000 + 19923);
+    d2k_session_packet(s, pkt, n, 40440, buf, sizeof buf, &r);
+    const d2k_jrn_entry *e = last_suspect(s);
+    CHECK(e && e->code == D2K_SUSPECT_FIN_RETRY && r.verdict == D2K_VERDICT_ACCEPT,
+          "повтор FIN без ответа после глухого обрыва (без плана) не дал узкого RX-сигнала");
+    CHECK(e && e->d_planned == D2K_PLANNED_NO,
+          "подозрение глухого обрыва без плана объявлено плановым");
+    d2k_session_free(s);
+
+    /* Обычное закрытие: сервер ответил своим FIN — поток отпущен, повтора нет. */
+    s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "контрольная сессия закрытия не создалась");
+    if (!s) { return; }
+    cut_handshake(s, 47821, hello, hlen, pkt, buf, sizeof buf, &r);
+    n = cut_seq(pkt, build_pkt(pkt, 47821, 0x11, NULL, 0), fin_seq, 5000 + 19923);
+    d2k_session_packet(s, pkt, n, 40000, buf, sizeof buf, &r);
+    n = cut_seq(pkt, build_rev_pkt(pkt, 47821, 0x11, NULL, 0), 5000 + 19923, fin_seq + 1);
+    d2k_session_packet(s, pkt, n, 40050, buf, sizeof buf, &r);
+    CHECK(d2k_session_suspects(s) == 0, "обычное закрытие долгого ответа стало подозрением");
+    CHECK(d2k_session_flows_tcp(s) == 0, "закрытый с обеих сторон поток не отпущен");
+    d2k_session_free(s);
+
+    /* Закрытие после одного рукопожатия: подтверждение не ушло за видимое —
+       об обрыве ОТВЕТА говорить не из чего, даже если FIN повторён. */
+    s = d2k_session_new(64, 64);
+    CHECK(s != NULL, "контрольная сессия рукопожатия не создалась");
+    if (!s) { return; }
+    cut_handshake(s, 47822, hello, hlen, pkt, buf, sizeof buf, &r);
+    n = cut_seq(pkt, build_pkt(pkt, 47822, 0x11, NULL, 0), fin_seq, 5000 + seen);
+    d2k_session_packet(s, pkt, n, 40000, buf, sizeof buf, &r);
+    d2k_session_packet(s, pkt, n, 40440, buf, sizeof buf, &r);
+    CHECK(d2k_session_suspects(s) == 0,
+          "повтор FIN без ответа сверх рукопожатия принят за обрыв ответа");
+    d2k_session_free(s);
+}
+
 /* --- ОТВЕТ, КОТОРЫЙ СПРЯТАЛ УСКОРИТЕЛЬ -----------------------------------
  *
  * Keenetic (MediaTek PPE, fastnat) уводит транзитный поток в аппаратный путь
@@ -834,6 +935,7 @@ int main(void) {
     }
     test_suspect_tells_planned();
     test_late_rst_after_tls_appdata();
+    test_silent_cut_fin_retry();
     d2k_session *s = d2k_session_new(64, 32);
     CHECK(s != NULL, "сессия не создалась");
     if (!s) {

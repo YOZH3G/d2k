@@ -605,6 +605,8 @@ int main(void) {
         CHECK(strcmp(d2k_suspect_text(D2K_SUSPECT_RST_AFTER_APP),
                      "сброс клиента или сервера после TLS app-data; проверить объём ответа") == 0,
               "поздний TLS-сброс потерял отдельное диагностическое значение");
+        CHECK(strcmp(d2k_suspect_text(D2K_SUSPECT_FIN_RETRY), "подозрение без кода") != 0,
+              "повтор FIN без ответа выводится как подозрение без кода");
         CHECK(d2k_suspect_text(200) != NULL, "неизвестный код без текста");
     }
 

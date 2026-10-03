@@ -1595,8 +1595,15 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     c->until_ms = s->now_ms + clear_backoff_ms(c->negative_streak);
 }
 
-/* Порог позднего RST: 1 — это второй RST по независимому потоку в окне,
-   замер можно начинать; 0 — первый (или повтор того же потока), ждём. */
+/* Какое позднее закрытие пришло — для журнала; порог у них общий. */
+static const char *late_close_what(uint8_t code) {
+    return code == D2K_SUSPECT_FIN_RETRY ? "повтор FIN без ответа после ответа сервера"
+                                         : "поздний RST после app-data";
+}
+
+/* Порог позднего закрытия (поздний RST после app-data или повтор FIN без
+   ответа на потоке без плана): 1 — второе такое по независимому потоку в
+   окне, замер можно начинать; 0 — первое (или повтор того же потока), ждём. */
 static int late_rst_confirmed(d2k_sched *s, const char *name, const d2k_ev *ev) {
     uint8_t family = ev->family ? ev->family : 4;
     late_rst_pending *p = NULL;
@@ -1608,8 +1615,9 @@ static int late_rst_confirmed(d2k_sched *s, const char *name, const d2k_ev *ev) 
     if (p && s->now_ms - p->seen_ms <= SCHED_LATE_RST_CONFIRM_MS) {
         if (ev_matches_flow(ev, &p->flow)) { return 0; }
         memset(p, 0, sizeof *p);
-        say(s, "по %s второй поздний RST на независимом потоке за %d с — подтверждаю подозрение",
-            name, SCHED_LATE_RST_CONFIRM_MS / 1000);
+        say(s, "по %s второе позднее закрытие (%s) на независимом потоке за %d с — "
+               "подтверждаю подозрение", name, late_close_what(ev->code),
+            SCHED_LATE_RST_CONFIRM_MS / 1000);
         return 1;
     }
     if (!p) {
@@ -1628,8 +1636,9 @@ static int late_rst_confirmed(d2k_sched *s, const char *name, const d2k_ev *ev) 
     p->flow.family = family;
     p->seen_ms = s->now_ms;
     p->used = 1;
-    say(s, "по %s одиночный поздний RST после app-data — жду второй независимый поток до %d с; "
-           "замер пока не запускаю", name, SCHED_LATE_RST_CONFIRM_MS / 1000);
+    say(s, "по %s одиночное позднее закрытие (%s) — жду второй независимый поток до %d с; "
+           "замер пока не запускаю", name, late_close_what(ev->code),
+        SCHED_LATE_RST_CONFIRM_MS / 1000);
     return 0;
 }
 
@@ -5749,7 +5758,15 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         t->voice_silent = 1;
         return 0;
     }
-    if (ev->code == D2K_SUSPECT_RST_AFTER_APP && (!t || t->state == T_WATCHING) &&
+    /* Повтор FIN без ответа на потоке БЕЗ плана (задача 50: глухой обрыв
+       ответа без RST/FIN, поле 03.10) — такой же низкоуверенный сигнал
+       позднего закрытия, как поздний RST, и с той же повторяемостью: второй
+       по независимому потоку в окне. Повтор FIN под планом (05e24fa) по-
+       прежнему меряется сразу: его датапат шлёт только о потоке, к которому
+       применён собственный план. */
+    const int late_close_needs_repeat = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
+        (ev->code == D2K_SUSPECT_FIN_RETRY && ev->planned == D2K_LINK_PLANNED_NO);
+    if (late_close_needs_repeat && (!t || t->state == T_WATCHING) &&
         !late_rst_confirmed(s, name, ev)) {
         return 0;
     }

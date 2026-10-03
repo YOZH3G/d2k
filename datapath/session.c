@@ -1641,8 +1641,30 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     }
 
     if (rst || fin) {
-        if (fin && !rst && fwd && fl->saw_hello && fl->plan_done &&
-            (fl->rev_types & (uint8_t)(1u << (23 - 20)))) {
+        /* ОТВЕТ ШЁЛ ДАЛЬШЕ РУКОПОЖАТИЯ — условие, при котором закрытие
+           клиента вообще может говорить об обрыве ответа. Два свидетельства:
+           пакет, начатый записью 0x17, или подтверждение клиента, ушедшее за
+           байты ответа, которые видела очередь, при увиденном ServerHello.
+           Второе нужно потому, что очередь видит только начало ответа
+           (connbytes 0:8): у TLS 1.3 там ServerHello-полёт и чистые ACK, а
+           первая запись 0x17 приходит позже (поле 03.10.2026, rua.gr — пакет
+           №10). Без него глухой обрыв Cloudflare не виден ничем. */
+        const int ack_beyond = ack && fl->hello_ack_valid && fl->rev_server_hello &&
+            (int32_t)(rd32(t + 8) - fl->hello_ack) > 0 &&
+            rd32(t + 8) - fl->hello_ack > fl->rev_payload_after_hello;
+        const int response_went_on =
+            (fl->rev_types & (uint8_t)(1u << (23 - 20))) || ack_beyond;
+        /* FIN клиента после ответа: поток держим до FIN/RST сервера или до
+           молчания и смотрим, не повторится ли FIN с тем же концом. Повтор
+           значит, что подтверждения с той стороны не пришло — сервер не
+           слышен вовсе. Обычное закрытие, длинная загрузка и long-poll
+           получают ACK (и FIN сервера) и повтора не дают. Раньше это
+           касалось только потоков под планом; поток без плана забывался на
+           первом FIN, и глухой обрыв без RST не давал ни одной улики
+           (задача 50). Подозрение — лишь повод для узкого RX-замера;
+           повторяемость по независимым потокам требует контроллер. */
+        if (fin && !rst && fwd && fl->saw_hello &&
+            (fl->plan_done || !fl->controller_probe) && response_went_on) {
             uint32_t fin_seq = rd32(t + 4) + (uint32_t)(total - ihl - doff);
             if (fl->pending_fin && fl->pending_fin_seq == fin_seq) {
                 d2k_jrn_detail det;
@@ -1652,7 +1674,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             }
             fl->pending_fin = 1; fl->pending_fin_seq = fin_seq;
             d2k_capture_forget(&s->capture, &key);
-            out->skipped = "клиент закрывает поток под планом; ждём подтверждение или повтор FIN";
+            out->skipped = "клиент закрывает поток после ответа; ждём подтверждение или повтор FIN";
             return 0; /* retain bounded flow metadata, never hold/drop the FIN */
         }
         if (rst && !fwd && fl->saw_hello && rev_before == 0) {

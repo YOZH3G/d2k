@@ -3043,6 +3043,88 @@ int main(int argc, char **argv) {
         d2k_catalog_free(&c18);
     }
 
+    /* ЗАДАЧА 50. Повтор FIN без ответа на потоке БЕЗ плана (глухой обрыв
+       ответа Cloudflare, rua.gr 03.10) — тот же низкоуверенный сигнал
+       позднего закрытия, что поздний RST: одиночный не меряется, второй по
+       независимому потоку в окне запускает ровно одну RX-volume-пару, а не
+       полный поиск. Поздний RST и повтор FIN подтверждают друг друга: оба —
+       оборванный ответ той же цели. */
+    {
+        d2k_catalog c50 = {0};
+        d2k_sched *s = d2k_sched_new(&c50, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для повтора FIN не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            vol_calls = tcp_calls = 0;
+            vol_answer = D2K_VOL_PASSED;
+            vol_rx_cut = 0;
+            settle(s);
+            const char *name = "silent-cut.test";
+            d2k_ev h = ev_hello(6, 41060, name);
+            d2k_sched_event(s, &h);
+            d2k_ev f = ev_suspect(6, 41060);
+            f.code = D2K_SUSPECT_FIN_RETRY;
+            f.planned = D2K_LINK_PLANNED_NO;
+            CHECK(d2k_sched_event(s, &f) == 0,
+                  "одиночный повтор FIN без плана сразу запустил замер");
+            settle(s);
+            CHECK(vol_calls == 0 && tcp_calls == 0,
+                  "одиночный повтор FIN без плана дошёл до сетевого измерения");
+            CHECK(said("жду второй независимый поток"),
+                  "ожидание второго позднего закрытия не отражено в журнале");
+            CHECK(d2k_sched_event(s, &f) == 0,
+                  "повтор FIN того же потока засчитан как независимый");
+            settle(s);
+            CHECK(vol_calls == 0, "повтор того же потока запустил замер");
+            d2k_ev h2 = ev_hello(6, 41061, name);
+            d2k_sched_event(s, &h2);
+            d2k_ev f2 = ev_suspect(6, 41061);
+            f2.code = D2K_SUSPECT_FIN_RETRY;
+            f2.planned = D2K_LINK_PLANNED_NO;
+            CHECK(d2k_sched_event(s, &f2) == 1,
+                  "второй повтор FIN по независимому потоку не запустил замер");
+            settle(s);
+            CHECK(vol_calls == 1 && tcp_calls == 0,
+                  "подтверждённый повтор FIN не прошёл ровно одну RX-volume-пару");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c50);
+
+        /* Смешанная пара: поздний RST, затем повтор FIN на другом потоке. */
+        c50 = (d2k_catalog){0};
+        s = d2k_sched_new(&c50, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик смешанной пары не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            vol_calls = tcp_calls = 0;
+            vol_answer = D2K_VOL_PASSED;
+            vol_rx_cut = 0;
+            /* Часы планировщика ставит первый тик; без него первое
+               подозрение помечено нулём и окно истекло бы на settle(). */
+            settle(s);
+            const char *name = "silent-cut-mixed.test";
+            d2k_ev h = ev_hello(6, 41062, name);
+            d2k_sched_event(s, &h);
+            d2k_ev r = ev_suspect(6, 41062);
+            r.code = D2K_SUSPECT_RST_AFTER_APP;
+            d2k_sched_event(s, &r);
+            settle(s);
+            d2k_ev h2 = ev_hello(6, 41063, name);
+            d2k_sched_event(s, &h2);
+            d2k_ev f2 = ev_suspect(6, 41063);
+            f2.code = D2K_SUSPECT_FIN_RETRY;
+            f2.planned = D2K_LINK_PLANNED_NO;
+            CHECK(d2k_sched_event(s, &f2) == 1,
+                  "поздний RST и повтор FIN на независимых потоках не подтвердили друг друга");
+            settle(s);
+            CHECK(vol_calls == 1 && tcp_calls == 0,
+                  "смешанная пара позднего закрытия не прошла ровно одну RX-volume-пару");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c50);
+    }
+
     /* «Блок доказан, кандидатов 0»: пустой поиск откладывается на cooldown,
        а не повторяется после двухминутного отдыха. */
     {
