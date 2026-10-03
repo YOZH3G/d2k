@@ -255,11 +255,14 @@ static const golden GOLD[] = {
 
 static int after_count(const char *name)
 {
+    /* Полный перебор — на 3 зонда дешевле (задача 49): три точных дубля
+       донора (badsum-x2-g20, badsum-x2-g80, badsum-x7-g0) больше не
+       спрашиваются второй раз. */
     static const struct { const char *n; int a; } A[] = {
         {"youtube", 12}, {"rutracker", 58}, {"flaky", 37}, {"prop-l7", 14},
-        {"none-pass", 103}, {"selftest-fail", 10}, {"selftest-late", 14},
-        {"ctl-late", 13}, {"ctl-dead", 105}, {"ctl-dead-vouched", 105},
-        {"ctl-dead-hit", 14}, {"errors", 103}};
+        {"none-pass", 100}, {"selftest-fail", 10}, {"selftest-late", 14},
+        {"ctl-late", 13}, {"ctl-dead", 102}, {"ctl-dead-vouched", 102},
+        {"ctl-dead-hit", 14}, {"errors", 100}};
     size_t i;
     for (i = 0; i < sizeof A / sizeof A[0]; i++) {
         if (strcmp(A[i].n, name) == 0) { return A[i].a; }

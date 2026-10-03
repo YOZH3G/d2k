@@ -209,7 +209,15 @@ static int bridge_input(const char *ip, uint16_t port,
  * Наблюдение то же, что печатает --progress, ни на что в дереве не влияет. */
 static void progress_seen(void *ctx, const d2k_obs *o)
 {
-    (void)ctx;
+    /* С ответом базы (seeded) наблюдение "whole" несёт счёт ПРОШЛОГО
+       прогона, зондов в этом не было: вопрос виден, зонды — нет (задача 49:
+       иначе ход обгонял итог, и карточка потом падала). */
+    int *seeded_whole = ctx;
+    if (seeded_whole && *seeded_whole && strcmp(o->probe, "whole") == 0) {
+        *seeded_whole = 0;
+        d2k_sched_progress_note(o->probe, 0, 0);
+        return;
+    }
     d2k_sched_progress_note(o->probe, o->pass, o->fail);
 }
 
@@ -238,8 +246,9 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
         opt.seed_fail = seed->fail;
         snprintf(opt.seed_err, sizeof(opt.seed_err), "%s", seed->err);
     }
+    int seeded_whole = opt.seed_whole;
     opt.on_obs = progress_seen;
-    opt.on_obs_ctx = NULL;
+    opt.on_obs_ctx = &seeded_whole;
     d2k_classify_run(addr, &tr, &opt, &res);
 
     if (res.stopped) {

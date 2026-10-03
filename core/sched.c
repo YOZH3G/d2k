@@ -865,6 +865,10 @@ typedef struct {
     int        ech_trial; /* failed baseline permits hypotheses, not a DPI verdict */
     int        ech_grease;     /* ECH offer оказался GREASE: обычный путь по имени */
     int        ech_unverified; /* настоящий ECH без своего свидетеля: «не проверено» */
+    /* GREASE распознан рабочим потоком, а свои планы ещё не спрашивались
+       (задача 49): поток вернулся без замера, решение own_first принимает
+       главный поток (каталог не под s->mu) и запускает поиск заново. */
+    int        ech_regrade;
     char       ech_origin[256]; /* known own-probe witness, not inferred hidden SNI */
     char       ech_witnesses[4][256];
     size_t     ech_witness_count;
@@ -882,11 +886,15 @@ typedef struct {
                              ступени RX-лестницы перед ним — из замера */
     unsigned   rx_volume_next_variant;
     int        res_ready;   /* пишется потоком под мьютексом планировщика */
-    /* Ход идущего прогона измерителя (задача 48): зонды и последний заданный
-       вопрос. Пишет рабочий поток через d2k_sched_progress_note под s->mu,
-       обнуляет start_worker. В счётчик кандидатов t->probes (бюджет
-       SCHED_MAX_PROBES) не переносится: это опыты измерителя, не кандидаты. */
+    /* Ход измерителя (задачи 48, 49): ask_probes — зонды, потраченные задачей
+       ВНЕ счётчика кандидатов t->probes (бюджет SCHED_MAX_PROBES): прогоны
+       измерителя и сброшенные счёты прежних испытаний. Пишет рабочий поток
+       через d2k_sched_progress_note под s->mu; по возврату прогона —
+       ask_base + r.probes (итог прогона, как «за N зондов замера» в журнале).
+       Обнуляется только с задачей (task_reset): карточка не падает к нулю.
+       ask_question — последний заданный вопрос идущего прогона. */
     int        ask_probes;
+    int        ask_base;
     char       ask_question[96];
     /* Подобранное плечо QUIC и признак того, что подбор состоялся. Отдельно
        от вердикта: «плечо не найдено» и «вердикта нет» — разные утверждения,
@@ -1857,6 +1865,18 @@ void d2k_sched_progress_note(const char *question, int pass, int fail) {
     pthread_mutex_unlock(&k->s->mu);
 }
 
+/* Итог прогона измерителя — на счёт задачи (под s->mu). Ход мог недосчитать
+   (ответное направление TCP хода не шлёт), но не пересчитать; max — страховка
+   от падения карточки, если когда-нибудь пересчитает. */
+static void ask_settle(task *t, int run_probes) {
+    int fin = t->ask_base + (run_probes > 0 ? run_probes : 0);
+    if (fin > t->ask_probes) t->ask_probes = fin;
+}
+
+static void sched_quic_progress(const char *question, int probes) {
+    d2k_sched_progress_note(question, probes, 0);
+}
+
 static void *worker_run(void *vp) {
     worker_arg *a = (worker_arg *)vp;
     d2k_sched *s = a->s;
@@ -2029,6 +2049,20 @@ static void *worker_run(void *vp) {
             pthread_mutex_unlock(&s->mu);
             say(s, "по %s ECH offer — GREASE: внешнее имя не является public_name "
                    "известной ECH-конфигурации; обычный поиск по имени", t->name);
+            /* СВОИ ПЛАНЫ — КАК БЕЗ ECH (задача 49). При ECH offer главный
+               поток своих планов не искал (own_first_plans: ECH-форма не
+               та). Теперь форма известна, и решение о шаге своих планов —
+               за главным потоком: он читает каталог. Замера не было. */
+            if (t->own_first == 0 && !t->stop) {
+                pthread_mutex_lock(&s->mu);
+                memset(&t->res, 0, sizeof t->res);
+                t->res.verdict = D2K_V_INCONCLUSIVE;
+                t->ech_regrade = 1;
+                t->res_ready = 1;
+                pthread_mutex_unlock(&s->mu);
+                ssize_t ign_rg = write(s->wake[1], "w", 1); (void)ign_rg;
+                return NULL;
+            }
         } else if (!t->ech_origin[0]) {
             /* Настоящий ECH, своего свидетеля (origin с этой конфигурацией)
              * нет: проверить нечем. Обычным приветствием внешнего имени не
@@ -2072,6 +2106,7 @@ static void *worker_run(void *vp) {
             : d2k_sched_quic_base_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark);
         pthread_mutex_lock(&s->mu);
         t->res = base;
+        ask_settle(t, base.probes);
         t->res_ready = 1;
         pthread_mutex_unlock(&s->mu);
         ssize_t ign_base = write(s->wake[1], "w", 1);
@@ -2147,6 +2182,7 @@ static void *worker_run(void *vp) {
 
     pthread_mutex_lock(&s->mu);
     t->res = r;
+    ask_settle(t, r.probes);
     t->res_ready = 1;
     pthread_mutex_unlock(&s->mu);
 
@@ -2172,9 +2208,9 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     if (job == JOB_VERIFY) { t->probe_fd = -1; }
     t->job = job;
     t->res_ready = 0;
-    /* Новый поток — новый ход: прошлый прогон (база задачи 32, повтор по
-       снимку) своих зондов этому не передаёт. Прежний поток уже присоединён. */
-    t->ask_probes = 0;
+    /* Новый поток — новый вопрос; зонды прежних прогонов (база задачи 32,
+       повтор по снимку) остаются на счету задачи. Прежний поток присоединён. */
+    t->ask_base = t->ask_probes;
     t->ask_question[0] = '\0';
     /* ФЛАГ «БРОСАЙ» — СВЕЖИЙ У КАЖДОГО ПОТОКА.
        Его взводит join_worker, дожидаясь предыдущего, и снимает только
@@ -3749,6 +3785,9 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     s->limit_logged = SCHED_DEFAULT_ACTIVE_MEASUREMENTS;
     s->wake[0] = s->wake[1] = -1;
     s->wall_base_s = (int64_t)time(NULL);
+    /* Ход QUIC-прогона — тем же приёмником, что TCP (задача 49). Приёмник
+       поточный: вне рабочего потока задачи вызов ничего не делает. */
+    d2k_quic_progress_hook = sched_quic_progress;
     /* The MIPS Linux pipe syscall returns the first descriptor in v0 (and
        the second in v1); Zig's musl wrapper exposes that positive value here
        instead of normalizing success to POSIX's zero. The descriptor pair is
@@ -3949,19 +3988,18 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         fputs(", \"since\": ", f);
         int64_t admitted_ms = t->state == T_QUEUED ? t->queued_ms : t->started_ms;
         json_time(f, wall_s(s, admitted_ms ? admitted_ms : s->now_ms));
-        /* Ход измерителя (задача 48): пока идёт прогон, зонды — его, а вопрос
-           — последний заданный. Иначе «probes: 0» минутами не отличить от
-           зависания. Копия под мьютексом: пишет рабочий поток. */
-        int ask_probes = 0;
+        /* Ход измерителя (задачи 48, 49): зонды задачи — кандидаты плюс
+           прогоны измерителя (идущий — по ходу, законченный — его итог);
+           вопрос — только пока прогон идёт. Копия под мьютексом: пишет
+           рабочий поток. */
+        int ask_probes;
         char question[sizeof t->ask_question];
         question[0] = '\0';
-        if (t->state == T_ASKING) {
-            pthread_mutex_lock(&s->mu);
-            ask_probes = t->ask_probes;
-            memcpy(question, t->ask_question, sizeof question);
-            pthread_mutex_unlock(&s->mu);
-            question[sizeof question - 1] = '\0';
-        }
+        pthread_mutex_lock(&s->mu);
+        ask_probes = t->ask_probes;
+        if (t->state == T_ASKING) memcpy(question, t->ask_question, sizeof question);
+        pthread_mutex_unlock(&s->mu);
+        question[sizeof question - 1] = '\0';
         fprintf(f, ", \"attempts\": %zu, \"probes\": %d, ", t->next_plan, t->probes + ask_probes);
         fputs("\"question\": ", f);
         json_str(f, question);
@@ -5775,7 +5813,9 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
        known_plans и запасной перебор пропускали уже испытанные хэши — в том
        числе только что подтверждённый план, который перемер и должен
        проверить первым. Курсоры источников кандидатов сбрасываются вместе с
-       ними, иначе «свежий» перебор начинался бы с середины. */
+       ними, иначе «свежий» перебор начинался бы с середины. Счёт на
+       карточке — тоже новый: это новый поиск, а не продолжение прежнего. */
+    t->ask_probes = 0;
     t->probes = 0;
     memset(t->tried, 0, sizeof t->tried);
     t->n_tried = 0;
@@ -6770,6 +6810,7 @@ static void own_first_continue(d2k_sched *s, task *t) {
     t->cached_measure_valid = 0;
     t->box_id[0] = '\0';
     t->rx_phase = 0;
+    t->ask_probes += t->probes; /* на карточке зонды не пропадают (задача 49) */
     t->probes = 0;
     if (t->transport == 6) memset(&t->vol, 0, sizeof t->vol);
     memset(&t->res, 0, sizeof t->res);
@@ -7144,6 +7185,20 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
+            if (t->ech_regrade) {
+                /* GREASE (задача 49): тот же вход, теперь как обычное
+                   приветствие — сперва свои подтверждённые планы той же
+                   формы, если они есть; иначе полный поиск сразу. */
+                t->ech_regrade = 0;
+                t->own_first = (d2k_sched_tcp_base_hook != NULL) && !t->family_reuse &&
+                               own_first_plans(s, t, 0) > 0 ? 1 : 0;
+                if (start_worker(s, t, JOB_CLASSIFY) != 0) { task_fail(s, t, now_ms); moved++; continue; }
+                if (t->own_first == 1)
+                    say(s, "по %s сначала базовый вопрос донора: если рукопожатие режется, "
+                           "проверю свои подтверждённые планы до полного замера", t->name);
+                moved++;
+                continue;
+            }
             /* Ответ базы годится одному полному прогону (задача 32). */
             int base_answer = t->own_first == 1;
             if (!base_answer) { t->seed_use = 0; t->seed.valid = 0; }

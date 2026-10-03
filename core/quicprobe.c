@@ -1501,6 +1501,12 @@ static d2k_tally quic_fragment(const char *addr,uint16_t port,int shape,d2k_hell
         NULL,NULL,sent_out,NULL,qp_verify_aead,&p,NULL,0);
 }
 d2k_quic_fragment_fn d2k_quic_fragment_hook=quic_fragment;
+/* d2k_quic_progress_hook определён в quicarms.c: тот линкуется и без
+   quicprobe.o (test_quic_original_arms), а quicprobe.o — только с ним. */
+static void qp_progress(const char *question, int sent)
+{
+    if (d2k_quic_progress_hook && sent > 0) d2k_quic_progress_hook(question, sent);
+}
 
 static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
     uint16_t port, uint32_t wait_ms, uint32_t mark, int *sent_out) {
@@ -2151,6 +2157,7 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
                                   D2K_QUIC_REPEATS, NULL, NULL, &sent, NULL);
         }
         r->probes += sent; /* сколько реально ушло на провод, не pass+fail */
+        qp_progress(label, sent);
         if (!t.marked) {
             *all_marked = 0;
         }
@@ -2377,6 +2384,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
             r.base.ctl_marked = base_ctl.marked; r.base.rtt_ms = rtt_ms; r.base.ttl_in = ttl_in;
         }
         r.probes += base_sent; /* сколько реально ушло на провод, не pass+fail (находка 4 ревью, круг 5) */
+        qp_progress("контроль живости", base_sent);
         if (!base_ctl.marked) {
             all_marked = 0;
         }
@@ -2436,6 +2444,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
             int vn_sent = 0;
             d2k_tally vn = qp_ask_vn(pool[0], port, d2k_quic_wait_ms, mark, &vn_sent);
             r.probes += vn_sent; /* сколько реально ушло на провод (находка 4 ревью, круг 5) */
+            qp_progress("согласование версии", vn_sent);
             if (!vn.marked) {
                 all_marked = 0;
             }
@@ -2507,6 +2516,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
             }
             if (base_only) {
                 r.probes += base_sent2;
+                qp_progress("прямой зонд", base_sent2);
                 r.base.direct_asked = 1;
                 r.base.pass = base.pass; r.base.fail = base.fail;
                 r.base.direct_err = base.err; r.base.direct_marked = base.marked;
@@ -2522,6 +2532,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                 return r;
             }
             r.probes += base_sent2; /* сколько реально ушло на провод (находка 4 ревью, круг 5) */
+            qp_progress("прямой зонд", base_sent2);
             if (!base.marked) {
                 all_marked = 0;
             }
@@ -2566,6 +2577,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                     d2k_tally same = d2k_quic_ask_control_hook(pool[0], port, NULL, 0, control, dyn_wait, mark,
                                                         D2K_QUIC_REPEATS, NULL, NULL, &same_sent, NULL);
                     r.probes += same_sent; /* сколько реально ушло на провод (находка 4 ревью, круг 5) */
+                    qp_progress("остаточная блокировка", same_sent);
                     if (!same.marked) {
                         all_marked = 0;
                     }

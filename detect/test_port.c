@@ -15,6 +15,9 @@
 
 int d2k_split_offsets(const int *cuts, int ncuts, int n, void *out, int cap);
 int d2k_parse_stale_rst_rule(const char *line, int *port);
+int d2k_parse_rst_rule(const char *line, int *port, long *pid);
+int d2k_rst_rule_stale(const char *line, int *port, long *pid);
+extern int (*d2k_raw_alive_hook)(long pid);
 
 typedef struct { int from, to; } span;
 
@@ -83,6 +86,31 @@ static void test_fooling_flags_reach_the_strategy(void)
         if (ps[i].ip_id_zero && !strstr(st, "ip_id")) {
             fail("%s: обнулённый идентификатор измерен, а в строке его нет\n  %s",
                  ps[i].name, st);
+        }
+    }
+}
+
+/* ЗАДАЧА 49: НИ ОДНОЙ ГИПОТЕЗЫ ДВАЖДЫ. Донор спрашивал badsum-x2-g20 и
+ * badsum-x2-g80 дважды (головной список и сетка «копии × пауза»), а
+ * badsum-x7 и badsum-x7-g0 — одно и то же. При единогласии повтор уже
+ * проваленной гипотезы исхода не меняет: три лишних зонда за прогон
+ * (решение владельца 03.10: трассу донора здесь не повторяем). Сравнение —
+ * по ВСЕМ параметрам, кроме имени; одна копия и «копий не задано» — одно. */
+static void test_no_duplicate_hypotheses(void)
+{
+    const d2k_poison *ps;
+    int n, i, j;
+    ps = d2k_poisons(&n);
+    for (i = 0; i < n; i++) {
+        for (j = i + 1; j < n; j++) {
+            d2k_poison a = ps[i], b = ps[j];
+            memset(a.name, 0, sizeof a.name);
+            memset(b.name, 0, sizeof b.name);
+            if (a.repeats <= 1) a.repeats = 1;
+            if (b.repeats <= 1) b.repeats = 1;
+            if (memcmp(&a, &b, sizeof a) == 0) {
+                fail("гипотеза спрашивается дважды: %s и %s", ps[i].name, ps[j].name);
+            }
         }
     }
 }
@@ -247,6 +275,57 @@ static void test_stale_rule_recognition_is_exact(void)
     }
 }
 
+/* ЗАДАЧА 49: ПРАВИЛО НЕСЁТ ВЛАДЕЛЬЦА. Уборка при старте снимала ЛЮБОЕ правило
+ * нашего диапазона — и правило живого зонда d2kc, если d2k-detect запускали
+ * рядом (поле 03.10). Теперь правило помечено pid процесса-владельца;
+ * снимается только правило мёртвого процесса или старое, без пометки. */
+static int fake_alive_pid;
+static int fake_alive(long pid) { return pid == fake_alive_pid; }
+
+static void test_rst_rule_owner_and_staleness(void)
+{
+    int port = 0;
+    long pid = -1;
+    const char *mine =
+        "-A OUTPUT -p tcp -m tcp --sport 40750 --tcp-flags RST RST "
+        "-m comment --comment d2k-rst:4242 -j DROP";
+    const char *quoted =
+        "-A OUTPUT -p tcp -m tcp --sport 40751 --tcp-flags RST RST "
+        "-m comment --comment \"d2k-rst:4243\" -j DROP";
+    const char *legacy = "-A OUTPUT -p tcp -m tcp --sport 39842 --tcp-flags RST RST -j DROP";
+    static const char *foreign[] = {
+        "-A OUTPUT -p tcp -m tcp --sport 40750 --tcp-flags RST RST "
+        "-m comment --comment other:4242 -j DROP",                           /* чужая пометка */
+        "-A OUTPUT -p tcp -m tcp --sport 40750 --tcp-flags RST RST "
+        "-m comment --comment d2k-rst:x -j DROP",                            /* не pid */
+        "-A OUTPUT -p tcp -m tcp --sport 40750 --tcp-flags RST RST "
+        "-m comment --comment d2k-rst:4242 -j ACCEPT",                       /* чужое действие */
+        "-A OUTPUT -p tcp -m tcp --sport 22 --tcp-flags RST RST "
+        "-m comment --comment d2k-rst:4242 -j DROP",                         /* порт не наш */
+    };
+    size_t i;
+    if (!d2k_parse_rst_rule(mine, &port, &pid) || port != 40750 || pid != 4242)
+        fail("помеченное правило не опознано: port=%d pid=%ld", port, pid);
+    if (!d2k_parse_rst_rule(quoted, &port, &pid) || port != 40751 || pid != 4243)
+        fail("помеченное правило в кавычках не опознано: port=%d pid=%ld", port, pid);
+    if (!d2k_parse_rst_rule(legacy, &port, &pid) || port != 39842 || pid != 0)
+        fail("правило без пометки не опознано: port=%d pid=%ld", port, pid);
+    for (i = 0; i < sizeof foreign / sizeof foreign[0]; i++)
+        if (d2k_parse_rst_rule(foreign[i], &port, &pid))
+            fail("чужое правило принято за своё: «%s»", foreign[i]);
+
+    d2k_raw_alive_hook = fake_alive;
+    fake_alive_pid = 4242;
+    if (d2k_rst_rule_stale(mine, &port, &pid))
+        fail("правило ЖИВОГО процесса признано брошенным — уборка сняла бы его у живого зонда");
+    fake_alive_pid = 1;
+    if (!d2k_rst_rule_stale(mine, &port, &pid) || port != 40750 || pid != 4242)
+        fail("правило мёртвого процесса не признано брошенным");
+    if (!d2k_rst_rule_stale(legacy, &port, &pid) || pid != 0)
+        fail("правило старого формата (без владельца) не признано брошенным");
+    d2k_raw_alive_hook = NULL;
+}
+
 /* Разрез в нуле и в длине — это не разрез; такие точки обязаны отсеиваться,
  * иначе двоичный поиск на краю выродится в запись нулевой длины. */
 static void test_split_offsets_ignores_out_of_range_cuts(void)
@@ -340,6 +419,7 @@ int main(void)
             fail("family filtering did not exercise IPv4-only IPID");
     }
     printf("перенос: инварианты без сети\n");
+    test_no_duplicate_hypotheses();
     test_repeats_reach_the_strategy();
     test_fooling_flags_reach_the_strategy();
     test_distinct_poisons_give_distinct_strategies();
@@ -347,6 +427,7 @@ int main(void)
     test_disorder_pos2_candidate_is_measured_and_exported();
     test_checksum_verdict_never_inferred_from_silence();
     test_stale_rule_recognition_is_exact();
+    test_rst_rule_owner_and_staleness();
     test_split_offsets_ignores_out_of_range_cuts();
     test_raw_trigger_parses_and_rejects_garbage();
     test_compose_follows_the_vector();

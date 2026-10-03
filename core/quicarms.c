@@ -23,6 +23,9 @@ const uint8_t d2k_quic_benign[D2K_QUIC_BENIGN_LEN] = {0};
    состоялся. *retry (может быть NULL) — исход НЕ решающий и спросить ещё
    раз есть на чём: не отправилось, повторы разошлись (1–2 из 3) или этап
    данных не состоялся. Решающий исход — measured без retry. */
+/* Ход прогона (задача 49), см. d2k_quicprobe.h. */
+d2k_quic_progress_fn d2k_quic_progress_hook = NULL;
+
 static int ask_q(d2k_quic_arm_context *c, d2k_quic_arm *r, d2k_quic_arm_question *q,
                  const char *label, int *measured, int *retry) {
     *measured=0;
@@ -43,6 +46,7 @@ static int ask_q(d2k_quic_arm_context *c, d2k_quic_arm *r, d2k_quic_arm_question
     d2k_tally t=c->probe(q,c->user,&sent);
     step->sent=sent; step->answered=t.pass;
     if(sent>0) r->probes+=sent;
+    if(sent>0 && d2k_quic_progress_hook) d2k_quic_progress_hook(label,sent); /* задача 49 */
     if(!t.marked) c->marked=0;
     /* Unsent/local failures are not negative network observations. An
        ECONNREFUSED refusal (probe.go:643/663) is not err (quic_ask_ex counts

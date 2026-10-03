@@ -30,9 +30,112 @@
 #include "d2k_arm.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+
+/* ПРАВИЛО ПОДАВЛЕНИЯ RST: РАЗБОР И ВЛАДЕЛЕЦ.
+ *
+ * Разбор — чистая работа со строкой, и он обязан проверяться на любой машине,
+ * а не только там, где есть iptables (так же вынесен в эталоне: raw_rules.go
+ * отдельно от raw_linux.go). Форма нормализована самим iptables (проверено на
+ * роутере, v1.4.21). Сверяем её ЦЕЛИКОМ, началом и концом: частичный разбор
+ * уже прострелил — правило с чужим действием (-j ACCEPT) принималось за своё.
+ *
+ * ЗАДАЧА 49: ПРАВИЛО НЕСЁТ PID ВЛАДЕЛЬЦА (-m comment --comment d2k-rst:PID).
+ * Без него уборка при старте любого процесса-измерителя снимала и правило
+ * живого зонда d2kc (поле 03.10: запуск d2k-detect рядом с d2kc снял три
+ * правила d2kc). Старое правило без пометки — от прежней версии, владельца
+ * у него нет, и оно по-прежнему считается брошенным. */
+static const char RST_PREFIX[] = "-A OUTPUT -p tcp -m tcp --sport ";
+static const char RST_LEGACY_SUFFIX[] = " --tcp-flags RST RST -j DROP";
+static const char RST_OWNED_MID[] = " --tcp-flags RST RST -m comment --comment ";
+static const char RST_OWNED_TAG[] = "d2k-rst:";
+static const char RST_OWNED_SUFFIX[] = " -j DROP";
+
+static int parse_long_exact(const char *from, size_t len, long *out)
+{
+    char buf[32];
+    char *end;
+    long v;
+    if (len == 0 || len >= sizeof buf) return 0;
+    memcpy(buf, from, len);
+    buf[len] = '\0';
+    if (buf[0] < '0' || buf[0] > '9') return 0;
+    errno = 0;
+    v = strtol(buf, &end, 10);
+    if (errno != 0 || end == buf || *end != '\0') return 0;
+    *out = v;
+    return 1;
+}
+
+int d2k_parse_rst_rule(const char *line, int *port, long *pid)
+{
+    size_t n, pl = sizeof(RST_PREFIX) - 1;
+    const char *num, *rest;
+    long v, owner = 0;
+
+    while (*line == ' ' || *line == '\t') line++;
+    n = strlen(line);
+    while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t' ||
+                     line[n - 1] == '\r' || line[n - 1] == '\n')) n--;
+    if (n <= pl || strncmp(line, RST_PREFIX, pl) != 0) return 0;
+    num = line + pl;
+    rest = num;
+    while (rest < line + n && *rest >= '0' && *rest <= '9') rest++;
+    if (!parse_long_exact(num, (size_t)(rest - num), &v)) return 0;
+    /* Только наш диапазон: чужие правила с флагом RST снимать мы не вправе. */
+    if (v < 30000 || v > 54999) return 0;
+    size_t left = (size_t)(line + n - rest);
+    size_t ls = sizeof(RST_LEGACY_SUFFIX) - 1;
+    size_t om = sizeof(RST_OWNED_MID) - 1, ot = sizeof(RST_OWNED_TAG) - 1;
+    size_t os = sizeof(RST_OWNED_SUFFIX) - 1;
+    if (left == ls && strncmp(rest, RST_LEGACY_SUFFIX, ls) == 0) {
+        owner = 0;
+    } else if (left > om + ot + os && strncmp(rest, RST_OWNED_MID, om) == 0 &&
+               strncmp(line + n - os, RST_OWNED_SUFFIX, os) == 0) {
+        const char *c = rest + om, *ce = line + n - os;
+        int quoted = c < ce && *c == '"';
+        if (quoted) {
+            if (ce - c < 2 || ce[-1] != '"') return 0;
+            c++; ce--;
+        }
+        if ((size_t)(ce - c) <= ot || strncmp(c, RST_OWNED_TAG, ot) != 0) return 0;
+        if (!parse_long_exact(c + ot, (size_t)(ce - c - (long)ot), &owner) || owner <= 0) return 0;
+    } else {
+        return 0;
+    }
+    *port = (int)v;
+    if (pid) *pid = owner;
+    return 1;
+}
+
+/* Прежний вход: наше ли правило (любого формата) и на каком порту. */
+int d2k_parse_stale_rst_rule(const char *line, int *port)
+{
+    return d2k_parse_rst_rule(line, port, NULL);
+}
+
+/* Жив ли процесс-владелец. Крючок — для теста; EPERM тоже «жив». */
+int (*d2k_raw_alive_hook)(long pid);
+static int pid_alive(long pid)
+{
+    if (d2k_raw_alive_hook) return d2k_raw_alive_hook(pid);
+    return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+}
+
+/* Брошенное ли наше правило: без владельца (прежняя версия) или владелец
+ * мёртв. Правило живого процесса — никогда, в том числе своего: его снимет
+ * тот, кто ставил (raw_close / отложенный повтор). */
+int d2k_rst_rule_stale(const char *line, int *port, long *pid)
+{
+    long owner = 0;
+    if (!d2k_parse_rst_rule(line, port, &owner)) return 0;
+    if (pid) *pid = owner;
+    return owner == 0 || !pid_alive(owner);
+}
 
 #if defined(__linux__) || defined(D2K_RAW_UNIT_TEST)
 
@@ -136,60 +239,6 @@ static uint16_t next_source_port(void)
     return port;
 }
 
-/* parseStaleRSTRule — наше ли это правило и на каком порту.
- *
- * Форма нормализована самим iptables (проверено на роутере, v1.4.21).
- * Сверяем её ЦЕЛИКОМ, началом и концом: частичный разбор уже прострелил —
- * правило с чужим действием (-j ACCEPT) принималось за своё. */
-static const char STALE_PREFIX[] = "-A OUTPUT -p tcp -m tcp --sport ";
-static const char STALE_SUFFIX[] = " --tcp-flags RST RST -j DROP";
-
-int d2k_parse_stale_rst_rule(const char *line, int *port)
-{
-    size_t n, pl, sl;
-    const char *mid;
-    char buf[32];
-    char *end;
-    long v;
-
-    while (*line == ' ' || *line == '\t') {
-        line++;
-    }
-    n = strlen(line);
-    while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t' ||
-                     line[n - 1] == '\r' || line[n - 1] == '\n')) {
-        n--;
-    }
-    pl = sizeof(STALE_PREFIX) - 1;
-    sl = sizeof(STALE_SUFFIX) - 1;
-    if (n <= pl + sl) {
-        return 0;
-    }
-    if (strncmp(line, STALE_PREFIX, pl) != 0) {
-        return 0;
-    }
-    if (strncmp(line + n - sl, STALE_SUFFIX, sl) != 0) {
-        return 0;
-    }
-    mid = line + pl;
-    if (n - pl - sl >= sizeof(buf)) {
-        return 0;
-    }
-    memcpy(buf, mid, n - pl - sl);
-    buf[n - pl - sl] = '\0';
-    errno = 0;
-    v = strtol(buf, &end, 10);
-    if (errno != 0 || end == buf || *end != '\0') {
-        return 0;
-    }
-    /* Только наш диапазон: чужие правила с флагом RST снимать мы не вправе. */
-    if (v < 30000 || v > 54999) {
-        return 0;
-    }
-    *port = (int)v;
-    return 1;
-}
-
 /* sweepStaleRSTRules снимает правила подавления, оставшиеся от прошлых
  * прогонов: уборщик не выполнится, если процесс убили сигналом KILL — а
  * панель именно так и добивает замер, не уложившийся в отведённое время. */
@@ -201,18 +250,20 @@ static void sweep_stale_rst_rules(void)
     const char *tables[] = {"iptables", "ip6tables"};
     for (size_t family = 0; family < 2; family++) {
     char list[96];
-    snprintf(list, sizeof list, "%s -S OUTPUT 2>/dev/null", tables[family]);
+    snprintf(list, sizeof list, "%s -w -S OUTPUT 2>/dev/null", tables[family]);
     f = popen(list, "r");
     if (!f) {
         continue;
     }
     while (fgets(line, sizeof(line), f)) {
         int port;
-        if (d2k_parse_stale_rst_rule(line, &port)) {
-            char cmd[192];
+        long owner = 0;
+        if (d2k_rst_rule_stale(line, &port, &owner)) {
+            char cmd[224], tag[48] = "";
+            if (owner > 0) snprintf(tag, sizeof tag, " -m comment --comment %s%ld", RST_OWNED_TAG, owner);
             snprintf(cmd, sizeof(cmd),
-                     "%s -D OUTPUT -p tcp --sport %d --tcp-flags RST RST -j DROP"
-                     " >/dev/null 2>&1", tables[family], port);
+                     "%s -w -D OUTPUT -p tcp --sport %d --tcp-flags RST RST%s -j DROP"
+                     " >/dev/null 2>&1", tables[family], port, tag);
             (void)system(cmd);
         }
     }
@@ -222,23 +273,54 @@ static void sweep_stale_rst_rules(void)
 
 /* suppressKernelRST закрывает ядру рот на время зонда.
  *
- * БЕЗ -w, И ЭТО ПРОВЕРЕНО. На роутере владельца iptables v1.4.21: он понимает
- * голый -w, но не понимает «-w 5» — числовой аргумент появился только в
+ * ТОЛЬКО ГОЛЫЙ -w, И ЭТО ПРОВЕРЕНО. На роутере владельца iptables v1.4.21: он
+ * понимает голый -w (проверено 03.10: iptables -w -S, ip6tables -w -S), но не «-w 5» — числовой аргумент появился только в
  * 1.4.22. С «-w 5» вставка падает, правило не встаёт, каждый зонд получает RST
  * от собственного ядра и читается как блокировка (замер 04.09: классификатор
  * вырождался в opaque с полным перебором на любом домене). Отказ здесь
  * молчаливый по замыслу, поэтому факт отказа обязан доехать до вердикта. */
+/* ЗАДАЧА 49: СНЯТИЕ НЕ ТЕРЯЕТСЯ. Голый -w (его v1.4.21 понимает) ждёт замок
+ * xtables вместо мгновенного отказа: NDM и сторож правил держат его регулярно,
+ * и без -w отказывали и вставка (94 «RST не подавлен» в журнале 03.10), и
+ * удаление — правило оставалось висеть (--sport 39842/39408/39354, 40750
+ * без единого поиска). Неудавшееся удаление повторяется сразу, затем
+ * запоминается и повторяется перед каждой следующей правкой правил. */
+#define RST_PENDING_MAX 64
+static struct { uint16_t sport; uint8_t family; } g_rst_pending[RST_PENDING_MAX];
+static size_t g_rst_pending_n;
+
+static int rst_rule_cmd(const char *op, uint16_t sport, uint8_t family)
+{
+    char cmd[224];
+    snprintf(cmd, sizeof(cmd),
+             "%s -w %s OUTPUT -p tcp --sport %u --tcp-flags RST RST"
+             " -m comment --comment %s%ld -j DROP >/dev/null 2>&1",
+             family == 6 ? "ip6tables" : "iptables", op, (unsigned)sport,
+             RST_OWNED_TAG, (long)getpid());
+    return d2k_raw_rule_hook(cmd);
+}
+
+/* Под g_raw_state. */
+static void retry_pending_releases(void)
+{
+    size_t k = 0;
+    while (k < g_rst_pending_n) {
+        if (rst_rule_cmd("-D", g_rst_pending[k].sport, g_rst_pending[k].family) == 0) {
+            g_rst_pending[k] = g_rst_pending[--g_rst_pending_n];
+        } else {
+            k++;
+        }
+    }
+}
+
 static int suppress_kernel_rst(uint16_t sport, uint8_t family)
 {
-    char cmd[192];
     int rc;
-    snprintf(cmd, sizeof(cmd),
-             "%s -I OUTPUT -p tcp --sport %u --tcp-flags RST RST -j DROP"
-             " >/dev/null 2>&1", family == 6 ? "ip6tables" : "iptables", (unsigned)sport);
     /* Old router iptables cannot be relied on to serialize our commands.
      * Protect only rule edits, not the network lifetime of the probe. */
     pthread_mutex_lock(&g_raw_state);
-    rc = d2k_raw_rule_hook(cmd);
+    retry_pending_releases();
+    rc = rst_rule_cmd("-I", sport, family);
     if (rc != 0) {
         g_rst_rule_failed = 1;
     }
@@ -248,12 +330,14 @@ static int suppress_kernel_rst(uint16_t sport, uint8_t family)
 
 static void release_kernel_rst(uint16_t sport, uint8_t family)
 {
-    char cmd[192];
-    snprintf(cmd, sizeof(cmd),
-             "%s -D OUTPUT -p tcp --sport %u --tcp-flags RST RST -j DROP"
-             " >/dev/null 2>&1", family == 6 ? "ip6tables" : "iptables", (unsigned)sport);
     pthread_mutex_lock(&g_raw_state);
-    (void)d2k_raw_rule_hook(cmd);
+    if (rst_rule_cmd("-D", sport, family) != 0 &&
+        rst_rule_cmd("-D", sport, family) != 0 &&
+        g_rst_pending_n < RST_PENDING_MAX) {
+        g_rst_pending[g_rst_pending_n].sport = sport;
+        g_rst_pending[g_rst_pending_n].family = family;
+        g_rst_pending_n++;
+    }
     pthread_mutex_unlock(&g_raw_state);
 }
 
@@ -1158,8 +1242,6 @@ senderr:
 int d2k_raw_supported(void) { return 0; }
 int d2k_raw_rst_rule_failed(void) { return 0; }
 
-int d2k_parse_stale_rst_rule(const char *line, int *port);
-
 int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,
                          int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
@@ -1177,55 +1259,6 @@ int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t 
     (void)family; (void)ip4; (void)port; (void)timeout_ms; (void)mark; (void)cancel;
     snprintf(err, errcap, "classify: сырой слой доступен только на Linux");
     return -1;
-}
-
-/* Разбор правила — чистая работа со строкой, и он обязан проверяться на любой
- * машине, а не только там, где есть iptables (так же вынесен в эталоне:
- * raw_rules.go отдельно от raw_linux.go). */
-static const char STALE_PREFIX[] = "-A OUTPUT -p tcp -m tcp --sport ";
-static const char STALE_SUFFIX[] = " --tcp-flags RST RST -j DROP";
-
-int d2k_parse_stale_rst_rule(const char *line, int *port)
-{
-    size_t n, pl, sl;
-    char buf[32];
-    char *end;
-    long v;
-
-    while (*line == ' ' || *line == '\t') {
-        line++;
-    }
-    n = strlen(line);
-    while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t' ||
-                     line[n - 1] == '\r' || line[n - 1] == '\n')) {
-        n--;
-    }
-    pl = sizeof(STALE_PREFIX) - 1;
-    sl = sizeof(STALE_SUFFIX) - 1;
-    if (n <= pl + sl) {
-        return 0;
-    }
-    if (strncmp(line, STALE_PREFIX, pl) != 0) {
-        return 0;
-    }
-    if (strncmp(line + n - sl, STALE_SUFFIX, sl) != 0) {
-        return 0;
-    }
-    if (n - pl - sl >= sizeof(buf)) {
-        return 0;
-    }
-    memcpy(buf, line + pl, n - pl - sl);
-    buf[n - pl - sl] = '\0';
-    errno = 0;
-    v = strtol(buf, &end, 10);
-    if (errno != 0 || end == buf || *end != '\0') {
-        return 0;
-    }
-    if (v < 30000 || v > 54999) {
-        return 0;
-    }
-    *port = (int)v;
-    return 1;
 }
 
 #endif /* __linux__ */

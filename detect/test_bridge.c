@@ -277,7 +277,8 @@ int main(void)
               seen.seed_fail == 2 && r.verdict == D2K_V_PREFIX);
         /* Полный прогон отдаёт ход планировщику: каждый вопрос с его зондами. */
         CHECK(seen.on_obs != NULL);
-        CHECK(progress_calls == 2 && progress_probes == 6 && strcmp(progress_last, "whole") == 0);
+        /* Задача 49: "whole" с ответом базы — без зондов (они прошлого прогона). */
+        CHECK(progress_calls == 2 && progress_probes == 3 && strcmp(progress_last, "whole") == 0);
         progress_reset();
         r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321);
         CHECK(seen.seed_whole == 0);

@@ -301,10 +301,17 @@ static void test_dial_survives_missing_rst_rule(void)
     rule_rc = 0; rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
     CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
     CHECK(c.rule_up == 1);
-    CHECK(rule_count == 1 && strstr(rule_cmds[0], "iptables -I OUTPUT") != NULL);
+    CHECK(rule_count == 1 && strstr(rule_cmds[0], "iptables -w -I OUTPUT") != NULL);
     raw_close(&c);
-    CHECK(rule_count == 2 && strstr(rule_cmds[1], "iptables -D OUTPUT") != NULL);
+    CHECK(rule_count == 2 && strstr(rule_cmds[1], "iptables -w -D OUTPUT") != NULL);
     CHECK(!d2k_raw_rst_rule_failed());
+    {
+        /* Задача 49: правило несёт pid владельца, снимается той же формой;
+           замок xtables ждётся (-w), а не проигрывается молча. */
+        char own[48];
+        snprintf(own, sizeof own, "--comment d2k-rst:%ld ", (long)getpid());
+        CHECK(strstr(rule_cmds[0], own) != NULL && strstr(rule_cmds[1], own) != NULL);
+    }
 
     rule_rc = 256; rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; err[0] = '\0';
     CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
@@ -316,6 +323,48 @@ static void test_dial_survives_missing_rst_rule(void)
 
     outgoing_count = 0; dial_recv_fd = -1;
     CHECK(d2k_raw_probe_handshake_family(dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 1);
+    d2k_raw_rule_hook = raw_rule_system;
+}
+
+/* ЗАДАЧА 49: СНЯТИЕ НЕ ТЕРЯЕТСЯ. Поле 03.10: в OUTPUT висели правила
+ * --sport 39842/39408/39354 и 40750 без единого идущего поиска — удаление не
+ * удалось (замок xtables у NDM/сторожа), и о нём забыли. Неснятое правило
+ * повторяется сразу и потом перед каждой следующей правкой правил. */
+static int del_fail_left;
+static int flaky_del_hook(const char *cmd)
+{
+    test_rule_hook(cmd);
+    if (strstr(cmd, " -D OUTPUT") && del_fail_left > 0) { del_fail_left--; return 4 << 8; }
+    return 0;
+}
+
+static void test_failed_release_is_retried(void)
+{
+    static const uint8_t dst[4] = {198, 51, 100, 8};
+    raw_conn c;
+    char err[160] = "";
+    pthread_once(&g_sweep_once, sweep_noop);
+    d2k_raw_rule_hook = flaky_del_hook;
+
+    /* Отказ один раз: повтор тут же, правило снято. */
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    raw_close(&c);
+    CHECK(rule_count == 3 && strstr(rule_cmds[1], " -D OUTPUT") && strstr(rule_cmds[2], " -D OUTPUT"));
+
+    /* Отказ дважды: правило запомнено и снимается перед следующей вставкой. */
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 2;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    uint16_t leaked = c.sport;
+    raw_close(&c);
+    CHECK(rule_count == 3);
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    char want[64];
+    snprintf(want, sizeof want, "-D OUTPUT -p tcp --sport %u ", (unsigned)leaked);
+    CHECK(rule_count == 2 && strstr(rule_cmds[0], want) != NULL &&
+          strstr(rule_cmds[1], " -I OUTPUT") != NULL);
+    raw_close(&c);
     d2k_raw_rule_hook = raw_rule_system;
 }
 
@@ -362,6 +411,7 @@ int main(void)
     test_datapath_matches_raw_headers();
     test_disorder_pos2_emits_exact_reverse_segments();
     test_dial_survives_missing_rst_rule();
+    test_failed_release_is_retried();
     if (failures) { return 1; }
     puts("raw: checksum, connection-owned receives and concurrent ports passed (no network)");
     return 0;

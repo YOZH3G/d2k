@@ -50,6 +50,23 @@ static d2k_poison *add(const char *fmt, ...)
     return p;
 }
 
+/* Та же гипотеза по всем параметрам, кроме имени, уже есть в списке. */
+static int already_listed(const d2k_poison *p)
+{
+    int k;
+    for (k = 0; k < g_npoisons; k++) {
+        const d2k_poison *q = &g_poisons[k];
+        if (q == p) { continue; }
+        d2k_poison a = *q, b = *p;
+        memset(a.name, 0, sizeof a.name);
+        memset(b.name, 0, sizeof b.name);
+        if (a.repeats <= 1) { a.repeats = 1; }
+        if (b.repeats <= 1) { b.repeats = 1; }
+        if (memcmp(&a, &b, sizeof a) == 0) { return 1; }
+    }
+    return 0;
+}
+
 static void init_poisons(void)
 {
     static const int rr[3] = {7, 4, 2};
@@ -119,6 +136,12 @@ static void init_poisons(void)
         for (j = 0; j < 4; j++) {
             p = add("badsum-x%d-g%d", reps[j], gaps[i]);
             p->badsum = 1; p->repeats = reps[j]; p->gap_ms = gaps[i];
+            /* УЖЕ СПРОШЕНО ВЫШЕ (задача 49): badsum-x2-g20, badsum-x2-g80 и
+             * badsum-x7 (= x7-g0) стоят в голове списка, где им и место по
+             * цене. У донора они спрашивались второй раз — при единогласии
+             * исход повтора тот же, это три лишних зонда. Решение владельца
+             * 03.10: трассу донора здесь не повторяем. */
+            if (already_listed(p)) { g_npoisons--; }
         }
     }
 

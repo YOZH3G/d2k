@@ -48,6 +48,16 @@
 #include "d2k_quicwire.h"
 #include "test_quic_vector.h"
 
+static int g_progress_sum, g_progress_calls;
+static char g_progress_last[96];
+static void record_progress(const char *question, int probes)
+{
+    g_progress_calls++;
+    g_progress_sum += probes;
+    snprintf(g_progress_last, sizeof g_progress_last, "%s", question ? question : "");
+}
+
+
 static int fails;
 #define CHECK(cond, msg)                          \
     do {                                           \
@@ -986,8 +996,13 @@ int main(int argc, char **argv) {
         g_mock_poison_on_trigger = 0;
         d2k_quic_ask_arm_hook = mock_arm;
         d2k_quic_arm ip_arm;
+        g_progress_sum = 0; g_progress_calls = 0;
+        d2k_quic_progress_hook = record_progress;
         d2k_vres r = d2k_quic_run("203.0.113.7", 443, "203.0.113.7",
                                   trig_hello(), ctl_hello(), 0x2d, &ip_arm);
+        d2k_quic_progress_hook = NULL;
+        CHECK(g_progress_sum == r.probes,
+              "QUIC: ход полного Run с приёмами (askArms) не сходится с итогом зондов");
         CHECK(r.verdict == D2K_V_OPAQUE,
               "полный Run не сохранил verdict для блокируемой IP-цели");
         CHECK(g_arm_calls > 0,
@@ -1015,8 +1030,15 @@ int main(int argc, char **argv) {
         d2k_vres seeded = d2k_quic_run_seeded("203.0.113.7", 443, "203.0.113.7",
                                               trig_hello(), ctl_hello(), 0x2d, NULL, &base.base);
         mock_reset();
+        /* Задача 49: ход QUIC-прогона доходит до планировщика вопрос за
+           вопросом, и сумма зондов хода равна итогу прогона. */
+        g_progress_sum = 0; g_progress_calls = 0; g_progress_last[0] = '\0';
+        d2k_quic_progress_hook = record_progress;
         d2k_vres plain = d2k_quic_classify("203.0.113.7", 443, "203.0.113.7",
                                            trig_hello(), ctl_hello(), 0x2d);
+        d2k_quic_progress_hook = NULL;
+        CHECK(g_progress_calls >= 3 && g_progress_sum == plain.probes && g_progress_last[0],
+              "QUIC: ход прогона не дошёл до планировщика или сумма зондов не равна итогу");
         CHECK(seeded.verdict == plain.verdict &&
               seeded.qprops.residual_blocking == plain.qprops.residual_blocking,
               "QUIC seed: вердикт с ответом базы расходится с обычным прогоном");

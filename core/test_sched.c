@@ -166,7 +166,7 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
     if (tcp_progress_notes) {
         d2k_sched_progress_note("split", 0, 500);
         d2k_sched_progress_note("poison:seqovl-1", 0, 500);
-        r.probes = 1000;
+        r.probes = 1006; /* итог прогона больше хода: ответное направление хода не шлёт */
     }
     if (snapshot_enabled) {
         uint8_t before[2048];
@@ -2629,6 +2629,8 @@ int main(int argc, char **argv) {
     {
         d2k_catalog empty = {0};
         d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        /* Задача 49: QUIC-прогон отдаёт ход тем же приёмником. */
+        CHECK(d2k_quic_progress_hook != NULL, "QUIC progress is not wired into the scheduler");
         snapshot_enabled = 1; snapshot_entered = snapshot_release = snapshot_ok = 0;
         tcp_progress_notes = 1;
         tcp_answer = D2K_V_OPAQUE;
@@ -2652,14 +2654,16 @@ int main(int argc, char **argv) {
         snapshot_release = 1; pthread_cond_broadcast(&snapshot_cv);
         pthread_mutex_unlock(&snapshot_mu);
         settle(s);
-        /* Вернувшийся измеритель больше не «спрашивает»: его зонды не
-           переносятся в счётчик кандидатов (бюджет SCHED_MAX_PROBES) и не
-           складываются второй раз с итогом r.probes. */
+        /* Вернувшийся измеритель больше не «спрашивает», но его зонды с
+           карточки не исчезают (задача 49: счётчик монотонный): после
+           возврата — итог прогона r.probes (1006, а не ход 1000 и не сумма
+           2006) плюс зонды проверки плана. */
         e = live_task_entry(s, "progress.example");
         CHECK(!strstr(e, "\"question\": \"poison:seqovl-1\""),
               "a finished classifier keeps reporting its last question");
         int p = live_task_probes(s, "progress.example");
-        CHECK(p >= 0 && p < 1000, "classifier probes leaked into the verifier counter after return");
+        CHECK(p >= 1006 && p < 2006,
+              "live probes dropped after the classifier returned or counted it twice");
         d2k_sched_free(s); d2k_catalog_free(&empty);
         snapshot_enabled = 0; tcp_progress_notes = 0; tcp_answer = D2K_V_OPAQUE;
     }
@@ -10736,6 +10740,52 @@ own_first_test:
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
             d2k_sched_rx_ver_hook = saved_rx;
+        }
+
+        /* (a2) ЗАДАЧА 49: GREASE ECH (любой Chromium) — те же свои планы до
+           полного замера. Поле 03.10: meduza.io IPv6 со снимком ECH offer
+           шёл 4:37 полным деревом (104 зонда), хотя plan-680fbe00 той же
+           формы и семейства был в каталоге: own_first_plans отказывал при
+           ech_offer, а GREASE распознаётся позже, в рабочем потоке, после
+           чего поток сразу шёл в полный классификатор. */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-cf-grease", pid, 2, 3, "rutracker.grease", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched_rx_ver_hook = stub_rx_counting;
+            d2k_sched_ech_resolve_hook = stub_ech_resolve;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42105;
+            uint8_t eb[2048]; size_t el = 0;
+            CHECK(ech_offer_hello("grease-own.example", eb, sizeof eb, &el) == 0 &&
+                  d2k_hello_ech_offer(eb, el, NULL) == 1, "own-first GREASE: fixture");
+            d2k_ev h = ev_hello(6, 42105, "grease-own.example"); d2k_sched_event(s, &h);
+            d2k_ev sh; memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+            memcpy(sh.shape, eb, el); sh.shape_len = el;
+            d2k_sched_event(s, &sh);
+            d2k_ev su = ev_suspect(6, 42105); d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 42105); d2k_sched_event(s, &ap);
+            spin(s, 40);
+            CHECK(said("GREASE"), "own-first GREASE: GREASE не распознан");
+            CHECK(base_calls == 1, "own-first GREASE: базовый вопрос донора не задан");
+            CHECK(said("пробую свои подтверждённые планы до полного замера: 1"),
+                  "own-first GREASE: свои планы не пробовались до полного замера");
+            CHECK(tcp_calls == 0, "own-first GREASE: полный классификатор пошёл раньше своих планов");
+            const d2k_cat_binding *bd = binding_of(&c, "grease-own.example", 6);
+            CHECK(bd != NULL && !strcmp(bd->plan_id, pid),
+                  "own-first GREASE: цель не подтверждена своим планом");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_rx_ver_hook = saved_rx;
+            d2k_sched_ech_resolve_hook = d2k_ech_resolve;
         }
 
         /* (b) Свой план не подтвердился: классификация продолжается как

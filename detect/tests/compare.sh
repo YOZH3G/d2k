@@ -21,6 +21,13 @@
 # кода ошибки, а не разное поведение, поэтому таблица ниже сводит их к коду —
 # поимённо, а не общим sed'ом по слову «too»: общий заглушил бы настоящую
 # разницу, если бы она когда-нибудь появилась.
+# ЗАДАЧА 49: ТРАССА ПОЛНОГО ПЕРЕБОРА НАМЕРЕННО КОРОЧЕ ЭТАЛОНА. Эталон
+# спрашивает badsum-x2-g20 и badsum-x2-g80 дважды и badsum-x7-g0 вслед за
+# равным ему badsum-x7; d2k — нет (решение владельца 03.10: при единогласии
+# повтор проваленной гипотезы исхода не меняет). Поэтому у эталона повторные
+# строки этих трёх гипотез из трассы вырезаются (norm_ref), а число зондов
+# сверяется только там, где эталон до них не дошёл; где дошёл — разница
+# печатается как сведения (ровно 3 × повторов на зонд — ожидаемо).
 set -e
 
 Z2K=${Z2K:-/opt/sbin/z2k-detect}
@@ -57,6 +64,26 @@ norm() {
 	    "$1"
 }
 
+# Повторные строки трёх дублей эталона — прочь; число зондов тогда
+# заменяется пометкой, а сами числа печатаются отдельно (сведения).
+norm_ref() {
+	norm "$1" | awk '
+		/^ *poison:badsum-x7-g0 / { dup = 1; next }
+		/^ *poison:badsum-x2-g(20|80) / { if (seen[$1]++) { dup = 1; next } }
+		{ lines[n++] = $0 }
+		END { for (i = 0; i < n; i++) {
+			l = lines[i]
+			if (dup) sub(/Зондов: *[0-9]*/, "Зондов: (сведения)", l)
+			print l } }'
+}
+norm_port() {
+	if grep -q 'poison:badsum-x7-g0 ' "$2"; then
+		norm "$1" | sed 's/Зондов: *[0-9]*/Зондов: (сведения)/'
+	else
+		norm "$1"
+	fi
+}
+
 for target in "$@"; do
 	total=$((total + 1))
 	tag=$(echo "$target-$HELLO" | tr ':/' '__')
@@ -77,8 +104,12 @@ for target in "$@"; do
 	# shellcheck disable=SC2086
 	"$D2K" classify "$target" --raw "$(cat "$hex")" $ctl --repeats "$REPEATS" > "$OUT/$tag.d2k" 2>&1 || true
 
-	norm "$OUT/$tag.z2k" > "$OUT/$tag.z2k.n"
-	norm "$OUT/$tag.d2k" > "$OUT/$tag.d2k.n"
+	norm_ref "$OUT/$tag.z2k" > "$OUT/$tag.z2k.n"
+	norm_port "$OUT/$tag.d2k" "$OUT/$tag.z2k" > "$OUT/$tag.d2k.n"
+	if grep -q 'Зондов: (сведения)' "$OUT/$tag.z2k.n"; then
+		echo "  сведения: зондов эталон $(sed -n 's/^Зондов: *\([0-9]*\).*/\1/p' "$OUT/$tag.z2k")," \
+		     "порт $(sed -n 's/^Зондов: *\([0-9]*\).*/\1/p' "$OUT/$tag.d2k") (дубли эталона не спрашиваются)"
+	fi
 	if diff -u "$OUT/$tag.z2k.n" "$OUT/$tag.d2k.n" > "$OUT/$tag.diff" 2>&1; then
 		echo "СОВПАЛО   $target — $(sed -n 's/^Вердикт: *//p' "$OUT/$tag.d2k")"
 	else
