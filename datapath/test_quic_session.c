@@ -13,6 +13,7 @@
  * зовёт его на UDP-ветке пакетного пути и правильно распоряжается
  * результатом). ClientHello внутри несёт имя example.com.
  */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
