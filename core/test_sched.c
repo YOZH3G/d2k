@@ -11014,9 +11014,22 @@ own_first_test:
             d2k_ev h = ev_hello(6, 42151, "life.target.own"); d2k_sched_event(s, &h);
             d2k_ev su = ev_suspect(6, 42151); d2k_sched_event(s, &su);
             for (int i = 0; i < 40 && !said("пробую свои подтверждённые планы"); i++) spin(s, 20);
+            char since0[64] = "", since1[64] = "";
+            {
+                const char *e = strstr(live_task_entry(s, "life.target.own"), "\"since\": ");
+                if (e) snprintf(since0, sizeof since0, "%.40s", e);
+            }
             skip_ahead(s, 9 * 60 * 1000);
             for (int i = 0; i < 60 && tcp_calls == 0; i++) { skip_ahead(s, 6000); spin(s, 20); }
             CHECK(tcp_calls == 1, "own-first life: полный замер не начался после своих планов");
+            {
+                const char *e = strstr(live_task_entry(s, "life.target.own"), "\"since\": ");
+                if (e) snprintf(since1, sizeof since1, "%.40s", e);
+            }
+            /* Срок окна перезапущен, но время поиска на карточке — от его
+               начала: карточка не «молодеет» на фазу своих планов. */
+            CHECK(since0[0] && !strcmp(since0, since1),
+                  "own-first life: карточка показывает время от перезапуска окна, а не от начала поиска");
             skip_ahead(s, 3 * 60 * 1000);
             spin(s, 40);
             tcp_release_waiters = 1;

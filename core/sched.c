@@ -575,6 +575,7 @@ typedef struct {
     uint16_t   port;
 
     int64_t    started_ms; /* active search/lifecycle budget begins on launch */
+    int64_t    began_ms;   /* when this search began, for the card and verdict line only (task 49) */
     int64_t    queued_ms;  /* independent age of a queued suspicion */
     uint64_t   queued_event;
     /* «Горячая» цель (задача 29): по ждущей в очереди пришло новое
@@ -4020,7 +4021,8 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         fprintf(f, ", \"port\": %u", (unsigned)t->port);
         fputs(", \"phase\": ", f); json_str(f, task_phase(t));
         fputs(", \"since\": ", f);
-        int64_t admitted_ms = t->state == T_QUEUED ? t->queued_ms : t->started_ms;
+        int64_t admitted_ms = t->state == T_QUEUED ? t->queued_ms
+                            : (t->began_ms ? t->began_ms : t->started_ms);
         json_time(f, wall_s(s, admitted_ms ? admitted_ms : s->now_ms));
         /* Ход измерителя (задачи 48, 49): зонды задачи — кандидаты плюс
            прогоны измерителя (идущий — по ходу, законченный — его итог);
@@ -6843,6 +6845,7 @@ static void own_first_continue(d2k_sched *s, task *t) {
        свой целый SCHED_TASK_LIFE_MS: иначе десятки своих планов съедали бы
        его срок, и цель, которую замер нашёл бы, уходила в отдых. Страховка
        от зацикливания остаётся у каждой фазы. */
+    int64_t began = t->began_ms ? t->began_ms : t->started_ms;
     t->started_ms = s->now_ms;
     t->n_plans = t->n_known = t->next_plan = 0;
     t->exec_refused = t->exec_probed = 0;
@@ -6866,6 +6869,7 @@ static void own_first_continue(d2k_sched *s, task *t) {
     }
     char name[sizeof t->name];
     snprintf(name, sizeof name, "%s", t->name);
+    t->began_ms = began; /* перезапуск окна не «омолаживает» поиск на карточке */
     if (!start_search(s, t))
         say(s, "по %s полный замер не запустился — задача снята, следующее "
                "подозрение начнёт поиск заново", name);
@@ -7515,7 +7519,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                стенда: ровно этим кончился прогон транзита 17.09, где замер
                шёл третью минуту при окне стенда в две. Числа берём
                измеренные — часы задачи и её же счётчик зондов. */
-            long long took_s = (long long)((now_ms - t->started_ms + 500) / 1000);
+            long long took_s = (long long)((now_ms - (t->began_ms ? t->began_ms : t->started_ms) + 500) / 1000);
             /* Зонды берём У ЗАМЕРА (r.probes), а не у задачи (t->probes):
                задачный счётчик считает поставленные кандидаты, а не опыты
                измерителя, и печатал «0 зондов» там, где их было восемнадцать. */
