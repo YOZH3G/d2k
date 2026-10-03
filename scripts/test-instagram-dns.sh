@@ -40,7 +40,7 @@ EOF
 cat > "$TMP/bin/ndmc" <<'EOF'
 #!/bin/sh
 case "$*" in
-    *"show running-config"*) [ "${NDMC_FAIL_SHOW:-0}" = 1 ] && exit 7; cat "$NDMC_STATE" ;;
+    *"show running-config"*) [ "${NDMC_FAIL_SHOW:-0}" = 1 ] && exit 7; [ "${NDMC_EMPTY_SHOW:-0}" = 1 ] && exit 0; cat "$NDMC_STATE" ;;
     *"system configuration save"*) [ "${NDMC_FAIL_SAVE:-0}" = 1 ] && exit 8; : ;;
     "-c ip host "*)
         if [ "${NDMC_TERM_DURING_ADD:-0}" = 1 ]; then
@@ -140,7 +140,7 @@ ok "refresh pins VPS-verified Instagram, fbcdn and WhatsApp IPs and records only
 DEF="$TMP/default"
 mkdir -p "$DEF/d2k/state" "$DEF/d2k/files" "$DEF/d2k/log"
 : > "$DEF/d2k/config"; cp "$TMP/d2k/files/meta-ranges.txt" "$DEF/d2k/files/"
-: > "$DEF/ndmc-state"
+printf 'system name test-router\n' > "$DEF/ndmc-state"
 env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$DEF/d2k" D2K_CONFIG="$DEF/d2k/config" \
     D2K_META_RANGES="$DEF/d2k/files/meta-ranges.txt" \
     NDMC_STATE="$DEF/ndmc-state" NDMC_CALLS="$DEF/ndmc-calls" \
@@ -289,7 +289,7 @@ ok "a stop request lets the in-flight NDM add finish, then exits; removal takes 
 CLAIM="$TMP/claimed"
 mkdir -p "$CLAIM/d2k/state" "$CLAIM/d2k/files" "$CLAIM/d2k/log"
 cp "$TMP/d2k/files/meta-ranges.txt" "$CLAIM/d2k/files/"
-: > "$CLAIM/ndmc-state"
+printf 'system name test-router\n' > "$CLAIM/ndmc-state"
 printf 'graph.instagram.com 157.240.9.199\n' > "$CLAIM/d2k/state/instagram-ip-hosts.tsv"
 env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$CLAIM/d2k" D2K_META_RANGES="$CLAIM/d2k/files/meta-ranges.txt" \
     D2K_RELAY_URL=https://resolve.example/resolve \
@@ -301,5 +301,23 @@ env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$CLAIM/d2k" NDMC_STATE="$CLAIM/ndmc-state"
     D2K_INSTAGRAM_LOG="$CLAIM/remove.log" sh "$SCRIPT" remove || fail "remove failed"
 grep -q '^ip host graph.instagram.com 157.240.9.199$' "$CLAIM/ndmc-state" || fail "a stale claim removed the user's own later pin"
 ok "a claim that never reached NDM is dropped at the next refresh"
+
+# NDM answering an empty configuration with exit 0 is a read failure, not
+# "no pins": every owned claim must survive it.
+EMPTY="$TMP/empty-show"
+mkdir -p "$EMPTY/d2k/state" "$EMPTY/d2k/files" "$EMPTY/d2k/log"
+cp "$TMP/d2k/files/meta-ranges.txt" "$EMPTY/d2k/files/"
+printf 'ip host graph.instagram.com 157.240.9.199\n' > "$EMPTY/ndmc-state"
+printf 'graph.instagram.com 157.240.9.199\n' > "$EMPTY/d2k/state/instagram-ip-hosts.tsv"
+cp "$EMPTY/d2k/state/instagram-ip-hosts.tsv" "$EMPTY/manifest-before"
+if env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$EMPTY/d2k" D2K_META_RANGES="$EMPTY/d2k/files/meta-ranges.txt" \
+    D2K_RELAY_URL=https://resolve.example/resolve NDMC_EMPTY_SHOW=1 \
+    NDMC_STATE="$EMPTY/ndmc-state" NDMC_CALLS="$EMPTY/ndmc-calls" CURL_CALLS="$EMPTY/curl-calls" \
+    D2K_INSTAGRAM_LOG="$EMPTY/refresh.log" sh "$SCRIPT" refresh; then
+    fail "refresh treated an empty NDM configuration as valid"
+fi
+cmp -s "$EMPTY/manifest-before" "$EMPTY/d2k/state/instagram-ip-hosts.tsv" || fail "empty NDM read dropped owned claims"
+[ ! -s "$EMPTY/ndmc-calls" ] || fail "empty NDM read still changed DNS"
+ok "an empty NDM configuration read is a failure and keeps every claim"
 
 echo "Instagram DNS lifecycle: all checks passed"

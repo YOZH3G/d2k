@@ -39,7 +39,13 @@ is_meta_ip() {
     valid_ipv4 "$1" || return 1
     awk -v ip="$1" 'function n(s,a){split(s,a,".");return ((a[1]*256+a[2])*256+a[3])*256+a[4]} BEGIN{v=n(ip);ok=0} /^[[:space:]]*#/||/^[[:space:]]*$/ {next} {split($0,p,"/");if(p[2]!~/^[0-9]+$/||p[2]<0||p[2]>32)next;s=2^(32-p[2]);if(int(v/s)==int(n(p[1])/s))ok=1} END{exit !ok}' "$META_RANGES" 2>/dev/null
 }
-running_config() { LD_LIBRARY_PATH='' ndmc -c 'show running-config' 2>/dev/null; }
+# A live NDM configuration is never empty; empty output is a failed read and
+# must not be taken as "none of our pins exist".
+running_config() {
+    _cfg=$(LD_LIBRARY_PATH='' ndmc -c 'show running-config' 2>/dev/null) || return 1
+    [ -n "$_cfg" ] || return 1
+    printf '%s\n' "$_cfg"
+}
 record_exists() {
     current=$(running_config) || return 2
     printf '%s\n' "$current" | awk -v h="$1" -v ip="$2" \
