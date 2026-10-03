@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "d2k_udp_release.h"
 #include "d2k_nl.h"
@@ -47,6 +48,41 @@ static void note_done(void *ctx, const d2k_key *key, uint64_t token,
         done_completes[done_calls - 1] = complete;
         done_sent_counts[done_calls - 1] = sent;
     }
+}
+
+/* Задача 46: журнал вызовов выпуска пачки — вердикты ('v') и посылки ('s'). */
+static char log_kind[32];
+static uint32_t log_id[32], log_v[32];
+static size_t log_len[32];
+static uint8_t log_byte[32];
+static size_t log_n;
+static size_t resend_fail_at;
+static uint32_t verdict_fail_id;
+
+static int log_verdict(void *ctx, uint32_t id, uint32_t verdict) {
+    (void)ctx;
+    if (log_n < 32) { log_kind[log_n] = 'v'; log_id[log_n] = id; log_v[log_n] = verdict; }
+    log_n++;
+    return id == verdict_fail_id ? -1 : 0;
+}
+
+static int log_resend(void *ctx, const uint8_t *p, size_t n) {
+    (void)ctx;
+    if (log_n < 32) { log_kind[log_n] = 's'; log_len[log_n] = n; log_byte[log_n] = n ? p[0] : 0; }
+    log_n++;
+    size_t sends = 0;
+    for (size_t i = 0; i < log_n && i < 32; i++) sends += log_kind[i] == 's';
+    return (resend_fail_at && sends == resend_fail_at) ? -1 : 0;
+}
+
+static void build_udp4(uint8_t *p, uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport) {
+    memset(p, 0, 40);
+    p[0] = 0x45; p[2] = 0; p[3] = 40; p[8] = 64; p[9] = 17;
+    p[12] = (uint8_t)(src >> 24); p[13] = (uint8_t)(src >> 16); p[14] = (uint8_t)(src >> 8); p[15] = (uint8_t)src;
+    p[16] = (uint8_t)(dst >> 24); p[17] = (uint8_t)(dst >> 16); p[18] = (uint8_t)(dst >> 8); p[19] = (uint8_t)dst;
+    p[20] = (uint8_t)(sport >> 8); p[21] = (uint8_t)sport;
+    p[22] = (uint8_t)(dport >> 8); p[23] = (uint8_t)dport;
+    p[24] = 0; p[25] = 20;
 }
 
 int main(void) {
@@ -103,19 +139,144 @@ int main(void) {
     {
         uint32_t v[3] = {9, 9, 9};
         uint8_t again[3] = {9, 9, 9};
-        CHECK(d2k_udp_replay_fates(3, D2K_NF_DROP, 1, v, again) == 2,
+        CHECK(d2k_udp_replay_fates(3, D2K_NF_DROP, 1, 1, v, again) == 2,
               "owned batch: both tails are re-sent by the datapath");
         CHECK(v[0] == D2K_NF_DROP && v[1] == D2K_NF_DROP && v[2] == D2K_NF_DROP,
               "owned batch: every queued copy is dropped");
         CHECK(!again[0] && again[1] && again[2],
               "the head is the plan's own emit, only tails are re-sent");
-        CHECK(d2k_udp_replay_fates(3, D2K_NF_ACCEPT, 0, v, again) == 0,
-              "not owned: the kernel releases everything");
-        CHECK(v[0] == D2K_NF_ACCEPT && v[1] == D2K_NF_ACCEPT && v[2] == D2K_NF_ACCEPT &&
-              !again[0] && !again[1] && !again[2], "not owned: plain ACCEPT");
-        CHECK(d2k_udp_replay_fates(2, D2K_NF_DROP, 0, v, again) == 0 &&
-              v[0] == D2K_NF_DROP && v[1] == D2K_NF_ACCEPT,
-              "a failed owner keeps the old verdict split");
+        /* Задача 46: хвосты идут за головой и БЕЗ плана. Голова получает свой
+           вердикт ядру, хвосты — нашей сырой посылкой, копии снимаются. */
+        CHECK(d2k_udp_replay_fates(3, D2K_NF_ACCEPT, 0, 1, v, again) == 2,
+              "unowned batch: tails are re-sent after the head");
+        CHECK(v[0] == D2K_NF_ACCEPT && v[1] == D2K_NF_DROP && v[2] == D2K_NF_DROP &&
+              !again[0] && again[1] && again[2],
+              "unowned batch: head ACCEPT, queued tail copies dropped");
+        CHECK(d2k_udp_replay_fates(1, D2K_NF_ACCEPT, 0, 1, v, again) == 0 &&
+              v[0] == D2K_NF_ACCEPT && !again[0],
+              "a single datagram has no tail to re-send");
+        CHECK(d2k_udp_replay_fates(2, D2K_NF_DROP, 0, 1, v, again) == 1 &&
+              v[0] == D2K_NF_DROP && v[1] == D2K_NF_DROP && again[1],
+              "a failed owner still re-sends its tails instead of losing them");
+        CHECK(d2k_udp_replay_fates(3, D2K_NF_ACCEPT, 0, 0, v, again) == 0 &&
+              v[0] == D2K_NF_ACCEPT && v[1] == D2K_NF_ACCEPT && v[2] == D2K_NF_ACCEPT &&
+              !again[0] && !again[1] && !again[2],
+              "without a raw path (observe) everything goes to the kernel");
+    }
+
+    /* Задача 46: порядок выпуска пачки — вердикт головы, затем каждый хвост
+       нашей посылкой и снятие его копии; копия не уходит второй раз; отказ
+       посылки — ACCEPT копии. */
+    for (size_t count = 2; count <= 4; count++) {
+        d2k_udp_hold_batch b;
+        memset(&b, 0, sizeof b);
+        b.count = count;
+        for (size_t i = 0; i < count; i++) {
+            b.ids[i] = (uint32_t)(40 + i);
+            b.len[i] = 30 + i;
+            memset(b.packets[i], (int)(0xA0 + i), b.len[i]);
+        }
+        log_n = 0;
+        resend_fail_at = 0;
+        int vfail = 0;
+        size_t rfail = 9;
+        CHECK(d2k_udp_release_batch(&b, D2K_NF_ACCEPT, 0, 1, log_verdict, log_resend,
+                                    NULL, &vfail, &rfail) == count - 1,
+              "unplanned batch: every tail re-sent");
+        CHECK(!vfail && rfail == 0, "no failure reported on a clean release");
+        CHECK(log_n == 1 + 2 * (count - 1), "one verdict per ID and one send per tail");
+        CHECK(log_kind[0] == 'v' && log_id[0] == 40 && log_v[0] == D2K_NF_ACCEPT,
+              "the head's verdict goes first");
+        for (size_t i = 1; i < count; i++) {
+            size_t a = 1 + 2 * (i - 1);
+            CHECK(log_kind[a] == 's' && log_len[a] == 30 + i && log_byte[a] == 0xA0 + i,
+                  "tail re-sent byte for byte, in arrival order, after the head");
+            CHECK(log_kind[a + 1] == 'v' && log_id[a + 1] == 40 + i &&
+                  log_v[a + 1] == D2K_NF_DROP,
+                  "the re-sent tail's queued copy is dropped right after");
+        }
+    }
+    {
+        d2k_udp_hold_batch b;
+        memset(&b, 0, sizeof b);
+        b.count = 3;
+        for (size_t i = 0; i < 3; i++) { b.ids[i] = (uint32_t)(50 + i); b.len[i] = 20; }
+        log_n = 0;
+        resend_fail_at = 2; /* the second re-send (tail #2) fails */
+        int vfail = 0;
+        size_t rfail = 0;
+        CHECK(d2k_udp_release_batch(&b, D2K_NF_ACCEPT, 0, 1, log_verdict, log_resend,
+                                    NULL, &vfail, &rfail) == 1 && rfail == 1,
+              "one failed re-send is counted");
+        CHECK(log_n == 5 && log_id[4] == 52 && log_v[4] == D2K_NF_ACCEPT,
+              "a tail that could not be re-sent is released to the kernel");
+        CHECK(log_id[2] == 51 && log_v[2] == D2K_NF_DROP,
+              "the successfully re-sent tail is still dropped");
+        resend_fail_at = 0;
+
+        /* Owned batch: the head's copy is dropped too, tails follow the plan. */
+        log_n = 0;
+        CHECK(d2k_udp_release_batch(&b, D2K_NF_DROP, 1, 1, log_verdict, log_resend,
+                                    NULL, &vfail, &rfail) == 2,
+              "owned batch re-sends both tails");
+        CHECK(log_kind[0] == 'v' && log_id[0] == 50 && log_v[0] == D2K_NF_DROP,
+              "owned: the head copy is dropped, its bytes left as the plan's emit");
+        CHECK(log_v[2] == D2K_NF_DROP && log_v[4] == D2K_NF_DROP,
+              "owned: tail copies dropped");
+
+        /* Observe mode: nothing re-sent, plain ACCEPT in order. */
+        log_n = 0;
+        CHECK(d2k_udp_release_batch(&b, D2K_NF_ACCEPT, 0, 0, log_verdict, log_resend,
+                                    NULL, &vfail, &rfail) == 0 && log_n == 3,
+              "without a raw path every copy gets its verdict");
+        CHECK(log_kind[0] == 'v' && log_kind[1] == 'v' && log_kind[2] == 'v' &&
+              log_v[1] == D2K_NF_ACCEPT && log_v[2] == D2K_NF_ACCEPT,
+              "observe: no send, all ACCEPT");
+
+        /* A failed verdict is reported, the rest still released. */
+        log_n = 0;
+        verdict_fail_id = 50;
+        vfail = 0;
+        (void)d2k_udp_release_batch(&b, D2K_NF_ACCEPT, 0, 1, log_verdict, log_resend,
+                                    NULL, &vfail, &rfail);
+        CHECK(vfail && log_n == 5, "verdict failure reported; tails not abandoned");
+        verdict_fail_id = 0;
+    }
+
+    /* Задача 46: датаграммы потока, которые ядро поставило в очередь, пока
+       голова ещё ждала, но которых не было в пачке (пришли позже её выпуска),
+       идут тем же путём. Окно — по кортежу и направлению клиента. */
+    {
+        d2k_udp_follow *f = d2k_udp_follow_new();
+        CHECK(f != NULL, "follow allocation");
+        uint8_t a[40], rev[40], other[40], tcp[40], frag[40];
+        build_udp4(a, 0xC0A80143u, 0x3990F8C0u, 50000, 443);
+        build_udp4(rev, 0x3990F8C0u, 0xC0A80143u, 443, 50000);
+        build_udp4(other, 0xC0A80143u, 0x3990F8C0u, 50001, 443);
+        build_udp4(tcp, 0xC0A80143u, 0x3990F8C0u, 50000, 443);
+        tcp[9] = 6;
+        build_udp4(frag, 0xC0A80143u, 0x3990F8C0u, 50000, 443);
+        frag[6] = 0x20; /* MF */
+        CHECK(!d2k_udp_follow_match(f, a, sizeof a, 1000), "nothing marked yet");
+        CHECK(d2k_udp_follow_mark(f, a, sizeof a, 1000) == 0, "mark the released head");
+        CHECK(d2k_udp_follow_match(f, a, sizeof a, 1000 + D2K_UDP_FOLLOW_NS - 1),
+              "a later datagram of the same client flow follows the head");
+        CHECK(!d2k_udp_follow_match(f, rev, sizeof rev, 1001),
+              "the server's direction is never re-sent");
+        CHECK(!d2k_udp_follow_match(f, other, sizeof other, 1001),
+              "another client port is another flow");
+        CHECK(!d2k_udp_follow_match(f, tcp, sizeof tcp, 1001), "TCP never matches");
+        CHECK(!d2k_udp_follow_match(f, frag, sizeof frag, 1001),
+              "an IP fragment is not re-sent as a whole datagram");
+        CHECK(!d2k_udp_follow_match(f, a, sizeof a, 1000 + D2K_UDP_FOLLOW_NS),
+              "the window closes");
+        for (uint16_t p = 0; p < 200; p++) {
+            build_udp4(other, 0xC0A80143u, 0x3990F8C0u, (uint16_t)(1000 + p), 443);
+            (void)d2k_udp_follow_mark(f, other, sizeof other, 5000);
+        }
+        CHECK(d2k_udp_follow_match(f, other, sizeof other, 5001),
+              "a full table still takes the newest head");
+        d2k_udp_follow_free(f);
     }
     if (!fails) puts("UDP release: due ordering and bounded ownership passed");
     return fails != 0;

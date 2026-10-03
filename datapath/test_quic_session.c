@@ -584,6 +584,72 @@ static void test_quic_held_initial_replay_is_first_packet(void) {
     d2k_nat_hook = saved_nat;
 }
 
+/* ЗАДАЧА 46: ПЕРВАЯ ДАТАГРАММА НЕ ЧИТАЕТ ТАБЛИЦУ CONNTRACK.
+ *
+ * Поле 03.10.2026: спланированный QUIC Initial уходил через 42 мс (против
+ * ~1 мс без плана), и все 42 мс — три полных чтения /proc/net/nf_conntrack
+ * по ~14 мс на роутере, каждое заведомо пустое: запись первой датаграммы не
+ * подтверждена, пока она сама стоит в очереди, а ответ для первого пакета
+ * всё равно «можно». Хвосты потока всё это время ждали в очереди со своей
+ * неподтверждённой записью. Чтение остаётся для непервых пакетов. */
+static unsigned nat_lookups;
+static int quic_nat_counting(const char *path, uint8_t proto,
+                             uint32_t src, uint16_t sport,
+                             uint32_t dst, uint16_t dport,
+                             uint32_t *outside_src, uint16_t *outside_sport) {
+    (void)path; (void)proto; (void)src; (void)sport;
+    (void)dst; (void)dport; (void)outside_src; (void)outside_sport;
+    nat_lookups++;
+    return -1;
+}
+
+static void test_quic_first_packet_skips_conntrack_scan(void) {
+    d2k_nat_fn saved_nat = d2k_nat_hook;
+    d2k_nat_hook = quic_nat_counting;
+    d2k_session *s = d2k_session_new(64, 32);
+    d2k_plan *p = NULL;
+    char err[160];
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    CHECK(s && d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_name_shaped(d2k_session_plans(s),
+                  (const uint8_t *)"example.com", 11, 1, p,
+                  D2K_PLAN_SHAPE_QUIC) == 0,
+          "first-packet scan fixture");
+    if (!s) { d2k_nat_hook = saved_nat; return; }
+
+    /* Held and replayed first Initial (the d2kd path). */
+    size_t n = build_udp_pkt(pkt, 50611, 443, v1_initial, sizeof v1_initial);
+    d2k_key key;
+    nat_lookups = 0;
+    CHECK(d2k_session_udp_hold_begin(s, pkt, n, 1000, &key) == 1, "hold begins");
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(r.udp_hold_ready, "assembled Initial asks for replay");
+    d2k_session_udp_hold_replay(s, &key);
+    d2k_session_packet(s, pkt, n, 1001, buf, sizeof buf, &r);
+    CHECK(r.applied && r.n_out > 0, "the held first Initial still gets its plan");
+    CHECK(nat_lookups == 0,
+          "the first datagram must not scan conntrack: its entry is unconfirmed by construction");
+
+    /* Unheld first Initial (direct path). */
+    n = build_udp_pkt(pkt, 50612, 443, v1_initial, sizeof v1_initial);
+    nat_lookups = 0;
+    d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+    CHECK(r.applied && nat_lookups == 0, "direct first Initial: plan, no scan");
+
+    /* A later packet that gets a plan (retransmit after a lost original)
+       still proves its conntrack entry. */
+    d2k_session_sent(s, 2001, &r.key, r.execution_id);
+    (void)d2k_session_exec_failed(s, 2002, &r.key, r.plan_id, D2K_REFUSE_SEND,
+                                  r.execution_id, 0, 0);
+    nat_lookups = 0;
+    d2k_session_packet(s, pkt, n, 300002000ull, buf, sizeof buf, &r);
+    CHECK(nat_lookups > 0 && !r.applied,
+          "a non-first packet without a conntrack entry is still refused");
+    d2k_session_free(s);
+    d2k_nat_hook = saved_nat;
+}
+
 /* ЗАДАЧА 42: ОРИГИНАЛ ПОСЛЕ ФАЛЬШИВОК УХОДИТ НАШЕЙ ПОСЫЛКОЙ.
  *
  * Поле 02.10.2026 (задача 33): сырые фальшивки создают и подтверждают запись
@@ -1588,6 +1654,7 @@ int main(void) {
     test_quic_cross_datagram_assembly();
     test_quic_split_hold_handshake();
     test_quic_held_initial_replay_is_first_packet();
+    test_quic_first_packet_skips_conntrack_scan();
     test_quic_retry_resets_assembly();
     test_quic_original_after_fakes();
     test_quic_crypto_split_plan();

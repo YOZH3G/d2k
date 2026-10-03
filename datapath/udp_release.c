@@ -3,6 +3,7 @@
 
 #include "d2k_udp_release.h"
 #include "d2k_nl.h"
+#include "d2k_packet.h"
 
 typedef struct {
     int used;
@@ -131,19 +132,112 @@ uint64_t d2k_udp_release_next_ns(const d2k_udp_release *q) {
 }
 
 size_t d2k_udp_replay_fates(size_t count, uint32_t head_verdict, int owned,
-                            uint32_t *verdicts, uint8_t *resend) {
+                            int can_resend, uint32_t *verdicts, uint8_t *resend) {
     size_t again = 0;
+    if (owned) { can_resend = 1; }
     for (size_t i = 0; i < count; i++) {
-        if (owned) {
-            /* The head is already the plan's last emit; the tails follow it
-               through the same raw path and the same conntrack entry. */
+        if (i == 0) {
+            /* An owned head already left as the plan's last emit. */
+            verdicts[i] = owned ? D2K_NF_DROP : head_verdict;
+            resend[i] = 0;
+        } else if (can_resend) {
             verdicts[i] = D2K_NF_DROP;
-            resend[i] = i > 0;
-            again += i > 0;
+            resend[i] = 1;
+            again++;
         } else {
-            verdicts[i] = i == 0 ? head_verdict : D2K_NF_ACCEPT;
+            verdicts[i] = D2K_NF_ACCEPT;
             resend[i] = 0;
         }
     }
     return again;
+}
+
+size_t d2k_udp_release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
+                             int owned, int can_resend,
+                             d2k_udp_release_send verdict, d2k_udp_resend resend,
+                             void *ctx, int *verdict_failed, size_t *resend_failed) {
+    uint32_t v[D2K_UDP_HOLD_PACKETS];
+    uint8_t again[D2K_UDP_HOLD_PACKETS];
+    size_t resent = 0, fell_back = 0;
+    int vfail = 0;
+    if (!b || !verdict || b->count == 0 || b->count > D2K_UDP_HOLD_PACKETS) {
+        if (verdict_failed) { *verdict_failed = b && b->count ? 1 : 0; }
+        if (resend_failed) { *resend_failed = 0; }
+        return 0;
+    }
+    if (!resend) { can_resend = 0; owned = 0; }
+    (void)d2k_udp_replay_fates(b->count, head_verdict, owned, can_resend, v, again);
+    for (size_t i = 0; i < b->count; i++) {
+        if (again[i]) {
+            if (resend(ctx, b->packets[i], b->len[i]) == 0) {
+                resent++;
+            } else {
+                v[i] = D2K_NF_ACCEPT;
+                fell_back++;
+            }
+        }
+        if (verdict(ctx, b->ids[i], v[i]) != 0) { vfail = 1; }
+    }
+    if (verdict_failed) { *verdict_failed = vfail; }
+    if (resend_failed) { *resend_failed = fell_back; }
+    return resent;
+}
+
+typedef struct {
+    uint64_t until_ns;
+    uint8_t family;
+    uint8_t src[16], dst[16];
+    uint8_t ports[4];
+} follow_entry;
+
+struct d2k_udp_follow { follow_entry e[D2K_UDP_FOLLOW_SLOTS]; };
+
+d2k_udp_follow *d2k_udp_follow_new(void) { return calloc(1, sizeof(d2k_udp_follow)); }
+
+void d2k_udp_follow_free(d2k_udp_follow *f) { free(f); }
+
+static int follow_tuple(const uint8_t *pkt, size_t len, follow_entry *out) {
+    d2k_packet_view v;
+    if (!d2k_packet_parse(pkt, len, &v) || v.protocol != 17) { return -1; }
+    /* d2k_packet_parse refuses later fragments; the first one still parses.
+       Neither is a whole datagram to re-send. */
+    if (v.family == 4 && (v.fragment & 0x2000u)) { return -1; }
+    memset(out, 0, sizeof *out);
+    out->family = v.family;
+    size_t alen = v.family == 6 ? 16 : 4;
+    memcpy(out->src, v.src.bytes, alen);
+    memcpy(out->dst, v.dst.bytes, alen);
+    memcpy(out->ports, pkt + v.l4, 4);
+    return 0;
+}
+
+static int same_tuple(const follow_entry *a, const follow_entry *b) {
+    return a->family == b->family && !memcmp(a->src, b->src, sizeof a->src) &&
+           !memcmp(a->dst, b->dst, sizeof a->dst) && !memcmp(a->ports, b->ports, 4);
+}
+
+int d2k_udp_follow_mark(d2k_udp_follow *f, const uint8_t *pkt, size_t len,
+                        uint64_t now_ns) {
+    follow_entry t;
+    if (!f || follow_tuple(pkt, len, &t) != 0) { return -1; }
+    t.until_ns = now_ns + D2K_UDP_FOLLOW_NS;
+    follow_entry *slot = NULL;
+    for (size_t i = 0; i < D2K_UDP_FOLLOW_SLOTS; i++) {
+        follow_entry *e = &f->e[i];
+        if (e->until_ns && same_tuple(e, &t)) { slot = e; break; }
+        if (!slot || e->until_ns < slot->until_ns) { slot = e; }
+    }
+    *slot = t;
+    return 0;
+}
+
+int d2k_udp_follow_match(const d2k_udp_follow *f, const uint8_t *pkt, size_t len,
+                         uint64_t now_ns) {
+    follow_entry t;
+    if (!f || follow_tuple(pkt, len, &t) != 0) { return 0; }
+    for (size_t i = 0; i < D2K_UDP_FOLLOW_SLOTS; i++) {
+        const follow_entry *e = &f->e[i];
+        if (e->until_ns > now_ns && same_tuple(e, &t)) { return 1; }
+    }
+    return 0;
 }

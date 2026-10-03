@@ -93,8 +93,8 @@ udp_hold.o: udp_hold.c $(HDR)
 udp_release.o: udp_release.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test_udp_hold: test_udp_hold.c udp_hold.o hold.o capture.o track.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_udp_hold.c udp_hold.o hold.o capture.o track.o $(LDFLAGS)
+test_udp_hold: test_udp_hold.c udp_hold.o udp_release.o hold.o capture.o track.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_udp_hold.c udp_hold.o udp_release.o hold.o capture.o track.o $(LDFLAGS)
 
 test_udp_release: test_udp_release.c udp_release.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_udp_release.c udp_release.o $(LDFLAGS)

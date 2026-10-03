@@ -188,10 +188,16 @@ static struct {
     uint64_t recv_err;
 } st;
 
-typedef struct { d2k_session *sess; d2k_nfq *q; } hold_context;
+/* raw/sched/follow are set only in apply mode with a raw socket: without them
+   held UDP tails go back to the kernel as before (observe mode). */
+typedef struct {
+    d2k_session *sess; d2k_nfq *q;
+    d2k_raw *raw; d2k_sched *sched; d2k_udp_follow *follow;
+} hold_context;
 static d2k_hold *holding;
 static d2k_udp_hold *udp_holding;
 static d2k_udp_release *udp_releases;
+static d2k_udp_follow *udp_follow;
 static int send_original_verdict(void *ctx, uint32_t id, uint32_t verdict) {
     hold_context *c = ctx;
     char err[256];
@@ -242,6 +248,81 @@ static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n)
     d2k_session_note_unassembled(c->sess, p, n, now_ns());
     d2k_session_observe_tcp(c->sess, p, n, now_ns());
     (void)send_original_verdict(ctx, id, D2K_NF_ACCEPT);
+}
+
+/* ХВОСТ ПОТОКА UDP — ЗА ГОЛОВОЙ, НАШЕЙ ПОСЫЛКОЙ (задачи 42, 46).
+ *
+ * Датаграмма, пришедшая в conntrack, пока голова потока ещё стояла в очереди,
+ * несёт свою неподтверждённую запись; отпущенная ядру после головы, она
+ * проигрывает вставку и снимается (insert_failed/drop: 61 из 61 прироста на
+ * роутере 03.10.2026 — хвосты ClientHello, 0-RTT, повторы). Поэтому она уходит
+ * сырым путём побайтно, как пришла (суммы ядро досчитало до выдачи: GSO в
+ * очереди выключен, см. nfq.c), через запись, которую голова только что
+ * подтвердила, — с той же трансляцией; копия в очереди снимается. Посылка,
+ * которой положено ждать отложенных посылок плана, встаёт в их очередь без
+ * ключа: это байты клиента, и уйти они обязаны при любом исходе плана. */
+typedef struct {
+    hold_context *hc;
+    uint64_t at, t;
+} tail_context;
+
+static int tail_verdict(void *ctx, uint32_t id, uint32_t verdict) {
+    return send_original_verdict(((tail_context *)ctx)->hc, id, verdict);
+}
+
+static int tail_resend(void *ctx, const uint8_t *p, size_t n) {
+    tail_context *c = ctx;
+    char err[256];
+    int ok = c->hc->raw && d2k_raw_prepare(c->hc->raw, p, n, err, sizeof err) == 0;
+    if (!c->hc->raw) { snprintf(err, sizeof err, "нет сырого сокета"); }
+    if (ok && c->at <= c->t) {
+        ok = d2k_raw_send(c->hc->raw, p, n, err, sizeof err) == 0;
+        if (ok) { st.emitted++; st.emitted_now++; }
+    } else if (ok) {
+        ok = d2k_sched_push_serial(c->hc->sched, c->at, p, n, NULL, 0) == 0;
+        if (ok) {
+            st.deferred++;
+        } else {
+            snprintf(err, sizeof err, "очередь отложенных полна");
+        }
+    }
+    if (!ok) {
+        st.send_fail++;
+        fprintf(stderr, "d2kd: хвост потока UDP не переиздан, отдаю ядру: %s\n", err);
+    }
+    return ok ? 0 : -1;
+}
+
+/* Выпуск удержанной пачки целиком и отметка её потока: датаграммы, которых в
+   пачке не было, но которые уже стоят в очереди за ней, идут тем же путём
+   (d2k_udp_follow, d2k_udp_release.h). Возвращает «вердикт не ушёл». */
+static int release_udp_batch(hold_context *hc, const d2k_udp_hold_batch *b,
+                             uint32_t head_verdict, int owned,
+                             uint64_t at, uint64_t t) {
+    tail_context tc = {hc, at, t};
+    int can = hc->raw && hc->sched;
+    int vfail = 0;
+    size_t rfail = 0;
+    (void)d2k_udp_release_batch(b, head_verdict, owned, can, tail_verdict,
+                                can ? tail_resend : NULL, &tc, &vfail, &rfail);
+    if (can && hc->follow && b->count) {
+        (void)d2k_udp_follow_mark(hc->follow, b->packets[0], b->len[0], now_ns());
+    }
+    return vfail;
+}
+
+/* Истечение или переполнение удержания: голова уходит ядру, хвосты — за ней. */
+static void release_udp_hold(void *ctx, const d2k_udp_hold_batch *b) {
+    hold_context *c = ctx;
+    if (!b->count) { return; }
+    d2k_key udp_key;
+    /* The hold transaction closes with the slot; otherwise the next packet on
+       the same 5-tuple would be held against originals that are gone. */
+    if (d2k_session_udp_hold_begin(c->sess, b->packets[0], b->len[0], now_ns(), &udp_key)) {
+        d2k_session_udp_hold_end(c->sess, &udp_key);
+    }
+    uint64_t t = now_ns();
+    (void)release_udp_batch(c, b, D2K_NF_ACCEPT, 0, t, t);
 }
 
 static const char *MODE_NAMES[] = {"observe", "apply"};
@@ -726,7 +807,9 @@ int main(int argc, char **argv) {
     if (mode == MODE_APPLY && !udp_releases) {
         fprintf(stderr, "d2kd: нет памяти для задержанных UDP-вердиктов — split Plan будет fail-open\n");
     }
-    hold_context hc = {sess, q};
+    udp_follow = mode == MODE_APPLY && raw ? d2k_udp_follow_new() : NULL;
+    hold_context hc = {sess, q, mode == MODE_APPLY ? raw : NULL,
+                       mode == MODE_APPLY ? sched : NULL, udp_follow};
 
     static uint8_t rbuf[RECV_BUF];
     static uint8_t obuf[OUT_BUF];
@@ -762,6 +845,8 @@ int main(int argc, char **argv) {
         uint64_t due = d2k_sched_next_ns(sched);
         if (due && due < wake) { wake = due; }
         due = d2k_udp_release_next_ns(udp_releases);
+        if (due && due < wake) { wake = due; }
+        due = d2k_udp_hold_next_ns(udp_holding);
         if (due && due < wake) { wake = due; }
         due = d2k_hold_next(holding);
         if (due && due < wake) { wake = due; }
@@ -815,17 +900,17 @@ int main(int argc, char **argv) {
 
         d2k_hold_flush(holding, now_ns(), d2k_session_plan_revision(sess), 0,
                         release_original, &hc);
-        d2k_udp_hold_flush(udp_holding, now_ns(), release_original, &hc);
+        d2k_udp_hold_flush(udp_holding, now_ns(), release_udp_hold, &hc);
         if (pr > 0 && (pfd[iq].revents & POLLIN)) {
             ssize_t n = d2k_nfq_recv(q, rbuf, sizeof rbuf, err, sizeof err);
             if (n == -1) {
                 st.recv_err++;
                 fprintf(stderr, "d2kd: %s\n", err);
                 d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
-                d2k_udp_hold_flush(udp_holding, now_ns(), release_original, &hc);
+                d2k_udp_hold_flush(udp_holding, now_ns(), release_udp_hold, &hc);
             } else if (n == -2) {
                 d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
-                d2k_udp_hold_flush(udp_holding, now_ns(), release_original, &hc);
+                d2k_udp_hold_flush(udp_holding, now_ns(), release_udp_hold, &hc);
             } else if (n > 0) {
                 t = now_ns();
                 d2k_nl_iter it;
@@ -877,7 +962,7 @@ int main(int argc, char **argv) {
                                                    t, &udp_key)) {
                         if (!d2k_udp_hold_feed(udp_holding, &udp_key, np.id,
                                                np.payload, np.payload_len, t,
-                                               release_original, &hc)) {
+                                               release_udp_hold, &hc)) {
                             d2k_session_udp_hold_end(sess, &udp_key);
                         }
                     }
@@ -1165,52 +1250,19 @@ int main(int argc, char **argv) {
                         }
                     }
 
-                    /* ХВОСТЫ СОСТАВНОГО INITIAL — ТОЖЕ НАШИ (задача 42).
+                    /* ХВОСТЫ УДЕРЖАННОЙ ПАЧКИ — ЗА ГОЛОВОЙ (задачи 42, 46).
                      *
-                     * План забрал первый оригинал и выпустил его последней
-                     * своей посылкой. Остальные удержанные датаграммы пришли в
-                     * conntrack, пока голова ещё стояла в очереди, и каждая
-                     * несёт свою неподтверждённую запись; отпущенные ядру
-                     * после наших сырых посылок, они снимаются как дубль
-                     * (insert_failed/drop). Поэтому они уходят тем же сырым
-                     * путём следом за планом — побайтно как пришли (суммы
-                     * ядро досчитало до выдачи: GSO в очереди выключен, см.
-                     * nfq.c), — а копии в очереди снимаются. Не вышло
-                     * переиздать — хвост отдаётся ядру, как раньше. */
-                    uint32_t batch_verdicts[D2K_UDP_HOLD_PACKETS];
-                    uint8_t batch_resend[D2K_UDP_HOLD_PACKETS];
+                     * План забрал голову (fate drop) — она ушла последней его
+                     * посылкой; не забрал или плана нет — голова уходит ядру
+                     * своим вердиктом. Остальные датаграммы пачки в обоих
+                     * случаях уходят нашей посылкой следом, их копии в очереди
+                     * снимаются (см. tail_resend). Раньше так было только при
+                     * плане, а пачка без плана отдавала хвосты ядру — и каждый
+                     * снимался как дубль (поле 03.10.2026). */
                     int owned_batch = 0;
                     if (udp_replay) {
                         owned_batch = mode == MODE_APPLY && raw && res.applied &&
                                       !output_failed && verdict == D2K_NF_DROP;
-                        (void)d2k_udp_replay_fates(udp_batch.count, verdict, owned_batch,
-                                                   batch_verdicts, batch_resend);
-                        for (size_t i = 1; i < udp_batch.count; i++) {
-                            if (!batch_resend[i]) { continue; }
-                            const uint8_t *tp = udp_batch.packets[i];
-                            size_t tl = udp_batch.len[i];
-                            int ok = d2k_raw_prepare(raw, tp, tl, err, sizeof err) == 0;
-                            if (ok && at <= t) {
-                                ok = d2k_raw_send(raw, tp, tl, err, sizeof err) == 0;
-                                if (ok) { st.emitted++; st.emitted_now++; }
-                            } else if (ok) {
-                                /* Без ключа: это байты клиента, а не посылка
-                                   плана, и уйти они обязаны при любом исходе
-                                   его исполнения. */
-                                ok = d2k_sched_push_serial(sched, at, tp, tl, NULL, 0) == 0;
-                                if (ok) {
-                                    st.deferred++;
-                                } else {
-                                    snprintf(err, sizeof err, "очередь отложенных полна");
-                                }
-                            }
-                            if (!ok) {
-                                st.send_fail++;
-                                fprintf(stderr, "d2kd: хвост QUIC Initial не переиздан, "
-                                                "отдаю ядру: %s\n", err);
-                                batch_verdicts[i] = D2K_NF_ACCEPT;
-                            }
-                        }
                     }
 
                     int delayed_originals = 0;
@@ -1245,16 +1297,26 @@ int main(int argc, char **argv) {
                     if (udp_replay && !delayed_originals) {
                         /* Only the first original was replaced by the
                            strategy.  Later QUIC datagrams are real client
-                           input and must remain in the stream: re-sent by us
-                           above when the plan owns the batch, otherwise
-                           released by the kernel. */
-                        for (size_t i = 0; i < udp_batch.count; i++) {
-                            uint32_t v = owned_batch ? batch_verdicts[i]
-                                       : (i == 0) ? verdict : D2K_NF_ACCEPT;
-                            if (send_original_verdict(&hc, udp_batch.ids[i], v) != 0) {
-                                original_failed = 1;
-                            }
-                        }
+                           input and must remain in the stream: they follow
+                           the head out through the raw path. */
+                        original_failed = release_udp_batch(&hc, &udp_batch, verdict,
+                                                            owned_batch, at, t);
+                    } else if (!delayed_originals && !batch.count && hc.follow &&
+                               verdict == D2K_NF_ACCEPT && !res.applied &&
+                               np.have_payload && !np.truncated &&
+                               d2k_udp_follow_match(hc.follow, np.payload,
+                                                    np.payload_len, t)) {
+                        /* ЗАПОЗДАВШИЙ ХВОСТ (задача 46): голова потока уже
+                           выпущена одна (имя собралось на ней), а эта
+                           датаграмма стояла в очереди за ней со своей
+                           неподтверждённой записью — 0-RTT, вторая половина
+                           ClientHello, повтор. Тот же путь, что у хвоста пачки;
+                           не ушла — отдаём ядру. Поле 03.10.2026: такой хвост
+                           спланированного Initial снимался всякий раз. */
+                        tail_context tc = {&hc, t, t};
+                        uint32_t v = tail_resend(&tc, np.payload, np.payload_len) == 0
+                                   ? D2K_NF_DROP : D2K_NF_ACCEPT;
+                        original_failed = send_original_verdict(&hc, np.id, v) != 0;
                     } else if (!delayed_originals) {
                         const uint32_t *original_ids = batch.count ? batch.ids : &np.id;
                         size_t original_count = batch.count ? batch.count : 1;
@@ -1371,7 +1433,7 @@ int main(int argc, char **argv) {
     }
 
     d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
-    d2k_udp_hold_flush(udp_holding, now_ns(), release_original, &hc);
+    d2k_udp_hold_flush(udp_holding, now_ns(), release_udp_hold, &hc);
     if (udp_releases) {
         (void)d2k_udp_release_flush(udp_releases, UINT64_MAX,
                                      send_delayed_verdict,
@@ -1401,10 +1463,12 @@ int main(int argc, char **argv) {
     d2k_sched_free(sched);
     d2k_hold_free(holding);
     holding = NULL;
-    d2k_udp_hold_free(udp_holding, release_original, &hc);
+    d2k_udp_hold_free(udp_holding, release_udp_hold, &hc);
     udp_holding = NULL;
     d2k_udp_release_free(udp_releases);
     udp_releases = NULL;
+    d2k_udp_follow_free(udp_follow);
+    udp_follow = NULL;
     d2k_session_free(sess);
     d2k_nfq_close(q);
     d2k_raw_close(raw);
