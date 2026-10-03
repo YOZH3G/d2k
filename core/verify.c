@@ -851,11 +851,17 @@ static void budget_say(d2k_ver_result *r, int outcome, const char *fmt, ...) {
 
 /* Чтение с запоминанием законного конца потока (close_notify): после него
    сокет может ещё не показать FIN, а молчанием коробки это не является. */
-typedef struct { read_fn rd; void *sess; int eof; } eof_reader;
+/* Заодно помнит, чем кончилось последнее чтение: отказ (n < 0) и сколько
+   байт ответа пришло. Молчание коробки — это отказ чтения по истечении
+   срока; битый ответ, тревога TLS, наш предел приходят раньше срока или без
+   отказа чтения и обрывом не считаются (ревью M-2). */
+typedef struct { read_fn rd; void *sess; int eof, failed; uint64_t bytes; } eof_reader;
 static long read_eof(void *ctx, uint8_t *buf, size_t cap, int wait_ms, char *err, size_t errcap) {
     eof_reader *e = ctx;
     long n = e->rd(e->sess, buf, cap, wait_ms, err, errcap);
     if (n == 0) e->eof = 1;
+    e->failed = n < 0;
+    if (n > 0) e->bytes += (uint64_t)n;
     return n;
 }
 
@@ -875,6 +881,7 @@ static void budget_tcp(read_fn rd, write_fn wr, void *sess, const budget_io *io,
     for (;;) {
         long pk = io->packets(io->ctx);
         if (pk < 0) {
+            r->budget_uncountable = 1;
             budget_say(r, D2K_BUDGET_NOT_APPLICABLE,
                        "пакеты потока не считаются (нет TCP_INFO data_segs) — бюджет не проверен");
             return;
@@ -895,8 +902,9 @@ static void budget_tcp(read_fn rd, write_fn wr, void *sess, const budget_io *io,
             return;
         }
         last = pk;
-        eof_reader er = { rd, sess, 0 };
+        eof_reader er = { rd, sess, 0, 0, 0 };
         err[0] = '\0';
+        int64_t asked = verify_now_ms();
         int wrote = wr(sess, (const uint8_t *)req, req_len, err, sizeof err);
         r->budget_requests++;
         int code = 0, complete = 0, cc = 0, ll = 0, chal = 0, a = 0, b = 0, c = 0, enc = 0;
@@ -910,10 +918,16 @@ static void budget_tcp(read_fn rd, write_fn wr, void *sess, const budget_io *io,
         if (wrote != 0 || !code || !complete) {
             long now = io->packets(io->ctx);
             if (now >= 0) r->budget_packets = (unsigned)now;
+            /* Срок ожидания прошёл целиком (с допуском на ход часов). */
+            int silent = er.failed && verify_now_ms() - asked >= (int64_t)deadline_ms - 20;
             if (wrote != 0 || er.eof || io->peer_spoke(io->ctx)) {
                 budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "сервер закрыл поток на %u-м запросе, "
                            "%u пакетов из %u — бюджет не проверен: %.60s",
                            r->budget_requests, r->budget_packets, need, err);
+            } else if (ll || !silent) {
+                budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "повтор %u не измерен (%s): %.60s — "
+                           "бюджет не проверен", r->budget_requests,
+                           ll ? "наш предел" : "ответ битый или отказ TLS, не молчание", err);
             } else {
                 budget_say(r, D2K_BUDGET_CUT, "сервер замолчал посреди повторов: %u-й запрос, "
                            "поток перенёс %u пакетов с данными из нужных %u: %.60s",
@@ -1448,6 +1462,7 @@ static void budget_quic(const quic_budget_io *io, int deadline_ms, unsigned budg
     for (;;) {
         long pk = io->packets(io->ctx);
         if (pk < 0) {
+            r->budget_uncountable = 1;
             budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "датаграммы связи не считаются — бюджет не проверен");
             return;
         }
@@ -1484,6 +1499,12 @@ static void budget_quic(const quic_budget_io *io, int deadline_ms, unsigned budg
                 budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "сервер закрыл связь на %u-м запросе, %u "
                            "датаграмм из %u — бюджет не проверен: %.60s", r->budget_requests,
                            r->budget_packets, need, err);
+                return;
+            }
+            if (!status && got) {
+                /* Байты пришли, а кадр HEADERS не разобран — не молчание. */
+                budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "ответ HTTP/3 на %u-й запрос не разобран "
+                           "(%zu байт) — бюджет не проверен", r->budget_requests, got);
                 return;
             }
             if (!status) {

@@ -129,6 +129,7 @@ typedef struct {
     unsigned budget_packets;  /* сколько пакетов с данными поток перенёс к итогу */
     unsigned budget_requests; /* запросов на потоке, включая первый */
     char     budget_note[160];
+    int      budget_uncountable; /* «не применимо»: пакеты потока не считаются (старое ядро) */
     /* TCP: пакеты с данными обеих сторон на момент конца обращения
        (TCP_INFO data_segs_in + data_segs_out), 0 — не считается. Им объёмный
        замер записывает бюджет коробки там, где видит обрыв identity. */

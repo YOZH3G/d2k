@@ -122,6 +122,8 @@ typedef struct {
     size_t mss;
     long pk, cut_at;
     int close_after, answered, eof;
+    int alert_after, bad_after; /* после стольких ответов: тревога TLS / битый ответ */
+    int alert, nocount;
     char buf[131072];
     size_t len, pos;
 } ka_srv;
@@ -131,18 +133,21 @@ static int ka_write(void *ctx, const uint8_t *b, size_t n, char *err, size_t err
     if (k->cut_at && k->pk >= k->cut_at) { k->pk++; return 0; } /* клиент шлёт, сервер не слышен */
     k->pk++;
     if (k->close_after && k->answered >= k->close_after) { k->eof = 1; return 0; }
-    size_t rl = strlen(k->resp), off = 0;
+    if (k->alert_after && k->answered >= k->alert_after) { k->alert = 1; return 0; }
+    const char *resp = k->bad_after && k->answered >= k->bad_after
+        ? "XTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" : k->resp;
+    size_t rl = strlen(resp), off = 0;
     while (off < rl) {
         if (k->cut_at && k->pk >= k->cut_at) break;  /* бюджет кончился посреди ответа */
         size_t seg = rl - off > k->mss ? k->mss : rl - off;
-        memcpy(k->buf + k->len, k->resp + off, seg);
+        memcpy(k->buf + k->len, resp + off, seg);
         k->len += seg; off += seg; k->pk++;
     }
     k->answered++;
     return 0;
 }
 static long ka_read(void *ctx, uint8_t *buf, size_t cap, int wait, char *err, size_t errcap) {
-    ka_srv *k = ctx; (void)wait;
+    ka_srv *k = ctx;
     if (k->pos < k->len) {
         size_t n = k->len - k->pos;
         if (n > cap) n = cap;
@@ -151,10 +156,16 @@ static long ka_read(void *ctx, uint8_t *buf, size_t cap, int wait, char *err, si
         return (long)n;
     }
     if (k->eof) return 0;
+    if (k->alert) {
+        snprintf(err, errcap, "тревога 20"); /* сразу, без молчания */
+        return -1;
+    }
+    /* Молчание: срок чтения проходит целиком, как у настоящего сокета. */
+    usleep((useconds_t)(wait > 0 ? wait : 1) * 1000);
     snprintf(err, errcap, "не дождались ответа (тайм-аут)");
     return -1;
 }
-static long ka_packets(void *ctx) { return ((ka_srv *)ctx)->pk; }
+static long ka_packets(void *ctx) { return ((ka_srv *)ctx)->nocount ? -1 : ((ka_srv *)ctx)->pk; }
 static int ka_spoke(void *ctx) { return ((ka_srv *)ctx)->eof; }
 
 /* QUIC-аналог: запрос — одна датаграмма клиента, ответ — dg датаграмм
@@ -212,7 +223,7 @@ static int budget_checks(void) {
         d2k_ver_result r = {0}; char err[200] = "";
         r.level = D2K_VER_HANDSHAKE;
         request_page_budget(ka_read, ka_write, &k, "cdn.discordapp.com", 2, NULL,
-                            1000, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
         int want = fake_first ? D2K_BUDGET_PASSED : D2K_BUDGET_CUT;
         if (r.level != D2K_VER_APPLICATION || r.status != 403 || r.budget != want ||
             r.budget_need != 50 || (fake_first && r.budget_packets < 50) ||
@@ -235,7 +246,7 @@ static int budget_checks(void) {
         d2k_ver_result r = {0}; char err[200] = "";
         r.level = D2K_VER_HANDSHAKE;
         request_page_budget(ka_read, ka_write, &k, "gateway.discord.gg", 2, NULL,
-                            1000, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
         if (r.budget != (cut ? D2K_BUDGET_CUT : D2K_BUDGET_PASSED) ||
             r.budget_requests < (cut ? 9u : 20u)) {
             fprintf(stderr, "budget 404 cut=%d: budget %d pk %u req %u [%s]\n", cut, r.budget,
@@ -251,7 +262,7 @@ static int budget_checks(void) {
         budget_io io = { ka_packets, ka_spoke, &k };
         d2k_ver_result r = {0}; char err[200] = "";
         request_page_budget(ka_read, ka_write, &k, "example.com", 2, NULL,
-                            1000, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
         if (r.level != D2K_VER_APPLICATION || r.budget != D2K_BUDGET_NOT_APPLICABLE ||
             r.budget_requests != 1 || !strstr(r.budget_note, "keep-alive")) {
             fprintf(stderr, "budget conn-close: level %d budget %d req %u [%s]\n",
@@ -265,7 +276,7 @@ static int budget_checks(void) {
         budget_io io = { ka_packets, ka_spoke, &k };
         d2k_ver_result r = {0}; char err[200] = "";
         request_page_budget(ka_read, ka_write, &k, "example.com", 2, NULL,
-                            1000, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
         if (r.level != D2K_VER_APPLICATION || r.budget != D2K_BUDGET_NOT_APPLICABLE ||
             r.budget_requests != 4) {
             fprintf(stderr, "budget server close: level %d budget %d req %u [%s]\n",
@@ -280,7 +291,7 @@ static int budget_checks(void) {
         budget_io io = { ka_packets, ka_spoke, &k };
         d2k_ver_result r = {0}; char err[200] = "";
         request_page_budget(ka_read, ka_write, &k, "example.com", 2, NULL,
-                            1000, 0, &io, 0, &r, err, sizeof err);
+                            60, 0, &io, 0, &r, err, sizeof err);
         if (r.budget != D2K_BUDGET_NOT_CHECKED || k.answered != 1) {
             fprintf(stderr, "budget off: budget %d answered %d\n", r.budget, k.answered); fails++;
         }
@@ -295,9 +306,38 @@ static int budget_checks(void) {
         budget_io io = { ka_packets, ka_spoke, &k };
         d2k_ver_result r = {0}; char err[200] = "";
         request_page_budget(ka_read, ka_write, &k, "example.com", 0, NULL,
-                            1000, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
         if (r.budget != D2K_BUDGET_PASSED || r.budget_requests != 1 || k.answered != 1) {
             fprintf(stderr, "budget big: budget %d req %u\n", r.budget, r.budget_requests); fails++;
+        }
+    }
+    /* (5b) Не молчание коробки — не обрыв (ревью M-2): тревога TLS сразу
+       после запроса и битый ответ на повтор — «не применимо». */
+    for (int kind = 0; kind < 2; kind++) {
+        static ka_srv k; memset(&k, 0, sizeof k);
+        k.resp = r403; k.mss = 1400; k.pk = 6;
+        if (kind) k.bad_after = 2; else k.alert_after = 2;
+        budget_io io = { ka_packets, ka_spoke, &k };
+        d2k_ver_result r = {0}; char err[200] = "";
+        request_page_budget(ka_read, ka_write, &k, "example.com", 2, NULL,
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+        if (r.level != D2K_VER_APPLICATION || r.budget != D2K_BUDGET_NOT_APPLICABLE) {
+            fprintf(stderr, "budget non-silence kind=%d: budget %d [%s]\n", kind, r.budget,
+                    r.budget_note); fails++;
+        }
+    }
+    /* (5c) Пакеты не считаются — «не применимо» с признаком для разовой
+       строки журнала (ревью M-5). */
+    {
+        static ka_srv k; memset(&k, 0, sizeof k);
+        k.resp = r403; k.mss = 1400; k.pk = 6; k.nocount = 1;
+        budget_io io = { ka_packets, ka_spoke, &k };
+        d2k_ver_result r = {0}; char err[200] = "";
+        request_page_budget(ka_read, ka_write, &k, "example.com", 2, NULL,
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+        if (r.budget != D2K_BUDGET_NOT_APPLICABLE || !r.budget_uncountable) {
+            fprintf(stderr, "budget uncountable: budget %d flag %d\n", r.budget,
+                    r.budget_uncountable); fails++;
         }
     }
     /* (6) QUIC: новые потоки той же связи. abc2b3eb (минимальная приманка):
@@ -589,6 +629,6 @@ int main(void) {
     }
     fails += budget_checks();
     if (fails) return 1;
-    puts("Production HTTP reader: 76 fragments + 4 stylesheet + 4 ECH + long-header (TCP 4+limit, H3 3) + 6 failure-reason + 11 flow-budget (TCP 8, QUIC 3) checks passed without sockets");
+    puts("Production HTTP reader: 76 fragments + 4 stylesheet + 4 ECH + long-header (TCP 4+limit, H3 3) + 6 failure-reason + 14 flow-budget (TCP 11, QUIC 3) checks passed without sockets");
     return 0;
 }

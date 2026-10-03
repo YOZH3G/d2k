@@ -12041,25 +12041,33 @@ own_first_test:
         /* (n4) Подозрение с потока ПОД планом: привязанный план не исключается
            вслепую, а испытывается ПЕРВЫМ с бюджетом. Прошёл — подозрение
            ложное, привязка переподтверждена, другие планы не пробуются.
-           (n5) Оборвался — исключён, дальше свои планы по порядку. */
-        for (int cut = 0; cut < 2; cut++) {
+           (n5) Оборвался (применение доказано) — исключён, его отметка
+           «пройден» снята (ревью I-3), дальше свои планы; замена в другой
+           коробке с «не применимо» — на провод идёт она, а не оборванный.
+           (n5b) «Не применимо» на привязанном — не доказательство (ревью
+           I-2): поиск не кончается «ложным подозрением», план не
+           переподтверждается, дальше свои планы без него. */
+        for (int variant = 0; variant < 3; variant++) {
             d2k_catalog c = {0};
             char p_bound[40], p_other[40];
-            const char *name = cut ? "gw-cut.bound.own" : "gw.bound.own";
+            const char *name = variant == 1 ? "gw-cut.bound.own" :
+                               variant == 2 ? "gw-na.bound.own" : "gw.bound.own";
             own_box(&c, "box-bound", p_bound, 81, 2, name, 6, D2K_SHAPE_MODERN, 4, 1790000000, 0);
             own_box(&c, "box-other", p_other, 82, 9, "other.bound.own", 6, D2K_SHAPE_MODERN, 4,
                     1790000500, 0);
+            c.boxes[0].binds[0].budget = D2K_CAT_BUDGET_PASSED;
             tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
             ver_app_after_tcp_search = 0; base_blocked_answer = 1; ver_fail_first = 0;
             ver_budget_n = 2;
-            ver_budget_seq[0] = cut ? D2K_BUDGET_CUT : D2K_BUDGET_PASSED;
-            ver_budget_seq[1] = D2K_BUDGET_PASSED;
+            ver_budget_seq[0] = variant == 0 ? D2K_BUDGET_PASSED :
+                                variant == 1 ? D2K_BUDGET_CUT : D2K_BUDGET_NOT_APPLICABLE;
+            ver_budget_seq[1] = variant == 1 ? D2K_BUDGET_NOT_APPLICABLE : D2K_BUDGET_PASSED;
             d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
             saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
             spin(s, 5); forget_sent();
             base_calls = tcp_calls = ver_calls = vol_calls = 0;
-            uint16_t port = (uint16_t)(42310 + cut);
+            uint16_t port = (uint16_t)(42310 + variant);
             ver_answer_port = port;
             d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
             d2k_ev su = ev_suspect(6, port); su.planned = D2K_LINK_PLANNED_YES;
@@ -12071,23 +12079,69 @@ own_first_test:
             }
             CHECK(sent_first_split_index(81) == 0,
                   "budget suspicion: план, под которым пришло подозрение, не испытан первым");
-            const d2k_cat_binding *bd = NULL;
+            const d2k_cat_binding *bound_bd = &c.boxes[0].binds[0];
+            const d2k_cat_binding *other_bd = NULL;
             for (size_t i = 0; i < c.n_boxes; i++)
                 for (size_t j = 0; j < c.boxes[i].n_binds; j++)
                     if (!strcmp(c.boxes[i].binds[j].target, name) &&
-                        c.boxes[i].binds[j].budget == D2K_CAT_BUDGET_PASSED) bd = &c.boxes[i].binds[j];
-            if (!cut) {
+                        !strcmp(c.boxes[i].binds[j].plan_id, p_other)) other_bd = &c.boxes[i].binds[j];
+            if (variant == 0) {
                 CHECK(ver_calls == 1 && sent_first_split_index(82) < 0 && tcp_calls == 0,
                       "budget suspicion: после прохода бюджета пробовались другие планы");
-                CHECK(bd && !strcmp(bd->plan_id, p_bound) && bd->successes >= 3,
+                CHECK(!strcmp(bound_bd->plan_id, p_bound) && bound_bd->successes >= 3 &&
+                      bound_bd->budget == D2K_CAT_BUDGET_PASSED,
                       "budget suspicion: привязка не переподтверждена с отметкой бюджета");
                 CHECK(said("подозрение было ложным"), "budget suspicion: ложное подозрение не названо");
             } else {
                 CHECK(sent_first_split_index(82) == 1 && ver_calls == 2,
-                      "budget suspicion: после обрыва привязанного плана свои не пошли по порядку");
-                CHECK(bd && !strcmp(bd->plan_id, p_other),
-                      "budget suspicion: прошедший бюджет свой план не подтверждён");
+                      "budget suspicion: после неудачи привязанного плана свои не пошли по порядку");
+                CHECK(other_bd && other_bd->budget == (variant == 1 ? D2K_CAT_BUDGET_UNCHECKED
+                                                                    : D2K_CAT_BUDGET_PASSED),
+                      "budget suspicion: замена своим планом не подтверждена");
+                CHECK(!said("подозрение было ложным") && bound_bd->successes == 2,
+                      "budget suspicion: без пройденного бюджета привязанный план переподтверждён");
+                if (variant == 1) {
+                    CHECK(bound_bd->budget == D2K_CAT_BUDGET_CUT,
+                          "budget suspicion: у оборванного плана осталась отметка «пройден»");
+                    drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+                    CHECK(sent_first_split_index(82) >= 0 && sent_first_split_index(81) < 0,
+                          "budget suspicion: на провод снова идёт оборванный план (ревью I-3)");
+                } else {
+                    CHECK(said("бюджет не проверен") && bound_bd->budget == D2K_CAT_BUDGET_PASSED,
+                          "budget suspicion: «не проверено» не названо или отметка тронута без улики");
+                }
             }
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_budget_n = 0;
+        }
+
+        /* (n4b) Обрыв без доказанного применения плана к потоку зонда — не
+           улика (ревью I-1): кандидат не отвергается как «оборван», отметка
+           его привязки не трогается, итог — «не засчитано». */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-unapplied", pid, 65, 3, "unapplied.budget.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            c.boxes[0].binds[0].budget = D2K_CAT_BUDGET_PASSED;
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1; ver_fail_first = 0;
+            ver_budget_n = 1; ver_budget_seq[0] = D2K_BUDGET_CUT;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5); forget_sent();
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42315;
+            d2k_ev h = ev_hello(6, 42315, "noapply.budget.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42315); d2k_sched_event(s, &su);
+            for (int i = 0; i < 30 && tcp_calls == 0; i++) { skip_ahead(s, 6000); spin(s, 40); }
+            CHECK(ver_calls >= 1 && !said("поток оборван посреди повторов"),
+                  "budget unapplied: обрыв без применения плана засчитан против кандидата");
+            CHECK(said("не засчитано"), "budget unapplied: «не измерено» не сказано");
+            CHECK(c.boxes[0].binds[0].budget == D2K_CAT_BUDGET_PASSED,
+                  "budget unapplied: отметка привязки тронута без улики");
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
             ver_budget_n = 0;

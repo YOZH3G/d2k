@@ -1162,6 +1162,9 @@ struct d2k_sched {
        жизнь процесса, и отметка стенных часов, от которой считается «с
        какого времени идёт поиск» (внутри всё на монотонных). */
     int          confirms, probes_used;
+    /* Разовая строка: пакеты потока на этой прошивке не считаются, проверка
+       бюджета выключена (ядро без TCP_INFO data_segs, задача 55). */
+    int          budget_uncountable_said;
     /* Сколько раз ПОСТОЯННЫЙ отказ пришёл на поток настоящего клиента при
        том, что план на цели стоит. Это не свойство коробки и не промах
        кандидата: это наша непереносимость — «подтверждено» в каталоге при
@@ -2322,7 +2325,8 @@ static int quic_split_unfit(const d2k_sched *s, const task *t) {
 /* БЮДЖЕТ ПОТОКА для испытания (задача 55): свойство коробки, а не константа
    обхода. Источники по силе: замер этой цели (пакеты на обрыве identity —
    примета rx-volume в её отпечатке или исход объёма), затем коробка задачи
-   (узнанная или коробка-владелец испытуемого плана), затем поле 04.10 —
+   t->box_id (узнанная по отпечатку; у кандидата из каталога install_next
+   кладёт туда коробку-владельца плана), затем поле 04.10 —
    25 пакетов в 18 из 18 оборванных потоков (task-55-facts.md §1.2). */
 static unsigned task_budget(const d2k_sched *s, task *t) {
     for (size_t i = 0; i < t->fp.n_sig; i++) {
@@ -3455,11 +3459,15 @@ static size_t known_plans(d2k_sched *s, task *t) {
    В tried план попадает, только если реально испытан на проводе
    (own_first_continue): отвергнутый исполнителем опыта не имел. */
 /* Which of two enabled bindings of one key the datapath gets (task 55, §2.2):
- * the one whose confirming flow passed the box's flow budget, then the newest.
+ * the one whose confirming flow passed the box's flow budget, then the newest;
+ * one whose plan was later cut mid-repeats (applied, review I-3) goes last.
  * A short 403/404 confirmation is not evidence against the budget cut, so a
  * fresher unproven binding must not displace a proven one. */
+static int budget_rank(uint8_t mark) {
+    return mark == D2K_CAT_BUDGET_PASSED ? 2 : mark == D2K_CAT_BUDGET_CUT ? 0 : 1;
+}
 static int binding_beats(const d2k_cat_binding *a, const d2k_cat_binding *b) {
-    int pa = a->budget == D2K_CAT_BUDGET_PASSED, pb = b->budget == D2K_CAT_BUDGET_PASSED;
+    int pa = budget_rank(a->budget), pb = budget_rank(b->budget);
     return pa != pb ? pa > pb : a->confirmed > b->confirmed;
 }
 
@@ -6468,11 +6476,78 @@ static void group_record(d2k_sched *s, const task *t, unsigned evidence,
     }
 }
 
+/* Форма, под которую пишется привязка подтверждения. */
+static uint8_t record_shape(const task *t) {
+    if (t->transport == 17) return (uint8_t)D2K_LINK_SHAPE_QUIC;
+    if (t->ech_offer) return D2K_LINK_SHAPE_ECH_TCP;
+    d2k_shape cs = d2k_hello_shape(t->trig, t->trig_len);
+    return (uint8_t)(cs == D2K_SHAPE_LEGACY ? D2K_SHAPE_LEGACY : SCHED_PROBE_SHAPE);
+}
+
+/* Разовая строка о выключенной проверке бюджета (ревью M-5). */
+static void budget_uncountable_note(d2k_sched *s, const task *t) {
+    if (!t->ver.budget_uncountable || s->budget_uncountable_said) return;
+    s->budget_uncountable_said = 1;
+    say(s, "проверка бюджета потока на этой прошивке не работает: %s — подтверждения "
+           "идут прежним критерием, привязки помечаются «бюджет не проверен»",
+        t->transport == 17 ? "датаграммы связи не считаются"
+                           : "ядро не отдаёт TCP_INFO data_segs (нужно Linux 4.6+)");
+}
+
+/* ОБРЫВ ПОСРЕДИ ПОВТОРОВ ПРИ ДОКАЗАННОМ ПРИМЕНЕНИИ (задача 55; ревью I-1,
+   I-3). Ответ приложения был, план исполнился на потоке зонда, а поток не
+   перенёс 2 × бюджет коробки — действие (a) поля 04.10. Кандидат не
+   подтверждён, как при RX-обрыве под кандидатом; у привязок этого ключа с
+   этим планом «пройден» сменяется на «оборван» — новая улика, не удаление:
+   установка больше не предпочитает план, только что измеренный режущимся. */
+static void budget_cut_reject(d2k_sched *s, task *t) {
+    char cut_id[40]; uint8_t cut_wire[D2K_PLAN_ID_LEN];
+    plan_ident(t->plans[t->next_plan - 1], cut_id, sizeof cut_id, cut_wire);
+    say(s, "по %s под кандидатом %s (план %zu) поток оборван посреди повторов: "
+           "HTTP %d, %s; бюджет %u пакетов (%s) — не подтверждаю, беру следующего",
+        t->name, cut_id, t->next_plan, t->ver.status, t->ver.budget_note,
+        t->budget_pk, t->budget_src);
+    uint8_t shape = record_shape(t);
+    for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
+        d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t j = 0; j < b->n_binds; j++) {
+            d2k_cat_binding *bd = &b->binds[j];
+            if (strcmp(bd->plan_id, cut_id) || strcmp(bd->target, t->name) ||
+                strcmp(bd->kind, t->by_addr ? "addr" : "name") ||
+                (bd->transport ? bd->transport : 6) != t->transport ||
+                (bd->family ? bd->family : 4) != t->family || bd->shape != shape ||
+                bd->budget == D2K_CAT_BUDGET_CUT) continue;
+            say(s, "по %s привязка плана %s коробки %s: отметка бюджета «%s» → «оборван»",
+                t->name, cut_id, b->id, bd->budget == D2K_CAT_BUDGET_PASSED ? "пройден" :
+                bd->budget == D2K_CAT_BUDGET_UNCHECKED ? "не проверен" : "нет");
+            bd->budget = D2K_CAT_BUDGET_CUT;
+            s->cat->revision++;
+            s->sync_pending = 1;
+        }
+    }
+    trial_retire(s, t);
+    ver_close(t);
+    t->state = T_PLANNING;
+}
+
 static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     const char *text = t->plans[t->next_plan - 1];
     char plan_id[40], box_id[40];
     uint8_t wire_id[D2K_PLAN_ID_LEN];
     plan_ident(text, plan_id, sizeof plan_id, wire_id);
+    budget_uncountable_note(s, t);
+    if (t->own_first == 2 && t->bound_plan_id[0] && !strcmp(t->bound_plan_id, plan_id) &&
+        t->ver.budget != D2K_BUDGET_PASSED) {
+        /* ПЛАН, ПОД КОТОРЫМ ШЁЛ ПОТОК ПОДОЗРЕНИЯ, снимает подозрение ТОЛЬКО
+           пройденным бюджетом (ревью I-2). «Не применимо» — не измерение:
+           переподтверждать нечем, поиск не кончается. Дальше свои планы без
+           него, как до задачи 55; отметка привязки не трогается. */
+        say(s, "по %s план %s, под которым шёл поток подозрения, ответил, но бюджет не проверен "
+               "(%s) — подозрение не снято, план не переподтверждаю, продолжаю свои планы без него",
+            t->name, plan_id, t->ver.budget_note[0] ? t->ver.budget_note : "проверки не было");
+        trial_retire(s, t); ver_close(t); t->state = T_PLANNING;
+        return;
+    }
     if (t->ech_offer && (!t->ver.ech_accepted || t->ver.name_ok != 1 ||
         t->ver.level != D2K_VER_APPLICATION || !t->ver.body_complete)) {
         say(s, "по %s ECH-план не подтверждён принятым ECH и полным ответом origin", t->name);
@@ -6533,16 +6608,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        со старым клиентом зонд ведёт рукопожатие TLS 1.2 (d2k_verify_probe12_on).
        Неразобранное приветствие означает, что зонд пошёл современным, — и
        записывается современная форма, а не «не знаю». */
-    uint8_t rec_shape;
-    if (t->transport == 17) {
-        rec_shape = (uint8_t)D2K_LINK_SHAPE_QUIC;
-    } else if (t->ech_offer) {
-        rec_shape = D2K_LINK_SHAPE_ECH_TCP;
-    } else {
-        d2k_shape cs = d2k_hello_shape(t->trig, t->trig_len);
-        rec_shape = (uint8_t)(cs == D2K_SHAPE_LEGACY ? D2K_SHAPE_LEGACY
-                                                     : SCHED_PROBE_SHAPE);
-    }
+    uint8_t rec_shape = record_shape(t);
     /* ЧЕМ ГОВОРИЛ ЗАМЕР, ИЗ КОТОРОГО ЭТОТ ПЛАН ВЫВЕДЕН. Не то же, что форма:
        форма у заготовки и у снимка может совпадать, а байты — нет, и коробке
        никто не запрещал смотреть на содержимое (§6). */
@@ -6580,8 +6646,9 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         }
     }
     /* ОТМЕТКА БЮДЖЕТА ПОТОКА (задача 55). Пройдено — сильнее всего и пишется
-       всегда; «не применимо» не отменяет пройденного тем же планом раньше
-       (не измерено ≠ нет, §2.4); без проверки (рукопожатие ALPN) — ничего. */
+       всегда; «не применимо» ложится только на пустую отметку: оно не
+       отменяет ни пройденного, ни оборванного (не измерено ≠ нет, §2.4); без
+       проверки (рукопожатие ALPN) — ничего. */
     {
         uint8_t mark = t->ver.budget == D2K_BUDGET_PASSED ? D2K_CAT_BUDGET_PASSED :
                        t->ver.budget == D2K_BUDGET_NOT_APPLICABLE ? D2K_CAT_BUDGET_UNCHECKED : 0;
@@ -6594,7 +6661,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                     !strcmp(bd->kind, t->by_addr ? "addr" : "name") &&
                     (bd->family ? bd->family : 4) == t->family && bd->shape == rec_shape &&
                     bd->transport == t->transport &&
-                    (mark == D2K_CAT_BUDGET_PASSED || bd->budget != D2K_CAT_BUDGET_PASSED) &&
+                    (mark == D2K_CAT_BUDGET_PASSED || bd->budget == 0) &&
                     bd->budget != mark) {
                     bd->budget = mark;
                     s->cat->revision++;
@@ -8252,19 +8319,32 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             }
             if (!t->ver.handshake_proof && layered_rx_result(s, t, now_ms)) { moved++; continue; }
             if (t->ver.level == D2K_VER_APPLICATION && t->ver.budget == D2K_BUDGET_CUT) {
-                /* ОБРЫВ ПОСРЕДИ ПОВТОРОВ (задача 55): ответ приложения был, но
-                   поток не перенёс 2 × бюджет коробки — ровно действие (a)
-                   поля 04.10, которое короткий 403/404 не показывал. Как
-                   RX-обрыв под кандидатом: не подтверждён, следующий. */
-                char cut_id[40]; uint8_t cut_wire[D2K_PLAN_ID_LEN];
-                plan_ident(t->plans[t->next_plan - 1], cut_id, sizeof cut_id, cut_wire);
-                say(s, "по %s под кандидатом %s (план %zu) поток оборван посреди повторов: "
-                       "HTTP %d, %s; бюджет %u пакетов (%s) — не подтверждаю, беру следующего",
-                    t->name, cut_id, t->next_plan, t->ver.status, t->ver.budget_note,
-                    t->budget_pk, t->budget_src);
-                trial_retire(s, t);
-                ver_close(t);
-                t->state = T_PLANNING;
+                /* ОБРЫВ ПОСРЕДИ ПОВТОРОВ — улика, только если план исполнился на
+                   потоке зонда (ревью I-1): тот же порядок, что у подтверждения.
+                   Посылка не ушла — наша неудача (local_refusal_verdict);
+                   применение не пришло — ждём его, держа сокет; не придёт —
+                   «не засчитано», как у подтверждения без применения. */
+                budget_uncountable_note(s, t);
+                if (local_refusal_verdict(s, t) != 0) { moved++; continue; }
+                d2k_ev own;
+                memset(&own, 0, sizeof own);
+                memcpy(own.low_ip, t->ver_flow.a_ip, sizeof own.low_ip);
+                memcpy(own.high_ip, t->ver_flow.b_ip, sizeof own.high_ip);
+                own.family = t->ver_flow.family;
+                own.low_port = t->ver_flow.a_port;
+                own.high_port = t->ver_flow.b_port;
+                own.transport = t->ver_flow.transport;
+                for (size_t k = 0; k < t->ver_seen; k++)
+                    if (ev_matches_flow(&own, &t->ver_early[k])) { t->ver_ok = 1; break; }
+                if (t->ver_ok) {
+                    budget_cut_reject(s, t);
+                } else {
+                    t->state = T_VERIFY_WAIT;
+                    t->ver_until_ms = now_ms + SCHED_VERIFY_STEP_MS;
+                    say(s, "по %s поток зонда оборвался посреди повторов (порт %u) — жду "
+                           "применения плана к нему, без него обрыв не улика",
+                        t->name, (unsigned)t->ver.local_port);
+                }
                 moved++;
                 continue;
             }
@@ -8399,7 +8479,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
 
         if (t->state == T_VERIFY_WAIT) {
             if (t->ver_ok) {
-                verify_confirm(s, t, now_ms);
+                int cut = t->ver.level == D2K_VER_APPLICATION && t->ver.budget == D2K_BUDGET_CUT;
+                if (cut && local_refusal_verdict(s, t) != 0) { /* наша неудача — не улика */ }
+                else if (cut) budget_cut_reject(s, t);
+                else verify_confirm(s, t, now_ms);
                 moved++;
             } else if (now_ms >= t->ver_until_ms) {
                 if (s->dropped_seen != t->ver_dropped0 && t->probes < SCHED_MAX_PROBES) {
