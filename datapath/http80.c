@@ -415,6 +415,17 @@ int d2k_http_hello(const uint8_t *p, size_t n, size_t *host_off, size_t *host_le
                 }
             }
             if (!label || p[v + hl - 1] == '-') { return 0; }
+            /* Последняя метка из одних цифр — адрес IPv4, а не имя (ревью
+               M-2): IP-цели проверяются в своём контексте, имени у них нет. */
+            {
+                size_t ls = hl;
+                while (ls > 0 && p[v + ls - 1] != '.') { ls--; }
+                int digits = 1;
+                for (size_t k = ls; k < hl; k++) {
+                    if (p[v + k] < '0' || p[v + k] > '9') { digits = 0; break; }
+                }
+                if (digits) { return 0; }
+            }
             off = v;
             len = hl;
         }

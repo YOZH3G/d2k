@@ -1746,7 +1746,10 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        приветствия TLS к такому потоку отношения не имеют. */
     int http_hello = 0;
     size_t http_off = 0, http_len = 0;
+    /* Порт 80 (ревью M-1): Host без порта означает 80, и запрос на другой
+       порт — не наш вход. */
     if (!fl->saw_hello && fwd && !fl->http_checked && fl->saw_syn &&
+        t[2] == 0 && t[3] == 80 &&
         in_seq == fl->syn_seq + 1u && payload_len >= 5 &&
         (pkt[payload_off] == 'G' || pkt[payload_off] == 'H')) {
         fl->http_checked = 1;

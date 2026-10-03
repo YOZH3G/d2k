@@ -319,14 +319,20 @@ int d2k_plantab_stream_candidate_target(const d2k_plantab *t, const uint8_t *nam
    не попадают намеренно: они существуют только для одного местного порта, и
    для всех прочих вопросов их как будто нет. Пропусти это — и пробный план
    утёк бы к пользователю через ветку «имя знаем, формы такой нет». */
-static entry *find_name(d2k_plantab *t, const uint8_t *name, size_t len, uint8_t family) {
+static entry *find_name_skip(d2k_plantab *t, const uint8_t *name, size_t len, uint8_t family,
+                             int skip_http) {
     for (size_t i = 0; i < t->used; i++) {
         if (t->v[i].kind == KEY_NAME && t->v[i].family == family && t->v[i].only_sport == 0 &&
+            !(skip_http && t->v[i].shape == D2K_PLAN_SHAPE_HTTP) &&
             name_eq(t->v[i].name, t->v[i].name_len, name, len)) {
             return &t->v[i];
         }
     }
     return NULL;
+}
+
+static entry *find_name(d2k_plantab *t, const uint8_t *name, size_t len, uint8_t family) {
+    return find_name_skip(t, name, len, family, 0);
 }
 
 /* ЗАПИСЬ ИЩЕТСЯ ПО ИМЕНИ И ФОРМЕ, а не по одному имени.
@@ -571,7 +577,10 @@ int d2k_plantab_set_name_family(d2k_plantab *t, const uint8_t *name, size_t len,
        записи — ровно прежнее поведение «форму не понижаем». */
     entry *e = NULL;
     if (shape == D2K_PLAN_SHAPE_GRANDFATHER && sport_be == 0) {
-        e = find_name(t, name, len, family);
+        /* Запись HTTP — другой протокол того же имени, не «измеренная форма
+           TLS»: дедушкин TLS-план её не заменяет (ревью I-1 шага 4 — иначе
+           пропадали и HTTP-, и TLS-план имени). */
+        e = find_name_skip(t, name, len, family, 1);
         if (e && e->only_sport == 0 && e->shape != D2K_PLAN_SHAPE_GRANDFATHER) {
             e->last_used_ns = now_ns;
             d2k_plan_free(e->plan);

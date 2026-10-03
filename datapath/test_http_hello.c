@@ -103,6 +103,8 @@ static void test_parse(void) {
         "GET / HTTP/1.1\r\nHost: \r\n\r\n",
         "\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03",
         "GET / SPDY/3\r\nHost: example.com\r\n\r\n",
+        /* IP вместо имени — не имя (ревью M-2): IP-цели в своём контексте. */
+        "GET / HTTP/1.1\r\nHost: 37.221.67.160\r\n\r\n",
     };
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
         CHECK(!d2k_http_hello((const uint8_t *)bad[i], strlen(bad[i]), &off, &len),
@@ -175,7 +177,73 @@ static void test_table(void) {
     d2k_plantab_free(tab);
 }
 
+/* ЗАПИСИ HTTP И TLS ОДНОГО ИМЕНИ СОСУЩЕСТВУЮТ (ревью I-1, воспроизведение
+   rv51/gf.c): дедушкина TLS-запись имени затирала HTTP-запись, и пропадали
+   оба плана. В любом порядке, и после синхронизации каталога, идущей вслед
+   за загрузкой http-plans.txt. */
+static int has_http(d2k_plantab *t, const uint8_t *n, size_t l, uint8_t id) {
+    const d2k_plan *p = d2k_plantab_find_http(t, n, l, 4, 0, 9);
+    return p && d2k_plan_id(p)[0] == id;
+}
+static int has_tls(d2k_plantab *t, const uint8_t *n, size_t l, uint8_t shape, uint8_t id) {
+    const d2k_plan *p = d2k_plantab_find_target(t, n, l, NULL, 4, 9, shape, 0);
+    return p && d2k_plan_id(p)[0] == id;
+}
+static void test_coexist(void) {
+    static const uint8_t name[] = "fast-torrent.ru";
+    const size_t nl = sizeof name - 1;
+    static const uint8_t tls_shapes[] = {D2K_PLAN_SHAPE_GRANDFATHER, D2K_PLAN_SHAPE_MODERN,
+                                         D2K_PLAN_SHAPE_LEGACY};
+    for (size_t k = 0; k < sizeof tls_shapes; k++) {
+        uint8_t sh = tls_shapes[k];
+        uint8_t seen = sh == D2K_PLAN_SHAPE_GRANDFATHER ? D2K_PLAN_SHAPE_MODERN : sh;
+        /* HTTP, затем TLS. */
+        d2k_plantab *t = d2k_plantab_new(16);
+        CHECK(d2k_plantab_set_name_family(t, name, nl, 1, http_split_plan(3), D2K_PLAN_SHAPE_HTTP, 0, 4) == 0 &&
+              d2k_plantab_set_name_family(t, name, nl, 1, tls_split_plan(2), sh, 0, 4) == 0,
+              "HTTP, затем TLS: установка отказала");
+        CHECK(has_http(t, name, nl, 3), "TLS-запись затёрла HTTP-запись имени");
+        CHECK(has_tls(t, name, nl, seen, 2), "TLS-план имени пропал рядом с HTTP-записью");
+        d2k_plantab_free(t);
+        /* TLS, затем HTTP. */
+        t = d2k_plantab_new(16);
+        CHECK(d2k_plantab_set_name_family(t, name, nl, 1, tls_split_plan(2), sh, 0, 4) == 0 &&
+              d2k_plantab_set_name_family(t, name, nl, 1, http_split_plan(3), D2K_PLAN_SHAPE_HTTP, 0, 4) == 0,
+              "TLS, затем HTTP: установка отказала");
+        CHECK(has_http(t, name, nl, 3) && has_tls(t, name, nl, seen, 2),
+              "HTTP-запись затёрла TLS-запись имени или пропала сама");
+        d2k_plantab_free(t);
+    }
+    /* Запуск d2kc: http-plans.txt, затем синхронизация каталога (TLS 1.3 и
+       дедушкина — по существующему правилу дедушкина обновляет план
+       измеренной TLS-записи, своей не заводит), затем повторная постановка
+       HTTP-планов. */
+    d2k_plantab *t = d2k_plantab_new(16);
+    CHECK(d2k_plantab_set_name_family(t, name, nl, 1, http_split_plan(3), D2K_PLAN_SHAPE_HTTP, 0, 4) == 0 &&
+          d2k_plantab_set_name_family(t, name, nl, 2, tls_split_plan(4), D2K_PLAN_SHAPE_MODERN, 0, 4) == 0 &&
+          d2k_plantab_set_name_family(t, name, nl, 3, tls_split_plan(5), D2K_PLAN_SHAPE_GRANDFATHER, 0, 4) == 0 &&
+          d2k_plantab_set_name_family(t, name, nl, 4, http_split_plan(6), D2K_PLAN_SHAPE_HTTP, 0, 4) == 0,
+          "запуск: установка отказала");
+    CHECK(has_http(t, name, nl, 6), "после синхронизации каталога HTTP-план не тот");
+    CHECK(has_tls(t, name, nl, D2K_PLAN_SHAPE_MODERN, 5), "после синхронизации TLS-план не тот");
+    d2k_plantab_free(t);
+    /* Снятие одного не трогает другое. */
+    t = d2k_plantab_new(16);
+    CHECK(d2k_plantab_set_name_family(t, name, nl, 1, http_split_plan(3), D2K_PLAN_SHAPE_HTTP, 0, 4) == 0 &&
+          d2k_plantab_set_name_family(t, name, nl, 2, tls_split_plan(5), D2K_PLAN_SHAPE_GRANDFATHER, 0, 4) == 0,
+          "установка отказала");
+    CHECK(d2k_plantab_del_name_shaped(t, name, nl, 6, D2K_PLAN_SHAPE_GRANDFATHER, 4) == 1 &&
+          has_http(t, name, nl, 3) && !has_tls(t, name, nl, D2K_PLAN_SHAPE_LEGACY, 5),
+          "снятие дедушкиной TLS-записи тронуло HTTP-запись");
+    CHECK(d2k_plantab_set_name_family(t, name, nl, 3, tls_split_plan(7), D2K_PLAN_SHAPE_MODERN, 0, 4) == 0 &&
+          d2k_plantab_del_name_shaped(t, name, nl, 6, D2K_PLAN_SHAPE_HTTP, 4) == 1 &&
+          has_tls(t, name, nl, D2K_PLAN_SHAPE_MODERN, 7) && !has_http(t, name, nl, 3),
+          "снятие HTTP-записи тронуло TLS-запись");
+    d2k_plantab_free(t);
+}
+
 /* --- сессия: разрез запроса на проводе -------------------------------------- */
+static unsigned g_sport = 80;
 static size_t pkt4(uint8_t *o, int to_server, uint8_t flags, uint32_t seq, uint32_t ack,
                    const char *pay) {
     size_t pl = pay ? strlen(pay) : 0, n = 40 + pl;
@@ -183,7 +251,7 @@ static size_t pkt4(uint8_t *o, int to_server, uint8_t flags, uint32_t seq, uint3
     o[0] = 0x45; wr16(o + 2, (unsigned)n); o[8] = 64; o[9] = 6;
     const uint8_t c[4] = {192, 168, 1, 117}, s[4] = {195, 82, 146, 214};
     memcpy(o + 12, to_server ? c : s, 4); memcpy(o + 16, to_server ? s : c, 4);
-    wr16(o + 20, to_server ? 51000 : 80); wr16(o + 22, to_server ? 80 : 51000);
+    wr16(o + 20, to_server ? 51000 : g_sport); wr16(o + 22, to_server ? g_sport : 51000);
     wr32(o + 24, seq); wr32(o + 28, ack); o[32] = 0x50; o[33] = flags; wr16(o + 34, 64240);
     if (pl) { memcpy(o + 40, pay, pl); }
     return n;
@@ -255,6 +323,12 @@ static void test_session(void) {
           "HTTP-план не встал");
     run_flow(s, "POST /x HTTP/1.1\r\nHost: rutracker.org\r\nContent-Length: 0\r\n\r\n", &r);
     CHECK(!r.applied && r.verdict == D2K_VERDICT_ACCEPT, "POST изменён HTTP-планом");
+    /* Не порт 80 (ревью M-1): Host без порта означает 80, а поток идёт не
+       туда — не наш вход. */
+    g_sport = 8080;
+    run_flow(s, GET, &r);
+    CHECK(!r.applied && r.verdict == D2K_VERDICT_ACCEPT, "запрос не на порт 80 изменён HTTP-планом");
+    g_sport = 80;
     d2k_session_free(s);
     (void)rd32;
 
@@ -324,6 +398,7 @@ int main(void) {
     test_parse();
     test_plan();
     test_table();
+    test_coexist();
     test_session();
     if (fails) { printf("test_http_hello: провалов %d\n", fails); return 1; }
     printf("test_http_hello: все проверки прошли\n");
