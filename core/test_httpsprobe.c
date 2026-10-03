@@ -270,18 +270,26 @@ static void test_persist(void) {
           nl == 1 && np == 1 && !strcmp(push[0].host, "a.example"), "истёкшее загружено");
     d2k_httpsprobe_free(p);
 
-    /* Часы роутера до NTP в прошлом: срок режется сроком класса. */
+    /* Часы роутера до NTP в прошлом (ревью N2): файл записан «в будущем» —
+       сколько ему на самом деле, не узнать, и старое знание не оживает. */
     p = d2k_httpsprobe_new(0, fake);
     CHECK(d2k_httpsprobe_load(p, path, 0, 10, push, 8, &np, &nl, err, sizeof err) == 0 &&
-          np == 2 && push[0].ttl_s <= 21600 && push[1].ttl_s <= 21600 &&
-          (push[0].state != D2K_HTTPS_TLS_BLOCKED || push[0].ttl_s == 3600) &&
-          (push[1].state != D2K_HTTPS_TLS_BLOCKED || push[1].ttl_s == 3600),
-          "срок из прошлого не урезан сроком класса");
+          np == 0 && nl == 0, "кэш, записанный позже «сейчас», ожил при отстающих часах");
     d2k_httpsprobe_free(p);
+    /* Старый формат без отметки записи читается, срок режется классом. */
+    {
+        FILE *g = fopen(path, "w");
+        fprintf(g, "d2k-https 1\nserved 99999999 old.example\n");
+        fclose(g);
+        p = d2k_httpsprobe_new(0, fake);
+        CHECK(d2k_httpsprobe_load(p, path, 0, 1000000, push, 8, &np, &nl, err, sizeof err) == 0 &&
+              np == 1 && push[0].ttl_s == 21600, "старый формат не прочитан или срок не урезан");
+        d2k_httpsprobe_free(p);
+    }
 
     /* Негодные строки пропускаются, годные берутся. */
     FILE *f = fopen(path, "w");
-    fprintf(f, "d2k-https 1\nserved 2000000 good.example\nserved x bad\nweird 2000000 w.example\n"
+    fprintf(f, "d2k-https 2 1000000\nserved 2000000 good.example\nserved x bad\nweird 2000000 w.example\n"
                "served 2000000 bad name\n\xff\xfe\nprobing 2000000 p.example\n");
     fclose(f);
     p = d2k_httpsprobe_new(0, fake);

@@ -182,7 +182,9 @@ static int first_flight(int fd, const char *host, char *why, size_t cap) {
     struct pollfd p = {fd, POLLIN, 0};
     int rc;
     do { rc = poll(&p, 1, FIRST_MS); } while (rc < 0 && errno == EINTR);
-    if (rc == 0) {
+    /* Ошибка poll — «ответа нет», а не повод читать: блокирующий recv на
+       молчащем соединении остановил бы единственный поток зонда (ревью N5). */
+    if (rc <= 0) {
         snprintf(why, cap, "443 принял, на ClientHello тишина %d мс", FIRST_MS);
         return 0;
     }
@@ -323,6 +325,8 @@ static void *worker(void *arg) {
         d2k_httpsprobe_result r;
         memset(&r, 0, sizeof r);
         snprintf(r.host, sizeof r.host, "%s", j.host);
+        r.family = j.family;
+        memcpy(r.addr, j.addr, sizeof r.addr);
         r.state = p->probe(j.family, j.addr, j.host, p->mark, r.why, sizeof r.why);
         if (r.state == D2K_HTTPS_UNKNOWN || r.state == D2K_HTTPS_PROBING) {
             r.state = D2K_HTTPS_UNCONFIRMED;
@@ -477,7 +481,8 @@ int d2k_httpsprobe_save(d2k_httpsprobe *p, const char *path, int64_t now_ms, int
     }
     FILE *f = fopen(tmp, "w");
     if (!f) { snprintf(err, cap, "%s: %s", tmp, strerror(errno)); return -1; }
-    fprintf(f, "d2k-https 1\n");
+    /* v2: отметка записи по стенным часам (ревью N2). */
+    fprintf(f, "d2k-https 2 %lld\n", (long long)wall_s);
     pthread_mutex_lock(&p->mu);
     for (size_t i = 0; i < D2K_HTTPSPROBE_NAMES; i++) {
         const entry *e = &p->cache[i];
@@ -510,15 +515,26 @@ int d2k_httpsprobe_load(d2k_httpsprobe *p, const char *path, int64_t now_ms, int
         return -1;
     }
     char line[512];
-    if (!fgets(line, sizeof line, f) || strcmp(line, "d2k-https 1\n") != 0) {
+    long long written = -1;
+    int used = 0;
+    if (!fgets(line, sizeof line, f) ||
+        (strcmp(line, "d2k-https 1\n") != 0 &&
+         (sscanf(line, "d2k-https 2 %lld\n%n", &written, &used) != 1 || line[used] != '\0' ||
+          written < 0))) {
         fclose(f);
-        snprintf(err, cap, "%s: не кэш HTTPS d2k (нет заголовка «d2k-https 1»)", path);
+        snprintf(err, cap, "%s: не кэш HTTPS d2k (нет заголовка «d2k-https 1|2»)", path);
         return -1;
+    }
+    if (written > wall_s) {
+        /* Файл записан позже, чем «сейчас»: часы отстают (Keenetic без RTC
+           до NTP). Сколько знанию на самом деле — не узнать; не оживляем. */
+        fclose(f);
+        return 0;
     }
     while (fgets(line, sizeof line, f)) {
         char st[32], host[300];
         long long exp;
-        int used = 0;
+        used = 0;
         if (sscanf(line, "%31s %lld %299s %n", st, &exp, host, &used) != 3 ||
             line[used] != '\0' || !host_ok(host)) { continue; }
         d2k_https_state s = D2K_HTTPS_UNKNOWN;

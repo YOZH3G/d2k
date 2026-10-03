@@ -88,6 +88,16 @@ TESTS += test_ech
 TESTS += test_domain test_groups
 TESTS += test_groups_catalog
 TESTS += test_http_reply
+# Поиск обхода открытого HTTP (задача 51, шаг 4): исполнитель — настоящий
+# датапатовский, планы кандидатов проверяются на нём.
+TESTS += test_httpsearch
+check: test-httpsearch
+.PHONY: test-httpsearch
+test_httpsearch: test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c include/d2k_httpsearch.h
+	$(CC) $(CFLAGS) -o $@ test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c $(TEST_LDFLAGS)
+test-httpsearch: test_httpsearch
+	./test_httpsearch
+
 # Есть ли у имени HTTPS — для перевода вставки провайдера на https (задача 51).
 TESTS += test_httpsprobe
 check: test-httpsprobe
@@ -688,11 +698,11 @@ cross: hello_profiles.inc
 		-lpthread || exit 1
 	@echo "== d2kc целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-a64 \
-		d2kc.c httpsprobe.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
+		d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
 		props.c voice.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-mipsel \
-		d2kc.c httpsprobe.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
+		d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
 		props.c voice.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
 	@echo "== test_measured целиком =="
@@ -745,7 +755,7 @@ d2kc-linux-arm64: release
 release: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -static -Wl,-S \
-		-o $(BUILDDIR)/d2kc-linux-$(ARCH) d2kc.c httpsprobe.c sched.c quichello.c plantlv.c verdict.c meas.c \
+		-o $(BUILDDIR)/d2kc-linux-$(ARCH) d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c \
 		crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c \
 		volume.c tls13.c tls12.c tls13core.c x25519.c verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread
 	@ls -l $(BUILDDIR)/d2kc-linux-$(ARCH)
@@ -786,7 +796,7 @@ test-sched-modes: test_sched sched.o quichello.o plantlv.o verify.o tls12.o quic
 # умолчание всё равно линкуется: крючок — точка подмены, а не условная сборка.
 test_sched: test_sched.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o stun.o \
             hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< httpsprobe.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
+	$(CC) $(CFLAGS) -o $@ $< httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
 		voice.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 # Стенд test_verify.c — СВОЙ (не общий test_stand.h): он единственный умеет
@@ -868,10 +878,10 @@ DETECT_OBJ = ../detect/bridge.o ../detect/classify.o ../detect/poison.o \
 $(DETECT_OBJ): FORCE
 	$(MAKE) -C ../detect $(notdir $@)
 
-d2kc: d2kc.c httpsprobe.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o stun.o \
+d2kc: d2kc.c httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o stun.o \
       hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
       $(DETECT_OBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< httpsprobe.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
+	$(CC) $(CFLAGS) -o $@ $< httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
 		voice.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
 		$(DETECT_OBJ) $(TEST_LDFLAGS)
 

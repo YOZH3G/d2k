@@ -29,6 +29,10 @@
 
 #include "d2k_sched.h"
 #include "d2k_httpsprobe.h"
+#include "d2k_httpsearch.h"
+#include "d2k_plantlv.h"
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include "d2k_link.h"
 
 /* Переходник к перенесённому измерителю (detect/bridge.c). Объявлен здесь, а
@@ -129,6 +133,130 @@ static void sched_say(void *ctx, const char *line) {
 
 /* --- открытый HTTP: вставка провайдера → HTTPS имени (задача 51) -------- */
 
+/* Поиск обхода самого HTTP (шаг 4): имена, у которых HTTPS нет. */
+static d2k_httpsearch *g_hs;
+static d2k_hs_runner *g_hr;
+static int g_link_fd = -1;
+static uint32_t g_probe_mark;
+static const char *g_http_plans;
+
+static void http_search_portal(const char *host, uint8_t family, const uint8_t *addr,
+                               d2k_https_state st, int64_t now) {
+    /* Только класс 3 — портал проходит как есть, HTTPS у имени нет. */
+    if (!g_hs || !family || st == D2K_HTTPS_UNKNOWN || st == D2K_HTTPS_PROBING ||
+        d2k_https_upgrade(st)) { return; }
+    d2k_httpsearch_portal(g_hs, host, family, addr, now);
+}
+
+static int hs_open_port(void *ctx, uint8_t family, int *fd_out, uint16_t *sport_be) {
+    (void)ctx;
+    int fd = socket(family == 6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { return -1; }
+#ifdef SO_MARK
+    /* Метка зондов: через очередь, к потоку достаётся только пробный план
+       его порта, нового обнаружения он не рождает. */
+    if (g_probe_mark &&
+        setsockopt(fd, SOL_SOCKET, SO_MARK, &g_probe_mark, sizeof g_probe_mark) != 0) {
+        close(fd);
+        return -1;
+    }
+#endif
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof ss);
+    socklen_t sl;
+    if (family == 6) {
+        ((struct sockaddr_in6 *)&ss)->sin6_family = AF_INET6;
+        sl = sizeof(struct sockaddr_in6);
+    } else {
+        ((struct sockaddr_in *)&ss)->sin_family = AF_INET;
+        sl = sizeof(struct sockaddr_in);
+    }
+    if (bind(fd, (struct sockaddr *)&ss, sl) != 0 ||
+        getsockname(fd, (struct sockaddr *)&ss, &sl) != 0) {
+        close(fd);
+        return -1;
+    }
+    *sport_be = family == 6 ? ((struct sockaddr_in6 *)&ss)->sin6_port
+                            : ((struct sockaddr_in *)&ss)->sin_port;
+    *fd_out = fd;
+    return 0;
+}
+
+static void hs_close_port(void *ctx, int fd) { (void)ctx; close(fd); }
+
+static int hs_hex(const char *text, char *hex, size_t cap) {
+    char err[200];
+    if (d2k_plan_text_to_hex(text, hex, cap, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: план HTTP не собрался: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int hs_set_probe(void *ctx, const char *host, uint8_t family, uint16_t sport_be,
+                        const char *text, const uint8_t trial[16]) {
+    (void)ctx;
+    static char hex[8192];
+    char err[200];
+    if (hs_hex(text, hex, sizeof hex) != 0) { return -1; }
+    if (d2k_link_set_name_probe_trial(g_link_fd, host, 6, hex, D2K_LINK_SHAPE_HTTP, sport_be,
+                                      family, trial, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int hs_del_probe(void *ctx, const char *host, uint8_t family, uint16_t sport_be) {
+    (void)ctx;
+    char err[200];
+    if (d2k_link_del_name_probe_family(g_link_fd, host, 6, D2K_LINK_SHAPE_HTTP, sport_be,
+                                       family, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int hs_set_plan(void *ctx, const char *host, uint8_t family, const char *text) {
+    (void)ctx;
+    static char hex[8192];
+    char err[200];
+    if (hs_hex(text, hex, sizeof hex) != 0) { return -1; }
+    if (d2k_link_set_name_family(g_link_fd, host, 6, hex, D2K_LINK_SHAPE_HTTP, 0, family,
+                                 err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int hs_del_plan(void *ctx, const char *host, uint8_t family) {
+    (void)ctx;
+    char err[200];
+    if (d2k_link_del_name_family(g_link_fd, host, 6, D2K_LINK_SHAPE_HTTP, family,
+                                 err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int hs_start(void *ctx, const d2k_hs_job *job) {
+    (void)ctx;
+    return d2k_hs_runner_start(g_hr, job);
+}
+
+static void hs_say(void *ctx, const char *line);
+static void hs_changed(void *ctx) {
+    (void)ctx;
+    char err[300];
+    if (g_hs && g_http_plans &&
+        d2k_httpsearch_save(g_hs, g_http_plans, (int64_t)time(NULL), err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: планы HTTP не сохранены: %s\n", err);
+    }
+}
+
 /* Датапат узнал вставку провайдера. Проверить HTTPS имени на том же адресе;
    подтверждённое, но забытое датапатом — повторить. */
 static void http_portal(d2k_httpsprobe *hp, int fd, const d2k_ev *ev, int64_t now) {
@@ -136,6 +264,10 @@ static void http_portal(d2k_httpsprobe *hp, int fd, const d2k_ev *ev, int64_t no
     uint32_t ttl = 0;
     int rc = d2k_httpsprobe_portal(hp, ev->name, ev->family, ev->high_ip, ev->code == 1,
                                    now, &ttl);
+    if (rc == 0) {
+        http_search_portal(ev->name, ev->family, ev->high_ip,
+                           d2k_httpsprobe_state(hp, ev->name, now), now);
+    }
     if (rc == 1) {
         snprintf(line, sizeof line, "HTTP %.255s: провайдер подменяет ответ порталом блокировки — "
                  "проверяю HTTPS имени", ev->name);
@@ -182,6 +314,7 @@ static void http_probe_done(d2k_httpsprobe *hp, int fd, int64_t now, const char 
                           "был бы тупиком");
             sched_say(NULL, line);
             if (up) { http_push(fd, r[i].host, r[i].ttl_s); }
+            else { http_search_portal(r[i].host, r[i].family, r[i].addr, r[i].state, now); }
         }
     }
     if (total) { http_save(hp, cache_path, now); }
@@ -193,6 +326,8 @@ static void http_probe_done(d2k_httpsprobe *hp, int fd, int64_t now, const char 
         lost_told = lost;
     }
 }
+
+static void hs_say(void *ctx, const char *line) { (void)ctx; sched_say(NULL, line); }
 
 static void usage(void) {
     fprintf(stderr,
@@ -328,6 +463,37 @@ int main(int argc, char **argv) {
             https_path = https_buf;
         }
     }
+    /* Поиск обхода HTTP и его подтверждённые планы — рядом с каталогом. */
+    g_link_fd = fd;
+    g_probe_mark = mark;
+    static char plans_buf[CATPATH_MAX + 32];
+    {
+        const char *slash = strrchr(catpath, '/');
+        size_t dirlen = slash ? (size_t)(slash - catpath + 1) : 0;
+        if (dirlen < sizeof plans_buf - 20) {
+            memcpy(plans_buf, catpath, dirlen);
+            snprintf(plans_buf + dirlen, sizeof plans_buf - dirlen, "http-plans.txt");
+            g_http_plans = plans_buf;
+        }
+    }
+    g_hr = d2k_hs_runner_new();
+    if (g_hr) {
+        d2k_hs_ops ops = {hs_open_port, hs_close_port, hs_set_probe, hs_del_probe, hs_set_plan,
+                          hs_del_plan, hs_start, hs_say, hs_changed, NULL};
+        g_hs = d2k_httpsearch_new(&ops);
+    }
+    if (!g_hs) {
+        fprintf(stderr, "d2kc: поиск обхода HTTP не завёлся — вставка в HTTP без HTTPS "
+                        "останется как есть\n");
+    } else if (g_http_plans) {
+        size_t nl = 0;
+        char herr[300];
+        if (d2k_httpsearch_load(g_hs, g_http_plans, &nl, herr, sizeof herr) != 0) {
+            fprintf(stderr, "d2kc: планы HTTP не прочитаны: %s\n", herr);
+        } else if (nl) {
+            printf("d2kc: планы HTTP %s: имён %zu поставлено датапату\n", g_http_plans, nl);
+        }
+    }
     if (hp && https_path) {
         static d2k_httpsprobe_result push[D2K_HTTPSPROBE_NAMES];
         size_t np = 0, nl = 0;
@@ -404,10 +570,11 @@ int main(int argc, char **argv) {
     int link_lost = 0;
 
     while (!stop_asked) {
-        struct pollfd pfd[3];
+        struct pollfd pfd[4];
         pfd[0].fd = fd;                       pfd[0].events = POLLIN; pfd[0].revents = 0;
         pfd[1].fd = d2k_sched_wake_fd(s);     pfd[1].events = POLLIN; pfd[1].revents = 0;
         pfd[2].fd = d2k_httpsprobe_wake_fd(hp); pfd[2].events = POLLIN; pfd[2].revents = 0;
+        pfd[3].fd = d2k_hs_runner_wake_fd(g_hr); pfd[3].events = POLLIN; pfd[3].revents = 0;
 
         int64_t t = now_ms();
         int wait = (int)(TICK_MS - (t - last_tick));
@@ -417,7 +584,7 @@ int main(int argc, char **argv) {
                порция обязана идти сразу за чтением событий. */
             wait = 0;
         }
-        int pr = poll(pfd, hp ? 3 : 2, wait);
+        int pr = poll(pfd, 4, wait);
         if (pr < 0 && errno != EINTR) {
             fprintf(stderr, "d2kc: poll: %s\n", strerror(errno));
             break;
@@ -443,6 +610,16 @@ int main(int argc, char **argv) {
                     case D2K_EV_HTTP_PORTAL:
                         if (hp) { http_portal(hp, fd, &ev, now_ms()); }
                         break;
+                    default: break;
+                    }
+                    /* Поиск HTTP: подтверждение своей пробы и исполнение
+                       своего плана (сверка по trial ID и Plan ID). */
+                    if (g_hs && ev.kind == D2K_EV_ACK && ev.code == D2K_CMD_SET_NAME_PROBE) {
+                        d2k_httpsearch_ack(g_hs, ev.trial_id, ((ev.num >> 8) & 0xffu) == 1u, now_ms());
+                    } else if (g_hs && ev.kind == D2K_EV_APPLIED) {
+                        d2k_httpsearch_applied(g_hs, ev.plan_id);
+                    }
+                    switch (ev.kind) {
                     case D2K_EV_PROTO:
                         /* ВЕРСИЯ ПРОВОДА. Чужая — работать нельзя: смешанная пара
                            не падает и не ругается, она молча не даёт
@@ -476,6 +653,11 @@ int main(int argc, char **argv) {
         if (hp && pr > 0 && (pfd[2].revents & POLLIN)) {
             http_probe_done(hp, fd, now_ms(), https_path);
         }
+        if (g_hs && pr > 0 && (pfd[3].revents & POLLIN)) {
+            d2k_hs_result hr;
+            if (d2k_hs_runner_done(g_hr, &hr)) { d2k_httpsearch_result(g_hs, &hr, now_ms()); }
+        }
+        if (g_hs) { d2k_httpsearch_tick(g_hs, now_ms()); }
         /* PID живого контроллера ещё не означает, что он связан с датапатом:
            закрытый AF_UNIX peer даёт POLLHUP один раз. Не выходя здесь,
            контроллер продолжал бы публиковать live.json с linked=true. */
@@ -553,6 +735,9 @@ int main(int argc, char **argv) {
     fflush(stdout);
     d2k_detect_stop_all();
     d2k_httpsprobe_free(hp);
+    /* Сперва дождаться зонда (он держит сокет), потом снять свою пробу. */
+    d2k_hs_runner_free(g_hr);
+    d2k_httpsearch_free(g_hs);
     d2k_sched_free(s);
     if (cat.revision != dirty) {
         if (save_atomic(&cat, catpath, err, sizeof err) != 0) {
