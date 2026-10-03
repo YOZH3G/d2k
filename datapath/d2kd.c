@@ -1315,6 +1315,15 @@ int main(int argc, char **argv) {
                         original_failed = d2k_hold_verdicts(original_ids, original_count,
                                                             verdict, send_original_verdict,
                                                             &hc) != 0;
+                        /* ПЕРВАЯ ДАТАГРАММА ПОТОКА БЕЗ УДЕРЖАНИЯ (поле 03.10 после
+                           4ed54d4): то, что стоит в очереди за ней, пришло в
+                           conntrack до её вердикта — тот же путь, что за
+                           выпущенной головой. */
+                        if (!batch.count && !original_failed && verdict == D2K_NF_ACCEPT &&
+                            !res.applied && np.have_payload && !np.truncated) {
+                            (void)d2k_udp_path_passed(&udp_path, np.payload,
+                                                      np.payload_len, t);
+                        }
                     }
                     if (original_failed) {
                         if (res.applied && mode == MODE_APPLY) {

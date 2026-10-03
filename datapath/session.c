@@ -2138,6 +2138,31 @@ int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
     return 1;
 }
 
+int d2k_session_udp_opening(d2k_session *s, const uint8_t *p, size_t n) {
+    d2k_packet_view ip;
+    if (!s || !d2k_packet_parse(p, n, &ip) || ip.protocol != 17 || (ip.fragment & 0x3fff)) {
+        return 0;
+    }
+    const uint8_t *u = p + ip.l4;
+    d2k_key key;
+    int src_is_low = d2k_key_make_addr(&key, 17, &ip.src, &ip.dst, u, u + 2);
+    d2k_flow *fl = d2k_track_find(s->uflows, &key);
+    if (!fl || fl->fwd_pkts != 1) { return 0; }
+    int from_client = -1;
+    if (s->hook == D2K_HOOK_OUTPUT || s->hook == D2K_HOOK_POSTROUTING) {
+        from_client = 1;
+    } else if (s->hook == D2K_HOOK_INPUT || s->hook == D2K_HOOK_PREROUTING) {
+        from_client = 0;
+    }
+    if (from_client < 0 && fl->dir_known) {
+        from_client = (src_is_low == fl->init_low) ? 1 : 0;
+    }
+    if (from_client < 0) {
+        from_client = rd16(u + 2) == 443 && rd16(u) != 443;
+    }
+    return from_client == 1;
+}
+
 void d2k_session_udp_hold_end(d2k_session *s, const d2k_key *key) {
     if (!s || !key) { return; }
     d2k_flow *fl = d2k_track_find(s->uflows, key);

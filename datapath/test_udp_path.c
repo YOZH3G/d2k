@@ -119,6 +119,10 @@ static int run_packet(d2k_session *s, uint32_t id, const uint8_t *pkt, size_t n,
         if (r.applied || r.verdict != D2K_VERDICT_ACCEPT ||
             !d2k_udp_out_late(&out, id, pkt, n, t, path.seq, &vf)) {
             (void)rec_verdict(NULL, id, D2K_NF_ACCEPT);
+            /* d2kd: a plainly ACCEPTed datagram that opens a client flow. */
+            if (!r.applied && r.verdict == D2K_VERDICT_ACCEPT) {
+                (void)d2k_udp_path_passed(&path, pkt, n, t);
+            }
         }
     }
     return how;
@@ -421,7 +425,61 @@ static void test_due_head_and_unfed_wait(void) {
     done(s, h, f);
 }
 
+/* Field 03.10 after 4ed54d4: a burst of 4 datagrams whose first one is not a
+ * QUIC Initial d2k can parse (long header, v1, random length field) is never
+ * held; each datagram was ACCEPTed on its own and the 2nd..4th, which reached
+ * conntrack while the 1st was still queued, were dropped as clashes (16 of 24
+ * lost).  The first datagram of any client UDP flow opens the same clash
+ * window as a released hold. */
+static void test_unheld_opening_burst(void) {
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    reset();
+    uint8_t pay[1200], pkt[1300];
+    for (uint32_t id = 1; id <= 4; id++) {
+        memset(pay, (int)(0x30 + id), sizeof pay);
+        pay[0] = 0xC5; pay[1] = 0; pay[2] = 0; pay[3] = 0; pay[4] = 1;
+        pay[5] = 8; pay[16] = 0x7F; pay[17] = 0xFF; /* Length far past the datagram */
+        size_t n = build(pkt, id, 50800, pay, sizeof pay);
+        if (id == 1) { d2k_udp_path_read(&path, 8000); }
+        CHECK(run_packet(s, id, pkt, n, 8000 + id * 100, 0) == D2K_UDP_PATH_NORMAL,
+              "an unparseable Initial is not held");
+    }
+    CHECK(verdicts_of[1] == 1 && last_verdict[1] == D2K_NF_ACCEPT && sends_of[1] == 0,
+          "the opening datagram goes to the kernel");
+    for (uint32_t id = 2; id <= 4; id++) {
+        CHECK(verdicts_of[id] == 1 && last_verdict[id] == D2K_NF_DROP && sends_of[id] == 1,
+              "datagrams queued behind it follow it through the raw path");
+    }
+    CHECK(!strcmp(order, "asdsdsd"), "opening verdict first, then each follower");
+
+    /* A later read past the window: the kernel path. */
+    d2k_udp_path_read(&path, 8000 + 50000000);
+    size_t n = build(pkt, 5, 50800, pay, sizeof pay);
+    (void)run_packet(s, 5, pkt, n, 8000 + 50000000, 0);
+    CHECK(last_verdict[5] == D2K_NF_ACCEPT && sends_of[5] == 0, "later datagram: kernel");
+
+    /* The server's datagrams never open a client window. */
+    uint8_t rev[200];
+    memset(rev, 0x44, sizeof rev);
+    n = build(pkt, 6, 50801, rev, sizeof rev);
+    /* swap ends: 57.144.248.192:443 -> 192.168.1.67:50801 */
+    uint8_t tmp[4]; memcpy(tmp, pkt + 12, 4); memcpy(pkt + 12, pkt + 16, 4); memcpy(pkt + 16, tmp, 4);
+    uint8_t pt[2]; memcpy(pt, pkt + 20, 2); memcpy(pkt + 20, pkt + 22, 2); memcpy(pkt + 22, pt, 2);
+    d2k_session_set_hook(s, D2K_HOOK_PREROUTING);
+    d2k_udp_path_read(&path, 9000);
+    (void)run_packet(s, 6, pkt, n, 9000, 0);
+    n = build(pkt, 7, 50801, rev, sizeof rev);
+    memcpy(tmp, pkt + 12, 4); memcpy(pkt + 12, pkt + 16, 4); memcpy(pkt + 16, tmp, 4);
+    memcpy(pt, pkt + 20, 2); memcpy(pkt + 20, pkt + 22, 2); memcpy(pkt + 22, pt, 2);
+    (void)run_packet(s, 7, pkt, n, 9001, 0);
+    CHECK(sends_of[6] == 0 && sends_of[7] == 0 && last_verdict[7] == D2K_NF_ACCEPT,
+          "server-side datagrams are never re-sent");
+    done(s, h, f);
+}
+
 int main(void) {
+    test_unheld_opening_burst();
     test_expiry_read_numbering();
     test_expiry_inside_feed_keeps_plan();
     test_due_head_and_unfed_wait();

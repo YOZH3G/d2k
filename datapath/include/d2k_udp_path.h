@@ -63,4 +63,13 @@ int d2k_udp_path_pre(d2k_udp_path *pp, uint32_t id, const uint8_t *pkt,
 int d2k_udp_path_post(d2k_udp_path *pp, int fed, const d2k_key *key,
                       const d2k_result *res, d2k_udp_hold_batch *batch);
 
+/* A datagram d2kd has just ACCEPTed plainly (no hold, no plan).  When it opened
+ * a client UDP flow (the session's first client datagram on the tuple), the
+ * datagrams queued right behind it reached conntrack while it was still
+ * queued and would clash: mark the flow for d2k_udp_out_late, exactly like a
+ * released hold.  Field 03.10.2026 after 4ed54d4: an unparseable-Initial burst
+ * lost its 2nd..4th datagrams this way (16 of 24).  Returns 1 when marked. */
+int d2k_udp_path_passed(d2k_udp_path *pp, const uint8_t *pkt, size_t len,
+                        uint64_t now_ns);
+
 #endif

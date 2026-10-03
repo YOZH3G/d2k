@@ -72,3 +72,12 @@ size_t d2k_udp_path_expire(d2k_udp_path *pp, uint64_t now_ns, int read_follows) 
     pp->seq = read_follows ? pp->rseq + 1 : D2K_UDP_SEQ_NONE;
     return d2k_udp_hold_flush(pp->hold, now_ns, d2k_udp_path_release, pp);
 }
+
+int d2k_udp_path_passed(d2k_udp_path *pp, const uint8_t *pkt, size_t len,
+                        uint64_t now_ns) {
+    if (!pp || !pp->out || !pp->out->can_resend || !pp->out->follow ||
+        !d2k_session_udp_opening(pp->sess, pkt, len)) {
+        return 0;
+    }
+    return d2k_udp_follow_mark(pp->out->follow, pkt, len, now_ns, 0, pp->seq) == 0;
+}

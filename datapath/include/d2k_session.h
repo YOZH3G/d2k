@@ -164,6 +164,11 @@ void d2k_session_udp_hold_end(d2k_session *s, const d2k_key *key);
 /* End a successful hold and preserve first-packet semantics for the immediate
  * replay of its original client datagram. */
 void d2k_session_udp_hold_replay(d2k_session *s, const d2k_key *key);
+/* 1 when this already-processed UDP datagram was the first client-side
+ * datagram the session counted on its flow (task 46: it opens the conntrack
+ * clash window for the datagrams queued behind it).  Direction as in the UDP
+ * branch: the NFQUEUE hook, the flow's known initiator, the 443 fallback. */
+int d2k_session_udp_opening(d2k_session *s, const uint8_t *p, size_t n);
 
 int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n);
 /* Accounting/capture for originals released without intervention. Never
