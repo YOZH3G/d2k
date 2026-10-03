@@ -78,6 +78,8 @@ d2k_hs_answer d2k_hs_judge(const char *host, const char *head, size_t n,
 void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
     memset(r, 0, sizeof *r);
     r->answer = D2K_HS_CONNECT_FAIL;
+    r->fd = job ? job->fd : -1;
+    r->seq = job ? job->seq : 0;
     if (!job || job->fd < 0) { snprintf(r->why, sizeof r->why, "нет сокета"); return; }
     int fd = job->fd;
     struct sockaddr_storage ss;
@@ -204,9 +206,41 @@ static const char *const CANDS[] = {"split", "disorder", "fake-badsum", "fake-se
 size_t d2k_hs_candidate_count(void) { return N_CANDS; }
 const char *d2k_hs_candidate_key(size_t i) { return i < N_CANDS ? CANDS[i] : NULL; }
 
+/* Ключ измеренной порчи: «fake:» + признаки через «+» в порядке ttl,
+   badsum, seqshift. Пишет строку признаков для плана в spec (через пробел). */
+static int poison_key_spec(const char *key, char *spec, size_t cap) {
+    if (strncmp(key, "fake:", 5) != 0 || !key[5] || strlen(key) > 39) { return -1; }
+    char buf[48];
+    snprintf(buf, sizeof buf, "%s", key + 5);
+    size_t pos = 0;
+    int have_ttl = 0, have_bad = 0, have_seq = 0, order = 0;
+    spec[0] = '\0';
+    for (char *tok = strtok(buf, "+"); tok; tok = strtok(NULL, "+")) {
+        int rank;
+        char *end = NULL;
+        if (!strcmp(tok, "badsum")) { if (have_bad++) return -1; rank = 2; }
+        else if (!strncmp(tok, "ttl=", 4)) {
+            long v = strtol(tok + 4, &end, 10);
+            if (have_ttl++ || !tok[4] || *end || v < 1 || v > 255) return -1;
+            rank = 1;
+        } else if (!strncmp(tok, "seqshift=", 9)) {
+            long v = strtol(tok + 9, &end, 10);
+            if (have_seq++ || !tok[9] || *end || v < -2147483647L || v > 2147483647L || v == 0) return -1;
+            rank = 3;
+        } else { return -1; }
+        if (rank <= order) { return -1; }   /* канонический порядок */
+        order = rank;
+        int k = snprintf(spec + pos, cap - pos, "%s%s", pos ? " " : "", tok);
+        if (k < 0 || (size_t)k >= cap - pos) { return -1; }
+        pos += (size_t)k;
+    }
+    return pos ? 0 : -1;
+}
+
 static int known_key(const char *k) {
     for (size_t i = 0; i < N_CANDS; i++) { if (!strcmp(CANDS[i], k)) return 1; }
-    return 0;
+    char spec[64];
+    return poison_key_spec(k, spec, sizeof spec) == 0;
 }
 
 int d2k_hs_candidate_text(const char *key, const uint8_t id[16], char *buf, size_t cap) {
@@ -219,13 +253,16 @@ int d2k_hs_candidate_text(const char *key, const uint8_t id[16], char *buf, size
 #define ADD(...) do { int k_ = snprintf(buf + pos, cap - pos, __VA_ARGS__); \
                       if (k_ < 0 || (size_t)k_ >= cap - pos) { return -1; } \
                       pos += (size_t)k_; } while (0)
-    if (!strncmp(key, "fake-", 5)) {
+    if (!strncmp(key, "fake-", 5) || !strncmp(key, "fake:", 5)) {
         static const char fake[] = "GET / HTTP/1.1\r\nHost: " HS_DECOY "\r\n\r\n";
+        char spec[64];
+        if (!strcmp(key, "fake-badsum")) { snprintf(spec, sizeof spec, "badsum"); }
+        else if (!strcmp(key, "fake-seqshift")) { snprintf(spec, sizeof spec, "seqshift=-66000"); }
+        else if (poison_key_spec(key, spec, sizeof spec) != 0) { return -1; }
         ADD("payload 1 ");
         for (size_t i = 0; i < sizeof fake - 1; i++) { ADD("%02x", (unsigned char)fake[i]); }
         ADD("\n");
-        if (!strcmp(key, "fake-badsum")) { ADD("poison 1 badsum\n"); }
-        else { ADD("poison 1 seqshift=-66000\n"); }
+        ADD("poison 1 %s\n", spec);
         ADD("fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n");
     }
     ADD("split sni_middle +0\n");
@@ -271,7 +308,7 @@ static void fresh_id(uint8_t id[16]) {
 typedef struct {
     char host[256];
     uint8_t family;
-    char key[24];          /* подтверждённый кандидат; "" — нет */
+    char key[40];          /* подтверждённый кандидат; "" — нет */
     uint64_t seq;          /* порядок подтверждения: свежие — первыми */
     int64_t no_before_ms;  /* раньше этого новый поиск/перепроверка не начинается */
     int64_t wall;          /* когда подтверждён (стенные часы, из файла) */
@@ -284,6 +321,8 @@ enum { PH_IDLE = 0, PH_BASE, PH_ACK, PH_RUN, PH_APPLIED };
 struct d2k_httpsearch {
     d2k_hs_ops ops;
     rec *recs; size_t n_recs, cap_recs;
+    char measured[8][40]; size_t n_measured;   /* ключи измеренной порчи */
+    uint32_t job_seq;
     pend *q; size_t n_q, cap_q;
     uint64_t seq;
     struct {
@@ -291,9 +330,11 @@ struct d2k_httpsearch {
         char host[256];
         uint8_t family, addr[16];
         int recheck;
-        char cands[N_CANDS * 2][24];
+        char cands[N_CANDS * 4 + 8][40];
         size_t n_cands, idx;
         int ok;            /* настоящих ответов подряд у текущего кандидата */
+        int judged;        /* судимых испытаний: ответ сервера или вставка под планом */
+        uint32_t job_seq;  /* номер текущего запуска зонда */
         int fd;
         uint16_t sport;
         uint8_t trial[16], plan_id[16];
@@ -322,7 +363,12 @@ static int host_ok(const char *h) {
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
               (c >= '0' && c <= '9') || c == '-' || c == '.')) { return 0; }
     }
-    return 1;
+    /* Адрес IPv4 — не имя (ревью M-2). */
+    const char *last = strrchr(h, '.');
+    last = last ? last + 1 : h;
+    if (!*last) { return 0; }
+    for (; *last; last++) { if (*last < '0' || *last > '9') { return 1; } }
+    return 0;
 }
 
 static rec *rec_find(const d2k_httpsearch *hs, const char *host, uint8_t family) {
@@ -349,6 +395,71 @@ static rec *rec_get(d2k_httpsearch *hs, const char *host, uint8_t family) {
     snprintf(r->host, sizeof r->host, "%s", host);
     r->family = family;
     return r;
+}
+
+int d2k_httpsearch_measured_poison(d2k_httpsearch *hs, const char *spec) {
+    if (!hs || !spec) { return -1; }
+    /* Строка признаков → канонический ключ. */
+    char buf[64], key[48] = "fake:";
+    char ttl[16] = "", seq[24] = "";
+    int bad = 0;
+    snprintf(buf, sizeof buf, "%s", spec);
+    for (char *tok = strtok(buf, " \t"); tok; tok = strtok(NULL, " \t")) {
+        if (!strcmp(tok, "badsum")) { bad = 1; }
+        else if (!strncmp(tok, "ttl=", 4) && strlen(tok) < sizeof ttl) { snprintf(ttl, sizeof ttl, "%s", tok); }
+        else if (!strncmp(tok, "seqshift=", 9) && strlen(tok) < sizeof seq) { snprintf(seq, sizeof seq, "%s", tok); }
+        else { return -1; }
+    }
+    size_t n = 5;
+    if (ttl[0]) { n += (size_t)snprintf(key + n, sizeof key - n, "%s", ttl); }
+    if (bad) { n += (size_t)snprintf(key + n, sizeof key - n, "%sbadsum", n > 5 ? "+" : ""); }
+    if (seq[0]) { n += (size_t)snprintf(key + n, sizeof key - n, "%s%s", n > 5 ? "+" : "", seq); }
+    if (n == 5 || n >= sizeof key) { return -1; }
+    /* Та же порча, что у заготовки, — ключ заготовки (одно имя на одно). */
+    const char *use = key;
+    if (!strcmp(key, "fake:badsum")) { use = "fake-badsum"; }
+    else if (!strcmp(key, "fake:seqshift=-66000")) { use = "fake-seqshift"; }
+    else if (!known_key(key)) { return -1; }
+    for (size_t i = 0; i < hs->n_measured; i++) { if (!strcmp(hs->measured[i], use)) return 0; }
+    if (hs->n_measured >= sizeof hs->measured / sizeof hs->measured[0]) { return -1; }
+    snprintf(hs->measured[hs->n_measured++], sizeof hs->measured[0], "%s", use);
+    return 0;
+}
+
+size_t d2k_hs_plan_poisons(const char *text, char out[][64], size_t cap) {
+    size_t n = 0;
+    if (!text || !strstr(text, "\nproto tcp tls\n")) { return 0; }
+    for (const char *ln = text; ln && *ln && n < cap;) {
+        unsigned id = 0;
+        int used = 0;
+        if (sscanf(ln, "poison %u %n", &id, &used) == 1 && used) {
+            char ref[32];
+            snprintf(ref, sizeof ref, " poison=%u ", id);
+            const char *e = strchr(ln + used, '\n');
+            size_t len = e ? (size_t)(e - (ln + used)) : strlen(ln + used);
+            /* Порча именно приманки («fake … poison=N»), не перекрытия. */
+            const char *f = strstr(text, "\nfake ");
+            int is_fake = 0;
+            while (f) {
+                const char *fe = strchr(f + 1, '\n');
+                size_t fl = fe ? (size_t)(fe - f) : strlen(f);
+                char line[256];
+                if (fl < sizeof line) {
+                    memcpy(line, f, fl); line[fl] = ' '; line[fl + 1 < sizeof line ? fl + 1 : fl] = '\0';
+                    if (strstr(line, ref)) { is_fake = 1; break; }
+                }
+                f = strstr(f + 1, "\nfake ");
+            }
+            if (is_fake && len > 0 && len < 64) {
+                memcpy(out[n], ln + used, len);
+                out[n][len] = '\0';
+                n++;
+            }
+        }
+        const char *nl = strchr(ln, '\n');
+        ln = nl ? nl + 1 : NULL;
+    }
+    return n;
 }
 
 d2k_httpsearch *d2k_httpsearch_new(const d2k_hs_ops *ops) {
@@ -421,6 +532,19 @@ static void next_candidate(d2k_httpsearch *hs, int64_t now);
 
 static void all_failed(d2k_httpsearch *hs, int64_t now) {
     rec *r = rec_get(hs, hs->cur.host, hs->cur.family);
+    if (!hs->cur.judged) {
+        /* Ни одного судимого испытания (ревью I-2): исполнение не
+           подтвердилось, датапат отказал или не ответил. О коробке это
+           ничего не говорит — план, если был, остаётся. */
+        if (r) { r->no_before_ms = now + D2K_HS_INCONCLUSIVE_MS; }
+        say(hs, "HTTP %s: поиск не измерен — ни один вопрос не дал исполненного опыта "
+                "(нет APPLIED, отказ или молчание датапата)%s; повтор не раньше чем через "
+                "%lld мин", hs->cur.host,
+            r && r->key[0] ? ", подтверждённый план оставлен" : "",
+            (long long)(D2K_HS_INCONCLUSIVE_MS / 60000));
+        finish(hs, now);
+        return;
+    }
     if (r && r->key[0]) {
         /* Перепроверка не подтвердила ни прежний план, ни другой: снимаем
            только свой постоянный план этого имени и формы HTTP. */
@@ -467,6 +591,7 @@ static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now)
         next_candidate(hs, now);
         return;
     }
+    if (r->answer == D2K_HS_REAL || r->answer == D2K_HS_INJECTED) { hs->cur.judged++; }
     if (r->answer == D2K_HS_REAL) {
         hs->cur.ok++;
         say(hs, "HTTP %s: «%s» — ответ сервера (%s), RTT %lld мкс, ответ через %lld мкс",
@@ -539,7 +664,16 @@ static void build_cands(d2k_httpsearch *hs) {
         if (!best) break;
         add_cand(hs, best->key);
     }
-    for (size_t i = 0; i < N_CANDS; i++) { add_cand(hs, CANDS[i]); }
+    add_cand(hs, "split");
+    add_cand(hs, "disorder");
+    if (hs->n_measured) {
+        /* Порча, измеренная на этой линии, — вместо заготовок. */
+        for (size_t i = 0; i < hs->n_measured; i++) { add_cand(hs, hs->measured[i]); }
+    } else {
+        /* Измеренной нет — заготовки (гипотезы TLS-поиска). */
+        add_cand(hs, "fake-badsum");
+        add_cand(hs, "fake-seqshift");
+    }
 }
 
 static void start(d2k_httpsearch *hs, const char *host, uint8_t family, const uint8_t *addr,
@@ -551,8 +685,10 @@ static void start(d2k_httpsearch *hs, const char *host, uint8_t family, const ui
     memcpy(hs->cur.addr, addr, family == 6 ? 16 : 4);
     hs->cur.recheck = recheck;
     d2k_hs_job job;
-    if (open_job(hs, &job) != 0 || !hs->ops.start_probe ||
-        hs->ops.start_probe(hs->ops.ctx, &job) != 0) {
+    hs->cur.job_seq = ++hs->job_seq;
+    int opened = open_job(hs, &job) == 0;
+    job.seq = hs->cur.job_seq;
+    if (!opened || !hs->ops.start_probe || hs->ops.start_probe(hs->ops.ctx, &job) != 0) {
         say(hs, "HTTP %s: зонд не запустился — поиск не начат", host);
         drop_socket(hs);
         hs->cur.phase = PH_IDLE;
@@ -621,6 +757,8 @@ void d2k_httpsearch_ack(d2k_httpsearch *hs, const uint8_t trial[16], int ok, int
     }
     d2k_hs_job job;
     memset(&job, 0, sizeof job);
+    hs->cur.job_seq = ++hs->job_seq;
+    job.seq = hs->cur.job_seq;
     job.fd = hs->cur.fd;
     job.family = hs->cur.family;
     memcpy(job.addr, hs->cur.addr, sizeof job.addr);
@@ -647,6 +785,14 @@ void d2k_httpsearch_applied(d2k_httpsearch *hs, const uint8_t plan_id[16]) {
 
 void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now) {
     if (!hs || !r) { return; }
+    if ((hs->cur.phase != PH_BASE && hs->cur.phase != PH_RUN) || r->seq != hs->cur.job_seq) {
+        /* Ответ не текущего запуска (ревью M-7): не судит опыт; его сокет
+           остался у зонда после остановки по сроку — закрываем здесь. */
+        if (r->fd >= 0 && r->fd != hs->cur.fd && hs->ops.close_port) {
+            hs->ops.close_port(hs->ops.ctx, r->fd);
+        }
+        return;
+    }
     if (hs->cur.phase == PH_BASE) {
         drop_socket(hs);
         if (r->answer == D2K_HS_INJECTED) {
@@ -695,6 +841,9 @@ void d2k_httpsearch_tick(d2k_httpsearch *hs, int64_t now) {
            нас; поиск останавливается, сокет закрывается. */
         say(hs, "HTTP %s: зонд не вернулся — поиск остановлен", hs->cur.host);
         if (hs->cur.phase == PH_RUN) { drop_probe(hs); }
+        /* Сокет у зонда: его закроет опоздавший ответ, не мы (ревью M-7). */
+        hs->cur.fd = -1;
+        hs->cur.job_seq = 0;
         finish(hs, now);
         break;
     default:
@@ -716,7 +865,7 @@ void d2k_httpsearch_push_all(d2k_httpsearch *hs) {
     }
 }
 
-int d2k_httpsearch_save(const d2k_httpsearch *hs, const char *path, int64_t wall_s,
+int d2k_httpsearch_save(d2k_httpsearch *hs, const char *path, int64_t wall_s,
                         char *err, size_t cap) {
     if (!hs || !path) { return -1; }
     char tmp[1100];
@@ -728,10 +877,12 @@ int d2k_httpsearch_save(const d2k_httpsearch *hs, const char *path, int64_t wall
     if (!f) { snprintf(err, cap, "%s: %s", tmp, strerror(errno)); return -1; }
     fprintf(f, "d2k-http-plans 1\n");
     for (size_t i = 0; i < hs->n_recs; i++) {
-        const rec *r = &hs->recs[i];
+        rec *r = &hs->recs[i];
         if (!r->key[0]) { continue; }
-        fprintf(f, "%s %u %s %lld\n", r->host, (unsigned)r->family, r->key,
-                (long long)(r->wall ? r->wall : wall_s));
+        /* Время подтверждения — первое сохранение после него (ревью M-4):
+           сохранение идёт сразу за подтверждением. */
+        if (!r->wall) { r->wall = wall_s; }
+        fprintf(f, "%s %u %s %lld\n", r->host, (unsigned)r->family, r->key, (long long)r->wall);
     }
     int bad = fflush(f) != 0 || fsync(fileno(f)) != 0;
     bad |= fclose(f) != 0;
@@ -760,16 +911,16 @@ int d2k_httpsearch_load(d2k_httpsearch *hs, const char *path, size_t *n_loaded,
         return -1;
     }
     while (fgets(line, sizeof line, f)) {
-        char host[300], key[32];
+        char host[300], key[48];
         unsigned family;
         long long wall;
         int used = 0;
-        if (sscanf(line, "%299s %u %31s %lld %n", host, &family, key, &wall, &used) != 4 ||
+        if (sscanf(line, "%299s %u %47s %lld %n", host, &family, key, &wall, &used) != 4 ||
             line[used] != '\0' || (family != 4 && family != 6) || !host_ok(host) ||
             !known_key(key)) { continue; }
         rec *r = rec_get(hs, host, (uint8_t)family);
         if (!r) { break; }
-        snprintf(r->key, sizeof r->key, "%.23s", key);
+        snprintf(r->key, sizeof r->key, "%.39s", key);
         r->seq = ++hs->seq;
         r->wall = wall;
         uint8_t id[16];

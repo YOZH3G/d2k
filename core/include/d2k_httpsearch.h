@@ -70,6 +70,7 @@ d2k_hs_answer d2k_hs_judge(const char *host, const char *head, size_t n,
 
 /* --- зонд ------------------------------------------------------------------ */
 typedef struct {
+    uint32_t seq;         /* номер запуска: ответ относится только к нему */
     int fd;               /* уже созданный и привязанный сокет (метка зондов) */
     uint8_t family;
     uint8_t addr[16];
@@ -81,6 +82,8 @@ typedef struct {
     int64_t rtt_us, reply_us;
     char status[64];      /* строка статуса, если была */
     char why[160];
+    uint32_t seq;         /* номер запуска (из d2k_hs_job) */
+    int fd;               /* его сокет: опоздавший ответ закрывает его */
 } d2k_hs_result;
 
 /* Порт и срок зонда; тесты подставляют свои. */
@@ -90,7 +93,17 @@ extern int d2k_hs_probe_ms;
  * НЕ закрывает: им владеет поиск (close_port после ответа). */
 void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r);
 
-/* --- кандидаты ------------------------------------------------------------- */
+/* --- кандидаты -------------------------------------------------------------
+ * Разрез ИМЕНИ ЗАГОЛОВКА («Ho» | «st:») не задаётся: разрез посреди значения
+ * Host уже не даёт ни одному сегменту целого имени, а разрез имени заголовка
+ * отличается от него только для коробки, которая, не найдя Host вовсе,
+ * блокирует соединение целиком. Такой коробки не измерено ни одной — вопрос
+ * был бы лишним зондом.
+ * Порча приманки — ИЗМЕРЕННАЯ, если есть: d2k_httpsearch_measured_poison
+ * (порча подтверждённых TLS-планов коробок этой линии из каталога). Нет
+ * измеренной — заготовки «fake-badsum» и «fake-seqshift» (те же порчи, что
+ * задаёт TLS-поиск), и это гипотезы, а не замер. Ключ измеренной —
+ * «fake:<порча через +>», например «fake:ttl=5+badsum». */
 size_t d2k_hs_candidate_count(void);
 const char *d2k_hs_candidate_key(size_t i);
 /* Текст плана кандидата (d2k_plantlv) с идентификатором id. 0 — собран. */
@@ -118,6 +131,13 @@ typedef struct d2k_httpsearch d2k_httpsearch;
 
 d2k_httpsearch *d2k_httpsearch_new(const d2k_hs_ops *ops);
 void d2k_httpsearch_free(d2k_httpsearch *hs);
+/* Порча приманки, измеренная на этой линии (строка признаков плана: «badsum»,
+ * «ttl=N», «seqshift=N»; прочие — tcpts, ipidzero — HTTP-исполнитель без
+ * шаблона потока не повторит, такая строка не принимается). 0 — принята. */
+int d2k_httpsearch_measured_poison(d2k_httpsearch *hs, const char *spec);
+/* Признаки порчи приманок из текста плана (строки «poison N …», на которые
+ * ссылается «fake … poison=N»). Сколько записано в out. */
+size_t d2k_hs_plan_poisons(const char *plan_text, char out[][64], size_t cap);
 
 /* Вставка провайдера по host на адресе addr, HTTPS имени — класс 3. Ставит
  * поиск в очередь (или перепроверку, если план уже подтверждён — тогда
@@ -125,6 +145,10 @@ void d2k_httpsearch_free(d2k_httpsearch *hs);
  * D2K_HS_RETRY_MS после неудачи и D2K_HS_RECHECK_MS после перепроверки. */
 #define D2K_HS_RETRY_MS   (60ll * 60 * 1000)
 #define D2K_HS_RECHECK_MS (10ll * 60 * 1000)
+/* Поиск, в котором ни один кандидат не судим (нет исполнения, отказ
+ * датапата, нет подтверждения), — не измерен: план не снимается, «обход не
+ * найден» не говорится, повтор — через этот срок (ревью I-2). */
+#define D2K_HS_INCONCLUSIVE_MS (5ll * 60 * 1000)
 void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
                            const uint8_t *addr, int64_t now_ms);
 /* Подтверждение SET_NAME_PROBE (trial ID и признак успеха). */
@@ -144,7 +168,7 @@ const char *d2k_httpsearch_plan_of(const d2k_httpsearch *hs, const char *host, u
  * «<имя> <семейство> <кандидат> <когда, unix>». Пишется атомарно. load
  * ставит каждый план датапату (set_plan); неизвестный кандидат и негодные
  * строки пропускаются; 0 — нет файла или прочитан, -1 — файл не наш. */
-int d2k_httpsearch_save(const d2k_httpsearch *hs, const char *path, int64_t wall_s,
+int d2k_httpsearch_save(d2k_httpsearch *hs, const char *path, int64_t wall_s,
                         char *err, size_t cap);
 int d2k_httpsearch_load(d2k_httpsearch *hs, const char *path, size_t *n_loaded,
                         char *err, size_t cap);

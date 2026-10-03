@@ -329,6 +329,41 @@ static void http_probe_done(d2k_httpsprobe *hp, int fd, int64_t now, const char 
 
 static void hs_say(void *ctx, const char *line) { (void)ctx; sched_say(NULL, line); }
 
+/* ПОРЧА ПРИМАНКИ, ИЗМЕРЕННАЯ НА ЭТОЙ ЛИНИИ: признаки порчи, на которой
+   держатся подтверждённые TLS-планы коробок каталога (успехи > 0), —
+   самые успешные первыми. Каждая — вопрос к HTTP-коробке той же линии
+   вместо заготовки; tcpts/ipidzero HTTP-исполнитель не повторит, они
+   отбрасываются (d2k_httpsearch_measured_poison). */
+typedef struct { int succ; char spec[64]; } poison_seen;
+static int poison_cmp(const void *a, const void *b) {
+    return ((const poison_seen *)b)->succ - ((const poison_seen *)a)->succ;
+}
+static void hs_measured_poisons(d2k_httpsearch *hs, const d2k_catalog *cat) {
+    poison_seen v[64];
+    size_t n = 0;
+    for (size_t b = 0; b < cat->n_boxes; b++) {
+        const d2k_cat_box *box = &cat->boxes[b];
+        for (size_t k = 0; k < box->n_plans && n < 64; k++) {
+            const d2k_cat_plan *pl = &box->plans[k];
+            if (!pl->text || pl->successes <= 0 || !pl->enabled ||
+                !strstr(pl->text, "\nproto tcp tls\n")) { continue; }
+            char specs[8][64];
+            size_t m = d2k_hs_plan_poisons(pl->text, specs, 8);
+            for (size_t i = 0; i < m && n < 64; i++) {
+                snprintf(v[n].spec, sizeof v[n].spec, "%.63s", specs[i]);
+                v[n].succ = pl->successes;
+                n++;
+            }
+        }
+    }
+    qsort(v, n, sizeof v[0], poison_cmp);
+    size_t taken = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (d2k_httpsearch_measured_poison(hs, v[i].spec) == 0) { taken++; }
+    }
+    if (taken) { printf("d2kc: HTTP: измеренной порчи приманки с этой линии — %zu\n", taken); }
+}
+
 static void usage(void) {
     fprintf(stderr,
         "использование: d2kc --control <сокет> [--catalog <файл>] [--mark 0x2e] [--measure-mark 0x2f]\n"
@@ -481,6 +516,7 @@ int main(int argc, char **argv) {
         d2k_hs_ops ops = {hs_open_port, hs_close_port, hs_set_probe, hs_del_probe, hs_set_plan,
                           hs_del_plan, hs_start, hs_say, hs_changed, NULL};
         g_hs = d2k_httpsearch_new(&ops);
+        if (g_hs) { hs_measured_poisons(g_hs, &cat); }
     }
     if (!g_hs) {
         fprintf(stderr, "d2kc: поиск обхода HTTP не завёлся — вставка в HTTP без HTTPS "
@@ -658,6 +694,13 @@ int main(int argc, char **argv) {
             if (d2k_hs_runner_done(g_hr, &hr)) { d2k_httpsearch_result(g_hs, &hr, now_ms()); }
         }
         if (g_hs) { d2k_httpsearch_tick(g_hs, now_ms()); }
+        /* Таблица датапата вытесняет давно не нужные записи (LRU): свои
+           HTTP-планы ставятся заново раз в 30 мин (ревью M-5). */
+        static int64_t last_http_push;
+        if (g_hs && now_ms() - last_http_push >= 30ll * 60 * 1000) {
+            if (last_http_push) { d2k_httpsearch_push_all(g_hs); }
+            last_http_push = now_ms();
+        }
         /* PID живого контроллера ещё не означает, что он связан с датапатом:
            закрытый AF_UNIX peer даёт POLLHUP один раз. Не выходя здесь,
            контроллер продолжал бы публиковать live.json с linked=true. */

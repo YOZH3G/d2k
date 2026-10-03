@@ -112,6 +112,18 @@ Google отвечает по IPv4 и IPv6. Независимые HTTP/3-кли�
 
 Если после включения появились проблемы с сетью, сначала выполните `stop`. Настройки находятся в `/opt/d2k/config`, журналы — в `/opt/d2k/log/`.
 
+Изученное состояние лежит в `/opt/d2k/state/` тремя файлами, и «начать с чистого листа» значит убрать все три (отдельной команды сброса нет; полное удаление без `D2K_KEEP_STATE=1` убирает их вместе с остальным):
+
+- `catalog.json` — коробки и найденные обходы TLS/QUIC/голоса;
+- `https-cache.txt` — проверка HTTPS имён, на которые провайдер вставлял страницу блокировки (по ней d2k переводит такой HTTP на https);
+- `http-plans.txt` — найденные обходы открытого HTTP (имена без HTTPS).
+
+```sh
+/opt/etc/init.d/S99d2k stop
+rm -f /opt/d2k/state/catalog.json /opt/d2k/state/https-cache.txt /opt/d2k/state/http-plans.txt
+/opt/etc/init.d/S99d2k start
+```
+
 Для Instagram и WhatsApp Web:
 
 ```sh

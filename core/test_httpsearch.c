@@ -233,6 +233,8 @@ static void trial(d2k_httpsearch *hs, fake *f, int64_t *now, int applied, d2k_hs
     CHECK(f->start_n == before + 1 && f->job.fd >= 100, "после подтверждения зонд не запущен своим сокетом");
     if (applied) { d2k_httpsearch_applied(hs, f->plan_id); }
     d2k_hs_result r = res(a);
+    r.seq = f->job.seq;
+    r.fd = f->job.fd;
     d2k_httpsearch_result(hs, &r, *now += 100);
 }
 
@@ -245,6 +247,7 @@ static void test_search(void) {
     d2k_httpsearch_portal(hs, "www.fast-torrent.ru", 4, IP, now);
     CHECK(f.start_n == 1 && f.set_probe_n == 0, "база: зонд без плана не запущен");
     d2k_hs_result r = res(D2K_HS_INJECTED);
+    r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     /* Вопрос 1 — разрез Host. */
     CHECK(f.set_probe_n == 1 && strstr(f.last_probe_plan, "split sni_middle") &&
@@ -286,6 +289,7 @@ static void test_search(void) {
     int sp = f.set_probe_n;
     d2k_httpsearch_portal(hs, "rutracker.org", 4, IP, now += 1000);
     r = res(D2K_HS_INJECTED);
+    r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     CHECK(f.set_probe_n == sp + 1 && strstr(f.last_probe_plan, "seqshift"),
           "свой подтверждённый план не испытан первым");
@@ -297,6 +301,7 @@ static void test_search(void) {
     sp = f.set_probe_n;
     d2k_httpsearch_portal(hs, "free.example", 4, IP, now += 1000);
     r = res(D2K_HS_REAL);
+    r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     CHECK(f.set_probe_n == sp && !d2k_httpsearch_busy(hs) && strstr(f.said, "не воспроизвод"),
           "поиск начат без воспроизведённой вставки");
@@ -304,6 +309,7 @@ static void test_search(void) {
     sp = f.set_probe_n;
     d2k_httpsearch_portal(hs, "rutracker.org", 4, IP, now += D2K_HS_RECHECK_MS + 1);
     r = res(D2K_HS_INJECTED);
+    r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     CHECK(f.set_probe_n == sp + 1 && strstr(f.last_probe_plan, "seqshift"), "перепроверка не начата своим планом");
     /* Все вопросы мимо — план снят, имя ждёт D2K_HS_RETRY_MS. */
@@ -317,12 +323,114 @@ static void test_search(void) {
     /* Сроки: нет подтверждения — проба снята, следующий кандидат. */
     d2k_httpsearch_portal(hs, "slow.example", 4, IP, now += 1000);
     r = res(D2K_HS_INJECTED);
+    r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     int dp = f.del_probe_n, spn = f.set_probe_n;
     d2k_httpsearch_tick(hs, now += 60000);
     CHECK(f.del_probe_n == dp + 1 && f.set_probe_n == spn + 1, "срок подтверждения не соблюдён");
     d2k_httpsearch_free(hs);
     CHECK(f.open_n == f.close_n, "сокеты зондов не закрыты при освобождении");
+}
+
+/* Ревью I-2: неизмеренный поиск не снимает план и не ставит часовую паузу. */
+static void base_injected(d2k_httpsearch *hs, fake *f, int64_t *now) {
+    d2k_hs_result r = res(D2K_HS_INJECTED);
+    r.seq = f->job.seq; r.fd = f->job.fd;
+    d2k_httpsearch_result(hs, &r, *now += 100);
+}
+static void test_inconclusive(void) {
+    fake f;
+    memset(&f, 0, sizeof f);
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    int64_t now = 1000;
+    /* Первый поиск: датапат отверг все пробы — не измерено. */
+    d2k_httpsearch_portal(hs, "a.example", 4, IP, now);
+    base_injected(hs, &f, &now);
+    for (int i = 0; i < 8 && d2k_httpsearch_busy(hs); i++) {
+        d2k_httpsearch_ack(hs, f.trial, 0, now += 10);
+    }
+    CHECK(!d2k_httpsearch_busy(hs) && strstr(f.said, "не измерен") && !strstr(f.said, "обход не найден"),
+          "отказы датапата названы «обход не найден»");
+    int st = f.start_n;
+    d2k_httpsearch_portal(hs, "a.example", 4, IP, now + D2K_HS_INCONCLUSIVE_MS + 1);
+    CHECK(f.start_n == st + 1, "после неизмеренного поиска повтор отложен на час");
+    while (d2k_httpsearch_busy(hs)) { d2k_httpsearch_tick(hs, now += 60000); }
+
+    /* Перепроверка подтверждённого плана, где ни одно исполнение не
+       подтвердилось (APPLIED потерян) — план остаётся. */
+    now += 10 * D2K_HS_RETRY_MS;
+    d2k_httpsearch_portal(hs, "b.example", 4, IP, now);
+    base_injected(hs, &f, &now);
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    CHECK(d2k_httpsearch_plan_of(hs, "b.example", 4) != NULL, "план b.example не подтверждён");
+    d2k_httpsearch_portal(hs, "b.example", 4, IP, now += D2K_HS_RECHECK_MS + 1);
+    base_injected(hs, &f, &now);
+    for (int i = 0; i < 8 && d2k_httpsearch_busy(hs); i++) {
+        trial(hs, &f, &now, 0, D2K_HS_INJECTED);
+        d2k_httpsearch_tick(hs, now += 1000);
+    }
+    CHECK(!d2k_httpsearch_busy(hs) && f.del_plan_n == 0 && d2k_httpsearch_plan_of(hs, "b.example", 4),
+          "перепроверка без единого исполнения сняла план");
+    d2k_httpsearch_free(hs);
+}
+
+/* Измеренная порча (каталог TLS-коробок этой линии) — вместо заготовок. */
+static void test_measured_poison(void) {
+    fake f;
+    memset(&f, 0, sizeof f);
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    CHECK(d2k_httpsearch_measured_poison(hs, "ttl=5 badsum") == 0, "измеренная порча не принята");
+    CHECK(d2k_httpsearch_measured_poison(hs, "tcpts") != 0, "порча, которую HTTP-исполнитель не повторит, принята");
+    CHECK(d2k_httpsearch_measured_poison(hs, "badsum") == 0, "измеренная badsum не принята");
+    int64_t now = 1000;
+    d2k_httpsearch_portal(hs, "c.example", 4, IP, now);
+    base_injected(hs, &f, &now);
+    trial(hs, &f, &now, 1, D2K_HS_INJECTED);   /* split */
+    trial(hs, &f, &now, 1, D2K_HS_INJECTED);   /* disorder */
+    CHECK(strstr(f.last_probe_plan, "fake payload=1") && strstr(f.last_probe_plan, "ttl=5") &&
+          strstr(f.last_probe_plan, "badsum"), "третий вопрос — не измеренная порча");
+    trial(hs, &f, &now, 1, D2K_HS_INJECTED);
+    CHECK(strstr(f.last_probe_plan, "badsum") && !strstr(f.last_probe_plan, "ttl="),
+          "четвёртый вопрос — не вторая измеренная порча");
+    trial(hs, &f, &now, 1, D2K_HS_INJECTED);
+    CHECK(!d2k_httpsearch_busy(hs) && !strstr(f.last_probe_plan, "seqshift"),
+          "при измеренной порче заданы и заготовки");
+    /* Извлечение из текста подтверждённого TLS-плана (как в каталоге). */
+    static const char tls[] = "d2k-plan 1 1\nid 00\nproto tcp tls\npayload 1 16\npayload 2 41\n"
+        "poison 1 badsum\npoison 2 ttl=4\nsplit hello_middle +0\n"
+        "fake payload=1 poison=1 repeats=2 gap_us=20000 place=before\n"
+        "seqovl payload=2 poison=2\norder reverse\n";
+    char sp[8][64];
+    CHECK(d2k_hs_plan_poisons(tls, sp, 8) == 1 && !strcmp(sp[0], "badsum"),
+          "порча приманки не извлечена или взята порча перекрытия");
+    CHECK(d2k_hs_plan_poisons("d2k-plan 1 11\nid 00\nproto tcp http\npoison 1 badsum\n"
+                              "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n", sp, 8) == 0,
+          "порча взята из не-TLS плана");
+    char text[2048];
+    const uint8_t id[16] = {1};
+    CHECK(d2k_hs_candidate_text("fake:ttl=5+badsum", id, text, sizeof text) == 0 &&
+          strstr(text, "poison 1 ttl=5 badsum"), "ключ измеренной порчи не собирается в план");
+    CHECK(d2k_hs_candidate_text("fake:tcpts", id, text, sizeof text) != 0, "негодный ключ порчи собран");
+    d2k_httpsearch_free(hs);
+}
+
+/* Ревью M-7: ответ чужого (устаревшего) зонда не судит текущий опыт. */
+static void test_stale_result(void) {
+    fake f;
+    memset(&f, 0, sizeof f);
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    int64_t now = 1000;
+    d2k_httpsearch_portal(hs, "d.example", 4, IP, now);
+    d2k_hs_result r = res(D2K_HS_INJECTED);
+    r.seq = f.job.seq + 7; r.fd = 999;
+    int cl = f.close_n;
+    d2k_httpsearch_result(hs, &r, now += 100);
+    CHECK(f.set_probe_n == 0 && f.close_n == cl + 1, "ответ чужого зонда принят или его сокет не закрыт");
+    d2k_httpsearch_free(hs);
 }
 
 static void test_persist(void) {
@@ -336,6 +444,7 @@ static void test_persist(void) {
     int64_t now = 1000;
     d2k_httpsearch_portal(hs, "www.fast-torrent.ru", 6, IP, now);
     d2k_hs_result r = res(D2K_HS_INJECTED);
+    r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     trial(hs, &f, &now, 1, D2K_HS_REAL);
     trial(hs, &f, &now, 1, D2K_HS_REAL);
@@ -383,6 +492,9 @@ int main(void) {
     test_probe();
     test_search();
     test_persist();
+    test_inconclusive();
+    test_measured_poison();
+    test_stale_result();
     if (fails) { printf("test_httpsearch: провалов %d\n", fails); return 1; }
     printf("test_httpsearch: все проверки прошли\n");
     return 0;
