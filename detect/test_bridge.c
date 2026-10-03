@@ -15,6 +15,8 @@ d2k_vres d2k_detect_sched_tcp_seeded(const char *, uint16_t, d2k_hello, d2k_hell
                                     uint32_t, int, uint32_t, uint32_t,
                                     const volatile sig_atomic_t *, const d2k_base_seed *);
 int d2k_arm_from_poison(const d2k_poison *, d2k_arm *, char *, size_t);
+int d2k_detect_sched_tcp_ack(const char *, uint16_t, uint32_t,
+                             const volatile sig_atomic_t *, int *);
 
 static d2k_opts seen;
 static d2k_result answer;
@@ -48,6 +50,32 @@ static void progress_reset(void)
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "bridge:%d: %s\n", __LINE__, #c); failures++; \
 } } while (0)
+
+/* Задача 54: нейтральный байт подменён сценарием по вызовам. */
+static const char *ack_pat = "-";
+static int ack_calls;
+static char ack_host[64], ack_port[16];
+static uint32_t ack_mark;
+static int ack_timeout;
+void d2k_opts_defaults(d2k_opts *o)
+{
+    if (o->repeats <= 0) o->repeats = 3;
+    if (o->timeout_ms <= 0) o->timeout_ms = 6000;
+}
+int d2k_probe_data_ack(const char *host, const char *port, const d2k_opts *opt,
+                       char *err, size_t errcap)
+{
+    size_t n = strlen(ack_pat);
+    char c = ack_pat[(size_t)ack_calls < n ? (size_t)ack_calls : n - 1];
+    ack_calls++;
+    snprintf(ack_host, sizeof ack_host, "%s", host);
+    snprintf(ack_port, sizeof ack_port, "%s", port);
+    ack_mark = opt->mark;
+    ack_timeout = opt->timeout_ms;
+    if (c == 'e') { snprintf(err, errcap, "dial"); return -1; }
+    if (c == 'u') { snprintf(err, errcap, "unobservable"); return -2; }
+    return c == '+' ? 1 : 0;
+}
 
 void d2k_classify_run(const char *addr, const d2k_trigger *tr,
                       d2k_opts *opt, d2k_result *res)
@@ -333,6 +361,31 @@ int main(void)
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
     p.oob = 0; p.md5 = 1;
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
+    {
+        /* Задача 54: вопрос перепроверки мёртвого адреса. */
+        int probes = -1, rc;
+        ack_pat = "-"; ack_calls = 0;
+        rc = d2k_detect_sched_tcp_ack("192.0.2.1", 443, 0x2f, NULL, &probes);
+        CHECK(rc == 0 && ack_calls == 3 && probes == 3);
+        CHECK(strcmp(ack_host, "192.0.2.1") == 0 && strcmp(ack_port, "443") == 0);
+        CHECK(ack_mark == 0x2f && ack_timeout > 0);
+        ack_pat = "-+"; ack_calls = 0;
+        rc = d2k_detect_sched_tcp_ack("2001:db8::1", 443, 0x2f, NULL, &probes);
+        CHECK(rc == 1 && ack_calls == 2 && probes == 2);
+        CHECK(strcmp(ack_host, "2001:db8::1") == 0);
+        ack_pat = "e"; ack_calls = 0;
+        rc = d2k_detect_sched_tcp_ack("192.0.2.1", 443, 0x2f, NULL, &probes);
+        CHECK(rc < 0 && ack_calls == 1 && probes == 1);
+        ack_pat = "u"; ack_calls = 0;
+        rc = d2k_detect_sched_tcp_ack("192.0.2.1", 443, 0x2f, NULL, &probes);
+        CHECK(rc < 0 && probes == 0);
+        {
+            volatile sig_atomic_t stop = 1;
+            ack_pat = "-"; ack_calls = 0;
+            rc = d2k_detect_sched_tcp_ack("192.0.2.1", 443, 0x2f, &stop, &probes);
+            CHECK(rc < 0 && ack_calls == 0);
+        }
+    }
     if (failures) { return 1; }
     puts("bridge: scheduler adapter contracts passed");
     return 0;

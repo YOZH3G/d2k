@@ -491,6 +491,59 @@ static void test_address_needs_vouched_control(void)
     }
 }
 
+/* Задача 54: вопрос «принимает ли адрес данные» на настоящем сокете. Коробка
+ * M_DEAF молчит на любое содержимое, но её TCP байт подтверждает — это и
+ * отличает «содержимое режут везде» (googlevideo) от тишины адреса. Тишину
+ * адреса петля изобразить не может (ядро подтверждает всё) — это поле. */
+static void test_neutral_ack_on_real_socket(void)
+{
+    fake_dpi d;
+    char addr[64], host[64], *colon;
+    char err[160];
+    d2k_opts opt;
+    d2k_result res;
+    int rc, i, seen = 0;
+    fast_opts(&opt);
+    if (fake_dpi_start(&d, M_DEAF, 0, addr, sizeof(addr)) != 0) {
+        fail("стенд не поднялся");
+        return;
+    }
+    snprintf(host, sizeof(host), "%s", addr);
+    colon = strrchr(host, ':');
+    *colon = '\0';
+    rc = d2k_probe_data_ack(host, colon + 1, &opt, err, sizeof(err));
+    if (rc != 1) {
+        fail("нейтральный байт на петле не подтверждён: rc=%d (%s)", rc, err);
+    }
+    /* Через дерево: контроль молчит, байт подтверждён — вердикт прежний
+     * (без поручительства «блок адреса» не утверждается), вопрос в трассе. */
+    ctl_trig(&opt.control);
+    {
+        d2k_trigger t;
+        trig(&t);
+        d2k_classify_run(addr, &t, &opt, &res);
+    }
+    for (i = 0; i < res.ntrace; i++) {
+        if (strcmp(res.trace[i].probe, "neutral-ack") == 0 && res.trace[i].pass == 1 &&
+            res.trace[i].fail == 0) {
+            seen = 1;
+        }
+    }
+    if (!seen) {
+        fail("в трассе нет подтверждённого нейтрального байта");
+        dump_trace(&res);
+    }
+    if (res.verdict != D2K_DV_INCONCLUSIVE) {
+        fail("подтверждённый байт: вердикт %s, ждали inconclusive", d2k_verdict_name(res.verdict));
+    }
+    fake_dpi_stop(&d);
+    /* Никто не слушает — нет TCP: это ошибка зонда, не тишина адреса. */
+    rc = d2k_probe_data_ack("127.0.0.1", "1", &opt, err, sizeof(err));
+    if (rc != -1) {
+        fail("закрытый порт: rc=%d, ждали -1", rc);
+    }
+}
+
 /* БРОШЕННЫЙ ЗАМЕР НЕ ВЫДАЁТСЯ ЗА ИЗМЕРЕННЫЙ.
  *
  * Отмена нужна не ради красоты: без неё остановка службы и истёкший срок
@@ -702,6 +755,7 @@ int main(void)
     test_reassembling_box_with_control_stays_opaque();
     test_address_block_is_not_called_opaque();
     test_address_needs_vouched_control();
+    test_neutral_ack_on_real_socket();
     test_loopback_guard_rejects_misresolved_target();
     test_stopped_run_is_marked_and_short();
     test_stop_midway_keeps_what_was_measured();

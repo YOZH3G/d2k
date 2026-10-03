@@ -35,11 +35,21 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #ifndef SO_MARK
 #define SO_MARK 36
+#endif
+/* Роутеры — Linux: без TIOCOUTQ вопрос neutral-ack молча выродился бы в
+ * «не наблюдается», и замер вернулся бы к перебору по таймаутам (задача 54).
+ * Пусть это будет видно в день сборки, а не в поле. */
+#if defined(__linux__) && !defined(TIOCOUTQ)
+#error "TIOCOUTQ не определён: подтверждение данных (neutral-ack) не наблюдается"
+#endif
+#if defined(__APPLE__) && !defined(SO_NWRITE)
+#define SO_NWRITE 0x1024 /* скрыт строгим _POSIX_C_SOURCE */
 #endif
 
 const char *d2k_verdict_name(d2k_verdict_t v)
@@ -420,6 +430,108 @@ static int once_probe(const char *host, const char *port, const d2k_trigger *tr,
     }
     return d2k_trigger_accepts(tr, buf, (size_t)n);
 }
+
+/* Неподтверждённых сервером байт в очереди отправки; -1 — не наблюдается.
+ * Linux: TIOCOUTQ (= SIOCOUTQ для TCP) — write_seq - snd_una, то же число,
+ * что столбец tx_queue в /proc/net/tcp. Константа берётся из заголовков
+ * libc своей архитектуры (на MIPS она другая). macOS: SO_NWRITE — байты в
+ * буфере отправки, которые TCP держит до подтверждения. */
+static int unacked_bytes(int fd)
+{
+#if defined(__linux__) && defined(TIOCOUTQ)
+    int n = 0;
+    if (ioctl(fd, TIOCOUTQ, &n) != 0) {
+        return -1;
+    }
+    return n;
+#elif defined(__APPLE__)
+    int n = 0;
+    socklen_t sl = sizeof(n);
+    if (getsockopt(fd, SOL_SOCKET, SO_NWRITE, &n, &sl) != 0) {
+        return -1;
+    }
+    return n;
+#else
+    (void)fd;
+    return -1;
+#endif
+}
+
+int d2k_probe_data_ack(const char *host, const char *port, const d2k_opts *opt,
+                       char *err, size_t errcap)
+{
+    /* Строчная «x»: не тип записи TLS (0x14..0x18), не первая буква метода
+     * HTTP — у коробки нет сигнатуры, по которой его резать. Именно этим
+     * байтом снят полевой замер 04.10 (см. отчёт задачи 54). */
+    static const uint8_t neutral[1] = {'x'};
+    struct pollfd pfd;
+    int64_t deadline;
+    int fd;
+
+    err[0] = '\0';
+#if !(defined(__linux__) && defined(TIOCOUTQ)) && !defined(__APPLE__)
+    (void)host; (void)port; (void)opt;
+    snprintf(err, errcap, "подтверждение данных на этой платформе не наблюдается");
+    return -2;
+#else
+    fd = dial_marked(host, port, opt->timeout_ms, opt->mark, err, errcap);
+    if (fd < 0) {
+        return -1;
+    }
+    if (unacked_bytes(fd) < 0) {
+        snprintf(err, errcap, "очередь отправки не читается: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (d2k_send_nosig(fd, neutral, sizeof(neutral)) != (ssize_t)sizeof(neutral)) {
+        snprintf(err, errcap, "write: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    deadline = d2k_now_ms() + opt->timeout_ms;
+    for (;;) {
+        int left;
+        int q = unacked_bytes(fd);
+        if (q == 0) {
+            close(fd);
+            return 1; /* TCP сервера байт принял */
+        }
+        if (q < 0) {
+            snprintf(err, errcap, "очередь отправки не читается: %s", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        left = (int)(deadline - d2k_now_ms());
+        if (left <= 0) {
+            break;
+        }
+        if (d2k_detect_stopped(&opt->cancel)) {
+            snprintf(err, errcap, "context canceled");
+            close(fd);
+            return -1;
+        }
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        /* Любое событие — данные, FIN, RST (свой или вброшенный) — это уже не
+         * тишина адреса. Вывод о блоке адреса делается только из тишины. */
+        if (poll(&pfd, 1, left < 20 ? left : 20) > 0) {
+            close(fd);
+            return 1;
+        }
+    }
+    close(fd);
+    return 0;
+#endif
+}
+
+/* Место вызова подменяемо стендом (test_repeats.c): петля ядра подтверждает
+ * любой байт, и тишину адреса на ней не изобразить. */
+#ifndef D2K_DATA_ACK_PROBE
+#define D2K_DATA_ACK_PROBE d2k_probe_data_ack
+#endif
+int D2K_DATA_ACK_PROBE(const char *host, const char *port, const d2k_opts *opt,
+                       char *err, size_t errcap);
 
 typedef struct {
     int  pass, fail;
@@ -1004,6 +1116,59 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
          * Перебор гипотез при этом полезен сам по себе: сработавшая отрава
          * ДОКАЗЫВАЕТ, что решение принимается по содержимому. Поэтому идём
          * дальше, а вердикт без базы просто не будет утверждать лишнего. */
+        if (!control_ok) {
+            /* 2б. ПРИНИМАЕТ ЛИ АДРЕС ДАННЫЕ ВООБЩЕ (задача 54). Молчание
+             * контроля без поручительства двусмысленно: сервер может не
+             * обслуживать имя приманки (googlevideo). Но подтверждение байта
+             * даёт TCP сервера, а не его приложение: на googlevideo
+             * нейтральный байт подтверждается, хотя и контроль, и триггер
+             * молчат (поле 04.10, 74.125.153.92). А если не подтверждается и
+             * он — данные к адресу режутся целиком, и перебор отрав (девяносто
+             * гипотез по тайм-ауту) спрашивал бы то, на что ответ уже есть:
+             * десинк меняет вид байт, но доставить их туда, куда не доходит
+             * ни один, не может. Поле 04.10, cdn.cookielaw.org: 104.18.86.0/24
+             * не подтверждает ни приветствия, ни одного байта, замер
+             * перебором не укладывался в срок задачи и шёл по кругу. */
+            d2k_obs *obs = d2k_trace_add(res, "neutral-ack");
+            char aerr[160];
+            int i, observed = 1;
+            for (i = 0; i < opt->repeats; i++) {
+                int rc;
+                if (d2k_detect_stopped(&opt->cancel)) {
+                    observed = 0;
+                    break;
+                }
+                aerr[0] = '\0';
+                rc = D2K_DATA_ACK_PROBE(host, port, opt, aerr, sizeof(aerr));
+                if (rc == -2) {
+                    observed = 0;
+                    snprintf(obs->err, sizeof(obs->err), "%s", aerr);
+                    break;
+                }
+                res->probes++;
+                if (rc < 0) {
+                    /* Локальная ошибка — не свойство адреса. */
+                    observed = 0;
+                    obs->fail++;
+                    snprintf(obs->err, sizeof(obs->err), "%s", aerr);
+                    break;
+                }
+                if (rc > 0) {
+                    obs->pass++;
+                    break; /* одного подтверждения достаточно: данные доходят */
+                }
+                obs->fail++;
+            }
+            obs_done(opt, obs);
+            if (observed && obs->pass == 0 && obs->fail == opt->repeats) {
+                res->verdict = D2K_DV_ADDRESS;
+                snprintf(res->reason, sizeof(res->reason),
+                         "рукопожатие проходит, но сервер не подтвердил ни одного нейтрального "
+                         "байта (0 из %d): данные к адресу режутся целиком, содержимое ни при "
+                         "чём — обходить содержимым нечего", opt->repeats);
+                goto done;
+            }
+        }
         memset(&hit, 0, sizeof(hit));
         if (!opt->no_raw && d2k_raw_supported()) {
             if (sweep_poisons(host, port, tr, opt, res, &hit)) {

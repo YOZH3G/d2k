@@ -48,6 +48,9 @@ d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
                                    uint32_t mark, int repeats,
                                    uint32_t gap_us, uint32_t wait_ms,
                                    const volatile sig_atomic_t *stop);
+/* Нейтральный байт перепроверки мёртвого адреса (задача 54). */
+int d2k_detect_sched_tcp_ack(const char *ip, uint16_t port, uint32_t mark,
+                             const volatile sig_atomic_t *stop, int *probes);
 d2k_vres d2k_detect_sched_tcp_seeded(const char *ip, uint16_t port,
                                      d2k_hello trigger, d2k_hello control,
                                      uint32_t mark, int repeats,
@@ -255,6 +258,9 @@ int main(int argc, char **argv) {
     /* Полный прогон берёт уже снятый ответ базы, а не спрашивает её снова;
      * QUIC — тот же шаг своим путём (core/quicprobe.c). */
     d2k_sched_tcp_seeded_hook = d2k_detect_sched_tcp_seeded;
+    /* Перепроверка адреса с вердиктом address — сначала один нейтральный
+     * байт, до любого триггера (задача 54). */
+    d2k_sched_tcp_ack_hook = d2k_detect_sched_tcp_ack;
     d2k_sched_quic_base_hook = d2k_quic_base;
     d2k_sched_quic_seeded_hook = d2k_quic_run_seeded;
 
