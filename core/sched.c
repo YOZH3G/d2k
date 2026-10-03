@@ -284,6 +284,17 @@ static int refuse_is_damage(uint8_t code) {
    пережить промежуток между ними. */
 #define SCHED_SEEN 512
 
+/* ECH-свидетели (поле 04.10, rutracker в Chrome). Кандидаты одного поиска —
+   свои наблюдения и свой каталог; ответы HTTPS RR помнятся между поисками,
+   поэтому имя без нужной конфигурации места в следующем списке не занимает
+   и за несколько поисков проверяется каждое имя, а не 4 последних.
+   Положительный ответ живёт дольше: конфигурация CDN меняется редко;
+   отрицательный — короче: он же означает и тайм-аут DNS. */
+#define SCHED_ECH_WITNESSES 32
+#define SCHED_ECH_RR 256
+#define SCHED_ECH_RR_YES_MS (6LL * 3600 * 1000)
+#define SCHED_ECH_RR_NO_MS  (30LL * 60 * 1000)
+
 /* Имя приманки по умолчанию. Не выдумано: то же значение, что у Go-стороны в
    internal/config/config.go (DecoySNI = "disk.rzd.ru"), и по той же причине —
    имя, заведомо не связанное с целью, но реально обслуживаемое. Измеренное
@@ -882,7 +893,7 @@ typedef struct {
        главный поток (каталог не под s->mu) и запускает поиск заново. */
     int        ech_regrade;
     char       ech_origin[256]; /* known own-probe witness, not inferred hidden SNI */
-    char       ech_witnesses[4][256];
+    char       ech_witnesses[SCHED_ECH_WITNESSES][256];
     size_t     ech_witness_count;
     d2k_ver_result rx_identity[2]; /* body evidence only; sockets closed normally */
     int64_t    rx_retry_after_ms;
@@ -1022,6 +1033,10 @@ struct d2k_sched {
     task         tasks[SCHED_MAX_TASKS];
     seen_name    seen[SCHED_SEEN];
     size_t       seen_next;   /* кольцо: старое вытесняется, а не отказывает */
+    /* Ответы HTTPS RR по именам-кандидатам в ECH-свидетели; под s->mu. */
+    struct { char name[256]; char public_name[256]; int has; int used;
+             int64_t until_ms; } ech_rr[SCHED_ECH_RR];
+    size_t       ech_rr_next;
     target_cooldown cooldowns[SCHED_COOLDOWN_SLOTS];
     late_rst_pending late_rst[SCHED_LATE_RST_SLOTS];
     size_t       late_rst_next;
@@ -1447,6 +1462,9 @@ static int same_flow(const seen_name *s, const d2k_ev *ev) {
            memcmp(s->low_ip, ev->low_ip, s->family == 6 ? 16 : 4) == 0 &&
            memcmp(s->high_ip, ev->high_ip, s->family == 6 ? 16 : 4) == 0;
 }
+
+static int ech_rr_known(const d2k_sched *s, const char *name, const char *public_name);
+static void ech_rr_store(d2k_sched *s, const char *name, int has, const char *public_name);
 
 static void remember(d2k_sched *s, const d2k_ev *ev) {
     if (ev->name[0] == '\0') { return; }
@@ -2055,9 +2073,13 @@ static void *worker_run(void *vp) {
          * GREASE — само имя цели. Доказательство «внешнее имя — public_name»
          * берётся только из своего знания: подтверждённая ECH-привязка этого
          * имени, HTTPS RR самого имени или известного свидетеля. Каждый
-         * запрос HTTPS RR ограничен (d2k_ech_resolve: ≤1,5 с), запросов не
-         * больше 1 + witnesses (≤4), и отказ DNS не держит поиск: без
-         * доказательства — GREASE и обычный путь по имени. */
+         * запрос HTTPS RR ограничен (d2k_ech_resolve: ≤1,5 с), ответы
+         * помнятся между поисками (ech_rr), и отказ DNS не держит поиск: без
+         * доказательства — GREASE и обычный путь по имени. Пока ECH не
+         * доказан HTTPS RR самого имени, новых вопросов о свидетелях не
+         * больше четырёх: GREASE шлёт почти каждый Chromium, и широкий
+         * перебор задержал бы ему обычный поиск, ничего не сообщив;
+         * доказанному настоящему ECH свидетель нужен — там весь список. */
         int real = t->ech_origin[0] != 0; /* своя подтверждённая ECH-привязка имени */
         if (t->ech_origin[0]) {
             d2k_ech_config cfg;
@@ -2071,9 +2093,21 @@ static void *worker_run(void *vp) {
         }
         if (!t->ech_origin[0]) {
             for (size_t i = 0; i < t->ech_witness_count && !t->stop; i++) {
+                pthread_mutex_lock(&s->mu);
+                int known = ech_rr_known(s, t->ech_witnesses[i], t->name);
+                pthread_mutex_unlock(&s->mu);
+                if (known == 0) continue;
+                if (known < 0 && !real && i >= 4) continue;
                 d2k_ech_config cfg;
-                if (!d2k_sched_ech_resolve_hook(t->ech_witnesses[i], s->measure_mark, &cfg) &&
-                    !strcmp(cfg.public_name, t->name)) {
+                int match = known == 1;
+                if (!match) {
+                    int has = !d2k_sched_ech_resolve_hook(t->ech_witnesses[i], s->measure_mark, &cfg);
+                    pthread_mutex_lock(&s->mu);
+                    ech_rr_store(s, t->ech_witnesses[i], has, has ? cfg.public_name : "");
+                    pthread_mutex_unlock(&s->mu);
+                    match = has && !strcmp(cfg.public_name, t->name);
+                }
+                if (match) {
                     snprintf(t->ech_origin, sizeof t->ech_origin, "%s", t->ech_witnesses[i]);
                     real = 1;
                     break;
@@ -4771,6 +4805,44 @@ static void select_resource_path(d2k_sched *s, task *t) {
                                t->name, t->measure_path);
 }
 
+/* Под s->mu. 1 — у имени ECH-конфигурация с этим public_name, 0 — свежий
+   ответ «не та или нет», -1 — не спрашивали или ответ устарел. */
+static int ech_rr_known(const d2k_sched *s, const char *name, const char *public_name) {
+    for (size_t i = 0; i < SCHED_ECH_RR; i++) {
+        const __typeof__(s->ech_rr[0]) *e = &s->ech_rr[i];
+        if (!e->used || e->until_ms < s->now_ms || strcmp(e->name, name)) continue;
+        return e->has && !strcmp(e->public_name, public_name);
+    }
+    return -1;
+}
+
+static void ech_rr_store(d2k_sched *s, const char *name, int has, const char *public_name) {
+    size_t slot = s->ech_rr_next;
+    for (size_t i = 0; i < SCHED_ECH_RR; i++)
+        if (s->ech_rr[i].used && !strcmp(s->ech_rr[i].name, name)) { slot = i; break; }
+    if (slot == s->ech_rr_next) s->ech_rr_next = (s->ech_rr_next + 1) % SCHED_ECH_RR;
+    __typeof__(s->ech_rr[0]) *e = &s->ech_rr[slot];
+    snprintf(e->name, sizeof e->name, "%s", name);
+    snprintf(e->public_name, sizeof e->public_name, "%s", has ? public_name : "");
+    e->has = has;
+    e->used = 1;
+    e->until_ms = s->now_ms + (has ? SCHED_ECH_RR_YES_MS : SCHED_ECH_RR_NO_MS);
+}
+
+/* Главный поток, s->mu не держит. Пропускает само внешнее имя, повторы и
+   имена со свежим ответом «конфигурация не та». */
+static void ech_witness_add(d2k_sched *s, task *t, const char *name) {
+    if (!name || !name[0] || !strcmp(name, t->name) ||
+        t->ech_witness_count >= SCHED_ECH_WITNESSES) return;
+    for (size_t k = 0; k < t->ech_witness_count; k++)
+        if (!strcmp(t->ech_witnesses[k], name)) return;
+    pthread_mutex_lock(&s->mu);
+    int known = ech_rr_known(s, name, t->name);
+    pthread_mutex_unlock(&s->mu);
+    if (known == 0) return;
+    snprintf(t->ech_witnesses[t->ech_witness_count++], sizeof t->ech_witnesses[0], "%s", name);
+}
+
 static int start_search(d2k_sched *s, task *t) {
     if (fill_hellos(s, t) != 0) {
         if (t->transport == 17 && t->shape_armed) {
@@ -4812,49 +4884,71 @@ static int start_search(d2k_sched *s, task *t) {
                     snprintf(t->ech_origin, sizeof t->ech_origin, "%s", bd->ech_origin);
             }
         }
-        /* Recent named traffic supplies a known endpoint to probe. This is
-         * NOT a claim that it is the hidden name of the ECH client flow. */
-        uint8_t addr[16] = {0};
-        if (!t->ech_origin[0] && inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, addr) == 1) {
-            for (size_t i = 0; i < SCHED_SEEN; i++) {
-                const seen_name *w = &s->seen[i];
-                size_t bytes = t->family == 6 ? 16 : 4;
-                if (w->used && w->transport == 6 && w->family == t->family &&
-                    w->observed_ms + 600000 >= s->now_ms && strcmp(w->name, t->name) &&
-                    (!memcmp(addr, w->low_ip, bytes) || !memcmp(addr, w->high_ip, bytes))) {
-                    if (t->ech_witness_count < 2)
-                        snprintf(t->ech_witnesses[t->ech_witness_count++], 256, "%s", w->name);
+        /* Кандидаты в свидетели — только своё знание, по убыванию силы:
+         * (1) имена, чей ответ HTTPS RR уже назвал это внешнее имя;
+         * (2) свидетели других своих ECH-привязок (любая семья);
+         * (3) имена, недавно виденные открытым текстом: сначала на том же
+         *     адресе, затем на любом (CDN раздаёт один public_name на много
+         *     адресов; свежая установка иначе свидетеля не найдёт никогда);
+         * (4) свои подтверждённые TCP-привязки, новые раньше старых.
+         * Это не утверждение, что кандидат — скрытое имя потока: рабочий
+         * поток берёт первого, у кого HTTPS RR даёт ту же конфигурацию. */
+        if (!t->ech_origin[0]) {
+            pthread_mutex_lock(&s->mu);
+            char known[SCHED_ECH_WITNESSES][256];
+            size_t n_known = 0;
+            for (size_t i = 0; i < SCHED_ECH_RR && n_known < SCHED_ECH_WITNESSES; i++)
+                if (ech_rr_known(s, s->ech_rr[i].name, t->name) == 1)
+                    snprintf(known[n_known++], sizeof known[0], "%s", s->ech_rr[i].name);
+            pthread_mutex_unlock(&s->mu);
+            for (size_t i = 0; i < n_known; i++) ech_witness_add(s, t, known[i]);
+            for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++)
+                for (size_t j = 0; j < s->cat->boxes[bi].n_binds; j++) {
+                    const d2k_cat_binding *bd = &s->cat->boxes[bi].binds[j];
+                    if (bd->enabled && bd->level >= 3 && bd->ech_origin[0])
+                        ech_witness_add(s, t, bd->ech_origin);
                 }
+            uint8_t addr[16] = {0};
+            int have_addr = inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, addr) == 1;
+            for (int same = 1; same >= 0; same--)
+                for (size_t i = 0; i < SCHED_SEEN; i++) {
+                    const seen_name *w = &s->seen[i];
+                    if (!w->used || w->transport != 6 || w->observed_ms + 600000 < s->now_ms) continue;
+                    size_t bytes = w->family == 6 ? 16 : 4;
+                    int at = have_addr && w->family == t->family &&
+                             (!memcmp(addr, w->low_ip, bytes) || !memcmp(addr, w->high_ip, bytes));
+                    if (at == same) ech_witness_add(s, t, w->name);
+                }
+            /* (4) по убыванию времени подтверждения. */
+            int64_t below = INT64_MAX;
+            while (t->ech_witness_count < SCHED_ECH_WITNESSES) {
+                const char *pick = NULL;
+                int64_t best = INT64_MIN;
+                for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++)
+                    for (size_t j = 0; j < s->cat->boxes[bi].n_binds; j++) {
+                        const d2k_cat_binding *bd = &s->cat->boxes[bi].binds[j];
+                        if (!bd->enabled || bd->level < 3 || bd->transport != 6 ||
+                            strcmp(bd->kind, "name") || !bd->target[0] || bd->ech_origin[0] ||
+                            bd->confirmed >= below || bd->confirmed <= best) continue;
+                        best = bd->confirmed; pick = bd->target;
+                    }
+                if (!pick) break;
+                /* Все привязки с этим временем — разом: равные метки иначе
+                   потерялись бы при строгом «меньше». */
+                for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++)
+                    for (size_t j = 0; j < s->cat->boxes[bi].n_binds; j++) {
+                        const d2k_cat_binding *bd = &s->cat->boxes[bi].binds[j];
+                        if (bd->enabled && bd->level >= 3 && bd->transport == 6 &&
+                            !strcmp(bd->kind, "name") && bd->target[0] && !bd->ech_origin[0] &&
+                            bd->confirmed == best)
+                            ech_witness_add(s, t, bd->target);
+                    }
+                below = best;
             }
         }
         say(s, "по %s обнаружен ECH offer; по HTTPS RR отличаю настоящий ECH от GREASE; "
-               "собственный witness: %s", t->name, t->ech_origin[0] ? t->ech_origin : "пока неизвестен");
-        /* Seed from OWN confirmed knowledge after restart, not an imported
-         * list. Four most recent distinct named TCP origins bound DNS cost. */
-        int64_t times[4] = {0};
-        for (size_t k = 0; k < t->ech_witness_count; k++) times[k] = INT64_MAX;
-        for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
-            const d2k_cat_box *b = &s->cat->boxes[bi];
-            for (size_t j = 0; j < b->n_binds; j++) {
-                const d2k_cat_binding *bd = &b->binds[j];
-                if (!bd->enabled || bd->level < 3 || bd->transport != 6 ||
-                    strcmp(bd->kind, "name") || !bd->target[0] ||
-                    !strcmp(bd->target, t->name) || bd->ech_origin[0]) continue;
-                int duplicate = 0;
-                for (size_t k = 0; k < t->ech_witness_count; k++)
-                    if (!strcmp(t->ech_witnesses[k], bd->target)) duplicate = 1;
-                if (duplicate) continue;
-                size_t slot = t->ech_witness_count;
-                if (slot < 4) t->ech_witness_count++;
-                else {
-                    slot = 0;
-                    for (size_t k = 1; k < 4; k++) if (times[k] < times[slot]) slot = k;
-                    if (times[slot] >= bd->confirmed) continue;
-                }
-                snprintf(t->ech_witnesses[slot], sizeof t->ech_witnesses[slot], "%s", bd->target);
-                times[slot] = bd->confirmed;
-            }
-        }
+               "собственный witness: %s%s", t->name, t->ech_origin[0] ? t->ech_origin : "пока неизвестен",
+            t->ech_origin[0] ? "" : (t->ech_witness_count ? ", кандидатов проверю" : ", кандидатов нет"));
     }
     if (family_recovery_start(s,t)) return 1;
     if (!t->rx_volume_only && !t->family_reuse && has_other_family_target_plan(s, t))

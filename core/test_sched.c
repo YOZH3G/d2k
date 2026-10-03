@@ -2474,6 +2474,74 @@ int main(int argc, char **argv) {
         tcp_answer = D2K_V_OPAQUE;
     }
 
+    /* ПОЛЕ 04.10.2026: свидетель находился случайно — кандидатами были
+     * только 4 последние подтверждённые TCP-привязки, и static.rutracker.cc
+     * выпадал из них по мере роста каталога (00:11 «не проверено», 00:22
+     * найден, когда его переподтвердили). (r) Свидетель в каталоге старше
+     * шести других привязок — всё равно найден. (f) Свежая установка:
+     * каталог пуст, но имя с той же ECH-конфигурацией недавно видено
+     * открытым текстом на ДРУГОМ адресе — оно и свидетель (своё
+     * наблюдение, не список). (c) Имя без ECH-конфигурации второй раз по
+     * HTTPS RR не спрашивается. */
+    for (int mode = 0; mode < 2; mode++) {
+        const char *nm = "ech-public.example";
+        d2k_catalog c = {0};
+        char pid[40];
+        if (mode == 0) {
+            own_box(&c, "box-wit-old", pid, 2, 2, "origin.ech.example", 6, D2K_SHAPE_MODERN, 4,
+                    1780000000, 0);
+            for (int k = 0; k < 6; k++) {
+                char bn[32], nn[64];
+                snprintf(bn, sizeof bn, "box-new-%d", k);
+                snprintf(nn, sizeof nn, "newer%d.example", k);
+                own_box(&c, bn, pid, (unsigned)(3 + k), 2, nn, 6, D2K_SHAPE_MODERN, 4,
+                        1790000000 + k, 0);
+            }
+        }
+        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        tcp_answer = D2K_V_CLEAR; tcp_calls = 0; ech_resolve_calls = 0;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        if (mode == 1) {
+            d2k_ev w = ev_hello(6, 41190, "origin.ech.example");
+            w.low_ip[3] = 9;                 /* другой адрес того же Cloudflare */
+            d2k_sched_event(s, &w);
+            d2k_ev o = ev_hello(6, 41191, "plain-other.example");
+            o.low_ip[3] = 10;
+            d2k_sched_event(s, &o);
+        }
+        uint8_t eb[2048]; size_t el = 0;
+        CHECK(ech_offer_hello(nm, eb, sizeof eb, &el) == 0, "ECH witness: fixture");
+        d2k_ev h = ev_hello(6, (uint16_t)(41192 + mode), nm); d2k_sched_event(s, &h);
+        d2k_ev sh; memset(&sh, 0, sizeof sh);
+        sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        memcpy(sh.shape, eb, el); sh.shape_len = el;
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, (uint16_t)(41192 + mode)); d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(!said("своего ECH-свидетеля нет"),
+              mode == 0 ? "ECH witness (r): свидетель старше 4 последних привязок не найден"
+                        : "ECH witness (f): имя, видённое на другом адресе, не стало свидетелем");
+        if (mode == 1) {
+            /* (c) Повторный поиск: plain-other.example (без ECH) не
+               переспрашивается — ответ HTTPS RR запомнен. */
+            int before = ech_resolve_calls;
+            skip_ahead(s, 11 * 60 * 1000);
+            saidbuf[0] = '\0';
+            d2k_ev h2 = ev_hello(6, 41196, nm); d2k_sched_event(s, &h2);
+            d2k_ev sh2 = sh; d2k_sched_event(s, &sh2);
+            d2k_ev su2 = ev_suspect(6, 41196); d2k_sched_event(s, &su2);
+            settle(s);
+            CHECK(ech_resolve_calls - before <= 2,
+                  "ECH witness (c): ответы HTTPS RR не запоминаются между поисками");
+        }
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
     /* ПОЛЕ 03.10.2026, Discord: QUIC-поиск discord.com кончился «кандидатов
      * нет» (отдых 10 мин — для QUIC), приложение ушло на TCP с GREASE ECH.
      * TCP-поиск того же имени шёл до конца (18:50:33 → 18:52:14, план
