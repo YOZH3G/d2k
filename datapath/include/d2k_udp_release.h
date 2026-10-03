@@ -85,7 +85,7 @@ size_t d2k_udp_release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
  * latency in reading the rest of the queue, and stays far below the client's
  * next flight (server RTT 40+ ms), which therefore goes the normal ACCEPT path
  * (its entry is confirmed, its conntrack accounting and routing untouched). */
-#define D2K_UDP_FOLLOW_SLOTS 64
+#define D2K_UDP_FOLLOW_SLOTS 256
 #define D2K_UDP_FOLLOW_NS UINT64_C(5000000)
 
 typedef struct d2k_udp_follow d2k_udp_follow;
@@ -116,6 +116,16 @@ typedef struct {
     void *ctx;
     d2k_udp_follow *follow;
     int can_resend;
+    /* A queued datagram is re-sent raw only when its nfmark is 0 or this
+       mark (the controller's own probe mark: no policy routing hangs on it,
+       and Task 42 already re-sent its tails).  Any other mark may select a
+       policy route (Keenetic 0xffffaaa -> table 4096 / VPN) that a raw send
+       with d2k's own mark would bypass: such datagrams go to the kernel as
+       before, clash or not (task 46 field round 2). */
+    uint32_t neutral_mark;
+    /* Optional: told once per flow when a marked datagram kept the kernel
+       path. */
+    void (*marked)(void *ctx, const uint8_t *pkt, size_t len, uint32_t mark);
 } d2k_udp_out;
 
 /* Releases a batch (d2k_udp_release_batch) with tails sent now when at_ns <=
@@ -130,7 +140,11 @@ int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,
  * its copy, or ACCEPT it if the re-send fails.  Returns 1 when it issued the
  * verdict (*verdict_failed set on failure), 0 when the caller keeps the ID. */
 int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
-                     size_t len, uint64_t now_ns, uint64_t seq, int *verdict_failed);
+                     size_t len, uint32_t mark, uint64_t now_ns, uint64_t seq,
+                     int *verdict_failed);
+
+/* 1 when a datagram with this nfmark may be re-sent raw (see neutral_mark). */
+int d2k_udp_out_neutral(const d2k_udp_out *o, uint32_t mark);
 
 /* Absolute deadline of the earliest pending batch; zero when empty. */
 uint64_t d2k_udp_release_next_ns(const d2k_udp_release *q);

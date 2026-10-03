@@ -40,6 +40,7 @@
 #include "d2k_udp_hold.h"
 #include "d2k_udp_release.h"
 #include "d2k_udp_path.h"
+#include "d2k_packet.h"
 
 #define RECV_BUF   65536
 #define MAX_PKT     1600
@@ -187,6 +188,7 @@ static struct {
     uint64_t verdict_fail;
     uint64_t send_fail;
     uint64_t recv_err;
+    uint64_t udp_marked_kept;  /* потоков UDP с меткой клиента: хвосты не переизданы */
 } st;
 
 /* raw/sched are set only in apply mode with a raw socket: without them held
@@ -274,6 +276,28 @@ static int out_fail(const char *err) {
     st.send_fail++;
     fprintf(stderr, "d2kd: хвост потока UDP не переиздан, отдаю ядру: %s\n", err);
     return -1;
+}
+
+/* МЕТКА КЛИЕНТА — ЕГО МАРШРУТ (поле 03.10, задача 46). Keenetic метит пакеты
+   клиента с маршрутизацией по доменам/политике (PREROUTING mangle,
+   0xffffaaa -> таблица 4096, например VPN) ДО нашей очереди в POSTROUTING.
+   Сырая посылка с меткой d2k ушла бы мимо этой таблицы — через ppp0.
+   Такие датаграммы идут ядром, как раньше; поток отмечается один раз. */
+static unsigned port_of(const void *p);
+static void out_marked(void *ctx, const uint8_t *p, size_t n, uint32_t mark) {
+    (void)ctx;
+    st.udp_marked_kept++;
+    if (st.udp_marked_kept <= 16) {
+        d2k_packet_view v;
+        unsigned sport = 0, dport = 0;
+        if (d2k_packet_parse(p, n, &v) && v.l4 + 4 <= n) {
+            sport = port_of(p + v.l4);
+            dport = port_of(p + v.l4 + 2);
+        }
+        fprintf(stderr, "d2kd: поток UDP %u -> %u с меткой клиента 0x%x: хвосты идут ядром, "
+                        "не сырой посылкой%s\n", sport, dport, mark,
+                st.udp_marked_kept == 16 ? " (дальше только счётчик)" : "");
+    }
 }
 
 static int out_send_now(void *ctx, const uint8_t *p, size_t n) {
@@ -446,6 +470,7 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
                ", таблицы нет %" PRIu64 ", спасла перепроверка %" PRIu64 "\n",
                nok, nm, nn, nr);
     }
+    printf("UDP с меткой клиента, хвосты ядром: %" PRIu64 " потоков\n", st.udp_marked_kept);
     printf("сырым сокетом отправлено %" PRIu64 ", ошибок %" PRIu64 "\n",
                d2k_raw_sent(r), d2k_raw_errors(r));
     }
@@ -792,6 +817,8 @@ int main(int argc, char **argv) {
     udp_out.ctx = &hc;
     udp_out.follow = udp_follow;
     udp_out.can_resend = udp_follow != NULL;
+    udp_out.neutral_mark = probe_mark;
+    udp_out.marked = out_marked;
     udp_path.sess = sess;
     udp_path.hold = udp_holding;
     udp_path.out = &udp_out;
@@ -956,7 +983,7 @@ int main(int argc, char **argv) {
                        concatenates these datagrams. */
                     int udp_fed = udp_holding && np.have_payload && !np.truncated &&
                         d2k_udp_path_pre(&udp_path, np.id, np.payload, np.payload_len,
-                                         t, &udp_key);
+                                         np.have_mark ? np.mark : 0, t, &udp_key);
                     if (holding && np.have_payload && !np.truncated) {
                         /* НАЧАЛО ПОТОКА — ИЗ САМОГО ПОТОКА, а не из первого
                            байта куска: куски приветствия приходят в любом
@@ -1298,7 +1325,8 @@ int main(int argc, char **argv) {
                                verdict == D2K_NF_ACCEPT && !res.applied &&
                                np.have_payload && !np.truncated &&
                                d2k_udp_out_late(&udp_out, np.id, np.payload,
-                                                np.payload_len, t, udp_path.seq,
+                                                np.payload_len, np.have_mark ? np.mark : 0,
+                                                t, udp_path.seq,
                                                 &original_failed)) {
                         /* ЗАПОЗДАВШИЙ ХВОСТ (задача 46): голова потока уже
                            выпущена одна (имя собралось на ней), а эта
@@ -1322,7 +1350,8 @@ int main(int argc, char **argv) {
                         if (!batch.count && !original_failed && verdict == D2K_NF_ACCEPT &&
                             !res.applied && np.have_payload && !np.truncated) {
                             (void)d2k_udp_path_passed(&udp_path, np.payload,
-                                                      np.payload_len, t);
+                                                      np.payload_len,
+                                                      np.have_mark ? np.mark : 0, t);
                         }
                     }
                     if (original_failed) {

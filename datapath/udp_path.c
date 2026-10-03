@@ -13,7 +13,7 @@ void d2k_udp_path_release(void *ctx, const d2k_udp_hold_batch *b) {
 }
 
 int d2k_udp_path_pre(d2k_udp_path *pp, uint32_t id, const uint8_t *pkt,
-                     size_t len, uint64_t now_ns, d2k_key *key) {
+                     size_t len, uint32_t mark, uint64_t now_ns, d2k_key *key) {
     if (!pp || !pp->hold || !key) { return 0; }
     pp->now_ns = now_ns;
     /* Expired slots go first (review N1).  Otherwise feed() would expire this
@@ -24,8 +24,8 @@ int d2k_udp_path_pre(d2k_udp_path *pp, uint32_t id, const uint8_t *pkt,
        ready: the plan goes through the replay path. */
     (void)d2k_udp_hold_flush(pp->hold, now_ns, d2k_udp_path_release, pp);
     if (!d2k_session_udp_hold_begin(pp->sess, pkt, len, now_ns, key)) { return 0; }
-    if (!d2k_udp_hold_feed(pp->hold, key, id, pkt, len, now_ns,
-                           d2k_udp_path_release, pp)) {
+    if (!d2k_udp_hold_feed_marked(pp->hold, key, id, pkt, len, mark, now_ns,
+                                  d2k_udp_path_release, pp)) {
         d2k_session_udp_hold_end(pp->sess, key);
         return 0;
     }
@@ -74,9 +74,14 @@ size_t d2k_udp_path_expire(d2k_udp_path *pp, uint64_t now_ns, int read_follows) 
 }
 
 int d2k_udp_path_passed(d2k_udp_path *pp, const uint8_t *pkt, size_t len,
-                        uint64_t now_ns) {
+                        uint32_t mark, uint64_t now_ns) {
     if (!pp || !pp->out || !pp->out->can_resend || !pp->out->follow ||
+        !pkt || len < 20 || (pkt[0] >> 4) != 4 ||
         !d2k_session_udp_opening(pp->sess, pkt, len)) {
+        return 0;
+    }
+    if (!d2k_udp_out_neutral(pp->out, mark)) {
+        if (pp->out->marked) { pp->out->marked(pp->out->ctx, pkt, len, mark); }
         return 0;
     }
     return d2k_udp_follow_mark(pp->out->follow, pkt, len, now_ns, 0, pp->seq) == 0;

@@ -25,6 +25,10 @@ typedef struct {
     uint32_t ids[D2K_UDP_HOLD_PACKETS];
     size_t len[D2K_UDP_HOLD_PACKETS];
     uint8_t packets[D2K_UDP_HOLD_PACKETS][D2K_UDP_HOLD_PACKET];
+    /* nfmark of each queued datagram (NFQA_MARK; 0 when the kernel gave none).
+       A marked client may be policy-routed (Keenetic fwmark 0xffffaaa ->
+       table 4096, e.g. a VPN): such a datagram is never re-sent raw. */
+    uint32_t marks[D2K_UDP_HOLD_PACKETS];
 } d2k_udp_hold_batch;
 
 /* Releases one whole slot (expiry, overflow, free), datagrams in arrival
@@ -45,6 +49,10 @@ void d2k_udp_hold_free(d2k_udp_hold *h,
 int d2k_udp_hold_feed(d2k_udp_hold *h, const d2k_key *key, uint32_t id,
                       const uint8_t *packet, size_t len, uint64_t now_ns,
                       d2k_udp_hold_release release, void *ctx);
+/* The same, recording the datagram's nfmark (feed records 0). */
+int d2k_udp_hold_feed_marked(d2k_udp_hold *h, const d2k_key *key, uint32_t id,
+                             const uint8_t *packet, size_t len, uint32_t mark,
+                             uint64_t now_ns, d2k_udp_hold_release release, void *ctx);
 
 /* Removes one flow from the table without releasing its IDs.  The caller owns
  * the returned batch and must issue the final verdict for every ID.  Call

@@ -96,6 +96,12 @@ static size_t unnamed_initial(uint8_t *pay, uint8_t salt) {
 static d2k_udp_out out;
 static d2k_udp_path path;
 static int last_replay_applied;
+static uint32_t cur_mark;       /* nfmark of the packets run_packet feeds */
+static unsigned marked_calls;
+static void rec_marked(void *ctx, const uint8_t *p, size_t n, uint32_t mark) {
+    (void)ctx; (void)p; (void)n; (void)mark;
+    marked_calls++;
+}
 
 /* d2kd's per-packet order, minus plan execution (no plan installed). */
 static int run_packet(d2k_session *s, uint32_t id, const uint8_t *pkt, size_t n,
@@ -104,7 +110,7 @@ static int run_packet(d2k_session *s, uint32_t id, const uint8_t *pkt, size_t n,
     d2k_key key;
     memset(&key, 0, sizeof key);
     if (seq) { path.seq = seq; }  /* 0: d2kd's own numbering (d2k_udp_path_read) */
-    int fed = d2k_udp_path_pre(&path, id, pkt, n, t, &key);
+    int fed = d2k_udp_path_pre(&path, id, pkt, n, cur_mark, t, &key);
     d2k_result r;
     d2k_session_packet(s, pkt, n, t, obuf, sizeof obuf, &r);
     d2k_udp_hold_batch b;
@@ -117,11 +123,11 @@ static int run_packet(d2k_session *s, uint32_t id, const uint8_t *pkt, size_t n,
         int vf = 0;
         /* d2kd's gate: only a datagram the kernel would get plainly. */
         if (r.applied || r.verdict != D2K_VERDICT_ACCEPT ||
-            !d2k_udp_out_late(&out, id, pkt, n, t, path.seq, &vf)) {
+            !d2k_udp_out_late(&out, id, pkt, n, cur_mark, t, path.seq, &vf)) {
             (void)rec_verdict(NULL, id, D2K_NF_ACCEPT);
             /* d2kd: a plainly ACCEPTed datagram that opens a client flow. */
             if (!r.applied && r.verdict == D2K_VERDICT_ACCEPT) {
-                (void)d2k_udp_path_passed(&path, pkt, n, t);
+                (void)d2k_udp_path_passed(&path, pkt, n, cur_mark, t);
             }
         }
     }
@@ -139,6 +145,10 @@ static d2k_session *fresh(d2k_udp_hold **h, d2k_udp_follow **f) {
     out.send_at = rec_at;
     out.follow = *f;
     out.can_resend = 1;
+    out.neutral_mark = 0x2e;
+    out.marked = rec_marked;
+    cur_mark = 0;
+    marked_calls = 0;
     memset(&path, 0, sizeof path);
     path.sess = s;
     path.hold = *h;
@@ -191,9 +201,9 @@ static void test_reclaim_guard(void) {
     d2k_key key;
     size_t pn = unnamed_initial(pay, 1);
     size_t n = build(pkt, 1, 50200, pay, pn);
-    CHECK(d2k_udp_path_pre(&path, 1, pkt, n, 2000, &key) == 1, "head fed");
+    CHECK(d2k_udp_path_pre(&path, 1, pkt, n, 0, 2000, &key) == 1, "head fed");
     n = build(pkt, 2, 50200, pay, pn);
-    CHECK(d2k_udp_path_pre(&path, 2, pkt, n, 2001, &key) == 1, "second fed");
+    CHECK(d2k_udp_path_pre(&path, 2, pkt, n, 0, 2001, &key) == 1, "second fed");
     d2k_result r;
     memset(&r, 0, sizeof r);
     r.skipped = "early exit";
@@ -292,7 +302,7 @@ static void test_ordering_guards(void) {
           "owned deferred: the tail waits behind the plan's emits");
     size_t n = build(pkt, 12, 50400, pay, sizeof pay);
     int vf = 0;
-    CHECK(d2k_udp_out_late(&out, 12, pkt, n, now + 1000000, 4, &vf) == 1,
+    CHECK(d2k_udp_out_late(&out, 12, pkt, n, 0, now + 1000000, 4, &vf) == 1,
           "late tail of a deferred head matched (window counts from the head)");
     CHECK(sends_of[12] == 1 && send_at_of[12] == at && last_verdict[12] == D2K_NF_DROP,
           "late tail queued at the head's time, not sent ahead of it");
@@ -314,7 +324,7 @@ static void test_ordering_guards(void) {
     out.can_resend = 0;
     (void)d2k_udp_out_batch(&out, &b, D2K_NF_ACCEPT, 0, now, now, 7);
     CHECK(sends_of[11] == 0 && last_verdict[11] == D2K_NF_ACCEPT, "observe: plain ACCEPT");
-    CHECK(d2k_udp_out_late(&out, 13, pkt, n, now, 7, &vf) == 0, "observe: no late path");
+    CHECK(d2k_udp_out_late(&out, 13, pkt, n, 0, now, 7, &vf) == 0, "observe: no late path");
     done(s, h, f);
 }
 
@@ -411,7 +421,7 @@ static void test_due_head_and_unfed_wait(void) {
     (void)d2k_udp_out_batch(&out, &b, D2K_NF_DROP, 1, at, now, 3);
     size_t n = build(pkt, 21, 50700, pay, sizeof pay);
     int vf = 0;
-    CHECK(d2k_udp_out_late(&out, 21, pkt, n, at + 500000, 4, &vf) == 1, "late tail matched");
+    CHECK(d2k_udp_out_late(&out, 21, pkt, n, 0, at + 500000, 4, &vf) == 1, "late tail matched");
     CHECK(sends_of[21] == 1 && send_at_of[21] == at,
           "head due but not popped: the tail still queues behind it");
 
@@ -475,10 +485,115 @@ static void test_unheld_opening_burst(void) {
     (void)run_packet(s, 7, pkt, n, 9001, 0);
     CHECK(sends_of[6] == 0 && sends_of[7] == 0 && last_verdict[7] == D2K_NF_ACCEPT,
           "server-side datagrams are never re-sent");
+
+    /* The router's real reply path: FORWARD hook, a non-443 server port, no
+       known initiator (review T1). */
+    d2k_session_set_hook(s, D2K_HOOK_FORWARD);
+    d2k_udp_path_read(&path, 9500);
+    for (uint32_t id = 8; id <= 9; id++) {
+        n = build(pkt, id, 50802, rev, sizeof rev);
+        memcpy(tmp, pkt + 12, 4); memcpy(pkt + 12, pkt + 16, 4); memcpy(pkt + 16, tmp, 4);
+        pkt[20] = 0x1F; pkt[21] = 0x90;           /* server port 8080 */
+        memcpy(pt, pkt + 20, 2); memcpy(pkt + 20, pkt + 22, 2); memcpy(pkt + 22, pt, 2);
+        (void)run_packet(s, id, pkt, n, 9500 + id, 0);
+    }
+    CHECK(sends_of[8] == 0 && sends_of[9] == 0 && last_verdict[9] == D2K_NF_ACCEPT,
+          "FORWARD replies on a non-443 port never open a client window");
     done(s, h, f);
 }
 
+/* Field round 2: a policy-routed client (Keenetic fwmark 0xffffaaa -> table
+ * 4096, e.g. a VPN) must keep its route: none of its datagrams is re-sent raw
+ * with d2k's own mark.  IPv4 opening bursts only; IPv6 keeps the kernel path. */
+static void test_marked_and_ipv6_keep_kernel_path(void) {
+    uint8_t pay[1200], pkt[1300];
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s;
+
+    /* Unheld opening burst, marked. */
+    s = fresh(&h, &f);
+    reset();
+    cur_mark = 0xffffaaa;
+    d2k_udp_path_read(&path, 10000);
+    for (uint32_t id = 1; id <= 4; id++) {
+        memset(pay, (int)(0x30 + id), sizeof pay);
+        pay[0] = 0xC5; pay[1] = 0; pay[2] = 0; pay[3] = 0; pay[4] = 1;
+        pay[5] = 8; pay[16] = 0x7F; pay[17] = 0xFF;
+        size_t n = build(pkt, id, 50900, pay, sizeof pay);
+        (void)run_packet(s, id, pkt, n, 10000 + id, 0);
+    }
+    for (uint32_t id = 1; id <= 4; id++) {
+        CHECK(verdicts_of[id] == 1 && last_verdict[id] == D2K_NF_ACCEPT && sends_of[id] == 0,
+              "marked client: every datagram keeps the kernel path");
+    }
+    CHECK(marked_calls == 1, "reported once for the flow");
+    done(s, h, f);
+
+    /* Held batch, marked tail. */
+    s = fresh(&h, &f);
+    reset();
+    cur_mark = 0xffffaaa;
+    d2k_udp_path_read(&path, 11000);
+    for (uint32_t id = 1; id <= 3; id++) {
+        size_t pn = unnamed_initial(pay, (uint8_t)id);
+        size_t n = build(pkt, id, 51000, pay, pn);
+        (void)run_packet(s, id, pkt, n, 11000 + id, 0);
+    }
+    (void)d2k_udp_path_expire(&path, 11000 + 1 + D2K_UDP_HOLD_WAIT_NS, 0);
+    for (uint32_t id = 1; id <= 3; id++) {
+        CHECK(verdicts_of[id] == 1 && last_verdict[id] == D2K_NF_ACCEPT && sends_of[id] == 0,
+              "marked held batch: tails ACCEPTed, not re-sent");
+    }
+    CHECK(marked_calls == 1, "held batch reported once");
+    /* A late datagram of that marked flow: also the kernel path. */
+    d2k_udp_path_read(&path, 11000 + 2 + D2K_UDP_HOLD_WAIT_NS);
+    memset(pay, 0xD1, 200);
+    size_t n = build(pkt, 4, 51000, pay, 200);
+    (void)run_packet(s, 4, pkt, n, 11000 + 2 + D2K_UDP_HOLD_WAIT_NS, 0);
+    CHECK(last_verdict[4] == D2K_NF_ACCEPT && sends_of[4] == 0, "marked late datagram: kernel");
+    done(s, h, f);
+
+    /* The controller's probe mark is neutral: its tails still follow. */
+    s = fresh(&h, &f);
+    reset();
+    cur_mark = 0x2e;
+    d2k_udp_path_read(&path, 12000);
+    for (uint32_t id = 1; id <= 2; id++) {
+        size_t pn = unnamed_initial(pay, (uint8_t)id);
+        n = build(pkt, id, 51100, pay, pn);
+        (void)run_packet(s, id, pkt, n, 12000 + id, 0);
+    }
+    (void)d2k_udp_path_expire(&path, 12000 + 1 + D2K_UDP_HOLD_WAIT_NS, 0);
+    CHECK(last_verdict[2] == D2K_NF_DROP && sends_of[2] == 1 && marked_calls == 0,
+          "probe-marked tail is re-sent as before");
+    done(s, h, f);
+
+    /* IPv6 opening burst: no raw path. */
+    s = fresh(&h, &f);
+    reset();
+    d2k_udp_path_read(&path, 13000);
+    for (uint32_t id = 1; id <= 3; id++) {
+        uint8_t p6[1300];
+        memset(p6, 0, 48);
+        size_t pl = 200;
+        p6[0] = 0x60; p6[4] = (uint8_t)((8 + pl) >> 8); p6[5] = (uint8_t)(8 + pl);
+        p6[6] = 17; p6[7] = 64;
+        p6[8] = 0xfd; p6[23] = 0x67; p6[24] = 0x2a; p6[25] = 0x03; p6[39] = 0x01;
+        p6[40] = 0xC5; p6[41] = 0x01; p6[42] = 0x01; p6[43] = 0xBB;
+        p6[44] = (uint8_t)((8 + pl) >> 8); p6[45] = (uint8_t)(8 + pl);
+        memset(p6 + 48, (int)(0x40 + id), pl);
+        (void)run_packet(s, id, p6, 48 + pl, 13000 + id, 0);
+    }
+    CHECK(sends_of[1] == 0 && verdicts_of[2] == 1 && verdicts_of[3] == 1,
+          "IPv6 verdicts issued");
+    CHECK(last_verdict[2] == D2K_NF_ACCEPT && last_verdict[3] == D2K_NF_ACCEPT,
+          "IPv6 opening burst keeps the kernel path");
+    done(s, h, f);
+    cur_mark = 0;
+}
+
 int main(void) {
+    test_marked_and_ipv6_keep_kernel_path();
     test_unheld_opening_burst();
     test_expiry_read_numbering();
     test_expiry_inside_feed_keeps_plan();

@@ -54,6 +54,12 @@ size_t d2k_udp_hold_flush(d2k_udp_hold *h, uint64_t now_ns,
 int d2k_udp_hold_feed(d2k_udp_hold *h, const d2k_key *key, uint32_t id,
                       const uint8_t *packet, size_t len, uint64_t now_ns,
                       d2k_udp_hold_release release, void *ctx) {
+    return d2k_udp_hold_feed_marked(h, key, id, packet, len, 0, now_ns, release, ctx);
+}
+
+int d2k_udp_hold_feed_marked(d2k_udp_hold *h, const d2k_key *key, uint32_t id,
+                             const uint8_t *packet, size_t len, uint32_t mark,
+                             uint64_t now_ns, d2k_udp_hold_release release, void *ctx) {
     if (!h || !key || !packet || len == 0 || len > D2K_UDP_HOLD_PACKET) {
         return 0;
     }
@@ -84,6 +90,7 @@ int d2k_udp_hold_feed(d2k_udp_hold *h, const d2k_key *key, uint32_t id,
     size_t i = slot->b.count++;
     slot->b.ids[i] = id;
     slot->b.len[i] = len;
+    slot->b.marks[i] = mark;
     memcpy(slot->b.packets[i], packet, len);
     return 1;
 }

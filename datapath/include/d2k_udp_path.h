@@ -51,7 +51,7 @@ void d2k_udp_path_release(void *ctx, const d2k_udp_hold_batch *b);
 
 /* Starts or feeds the hold.  Returns 1 when the hold now owns id. */
 int d2k_udp_path_pre(d2k_udp_path *pp, uint32_t id, const uint8_t *pkt,
-                     size_t len, uint64_t now_ns, d2k_key *key);
+                     size_t len, uint32_t mark, uint64_t now_ns, d2k_key *key);
 
 /* Decides after the session call.  fed is pre()'s answer.
  *
@@ -68,8 +68,14 @@ int d2k_udp_path_post(d2k_udp_path *pp, int fed, const d2k_key *key,
  * datagrams queued right behind it reached conntrack while it was still
  * queued and would clash: mark the flow for d2k_udp_out_late, exactly like a
  * released hold.  Field 03.10.2026 after 4ed54d4: an unparseable-Initial burst
- * lost its 2nd..4th datagrams this way (16 of 24).  Returns 1 when marked. */
+ * lost its 2nd..4th datagrams this way (16 of 24).  Returns 1 when marked.
+ * IPv4 only: the measured loss is the NAT clash; IPv6 has no NAT here and the
+ * kernel resolves its UDP clashes, so its datagrams keep the kernel path.  A
+ * marked (policy-routed) opening datagram is not marked either.  A flow first
+ * seen mid-life (d2kd restart, flow-table eviction) still counts as opening:
+ * its next datagrams within the window are re-sent needlessly but harmlessly
+ * (no conntrack "NEW" information reaches the queue today). */
 int d2k_udp_path_passed(d2k_udp_path *pp, const uint8_t *pkt, size_t len,
-                        uint64_t now_ns);
+                        uint32_t mark, uint64_t now_ns);
 
 #endif
