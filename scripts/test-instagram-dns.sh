@@ -75,6 +75,7 @@ case "$*" in
         [ "${RESOLVE_FAIL:-0}" = 1 ] && exit 22
         calls=$(grep -c '/resolve' "$CURL_CALLS" 2>/dev/null || echo 0)
         [ "$calls" -le "${RESOLVE_FAIL_FIRST:-0}" ] && exit 28
+        if [ -n "${RESOLVE_BODY:-}" ]; then printf '%s' "$RESOLVE_BODY"; exit 0; fi
         printf '{"results":{"instagram.com":["%s","8.8.8.8","%s","157.240.9.177","157.240.9.178"],"www.instagram.com":["157.240.9.175"],"not-instagram.example":["157.240.9.179"],"i.instagram.com":["157.240.9.63"],"static.xx.fbcdn.net":["%s"],"scontent.xx.fbcdn.net":["%s"],"web.whatsapp.com":["%s","57.144.245.33"],"v.whatsapp.com":[],"static.whatsapp.net":["57.144.245.32"],"evil.whatsapp.com":["57.144.245.40"]}}' \
             "${VPS_IP1:-157.240.9.174}" "${VPS_IP2:-157.240.9.176}" "${FB_IP:-157.240.205.11}" "${FB_IP:-157.240.205.11}" "${WA_IP:-57.144.245.32}"
         ;;
@@ -95,6 +96,10 @@ cat > "$TMP/bin/d2ktg" <<'EOF'
 [ "$1" = --check-instagram-ip ] && [ "$#" = 4 ] || exit 2
 printf '%s\n' "$*" >> "$CURL_CALLS"
 [ "${PROBE_FAIL_ALL:-0}" = 1 ] && exit 1
+# PROBE_DEAD: "ip" (dead for every name) or "name:ip" (certificate/edge fails for that name).
+for dead in ${PROBE_DEAD:-}; do
+    case "$dead" in *:*) [ "$2:$3" = "$dead" ] && exit 1 ;; *) [ "$3" = "$dead" ] && exit 1 ;; esac
+done
 probes=$(grep -c -- '--check-instagram-ip' "$CURL_CALLS" || true)
 [ "$probes" -gt "${PROBE_FAIL_FIRST:-0}" ]
 EOF
@@ -321,5 +326,40 @@ fi
 cmp -s "$EMPTY/manifest-before" "$EMPTY/d2k/state/instagram-ip-hosts.tsv" || fail "empty NDM read dropped owned claims"
 [ ! -s "$EMPTY/ndmc-calls" ] || fail "empty NDM read still changed DNS"
 ok "an empty NDM configuration read is a failure and keeps every claim"
+
+# Family fallback: the VPS answer for static.whatsapp.net is dead from the
+# router, but a sibling of the same family already verified this refresh
+# serves it. Every borrowed address is verified for THIS name; families never
+# mix; a candidate failing this name's check is not pinned.
+FAM="$TMP/family"
+mkdir -p "$FAM/d2k/state" "$FAM/d2k/files" "$FAM/d2k/log"
+cp "$TMP/d2k/files/meta-ranges.txt" "$FAM/d2k/files/"
+: > "$FAM/ndmc-state"
+printf 'pps.whatsapp.net 57.144.249.32\n' > "$FAM/d2k/state/instagram-ip-hosts.tsv"
+printf 'ip host pps.whatsapp.net 57.144.249.32\n' > "$FAM/ndmc-state"
+env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$FAM/d2k" D2K_META_RANGES="$FAM/d2k/files/meta-ranges.txt" \
+    D2K_RELAY_URL=https://resolve.example/resolve D2K_IP_PROBE_ATTEMPTS=1 \
+    RESOLVE_BODY='{"results":{"instagram.com":["157.240.9.174"],"web.whatsapp.com":["57.144.245.32"],"static.whatsapp.net":["157.240.0.60"],"mmg.whatsapp.net":["157.240.0.61"],"pps.whatsapp.net":[],"static.xx.fbcdn.net":["157.240.0.62"],"graph.whatsapp.com":["8.8.4.4"]}}' \
+    PROBE_DEAD='157.240.0.60 157.240.0.61 157.240.0.62 mmg.whatsapp.net:57.144.245.32 mmg.whatsapp.net:57.144.249.32' \
+    NDMC_STATE="$FAM/ndmc-state" NDMC_CALLS="$FAM/ndmc-calls" CURL_CALLS="$FAM/curl-calls" \
+    D2K_INSTAGRAM_LOG="$FAM/refresh.log" sh "$SCRIPT" refresh || { cat "$FAM/refresh.log" >&2; fail "family refresh failed"; }
+grep -q '^ip host static.whatsapp.net 57.144.245.32$' "$FAM/ndmc-state" || { cat "$FAM/refresh.log" >&2; fail "static.whatsapp.net did not get a verified sibling address"; }
+grep -q -- '--check-instagram-ip static.whatsapp.net 57.144.245.32' "$FAM/curl-calls" || fail "borrowed address was not verified for this name"
+grep -q 'адрес семейства' "$FAM/refresh.log" || fail "family fallback is not logged"
+grep -q '^static.whatsapp.net 57.144.245.32$' "$FAM/d2k/state/instagram-ip-hosts.tsv" || fail "family pin is not owned"
+# An owned sibling pin (pps, from the manifest) is a candidate too.
+grep -q -- '--check-instagram-ip static.whatsapp.net 57.144.249.32' "$FAM/curl-calls" || fail "owned sibling address was not tried"
+! grep -q '^ip host mmg.whatsapp.net ' "$FAM/ndmc-state" || fail "candidate failing this name's TLS check was pinned"
+grep -q -- '--check-instagram-ip mmg.whatsapp.net 57.144.245.32' "$FAM/curl-calls" || fail "mmg.whatsapp.net did not try its family"
+! grep -q '^ip host static.xx.fbcdn.net ' "$FAM/ndmc-state" || fail "fbcdn borrowed an address from another family"
+! grep -Eq -- '--check-instagram-ip static.xx.fbcdn.net (57.144.245.32|157.240.9.174|57.144.249.32)' "$FAM/curl-calls" || fail "fbcdn was checked against another family's address"
+! grep -Eq -- '--check-instagram-ip (www.instagram.com|i.instagram.com) (57.144.245.32|57.144.249.32)' "$FAM/curl-calls" || fail "Instagram borrowed from WhatsApp"
+grep -q '^ip host www.instagram.com 157.240.9.174$' "$FAM/ndmc-state" || fail "Instagram sibling without a VPS address did not use its family"
+# graph.whatsapp.com: its VPS address is outside Meta ranges and dropped; a
+# family address is still range-checked before use.
+grep -q '^ip host graph.whatsapp.com 57.144.245.32$' "$FAM/ndmc-state" || fail "graph.whatsapp.com did not use its family after a non-Meta answer"
+! grep -q '8.8.4.4' "$FAM/ndmc-calls" || fail "non-Meta address reached ndmc"
+[ "$(grep -c '^ip host static.whatsapp.net ' "$FAM/ndmc-state")" -le 2 ] || fail "family fallback pinned more than two addresses"
+ok "family fallback pins only same-family addresses verified for this very name"
 
 echo "Instagram DNS lifecycle: all checks passed"

@@ -41,6 +41,31 @@ is_meta_ip() {
 }
 # A live NDM configuration is never empty; empty output is a failed read and
 # must not be taken as "none of our pins exist".
+# Names whose edges may serve each other. A borrowed address is still
+# verified for the borrowing name itself; families never mix.
+meta_family() {
+    case "$1" in
+        instagram.com|*.instagram.com|*.cdninstagram.com) echo instagram ;;
+        *.fbcdn.net) echo fbcdn ;;
+        *.whatsapp.net|*.whatsapp.com) echo whatsapp ;;
+    esac
+}
+# 0 when the address is a reachable Meta edge whose certificate is valid for
+# host. DNS pinning checks edge reachability, not whether the SNI is already
+# unblocked: the C control uses a neutral wire SNI and no HTTP traffic.
+edge_verified() {
+    probe_attempt=1
+    probe_attempts=${D2K_IP_PROBE_ATTEMPTS:-2}
+    while [ "$probe_attempt" -le "$probe_attempts" ]; do
+        d2ktg --check-instagram-ip "$1" "$2" "$ca_bundle" >>"$LOG" 2>&1 && return 0
+        if [ "$probe_attempt" -lt "$probe_attempts" ]; then
+            log "повтор TLS-пробы $probe_attempt/$probe_attempts: $1 $2"
+            sleep "${D2K_IP_PROBE_RETRY_DELAY:-1}"
+        fi
+        probe_attempt=$((probe_attempt + 1))
+    done
+    return 1
+}
 running_config() {
     _cfg=$(LD_LIBRARY_PATH='' ndmc -c 'show running-config' 2>/dev/null) || return 1
     [ -n "$_cfg" ] || return 1
@@ -116,6 +141,7 @@ refresh() {
     parsed=$(printf '%s' "$response" | sed -e 's/.*"results":{//' -e 's/}}$//' -e 's/\],/\n/g' -e 's/\]$//' | awk '{n1=index($0,"\"");if(!n1)next;r=substr($0,n1+1);n2=index(r,"\"");if(!n2)next;h=substr(r,1,n2-1);ips=substr(r,n2+1);gsub(/[^0-9.,]/,"",ips);n=split(ips,a,",");for(i=1;i<=n;i++)if(a[i]~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)print h" "a[i]}')
     [ -n "$parsed" ] || { log 'не удалось разобрать ответ VPS'; return 1; }
     filtered=
+    missing=
     for host in $HOSTS; do
         tried=0
         kept=0
@@ -123,24 +149,7 @@ refresh() {
             [ "$tried" -lt 4 ] || break
             tried=$((tried + 1))
             is_meta_ip "$ip" || { log "отброшен адрес вне диапазонов Meta: $host $ip"; continue; }
-            probe_attempt=1
-            edge_ok=0
-            probe_attempts=${D2K_IP_PROBE_ATTEMPTS:-2}
-            while [ "$probe_attempt" -le "$probe_attempts" ]; do
-                # DNS pinning checks edge reachability, not whether Instagram's
-                # SNI is already unblocked. The C control verifies the real
-                # Meta certificate with neutral wire SNI, without HTTP traffic.
-                if d2ktg --check-instagram-ip "$host" "$ip" "$ca_bundle" >>"$LOG" 2>&1; then
-                    edge_ok=1
-                    break
-                fi
-                if [ "$probe_attempt" -lt "$probe_attempts" ]; then
-                    log "повтор TLS-пробы $probe_attempt/$probe_attempts: $host $ip"
-                    sleep "${D2K_IP_PROBE_RETRY_DELAY:-1}"
-                fi
-                probe_attempt=$((probe_attempt + 1))
-            done
-            if [ "$edge_ok" = 1 ]; then
+            if edge_verified "$host" "$ip"; then
                 filtered="${filtered}${host} ${ip}\n"
                 kept=$((kept + 1))
                 [ "$kept" -lt 2 ] || break
@@ -148,6 +157,42 @@ refresh() {
                 log "адрес не прошёл TLS-проверку доступности и сертификата Meta: $host $ip"
             fi
         done
+        [ "$kept" -gt 0 ] || missing="$missing $host"
+    done
+    # Meta GeoDNS may give the VPS only an edge that is dead from here. For a
+    # name left without a verified address, try addresses of the same family
+    # verified in this refresh, then ones currently owned in the manifest.
+    for host in $missing; do
+        family=$(meta_family "$host")
+        [ -n "$family" ] || continue
+        answered=" $(printf '%s\n' "$parsed" | awk -v h="$host" '$1==h{print $2}' | tr '\n' ' ') "
+        candidates=$({ printf '%b' "$filtered"; cat "$MANIFEST" 2>/dev/null || true; } |
+            while read -r sibling ip _extra; do
+                [ -n "${sibling:-}" ] && [ -n "${ip:-}" ] || continue
+                [ "$sibling" != "$host" ] || continue
+                if ! managed_host "$sibling" || ! valid_ipv4 "$ip"; then continue; fi
+                [ "$(meta_family "$sibling")" = "$family" ] || continue
+                printf '%s %s\n' "$ip" "$sibling"
+            done | awk '!seen[$1]++')
+        tried=0
+        kept=0
+        while read -r ip sibling; do
+            [ -n "${ip:-}" ] || continue
+            case "$answered" in *" $ip "*) continue;; esac
+            [ "$tried" -lt 4 ] || break
+            tried=$((tried + 1))
+            is_meta_ip "$ip" || { log "адрес семейства вне диапазонов Meta: $host $ip"; continue; }
+            if edge_verified "$host" "$ip"; then
+                filtered="${filtered}${host} ${ip}\n"
+                kept=$((kept + 1))
+                log "адрес семейства: $host $ip (от $sibling), сертификат проверен для $host"
+                [ "$kept" -lt 2 ] || break
+            else
+                log "адрес семейства не прошёл TLS-проверку для $host: $ip (от $sibling)"
+            fi
+        done <<EOF_CANDIDATES
+$candidates
+EOF_CANDIDATES
     done
     [ -n "$filtered" ] || { log 'VPS ответил, но нет адресов с доступным и подлинным TLS-сервисом Meta; DNS не изменён'; return 1; }
     if ! printf '%b' "$filtered" | awk '$1=="instagram.com" {ok=1} END{exit !ok}'; then
