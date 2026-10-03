@@ -159,24 +159,42 @@ typedef struct {
     uint64_t at_ns;
 } defer_op;
 
+/* A re-send with the datagram's NFQUEUE ID: 0 — sent (its copy is DROPped
+   here), 1 — taken (the deferred queue owns the ID and gives its verdict when
+   it emits it), -1 — not sent (its copy is ACCEPTed here). */
+typedef int (*resend_id_fn)(void *ctx, const uint8_t *pkt, size_t len, uint32_t id);
+
 static size_t release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
                             int owned, int can_resend, const uint8_t *may,
                             const defer_op *defer,
-                            d2k_udp_release_send verdict, d2k_udp_resend resend,
+                            d2k_udp_release_send verdict, resend_id_fn resend,
                             void *ctx, int *verdict_failed, size_t *resend_failed);
+
+typedef struct { d2k_udp_release_send verdict; d2k_udp_resend resend; void *ctx; } plain_ctx;
+static int plain_verdict(void *ctx, uint32_t id, uint32_t v) {
+    plain_ctx *p = ctx;
+    return p->verdict(p->ctx, id, v);
+}
+static int plain_resend(void *ctx, const uint8_t *pkt, size_t len, uint32_t id) {
+    (void)id;
+    plain_ctx *p = ctx;
+    return p->resend(p->ctx, pkt, len) == 0 ? 0 : -1;
+}
 
 size_t d2k_udp_release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
                              int owned, int can_resend,
                              d2k_udp_release_send verdict, d2k_udp_resend resend,
                              void *ctx, int *verdict_failed, size_t *resend_failed) {
-    return release_batch(b, head_verdict, owned, can_resend, NULL, NULL, verdict, resend,
-                         ctx, verdict_failed, resend_failed);
+    plain_ctx p = {verdict, resend, ctx};
+    return release_batch(b, head_verdict, owned, can_resend, NULL, NULL,
+                         verdict ? plain_verdict : NULL, resend ? plain_resend : NULL,
+                         &p, verdict_failed, resend_failed);
 }
 
 static size_t release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
                             int owned, int can_resend, const uint8_t *may,
                             const defer_op *defer,
-                            d2k_udp_release_send verdict, d2k_udp_resend resend,
+                            d2k_udp_release_send verdict, resend_id_fn resend,
                             void *ctx, int *verdict_failed, size_t *resend_failed) {
     uint32_t v[D2K_UDP_HOLD_PACKETS];
     uint8_t again[D2K_UDP_HOLD_PACKETS];
@@ -209,7 +227,12 @@ static size_t release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
             }
         }
         if (again[i]) {
-            if (resend(ctx, b->packets[i], b->len[i]) == 0) {
+            int rr = resend(ctx, b->packets[i], b->len[i], b->ids[i]);
+            if (rr == 1) {
+                resent++;
+                continue;      /* the deferred queue gives this ID its verdict */
+            }
+            if (rr == 0) {
                 resent++;
             } else {
                 v[i] = D2K_NF_ACCEPT;
@@ -239,6 +262,7 @@ struct d2k_udp_follow {
     follow_entry e[D2K_UDP_FOLLOW_SLOTS];
     size_t live;         /* used entries: none -> no parse, no scan (M-5) */
     uint64_t busy;       /* re-sends refused by a full socket (M-3) */
+    uint64_t queue_full; /* deferred re-sends refused by a full queue */
     uint64_t refused;    /* flows whose re-send was refused otherwise (M-7) */
 };
 
@@ -264,6 +288,7 @@ void d2k_udp_follow_age(d2k_udp_follow *f, uint64_t now_ns, uint64_t seq) {
 
 size_t d2k_udp_follow_live(const d2k_udp_follow *f) { return f ? f->live : 0; }
 uint64_t d2k_udp_follow_busy(const d2k_udp_follow *f) { return f ? f->busy : 0; }
+uint64_t d2k_udp_follow_queue_full(const d2k_udp_follow *f) { return f ? f->queue_full : 0; }
 uint64_t d2k_udp_follow_refused(const d2k_udp_follow *f) { return f ? f->refused : 0; }
 
 int d2k_udp_send_busy(int err) {
@@ -360,16 +385,24 @@ typedef struct {
     int failed_err;
 } out_tail;
 
-static int out_resend(void *ctx, const uint8_t *pkt, size_t len) {
+static int out_resend(void *ctx, const uint8_t *pkt, size_t len, uint32_t id) {
     out_tail *c = ctx;
     errno = 0;
-    int rc;
-    if (c->at > c->now) {
+    int rc, taken = 0;
+    if (c->at > c->now && c->o->send_at_owned) {
+        /* Behind a deferred head: the queue keeps the ID until it emits the
+           datagram (review I-A m-2): never DROPped now and lost later. */
+        rc = c->o->send_at_owned(c->o->ctx, c->at, pkt, len, id);
+        taken = rc == 0;
+    } else if (c->at > c->now) {
         rc = c->o->send_at ? c->o->send_at(c->o->ctx, c->at, pkt, len) : -1;
     } else {
         rc = c->o->send_now ? c->o->send_now(c->o->ctx, pkt, len) : -1;
     }
-    if (rc != 0 && d2k_udp_send_busy(errno)) {
+    if (rc != 0 && errno == ENOSPC) {
+        /* The deferred queue is full: this copy goes to the kernel now. */
+        if (c->o->follow) { c->o->follow->queue_full++; }
+    } else if (rc != 0 && d2k_udp_send_busy(errno)) {
         /* A full socket (M-3): this copy goes to the kernel, the flow is not
            given up and no line is written — only counted. */
         if (c->o->follow) { c->o->follow->busy++; }
@@ -378,7 +411,13 @@ static int out_resend(void *ctx, const uint8_t *pkt, size_t len) {
         c->failed_len = len;
         c->failed_err = errno;
     }
-    return rc;
+    return rc != 0 ? -1 : taken ? 1 : 0;
+}
+
+int d2k_udp_out_owned_emit(const d2k_udp_out *o, uint32_t id, int err) {
+    if (!o || !o->verdict) { return -1; }
+    if (err && d2k_udp_send_busy(err) && o->follow) { o->follow->busy++; }
+    return o->verdict(o->ctx, id, err ? D2K_NF_ACCEPT : D2K_NF_DROP) != 0 ? -1 : 0;
 }
 
 /* One refused flow: counted always, told for the first D2K_UDP_REFUSED_LOG
@@ -454,7 +493,12 @@ int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
     /* A deferred head stays deferred until the queue pops it, even once due:
        queue the tail at its time whenever there is one (review N3). */
     out_tail c = {o, e->at_ns, e->at_ns ? 0 : now_ns, NULL, 0, 0};
-    uint32_t v = out_resend(&c, pkt, len) == 0 ? D2K_NF_DROP : D2K_NF_ACCEPT;
+    int rr = out_resend(&c, pkt, len, id);
+    if (rr == 1) {
+        if (verdict_failed) { *verdict_failed = 0; }
+        return 1;     /* owned by the deferred queue: its verdict comes then */
+    }
+    uint32_t v = rr == 0 ? D2K_NF_DROP : D2K_NF_ACCEPT;
     if (c.failed_pkt) {
         e->failed = 1;
         refused_flow(o, pkt, len, c.failed_err);

@@ -307,6 +307,32 @@ int main(void) {
         d2k_sched_free(s);
     }
 
+    /* --- посылка, владеющая ID очереди (ревью I-A, m-2) -------------------
+     * Отложенный хвост UDP держит своё NFQUEUE-ID до выдачи: ушла — DROP,
+     * не ушла — ACCEPT копии. Очередь возвращает ID вместе с посылкой, и
+     * даже не влезшая в буфер посылка не теряет его. */
+    {
+        d2k_sched *s = d2k_sched_new(4, 64);
+        mark(pkt, 20, 7);
+        mark(pkt2, 20, 8);
+        CHECK(d2k_sched_push_owned(s, 100, pkt, 20, 4242) == 0, "владеющая посылка не встала");
+        CHECK(d2k_sched_push(s, 100, pkt2, 20, &tag) == 0, "обычная посылка не встала");
+        int owned = -1;
+        uint32_t qid = 0;
+        uint64_t ex = 9;
+        CHECK(d2k_sched_pop_due_ex(s, 100, got, sizeof got, &len, &back, &ex, &owned, &qid) == 1 &&
+              owned == 1 && qid == 4242 && idof(got) == 7 && back.proto == 0 && ex == 0,
+              "владеющая посылка вернулась со своим ID");
+        CHECK(d2k_sched_pop_due_ex(s, 100, got, sizeof got, &len, &back, &ex, &owned, &qid) == 1 &&
+              owned == 0 && idof(got) == 8, "обычная посылка — без ID");
+        CHECK(d2k_sched_push_owned(s, 200, pkt, 20, 77) == 0, "вторая владеющая не встала");
+        owned = -1;
+        CHECK(d2k_sched_pop_due_ex(s, 200, got, 8, &len, &back, &ex, &owned, &qid) == -1 &&
+              owned == 1 && qid == 77 && len == 0 && d2k_sched_count(s) == 0,
+              "не влезшая владеющая посылка отдаёт ID, а не теряет его");
+        d2k_sched_free(s);
+    }
+
     if (fails) {
         printf("ПРОВАЛОВ: %d\n", fails);
         return 1;

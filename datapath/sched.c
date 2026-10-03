@@ -19,6 +19,10 @@ typedef struct {
        приписать плану (см. d2k_sched.h). */
     d2k_key  key;
     uint64_t execution;
+    /* NFQUEUE-ID, которым посылка владеет до выдачи (отложенный хвост UDP,
+       ревью I-A m-2): ушла — DROP копии, не ушла — ACCEPT. */
+    uint32_t owner_id;
+    uint8_t  owned;
 } entry;
 
 struct d2k_sched {
@@ -122,8 +126,21 @@ int d2k_sched_push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t le
     return d2k_sched_push_serial(s, due_ns, data, len, key, 0);
 }
 
+static int push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len,
+                const d2k_key *key, uint64_t execution, int owned, uint32_t id);
+
 int d2k_sched_push_serial(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len,
                           const d2k_key *key, uint64_t execution) {
+    return push(s, due_ns, data, len, key, execution, 0, 0);
+}
+
+int d2k_sched_push_owned(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len,
+                         uint32_t id) {
+    return push(s, due_ns, data, len, NULL, 0, 1, id);
+}
+
+static int push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len,
+                const d2k_key *key, uint64_t execution, int owned, uint32_t id) {
     if (!s || !data || len == 0) {
         return -2;
     }
@@ -143,6 +160,8 @@ int d2k_sched_push_serial(d2k_sched *s, uint64_t due_ns, const uint8_t *data, si
     s->heap[s->n].slot = slot;
     s->heap[s->n].len = len;
     s->heap[s->n].execution = execution;
+    s->heap[s->n].owned = owned ? 1 : 0;
+    s->heap[s->n].owner_id = id;
     if (key) {
         s->heap[s->n].key = *key;
     } else {
@@ -162,6 +181,14 @@ int d2k_sched_pop_due(d2k_sched *s, uint64_t now_ns,
 int d2k_sched_pop_due_serial(d2k_sched *s, uint64_t now_ns,
                              uint8_t *out, size_t outcap, size_t *len,
                              d2k_key *key, uint64_t *execution) {
+    return d2k_sched_pop_due_ex(s, now_ns, out, outcap, len, key, execution, NULL, NULL);
+}
+
+int d2k_sched_pop_due_ex(d2k_sched *s, uint64_t now_ns,
+                         uint8_t *out, size_t outcap, size_t *len,
+                         d2k_key *key, uint64_t *execution,
+                         int *owned, uint32_t *owner_id) {
+    if (owned) { *owned = 0; }
     if (!s || s->n == 0 || !out) {
         return 0;
     }
@@ -186,13 +213,21 @@ int d2k_sched_pop_due_serial(d2k_sched *s, uint64_t now_ns,
            планы продолжат жить. Молчания при этом нет: отказ считается
            отдельно (d2k_sched_refusals) и разбирается вызывающим. */
         s->refusals++;
+        int was_owned = s->heap[0].owned;
+        if (was_owned) {
+            /* Владеющая посылка отдаёт свой ID: вердикт ему обязан дать
+               вызывающий (ACCEPT копии), иначе пакет повис бы в очереди ядра. */
+            if (owned) { *owned = 1; }
+            if (owner_id) { *owner_id = s->heap[0].owner_id; }
+            if (len) { *len = 0; }
+        }
         s->freelist[s->nfree++] = s->heap[0].slot;
         s->n--;
         if (s->n > 0) {
             s->heap[0] = s->heap[s->n];
             sift_down(s, 0);
         }
-        return 0;
+        return was_owned ? -1 : 0;
     }
     memcpy(out, s->mem + s->heap[0].slot * s->slot_size, s->heap[0].len);
     if (len) {
@@ -202,6 +237,8 @@ int d2k_sched_pop_due_serial(d2k_sched *s, uint64_t now_ns,
         *key = s->heap[0].key;
     }
     if (execution) { *execution = s->heap[0].execution; }
+    if (owned) { *owned = s->heap[0].owned; }
+    if (owner_id) { *owner_id = s->heap[0].owner_id; }
     s->freelist[s->nfree++] = s->heap[0].slot;
 
     s->n--;

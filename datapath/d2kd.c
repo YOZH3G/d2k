@@ -232,7 +232,7 @@ static int routes_routed(const void *r, uint8_t ipver, uint32_t mark) {
 static void describe_oifs(char *buf, size_t cap, const uint32_t *o, size_t n, int read) {
     size_t w = 0;
     buf[0] = 0;
-    if (!read) { snprintf(buf, cap, "не прочитаны"); return; }
+    if (!read) { snprintf(buf, cap, "неизвестен (проверка по интерфейсу выключена)"); return; }
     if (!n) { snprintf(buf, cap, "нет"); return; }
     for (size_t i = 0; i < n && w < cap; i++) {
         char name[IF_NAMESIZE] = "";
@@ -243,8 +243,9 @@ static void describe_oifs(char *buf, size_t cap, const uint32_t *o, size_t n, in
     }
 }
 
-/* Правила по метке и выходы маршрутов по умолчанию главной таблицы
-   (финальное ревью I-1, M-2). Каждая часть читается сама по себе; не
+/* Правила по метке и выход сырой посылки (финальное ревью I-1, M-2): один
+   поиск маршрута к пробному адресу на семейство, без дампа таблиц (ревью
+   I-A). Каждая часть читается сама по себе; не
    прочитанная держит прежнее значение. Каждое состояние пишется в журнал
    один раз, при смене, а не раз в 30 с. */
 static void routes_refresh(void) {
@@ -271,11 +272,20 @@ static void routes_refresh(void) {
     int now[4] = {st_rm.v4_ok, st_rm.v6_ok, r4, r6};
     int *last[4] = {&last_v4, &last_v6, &last_r4, &last_r6};
     static const char *what[4] = {"правила IPv4 по метке", "правила IPv6 по метке",
-                                  "маршруты IPv4", "маршруты IPv6"};
+                                  "маршрут IPv4", "маршрут IPv6"};
     for (int i = 0; i < 4; i++) {
         if (now[i] == *last[i]) { continue; }
-        if (now[i]) { fprintf(stderr, "d2kd: %s снова читаются\n", what[i]); }
-        else { fprintf(stderr, "d2kd: %s не прочитаны: %s — держу прежние\n", what[i], err); }
+        if (now[i] == 2) {
+            /* Маршрут есть, а интерфейса в ответе нет (объекты nexthop):
+               сравнивать не с чем — для семейства только проверка метки. */
+            fprintf(stderr, "d2kd: %s без интерфейса в ответе ядра — проверка выхода "
+                            "по интерфейсу для этого семейства выключена, действует "
+                            "только метка\n", what[i]);
+        } else if (now[i]) {
+            fprintf(stderr, "d2kd: %s снова читаются\n", what[i]);
+        } else {
+            fprintf(stderr, "d2kd: %s не прочитаны: %s — держу прежние\n", what[i], err);
+        }
         *last[i] = now[i];
     }
     if (st_rm.truncated != last_trunc) {
@@ -291,7 +301,7 @@ static void routes_refresh(void) {
         describe_oifs(o4, sizeof o4, routes.oif4, routes.n_oif4, routes.oifs_read4);
         describe_oifs(o6, sizeof o6, routes.oif6, routes.n_oif6, routes.oifs_read6);
         fprintf(stderr, "d2kd: метки маршрута по ip rule (клиент с такой меткой — без плана): %s; "
-                        "выходы по умолчанию главной таблицы IPv4: %s, IPv6: %s "
+                        "выход сырой посылки IPv4: %s, IPv6: %s "
                         "(клиент, уходящий через другой интерфейс, — без плана)\n",
                 text, o4, o6);
     }
@@ -399,9 +409,15 @@ static void out_marked(void *ctx, const uint8_t *p, size_t n, uint32_t mark) {
             sport = port_of(p + v.l4);
             dport = port_of(p + v.l4 + 2);
         }
-        fprintf(stderr, "d2kd: поток UDP %u -> %u с меткой клиента 0x%x: хвосты идут ядром, "
-                        "не сырой посылкой%s\n", sport, dport, mark,
-                st.udp_marked_kept == 16 ? " (дальше только счётчик)" : "");
+        if (mark == D2K_ROUTE_OTHER_DEV) {
+            fprintf(stderr, "d2kd: поток UDP %u -> %u уходит через другой интерфейс: хвосты "
+                            "идут ядром, не сырой посылкой%s\n", sport, dport,
+                    st.udp_marked_kept == 16 ? " (дальше только счётчик)" : "");
+        } else {
+            fprintf(stderr, "d2kd: поток UDP %u -> %u с меткой клиента 0x%x: хвосты идут ядром, "
+                            "не сырой посылкой%s\n", sport, dport, mark,
+                    st.udp_marked_kept == 16 ? " (дальше только счётчик)" : "");
+        }
     }
 }
 
@@ -460,7 +476,20 @@ static int out_send_at(void *ctx, uint64_t at, const uint8_t *p, size_t n) {
     if (!c->raw || !c->sched) { return out_fail(ENOTSOCK); }
     if (d2k_raw_prepare(c->raw, p, n, err, sizeof err) != 0) { return out_fail(errno ? errno : EIO); }
     if (d2k_sched_push_serial(c->sched, at, p, n, NULL, 0) != 0) {
-        return out_fail(ENOBUFS);
+        return out_fail(ENOSPC);   /* очередь отложенных полна — не «сокет полон» */
+    }
+    st.deferred++;
+    return 0;
+}
+
+/* То же, но очередь владеет ID копии до выдачи (ревью I-A m-2). */
+static int out_send_at_owned(void *ctx, uint64_t at, const uint8_t *p, size_t n, uint32_t id) {
+    hold_context *c = ctx;
+    char err[256];
+    if (!c->raw || !c->sched) { return out_fail(ENOTSOCK); }
+    if (d2k_raw_prepare(c->raw, p, n, err, sizeof err) != 0) { return out_fail(errno ? errno : EIO); }
+    if (d2k_sched_push_owned(c->sched, at, p, n, id) != 0) {
+        return out_fail(ENOSPC);
     }
     st.deferred++;
     return 0;
@@ -613,14 +642,16 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
     }
     printf("потоков клиентов с меткой маршрутизации (ядром, без плана): %" PRIu64 "\n",
            d2k_session_routed_flows(s));
-    printf("UDP с меткой клиента, хвосты ядром: %" PRIu64 " потоков\n", st.udp_marked_kept);
+    printf("UDP с меткой клиента или через другой интерфейс, хвосты ядром: %" PRIu64
+           " потоков\n", st.udp_marked_kept);
     printf("сырым сокетом отправлено %" PRIu64 ", ошибок %" PRIu64
            " (из них сокет полон %" PRIu64 ")\n",
                d2k_raw_sent(r), d2k_raw_errors(r), d2k_raw_busy(r));
     printf("UDP переиздание: отказано потоков %" PRIu64 ", сокет полон %" PRIu64
-           " раз; уведомлений о правилах/маршрутах %" PRIu64 "\n",
+           " раз, очередь отложенных полна %" PRIu64 " раз; уведомлений о правилах/"
+           "маршрутах %" PRIu64 "\n",
            d2k_udp_follow_refused(udp_follow), d2k_udp_follow_busy(udp_follow),
-           st.routes_watch);
+           d2k_udp_follow_queue_full(udp_follow), st.routes_watch);
     }
     printf("отказов по форме приветствия %zu\n",
            d2k_plantab_shape_misses(d2k_session_plans((d2k_session *)s)));
@@ -962,6 +993,7 @@ int main(int argc, char **argv) {
     udp_out.verdict = out_verdict;
     udp_out.send_now = out_send_now;
     udp_out.send_at = out_send_at;
+    udp_out.send_at_owned = out_send_at_owned;
     udp_out.ctx = &hc;
     udp_out.follow = udp_follow;
     udp_out.can_resend = udp_follow != NULL;
@@ -1335,8 +1367,8 @@ int main(int argc, char **argv) {
                             if (!np.have_outdev || !if_indextoname(np.outdev, dev)) {
                                 snprintf(dev, sizeof dev, "#%u", np.outdev);
                             }
-                            fprintf(stderr, "d2kd: поток клиента уходит через %s — не выход "
-                                            "маршрута по умолчанию главной таблицы; идёт "
+                            fprintf(stderr, "d2kd: поток клиента уходит через %s — не тем "
+                                            "выходом, что сырая посылка; идёт "
                                             "ядром, без плана%s\n", dev,
                                     rf == 16 ? " (дальше только счётчик)" : "");
                         } else if (rf <= 16) {
@@ -1621,7 +1653,31 @@ int main(int argc, char **argv) {
             size_t slen = 0;
             d2k_key skey;
             uint64_t execution;
-            while (d2k_sched_pop_due_serial(sched, t, sbuf, sizeof sbuf, &slen, &skey, &execution)) {
+            int owned = 0, popped;
+            uint32_t owner_id = 0;
+            while ((popped = d2k_sched_pop_due_ex(sched, t, sbuf, sizeof sbuf, &slen, &skey,
+                                                  &execution, &owned, &owner_id)) != 0) {
+                /* ОТЛОЖЕННЫЙ ХВОСТ UDP СО СВОИМ ID (ревью I-A m-2): ушёл —
+                   DROP копии, не ушёл (полный сокет) — копия идёт ядром, а не
+                   теряется. Ровно один вердикт. */
+                if (owned) {
+                    int e = 0;
+                    if (popped < 0) {
+                        e = EMSGSIZE;
+                    } else if (d2k_raw_send(raw, sbuf, slen, err, sizeof err) != 0) {
+                        e = errno ? errno : EIO;
+                        st.send_fail++;
+                        log_send_fail("отложенный хвост UDP: ", err, e);
+                    } else {
+                        st.emitted++;
+                        st.emitted_late++;
+                    }
+                    if (d2k_udp_out_owned_emit(&udp_out, owner_id, e) != 0) {
+                        st.verdict_fail++;
+                    }
+                    continue;
+                }
+                if (popped < 0) { continue; }
                 /* Нулевой ключ означает «клали без метки» (лаборатория):
                    приписывать такую посылку некому, и молчание тут честнее
                    выдумки. */
@@ -1726,8 +1782,15 @@ int main(int argc, char **argv) {
         size_t slen;
         d2k_key skey;
         uint64_t execution;
-        while (d2k_sched_pop_due_serial(sched, UINT64_MAX, sbuf, sizeof sbuf,
-                                        &slen, &skey, &execution)) {
+        int owned = 0;
+        uint32_t owner_id = 0;
+        while (d2k_sched_pop_due_ex(sched, UINT64_MAX, sbuf, sizeof sbuf,
+                                    &slen, &skey, &execution, &owned, &owner_id) != 0) {
+            if (owned) {
+                /* Хвост клиента не ушёл — его копия идёт ядром. */
+                (void)d2k_udp_out_owned_emit(&udp_out, owner_id, ECANCELED);
+                continue;
+            }
             if (skey.proto && d2k_session_send_pending(sess, &skey, execution)) {
                 (void)d2k_session_exec_failed(sess, now_ns(), &skey, NULL,
                     D2K_REFUSE_QUEUE, execution, 0, 1);

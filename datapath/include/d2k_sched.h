@@ -62,6 +62,22 @@ int d2k_sched_push_serial(d2k_sched *s, uint64_t due_ns, const uint8_t *data, si
 /* Забирает один созревший пакет, копируя его в буфер вызывающего.
  * 1 — забрали, 0 — созревших нет либо буфер мал (тогда пакет остаётся).
  * key — куда положить метку, с которой пакет клали; NULL, если она не нужна. */
+/* A deferred UDP tail that owns its NFQUEUE ID until it is emitted (review
+ * I-A m-2): the caller gives that ID exactly one verdict when it pops it —
+ * DROP once the raw send went out, ACCEPT of the queued copy otherwise. */
+int d2k_sched_push_owned(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len,
+                         uint32_t id);
+
+/* d2k_sched_pop_due_serial that also returns ownership: *owned = 1 and
+ * *owner_id for an owned entry.  1 — popped; 0 — nothing due; -1 — an owned
+ * entry did not fit outcap and was dropped: its ID is returned (len 0) so
+ * the caller can still ACCEPT it.  Only callers of this function may push
+ * owned entries: the other pops would lose the ID. */
+int d2k_sched_pop_due_ex(d2k_sched *s, uint64_t now_ns,
+                         uint8_t *out, size_t outcap, size_t *len,
+                         d2k_key *key, uint64_t *execution,
+                         int *owned, uint32_t *owner_id);
+
 int d2k_sched_pop_due(d2k_sched *s, uint64_t now_ns,
                       uint8_t *out, size_t outcap, size_t *len,
                       d2k_key *key);

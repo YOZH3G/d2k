@@ -931,7 +931,68 @@ static void test_refused_lines_capped(void) {
     done(s, h, f);
 }
 
+/* Review m-2 / m-1: a deferred tail keeps its NFQUEUE ID in the queue until
+ * it is emitted — DROP once sent, ACCEPT of the queued copy when the socket is
+ * full then — instead of a DROP now and a loss later.  A full deferred queue
+ * (ENOSPC) is its own counter, not "socket full". */
+static uint32_t owned_ids[8];
+static size_t owned_n;
+static int fail_owned;
+static int rec_at_owned(void *ctx, uint64_t at, const uint8_t *p, size_t n, uint32_t id) {
+    (void)ctx; (void)at; (void)p; (void)n;
+    if (fail_owned) { errno = ENOSPC; return -1; }
+    if (owned_n < 8) { owned_ids[owned_n++] = id; }
+    return 0;
+}
+static void test_owned_deferred_tail(void) {
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    reset();
+    out.send_at_owned = rec_at_owned;
+    owned_n = 0;
+    fail_owned = 0;
+    uint8_t pay[100];
+    memset(pay, 1, sizeof pay);
+    d2k_udp_hold_batch b;
+    memset(&b, 0, sizeof b);
+    b.count = 3;
+    for (uint32_t i = 0; i < 3; i++) { b.ids[i] = 30 + i; b.len[i] = build(b.packets[i], 30 + i, 52100, pay, 100); }
+    (void)d2k_udp_out_batch(&out, &b, D2K_NF_DROP, 1, 200000, 100000, 9);
+    CHECK(verdicts_of[30] == 1 && last_verdict[30] == D2K_NF_DROP, "owned head: one DROP");
+    CHECK(verdicts_of[31] == 0 && verdicts_of[32] == 0 && owned_n == 2 &&
+          owned_ids[0] == 31 && owned_ids[1] == 32,
+          "deferred tails: their IDs wait in the queue, no verdict yet");
+    CHECK(d2k_udp_out_owned_emit(&out, 31, 0) == 0 &&
+          verdicts_of[31] == 1 && last_verdict[31] == D2K_NF_DROP, "sent at its time: DROP");
+    CHECK(d2k_udp_out_owned_emit(&out, 32, EAGAIN) == 0 &&
+          verdicts_of[32] == 1 && last_verdict[32] == D2K_NF_ACCEPT &&
+          d2k_udp_follow_busy(f) == 1 && failed_reports == 0,
+          "socket full at its time: the queued copy goes to the kernel, counted");
+
+    /* A late tail behind the same deferred head is owned the same way. */
+    uint8_t pkt[200];
+    size_t n = build(pkt, 33, 52100, pay, 100);
+    int vf = 0;
+    CHECK(d2k_udp_out_late(&out, 33, pkt, n, 0, 150000, 10, &vf) == 1 &&
+          verdicts_of[33] == 0 && owned_n == 3 && owned_ids[2] == 33,
+          "late tail behind a deferred head: owned by the queue");
+    CHECK(d2k_udp_out_owned_emit(&out, 33, 0) == 0 && verdicts_of[33] == 1, "then one verdict");
+
+    /* The deferred queue is full: ACCEPT now, its own counter. */
+    fail_owned = 1;
+    for (uint32_t i = 0; i < 2; i++) { b.ids[i] = 40 + i; b.len[i] = build(b.packets[i], 40 + i, 52200, pay, 100); }
+    b.count = 2;
+    (void)d2k_udp_out_batch(&out, &b, D2K_NF_DROP, 1, 300000, 250000, 11);
+    CHECK(verdicts_of[41] == 1 && last_verdict[41] == D2K_NF_ACCEPT &&
+          d2k_udp_follow_queue_full(f) == 1 && d2k_udp_follow_busy(f) == 1 && failed_reports == 0,
+          "full deferred queue: ACCEPT now, counted apart from a full socket");
+    fail_owned = 0;
+    out.send_at_owned = NULL;
+    done(s, h, f);
+}
+
 int main(void) {
+    test_owned_deferred_tail();
     test_device_routed_flow_keeps_kernel_path();
     test_busy_resend_is_transient();
     test_refused_lines_capped();

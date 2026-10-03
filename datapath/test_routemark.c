@@ -216,31 +216,83 @@ int main(void) {
 
     /* --- final review I-1: the output interface gate ---------------------- */
     {
-        /* Main table (254): default via ppp0 (5); a default in table 1000 via
-           a VPN (9); 10/8 via br0 (3); an unreachable IPv6-style default with
-           no device; a multipath default (ifindex 6 and 8) in main via
-           RTA_TABLE with the compat byte 252. */
+        /* Review I-A: no table dumps on the packet thread.  One non-dump
+           RTM_GETROUTE per family for a fixed probe address answers which
+           device a raw send would leave through. */
+        uint8_t rq[128];
+        size_t rql = d2k_routemark_lookup_request(rq, sizeof rq, 2, 5);
+        uint16_t rflags;
+        memcpy(&rflags, rq + 6, 2);
+        CHECK(rql >= 36 && rq[4] == 26 && rq[16] == 2 && rq[17] == 32 && rflags == 1,
+              "IPv4 lookup: RTM_GETROUTE, request only (no dump), dst/32");
+        CHECK(rq[28 + 2] == 1 && rq[32] == 192 && rq[33] == 0 && rq[34] == 2 && rq[35] == 1,
+              "IPv4 lookup carries RTA_DST 192.0.2.1");
+        rql = d2k_routemark_lookup_request(rq, sizeof rq, 10, 6);
+        memcpy(&rflags, rq + 6, 2);
+        CHECK(rql >= 48 && rq[16] == 10 && rq[17] == 128 && rflags == 1 &&
+              rq[32] == 0x20 && rq[33] == 0x01 && rq[34] == 0x0d && rq[35] == 0xb8,
+              "IPv6 lookup: dst/128, RTA_DST 2001:db8::1");
+        CHECK(d2k_routemark_lookup_request(rq, 8, 2, 1) == 0, "small buffer refused");
+
         uint32_t oifs[D2K_ROUTEMARK_OIF_MAX];
         size_t no = 0;
         int32_t rk = 0;
-        len = 0;
-        len += route_msg(buf + len, 2, 0, 254, 254, 1, 5, 0, 0);
-        len += route_msg(buf + len, 2, 0, 252, 1000, 1, 9, 0, 0);
-        len += route_msg(buf + len, 2, 8, 254, 254, 1, 3, 0, 0);
-        len += route_msg(buf + len, 2, 0, 254, 0, 7, 0, 0, 0);
-        len += route_msg(buf + len, 2, 0, 252, 254, 1, 0, 6, 8);
-        len += route_msg(buf + len, 2, 0, 254, 254, 1, 5, 0, 0);   /* same oif twice */
-        len += done_msg(buf + len);
-        CHECK(d2k_routemark_routes_parse(oifs, D2K_ROUTEMARK_OIF_MAX, &no, buf, len, &rk) == 1,
-              "route dump parsed to DONE");
-        CHECK(no == 3 && has_oif(oifs, no, 5) && has_oif(oifs, no, 6) && has_oif(oifs, no, 8),
-              "main-table default devices only: ppp0 and both multipath hops, once each");
-        CHECK(!has_oif(oifs, no, 9) && !has_oif(oifs, no, 3),
-              "another table's default and a non-default route are not exits");
-        uint8_t rq[64];
-        size_t rql = d2k_routemark_routes_request(rq, sizeof rq, 10, 5);
-        CHECK(rql >= 28 && rq[4] == 26 && rq[16] == 10, "RTM_GETROUTE dump request for AF_INET6");
+        /* The answer: a unicast route through ppp0 (5), cloned flag set. */
+        len = route_msg(buf, 2, 32, 254, 254, 1, 5, 0, 0);
+        w32(buf + 16 + 8, 0x200);
+        CHECK(d2k_routemark_lookup_parse(oifs, D2K_ROUTEMARK_OIF_MAX, &no, buf, len, &rk) == 1 &&
+              no == 1 && oifs[0] == 5, "lookup answer: the device of the route");
+        no = 0;
+        len = route_msg(buf, 2, 32, 254, 254, 1, 0, 6, 8);
+        CHECK(d2k_routemark_lookup_parse(oifs, D2K_ROUTEMARK_OIF_MAX, &no, buf, len, &rk) == 1 &&
+              no == 2 && has_oif(oifs, no, 6) && has_oif(oifs, no, 8),
+              "a multipath answer gives every hop");
+        no = 0;
+        len = route_msg(buf, 10, 128, 254, 254, 7, 1, 0, 0);    /* unreachable, dev lo */
+        CHECK(d2k_routemark_lookup_parse(oifs, D2K_ROUTEMARK_OIF_MAX, &no, buf, len, &rk) == 2 &&
+              no == 0, "an unreachable answer: no route");
+        no = 0;
+        len = route_msg(buf, 2, 32, 254, 254, 1, 0, 0, 0);      /* nexthop object, no OIF */
+        CHECK(d2k_routemark_lookup_parse(oifs, D2K_ROUTEMARK_OIF_MAX, &no, buf, len, &rk) == 1 &&
+              no == 0, "a unicast answer without a device: route exists, device unknown");
+        uint8_t ne[36];
+        memset(ne, 0, sizeof ne);
+        w32(ne, 36); w16(ne + 4, 2); w32(ne + 16, (uint32_t)-101);
+        no = 0;
+        CHECK(d2k_routemark_lookup_parse(oifs, D2K_ROUTEMARK_OIF_MAX, &no, ne, sizeof ne, &rk) == -1 &&
+              rk == -101, "a kernel error is reported with its errno");
+        no = 0;
+        CHECK(d2k_routemark_lookup_parse(oifs, D2K_ROUTEMARK_OIF_MAX, &no, bad, sizeof bad, &rk) == -1,
+              "garbage refused");
 
+        /* Notifications: rules always; routes only for defaults (dst/0). */
+        len = rule_msg(buf, 2, 1, 0x5, 1, 0xff, 1);
+        CHECK(d2k_routemark_watch_relevant(buf, len) == 1, "a rule change is relevant");
+        w16(buf + 4, 33);
+        CHECK(d2k_routemark_watch_relevant(buf, len) == 1, "a rule removal is relevant");
+        len = route_msg(buf, 2, 24, 254, 254, 1, 3, 0, 0);
+        CHECK(d2k_routemark_watch_relevant(buf, len) == 0, "a /24 route change is not");
+        len = route_msg(buf, 2, 32, 252, 1000, 1, 9, 0, 0);
+        w16(buf + 4, 25);
+        CHECK(d2k_routemark_watch_relevant(buf, len) == 0, "a host route removal is not");
+        size_t l2r = route_msg(buf, 2, 24, 254, 254, 1, 3, 0, 0);
+        l2r += route_msg(buf + l2r, 2, 0, 254, 254, 1, 5, 0, 0);
+        CHECK(d2k_routemark_watch_relevant(buf, l2r) == 1, "a default among others is relevant");
+        len = route_msg(buf, 10, 0, 254, 254, 1, 5, 0, 0);
+        w16(buf + 4, 25);
+        CHECK(d2k_routemark_watch_relevant(buf, len) == 1, "a default removal is relevant");
+        memset(buf, 0, 40); w32(buf, 40); w16(buf + 4, 28);     /* RTM_NEWNEIGH */
+        CHECK(d2k_routemark_watch_relevant(buf, 40) == 0, "other messages are not");
+        CHECK(d2k_routemark_watch_relevant(bad, sizeof bad) == 1,
+              "an unreadable notification: refresh to be safe");
+
+        /* The device set the gate compares with. */
+        no = 0;
+        len = route_msg(buf, 2, 32, 254, 254, 1, 5, 0, 0);
+        (void)d2k_routemark_lookup_parse(oifs, D2K_ROUTEMARK_OIF_MAX, &no, buf, len, &rk);
+        len = route_msg(buf, 2, 32, 254, 254, 1, 0, 6, 8);
+        CHECK(d2k_routemark_lookup_parse(oifs, D2K_ROUTEMARK_OIF_MAX, &no, buf, len, &rk) == 1 &&
+              no == 3, "answers accumulate distinct devices");
         d2k_routemark g;
         d2k_routemark_init(&g);
         /* Routes unknown: no outdev gate (nothing to compare with). */
@@ -271,7 +323,13 @@ int main(void) {
            elsewhere — a raw send could not follow it. */
         CHECK(d2k_routemark_set_oifs(&g, 10, oifs, 0, 1) == 1 &&
               d2k_routemark_gate(&g, 6, 1, 0, 0, 0x2e, 0x2d, 1, 5) == D2K_ROUTE_OTHER_DEV,
-              "no IPv6 default in main: outbound IPv6 is routed elsewhere");
+              "no IPv6 route: outbound IPv6 is routed elsewhere");
+        /* Review minor: a route exists but no device is known (nexthop
+           objects): no device gate for that family, the mark gate only. */
+        CHECK(d2k_routemark_clear_oifs(&g, 10) == 1 &&
+              d2k_routemark_gate(&g, 6, 1, 0, 0, 0x2e, 0x2d, 1, 5) == 0,
+              "device unknown: no IPv6 device gate");
+        CHECK(d2k_routemark_clear_oifs(&g, 10) == 0, "clearing again is no change");
 
         /* Marks: own and probe marks never gate by mark; a routed fwmark wins
            (its own value is logged). */

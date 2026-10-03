@@ -14,11 +14,12 @@
  * NOT ONLY MARKS (final review I-1).  A client routed by source, iif, tos or
  * uidrange carries no mark, and a raw send (d2k's mark, saddr 0) never matches
  * such a rule: it follows the main table.  So an outbound packet (OUTPUT or
- * POSTROUTING) whose output device is none of the devices of the main table's
- * default routes (RTM_GETROUTE, table 254, dst/0, unicast, multipath hops
- * included) is routed elsewhere, whatever routed it.  Until a family's routes
- * were read once there is nothing to compare with, and the device gate is off
- * for it (the mark gate still applies).
+ * POSTROUTING) whose output device is none of the devices a raw send to the
+ * Internet would take (one RTM_GETROUTE lookup per family for a probe
+ * address, multipath hops included — review I-A: no table dumps) is routed
+ * elsewhere, whatever routed it.  Until a family's route was read once, or
+ * when the route names no device, there is nothing to compare with and the
+ * device gate is off for it (the mark gate still applies).
  *
  * FAIL CLOSED (final review M-2).  A read error never replaces a family's
  * selectors or devices: the previous ones stay.  Until a family's rules were
@@ -33,8 +34,8 @@
 #define D2K_ROUTEMARK_MAX 32
 #define D2K_ROUTEMARK_OIF_MAX 16
 #define D2K_ROUTEMARK_REFRESH_NS UINT64_C(30000000000)
-/* Notifications come in bursts (a VPN coming up adds its routes one by one);
-   one dump after the burst, not one per message.  The leak window this leaves
+/* Relevant notifications (rules, default routes) can come in bursts; one
+   refresh after the burst, not one per message.  The leak window this leaves
    is this long, against 30 s before notifications were read. */
 #define D2K_ROUTEMARK_SETTLE_NS UINT64_C(100000000)
 
@@ -77,20 +78,36 @@ size_t d2k_routemark_request(uint8_t *o, size_t cap, uint8_t family, uint32_t se
 int d2k_routemark_parse(d2k_fwsel *out, size_t cap, size_t *n,
                         const uint8_t *buf, size_t len, int32_t *kerr);
 
-/* RTM_GETROUTE dump request for one family.  Returns its length, 0 if cap is
- * too small. */
-size_t d2k_routemark_routes_request(uint8_t *o, size_t cap, uint8_t family, uint32_t seq);
+/* ONE LOOKUP, NOT A DUMP (review I-A).  A non-dump RTM_GETROUTE for a fixed
+ * probe address (192.0.2.1, 2001:db8::1; no mark, no source): the kernel's own
+ * policy lookup answers which device a raw send to the Internet leaves
+ * through, in microseconds, however many routes other tables hold (a 4.9
+ * dump ignores the table filter and walks them all).  Returns the request
+ * length, 0 if cap is too small or the family is not 2/10. */
+size_t d2k_routemark_lookup_request(uint8_t *o, size_t cap, uint8_t family, uint32_t seq);
 
-/* Appends to oifs[*n..cap) every distinct output device of the main table's
- * (254) default unicast routes found in RTM_NEWROUTE messages: RTA_OIF and
- * each RTA_MULTIPATH hop.  Source-specific, cloned and non-unicast defaults
- * (unreachable, blackhole) are not exits.  Return values and *kerr as
- * d2k_routemark_parse; *n counts distinct devices past cap too. */
-int d2k_routemark_routes_parse(uint32_t *oifs, size_t cap, size_t *n,
+/* The lookup's answer: appends the route's device (RTA_OIF) and multipath
+ * hops to oifs[*n..cap), distinct.  1 — a unicast route (*n may stay 0: the
+ * route exists but names no device, e.g. a nexthop object); 2 — a
+ * non-unicast answer (unreachable, prohibit: no route); 0 — no answer yet;
+ * -1 — an error message (*kerr: the kernel's negative errno, e.g.
+ * -ENETUNREACH when there is no route) or malformed input. */
+int d2k_routemark_lookup_parse(uint32_t *oifs, size_t cap, size_t *n,
                                const uint8_t *buf, size_t len, int32_t *kerr);
 
-/* Replaces one family's default devices (family 2 or 10) when ok; a failed
- * read (ok == 0) keeps the previous ones.  Returns 1 when the set changed. */
+/* 1 when a batch of rtnetlink notifications can change the gate: any rule
+ * change, a default route (dst/0) added or removed in any table (a rule may
+ * select it), or anything unreadable.  Other route churn (host routes, route
+ * lists through a VPN) is not a reason to refresh. */
+int d2k_routemark_watch_relevant(const uint8_t *buf, size_t len);
+
+/* The family's route exists but no device is known: no device gate for it
+ * (the mark gate only).  Returns 1 when that is a change. */
+int d2k_routemark_clear_oifs(d2k_routemark *r, uint8_t family);
+
+/* Replaces one family's exit devices (family 2 or 10) when ok — n == 0 means
+ * there is no route: every outbound packet leaves elsewhere; a failed read
+ * (ok == 0) keeps the previous ones.  Returns 1 when the set changed. */
 int d2k_routemark_set_oifs(d2k_routemark *r, uint8_t family, const uint32_t *oifs,
                            size_t n, int ok);
 
@@ -136,11 +153,13 @@ uint32_t d2k_routemark_gate(const d2k_routemark *r, uint8_t ipver, int outbound,
 /* "0xffffaaa/0xffffffff v4, ..." or "нет"; returns the length written. */
 size_t d2k_routemark_describe(const d2k_routemark *r, char *buf, size_t cap);
 
-/* Linux (routemark_nl.c): reads the rules and the main-table default
- * devices of both families and merges them into r (a failed part keeps its
- * previous value).  st->v4_ok/v6_ok tell the rule dumps, routes4_ok/routes6_ok
- * (optional) the route dumps.  Returns 1 when the selectors or devices
- * changed, 0 when unchanged, -1 when nothing could be read (err filled).
+/* Linux (routemark_nl.c): dumps the rules (few) and looks up the exit
+ * device of both families (d2k_routemark_lookup_request), merging them into
+ * r (a failed part keeps its previous value).  st->v4_ok/v6_ok tell the rule
+ * dumps, routes4_ok/routes6_ok (optional) the lookups: 1 read, 0 failed,
+ * 2 read but the route names no device (device gate off for that family).
+ * Returns 1 when the selectors or devices changed, 0 when unchanged, -1 when
+ * nothing could be read (err filled).
  * Never blocks: a socket without a receive timeout is not read at all. */
 int d2k_routemark_load(d2k_routemark *r, d2k_routemark_status *st,
                        int *routes4_ok, int *routes6_ok,
@@ -151,8 +170,11 @@ int d2k_routemark_load(d2k_routemark *r, d2k_routemark_status *st,
  * RTNLGRP_IPV6_ROUTE) for the packet loop's poll.  -1 on failure (err).
  * A group the kernel lacks (no IPv6) is skipped. */
 int d2k_routemark_watch_open(char *err, size_t errcap);
-/* Reads everything pending without blocking.  1 when anything changed (or
- * the socket overran: something may have), 0 when nothing was pending. */
+/* Reads what is pending without blocking, at most D2K_ROUTEMARK_WATCH_READS
+ * reads per call.  1 when a relevant change arrived
+ * (d2k_routemark_watch_relevant), the socket overran (ENOBUFS: something may
+ * have) or the cap was reached; 0 otherwise. */
+#define D2K_ROUTEMARK_WATCH_READS 256
 int d2k_routemark_watch_drain(int fd);
 
 #endif

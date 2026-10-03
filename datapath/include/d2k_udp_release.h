@@ -117,6 +117,9 @@ size_t d2k_udp_follow_live(const d2k_udp_follow *f);
  * copy is ACCEPTed, the flow keeps its entry, and it is only counted here. */
 int d2k_udp_send_busy(int err);
 uint64_t d2k_udp_follow_busy(const d2k_udp_follow *f);
+/* Deferred re-sends refused because the deferred queue was full (ENOSPC from
+ * send_at/send_at_owned): also transient, counted apart from a full socket. */
+uint64_t d2k_udp_follow_queue_full(const d2k_udp_follow *f);
 /* Flows whose re-send was refused for any other reason (resend_failed is
  * told only for the first D2K_UDP_REFUSED_LOG of them, final review M-7). */
 #define D2K_UDP_REFUSED_LOG 16
@@ -131,6 +134,13 @@ typedef struct {
     d2k_udp_release_send verdict;                                   /* (ctx, id, v) */
     int (*send_now)(void *ctx, const uint8_t *pkt, size_t len);      /* raw, now */
     int (*send_at)(void *ctx, uint64_t at_ns, const uint8_t *pkt, size_t len); /* behind deferred emits */
+    /* Optional, preferred over send_at (review I-A m-2): queue the datagram
+       behind the deferred emits WITH its NFQUEUE ID.  0 — taken: the caller
+       gives no verdict, the owner calls d2k_udp_out_owned_emit when it emits
+       it; -1 — refused (errno; ENOSPC: the queue is full), the copy is
+       ACCEPTed now. */
+    int (*send_at_owned)(void *ctx, uint64_t at_ns, const uint8_t *pkt, size_t len,
+                         uint32_t id);
     void *ctx;
     d2k_udp_follow *follow;
     int can_resend;
@@ -175,6 +185,11 @@ int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,
 int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
                      size_t len, uint32_t mark, uint64_t now_ns, uint64_t seq,
                      int *verdict_failed);
+
+/* The deferred queue emits a datagram it owns (send_at_owned): err 0 — the
+ * raw send went out, DROP its copy; otherwise ACCEPT the copy (a busy err is
+ * counted).  Exactly one verdict.  Returns -1 when the verdict failed. */
+int d2k_udp_out_owned_emit(const d2k_udp_out *o, uint32_t id, int err);
 
 /* 1 when a datagram with this nfmark may be re-sent raw (see neutral_mark). */
 int d2k_udp_out_neutral(const d2k_udp_out *o, uint32_t mark, uint8_t ipver);

@@ -14,14 +14,14 @@
 #define RM_FIB_RULE_INVERT 0x2u
 /* linux/rtnetlink.h: struct rtmsg and its attributes */
 #define RM_RTM_NEWROUTE 24
+#define RM_RTM_DELROUTE 25
 #define RM_RTM_GETROUTE 26
+#define RM_RTM_DELRULE  33
+#define RM_RTA_DST      1
 #define RM_RTMSG       12u
 #define RM_RTA_OIF      4
 #define RM_RTA_MULTIPATH 9
-#define RM_RTA_TABLE   15
-#define RM_RT_TABLE_MAIN 254
 #define RM_RTN_UNICAST  1
-#define RM_RTM_F_CLONED 0x200u
 #define RM_RTNH_LEN     8u      /* struct rtnexthop */
 
 static uint16_t rd16h(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
@@ -94,15 +94,28 @@ int d2k_routemark_parse(d2k_fwsel *out, size_t cap, size_t *n,
     return (len - consumed) < 4 ? 0 : -1;   /* at most an alignment tail */
 }
 
-size_t d2k_routemark_routes_request(uint8_t *o, size_t cap, uint8_t family, uint32_t seq) {
-    size_t len = D2K_NLMSG_HDRLEN + RM_RTMSG;
-    if (!o || cap < len) { return 0; }
+/* Probe destinations: documentation prefixes (RFC 5737, RFC 3849) — no
+   route list carries them, so the answer is the route a raw send to an
+   arbitrary Internet address takes. */
+static const uint8_t PROBE4[4] = {192, 0, 2, 1};
+static const uint8_t PROBE6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+
+size_t d2k_routemark_lookup_request(uint8_t *o, size_t cap, uint8_t family, uint32_t seq) {
+    size_t al = family == 10 ? 16 : 4;
+    size_t len = D2K_NLMSG_HDRLEN + RM_RTMSG + D2K_NLA_HDRLEN + al;
+    if (!o || cap < len || (family != 2 && family != 10)) { return 0; }
     memset(o, 0, len);
     wr32h(o, (uint32_t)len);
     wr16h(o + 4, RM_RTM_GETROUTE);
-    wr16h(o + 6, D2K_NLM_F_REQUEST | RM_NLM_F_DUMP);
+    wr16h(o + 6, D2K_NLM_F_REQUEST);          /* one lookup, not a dump */
     wr32h(o + 8, seq);
-    o[D2K_NLMSG_HDRLEN] = family;
+    uint8_t *m = o + D2K_NLMSG_HDRLEN;
+    m[0] = family;
+    m[1] = (uint8_t)(al * 8);                 /* dst_len */
+    uint8_t *a = m + RM_RTMSG;
+    wr16h(a, (uint16_t)(D2K_NLA_HDRLEN + al));
+    wr16h(a + 2, RM_RTA_DST);
+    memcpy(a + D2K_NLA_HDRLEN, family == 10 ? PROBE6 : PROBE4, al);
     return len;
 }
 
@@ -114,7 +127,31 @@ static void add_oif(uint32_t *oifs, size_t cap, size_t *n, uint32_t oif) {
     (*n)++;
 }
 
-int d2k_routemark_routes_parse(uint32_t *oifs, size_t cap, size_t *n,
+/* Walks one route message's attributes: the device and multipath hops.
+   -1 on a malformed message. */
+static int route_oifs(const uint8_t *b, size_t blen, uint32_t *oifs, size_t cap, size_t *n) {
+    size_t off = RM_RTMSG;
+    while (off + D2K_NLA_HDRLEN <= blen) {
+        uint16_t alen = rd16h(b + off);
+        uint16_t atype = rd16h(b + off + 2) & D2K_NLA_TYPE_MASK;
+        if (alen < D2K_NLA_HDRLEN || alen > blen - off) { return -1; }
+        if (alen >= 8 && atype == RM_RTA_OIF) { add_oif(oifs, cap, n, rd32h(b + off + 4)); }
+        if (atype == RM_RTA_MULTIPATH) {
+            const uint8_t *mp = b + off + 4;
+            size_t mp_len = (size_t)alen - 4, h = 0;
+            while (h + RM_RTNH_LEN <= mp_len) {
+                uint16_t nl = rd16h(mp + h);
+                if (nl < RM_RTNH_LEN || nl > mp_len - h) { return -1; }
+                add_oif(oifs, cap, n, rd32h(mp + h + 4));
+                h += ((size_t)nl + 3u) & ~(size_t)3u;
+            }
+        }
+        off += ((size_t)alen + 3u) & ~(size_t)3u;
+    }
+    return 0;
+}
+
+int d2k_routemark_lookup_parse(uint32_t *oifs, size_t cap, size_t *n,
                                const uint8_t *buf, size_t len, int32_t *kerr) {
     if (kerr) { *kerr = 0; }
     if (!oifs || !n || !buf) { return -1; }
@@ -124,42 +161,41 @@ int d2k_routemark_routes_parse(uint32_t *oifs, size_t cap, size_t *n,
     size_t consumed = 0;
     while (d2k_nl_next(&it, &m)) {
         consumed = (size_t)(m.body - buf) + m.body_len;
-        if (m.type == D2K_NLMSG_DONE) { return 1; }
         if (m.type == D2K_NLMSG_ERROR) {
             if (kerr) { *kerr = nl_error(&m); }
             return -1;
         }
         if (m.type != RM_RTM_NEWROUTE || m.body_len < RM_RTMSG) { continue; }
-        const uint8_t *b = m.body;
-        uint32_t table = b[4];
-        uint32_t oif = 0;
-        const uint8_t *mp = NULL;
-        size_t mp_len = 0;
-        size_t off = RM_RTMSG;
-        while (off + D2K_NLA_HDRLEN <= m.body_len) {
-            uint16_t alen = rd16h(b + off);
-            uint16_t atype = rd16h(b + off + 2) & D2K_NLA_TYPE_MASK;
-            if (alen < D2K_NLA_HDRLEN || alen > m.body_len - off) { return -1; }
-            if (alen >= 8 && atype == RM_RTA_TABLE) { table = rd32h(b + off + 4); }
-            if (alen >= 8 && atype == RM_RTA_OIF) { oif = rd32h(b + off + 4); }
-            if (atype == RM_RTA_MULTIPATH) { mp = b + off + 4; mp_len = (size_t)alen - 4; }
-            off += ((size_t)alen + 3u) & ~(size_t)3u;
-        }
-        /* dst/0 and src/0, unicast, the main table, not a cached clone. */
-        if (b[1] != 0 || b[2] != 0 || b[7] != RM_RTN_UNICAST || table != RM_RT_TABLE_MAIN ||
-            (rd32h(b + 8) & RM_RTM_F_CLONED)) {
-            continue;
-        }
-        add_oif(oifs, cap, n, oif);
-        size_t h = 0;
-        while (mp && h + RM_RTNH_LEN <= mp_len) {
-            uint16_t nl = rd16h(mp + h);
-            if (nl < RM_RTNH_LEN || nl > mp_len - h) { return -1; }
-            add_oif(oifs, cap, n, rd32h(mp + h + 4));
-            h += ((size_t)nl + 3u) & ~(size_t)3u;
-        }
+        if (m.body[7] != RM_RTN_UNICAST) { return 2; }   /* unreachable, prohibit... */
+        return route_oifs(m.body, m.body_len, oifs, cap, n) == 0 ? 1 : -1;
     }
     return (len - consumed) < 4 ? 0 : -1;
+}
+
+int d2k_routemark_watch_relevant(const uint8_t *buf, size_t len) {
+    if (!buf) { return 0; }
+    d2k_nl_iter it;
+    d2k_nl_msg m;
+    d2k_nl_iter_init(&it, buf, len);
+    size_t consumed = 0;
+    while (d2k_nl_next(&it, &m)) {
+        consumed = (size_t)(m.body - buf) + m.body_len;
+        if (m.type == RM_RTM_NEWRULE || m.type == RM_RTM_DELRULE) { return 1; }
+        if ((m.type == RM_RTM_NEWROUTE || m.type == RM_RTM_DELROUTE) &&
+            (m.body_len < RM_RTMSG || m.body[1] == 0)) {
+            return 1;   /* a default route (or unreadable: refresh to be safe) */
+        }
+    }
+    return (len - consumed) < 4 ? 0 : 1;
+}
+
+int d2k_routemark_clear_oifs(d2k_routemark *r, uint8_t family) {
+    if (!r || (family != 2 && family != 10)) { return 0; }
+    uint8_t *read = family == 10 ? &r->oifs_read6 : &r->oifs_read4;
+    int changed = *read;
+    *read = 0;
+    if (family == 10) { r->n_oif6 = 0; } else { r->n_oif4 = 0; }
+    return changed;
 }
 
 int d2k_routemark_set_oifs(d2k_routemark *r, uint8_t family, const uint32_t *oifs,
