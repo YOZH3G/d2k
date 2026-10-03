@@ -2829,6 +2829,76 @@ int main(int argc, char **argv) {
 
     tcp_answer = D2K_V_OPAQUE;
 
+    /* ЗАДАЧА 54. Поле 04.10, cdn.cookielaw.org: адрес 104.18.86.42 после
+       рукопожатия не принимает никаких данных, замер это теперь доказывает
+       (вердикт address). Это не «результат неубедителен» с десятиминутным
+       кругом: обходить содержимым нечего, повторная проверка адреса — по
+       нарастающей отсрочке (10/30/60 мин), и только ЭТОГО адреса: другой
+       адрес того же имени (104.18.87.42 у владельца работает) мерится сразу. */
+    {
+        d2k_catalog c_addr = {0};
+        d2k_sched *s = d2k_sched_new(&c_addr, sv[0], 0x2d);
+        CHECK(s != NULL, "task54: планировщик не завёлся");
+        if (s) {
+            const char *name = "dead.address.example";
+            tcp_calls = quic_calls = 0;
+            tcp_answer = D2K_V_ADDRESS;
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            d2k_ev h1 = ev_hello(6, 41301, name);
+            d2k_sched_event(s, &h1);
+            d2k_ev r1 = ev_suspect(6, 41301);
+            CHECK(d2k_sched_event(s, &r1) == 1, "task54: подозрение не запустило замер");
+            settle(s);
+            CHECK(tcp_calls == 1 && strcmp(tcp_last_ip, "127.0.0.1") == 0,
+                  "task54: замер адреса не прошёл");
+            CHECK(!said("результат неубедителен"),
+                  "task54: доказанный блок адреса назван неубедительным");
+            CHECK(said("по dead.address.example адрес 127.0.0.1 не принимает данных"),
+                  "task54: блок адреса не назван в журнале");
+            CHECK(bindings_of(&c_addr, name, 6) == 0 && c_addr.n_boxes == 0,
+                  "task54: блок адреса записал обход");
+
+            /* Через 11 минут прежний 10-минутный круг запускал бы тот же
+               замер снова; теперь первая отсрочка — 10 мин, вторая — 30. */
+            skip_ahead(s, 11 * 60 * 1000);
+            d2k_ev h2 = ev_hello(6, 41302, name);
+            d2k_sched_event(s, &h2);
+            d2k_ev r2 = ev_suspect(6, 41302);
+            d2k_sched_event(s, &r2);
+            settle(s);
+            CHECK(tcp_calls == 2, "task54: по истечении первой отсрочки адрес не перепроверен");
+            skip_ahead(s, 11 * 60 * 1000);
+            saidbuf[0] = '\0';
+            d2k_ev h3 = ev_hello(6, 41303, name);
+            d2k_sched_event(s, &h3);
+            d2k_ev r3 = ev_suspect(6, 41303);
+            r3.code = D2K_SUSPECT_RST; /* другой симптом того же мёртвого адреса */
+            CHECK(d2k_sched_event(s, &r3) == 0,
+                  "task54: повторный блок адреса не удлинил отсрочку");
+            settle(s);
+            CHECK(tcp_calls == 2, "task54: мёртвый адрес перемерен до конца второй отсрочки");
+            CHECK(said("замер отложен после блока адреса 127.0.0.1"),
+                  "task54: причина отсрочки не названа");
+
+            /* Другой адрес того же имени — другое наблюдение: мерится сразу. */
+            d2k_ev h4 = ev_hello(6, 41304, name);
+            h4.low_ip[3] = 2;
+            d2k_sched_event(s, &h4);
+            d2k_ev r4 = ev_suspect(6, 41304);
+            r4.low_ip[3] = 2;
+            tcp_answer = D2K_V_INCONCLUSIVE;
+            CHECK(d2k_sched_event(s, &r4) == 1,
+                  "task54: отсрочка мёртвого адреса заглушила другой адрес имени");
+            settle(s);
+            CHECK(tcp_calls == 3 && strcmp(tcp_last_ip, "127.0.0.2") == 0,
+                  "task54: другой адрес имени не измерен");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c_addr);
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
     /* Обычный входящий RST запускает ТОЛЬКО прямую классификацию. Пока она
        не докажет блокировку, ни готовые планы, ни синтез не запускаются.
        Неопределённый результат охлаждает цель, чтобы повторные RST не
