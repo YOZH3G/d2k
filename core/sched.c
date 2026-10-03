@@ -4796,13 +4796,19 @@ static int start_search(d2k_sched *s, task *t) {
         /* ECH baseline owns its application result. A late-reset trigger
          * must not feed it into the ordinary identity/gzip RX gate. */
         t->rx_volume_only = 0;
-        /* Preserve the explicit successful witness across restarts. */
+        /* Preserve the explicit successful witness across restarts. The
+         * witness is an origin name carrying this ECH config, not an address:
+         * one proven over IPv6 serves IPv4 too (поле 04.10, rutracker в
+         * Chrome по IPv4 при свидетеле, подтверждённом по IPv6). Its HTTPS RR
+         * is re-checked by the worker; the same family's witness wins. */
+        for (int pass = 0; pass < 2 && !t->ech_origin[0]; pass++)
         for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
             const d2k_cat_box *b = &s->cat->boxes[bi];
             for (size_t j = 0; j < b->n_binds; j++) {
                 const d2k_cat_binding *bd = &b->binds[j];
                 if (bd->enabled && bd->level >= 3 && bd->transport == 6 &&
-                    bd->family == t->family && !strcmp(bd->target, t->name) && bd->ech_origin[0])
+                    (pass || bd->family == t->family) &&
+                    !strcmp(bd->target, t->name) && bd->ech_origin[0])
                     snprintf(t->ech_origin, sizeof t->ech_origin, "%s", bd->ech_origin);
             }
         }

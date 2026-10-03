@@ -2435,6 +2435,45 @@ int main(int argc, char **argv) {
         tcp_answer = D2K_V_OPAQUE;
     }
 
+    /* ПОЛЕ 04.10.2026, rutracker в Chrome: ECH-привязка внешнего имени
+     * cloudflare-ech.com со свидетелем static.rutracker.cc подтверждена по
+     * IPv6, а Chrome пошёл тем же ECH по IPv4 — «своего свидетеля нет — не
+     * проверено», и сайт не открывался. Свидетель — имя origin с этой
+     * ECH-конфигурацией; к IP-семье он не привязан (HTTPS RR перепроверяется
+     * при каждом поиске), семья — только у самой привязки. */
+    {
+        const char *nm = "ech-public.example";
+        d2k_catalog c = {0};
+        char pid[40];
+        own_box(&c, "box-ech-v6", pid, 2, 2, nm, 6, D2K_LINK_SHAPE_ECH_TCP, 6, 1790000000, 0);
+        if (c.n_boxes && c.boxes[0].n_binds)
+            snprintf(c.boxes[0].binds[0].ech_origin, sizeof c.boxes[0].binds[0].ech_origin,
+                     "%s", "origin.ech.example");
+        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        tcp_answer = D2K_V_CLEAR; tcp_calls = 0;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        uint8_t eb[2048]; size_t el = 0;
+        CHECK(ech_offer_hello(nm, eb, sizeof eb, &el) == 0 &&
+              d2k_hello_ech_offer(eb, el, NULL) == 1, "ECH cross-family: fixture");
+        d2k_ev h = ev_hello(6, 41180, nm); d2k_sched_event(s, &h);   /* IPv4 */
+        d2k_ev sh; memset(&sh, 0, sizeof sh);
+        sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        memcpy(sh.shape, eb, el); sh.shape_len = el;
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 41180); d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(said("собственный witness: origin.ech.example"),
+              "ECH cross-family: свидетель ECH-привязки IPv6 не подхвачен для IPv4");
+        CHECK(!said("своего свидетеля нет") && !said("своего ECH-свидетеля нет"),
+              "ECH cross-family: IPv4 объявлен «не проверено» при известном свидетеле");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
     /* ПОЛЕ 03.10.2026, Discord: QUIC-поиск discord.com кончился «кандидатов
      * нет» (отдых 10 мин — для QUIC), приложение ушло на TCP с GREASE ECH.
      * TCP-поиск того же имени шёл до конца (18:50:33 → 18:52:14, план
