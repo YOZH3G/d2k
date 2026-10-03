@@ -2645,7 +2645,11 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                             .path=arm_path[0]?arm_path:NULL,
                             .no_split=arm_split_unfit,
                             .need_complete=1};
-                        if (budget_left(&start)) {
+                        if (data_cut == 2) {
+                            /* Перепроверка перед снятием запрета QUIC: нужен
+                               только ответ «встаёт ли ещё»; плечи — не здесь. */
+                            arm->data_cut = 2;
+                        } else if (budget_left(&start)) {
                             char why[sizeof r.reason];
                             snprintf(why, sizeof why, "%s", r.reason);
                             *arm = d2k_quic_strategy_measure(&context, port, trigger, control,

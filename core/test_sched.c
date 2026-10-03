@@ -3218,10 +3218,80 @@ int main(int argc, char **argv) {
             CHECK(said("QUIC для имени не пропускаю"), "снятие QUIC не названо в журнале");
             CHECK(bindings_of(&cq, "quic-deny.test", 17) == 0,
                   "снятие QUIC записано в каталог как обход");
+            /* Раунд 3: по сроку — сначала своя перепроверка (только прямые
+               запросы, без плеч). Обрыв воспроизводится — снятие продлено, не
+               снято. */
+            quic_last_data_cut = -1;
+            skip_ahead(s, 11 * 60 * 1000);
+            for (int i = 0; i < 40 && sent_quic_deny("quic-deny.test") < 2; i++) settle(s);
+            CHECK(quic_calls == 2 && quic_last_data_cut == 2,
+                  "перед снятием запрета QUIC нет своей перепроверки только прямым запросом");
+            CHECK(sent_quic_deny("quic-deny.test") == 2 &&
+                  sent_del_name_key("quic-deny.test", 17, D2K_LINK_SHAPE_QUIC, 4) == 0,
+                  "обрыв воспроизведён перепроверкой, а запрет QUIC снят или не продлён");
+            /* Второй срок длиннее (30 мин). Ответ своим запросом пришёл — снять. */
+            quic_answer = D2K_V_CLEAR;
             skip_ahead(s, 11 * 60 * 1000);
             settle(s);
-            CHECK(sent_del_name_key("quic-deny.test", 17, D2K_LINK_SHAPE_QUIC, 4) >= 1,
-                  "снятие QUIC не снято по сроку");
+            CHECK(quic_calls == 2, "продлённый запрет перепроверен раньше своего срока");
+            skip_ahead(s, 20 * 60 * 1000);
+            for (int i = 0; i < 40 &&
+                 !sent_del_name_key("quic-deny.test", 17, D2K_LINK_SHAPE_QUIC, 4); i++) settle(s);
+            CHECK(quic_calls == 3 &&
+                  sent_del_name_key("quic-deny.test", 17, D2K_LINK_SHAPE_QUIC, 4) >= 1,
+                  "ответ своим запросом пришёл целиком, а запрет QUIC не снят");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cq);
+        quic_arm_none = 0;
+        quic_answer = D2K_V_OPAQUE;
+    }
+
+    /* Раунд 3, I2: у имени подтверждённая QUIC-привязка, а обрыв после
+       рукопожатия воспроизведён своим запросом и обхода нет — привязка под
+       этим обрывом не работает: помечается на повторную проверку (каталог
+       цел), запрет QUIC действует, проход каталога её обратно не ставит. */
+    {
+        d2k_catalog cq = {0};
+        char pq[40];
+        own_box(&cq, "box-quic-deny", pq, 31, 5, "quic-bound.test", 17,
+                D2K_LINK_SHAPE_QUIC, 4, 1790000000, 0);
+        d2k_sched *s = d2k_sched_new(&cq, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для привязки под обрывом не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            settle(s);
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            size_t set_before = sent_set_name_shape("quic-bound.test", D2K_LINK_SHAPE_QUIC);
+            CHECK(set_before >= 1, "фикстура: подтверждённая QUIC-привязка не встала");
+            forget_sent();
+            quic_calls = 0; quic_answer = D2K_V_OPAQUE; quic_arm_none = 1;
+            d2k_ev h = ev_hello(17, 41097, "quic-bound.test");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 41097);
+            su.code = D2K_SUSPECT_QUIC_STALL;
+            su.planned = D2K_LINK_PLANNED_YES;
+            d2k_sched_event(s, &su);
+            for (int i = 0; i < 40 && !sent_quic_deny("quic-bound.test"); i++) settle(s);
+            CHECK(sent_quic_deny("quic-bound.test") == 1, "обрыв под привязкой не снял QUIC");
+            CHECK(cq.n_boxes == 1 && cq.boxes[0].n_binds == 1 &&
+                  cq.boxes[0].binds[0].recheck_since != 0,
+                  "QUIC-привязка под воспроизведённым обрывом не помечена на перепроверку");
+            CHECK(said("помечена на повторную проверку"), "пометка привязки не названа в журнале");
+            /* Проходы каталога после этого привязку не возвращают. */
+            for (int i = 0; i < 10; i++) settle(s);
+            d2k_sched_sync(s); sync_out(s);
+            CHECK(sent_set_name_shape("quic-bound.test", D2K_LINK_SHAPE_QUIC) ==
+                  sent_quic_deny("quic-bound.test"),
+                  "проход каталога вернул QUIC-привязку поверх запрета QUIC");
+            /* И даже привязка без пометки (например, подтверждённая заново
+               где-то ещё) поверх действующего запрета не ставится. */
+            cq.boxes[0].binds[0].recheck_since = 0;
+            d2k_sched_sync(s); sync_out(s);
+            CHECK(sent_set_name_shape("quic-bound.test", D2K_LINK_SHAPE_QUIC) ==
+                  sent_quic_deny("quic-bound.test"),
+                  "проход каталога поставил QUIC-привязку при действующем запрете QUIC");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cq);
