@@ -118,6 +118,18 @@ fi
 [ ! -e "$TMP/run/fw-ipv4-only" ] || fail "partial IPv6 failure set IPv4-only"
 ok "a partial IPv6 failure still rolls back both families"
 
+# Прошивка без xt_addrtype (поле 03.10.2026, Keenetic mipsel 3.4_kn: «No
+# chain/target/match by that name», служба не запускалась): исключения
+# ставятся явными адресами, служба стартует и проверка правил её принимает.
+rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
+out=$(S99_SNIPPET='fw_up && fw_installed && echo INSTALLED' s99 STUB_FAIL_MATCH=addrtype STUB_FAIL_TOOL=iptables 2>&1) \
+    || { echo "$out" >&2; fail "fw_up refused to start without xt_addrtype"; }
+printf '%s\n' "$out" | grep -q INSTALLED || { echo "$out" >&2; fail "rules without xt_addrtype not accepted as installed"; }
+printf '%s\n' "$out" | grep -q "нет xt_addrtype" || fail "missing xt_addrtype not reported"
+rules iptables mangle | grep -qx -- "-A D2K_OUT -d 255.255.255.255 -j RETURN" || fail "explicit broadcast RETURN missing"
+! rules iptables mangle | grep -q addrtype || fail "addrtype rule present although unsupported"
+ok "without xt_addrtype the service starts with explicit broadcast exclusions"
+
 # --- Leftover d2k-rst: rules (filter OUTPUT, both families) ------------------
 rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
 sleep 300 & SLEEPER=$!

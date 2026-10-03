@@ -318,7 +318,9 @@ static void test_dial_survives_missing_rst_rule(void)
     CHECK(c.rule_up == 0);
     CHECK(outgoing_count == 2); /* SYN and the final ACK: probe went on */
     raw_close(&c);
-    CHECK(rule_count == 1); /* nothing installed, nothing to delete */
+    /* Отказ с комментарием → одна попытка без него (прошивка без xt_comment),
+       тоже отказ: ничего не встало, снимать нечего. */
+    CHECK(rule_count == 2); /* nothing installed, nothing to delete */
     /* Отказ считается, а не взводит флаг навсегда: прогон сравнивает счётчик
        со своим стартом, поэтому прошлый отказ не метит будущие прогоны. */
     CHECK(d2k_raw_rst_fail_count() == fails0 + 1); /* still reaches the verdict trace */
@@ -596,6 +598,39 @@ static void test_rule_command_is_bounded(void)
     g_rule_deadline_ms = saved;
 }
 
+/* Прошивка без xt_comment (поле 03.10.2026, Keenetic mipsel 3.4_kn: в lsmod нет
+ * xt_comment). Правило с комментарием отвергается — ставится старая форма без
+ * него, снимается той же формой, и дальше процесс сразу ставит её. */
+static int nocomment_hook(const char *cmd)
+{
+    if (rule_count < 4) { snprintf(rule_cmds[rule_count], sizeof rule_cmds[0], "%s", cmd); }
+    rule_count++;
+    return strstr(cmd, "--comment") ? 256 : 0;
+}
+
+static void test_rule_without_comment_module(void)
+{
+    static const uint8_t dst[4] = {198, 51, 100, 9};
+    raw_conn c;
+    char err[160] = "";
+    pthread_once(&g_sweep_once, sweep_noop);
+    d2k_raw_rule_hook = nocomment_hook;
+    unsigned long fails0 = d2k_raw_rst_fail_count();
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(c.rule_up == 1);
+    CHECK(rule_count == 2 && strstr(rule_cmds[0], "--comment") && !strstr(rule_cmds[1], "--comment") &&
+          strstr(rule_cmds[1], "-I OUTPUT"));
+    raw_close(&c);
+    CHECK(rule_count == 3 && strstr(rule_cmds[2], "-D OUTPUT") && !strstr(rule_cmds[2], "--comment"));
+    CHECK(d2k_raw_rst_fail_count() == fails0); /* the rule did go in */
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(c.rule_up == 1 && rule_count == 1 && !strstr(rule_cmds[0], "--comment"));
+    raw_close(&c);
+    d2k_raw_rule_hook = raw_rule_system;
+}
+
 int main(void)
 {
     {
@@ -641,6 +676,7 @@ int main(void)
     test_dial_survives_missing_rst_rule();
     test_failed_release_is_retried();
     test_rule_command_is_bounded();
+    test_rule_without_comment_module();
     test_rule_lifecycle_has_no_leaks();
     test_rst_failures_are_per_thread();
     test_clock_survives_long_uptime();

@@ -340,15 +340,25 @@ static size_t g_rst_pending_n;
 static int g_rst_abandon_said;
 static pthread_once_t g_atexit_once = PTHREAD_ONCE_INIT;
 
+/* xt_comment есть не во всех прошивках (поле 03.10.2026, Keenetic mipsel
+ * 3.4_kn: в lsmod нет xt_comment). Если правило с комментарием-владельцем
+ * отвергнуто, а старая форма встала — дальше процесс ставит и снимает старую:
+ * уборка старта узнаёт её по форме (владельца нет — снимается как чужая). */
+static int g_rst_comment = 1;
+
+static int rst_rule_cmd_form(const char *op, uint16_t sport, uint8_t family, int comment)
+{
+    char cmd[224], tag[64] = "";
+    if (comment) snprintf(tag, sizeof tag, " -m comment --comment %s%ld", RST_OWNED_TAG, (long)getpid());
+    snprintf(cmd, sizeof(cmd),
+             "%s -w %s OUTPUT -p tcp --sport %u --tcp-flags RST RST%s -j DROP >/dev/null 2>&1",
+             family == 6 ? "ip6tables" : "iptables", op, (unsigned)sport, tag);
+    return d2k_raw_rule_hook(cmd);
+}
+
 static int rst_rule_cmd(const char *op, uint16_t sport, uint8_t family)
 {
-    char cmd[224];
-    snprintf(cmd, sizeof(cmd),
-             "%s -w %s OUTPUT -p tcp --sport %u --tcp-flags RST RST"
-             " -m comment --comment %s%ld -j DROP >/dev/null 2>&1",
-             family == 6 ? "ip6tables" : "iptables", op, (unsigned)sport,
-             RST_OWNED_TAG, (long)getpid());
-    return d2k_raw_rule_hook(cmd);
+    return rst_rule_cmd_form(op, sport, family, g_rst_comment);
 }
 
 static int rc_exit1(int rc)
@@ -457,6 +467,13 @@ static int suppress_kernel_rst(uint16_t sport, uint8_t family)
     pthread_mutex_lock(&g_raw_state);
     retry_pending_releases(0);
     rc = rst_rule_cmd("-I", sport, family);
+    if (rc > 0 && g_rst_comment && WIFEXITED(rc) && WEXITSTATUS(rc) <= 2 &&
+        rst_rule_cmd_form("-I", sport, family, 0) == 0) {
+        g_rst_comment = 0;
+        fprintf(stderr, "d2k: в прошивке нет xt_comment — правила подавления RST "
+                        "ставлю без метки владельца\n");
+        rc = 0;
+    }
     if (rc != 0) {
         t_rst_rule_failures++;
         /* Вставку убили по сроку: с -w iptables мог дождаться замка и

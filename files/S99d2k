@@ -184,6 +184,30 @@ late_rst_from() {
     echo $((late_rst_upper + 1))
 }
 
+# xt_addrtype есть не во всех прошивках (поле 03.10.2026: Keenetic mipsel
+# 3.4_kn — «iptables: No chain/target/match by that name», служба не
+# запускалась). Где модуля нет, те же исключения ставятся явными адресами.
+# $1 — утилита, $2 — таблица, $3 — цепочка; печатает, каким способом встало.
+fw_return_broadcast() {
+    if "$1" -t "$2" -A "$3" -m addrtype --dst-type BROADCAST -j RETURN 2>/dev/null; then
+        return 0
+    fi
+    say "в прошивке нет xt_addrtype: широковещательные адреса исключаю явным списком"
+    "$1" -t "$2" -A "$3" -d 255.255.255.255 -j RETURN || return 1
+    for b in $(ip -4 addr show 2>/dev/null | awk '$1 == "inet" { for (i = 1; i < NF; i++) if ($i == "brd") print $(i + 1) }' | sort -u); do
+        "$1" -t "$2" -A "$3" -d "$b" -j RETURN || return 1
+    done
+}
+fw_return_local() {
+    if "$1" -t "$2" -A "$3" -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null; then
+        return 0
+    fi
+    say "в прошивке нет xt_addrtype: собственные адреса роутера исключаю явным списком"
+    for a in $(ip -4 addr show 2>/dev/null | awk '$1 == "inet" { sub(/\/.*/, "", $2); print $2 }' | sort -u); do
+        "$1" -t "$2" -A "$3" -d "$a" -j RETURN || return 1
+    done
+}
+
 fw_family_up() (
     fw_tool=$1
     loopback=127.0.0.0/8
@@ -215,8 +239,7 @@ fw_family_up() (
     # and the like). The router's own unicast UDP stays queued: the Telegram
     # tunnel and controller probes may need d2k. Before every NFQUEUE jump.
     if [ "$fw_tool" = iptables ]; then
-        "$fw_tool" -t mangle -A "$CHAIN_OUT" -m addrtype --dst-type BROADCAST \
-            -j RETURN || return 1
+        fw_return_broadcast "$fw_tool" mangle "$CHAIN_OUT" || return 1
         "$fw_tool" -t mangle -A "$CHAIN_OUT" -d 224.0.0.0/4 -j RETURN || return 1
     else
         "$fw_tool" -t mangle -A "$CHAIN_OUT" -d ff00::/8 -j RETURN || return 1
@@ -359,7 +382,7 @@ fw_family_up() (
     if [ "$fw_tool" = iptables ] && httpup_enabled; then
         [ -x "$HTTPUPBIN" ] && running "$HU_PID" || return 1
         "$fw_tool" -t nat -N D2K_HTTP 2>/dev/null || return 1
-        "$fw_tool" -t nat -A D2K_HTTP -m addrtype --dst-type LOCAL -j RETURN || return 1
+        fw_return_local "$fw_tool" nat D2K_HTTP || return 1
         # Skip directly-connected router/LAN subnets, but do not blanket-skip
         # RFC1918: some ISPs return a private sinkhole address for blocked DNS
         # names, and HTTP to that address must still reach this portal detector.
@@ -568,8 +591,9 @@ fw_family_installed() (
         "$fw_tool" -t mangle -C "$chain" -d $loopback -j RETURN 2>/dev/null || return 1
     done
     if [ "$fw_tool" = iptables ]; then
-        "$fw_tool" -t mangle -C "$CHAIN_OUT" -m addrtype --dst-type BROADCAST \
-            -j RETURN 2>/dev/null || return 1
+        { "$fw_tool" -t mangle -C "$CHAIN_OUT" -m addrtype --dst-type BROADCAST \
+              -j RETURN 2>/dev/null ||
+          "$fw_tool" -t mangle -C "$CHAIN_OUT" -d 255.255.255.255 -j RETURN 2>/dev/null; } || return 1
         "$fw_tool" -t mangle -C "$CHAIN_OUT" -d 224.0.0.0/4 -j RETURN 2>/dev/null || return 1
     else
         "$fw_tool" -t mangle -C "$CHAIN_OUT" -d ff00::/8 -j RETURN 2>/dev/null || return 1
