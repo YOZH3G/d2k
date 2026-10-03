@@ -41,7 +41,7 @@ cat > "$TMP/bin/ndmc" <<'EOF'
 #!/bin/sh
 case "$*" in
     *"show running-config"*) [ "${NDMC_FAIL_SHOW:-0}" = 1 ] && exit 7; [ "${NDMC_EMPTY_SHOW:-0}" = 1 ] && exit 0; cat "$NDMC_STATE" ;;
-    *"system configuration save"*) [ "${NDMC_FAIL_SAVE:-0}" = 1 ] && exit 8; : ;;
+    *"system configuration save"*) [ "${NDMC_FAIL_SAVE:-0}" = 1 ] && exit 8; printf '%s\n' "$*" >> "$NDMC_CALLS" ;;
     "-c ip host "*)
         if [ "${NDMC_TERM_DURING_ADD:-0}" = 1 ]; then
             printf '%s\n' "$*" >> "$NDMC_CALLS"
@@ -375,5 +375,77 @@ env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$JUNK/d2k" D2K_META_RANGES="$JUNK/d2k/file
     D2K_INSTAGRAM_LOG="$JUNK/refresh.log" sh "$SCRIPT" refresh || { cat "$JUNK/refresh.log" >&2; fail "refresh with junk answers failed"; }
 grep -q '^ip host instagram.com 157.240.9.174$' "$JUNK/ndmc-state" || fail "non-Meta answers pushed out the real Meta address"
 ok "non-Meta answers do not use up the probe tries"
+
+# A refresh that changes nothing does not write the router's flash: NDM's
+# configuration is saved only after an add or a removal; the success mark
+# carries the date and the time of the success.
+SAVE="$TMP/save"
+mkdir -p "$SAVE/d2k/state" "$SAVE/d2k/files" "$SAVE/d2k/log"
+cp "$TMP/d2k/files/meta-ranges.txt" "$SAVE/d2k/files/"
+printf 'system name test-router\n' > "$SAVE/ndmc-state"
+save_refresh() {
+    env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$SAVE/d2k" D2K_META_RANGES="$SAVE/d2k/files/meta-ranges.txt" \
+        D2K_RELAY_URL=https://resolve.example/resolve D2K_IP_PROBE_ATTEMPTS=1 \
+        RESOLVE_BODY='{"results":{"instagram.com":["157.240.9.174"],"web.whatsapp.com":["57.144.245.32"]}}' \
+        NDMC_STATE="$SAVE/ndmc-state" NDMC_CALLS="$SAVE/ndmc-calls" CURL_CALLS="$SAVE/curl-calls" \
+        D2K_INSTAGRAM_LOG="$SAVE/refresh.log" sh "$SCRIPT" refresh
+}
+save_refresh || { cat "$SAVE/refresh.log" >&2; fail "first refresh failed"; }
+[ "$(grep -c 'system configuration save' "$SAVE/ndmc-calls")" = 1 ] || fail "a changing refresh did not save NDM exactly once"
+[ "$(sed -n 2p "$SAVE/d2k/state/instagram-dns-last-success")" -gt 1700000000 ] 2>/dev/null || fail "success mark lacks the success time"
+: > "$SAVE/ndmc-calls"
+save_refresh || fail "unchanged refresh failed"
+! grep -q 'system configuration save' "$SAVE/ndmc-calls" || fail "a refresh without changes saved NDM configuration (flash write)"
+ok "NDM configuration is saved only when a pin changed"
+
+# Each family is pinned on its own: an unverifiable instagram.com keeps the
+# Instagram family as it was, but WhatsApp and fbcdn are still refreshed.
+FAMS="$TMP/families"
+mkdir -p "$FAMS/d2k/state" "$FAMS/d2k/files" "$FAMS/d2k/log"
+cp "$TMP/d2k/files/meta-ranges.txt" "$FAMS/d2k/files/"
+printf 'ip host i.instagram.com 157.240.9.60\n' > "$FAMS/ndmc-state"
+printf 'i.instagram.com 157.240.9.60\n' > "$FAMS/d2k/state/instagram-ip-hosts.tsv"
+env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$FAMS/d2k" D2K_META_RANGES="$FAMS/d2k/files/meta-ranges.txt" \
+    D2K_RELAY_URL=https://resolve.example/resolve D2K_IP_PROBE_ATTEMPTS=1 \
+    RESOLVE_BODY='{"results":{"instagram.com":["157.240.9.174"],"i.instagram.com":["157.240.9.63"],"web.whatsapp.com":["57.144.245.32"],"static.xx.fbcdn.net":["157.240.205.11"]}}' \
+    PROBE_DEAD='instagram.com:157.240.9.174 instagram.com:157.240.9.60 instagram.com:157.240.9.63' \
+    NDMC_STATE="$FAMS/ndmc-state" NDMC_CALLS="$FAMS/ndmc-calls" CURL_CALLS="$FAMS/curl-calls" \
+    D2K_INSTAGRAM_LOG="$FAMS/refresh.log" sh "$SCRIPT" refresh || { cat "$FAMS/refresh.log" >&2; fail "refresh without instagram.com failed although WhatsApp/fbcdn verified"; }
+grep -q '^ip host web.whatsapp.com 57.144.245.32$' "$FAMS/ndmc-state" || fail "WhatsApp pin depended on instagram.com"
+grep -q '^ip host static.xx.fbcdn.net 157.240.205.11$' "$FAMS/ndmc-state" || fail "fbcdn pin depended on instagram.com"
+! grep -q '^ip host i.instagram.com 157.240.9.63$' "$FAMS/ndmc-state" || fail "Instagram family pinned without a verified instagram.com"
+grep -q '^ip host i.instagram.com 157.240.9.60$' "$FAMS/ndmc-state" || fail "Instagram family pins changed without a verified instagram.com"
+grep -q 'семейство instagram' "$FAMS/refresh.log" || fail "skipped Instagram family is not logged"
+ok "WhatsApp and fbcdn are pinned independently of instagram.com"
+
+# I3: owned pins heal without the VPS. Each owned pin is re-checked locally;
+# a dead one is removed (normal DNS takes over) even when /resolve fails.
+HEAL="$TMP/heal"
+mkdir -p "$HEAL/d2k/state" "$HEAL/d2k/files" "$HEAL/d2k/log"
+cp "$TMP/d2k/files/meta-ranges.txt" "$HEAL/d2k/files/"
+printf 'ip host instagram.com 157.240.9.174\nip host web.whatsapp.com 57.144.245.32\nip host graph.instagram.com 157.240.9.50\n' > "$HEAL/ndmc-state"
+printf 'instagram.com 157.240.9.174\nweb.whatsapp.com 57.144.245.32\n' > "$HEAL/d2k/state/instagram-ip-hosts.tsv"
+heal_refresh() {
+    env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$HEAL/d2k" D2K_META_RANGES="$HEAL/d2k/files/meta-ranges.txt" \
+        D2K_RELAY_URL=https://resolve.example/resolve D2K_IP_PROBE_ATTEMPTS=1 D2K_RESOLVE_RETRY_DELAY=0 \
+        RESOLVE_FAIL=1 NDMC_STATE="$HEAL/ndmc-state" NDMC_CALLS="$HEAL/ndmc-calls" CURL_CALLS="$HEAL/curl-calls" \
+        D2K_INSTAGRAM_LOG="$HEAL/refresh.log" "$@" sh "$SCRIPT" refresh
+}
+# Every owned pin dead and no VPS: most likely the router's own uplink, so
+# nothing is removed.
+if heal_refresh PROBE_FAIL_ALL=1; then fail "refresh without the VPS reported success"; fi
+grep -q '^ip host instagram.com 157.240.9.174$' "$HEAL/ndmc-state" || fail "all-dead check without the VPS removed pins (uplink outage)"
+grep -q '^ip host web.whatsapp.com 57.144.245.32$' "$HEAL/ndmc-state" || fail "all-dead check without the VPS removed pins (uplink outage)"
+# One pin dead, another alive: the dead one goes, the live one stays, a
+# user's own record is never touched.
+if heal_refresh PROBE_DEAD=157.240.9.174; then fail "refresh without the VPS reported success"; fi
+grep -q -- '--check-instagram-ip instagram.com 157.240.9.174' "$HEAL/curl-calls" || fail "owned pin was not re-checked locally"
+! grep -q '^ip host instagram.com 157.240.9.174$' "$HEAL/ndmc-state" || { cat "$HEAL/refresh.log" >&2; fail "dead owned pin survived without the VPS"; }
+grep -q '^ip host web.whatsapp.com 57.144.245.32$' "$HEAL/ndmc-state" || fail "live owned pin was removed"
+grep -q '^ip host graph.instagram.com 157.240.9.50$' "$HEAL/ndmc-state" || fail "a user-owned record was touched"
+! grep -q '^instagram.com 157.240.9.174$' "$HEAL/d2k/state/instagram-ip-hosts.tsv" || fail "dead pin still owned in the manifest"
+grep -q '^web.whatsapp.com 57.144.245.32$' "$HEAL/d2k/state/instagram-ip-hosts.tsv" || fail "live pin lost from the manifest"
+grep -q 'system configuration save' "$HEAL/ndmc-calls" || fail "removal of a dead pin was not saved"
+ok "dead owned pins are removed locally without the VPS; an all-dead outage keeps them"
 
 echo "Instagram DNS lifecycle: all checks passed"

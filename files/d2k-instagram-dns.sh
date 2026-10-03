@@ -21,7 +21,9 @@ log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$LOG"; }
 mark_refresh_success() {
     state=${D2K_INSTAGRAM_SCHED_STATE:-$DIR/state/instagram-dns-last-success}
     tmp="$state.new.$$"
-    if printf '%s\n' "$(date +%Y-%m-%d)" > "$tmp" && mv -f "$tmp" "$state"; then
+    # Date for the scheduler, time for the installer (an upgrade keeps a mark
+    # younger than a day instead of refreshing the whole fleet at once).
+    if printf '%s\n%s\n' "$(date +%Y-%m-%d)" "$(date +%s)" > "$tmp" && mv -f "$tmp" "$state"; then
         :
     else
         rm -f "$tmp"
@@ -57,7 +59,7 @@ edge_verified() {
     probe_attempt=1
     probe_attempts=${D2K_IP_PROBE_ATTEMPTS:-2}
     while [ "$probe_attempt" -le "$probe_attempts" ]; do
-        d2ktg --check-instagram-ip "$1" "$2" "$ca_bundle" >>"$LOG" 2>&1 && return 0
+        d2ktg --check-instagram-ip "$1" "$2" "$ca_bundle" </dev/null >>"$LOG" 2>&1 && return 0
         if [ "$probe_attempt" -lt "$probe_attempts" ]; then
             log "повтор TLS-пробы $probe_attempt/$probe_attempts: $1 $2"
             sleep "${D2K_IP_PROBE_RETRY_DELAY:-1}"
@@ -71,10 +73,80 @@ running_config() {
     [ -n "$_cfg" ] || return 1
     printf '%s\n' "$_cfg"
 }
+# One configuration dump per refresh, read again only after a change of ours.
+ndm_cfg=
+ndm_cfg_ok=0
+ndm_changed=0
+ndm_config() {
+    [ "$ndm_cfg_ok" = 1 ] && return 0
+    ndm_cfg=$(running_config) || return 1
+    ndm_cfg_ok=1
+}
+ndm_touched() { ndm_cfg_ok=0; ndm_changed=1; }
+# Saving writes the router's flash: only after an add or a removal.
+ndm_save_if_changed() {
+    [ "$ndm_changed" = 1 ] || return 0
+    LD_LIBRARY_PATH='' ndmc -c 'system configuration save' >/dev/null 2>&1
+}
 record_exists() {
-    current=$(running_config) || return 2
-    printf '%s\n' "$current" | awk -v h="$1" -v ip="$2" \
+    ndm_config || return 2
+    printf '%s\n' "$ndm_cfg" | awk -v h="$1" -v ip="$2" \
         '$1=="ip"&&$2=="host"&&$3==h&&$4==ip {f=1} END{exit !f}'
+}
+# I3: every owned pin present in NDM is re-checked from the router itself,
+# independently of the VPS. Sets dead_pins ("host ip" lines) and alive_pins.
+dead_pins=
+alive_pins=0
+recheck_owned() {
+    [ -s "$MANIFEST" ] || return 0
+    while read -r host ip _extra; do
+        [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+        if ! managed_host "$host" || ! valid_ipv4 "$ip"; then continue; fi
+        if record_exists "$host" "$ip"; then :; else
+            [ "$?" = 1 ] && continue
+            log 'не удалось прочитать NDM для проверки своих записей'; return 1
+        fi
+        if edge_verified "$host" "$ip"; then
+            alive_pins=$((alive_pins + 1))
+        else
+            dead_pins="${dead_pins}${host} ${ip}
+"
+            log "своя запись не прошла локальную TLS-проверку: $host $ip"
+        fi
+    done < "$MANIFEST"
+}
+is_dead_pin() {
+    case "
+$dead_pins" in *"
+$1 $2
+"*) return 0;; esac
+    return 1
+}
+# Removes the dead owned pins (only those) from NDM and from the manifest.
+# The caller decides whether the checks can be trusted.
+drop_dead_pins() {
+    [ -n "$dead_pins" ] || return 0
+    while read -r host ip; do
+        [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+        if record_exists "$host" "$ip"; then
+            LD_LIBRARY_PATH='' ndmc -c "no ip host $host $ip" >/dev/null 2>&1 || { log "ошибка удаления недоступной записи $host $ip"; return 1; }
+            ndm_touched
+            log "удалена недоступная D2K-запись $host $ip; имя снова решается обычным DNS"
+        else
+            [ "$?" = 1 ] || { log "не удалось проверить NDM перед удалением $host $ip"; return 1; }
+        fi
+    done <<EOF_DEAD
+$dead_pins
+EOF_DEAD
+    kept="$MANIFEST.alive.$$"
+    : > "$kept"
+    while read -r host ip _extra; do
+        [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+        is_dead_pin "$host" "$ip" && continue
+        printf '%s %s\n' "$host" "$ip" >> "$kept"
+    done < "$MANIFEST"
+    mv -f "$kept" "$MANIFEST"
+    dead_pins=
 }
 remove_owned() {
     [ -s "$MANIFEST" ] || { rm -f "$MANIFEST"; log 'нет D2K-owned DNS-записей Instagram/WhatsApp'; return 0; }
@@ -87,13 +159,14 @@ remove_owned() {
         fi
         if record_exists "$host" "$ip"; then
             LD_LIBRARY_PATH='' ndmc -c "no ip host $host $ip" >/dev/null 2>&1 || { log "ошибка удаления $host $ip"; return 1; }
+            ndm_touched
             log "удалена D2K-запись $host $ip"
         else
             rc=$?
             [ "$rc" = 1 ] || { log "не удалось проверить NDM перед удалением $host $ip"; return 1; }
         fi
     done < "$MANIFEST"
-    if ! LD_LIBRARY_PATH='' ndmc -c 'system configuration save' >/dev/null 2>&1; then
+    if ! ndm_save_if_changed; then
         log 'не удалось сохранить конфигурацию NDM; manifest оставлен для повтора'
         return 1
     fi
@@ -106,6 +179,9 @@ refresh() {
     ca_bundle=${D2K_IP_CA_BUNDLE:-/opt/etc/ssl/certs/ca-certificates.crt}
     [ -r "$ca_bundle" ] || ca_bundle=/etc/ssl/certs/ca-certificates.crt
     [ -r "$ca_bundle" ] || { log 'нет системных доверенных CA; установите ca-bundle'; return 1; }
+    # Owned pins are checked first, from here: if the VPS is gone, a pin to a
+    # retired edge must still go away.
+    recheck_owned || return 1
     # No credential: the VPS answers public DNS data for this fixed list only.
     RELAY_AUTHORITY=${RELAY_URL#*://}; RELAY_AUTHORITY=${RELAY_AUTHORITY%%/*}
     RELAY_HOST=${RELAY_AUTHORITY%%:*}
@@ -135,7 +211,18 @@ refresh() {
         attempt=$((attempt + 1))
         [ "$attempt" -le "$attempts" ] && sleep "${D2K_RESOLVE_RETRY_DELAY:-3}"
     done
-    [ -n "$response" ] || { log 'VPS /resolve не ответил после повторов; текущие DNS-записи не изменены'; return 1; }
+    if [ -z "$response" ]; then
+        if [ -n "$dead_pins" ] && [ "$alive_pins" -gt 0 ]; then
+            drop_dead_pins || return 1
+            ndm_save_if_changed || log 'не удалось сохранить конфигурацию NDM'
+            log 'VPS /resolve не ответил после повторов; недоступные свои записи сняты, остальные не изменены'
+        elif [ -n "$dead_pins" ]; then
+            log 'VPS /resolve не ответил, и ни одна своя запись не прошла проверку — похоже, нет связи у самого роутера; DNS-записи не изменены'
+        else
+            log 'VPS /resolve не ответил после повторов; текущие DNS-записи не изменены'
+        fi
+        return 1
+    fi
     log "VPS /resolve ответил (попытка $attempt/$attempts)"
     printf '%s' "$response" | grep -q '"results"' || { log 'ответ VPS не содержит results'; return 1; }
     parsed=$(printf '%s' "$response" | sed -e 's/.*"results":{//' -e 's/}}$//' -e 's/\],/\n/g' -e 's/\]$//' | awk '{n1=index($0,"\"");if(!n1)next;r=substr($0,n1+1);n2=index(r,"\"");if(!n2)next;h=substr(r,1,n2-1);ips=substr(r,n2+1);gsub(/[^0-9.,]/,"",ips);n=split(ips,a,",");for(i=1;i<=n;i++)if(a[i]~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)print h" "a[i]}')
@@ -173,6 +260,7 @@ refresh() {
                 [ -n "${sibling:-}" ] && [ -n "${ip:-}" ] || continue
                 [ "$sibling" != "$host" ] || continue
                 if ! managed_host "$sibling" || ! valid_ipv4 "$ip"; then continue; fi
+                is_dead_pin "$sibling" "$ip" && continue
                 [ "$(meta_family "$sibling")" = "$family" ] || continue
                 printf '%s %s\n' "$ip" "$sibling"
             done | awk '!seen[$1]++')
@@ -196,21 +284,36 @@ refresh() {
 $candidates
 EOF_CANDIDATES
     done
-    [ -n "$filtered" ] || { log 'VPS ответил, но нет адресов с доступным и подлинным TLS-сервисом Meta; DNS не изменён'; return 1; }
-    if ! printf '%b' "$filtered" | awk '$1=="instagram.com" {ok=1} END{exit !ok}'; then
-        log 'VPS не дал ни одного доступного адреса instagram.com; остальные DNS-записи не изменены'
+    # Each family stands on its own. The Instagram family is pinned only with
+    # a verified instagram.com; WhatsApp and fbcdn never wait for it.
+    if [ -n "$filtered" ] && ! printf '%b' "$filtered" | awk '$1=="instagram.com" {ok=1} END{exit !ok}'; then
+        filtered=$(printf '%b' "$filtered" | while read -r host ip; do
+            [ -n "${host:-}" ] || continue
+            [ "$(meta_family "$host")" = instagram ] || printf '%s %s\\n' "$host" "$ip"
+        done)
+        log 'семейство instagram: нет проверенного адреса instagram.com; его записи не изменены, WhatsApp и fbcdn обновляются отдельно'
+    fi
+    if [ -z "$filtered" ]; then
+        # Some check passed in this refresh: the uplink works, so the dead
+        # pins really are dead.
+        if [ -n "$dead_pins" ] && [ "$alive_pins" -gt 0 ]; then
+            drop_dead_pins || return 1
+            ndm_save_if_changed || log 'не удалось сохранить конфигурацию NDM'
+        fi
+        log 'VPS ответил, но нет адресов с доступным и подлинным TLS-сервисом Meta; остальные DNS-записи не изменены'
         return 1
     fi
+    drop_dead_pins || return 1
     next="$MANIFEST.new.$$"; : > "$next"
     if [ -f "$MANIFEST" ]; then
         # Keep owning only pairs NDM actually has: a claim written by a refresh
         # that died before its add (or a pin the user deleted) is dropped, so
         # it can never cover the user's own later identical pin.
-        current=$(running_config) || { rm -f "$next"; log 'не удалось прочитать NDM перед обновлением'; return 1; }
+        ndm_config || { rm -f "$next"; log 'не удалось прочитать NDM перед обновлением'; return 1; }
         while read -r host ip _extra; do
             [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
             if ! managed_host "$host" || ! valid_ipv4 "$ip"; then continue; fi
-            if printf '%s\n' "$current" | awk -v h="$host" -v ip="$ip" '$1=="ip"&&$2=="host"&&$3==h&&$4==ip {f=1} END{exit !f}'; then
+            if printf '%s\n' "$ndm_cfg" | awk -v h="$host" -v ip="$ip" '$1=="ip"&&$2=="host"&&$3==h&&$4==ip {f=1} END{exit !f}'; then
                 printf '%s %s\n' "$host" "$ip" >> "$next"
             else
                 log "владение снято: записи $host $ip нет в NDM"
@@ -232,15 +335,16 @@ EOF_CANDIDATES
             # remove skips a claimed pair that NDM never received.
             printf '%s %s\n' "$host" "$ip" >> "$MANIFEST"
             if LD_LIBRARY_PATH='' ndmc -c "ip host $host $ip" >/dev/null 2>&1; then
+                ndm_touched
                 printf '%s %s\n' "$host" "$ip" >> "$next"; log "добавлена D2K-запись $host $ip"
-            else add_failed=1; log "ошибка добавления $host $ip"; fi
+            else ndm_touched; add_failed=1; log "ошибка добавления $host $ip"; fi
         done
     done
     if [ "$add_failed" = 1 ]; then
         # Remember any partial additions so uninstall still owns them, but
         # never retire previous pins when replacement failed.
         sort -u "$next" > "$MANIFEST"; rm -f "$next"
-        LD_LIBRARY_PATH='' ndmc -c 'system configuration save' >/dev/null 2>&1 || true
+        ndm_save_if_changed || true
         log 'NDM не принял новые записи; прежние адреса сохранены, обновление не завершено'
         return 1
     fi
@@ -258,6 +362,7 @@ EOF_CANDIDATES
             case " $fresh " in *" $ip "*) continue;; esac
             if record_exists "$host" "$ip"; then
                 if LD_LIBRARY_PATH='' ndmc -c "no ip host $host $ip" >/dev/null 2>&1; then
+                    ndm_touched
                     log "удалена устаревшая D2K-запись $host $ip"
                     stale_removed=1
                 else
@@ -282,7 +387,7 @@ EOF_CANDIDATES
         fi
     fi
     sort -u "$next" > "$next.sorted"; mv -f "$next.sorted" "$MANIFEST"; rm -f "$next"
-    if ! LD_LIBRARY_PATH='' ndmc -c 'system configuration save' >/dev/null 2>&1; then
+    if ! ndm_save_if_changed; then
         log 'не удалось сохранить конфигурацию NDM'
         return 1
     fi

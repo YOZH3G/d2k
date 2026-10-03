@@ -59,11 +59,23 @@ try {
   // installer: the service's scheduler runs it in the background with a log.
   assert(!calls().includes('dns-refresh'), 'installer must not run the DNS refresh synchronously');
   assert.match(installOut, /в фоне/, 'installer must say the DNS refresh runs in the background');
-  // An upgrade clears the recorded success so the new host set is pinned now.
+  // An upgrade keeps a success younger than a day (no release-day herd on
+  // /resolve); an older or time-less mark is cleared, so the scheduler
+  // refreshes right away.
   const dnsSuccess = path.join(tmp, 'opt/d2k/state/instagram-dns-last-success');
+  const nowSec = Math.floor(Date.now() / 1000);
+  fs.writeFileSync(dnsSuccess, `2026-10-02\n${nowSec - 3600}\n`);
+  run('install');
+  assert(fs.existsSync(dnsSuccess), 'upgrade must keep a DNS success mark younger than 24 h');
+  fs.writeFileSync(dnsSuccess, `2026-10-01\n${nowSec - 90000}\n`);
+  run('install');
+  assert(!fs.existsSync(dnsSuccess), 'upgrade must clear a DNS success mark older than 24 h');
+  fs.writeFileSync(dnsSuccess, `2026-10-02\n${nowSec + 7200}\n`);
+  run('install');
+  assert(!fs.existsSync(dnsSuccess), 'a success mark from the future is not trusted');
   fs.writeFileSync(dnsSuccess, '2026-10-02\n');
   run('install');
-  assert(!fs.existsSync(dnsSuccess), 'upgrade must clear the DNS success mark so the scheduler refreshes right away');
+  assert(!fs.existsSync(dnsSuccess), 'upgrade must clear an old-format DNS success mark so the scheduler refreshes right away');
   assert(!calls().includes('dns-refresh'), 'upgrade must not run the DNS refresh synchronously');
   // A d2ktg without the 15-name certificate check would silently skip WhatsApp/fbcdn.
   const tgFixture = path.join(tmp, 'source/builds/d2ktg-linux-amd64');

@@ -258,11 +258,24 @@ if [ "$TG_INSTALL_URL" = wss://213.176.74.63.nip.io/ws ] &&
     printf 'TG_ENROLL_PORT=9443\n' >> "$DIR/config"
 fi
 # Instagram/WhatsApp DNS pins come from d2k's own C resolver on the VPS.
-# Checking 18 names can wait on silent edges, so the installer does not run it:
-# clearing the success mark makes the service's scheduler refresh right after
+# Checking 18 names can wait on silent edges, so the installer does not run it.
+# A success younger than a day is kept: a release must not send the whole
+# fleet to /resolve at once. An older mark (or one without its time, from an
+# older version) is cleared, so the service's scheduler refreshes right after
 # start, in the background. A resolver/VPS outage never fails the install.
-rm -f "$DIR/state/instagram-dns-last-success" /tmp/d2k-instagram-dns-last-attempt
-say "DNS Instagram/WhatsApp обновляется в фоне после запуска: результат в $DIR/log/instagram-dns.log; прежние записи сохраняются, далее — ежедневно в 02:00–02:59 (своя минута у каждой установки)"
+DNS_MARK="$DIR/state/instagram-dns-last-success"
+dns_mark_at=$(sed -n 2p "$DNS_MARK" 2>/dev/null || true)
+dns_now=$(date +%s)
+case "$dns_mark_at:$dns_now" in
+    *[!0-9:]*|:*|*:) dns_mark_at= ;;
+esac
+if [ -n "$dns_mark_at" ] && [ "$dns_mark_at" -le "$dns_now" ] && [ $((dns_now - dns_mark_at)) -lt 86400 ]; then
+    say "DNS Instagram/WhatsApp обновлялся меньше суток назад — следующее обновление по расписанию"
+else
+    rm -f "$DNS_MARK" /tmp/d2k-instagram-dns-last-attempt
+    say "DNS Instagram/WhatsApp обновляется в фоне после запуска: результат в $DIR/log/instagram-dns.log; прежние записи сохраняются"
+fi
+say "далее — ежедневно в 01:00–04:59 (своя минута у каждой установки), при неудаче повтор с нарастающей паузой"
 # Убираем только legacy Go-панельный бинарник прежней установки; новый C
 # runtime уже проверен выше и установлен отдельно как d2kpanel.
 rm -f "$SBIN/d2k"
