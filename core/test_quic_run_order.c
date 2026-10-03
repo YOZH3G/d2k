@@ -3,7 +3,7 @@
 #include "d2k_quic_arms.h"
 #include "d2k_quichello.h"
 #include "d2k_quic.h"
-static int calls, fails, lose_base_mark, junk16_asks;
+static int calls, fails, lose_base_mark, junk16_asks, all_pass;
 static int fragment_calls;
 static size_t first_prefix;
 static uint8_t first_arm_hello[2048];
@@ -16,7 +16,7 @@ static size_t resolve(const char *sni,char out[][D2K_QUIC_ADDR_LEN],size_t cap) 
 static d2k_tally answer(int n,int *sent) {
     d2k_tally t={0}; t.marked=1; if(sent)*sent=n;
     if(lose_base_mark && calls==0)t.marked=0;
-    if(calls++==1) t.fail=n; else t.pass=n;
+    if(calls++==1 && !all_pass) t.fail=n; else t.pass=n;
     return t;
 }
 static d2k_tally ask(const char *ip,uint16_t port,const uint8_t *pre,size_t len,
@@ -108,6 +108,60 @@ static d2k_quic_arm_data data_pass(const d2k_quic_arm_question *q,const char *sn
     d.verdict=D2K_QAD_PASS; d.app_bytes=D2K_QUIC_ARM_DATA_BYTES;
     return d;
 }
+/* Задача 50, раунд 2: прямой этап данных — без воздействия. Обрыв после
+   рукопожатия: сам по себе ответ встаёт, плечо с воздействием проходит. */
+static int direct_data_calls, direct_cut;
+static d2k_quic_arm_data data_cut(const d2k_quic_arm_question *q,const char *sni,
+    const char *path,uint16_t port,uint32_t wait,uint32_t mark) {
+    (void)path;(void)port;(void)wait;(void)mark;(void)sni;
+    d2k_quic_arm_data d; memset(&d,0,sizeof d);
+    int plain=!q->blob && q->copies<=1 && !q->ttl && !q->frag && !q->benign && !q->split;
+    if(plain) {
+        direct_data_calls++;
+        d.verdict=direct_cut?D2K_QAD_CUT:D2K_QAD_PASS;
+        d.app_bytes=direct_cut?1169:D2K_QUIC_ARM_DATA_BYTES;
+    } else {
+        data_calls++;
+        d.verdict=D2K_QAD_PASS; d.app_bytes=D2K_QUIC_ARM_DATA_BYTES;
+    }
+    return d;
+}
+
+static void post_handshake_stall(void) {
+    uint8_t tb[1500],cb[1500];size_t tn=0,cn=0;
+    CHECK(d2k_quic_probe_initial("target.example",tb,sizeof tb,&tn)==0);
+    CHECK(d2k_quic_probe_initial("neutral.example",cb,sizeof cb,&cn)==0);
+    d2k_quic_arm_data_wire_fn saved=d2k_quic_arm_data_hook;
+    d2k_quic_arm_data_hook=data_cut;
+    all_pass=1;
+    d2k_quic_arm arm;
+    /* Без признака обрыва после рукопожатия — как прежде: прямой Initial
+       3/3 и CLEAR, этап данных не задаётся. */
+    memset(&arm,0,sizeof arm); calls=0; data_calls=direct_data_calls=0; direct_cut=1;
+    d2k_vres r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(r.verdict==D2K_V_CLEAR && direct_data_calls==0 && data_calls==0);
+    /* Признак есть, ответ своим запросом встаёт: обрыв воспроизведён, плечи
+       меряются этапом данных, найденное плечо — кандидат. */
+    memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(r.verdict==D2K_V_OPAQUE && direct_data_calls==1 && data_calls>=1);
+    CHECK(arm.original && arm.kind!=D2K_QA_NOT_FOUND && arm.kind!=D2K_QA_FLAKY);
+    CHECK(strstr(r.reason,"после рукопожатия")!=NULL);
+    CHECK(arm.data_cut==1);
+    /* Признак есть, но ответ приходит целиком: не воспроизвелось — CLEAR,
+       плечи не меряются. */
+    memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
+    direct_cut=0;
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(r.verdict==D2K_V_CLEAR && direct_data_calls==1 && data_calls==0);
+    CHECK(strstr(r.reason,"не воспроизв")!=NULL);
+    all_pass=0;
+    d2k_quic_arm_data_hook=saved;
+}
+
 int main(void) {
     d2k_quic_arm_data_hook=data_pass;
     d2k_quic_allow_local=1; d2k_quic_resolve_hook=resolve;
@@ -172,6 +226,8 @@ int main(void) {
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},99,&arm);
     CHECK(!r.marked && arm.kind==D2K_QA_FLAKY);
+    lose_base_mark=0; calls=0;
+    post_handshake_stall();
     if(fails)return 1;
     puts("original Run order: passed");return 0;
 }

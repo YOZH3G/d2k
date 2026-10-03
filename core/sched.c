@@ -2198,6 +2198,10 @@ static void *worker_run(void *vp) {
         /* Task 39 round 1: the arm data stage asks the known large resource. */
         snprintf(t->arm.probe_path, sizeof t->arm.probe_path, "%s", t->measure_path);
         t->arm.split_unfit = a_split_unfit;
+        /* Задача 50, раунд 2: поиск начат обрывом ПОСЛЕ рукопожатия —
+           прямой вопрос обязан проверить ответ своим запросом HTTP/3, а не
+           только ответ на Initial (тот проходит и при обрыве). */
+        t->arm.data_cut = t->trigger_code == D2K_SUSPECT_QUIC_STALL;
         r = seed && d2k_sched_quic_seeded_hook
             ? d2k_sched_quic_seeded_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm, seed)
             : d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm);

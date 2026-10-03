@@ -486,6 +486,7 @@ static d2k_ver_result stub_quic_path_ver(int use_fd, const char *ip, uint16_t po
 
 /* Задача 39: путь, которым этап данных плеча спрашивает цель (вход в arm). */
 static char quic_last_path[512];
+static int quic_last_data_cut = -1;
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
                           d2k_hello trigger, d2k_hello control, uint32_t mark,
                           d2k_quic_arm *arm) {
@@ -544,6 +545,7 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
     memset(&r, 0, sizeof r);
     r.verdict = quic_answer;
     quic_last_split_unfit = arm ? arm->split_unfit : -1;
+    quic_last_data_cut = arm ? arm->data_cut : -1;
     memset(arm, 0, sizeof *arm);
     arm->kind = D2K_QA_NOT_FOUND;
     if (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX || r.verdict == D2K_V_WHOLE)
@@ -3123,6 +3125,41 @@ int main(int argc, char **argv) {
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c50);
+    }
+
+    /* ЗАДАЧА 50, РАУНД 2. «QUIC замолчал после рукопожатия» (Safari на
+       rua.gr) — QUIC-поиск своего протокола, и вопросник обязан мерить
+       ответ своим запросом (arm.data_cut), а не только ответ на Initial.
+       Обычное подозрение QUIC (молчание рукопожатия) — без этого признака. */
+    {
+        d2k_catalog cq = {0};
+        d2k_sched *s = d2k_sched_new(&cq, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для обрыва QUIC не завёлся");
+        if (s) {
+            settle(s);
+            quic_calls = 0; quic_last_data_cut = -1;
+            quic_answer = D2K_V_CLEAR;
+            d2k_ev h = ev_hello(17, 41090, "quic-stall.test");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 41090);
+            su.code = D2K_SUSPECT_QUIC_STALL;
+            su.planned = D2K_LINK_PLANNED_NO;
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(quic_calls == 1 && quic_last_data_cut == 1,
+                  "обрыв QUIC после рукопожатия не дошёл до замера ответа своим запросом");
+            d2k_ev h2 = ev_hello(17, 41091, "quic-silent.test");
+            d2k_sched_event(s, &h2);
+            d2k_ev su2 = ev_suspect(17, 41091);
+            su2.code = D2K_SUSPECT_SILENT;
+            d2k_sched_event(s, &su2);
+            settle(s);
+            CHECK(quic_calls == 2 && quic_last_data_cut == 0,
+                  "молчание рукопожатия QUIC стало замером ответа");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cq);
+        quic_answer = D2K_V_OPAQUE;
     }
 
     /* «Блок доказан, кандидатов 0»: пустой поиск откладывается на cooldown,

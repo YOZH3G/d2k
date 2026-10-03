@@ -2266,9 +2266,10 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
     d2k_vres r;
     memset(&r, 0, sizeof r);
     char arm_path[sizeof ((d2k_quic_arm *)0)->probe_path] = "";
-    int arm_split_unfit = 0;
+    int arm_split_unfit = 0, data_cut = 0;
     if(arm) {
         arm_split_unfit = arm->split_unfit != 0;
+        data_cut = arm->data_cut != 0;
         /* Input only when the caller filled it: a terminated, public resource
            path (d2k_resource_path_ok). Anything else -- including an
            uninitialised arm -- means "/". */
@@ -2278,6 +2279,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
         memset(arm,0,sizeof *arm); arm->kind=D2K_QA_NOT_FOUND;
         memcpy(arm->probe_path,arm_path,sizeof arm_path);
         arm->split_unfit = arm_split_unfit;
+        arm->data_cut = data_cut;
     }
 
     /* ОДИН guard на весь класс "структурно непригодный вход" — было разведено
@@ -2552,7 +2554,60 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                    Дополнительные два зонда были перенесены из TCP-дерева,
                    а не из QUIC-оригинала. Изоляция через mark остаётся
                    самостоятельным условием достоверности опыта D2K. */
-                if (all_marked) {
+                if (all_marked && data_cut && arm) {
+                    /* Задача 50, раунд 2: рукопожатие проходит, вопрос — в
+                       ответе. Своё соединение без воздействия, запрос HTTP/3
+                       к тому же ресурсу, что у плеч; правило то же
+                       (d2k_quic_arm_data_judge). */
+                    d2k_quic_arm_question dq;
+                    memset(&dq, 0, sizeof dq);
+                    dq.addr = pool[0];
+                    dq.label = "прямой запрос HTTP/3";
+                    d2k_quic_arm_data dd = d2k_quic_arm_data_hook(&dq, sni,
+                        arm_path[0] ? arm_path : NULL, port, dyn_wait, mark);
+                    r.probes += 1;
+                    qp_progress("прямой запрос HTTP/3", 1);
+                    if (dd.verdict == D2K_QAD_PASS) {
+                        r.verdict = D2K_V_CLEAR;
+                        reason_set(&r, "Initial проходит (%d/%d), ответ на свой запрос HTTP/3 "
+                                       "приходит (%.120s) — обрыв после рукопожатия не воспроизвёлся",
+                                   base.pass, D2K_QUIC_REPEATS, dd.reason);
+                    } else if (dd.verdict != D2K_QAD_CUT) {
+                        r.verdict = D2K_V_INCONCLUSIVE;
+                        reason_set(&r, "Initial проходит (%d/%d), прямой запрос HTTP/3 не "
+                                       "состоялся как замер: %.120s", base.pass,
+                                   D2K_QUIC_REPEATS, dd.reason);
+                    } else {
+                        /* Воспроизведено: плечи — этапом данных на том же
+                           адресе (остаточной блокировки рукопожатия нет, её
+                           вопрос здесь не задаётся). */
+                        r.verdict = D2K_V_OPAQUE;
+                        reason_set(&r, "Initial проходит (%d/%d), ответ на свой запрос HTTP/3 "
+                                       "встаёт после рукопожатия (%llu байт: %.100s)",
+                                   base.pass, D2K_QUIC_REPEATS,
+                                   (unsigned long long)dd.app_bytes, dd.reason);
+                        d2k_quic_arm_context context = {.pool=pool, .n_pool=n_pool,
+                            .next=next_addr, .residual=0, .marked=all_marked,
+                            .can_ask=arm_budget_left, .limit_user=&start,
+                            .spent=arm_budget_spent,
+                            .path=arm_path[0]?arm_path:NULL,
+                            .no_split=arm_split_unfit};
+                        if (budget_left(&start)) {
+                            char why[sizeof r.reason];
+                            snprintf(why, sizeof why, "%s", r.reason);
+                            *arm = d2k_quic_strategy_measure(&context, port, trigger, control,
+                                                             dyn_wait, mark);
+                            arm->data_cut = 1;
+                            next_addr = context.next;
+                            r.probes += arm->probes;
+                            if (!context.marked) all_marked = 0;
+                            snprintf(r.reason, sizeof r.reason, "%s", why);
+                        } else {
+                            arm->original = 1; arm->incomplete = 1; arm->data_cut = 1;
+                            snprintf(arm->reason, sizeof arm->reason, "budget exhausted before askArms");
+                        }
+                    }
+                } else if (all_marked) {
                     r.verdict = D2K_V_CLEAR;
                     reason_set(&r, "триггер проходит как есть, метка подтверждена (%d/%d) — "
                                    "обходить нечего",

@@ -524,6 +524,13 @@ typedef struct {
        Вопрос «разрез CRYPTO» тогда не задаётся: его ответ не может стать
        планом. Сохраняется d2k_quic_run так же, как probe_path. */
     int               split_unfit;
+    /* ВХОД (задача 50, раунд 2): поиск начат подозрением «QUIC замолчал после
+       рукопожатия» (D2K_SUSPECT_QUIC_STALL). Прямой зонд тогда не кончается
+       на «Initial отвечен 3/3»: своё соединение с запросом HTTP/3 (этап
+       данных без воздействия) обязано воспроизвести остановку ответа, иначе
+       CLEAR; воспроизвёл — плечи меряются этапом данных. Сохраняется
+       d2k_quic_run так же, как probe_path. */
+    int               data_cut;
 } d2k_quic_arm;
 
 /* One original run: arm search happens before properties with the SAME pool.
