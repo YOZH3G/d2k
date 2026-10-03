@@ -13,6 +13,9 @@
 #define d2k_raw_probe_poison_family    fake_poison
 #define d2k_raw_supported              fake_raw_supported
 #define d2k_raw_rst_fail_count         fake_rst_fail_count
+/* Настоящий вопрос определён в самом classify.c, поэтому подменяется место
+ * вызова, а не имя функции. */
+#define D2K_DATA_ACK_PROBE             fake_data_ack
 #include "classify.c"
 #include "props.c"
 
@@ -86,6 +89,25 @@ int fake_poison(const uint8_t *ip, uint8_t family, uint16_t port, const d2k_trig
     return rc;
 }
 
+/* Вопрос «принимает ли адрес данные вообще» (задача 54). Петля ядра
+ * подтверждает любой байт мгновенно, поэтому тишину адреса на ней не
+ * изобразить — ответ подменён сценарием: '+' байт подтверждён, '-' тишина,
+ * 'e' локальная ошибка, 'u' подтверждение на платформе не наблюдается. */
+static const char *g_ack_pat = "+";
+static int g_ack_calls;
+
+int fake_data_ack(const char *host, const char *port, const d2k_opts *opt,
+                  char *err, size_t errcap)
+{
+    size_t n = strlen(g_ack_pat);
+    char c = g_ack_pat[(size_t)g_ack_calls < n ? (size_t)g_ack_calls : n - 1];
+    (void)host; (void)port; (void)opt;
+    g_ack_calls++;
+    if (c == 'e') { snprintf(err, errcap, "dial tcp: i/o timeout"); return -1; }
+    if (c == 'u') { snprintf(err, errcap, "подтверждение не наблюдается"); return -2; }
+    return c == '+' ? 1 : 0;
+}
+
 /* --- коробка на петле ---------------------------------------------------- */
 static const char CTL[] = "BENIGN-CONTROL-PAYLOAD";
 static const char *g_ctl_pat = "+"; /* ответ на контрольную нагрузку по вызовам */
@@ -142,6 +164,7 @@ typedef struct {
     const char       *selftest;
     const char       *ctl;
     int               vouched;
+    const char       *ack;
 } scenario;
 
 static void run(const scenario *s, d2k_result *res)
@@ -171,6 +194,8 @@ static void run(const scenario *s, d2k_result *res)
     g_selftest = s->selftest ? s->selftest : "+";
     g_ctl_pat = s->ctl ? s->ctl : "+";
     g_ctl_calls = 0;
+    g_ack_pat = s->ack ? s->ack : "+";
+    g_ack_calls = 0;
     g_res = res;
     g_ask = -1;
     g_hs_calls = 0;
@@ -208,18 +233,25 @@ static script_ent S_FLAKY[] = {
 static const script_ent S_PROPHIT_L7[] = {{"badsum+hello", "+"}, {NULL, NULL}};
 
 static scenario SC[] = {
-    {"youtube", S_YOUTUBE, NULL, NULL, NULL, 0},
-    {"rutracker", S_RUTRACKER, NULL, NULL, NULL, 0},
-    {"flaky", S_FLAKY, NULL, NULL, NULL, 0},
-    {"prop-l7", S_PROPHIT_L7, NULL, NULL, NULL, 0},
-    {"none-pass", NULL, "-", NULL, NULL, 0},
-    {"selftest-fail", NULL, "-", "e", NULL, 0},
-    {"selftest-late", S_YOUTUBE, NULL, "-e+", NULL, 0},
-    {"ctl-late", S_YOUTUBE, NULL, NULL, "-+", 0},
-    {"ctl-dead", NULL, "-", NULL, "-", 0},
-    {"ctl-dead-vouched", NULL, "-", NULL, "-", 1},
-    {"ctl-dead-hit", S_YOUTUBE, NULL, NULL, "-", 1},
-    {"errors", NULL, "e", NULL, NULL, 0},
+    {"youtube", S_YOUTUBE, NULL, NULL, NULL, 0, NULL},
+    {"rutracker", S_RUTRACKER, NULL, NULL, NULL, 0, NULL},
+    {"flaky", S_FLAKY, NULL, NULL, NULL, 0, NULL},
+    {"prop-l7", S_PROPHIT_L7, NULL, NULL, NULL, 0, NULL},
+    {"none-pass", NULL, "-", NULL, NULL, 0, NULL},
+    {"selftest-fail", NULL, "-", "e", NULL, 0, NULL},
+    {"selftest-late", S_YOUTUBE, NULL, "-e+", NULL, 0, NULL},
+    {"ctl-late", S_YOUTUBE, NULL, NULL, "-+", 0, NULL},
+    {"ctl-dead", NULL, "-", NULL, "-", 0, NULL},
+    {"ctl-dead-vouched", NULL, "-", NULL, "-", 1, NULL},
+    {"ctl-dead-hit", S_YOUTUBE, NULL, NULL, "-", 1, NULL},
+    {"errors", NULL, "e", NULL, NULL, 0, NULL},
+    /* Задача 54 (поле 04.10, cdn.cookielaw.org, 104.18.86.0/24): рукопожатие
+     * проходит, а сервер не подтверждает ни одного байта данных — ни
+     * приветствия, ни контроля, ни одного нейтрального байта. */
+    {"addr-silent", NULL, "-", NULL, "-", 0, "-"},
+    {"addr-silent-late", NULL, "-", NULL, "-", 0, "-+"},
+    {"addr-ack-unseen", NULL, "-", NULL, "-", 0, "u"},
+    {"addr-ack-err", NULL, "-", NULL, "-", 0, "e"},
 };
 #define NSC ((int)(sizeof SC / sizeof SC[0]))
 
@@ -251,6 +283,12 @@ static const golden GOLD[] = {
 {"ctl-dead-vouched", 297, "address||-||0002200|0|u1|f0|молчит и контроль на имени, за которое ручается оператор, и ни одна гипотеза не сработала — похоже на блок по адресу"},
 {"ctl-dead-hit", 18, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
 {"errors", 297, "opaque||-||0002200|0|u1|f0|разрез не помогает, контроль проходит, отравить буфер не удалось — содержимое важно, но чем брать, зондами не нашли"},
+/* Задача 54: снято не с кода до правки — нового вопроса там не было. Тишина
+ * адреса — свой вердикт; остальные три обязаны совпасть с ctl-dead. */
+{"addr-silent", 0, "address||-||0000000|0|u0|f0|рукопожатие проходит, но сервер не подтвердил ни одного нейтрального байта (0 из 3): данные к адресу режутся целиком, содержимое ни при чём — обходить содержимым нечего"},
+{"addr-silent-late", 297, "inconclusive||-||0002200|0|u1|f0|контроль не ответил и отравить не удалось: базы нет, отличить блок по адресу от нехватки гипотез нельзя"},
+{"addr-ack-unseen", 297, "inconclusive||-||0002200|0|u1|f0|контроль не ответил и отравить не удалось: базы нет, отличить блок по адресу от нехватки гипотез нельзя"},
+{"addr-ack-err", 297, "inconclusive||-||0002200|0|u1|f0|контроль не ответил и отравить не удалось: базы нет, отличить блок по адресу от нехватки гипотез нельзя"},
 };
 
 static int after_count(const char *name)
@@ -261,8 +299,13 @@ static int after_count(const char *name)
     static const struct { const char *n; int a; } A[] = {
         {"youtube", 12}, {"rutracker", 58}, {"flaky", 37}, {"prop-l7", 14},
         {"none-pass", 100}, {"selftest-fail", 10}, {"selftest-late", 14},
-        {"ctl-late", 13}, {"ctl-dead", 102}, {"ctl-dead-vouched", 102},
-        {"ctl-dead-hit", 14}, {"errors", 100}};
+        {"ctl-late", 13}, {"ctl-dead", 103}, {"ctl-dead-vouched", 103},
+        {"ctl-dead-hit", 15}, {"errors", 100},
+        /* Задача 54: молчащий контроль добавляет ОДИН вопрос — нейтральный
+         * байт; подтверждённый с первого раза, он стоит один зонд. Молчание
+         * адреса стоит три (единогласие) и снимает весь перебор отравлений. */
+        {"addr-silent", 12}, {"addr-silent-late", 104},
+        {"addr-ack-unseen", 102}, {"addr-ack-err", 103}};
     size_t i;
     for (i = 0; i < sizeof A / sizeof A[0]; i++) {
         if (strcmp(A[i].n, name) == 0) { return A[i].a; }
@@ -362,6 +405,48 @@ static void test_counts_per_question(void)
     CHECK(o && o->pass == 0 && o->fail == 3, "контроль без прохода: все 3 повтора");
 }
 
+/* ЗАДАЧА 54. Адрес, который после рукопожатия не принимает НИКАКИХ данных,
+ * содержимым не обходится: десинк меняет то, как выглядят байты, но байты
+ * всё равно должны дойти до сервера. Перебор девяноста гипотез по шесть
+ * секунд тишины на каждой не укладывался в срок задачи (10 мин), замер
+ * бросался без вердикта и через 10 мин начинался снова. */
+static void test_address_silence(void)
+{
+    d2k_result r;
+    const d2k_obs *o;
+    printf("адрес не принимает данных\n");
+    fresh_process();
+    run(find_sc("addr-silent"), &r);
+    CHECK(r.verdict == D2K_DV_ADDRESS, "вердикт %s, ждали address (%s)",
+          d2k_verdict_name(r.verdict), r.reason);
+    CHECK(strstr(r.reason, "нейтральн") != NULL, "причина не называет измерение: %s", r.reason);
+    CHECK(r.strategy[0] == '\0', "для блока адреса предложена стратегия «%s»", r.strategy);
+    CHECK(g_poison_calls == 0 && g_hs_calls == 0,
+          "после доказанной тишины адреса шёл сырой перебор: отрав %d, самопроверок %d",
+          g_poison_calls, g_hs_calls);
+    o = find_obs(&r, "neutral-ack");
+    CHECK(o && o->pass == 0 && o->fail == 3, "нейтральный байт: ждали 0 из 3 в трассе");
+
+    /* Один подтверждённый байт — адрес данные принимает; дальше по-старому. */
+    fresh_process();
+    run(find_sc("addr-silent-late"), &r);
+    CHECK(r.verdict == D2K_DV_INCONCLUSIVE, "подтверждённый байт: вердикт %s",
+          d2k_verdict_name(r.verdict));
+    CHECK(g_poison_calls > 0, "подтверждённый байт снял перебор");
+    o = find_obs(&r, "neutral-ack");
+    CHECK(o && o->pass == 1 && o->fail == 1, "нейтральный байт: ждали остановку на первом проходе");
+
+    /* Не наблюдаемо или локальная ошибка — не свойство адреса. */
+    fresh_process();
+    run(find_sc("addr-ack-unseen"), &r);
+    CHECK(r.verdict == D2K_DV_INCONCLUSIVE && g_poison_calls > 0,
+          "ненаблюдаемое подтверждение выдано за тишину адреса: %s", d2k_verdict_name(r.verdict));
+    fresh_process();
+    run(find_sc("addr-ack-err"), &r);
+    CHECK(r.verdict == D2K_DV_INCONCLUSIVE && g_poison_calls > 0,
+          "локальная ошибка выдана за тишину адреса: %s", d2k_verdict_name(r.verdict));
+}
+
 static void test_selftest_cache(void)
 {
     d2k_result r;
@@ -418,7 +503,7 @@ static void test_selftest_cache(void)
     /* Кэш есть, а сырой слой сломался: первые же отказы этого прогона
      * перепроверяют слой, и провал ведёт себя ровно как провал самопроверки. */
     {
-        scenario broken = {"broken", NULL, "e", "e", NULL, 0};
+        scenario broken = {"broken", NULL, "e", "e", NULL, 0, NULL};
         fresh_process();
         run(find_sc("youtube"), &r);
         run(&broken, &r);
@@ -467,6 +552,7 @@ int main(void)
     }
     test_equivalence();
     test_counts_per_question();
+    test_address_silence();
     test_selftest_cache();
     if (fails) {
         printf("повторы: ПРОВАЛОВ %d\n", fails);

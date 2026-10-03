@@ -346,6 +346,18 @@ int  d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
                              int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
                              char *err, size_t errcap);
 
+/* Принимает ли адрес ДАННЫЕ вообще (задача 54): своё обычное соединение,
+ * один нейтральный байт (не запись TLS, не начало HTTP — матчить нечего) и
+ * ожидание, пока TCP сервера его подтвердит. Подтверждение даёт ядро
+ * сервера, а не его приложение, поэтому ответ не зависит от того, какие
+ * имена сервер обслуживает (урок googlevideo 2026-08-28, где молчал контроль).
+ * Возврат: 1 — байт подтверждён или сервер/путь как-то отреагировал
+ * (данные, FIN, RST); 0 — тишина: за срок не подтверждён; -1 — локальная
+ * ошибка или нет TCP (err заполнен); -2 — подтверждение на этой платформе
+ * не наблюдается (err заполнен, соединения не было). */
+int d2k_probe_data_ack(const char *host, const char *port, const d2k_opts *opt,
+                       char *err, size_t errcap);
+
 /* --- гипотезы (poison.c) ------------------------------------------------ */
 int d2k_raw_probe_handshake_family(const uint8_t *ip, uint8_t family, uint16_t port,
     int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel, char *err, size_t errcap);
