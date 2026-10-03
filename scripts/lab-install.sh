@@ -50,6 +50,9 @@ dump() {
     echo "--- журналы ---"; tail -n 15 "$DIR"/log/*.log 2>/dev/null || true
 }
 sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+# Действия панели асинхронны (POST отвечает «запущено», S99d2k идёт фоном):
+# итог проверяем, дав ему до 30 с, а не в ту же миллисекунду.
+await() { for _ in $(seq 1 30); do sh -c "$1" && return 0; sleep 1; done; sh -c "$1"; }
 rules() {
     iptables -t mangle -S 2>/dev/null | sort
     ip6tables -t mangle -S 2>/dev/null | sort
@@ -261,12 +264,18 @@ panel_curl -fsS http://127.0.0.1:8090/assets/gsap.js -o /tmp/d2k-gsap.js || fail
 panel_curl -fsS http://127.0.0.1:8090/assets/onest.woff2 -o /tmp/d2k-onest.woff2 || fail "C-панель не отдала шрифт"
 panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/stop | grep -q '"ok":true' || fail "локальная панель не остановила движок"
 [ -d "/proc/$PANEL_PID" ] || fail "остановка движка погасила панель управления"
-panel_curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-stopped.json || fail "панель недоступна после остановки движка"
+# Действие панели асинхронно: POST отвечает «запущено», S99d2k stop идёт фоном.
+# Ждём его итога (до 30 с), а не опрашиваем статус в ту же миллисекунду.
+for _ in $(seq 1 30); do
+    panel_curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-stopped.json || fail "панель недоступна после остановки движка"
+    grep -q '"engine_running":false' /tmp/d2k-panel-stopped.json && break
+    sleep 1
+done
 grep -q '"engine_running":false' /tmp/d2k-panel-stopped.json || fail "после остановки API продолжает считать движок работающим"
 grep -q '"controller_running":false' /tmp/d2k-panel-stopped.json || fail "после остановки API продолжает считать контроллер работающим"
 grep -Eq '"linked"[[:space:]]*:[[:space:]]*false' /tmp/d2k-panel-stopped.json || fail "API сохранил linked=true после остановки движка"
 panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/start | grep -q '"ok":true' || fail "локальная панель не запустила движок"
-"$INIT" status | grep -q "датапат: работает" || fail "движок не восстановился из панели"
+await "\"$INIT\" status | grep -q 'датапат: работает'" || fail "движок не восстановился из панели"
 echo "== параллельное восстановление правил =="
 REAPPLY_PIDS=
 for i in 1 2 3 4; do
@@ -295,7 +304,7 @@ panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090
 [ -f "$DIR/run/d2ktg.pid" ] || fail "d2ktg не создал pid-файл после включения"
 TG_PID_NOW=$(cat "$DIR/run/d2ktg.pid")
 [ -d "/proc/$TG_PID_NOW" ] || fail "d2ktg завершился после включения"
-"$INIT" status | grep -q "Telegram tunnel: работает" || fail "служба не показывает активный Telegram-туннель"
+await "\"$INIT\" status | grep -q 'Telegram tunnel: работает'" || fail "служба не показывает активный Telegram-туннель"
 ipset test d2k_tg_dc 149.154.167.51 >/dev/null 2>&1 || fail "ipset не содержит Telegram DC IPv4"
 ! ipset test d2k_tg_dc 203.0.113.1 >/dev/null 2>&1 || fail "ipset ошибочно включает посторонний IPv4"
 iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "нет Telegram PREROUTING redirect"
@@ -326,7 +335,7 @@ panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090
 [ ! -e "$DIR/run/d2ktg.pid" ] || fail "pid-файл d2ktg остался после отключения"
 ! iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "PREROUTING redirect остался после отключения"
 ! iptables -t nat -C OUTPUT -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "OUTPUT redirect остался после отключения"
-grep -q '^TG_ENABLED=0$' "$DIR/config" || fail "disable не сохранил TG_ENABLED=0"
+await "grep -q '^TG_ENABLED=0\$' \"$DIR/config\"" || fail "disable не сохранил TG_ENABLED=0"
 panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' http://127.0.0.1:8090/api/control/reapply | grep -q '"ok":true' || fail "локальная панель не восстановила правила"
 echo "установлено и работает"
 
