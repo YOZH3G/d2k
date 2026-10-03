@@ -85,6 +85,13 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
                 fail(err, errlen, "quicsplit требует minexec=10 и форму 1"); return -1;
             }
             break;
+        case REC_QDENY:
+            /* minexec=11: старый исполнитель записи не знает и пропустил бы
+               QUIC — то есть не сделал бы того, ради чего план поставлен. */
+            if (rd16(b + 6) < 11 || ln != 1 || b[off] != 1) {
+                fail(err, errlen, "quicdeny требует minexec=11 и форму 1"); return -1;
+            }
+            break;
         case REC_OOB:
             if (rd16(b + 6) < 8 || ln != 3 || rd16(b + off) > ANCHOR_SNI_MIDDLE) {
                 fail(err, errlen, "oob требует minexec=8, якорь и один байт"); return -1;
@@ -219,6 +226,15 @@ static int check_refs(const d2k_plan *p, char *err, size_t errlen) {
         p->n_seqovls || p->order || p->input_len || p->input_tls || p->settle_us ||
         p->segment_size || p->wire_profile || p->guards || p->oob_enabled)) {
         fail(err, errlen, "quicsplit требует UDP без фрагментации, удлинения и TCP-операций");
+        return -1;
+    }
+    /* Снятие QUIC — единственное содержание своего плана: с воздействиями
+       оно не смешивается, и у TCP его нет. */
+    if (p->qdeny && (p->transport != 17 || p->ipfrag || p->udplen || p->qsplit ||
+        p->n_splits || p->n_seqovls || p->n_fakes || p->n_payloads || p->n_poisons ||
+        p->order || p->input_len || p->input_tls || p->settle_us || p->segment_size ||
+        p->wire_profile || p->guards || p->oob_enabled || p->pace_us || p->delay_us)) {
+        fail(err, errlen, "quicdeny требует UDP и план без воздействий");
         return -1;
     }
     if (p->oob_enabled && (p->minexec < 8 || p->transport != 6 || p->proto != 1 ||
@@ -387,6 +403,12 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
             }
             p->qsplit = v[0];
             break;
+        case REC_QDENY:
+            if (p->qdeny) {
+                d2k_plan_free(p); fail(err, errlen, "повторная запись quicdeny"); return -1;
+            }
+            p->qdeny = v[0];
+            break;
         case REC_OOB:
             p->oob_enabled = 1;
             p->oob_anchor = rd16(v);
@@ -526,6 +548,10 @@ uint8_t d2k_plan_poison_used(const d2k_plan *p) {
         used |= p->poisons[i].flags;
     }
     return used;
+}
+
+int d2k_plan_quic_deny(const d2k_plan *p) {
+    return p && p->qdeny;
 }
 
 uint8_t d2k_plan_guards(const d2k_plan *p) {

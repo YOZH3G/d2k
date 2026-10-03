@@ -270,6 +270,31 @@ int main(void) {
               out,sizeof out,&n,err,sizeof err)!=0,"quicsplit with TCP text");
     }
 
+    /* quicdeny — QUIC для имени не пропускается (задача 50, раунд 2):
+       запись 0x0110, форма 1, исполнитель 11, только UDP и без воздействий. */
+    {
+        uint8_t out[256];size_t n=0;char err[200],text[256];
+        int rc=d2k_plan_text_to_tlv("d2k-plan 1 11\nproto udp quic\nquicdeny 1\norder forward\n",
+                                    out,sizeof out,&n,err,sizeof err);
+        if(rc)printf("quicdeny: %s\n",err);
+        static const uint8_t rec[]={0x01,0x10,0x00,0x01,0x01};
+        int found=0;
+        for(size_t i=12;i+sizeof rec<=n;i++) if(!memcmp(out+i,rec,sizeof rec)) found=1;
+        CHECK(rc==0&&found&&out[7]==11,"quicdeny 1 не дал записи 0110 0001 01 с исполнителем 11");
+        const char *bad[]={"quicdeny 0\n","quicdeny 2\n","quicdeny\n","quicdeny 1\nquicdeny 1\n",
+            "quicdeny 1\nudplen 100\n","quicdeny 1\nquicsplit 1\n","quicdeny 1\nipfrag 1\n",
+            "quicdeny 1\npayload 1 00ff\nfake 1 0 before 1 0\n","quicdeny 1\norder reverse\n"};
+        for(size_t i=0;i<sizeof bad/sizeof bad[0];i++) {
+            snprintf(text,sizeof text,"d2k-plan 1 11\nproto udp quic\n%s",bad[i]);
+            CHECK(d2k_plan_text_to_tlv(text,out,sizeof out,&n,err,sizeof err)!=0,
+                  "invalid/conflicting quicdeny text accepted");
+        }
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 10\nproto udp quic\nquicdeny 1\n",
+              out,sizeof out,&n,err,sizeof err)!=0,"quicdeny with old executor");
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 11\nproto tcp tls\nquicdeny 1\n",
+              out,sizeof out,&n,err,sizeof err)!=0,"quicdeny with TCP text");
+    }
+
     /* Строгий разбор: усечённое слово и число вне ширины поля — отказ. */
     {
         uint8_t out[512]; size_t n=0; char err[200], text[512];

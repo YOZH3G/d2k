@@ -37,7 +37,10 @@
 /* Version 10 adds REC_QSPLIT: the client's Initial is re-sealed with the
  * ClientHello split into two CRYPTO frames, tail first, same length and
  * packet number (core d2k_quic_initial_split_crypto, task 40). */
-#define D2K_EXEC_VERSION 10
+/* Version 11 adds REC_QDENY: QUIC for the name is not let through (every
+ * client datagram of the flow is dropped, nothing is sent) so the client
+ * falls back to TCP. Not a QUIC bypass (task 50 round 2). */
+#define D2K_EXEC_VERSION 11
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_WIRE_TCP_TEMPLATE 2
 #define D2K_SCHEMA_MAX   1
@@ -245,6 +248,8 @@ size_t d2k_plan_max_emit(const d2k_plan *p);
  * действует не на один пакет, а на соединение, и потому не является
  * действием. */
 uint8_t d2k_plan_guards(const d2k_plan *p);
+/* 1 — план «QUIC для имени не пропускается» (REC_QDENY). */
+int d2k_plan_quic_deny(const d2k_plan *p);
 
 /* ТРАНСПОРТ, ДЛЯ КОТОРОГО ПЛАН ОБЪЯВЛЕН: 6 TCP, 17 UDP, 0 — не объявлен.
  *

@@ -1583,7 +1583,16 @@ int main(int argc, char **argv) {
                     }
 
                     int original_failed = 0;
-                    if (udp_replay && !delayed_originals) {
+                    if (udp_replay && res.quic_deny) {
+                        /* QUIC для имени не пропускается: вся пачка снимается,
+                           хвосты не уходят ни ядром, ни нашей посылкой —
+                           иначе сервер получил бы часть ClientHello. */
+                        for (size_t i = 0; i < udp_batch.count; i++) {
+                            if (out_verdict(&hc, udp_batch.ids[i], D2K_NF_DROP) != 0) {
+                                original_failed = 1;
+                            }
+                        }
+                    } else if (udp_replay && !delayed_originals) {
                         /* Only the first original was replaced by the
                            strategy.  Later QUIC datagrams are real client
                            input and must remain in the stream: they follow

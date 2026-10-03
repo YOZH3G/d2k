@@ -740,6 +740,10 @@ typedef struct {
     int        search_started; /* classifier/voice measurement started, even at zero probes */
     int        cached_measure_valid; /* preserve measured candidates after box-plan reuse */
     uint8_t    trigger_code;   /* signal that admitted this measurement; cooldown key */
+    /* Задача 50, раунд 2: обрыв QUIC после рукопожатия воспроизведён своим
+       запросом (прогон с arm.data_cut вернул OPAQUE). Неудача такой задачи
+       снимает QUIC для имени (quic_deny_install). */
+    uint8_t    stall_cut;
     uint8_t    trigger_planned;
     uint8_t    trigger_shape;
     d2k_flowkey trigger_flow;
@@ -1000,6 +1004,21 @@ typedef struct {
     int64_t seen_ms;
 } late_rst_pending;
 
+/* QUIC ДЛЯ ИМЕНИ НЕ ПРОПУСКАЕТСЯ (задача 50, раунд 2, требование 5c).
+   Обрыв QUIC после рукопожатия воспроизведён своим запросом, обхода по QUIC
+   поиск не нашёл: на имя ставится план quicdeny, и браузер уходит на TCP.
+   Это НЕ обход QUIC (§4) и НЕ знание: в каталог не пишется (§2.3 —
+   отрицательное не хранится), живёт сроком отдыха цели и снимается, чтобы
+   следующий обрыв был измерен заново. streak — сколько раз подряд имя
+   снималось: срок растёт так же, как у повторного CLEAR (10/30/60 мин). */
+#define SCHED_QUIC_DENY_SLOTS 16
+typedef struct {
+    char name[256];
+    uint8_t family, used, active;
+    unsigned streak;
+    int64_t until_ms;
+} quic_deny_slot;
+
 typedef struct {
     char name[256], plan_id[40];
     uint8_t kind, transport, shape, family;
@@ -1025,6 +1044,7 @@ struct d2k_sched {
     target_cooldown cooldowns[SCHED_COOLDOWN_SLOTS];
     late_rst_pending late_rst[SCHED_LATE_RST_SLOTS];
     size_t       late_rst_next;
+    quic_deny_slot quic_deny[SCHED_QUIC_DENY_SLOTS];
     struct { d2k_resource ref; int64_t expires_ms; } resources[8];
     size_t resource_next;
     struct { char name[256]; uint8_t bytes[2048]; size_t len;
@@ -2782,9 +2802,15 @@ static void prop_finish(d2k_sched *s, task *t) {
     s->sync_pending = 1;
 }
 
+static void quic_deny_install(d2k_sched *s, task *t, int64_t now_ms);
+
 static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     join_worker(t);
     contact_close(t);
+    if (t->transport == 17 && t->stall_cut) {
+        t->stall_cut = 0;
+        quic_deny_install(s, t, now_ms);
+    }
     /* И вопрос, и кандидат — каждый своим ключом (задача 20). Прежде порт
        вопроса проверялся первым и, оставшись в памяти после вопросов, уводил
        снятие на давно снятый вопрос, а стоящий кандидат оставался. */
@@ -2813,6 +2839,77 @@ static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     t->n_plans = 0;
     t->next_plan = 0;
     t->fb_queue = 0;
+}
+
+static quic_deny_slot *quic_deny_find(d2k_sched *s, const char *name, uint8_t family) {
+    for (size_t i = 0; i < SCHED_QUIC_DENY_SLOTS; i++) {
+        quic_deny_slot *q = &s->quic_deny[i];
+        if (q->used && q->family == family && !strcmp(q->name, name)) return q;
+    }
+    return NULL;
+}
+
+static void quic_deny_install(d2k_sched *s, task *t, int64_t now_ms) {
+    uint8_t family = t->family ? t->family : 4;
+    quic_deny_slot *q = quic_deny_find(s, t->name, family);
+    if (!q) {
+        quic_deny_slot *victim = NULL;
+        for (size_t i = 0; i < SCHED_QUIC_DENY_SLOTS; i++) {
+            quic_deny_slot *c = &s->quic_deny[i];
+            if (!c->used) { victim = c; break; }
+            if (!c->active && (!victim || victim->active || c->until_ms < victim->until_ms))
+                victim = c;
+        }
+        if (!victim) {
+            say(s, "по %s (QUIC) обхода по QUIC нет, но мест для снятия QUIC нет — "
+                   "оставляю как есть", t->name);
+            return;
+        }
+        q = victim;
+        memset(q, 0, sizeof *q);
+        snprintf(q->name, sizeof q->name, "%s", t->name);
+        q->family = family;
+        q->used = 1;
+    }
+    char text[256], hex[2 * D2K_PLAN_TLV_MAX + 1], err[160], plan_id[40];
+    uint8_t wire_id[D2K_PLAN_ID_LEN];
+    snprintf(text, sizeof text, "d2k-plan 1 11\nid 00000000000000000000000000000000\n"
+                                "proto udp quic\nquicdeny 1\norder forward\n");
+    plan_ident(text, plan_id, sizeof plan_id, wire_id);
+    err[0] = '\0';
+    if (stamp_plan_id(text, wire_id) != 0 ||
+        d2k_plan_text_to_hex(text, hex, sizeof hex, err, sizeof err) != 0 ||
+        d2k_link_set_name_family(s->link_fd, t->name, 17, hex, D2K_LINK_SHAPE_QUIC, 0,
+                                 family, err, sizeof err) != 0) {
+        say(s, "по %s (QUIC) снять QUIC не удалось: %s", t->name, err[0] ? err : "ошибка записи");
+        return;
+    }
+    if (q->streak < UINT8_MAX) q->streak++;
+    int64_t dur = clear_backoff_ms(q->streak);
+    q->until_ms = now_ms + dur;
+    q->active = 1;
+    say(s, "по %s (QUIC) обрыв после рукопожатия воспроизведён своим запросом, обхода по QUIC "
+           "нет — QUIC для имени не пропускаю %lld мин: браузер уйдёт на TCP (это не обход QUIC, "
+           "в каталог не пишется)", t->name, (long long)(dur / 60000));
+}
+
+static void quic_deny_tick(d2k_sched *s, int64_t now_ms) {
+    for (size_t i = 0; i < SCHED_QUIC_DENY_SLOTS; i++) {
+        quic_deny_slot *q = &s->quic_deny[i];
+        if (!q->used || !q->active || now_ms < q->until_ms) continue;
+        char err[160];
+        err[0] = '\0';
+        q->active = 0;
+        if (d2k_link_del_name_family(s->link_fd, q->name, 17, D2K_LINK_SHAPE_QUIC, q->family,
+                                     err, sizeof err) != 0) {
+            say(s, "по %s (QUIC) снятие запрета QUIC не ушло: %s", q->name, err);
+        }
+        /* Подтверждённая QUIC-привязка того же имени (если появилась) вернётся
+           проходом каталога. */
+        s->sync_pending = 1;
+        say(s, "по %s (QUIC) срок запрета QUIC вышел — пропускаю QUIC снова; следующий "
+               "обрыв измерю заново", q->name);
+    }
 }
 
 static void task_done(task *t) {
@@ -3671,6 +3768,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
     }
 
     if (t->transport == 17) {
+        if (t->arm.data_cut && r->verdict == D2K_V_OPAQUE) { t->stall_cut = 1; }
         /* У QUIC свой источник кандидатов — подобранное плечо. Разрезы и
            перекрытия, которые выводит d2k_compose, к датаграмме не
            применимы вовсе, и предлагать их значило бы тратить бюджет зондов
@@ -7290,6 +7388,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     uint8_t drain[64];
     while (read(s->wake[0], drain, sizeof drain) > 0) { }
 
+    quic_deny_tick(s, now_ms);
     if (s->sync_pending && !s->sync_active) {
         (void)d2k_sched_sync(s);
     }

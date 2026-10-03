@@ -41,7 +41,8 @@ enum {
     REC_IPFRAG    = 0x010c,
     REC_OOB       = 0x010d,
     REC_UDPLEN    = 0x010e,
-    REC_QSPLIT    = 0x010f
+    REC_QSPLIT    = 0x010f,
+    REC_QDENY     = 0x0110
 };
 
 /* Якоря семантических позиций. */
@@ -122,6 +123,11 @@ struct d2k_plan {
        функцией ядра d2k_quic_initial_split_crypto — той же, которой задан
        вопрос замера; план владеет нагрузкой, как при udplen. */
     uint8_t qsplit;
+    /* QUIC ДЛЯ ИМЕНИ НЕ ПРОПУСКАЕТСЯ (задача 50, раунд 2); 0 — записи нет.
+       Не воздействие и не обход: датаграммы клиента потока снимаются, чтобы
+       браузер ушёл на TCP. Ставит контроллер, только когда обрыв QUIC
+       воспроизведён своим запросом и обхода по QUIC нет. */
+    uint8_t qdeny;
 
     struct d2k_payload *payloads; size_t n_payloads;
     struct d2k_poison  *poisons;  size_t n_poisons;

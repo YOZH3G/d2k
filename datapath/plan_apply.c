@@ -300,6 +300,12 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     if (!in->payload || in->payload_len == 0) {
         return -1;
     }
+    if (p->qdeny) {
+        /* Не воздействие: оригинал снимается, посылок нет (сессия решает
+           это раньше; здесь — чтобы исполнитель не выдумал иного). */
+        out->fate = D2K_ORIG_DROP;
+        return 0;
+    }
     if (p->input_tls) {
         /* SNI-relative actions are reusable, but a first TCP fragment is
          * not the full input on which raw.c performs its three-part send.

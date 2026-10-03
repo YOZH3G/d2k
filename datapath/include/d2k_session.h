@@ -95,6 +95,10 @@ typedef struct {
     uint8_t  first_payload;
     uint8_t  udp_hold_wait;
     uint8_t  udp_hold_ready;
+    /* Датаграмма снята quicdeny (задача 50, раунд 2): QUIC для имени не
+       пропускается. Удержанная пачка снимается целиком, хвосты не
+       переотправляются. */
+    uint8_t  quic_deny;
     /* Task 47: the first packet of a flow whose client carries a routing mark
        (d2k_session_set_route_mark) — the caller logs it once per flow. */
     uint8_t  routed_first;

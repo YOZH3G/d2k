@@ -1712,7 +1712,79 @@ static void test_quic_post_handshake_stall(void) {
     unlink(ct_path);
 }
 
+/* --- QUIC ДЛЯ ИМЕНИ НЕ ПРОПУСКАЕТСЯ (задача 50, раунд 2, требование 5c) ----
+ *
+ * Обрыв QUIC после рукопожатия воспроизведён своим запросом, обхода по QUIC
+ * нет: контроллер ставит на имя план «quicdeny». Каждая датаграмма клиента
+ * этого потока, которую видит очередь, снимается — рукопожатие не
+ * складывается, и браузер уходит на TCP (там свой поиск). Это НЕ обход QUIC
+ * (§4 спецификации): ни посылок, ни события APPLIED. Зонд контроллера не
+ * снимается — иначе перепроверить имя было бы нечем. Молчание потока, которое
+ * мы устроили сами, подозрением не становится. */
+static const uint8_t plan_deny[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 11, 0, 0, 0, 2,
+    0x00, 0x02, 0x00, 0x02, 17, 2,
+    0x01, 0x10, 0x00, 0x01, 0x01,
+};
+static const uint8_t plan_deny_tcp[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 11, 0, 0, 0, 2,
+    0x00, 0x02, 0x00, 0x02, 6, 1,
+    0x01, 0x10, 0x00, 0x01, 0x01,
+};
+static const uint8_t plan_deny_old[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 10, 0, 0, 0, 2,
+    0x00, 0x02, 0x00, 0x02, 17, 2,
+    0x01, 0x10, 0x00, 0x01, 0x01,
+};
+
+static void test_quic_deny(void) {
+    const uint64_t S = 1000000000ull;
+    char err[160];
+    d2k_plan *p = NULL;
+    CHECK(d2k_plan_load(plan_deny, sizeof plan_deny, &p, err, sizeof err) == 0,
+          "план quicdeny не разобрался");
+    CHECK(p && d2k_plan_quic_deny(p), "план quicdeny не опознан");
+    d2k_plan *bad = NULL;
+    CHECK(d2k_plan_load(plan_deny_tcp, sizeof plan_deny_tcp, &bad, err, sizeof err) != 0,
+          "quicdeny принят для TCP");
+    CHECK(d2k_plan_load(plan_deny_old, sizeof plan_deny_old, &bad, err, sizeof err) != 0,
+          "quicdeny принят без minexec=11");
+    if (!p) return;
+
+    d2k_session *s = d2k_session_new(64, 64);
+    CHECK(d2k_plantab_set_name_family(d2k_session_plans(s), (const uint8_t *)"example.com", 11,
+                                      1, p, D2K_PLAN_SHAPE_QUIC, 0, 4) == 0,
+          "quicdeny не встал на имя");
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    /* Обратная сторона видна — молчание иначе не рассматривалось бы вовсе. */
+    const uint8_t any[4] = {1, 2, 3, 4};
+    size_t n = build_udp_rev_pkt(pkt, 50500, any, sizeof any);
+    d2k_session_packet(s, pkt, n, 1 * S, buf, sizeof buf, &r);
+
+    n = build_udp_pkt(pkt, 50501, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 2 * S, buf, sizeof buf, &r);
+    CHECK(r.verdict == D2K_VERDICT_DROP && r.n_out == 0,
+          "Initial имени без обхода по QUIC не снят (или ушли посылки)");
+    CHECK(r.quic_deny == 1, "снятие quicdeny не помечено для удержанной пачки");
+    CHECK(count_journal_kind(s, D2K_JRN_PLAN_APPLIED) == 0,
+          "снятие QUIC выдано контроллеру за применение плана");
+    /* Повтор Initial по PTO — тоже снимается: иначе рукопожатие сложится
+       со второй попытки. */
+    d2k_session_packet(s, pkt, n, 3 * S, buf, sizeof buf, &r);
+    CHECK(r.verdict == D2K_VERDICT_DROP, "повтор Initial прошёл мимо quicdeny");
+    d2k_session_sweep(s, 10 * S);
+    CHECK(d2k_session_suspects(s) == 0, "молчание, устроенное quicdeny, стало подозрением");
+
+    /* Зонд контроллера того же имени не снимается. */
+    n = build_udp_pkt(pkt, 50502, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet_probe(s, pkt, n, 11 * S, buf, sizeof buf, &r);
+    CHECK(r.verdict != D2K_VERDICT_DROP, "quicdeny снял зонд контроллера");
+    d2k_session_free(s);
+}
+
 int main(void) {
+    test_quic_deny();
     test_quic_post_handshake_stall();
     {
         d2k_session *s = d2k_session_new(32, 32);

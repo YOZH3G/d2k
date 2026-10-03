@@ -798,6 +798,12 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         out->skipped = "поток испорчен предыдущей отменой";
         return;
     }
+    if (fl->quic_deny) {
+        out->verdict = D2K_VERDICT_DROP;
+        out->quic_deny = 1;
+        out->skipped = "QUIC для имени не пропускается: обхода по QUIC нет, клиент уйдёт на TCP";
+        return;
+    }
     /* Приветствие уже разбирали — второй раз незачем. КРОМЕ случая, когда
        план к нему так и не применился: у QUIC первая датаграмма и есть
        приветствие, и на ней запись conntrack ещё не подтверждена (см.
@@ -1061,6 +1067,20 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        write-only, а контроллер не получал бы о нём ни слова. */
     if (fl->plan_done && !fl->udp_replan) {
         out->skipped = "план уже применён к этому потоку";
+        return;
+    }
+    if (d2k_plan_quic_deny(use)) {
+        /* Задача 50, раунд 2: обхода по QUIC нет — поток не складывается,
+           клиент уходит на TCP. Зонд контроллера не трогаем: им имя и
+           перепроверяется. APPLIED нет — это не исполнение обхода. */
+        if (fl->controller_probe) {
+            out->skipped = "зонд контроллера: QUIC для имени снят только у клиентов";
+            return;
+        }
+        fl->quic_deny = 1;
+        out->verdict = D2K_VERDICT_DROP;
+        out->quic_deny = 1;
+        out->skipped = "QUIC для имени не пропускается: обхода по QUIC нет, клиент уйдёт на TCP";
         return;
     }
 
@@ -2625,7 +2645,8 @@ static void sweep_udp_one(void *ctx, d2k_flow *f) {
     struct sweep_ctx *c = ctx;
     /* saw_initial — тот же поток, только имя из Initial не прочиталось
        (см. d2k_track.h). Молчание по нему — наблюдение не хуже прочих. */
-    if ((!f->saw_hello && !f->saw_initial) || f->silence_told || f->suspected) {
+    if ((!f->saw_hello && !f->saw_initial) || f->silence_told || f->suspected ||
+        f->quic_deny) {
         return;
     }
     /* Один ответ не закрывает наблюдение навсегда: цензор может пропустить
@@ -2681,6 +2702,7 @@ struct ct_ctx {
 static int quic_watch(const d2k_flow *f) {
     return f->key.proto == 17 && (f->saw_hello || f->saw_initial) &&
            f->rev_after_hello > 0 && !f->suspected && !f->controller_probe &&
+           !f->quic_deny &&
            !f->voice_ssrc_valid && !f->stun_txid_valid;
 }
 

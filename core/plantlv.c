@@ -56,7 +56,8 @@ enum {
     REC_IPFRAG  = 0x010c,
     REC_OOB     = 0x010d,
     REC_UDPLEN  = 0x010e,
-    REC_QSPLIT  = 0x010f
+    REC_QSPLIT  = 0x010f,
+    REC_QDENY   = 0x0110
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -112,6 +113,7 @@ typedef struct {
     uint8_t    oob_byte;
     uint16_t   udplen;    /* 0 — записи нет */
     uint8_t    qsplit;    /* 0 — записи нет; 1 — кадры CRYPTO, хвост первым */
+    uint8_t    qdeny;     /* 0 — записи нет; 1 — QUIC для имени не пропускается */
 } pl_plan;
 
 static int b64_value(unsigned char c) {
@@ -567,6 +569,15 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 say(err, errcap, "строка %zu: quicsplit ждёт форму 1", lineno); goto bad;
             }
             p->qsplit = (uint8_t)u;
+        } else if (strcmp(f[0], "quicdeny") == 0) {
+            /* QUIC ДЛЯ ИМЕНИ НЕ ПРОПУСКАЕТСЯ (задача 50, раунд 2): не
+               воздействие — датаграммы клиента снимаются, клиент уходит на
+               TCP. Форма одна. */
+            unsigned long u = 0;
+            if (nf != 2 || p->qdeny || parse_uint(f[1], 1, &u) != 0 || u != 1) {
+                say(err, errcap, "строка %zu: quicdeny ждёт форму 1", lineno); goto bad;
+            }
+            p->qdeny = (uint8_t)u;
         } else if (strcmp(f[0], "delay") == 0) {
             /* ВЫДЕРЖКА ПЕРЕД ПЕРВОЙ ПОСЫЛКОЙ НАГРУЗКИ, микросекунды. Ни pace,
                ни settle её не выражают: первый задерживает посылки ПОСЛЕ
@@ -625,6 +636,13 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
         p->settle_us || p->segment_size || p->wire_profile || p->guards || p->oob_enabled)) {
         say(err, errcap, "quicsplit требует minexec=10 и UDP без фрагментации, удлинения и TCP-операций"); goto bad;
     }
+    if (p->qdeny && (p->minexec < 11 || p->transport != 17 || p->ipfrag || p->udplen ||
+        p->qsplit || p->n_payloads || p->n_poisons || p->n_splits || p->n_fakes ||
+        p->n_seqovls || p->order || p->input_len || p->input_tls || p->settle_us ||
+        p->segment_size || p->wire_profile || p->guards || p->oob_enabled || p->pace_us ||
+        p->delay_us)) {
+        say(err, errcap, "quicdeny требует minexec=11, UDP и план без воздействий"); goto bad;
+    }
     if (p->wire_profile && (p->minexec < 4 || p->transport != 6)) {
         say(err, errcap, "wire detect-tcp-v1 требует minexec=4 и proto tcp"); goto bad;
     }
@@ -676,7 +694,7 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
                        (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u) +
                        (p.input_tls ? 1u : 0u) + (p.delay_us ? 1u : 0u) +
                        (p.ipfrag ? 1u : 0u) + (p.oob_enabled ? 1u : 0u) +
-                       (p.udplen ? 1u : 0u) + (p.qsplit ? 1u : 0u);
+                       (p.udplen ? 1u : 0u) + (p.qsplit ? 1u : 0u) + (p.qdeny ? 1u : 0u);
     if (n_records > 0xFFFFu) {
         plan_free(&p);
         say(err, errcap, "слишком много записей (%zu)", n_records);
@@ -766,6 +784,7 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     if (p.ipfrag) { put_rec(&w, REC_IPFRAG, &p.ipfrag, 1); }
     if (p.udplen) { put_u16(&w, REC_UDPLEN); put_u16(&w, 2); put_u16(&w, p.udplen); }
     if (p.qsplit) { put_rec(&w, REC_QSPLIT, &p.qsplit, 1); }
+    if (p.qdeny) { put_rec(&w, REC_QDENY, &p.qdeny, 1); }
     if (p.oob_enabled) {
         uint8_t v[3] = { (uint8_t)(p.oob_anchor >> 8), (uint8_t)p.oob_anchor, p.oob_byte };
         put_rec(&w, REC_OOB, v, sizeof v);

@@ -487,6 +487,7 @@ static d2k_ver_result stub_quic_path_ver(int use_fd, const char *ip, uint16_t po
 /* Задача 39: путь, которым этап данных плеча спрашивает цель (вход в arm). */
 static char quic_last_path[512];
 static int quic_last_data_cut = -1;
+static int quic_arm_none = 0; /* OPAQUE без найденного плеча */
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
                           d2k_hello trigger, d2k_hello control, uint32_t mark,
                           d2k_quic_arm *arm) {
@@ -546,10 +547,14 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
     r.verdict = quic_answer;
     quic_last_split_unfit = arm ? arm->split_unfit : -1;
     quic_last_data_cut = arm ? arm->data_cut : -1;
+    int keep_data_cut = arm ? arm->data_cut : 0;
     memset(arm, 0, sizeof *arm);
     arm->kind = D2K_QA_NOT_FOUND;
-    if (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX || r.verdict == D2K_V_WHOLE)
+    if (!quic_arm_none &&
+        (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX || r.verdict == D2K_V_WHOLE))
         *arm = stub_arm(ip, port, sni, NULL, trigger, mark);
+    if (quic_arm_none) { arm->original = 1; }
+    arm->data_cut = keep_data_cut;
     r.qprops = quic_props_answer;
     snprintf(r.reason, sizeof r.reason, "подменённый вопросник QUIC");
     return r;
@@ -1467,6 +1472,28 @@ static size_t sent_set_name_shape(const char *name, uint8_t shape) {
         const uint8_t *body = p + 6;
         if (cmd == D2K_CMD_SET_NAME && n - 2 >= 3 + nl && body[0] == nl &&
             !memcmp(body + 1, name, nl) && body[1 + nl] == shape) { count++; }
+        off += 4 + n;
+    }
+    return count;
+}
+
+/* SET_NAME с планом quicdeny (запись 0x0110) для имени — задача 50, раунд 2. */
+static size_t sent_quic_deny(const char *name) {
+    static const uint8_t rec[] = {0x01, 0x10, 0x00, 0x01, 0x01};
+    size_t count = 0, nl = strlen(name);
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+                     (uint32_t)p[2] << 8 | p[3];
+        if (n < 2 || n > sent_len - off - 4) break;
+        uint16_t cmd = (uint16_t)((uint16_t)p[4] << 8 | p[5]);
+        const uint8_t *body = p + 6;
+        size_t len = n - 2;
+        if (cmd == D2K_CMD_SET_NAME && len >= 3 + nl && body[0] == nl &&
+            !memcmp(body + 1, name, nl)) {
+            for (size_t i = 1 + nl; i + sizeof rec <= len; i++)
+                if (!memcmp(body + i, rec, sizeof rec)) { count++; break; }
+        }
         off += 4 + n;
     }
     return count;
@@ -3156,10 +3183,72 @@ int main(int argc, char **argv) {
             settle(s);
             CHECK(quic_calls == 2 && quic_last_data_cut == 0,
                   "молчание рукопожатия QUIC стало замером ответа");
+            CHECK(sent_quic_deny("quic-stall.test") == 0,
+                  "QUIC снят по невоспроизведённому обрыву");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cq);
         quic_answer = D2K_V_OPAQUE;
+    }
+
+    /* ЗАДАЧА 50, РАУНД 2, требование 5c. Обрыв воспроизведён своим
+       запросом, обхода по QUIC нет — QUIC для имени не пропускается (план
+       quicdeny на провод, в каталог — нет: это не обход и не знание), чтобы
+       браузер ушёл на TCP. По сроку отдыха снимается — следующий обрыв
+       меряется заново. */
+    {
+        d2k_catalog cq = {0};
+        d2k_sched *s = d2k_sched_new(&cq, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для снятия QUIC не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            settle(s);
+            forget_sent();
+            quic_calls = 0; quic_answer = D2K_V_OPAQUE; quic_arm_none = 1;
+            d2k_ev h = ev_hello(17, 41095, "quic-deny.test");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 41095);
+            su.code = D2K_SUSPECT_QUIC_STALL;
+            su.planned = D2K_LINK_PLANNED_NO;
+            d2k_sched_event(s, &su);
+            for (int i = 0; i < 40 && !sent_quic_deny("quic-deny.test"); i++) settle(s);
+            CHECK(quic_calls == 1 && sent_quic_deny("quic-deny.test") == 1,
+                  "обхода по QUIC нет, а QUIC для имени по-прежнему пропускается");
+            CHECK(said("QUIC для имени не пропускаю"), "снятие QUIC не названо в журнале");
+            CHECK(bindings_of(&cq, "quic-deny.test", 17) == 0,
+                  "снятие QUIC записано в каталог как обход");
+            skip_ahead(s, 11 * 60 * 1000);
+            settle(s);
+            CHECK(sent_del_name_key("quic-deny.test", 17, D2K_LINK_SHAPE_QUIC, 4) >= 1,
+                  "снятие QUIC не снято по сроку");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cq);
+        quic_arm_none = 0;
+        quic_answer = D2K_V_OPAQUE;
+    }
+
+    /* Найденное плечо — обычный кандидат, QUIC не снимается. */
+    {
+        d2k_catalog cq = {0};
+        d2k_sched *s = d2k_sched_new(&cq, sv[0], 0x2d);
+        if (s) {
+            settle(s);
+            forget_sent();
+            quic_calls = 0; quic_answer = D2K_V_OPAQUE;
+            d2k_ev h = ev_hello(17, 41096, "quic-arm.test");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 41096);
+            su.code = D2K_SUSPECT_QUIC_STALL;
+            su.planned = D2K_LINK_PLANNED_NO;
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(quic_calls == 1 && sent_quic_deny("quic-arm.test") == 0,
+                  "QUIC снят при найденном плече");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cq);
     }
 
     /* «Блок доказан, кандидатов 0»: пустой поиск откладывается на cooldown,
