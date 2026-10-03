@@ -86,7 +86,8 @@ static void test_resolve(void) {
     /* Every name of the fixed list is accepted in one request. */
     char all[1024]="{\"hosts\":[";
     for(size_t i=0;i<sizeof(resolve_hosts)/sizeof(resolve_hosts[0]);i++){
-        if(i)strcat(all,",");strcat(all,"\"");strcat(all,resolve_hosts[i]);strcat(all,"\"");}
+        if(i)strcat(all,",");
+        strcat(all,"\"");strcat(all,resolve_hosts[i]);strcat(all,"\"");}
     strcat(all,"]}");assert(sizeof(resolve_hosts)/sizeof(resolve_hosts[0])==15);
     assert(resolve_json(all,out,sizeof(out))==200);
     for(size_t i=0;i<sizeof(resolve_hosts)/sizeof(resolve_hosts[0]);i++){
