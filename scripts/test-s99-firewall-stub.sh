@@ -134,7 +134,8 @@ ok "without xt_addrtype the service starts with explicit broadcast exclusions"
 # Entware ищет в /opt/lib/modules) — служба загружает их сама через insmod.
 # Уже доступные (в /proc/net/ip_tables_matches) не трогаются.
 mkdir -p "$TMP/mods/9.9-test" "$TMP/proc/net"
-for m in xt_addrtype xt_comment xt_conntrack; do : > "$TMP/mods/9.9-test/$m.ko"; done
+for m in xt_addrtype xt_comment xt_conntrack nf_conntrack_netlink xt_mark; do : > "$TMP/mods/9.9-test/$m.ko"; done
+mkdir -p "$TMP/sysmod/xt_mark"   # встроен в ядро: есть в /sys/module, нет в lsmod
 printf 'multiport\nconnbytes\nmark\nconnmark\n' > "$TMP/proc/net/ip_tables_matches"
 printf 'NFQUEUE\nCONNMARK\n' > "$TMP/proc/net/ip_tables_targets"
 cat > "$TMP/bin/uname" <<'EOF2'
@@ -155,11 +156,11 @@ exit 0
 EOF2
 chmod +x "$TMP/bin/uname" "$TMP/bin/modprobe" "$TMP/bin/insmod" "$TMP/bin/lsmod"
 : > "$TMP/insmod.log"
-out=$(S99_SNIPPET='load_modules' s99 D2K_MODULES_DIR="$TMP/mods" INSMOD_LOG="$TMP/insmod.log" 2>&1) || { echo "$out" >&2; fail "load_modules failed"; }
-for m in xt_addrtype xt_comment xt_conntrack; do
+out=$(S99_SNIPPET='load_modules' s99 D2K_MODULES_DIR="$TMP/mods" D2K_SYS_MODULE_DIR="$TMP/sysmod" INSMOD_LOG="$TMP/insmod.log" 2>&1) || { echo "$out" >&2; fail "load_modules failed"; }
+for m in xt_addrtype xt_comment xt_conntrack nf_conntrack_netlink; do
     grep -q "/$m.ko$" "$TMP/insmod.log" || fail "$m not loaded from the firmware tree"
 done
-! grep -q "multiport\|connbytes\|NFQUEUE" "$TMP/insmod.log" || fail "an already available module was reloaded"
+! grep -q "multiport\|connbytes\|NFQUEUE\|xt_mark" "$TMP/insmod.log" || fail "an already available module was reloaded"
 printf '%s\n' "$out" | grep -q "загружен модуль ядра xt_addrtype" || fail "module load not reported"
 rm -f "$TMP/bin/uname" "$TMP/bin/modprobe" "$TMP/bin/insmod" "$TMP/bin/lsmod"
 ok "kernel modules present as files are loaded by the service itself"

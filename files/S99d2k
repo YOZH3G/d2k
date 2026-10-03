@@ -718,7 +718,10 @@ start_log_maintenance() {
 # стартовала. Загружаем сами; отсутствие модуля — не отказ здесь: правило,
 # которому он нужен, либо имеет запасной путь, либо назовёт себя при отказе.
 MODULES_DIR=${D2K_MODULES_DIR:-/lib/modules}
-D2K_MODULES="nfnetlink_queue xt_NFQUEUE xt_conntrack xt_connbytes xt_multiport xt_mark xt_connmark xt_CONNMARK xt_addrtype xt_comment ip6table_mangle"
+# nf_conntrack_netlink: счётчики потока по кортежу для детектора тишины QUIC
+# (d2kd); без него детектор выключен, остальное работает.
+SYS_MODULE_DIR=${D2K_SYS_MODULE_DIR:-/sys/module}
+D2K_MODULES="nfnetlink_queue xt_NFQUEUE xt_conntrack xt_connbytes xt_multiport xt_mark xt_connmark xt_CONNMARK xt_addrtype xt_comment ip6table_mangle nf_conntrack_netlink"
 module_present() {
     case "$1" in
         xt_NFQUEUE|xt_CONNMARK)
@@ -727,6 +730,8 @@ module_present() {
         ip6table_mangle) grep -qw mangle "$PROC_DIR/net/ip6_tables_names" 2>/dev/null && return 0 ;;
         xt_*) grep -qw "${1#xt_}" "$PROC_DIR/net/ip_tables_matches" 2>/dev/null && return 0 ;;
     esac
+    # Встроенный в ядро модуль в lsmod не виден, но есть в /sys/module.
+    [ -d "$SYS_MODULE_DIR/$1" ] && return 0
     lsmod 2>/dev/null | grep -q "^$1 "
 }
 load_modules() {
