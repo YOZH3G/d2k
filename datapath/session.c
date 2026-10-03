@@ -38,6 +38,9 @@ struct d2k_session {
        D2K_HOOK_UNKNOWN значит «не сказали», и тогда направление выводится
        по порту, как и раньше. */
     uint8_t hook;
+    /* Метка маршрутизации клиента у ТЕКУЩЕГО пакета (0 — нет), задача 47. */
+    uint32_t route_mark;
+    uint64_t routed_flows;
     d2k_capture capture;
     d2k_table   *flows;
     /* Учёт QUIC/UDP-потоков (задача 4 QUIC-вертикали) — ВТОРАЯ, независимая
@@ -507,6 +510,18 @@ static int flow_tracked(d2k_flow *fl, const d2k_conn *c, uint8_t proto,
        неподтверждённой записью (поле 03.10.2026). Состояние не запоминается:
        следующий пакет спросит таблицу, как и раньше после промаха. */
     if (fl->nat_state == 0 && first_packet) {
+        return 0;
+    }
+    /* ОТВЕТ УЖЕ ПРОШЁЛ ЧЕРЕЗ ЯДРО — ЗАПИСЬ ДОКАЗАНА (задача 47). SYN-ACK
+       возвращается к клиенту только по подтверждённой записи conntrack, с её
+       трансляцией: прочитать таблицу значило бы заплатить ~14 мс (полный проход
+       /proc/net/nf_conntrack на роутере, поле 03.10.2026) перед каждым
+       спланированным ClientHello ради ответа, известного заранее. Без
+       увиденного ответа (нет обратного правила, лаборатория) — чтение, как
+       раньше. */
+    if (fl->nat_state == 0 && proto == 6 && fl->saw_synack) {
+        fl->nat_state = 1;
+        g_nat_ok++;
         return 0;
     }
     if (fl->nat_state == 0) {
@@ -1297,6 +1312,44 @@ static void note_tcp_hello(d2k_session *s, d2k_flow *fl, int ack,
     fl->hello_ack_valid = ack ? 1 : 0;
 }
 
+/* ПОТОК КЛИЕНТА С МЕТКОЙ МАРШРУТИЗАЦИИ (задача 47, поле 03.10.2026).
+ *
+ * Keenetic метит пакеты клиента с маршрутом по политике или доменам в mangle
+ * PREROUTING (0xffffaaa -> ip rule 100 -> таблица 4096, например VPN) — до
+ * нашей очереди в POSTROUTING. Все сырые посылки d2k (фальшивки, куски,
+ * собственный Initial задачи 42) идут с меткой 0x2d по главной таблице, то
+ * есть через провайдера мимо VPN: утечка ClientHello/Initial и разорванное
+ * соединение. Такой поток не получает ни плана, ни удержания, ни наблюдения:
+ * его ответы и молчание — свойство чужого пути, а не коробки провайдера, и
+ * уликой для контроллера быть не могут. Помечается поток (обе стороны), а не
+ * пакет: ответы сервера приходят без метки клиента. */
+static int routed_flow(d2k_session *s, const uint8_t *pkt, size_t len,
+                       const d2k_packet_view *ip, uint64_t now_ns, d2k_result *out) {
+    if ((ip->protocol != 6 && ip->protocol != 17) || len < ip->l4 + 4 ||
+        (ip->fragment & 0x1fff)) {
+        return 0;
+    }
+    const uint8_t *l4 = pkt + ip->l4;
+    d2k_key key;
+    (void)d2k_key_make_addr(&key, ip->protocol, &ip->src, &ip->dst, l4, l4 + 2);
+    d2k_table *t = ip->protocol == 6 ? s->flows : s->uflows;
+    d2k_flow *fl;
+    if (s->route_mark) {
+        fl = d2k_track_get(t, &key, now_ns);
+        if (fl && !fl->routed) {
+            fl->routed = 1;
+            s->routed_flows++;
+            out->routed_first = 1;
+            out->routed_mark = s->route_mark;
+        }
+    } else {
+        fl = d2k_track_find(t, &key);
+        if (!fl || !fl->routed) { return 0; }
+    }
+    out->skipped = "клиент с меткой маршрутизации — поток идёт ядром";
+    return 1;
+}
+
 static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap,
                        d2k_result *out, int observe_only,
@@ -1326,6 +1379,9 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
            транспорте — эта проверка делится TCP и UDP честно, а не по
            TCP-инерции (ниже — наоборот, минимум под конкретный L4). */
         out->skipped = "заголовок не помещается";
+        return 0;
+    }
+    if (routed_flow(s, pkt, len, &ip, now_ns, out)) {
         return 0;
     }
     if (ip.protocol == 17) {
@@ -2093,6 +2149,14 @@ void d2k_session_set_hook(d2k_session *s, uint8_t hook) {
     if (s) { s->hook = hook; }
 }
 
+void d2k_session_set_route_mark(d2k_session *s, uint32_t mark) {
+    if (s) { s->route_mark = mark; }
+}
+
+uint64_t d2k_session_routed_flows(const d2k_session *s) {
+    return s ? s->routed_flows : 0;
+}
+
 void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed) {
     if (s) { s->udp_reverse_hook = installed != 0; }
 }
@@ -2100,7 +2164,8 @@ void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed) {
 int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
                                uint64_t now_ns, d2k_key *key_out) {
     d2k_packet_view ip;
-    if (!s || !d2k_packet_parse(p, n, &ip) || ip.protocol != 17 || (ip.fragment & 0x3fff)) { return 0; }
+    if (!s || s->route_mark || !d2k_packet_parse(p, n, &ip) || ip.protocol != 17 ||
+        (ip.fragment & 0x3fff)) { return 0; }
     size_t ihl = ip.l4;
     const uint8_t *u = p + ihl;
     size_t total = ip.total;
@@ -2131,7 +2196,7 @@ int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
        ready), и датаграмма осталась бы и в ячейке, и под обычным вердиктом:
        два вердикта на один ID и повторная посылка уже ушедшего (задача 46,
        ревью I1). fwd_pkts растёт уже после этого вызова. */
-    if (fl->plan_done || fl->damaged || fl->saw_hello ||
+    if (fl->plan_done || fl->damaged || fl->saw_hello || fl->routed ||
         fl->fwd_pkts >= D2K_HELLO_WINDOW) { return 0; }
     fl->udp_hold_active = 1;
     if (key_out) { *key_out = key; }
@@ -2213,13 +2278,13 @@ void d2k_session_note_unassembled(d2k_session *s, const uint8_t *p, size_t n,
 
 int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
     d2k_hold_info v;
-    if (!s || !d2k_hold_parse(p, n, &v) || !v.payload ||
+    if (!s || s->route_mark || !d2k_hold_parse(p, n, &v) || !v.payload ||
         (v.flags & ~0x18) || !(v.flags & 0x10)) { return 0; }
     d2k_flow *fl = d2k_track_find(s->flows, &v.key);
     /* Do not retain a tail of an already-passed stream or guess direction.
        Only a first payload anchored by the observed client SYN qualifies. */
     if (!fl || !fl->saw_syn || !fl->dir_known || fl->init_low != v.src_low ||
-        fl->damaged) {
+        fl->damaged || fl->routed) {
         return 0;
     }
 

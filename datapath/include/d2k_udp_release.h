@@ -126,6 +126,11 @@ typedef struct {
     /* Optional: told once per flow when a marked datagram kept the kernel
        path. */
     void (*marked)(void *ctx, const uint8_t *pkt, size_t len, uint32_t mark);
+    /* Optional: issue verdict for id at at_ns, after the deferred emits due
+       then (d2kd: the delayed-verdict ring, flushed after the scheduler).  A
+       marked datagram behind a deferred planned head is ACCEPTed this way so
+       it never reaches conntrack before the head (task 46 rereview4 I3). */
+    int (*defer_verdict)(void *ctx, uint64_t at_ns, uint32_t id, uint32_t verdict);
 } d2k_udp_out;
 
 /* Releases a batch (d2k_udp_release_batch) with tails sent now when at_ns <=

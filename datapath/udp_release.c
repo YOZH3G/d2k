@@ -152,8 +152,15 @@ size_t d2k_udp_replay_fates(size_t count, uint32_t head_verdict, int owned,
     return again;
 }
 
+typedef struct {
+    int (*fn)(void *ctx, uint64_t at_ns, uint32_t id, uint32_t verdict);
+    void *ctx;
+    uint64_t at_ns;
+} defer_op;
+
 static size_t release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
                             int owned, int can_resend, const uint8_t *may,
+                            const defer_op *defer,
                             d2k_udp_release_send verdict, d2k_udp_resend resend,
                             void *ctx, int *verdict_failed, size_t *resend_failed);
 
@@ -161,12 +168,13 @@ size_t d2k_udp_release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
                              int owned, int can_resend,
                              d2k_udp_release_send verdict, d2k_udp_resend resend,
                              void *ctx, int *verdict_failed, size_t *resend_failed) {
-    return release_batch(b, head_verdict, owned, can_resend, NULL, verdict, resend,
+    return release_batch(b, head_verdict, owned, can_resend, NULL, NULL, verdict, resend,
                          ctx, verdict_failed, resend_failed);
 }
 
 static size_t release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
                             int owned, int can_resend, const uint8_t *may,
+                            const defer_op *defer,
                             d2k_udp_release_send verdict, d2k_udp_resend resend,
                             void *ctx, int *verdict_failed, size_t *resend_failed) {
     uint32_t v[D2K_UDP_HOLD_PACKETS];
@@ -190,9 +198,14 @@ static size_t release_batch(const d2k_udp_hold_batch *b, uint32_t head_verdict,
             fell_back++;
         }
         if (again[i] && may && !may[i]) {
-            /* Marked client: its policy route must hold; the kernel path. */
+            /* Marked client: its policy route must hold; the kernel path —
+               but never ahead of a deferred head (rereview4 I3). */
             again[i] = 0;
             v[i] = D2K_NF_ACCEPT;
+            if (defer && defer->fn) {
+                if (defer->fn(defer->ctx, defer->at_ns, b->ids[i], v[i]) != 0) { vfail = 1; }
+                continue;
+            }
         }
         if (again[i]) {
             if (resend(ctx, b->packets[i], b->len[i]) == 0) {
@@ -246,10 +259,18 @@ static int same_tuple(const follow_entry *a, const follow_entry *b) {
            !memcmp(a->dst, b->dst, sizeof a->dst) && !memcmp(a->ports, b->ports, 4);
 }
 
+static follow_entry *follow_put(d2k_udp_follow *f, const uint8_t *pkt, size_t len,
+                                uint64_t now_ns, uint64_t at_ns, uint64_t seq);
+
 int d2k_udp_follow_mark(d2k_udp_follow *f, const uint8_t *pkt, size_t len,
                         uint64_t now_ns, uint64_t at_ns, uint64_t seq) {
+    return follow_put(f, pkt, len, now_ns, at_ns, seq) ? 0 : -1;
+}
+
+static follow_entry *follow_put(d2k_udp_follow *f, const uint8_t *pkt, size_t len,
+                                uint64_t now_ns, uint64_t at_ns, uint64_t seq) {
     follow_entry t;
-    if (!f || follow_tuple(pkt, len, &t) != 0) { return -1; }
+    if (!f || follow_tuple(pkt, len, &t) != 0) { return NULL; }
     uint64_t out = at_ns > now_ns ? at_ns : now_ns;
     t.until_ns = out + D2K_UDP_FOLLOW_NS;
     t.at_ns = at_ns > now_ns ? at_ns : 0;
@@ -263,8 +284,9 @@ int d2k_udp_follow_mark(d2k_udp_follow *f, const uint8_t *pkt, size_t len,
             spare = e;
         }
     }
-    *(slot ? slot : spare) = t;
-    return 0;
+    follow_entry *e = slot ? slot : spare;
+    *e = t;
+    return e;
 }
 
 int d2k_udp_follow_match(const d2k_udp_follow *f, const uint8_t *pkt, size_t len,
@@ -318,7 +340,9 @@ int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,
         may[i] = (uint8_t)d2k_udp_out_neutral(o, b->marks[i]);
         if (i > 0 && !may[i]) { marked_tail = 1; }
     }
-    (void)release_batch(b, head_verdict, can ? owned : 0, can, may, out_verdict,
+    defer_op d = {o->defer_verdict, o->ctx, at_ns};
+    (void)release_batch(b, head_verdict, can ? owned : 0, can, may,
+                        (at_ns > now_ns && o->defer_verdict) ? &d : NULL, out_verdict,
                         can ? out_resend : NULL, &c, &vfail, &rfail);
     if (can && marked_tail && o->marked) {
         size_t i = 1;
@@ -326,7 +350,9 @@ int d2k_udp_out_batch(const d2k_udp_out *o, const d2k_udp_hold_batch *b,
         o->marked(o->ctx, b->packets[i], b->len[i], b->marks[i]);
     }
     if (can && o->follow && may[0]) {
-        (void)d2k_udp_follow_mark(o->follow, b->packets[0], b->len[0], now_ns, at_ns, seq);
+        follow_entry *e = follow_put(o->follow, b->packets[0], b->len[0], now_ns, at_ns, seq);
+        /* Counted once per flow, batch or late datagram (rereview4 N9). */
+        if (e && marked_tail) { e->noted = 1; }
     }
     return vfail;
 }
@@ -352,6 +378,13 @@ int d2k_udp_out_late(const d2k_udp_out *o, uint32_t id, const uint8_t *pkt,
     if (!d2k_udp_out_neutral(o, mark)) {
         if (!e->noted && o->marked) { o->marked(o->ctx, pkt, len, mark); }
         e->noted = 1;
+        if (e->at_ns && o->defer_verdict) {
+            /* Behind a deferred planned head: ACCEPT, but not before it
+               leaves (rereview4 I3). */
+            int rc = o->defer_verdict(o->ctx, e->at_ns, id, D2K_NF_ACCEPT);
+            if (verdict_failed) { *verdict_failed = rc != 0; }
+            return 1;
+        }
         return 0;  /* the caller's ordinary ACCEPT */
     }
     /* A deferred head stays deferred until the queue pops it, even once due:

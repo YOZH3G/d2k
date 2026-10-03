@@ -652,7 +652,95 @@ static void test_reply_hidden_by_accelerator(void) {
     d2k_session_free(s);
 }
 
+/* ЗАДАЧА 47, п. 1: ПЛАНУ НА ПРИВЕТСТВИИ НЕ НУЖНО ЧИТАТЬ ТАБЛИЦУ CONNTRACK,
+ * если ответ сервера (SYN-ACK) уже прошёл через ядро: ответ возвращается
+ * только по подтверждённой записи, и её трансляция уже есть. Полное чтение
+ * /proc/net/nf_conntrack стоит на роутере ~14 мс перед каждым ClientHello.
+ * Без увиденного ответа (нет обратного правила, лаборатория) проверка
+ * остаётся. */
+static void test_tcp_plan_skips_conntrack_read(void) {
+    d2k_nat_fn saved = d2k_nat_hook;
+    d2k_nat_hook = nat_stub;
+    uint8_t hello[512], pkt[1024], buf[8192];
+    char err[128];
+    size_t hlen = build_hello(hello);
+    d2k_result r;
+
+    d2k_session *g = d2k_session_new(8, 4);
+    d2k_plan *gp = NULL;
+    CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &gp, err, sizeof err) == 0, "plan");
+    d2k_session_set_plan(g, gp);
+    nat_calls = 0;
+    nat_miss_first_n = 1000;   /* the table would say "absent": it must not be asked */
+    size_t n = build_pkt(pkt, 41300, 0x02, NULL, 0);           /* SYN */
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    n = build_rev_pkt(pkt, 41300, 0x12, NULL, 0);              /* SYN-ACK */
+    d2k_session_packet(g, pkt, n, 2000, buf, sizeof buf, &r);
+    n = build_pkt(pkt, 41300, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 3000, buf, sizeof buf, &r);
+    CHECK(r.n_out > 0 && r.skipped == NULL, "plan applied on the ClientHello");
+    CHECK(nat_calls == 0, "a reply already proved the conntrack entry: no table read");
+    d2k_session_free(g);
+
+    /* No reply seen: the entry is still proven by the table. */
+    g = d2k_session_new(8, 4);
+    gp = NULL;
+    CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &gp, err, sizeof err) == 0, "plan");
+    d2k_session_set_plan(g, gp);
+    nat_calls = 0;
+    nat_miss_first_n = 0;
+    n = build_pkt(pkt, 41301, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(r.n_out > 0 && nat_calls >= 1, "without a reply the table is still read");
+    d2k_session_free(g);
+    d2k_nat_hook = saved;
+}
+
+/* ЗАДАЧА 47, п. 0: КЛИЕНТ С МЕТКОЙ МАРШРУТИЗАЦИИ ПЛАНА НЕ ПОЛУЧАЕТ.
+ * Keenetic метит пакеты клиента с маршрутом по политике/доменам (0xffffaaa ->
+ * таблица 4096, VPN) до нашей очереди; сырые посылки d2k идут с меткой 0x2d
+ * мимо этой таблицы — через провайдера. Поток идёт ядром без вмешательства и
+ * без наблюдения: его поведение — свойство чужого пути, не коробки. */
+static void test_routed_client_gets_no_plan_tcp(void) {
+    uint8_t hello[512], pkt[1024], buf[8192];
+    char err[128];
+    size_t hlen = build_hello(hello);
+    d2k_result r;
+    d2k_session *g = d2k_session_new(8, 8);
+    d2k_plan *gp = NULL;
+    CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &gp, err, sizeof err) == 0, "plan");
+    d2k_session_set_plan(g, gp);
+
+    d2k_session_set_route_mark(g, 0xffffaaa);
+    size_t n = build_pkt(pkt, 41400, 0x02, NULL, 0);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(r.routed_first && r.routed_mark == 0xffffaaa, "first packet of a routed flow reported");
+    d2k_session_set_route_mark(g, 0);           /* replies carry no client mark */
+    n = build_rev_pkt(pkt, 41400, 0x12, NULL, 0);
+    d2k_session_packet(g, pkt, n, 2000, buf, sizeof buf, &r);
+    CHECK(!r.routed_first && r.skipped != NULL, "the flow's replies are left alone too");
+    d2k_session_set_route_mark(g, 0xffffaaa);
+    n = build_pkt(pkt, 41400, 0x18, hello, hlen);
+    CHECK(d2k_session_hold_candidate(g, pkt, n) == 0, "a routed flow is never held");
+    d2k_session_packet(g, pkt, n, 3000, buf, sizeof buf, &r);
+    CHECK(r.n_out == 0 && !r.applied && r.verdict == D2K_VERDICT_ACCEPT,
+          "routed client: no plan, kernel path");
+    CHECK(!r.routed_first, "reported once per flow");
+    CHECK(count_kind(g, D2K_JRN_HELLO_SNI) == 0 && count_plan_refused(g) == 0,
+          "nothing about a foreign path reaches the controller");
+    CHECK(d2k_session_routed_flows(g) == 1, "counted once");
+
+    /* The same session still plans an unmarked client. */
+    d2k_session_set_route_mark(g, 0);
+    n = build_pkt(pkt, 41401, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 4000, buf, sizeof buf, &r);
+    CHECK(r.n_out > 0, "unmarked client still planned");
+    d2k_session_free(g);
+}
+
 int main(void) {
+    test_tcp_plan_skips_conntrack_read();
+    test_routed_client_gets_no_plan_tcp();
     test_reply_hidden_by_accelerator();
     {
         d2k_session *v6 = d2k_session_new(32, 32);

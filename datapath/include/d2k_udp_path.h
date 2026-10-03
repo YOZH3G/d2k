@@ -78,4 +78,12 @@ int d2k_udp_path_post(d2k_udp_path *pp, int fed, const d2k_key *key,
 int d2k_udp_path_passed(d2k_udp_path *pp, const uint8_t *pkt, size_t len,
                         uint32_t mark, uint64_t now_ns);
 
+/* An unheld UDP datagram a plan took over (fate drop, sent after the plan's
+ * own raw emits; the last emit leaves at at_ns): the plan's first raw send
+ * created and confirmed the conntrack entry, and the datagrams queued behind
+ * it would clash.  Marks the flow like a released hold (task 47, req 3:
+ * voice/STUN plans).  IPv4 only, neutral mark only.  Returns 1 when marked. */
+int d2k_udp_path_planned(d2k_udp_path *pp, const uint8_t *pkt, size_t len,
+                         uint32_t mark, uint64_t at_ns, uint64_t now_ns);
+
 #endif

@@ -223,6 +223,9 @@ static void delayed_verdict_done(void *ctx, const d2k_key *key,
                                  uint64_t execution, int complete, size_t sent) {
     hold_context *c = ctx;
     uint64_t at = now_ns();
+    /* Token 0: a single deferred verdict of a client datagram (out_defer),
+       not a plan's execution — nothing to account. */
+    if (execution == 0) { return; }
     if (complete) {
         d2k_session_sent(c->sess, at, key, execution);
         return;
@@ -298,6 +301,18 @@ static void out_marked(void *ctx, const uint8_t *p, size_t n, uint32_t mark) {
                         "не сырой посылкой%s\n", sport, dport, mark,
                 st.udp_marked_kept == 16 ? " (дальше только счётчик)" : "");
     }
+}
+
+/* Вердикт клиентской датаграммы — позже, за отложенной головой плана
+   (ревью 4 задачи 46, I3): кольцо отложенных вердиктов сливается после
+   очереди сырых посылок того же прохода. Нет места — вердикт сразу. */
+static int out_defer(void *ctx, uint64_t at, uint32_t id, uint32_t verdict) {
+    static const d2k_key none = {.proto = 17};
+    if (udp_releases &&
+        d2k_udp_release_enqueue(udp_releases, at, &id, &verdict, 1, &none, 0) == 0) {
+        return 0;
+    }
+    return send_original_verdict(ctx, id, verdict);
 }
 
 static int out_send_now(void *ctx, const uint8_t *p, size_t n) {
@@ -470,6 +485,8 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
                ", таблицы нет %" PRIu64 ", спасла перепроверка %" PRIu64 "\n",
                nok, nm, nn, nr);
     }
+    printf("потоков клиентов с меткой маршрутизации (ядром, без плана): %" PRIu64 "\n",
+           d2k_session_routed_flows(s));
     printf("UDP с меткой клиента, хвосты ядром: %" PRIu64 " потоков\n", st.udp_marked_kept);
     printf("сырым сокетом отправлено %" PRIu64 ", ошибок %" PRIu64 "\n",
                d2k_raw_sent(r), d2k_raw_errors(r));
@@ -819,6 +836,7 @@ int main(int argc, char **argv) {
     udp_out.can_resend = udp_follow != NULL;
     udp_out.neutral_mark = probe_mark;
     udp_out.marked = out_marked;
+    udp_out.defer_verdict = out_defer;
     udp_path.sess = sess;
     udp_path.hold = udp_holding;
     udp_path.out = &udp_out;
@@ -976,6 +994,14 @@ int main(int argc, char **argv) {
                        non-443 client Initials are accepted only when NFQUEUE
                        supplied OUTPUT/POSTROUTING. */
                     d2k_session_set_hook(sess, np.have_hdr ? np.hook : D2K_HOOK_UNKNOWN);
+                    /* МЕТКА МАРШРУТИЗАЦИИ КЛИЕНТА (задача 47): любая ненулевая,
+                       кроме собственных меток d2k (зонды контроллера; свои
+                       сырые посылки в очередь не попадают), — поток идёт
+                       ядром, без плана и удержания. */
+                    uint32_t client_mark = np.have_mark ? np.mark : 0;
+                    d2k_session_set_route_mark(sess,
+                        (client_mark && client_mark != probe_mark && client_mark != mark)
+                            ? client_mark : 0);
 
                     /* QUIC split hold starts before session inspection, so the
                        first tail cannot escape while the ClientHello is still
@@ -1112,6 +1138,14 @@ int main(int argc, char **argv) {
                         res.skipped = "split QUIC hold исчез до replay";
                     }
 
+                    if (res.routed_first) {
+                        uint64_t rf = d2k_session_routed_flows(sess);
+                        if (rf <= 16) {
+                            fprintf(stderr, "d2kd: поток клиента с меткой маршрутизации 0x%x "
+                                            "идёт ядром, без плана%s\n", res.routed_mark,
+                                    rf == 16 ? " (дальше только счётчик)" : "");
+                        }
+                    }
                     if (res.skipped) {
                         count_reason(res.skipped);
                     }
@@ -1352,6 +1386,17 @@ int main(int argc, char **argv) {
                             (void)d2k_udp_path_passed(&udp_path, np.payload,
                                                       np.payload_len,
                                                       np.have_mark ? np.mark : 0, t);
+                        }
+                        /* UDP-ПЛАН БЕЗ УДЕРЖАНИЯ (голос/STUN, задача 47): план
+                           забрал датаграмму и выпустил её после своих сырых
+                           посылок — их запись уже подтверждена, и то, что
+                           стоит в очереди за ней, пойдёт тем же путём. */
+                        if (!batch.count && !original_failed && !output_failed &&
+                            mode == MODE_APPLY && res.applied && verdict == D2K_NF_DROP &&
+                            np.have_payload && !np.truncated) {
+                            (void)d2k_udp_path_planned(&udp_path, np.payload,
+                                                       np.payload_len,
+                                                       np.have_mark ? np.mark : 0, at, t);
                         }
                     }
                     if (original_failed) {

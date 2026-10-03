@@ -22,6 +22,7 @@ static unsigned verdicts_of[MAXID];
 static uint32_t last_verdict[MAXID];
 static unsigned sends_of[MAXID];          /* by the ID stamped in the packet */
 static uint64_t send_at_of[MAXID];
+static uint64_t deferred_at[MAXID];
 static char order[256];
 static size_t order_n;
 static uint32_t verdict_fail_id;
@@ -59,6 +60,7 @@ static void reset(void) {
     memset(last_verdict, 0, sizeof last_verdict);
     memset(sends_of, 0, sizeof sends_of);
     memset(send_at_of, 0, sizeof send_at_of);
+    memset(deferred_at, 0, sizeof deferred_at);
     order_n = 0;
     order[0] = 0;
     verdict_fail_id = 0;
@@ -103,13 +105,35 @@ static void rec_marked(void *ctx, const uint8_t *p, size_t n, uint32_t mark) {
     marked_calls++;
 }
 
-/* d2kd's per-packet order, minus plan execution (no plan installed). */
+static int rec_defer(void *ctx, uint64_t at, uint32_t id, uint32_t v) {
+    (void)ctx;
+    if (id < MAXID) { verdicts_of[id]++; last_verdict[id] = v; deferred_at[id] = at; }
+    if (order_n < sizeof order - 1) { order[order_n++] = 'D'; order[order_n] = 0; }
+    return 0;
+}
+
+/* d2kd's plan execution, recorded: an emit due now is 'e', a deferred one
+ * 'E' (the deferred queue keeps their order).  Returns the last emit time. */
+static uint64_t last_at;
+static uint64_t exec_plan(const d2k_result *r, uint64_t t) {
+    uint64_t at = t;
+    for (size_t k = 0; k < r->n_out; k++) {
+        at += (uint64_t)r->out[k].delay_us * 1000u;
+        if (order_n < sizeof order - 1) { order[order_n++] = at <= t ? 'e' : 'E'; order[order_n] = 0; }
+    }
+    last_at = at;
+    return at;
+}
+
+/* d2kd's per-packet order (d2kd.c), with plan execution recorded. */
 static int run_packet(d2k_session *s, uint32_t id, const uint8_t *pkt, size_t n,
                       uint64_t t, uint64_t seq) {
     uint8_t obuf[4096];
     d2k_key key;
     memset(&key, 0, sizeof key);
     if (seq) { path.seq = seq; }  /* 0: d2kd's own numbering (d2k_udp_path_read) */
+    /* d2kd: a non-neutral client mark is a routed client (task 47). */
+    d2k_session_set_route_mark(s, (cur_mark && cur_mark != out.neutral_mark) ? cur_mark : 0);
     int fed = d2k_udp_path_pre(&path, id, pkt, n, cur_mark, t, &key);
     d2k_result r;
     d2k_session_packet(s, pkt, n, t, obuf, sizeof obuf, &r);
@@ -118,15 +142,24 @@ static int run_packet(d2k_session *s, uint32_t id, const uint8_t *pkt, size_t n,
     if (how == D2K_UDP_PATH_REPLAY) {
         d2k_session_packet(s, b.packets[0], b.len[0], t, obuf, sizeof obuf, &r);
         last_replay_applied = r.applied;
-        (void)d2k_udp_out_batch(&out, &b, D2K_NF_ACCEPT, 0, t, t, path.seq);
+        uint64_t at = exec_plan(&r, t);
+        int owned = r.applied && r.verdict == D2K_VERDICT_DROP;
+        (void)d2k_udp_out_batch(&out, &b, owned ? D2K_NF_DROP : D2K_NF_ACCEPT, owned,
+                                at, t, path.seq);
     } else if (how == D2K_UDP_PATH_NORMAL || how == D2K_UDP_PATH_LOST) {
         int vf = 0;
-        /* d2kd's gate: only a datagram the kernel would get plainly. */
-        if (r.applied || r.verdict != D2K_VERDICT_ACCEPT ||
-            !d2k_udp_out_late(&out, id, pkt, n, cur_mark, t, path.seq, &vf)) {
-            (void)rec_verdict(NULL, id, D2K_NF_ACCEPT);
+        if (r.applied) {
+            uint64_t at = exec_plan(&r, t);
+            int owned = r.verdict == D2K_VERDICT_DROP;
+            (void)rec_verdict(NULL, id, owned ? D2K_NF_DROP : D2K_NF_ACCEPT);
+            if (owned) { (void)d2k_udp_path_planned(&path, pkt, n, cur_mark, at, t); }
+        } else if (r.verdict != D2K_VERDICT_ACCEPT ||
+                   !d2k_udp_out_late(&out, id, pkt, n, cur_mark, t, path.seq, &vf)) {
+            /* d2kd's gate: only a datagram the kernel would get plainly. */
+            (void)rec_verdict(NULL, id, r.verdict == D2K_VERDICT_ACCEPT ? D2K_NF_ACCEPT
+                                                                         : D2K_NF_DROP);
             /* d2kd: a plainly ACCEPTed datagram that opens a client flow. */
-            if (!r.applied && r.verdict == D2K_VERDICT_ACCEPT) {
+            if (r.verdict == D2K_VERDICT_ACCEPT) {
                 (void)d2k_udp_path_passed(&path, pkt, n, cur_mark, t);
             }
         }
@@ -147,6 +180,7 @@ static d2k_session *fresh(d2k_udp_hold **h, d2k_udp_follow **f) {
     out.can_resend = 1;
     out.neutral_mark = 0x2e;
     out.marked = rec_marked;
+    out.defer_verdict = rec_defer;
     cur_mark = 0;
     marked_calls = 0;
     memset(&path, 0, sizeof path);
@@ -526,10 +560,12 @@ static void test_marked_and_ipv6_keep_kernel_path(void) {
         CHECK(verdicts_of[id] == 1 && last_verdict[id] == D2K_NF_ACCEPT && sends_of[id] == 0,
               "marked client: every datagram keeps the kernel path");
     }
-    CHECK(marked_calls == 1, "reported once for the flow");
+    /* Since task 47 the session itself routes a marked flow to the kernel
+       (no plan, no hold) and reports it once. */
+    CHECK(d2k_session_routed_flows(s) == 1, "reported once for the flow");
     done(s, h, f);
 
-    /* Held batch, marked tail. */
+    /* Marked Initials: not held (task 47), kernel path. */
     s = fresh(&h, &f);
     reset();
     cur_mark = 0xffffaaa;
@@ -544,7 +580,8 @@ static void test_marked_and_ipv6_keep_kernel_path(void) {
         CHECK(verdicts_of[id] == 1 && last_verdict[id] == D2K_NF_ACCEPT && sends_of[id] == 0,
               "marked held batch: tails ACCEPTed, not re-sent");
     }
-    CHECK(marked_calls == 1, "held batch reported once");
+    CHECK(d2k_session_routed_flows(s) == 1 && d2k_udp_hold_next_ns(h) == 0,
+          "a marked flow is not even held; reported once");
     /* A late datagram of that marked flow: also the kernel path. */
     d2k_udp_path_read(&path, 11000 + 2 + D2K_UDP_HOLD_WAIT_NS);
     memset(pay, 0xD1, 200);
@@ -592,7 +629,119 @@ static void test_marked_and_ipv6_keep_kernel_path(void) {
     cur_mark = 0;
 }
 
+/* Task 47, req 2: a held QUIC plan with deferred emits takes over the first
+ * datagram: plan emits (now, then deferred), the head's copy dropped, never
+ * ACCEPTed after a raw send; the tails queued behind the deferred head. */
+static void test_deferred_plan_owns_head(void) {
+    uint8_t probe[1600], head[2048], tail[2048], pkt[2200];
+    size_t pl = 0, hn = 0, tn = 0;
+    CHECK(d2k_quic_probe_initial("www.example.com", probe, sizeof probe, &pl) == 0 &&
+          d2k_quic_hello_split(probe, pl, "www.example.com", head, sizeof head, &hn,
+                               tail, sizeof tail, &tn) == 0, "split fixture");
+    if (!hn || !tn) { return; }
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    d2k_plan *p = NULL;
+    char err[160];
+    CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_name_shaped(d2k_session_plans(s),
+              (const uint8_t *)"www.example.com", 15, 1, p, D2K_PLAN_SHAPE_QUIC) == 0,
+          "plan with a 78 ms fake gap");
+    reset();
+    d2k_udp_path_read(&path, 20000);
+    size_t n = build(pkt, 1, 51200, head, hn);
+    CHECK(run_packet(s, 1, pkt, n, 20000, 0) == D2K_UDP_PATH_HELD, "head held");
+    n = build(pkt, 2, 51200, tail, tn);
+    CHECK(run_packet(s, 2, pkt, n, 20001, 0) == D2K_UDP_PATH_REPLAY, "replayed with plan");
+    CHECK(last_replay_applied && last_at > 20001, "plan applied with deferred emits");
+    CHECK(!strcmp(order, "eEEdqd"),
+          "plan emits (now, deferred, deferred original), head copy dropped, tail queued");
+    CHECK(verdicts_of[1] == 1 && last_verdict[1] == D2K_NF_DROP && sends_of[1] == 0,
+          "the head is never ACCEPTed after the plan's raw sends");
+    CHECK(verdicts_of[2] == 1 && last_verdict[2] == D2K_NF_DROP && send_at_of[2] == last_at,
+          "the tail leaves behind the deferred head");
+
+    /* I3: a marked datagram of that flow (a routed client) arriving now must
+       not reach the kernel before the deferred head: its ACCEPT is deferred. */
+    uint64_t at = last_at;
+    cur_mark = 0xffffaaa;
+    uint8_t z[200];
+    memset(z, 0xD1, sizeof z);
+    n = build(pkt, 3, 51200, z, sizeof z);
+    (void)run_packet(s, 3, pkt, n, 20002, 0);
+    CHECK(verdicts_of[3] == 1 && last_verdict[3] == D2K_NF_ACCEPT && deferred_at[3] == at &&
+          sends_of[3] == 0, "marked follower: ACCEPT deferred to the head's time, not re-sent");
+    cur_mark = 0;
+    done(s, h, f);
+}
+
+/* Task 47, req 3: an unheld UDP plan (voice: Discord IP Discovery) owns its
+ * datagram; the datagrams queued behind its raw sends follow it. */
+static void test_unheld_voice_plan_followers(void) {
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    d2k_plan *p = NULL;
+    char err[160];
+    CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0, "plan");
+    d2k_session_set_plan(s, p);
+    reset();
+    uint8_t disc[74], pkt[200];
+    memset(disc, 0, sizeof disc);
+    disc[1] = 1; disc[3] = 70; disc[7] = 7;
+    size_t n = build(pkt, 1, 51300, disc, sizeof disc);
+    pkt[22] = 0xC3; pkt[23] = 0x54;    /* server port 50004 */
+    d2k_udp_path_read(&path, 30000);
+    CHECK(run_packet(s, 1, pkt, n, 30000, 0) == D2K_UDP_PATH_NORMAL, "voice is not held");
+    CHECK(verdicts_of[1] == 1 && last_verdict[1] == D2K_NF_DROP,
+          "the plan owns the voice datagram (sent after its fakes)");
+    uint64_t at = last_at;
+    n = build(pkt, 2, 51300, disc, sizeof disc);
+    pkt[22] = 0xC3; pkt[23] = 0x54;
+    (void)run_packet(s, 2, pkt, n, 30001, 0);
+    CHECK(verdicts_of[2] == 1 && last_verdict[2] == D2K_NF_DROP && sends_of[2] == 1 &&
+          send_at_of[2] == at, "the follower is re-sent behind the plan, its copy dropped");
+    /* Past the window: kernel path. */
+    d2k_udp_path_read(&path, at + D2K_UDP_FOLLOW_NS);
+    n = build(pkt, 3, 51300, disc, sizeof disc);
+    pkt[22] = 0xC3; pkt[23] = 0x54;
+    (void)run_packet(s, 3, pkt, n, at + D2K_UDP_FOLLOW_NS, 0);
+    CHECK(last_verdict[3] == D2K_NF_ACCEPT && sends_of[3] == 0, "later datagram: kernel");
+    done(s, h, f);
+}
+
+/* Rereview4 T2 / N9: an unmarked head with a marked follower — the follower
+ * keeps the kernel path (not re-sent), and the flow is reported once even
+ * when both a batch tail and a late datagram were marked. */
+static void test_marked_follower_of_unmarked_head(void) {
+    d2k_udp_hold *h; d2k_udp_follow *f;
+    d2k_session *s = fresh(&h, &f);
+    uint8_t pay[100], pkt[200];
+    memset(pay, 0x55, sizeof pay);
+    d2k_udp_hold_batch b;
+    memset(&b, 0, sizeof b);
+    b.count = 2;
+    b.ids[0] = 30; b.len[0] = build(b.packets[0], 30, 51400, pay, sizeof pay);
+    b.ids[1] = 31; b.len[1] = build(b.packets[1], 31, 51400, pay, sizeof pay);
+    b.marks[1] = 0xffffaaa;
+    reset();
+    (void)d2k_udp_out_batch(&out, &b, D2K_NF_ACCEPT, 0, 40000, 40000, 5);
+    CHECK(last_verdict[31] == D2K_NF_ACCEPT && sends_of[31] == 0 && marked_calls == 1,
+          "marked batch tail: kernel, reported");
+    size_t n = build(pkt, 32, 51400, pay, sizeof pay);
+    int vf = 0;
+    CHECK(d2k_udp_out_late(&out, 32, pkt, n, 0xffffaaa, 40001, 5, &vf) == 0,
+          "marked late datagram with a live entry: the caller's kernel path");
+    CHECK(sends_of[32] == 0 && marked_calls == 1, "not re-sent, not counted twice");
+    n = build(pkt, 33, 51400, pay, sizeof pay);
+    CHECK(d2k_udp_out_late(&out, 33, pkt, n, 0, 40002, 5, &vf) == 1 &&
+          sends_of[33] == 1, "an unmarked follower still follows (the entry exists)");
+    done(s, h, f);
+}
+
 int main(void) {
+    test_deferred_plan_owns_head();
+    test_unheld_voice_plan_followers();
+    test_marked_follower_of_unmarked_head();
     test_marked_and_ipv6_keep_kernel_path();
     test_unheld_opening_burst();
     test_expiry_read_numbering();

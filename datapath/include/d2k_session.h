@@ -95,6 +95,10 @@ typedef struct {
     uint8_t  first_payload;
     uint8_t  udp_hold_wait;
     uint8_t  udp_hold_ready;
+    /* Task 47: the first packet of a flow whose client carries a routing mark
+       (d2k_session_set_route_mark) — the caller logs it once per flow. */
+    uint8_t  routed_first;
+    uint32_t routed_mark;
 } d2k_result;
 
 
@@ -151,6 +155,14 @@ int d2k_session_stream_anchor(d2k_session *s, const uint8_t *p, size_t n,
                               uint32_t *anchor);
 
 void d2k_session_set_hook(d2k_session *s, uint8_t hook);
+/* КЛИЕНТ С МЕТКОЙ МАРШРУТИЗАЦИИ (задача 47). Ненулевое значение для ТЕКУЩЕГО
+ * пакета: его nfmark выбирает маршрут по политике (Keenetic 0xffffaaa ->
+ * таблица 4096, VPN), а сырые посылки d2k идут со своей меткой мимо этой
+ * таблицы. Такой поток (и его ответы) идёт ядром: ни плана, ни удержания, ни
+ * наблюдения — его поведение принадлежит чужому пути. Собственные метки d2k
+ * (зонды контроллера) вызывающий сюда не передаёт. */
+void d2k_session_set_route_mark(d2k_session *s, uint32_t mark);
+uint64_t d2k_session_routed_flows(const d2k_session *s);
 /* Явное подтверждение конфигурации: правило обратного направления UDP
    установлено. Нужен для распознавания полной тишины на заблокированном QUIC,
    где обратный пакет физически не может прийти. По умолчанию выключено. */

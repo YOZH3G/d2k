@@ -584,6 +584,38 @@ static void test_quic_held_initial_replay_is_first_packet(void) {
     d2k_nat_hook = saved_nat;
 }
 
+/* ЗАДАЧА 47, п. 0: QUIC/голос клиента с меткой маршрутизации — без плана,
+ * без удержания (удерживать незачем: плана не будет, а 100 мс — чистая
+ * задержка), без наблюдения. */
+static void test_routed_client_gets_no_plan_udp(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    d2k_plan *p = NULL;
+    char err[160];
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    CHECK(s && d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_name_shaped(d2k_session_plans(s), (const uint8_t *)"example.com", 11,
+                                      1, p, D2K_PLAN_SHAPE_QUIC) == 0, "routed udp fixture");
+    if (!s) { return; }
+    size_t n = build_udp_pkt(pkt, 50711, 443, v1_initial, sizeof v1_initial);
+    d2k_session_set_route_mark(s, 0xffffaaa);
+    d2k_key key;
+    CHECK(d2k_session_udp_hold_begin(s, pkt, n, 1000, &key) == 0, "a routed Initial is not held");
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(!r.applied && r.n_out == 0 && r.verdict == D2K_VERDICT_ACCEPT && r.routed_first,
+          "routed Initial: no plan, kernel path, reported");
+    CHECK(d2k_session_hellos(s) == 0, "no hello from a foreign path");
+    CHECK(d2k_session_udp_opening(s, pkt, n) == 0, "a routed flow never opens a follow window");
+    d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+    CHECK(!r.routed_first && !r.applied, "once per flow");
+    d2k_session_set_route_mark(s, 0);
+    n = build_udp_pkt(pkt, 50712, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 3000, buf, sizeof buf, &r);
+    CHECK(r.applied, "unmarked client still planned");
+    CHECK(d2k_session_routed_flows(s) == 1, "one routed flow counted");
+    d2k_session_free(s);
+}
+
 /* ЗАДАЧА 46: ПЕРВАЯ ДАТАГРАММА НЕ ЧИТАЕТ ТАБЛИЦУ CONNTRACK.
  *
  * Поле 03.10.2026: спланированный QUIC Initial уходил через 42 мс (против
@@ -1655,6 +1687,7 @@ int main(void) {
     test_quic_split_hold_handshake();
     test_quic_held_initial_replay_is_first_packet();
     test_quic_first_packet_skips_conntrack_scan();
+    test_routed_client_gets_no_plan_udp();
     test_quic_retry_resets_assembly();
     test_quic_original_after_fakes();
     test_quic_crypto_split_plan();
