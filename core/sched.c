@@ -164,6 +164,7 @@
    они идут порциями по SCHED_MAX_PLANS, свежие первыми; own_seen помнит, какие
    уже ставились в очередь, чтобы порции не повторялись. */
 #define SCHED_OWN_SEEN_MAX 256
+#define SCHED_TRIED_MAX 256
 
 /* Зондов на задачу. ЗАМЕРЕНО на живой линии 11.09 (accounts.youtube.com, та
    самая тяжёлая цель, из-за которой ревью 06.09 сказало «восьми мало»):
@@ -714,8 +715,12 @@ typedef struct {
     /* Хэши уже испытанных текстов планов — чтобы перебор не предлагал то, что
        синтез уже дал. Одинаковый текст это один и тот же план, сколько бы
        источников его ни назвало. */
-    uint32_t   tried[SCHED_MAX_PLANS * 4];
+    /* Испытанные тексты. Ёмкость с запасом на фазу своих планов (задача 49:
+       испытываются все подходящие, до бюджета кандидатов); переполнение не
+       молчит — tried_full и строка в журнале (tried_note). */
+    uint32_t   tried[SCHED_TRIED_MAX];
     size_t     n_tried;
+    int        tried_full;
     int64_t    ver_until_ms;
     uint32_t   ver_dropped0;    /* сколько событий было потеряно, когда план встал */
 
@@ -843,6 +848,7 @@ typedef struct {
     int        own_first;
     uint32_t   own_seen[SCHED_OWN_SEEN_MAX]; /* fnv1a текстов, уже поставленных в очередь */
     size_t     n_own_seen;
+    int        own_seen_full; /* своих подходящих больше, чем помнит own_seen */
     /* Испытан ли на проводе i-й свой план (бит i): только такие уходят в
        tried — отвергнутый исполнителем опыта не имел (задача 32, M1). */
     unsigned   own_probed;
@@ -2399,6 +2405,13 @@ static uint64_t fnv1a(const char *s) {
  * молча, а так журнал датапата и каталог показывают человеку буквально одно и
  * то же имя. Строка короче шестнадцати байт всегда: "plan-" плюс восемь
  * знаков. */
+/* Испытанный текст — в tried; переполнение помечается (tried_full = 1) и
+   называется в журнале на ближайшем шаге планирования, а не теряется молча. */
+static void tried_add(task *t, uint32_t h) {
+    if (t->n_tried < sizeof t->tried / sizeof t->tried[0]) t->tried[t->n_tried++] = h;
+    else if (!t->tried_full) t->tried_full = 1;
+}
+
 static void plan_ident(const char *text, char *id, size_t cap,
                        uint8_t wire[D2K_PLAN_ID_LEN]) {
     snprintf(id, cap, "plan-%08x", (unsigned)(fnv1a(text) & 0xFFFFFFFFu));
@@ -2740,9 +2753,7 @@ static int next_rx_volume_plan(d2k_sched *s, task *t, d2k_shape sh,
             if (t->tried[i] == h) { seen = 1; }
         }
         if (seen) { continue; }
-        if (t->n_tried < sizeof t->tried / sizeof t->tried[0]) {
-            t->tried[t->n_tried++] = h;
-        }
+        tried_add(t, h);
         return 1;
     }
     return 0;
@@ -2790,9 +2801,7 @@ static size_t refill_from_fallback(d2k_sched *s, task *t) {
             if (t->tried[i] == h) { seen = 1; }
         }
         if (seen) { continue; }
-        if (t->n_tried < sizeof t->tried / sizeof t->tried[0]) {
-            t->tried[t->n_tried++] = h;
-        }
+        tried_add(t, h);
         snprintf(t->plans[added], sizeof t->plans[added], "%s", text);
         t->plan_boxes[added][0] = '\0';
         added++;
@@ -3224,9 +3233,7 @@ static size_t known_plans(d2k_sched *s, task *t) {
         memcpy(t->plans[took], best->text, strlen(best->text) + 1);
         snprintf(t->plan_boxes[took], sizeof t->plan_boxes[took], "%s", owner->id);
         uint32_t h = fnv1a(best->text);
-        if (t->n_tried < sizeof t->tried / sizeof t->tried[0]) {
-            t->tried[t->n_tried++] = h;
-        }
+        tried_add(t, h);
         took++;
     }
     return took;
@@ -3278,6 +3285,16 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
     const d2k_cat_box *owner[SCHED_MAX_PLANS];
     int64_t fresh[SCHED_MAX_PLANS];
     size_t n = 0;
+    /* fill == 2: сколько ВСЕГО подходящих своих текстов ещё не ставилось в
+       очередь (для честной строки, когда фаза обрывается не по их концу). */
+    uint32_t *distinct = NULL;
+    size_t n_distinct = 0;
+    if (fill == 2) {
+        size_t all = 0;
+        for (size_t bi = 0; bi < s->cat->n_boxes; bi++) all += s->cat->boxes[bi].n_plans;
+        distinct = all ? malloc(all * sizeof *distinct) : NULL;
+        if (!distinct) return 0;
+    }
     for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
         const d2k_cat_box *b = &s->cat->boxes[bi];
         for (size_t i = 0; i < b->n_plans; i++) {
@@ -3307,6 +3324,12 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
             for (size_t k = 0; k < t->n_tried && !tried; k++) tried = t->tried[k] == h;
             for (size_t k = 0; k < t->n_own_seen && !tried; k++) tried = t->own_seen[k] == h;
             if (tried) continue;
+            if (distinct) {
+                int known = 0;
+                for (size_t k = 0; k < n_distinct && !known; k++) known = distinct[k] == h;
+                if (!known) distinct[n_distinct++] = h;
+                continue;
+            }
             /* Тот же текст в другой коробке — тот же план: остаётся лучший. */
             size_t dup = n;
             for (size_t k = 0; k < n; k++) if (!strcmp(pick[k]->text, p->text)) dup = k;
@@ -3329,12 +3352,18 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
             n++;
         }
     }
+    /* Порция не больше, чем помнит own_seen: незапомненный план вернулся бы
+       следующей порцией снова (повторное ревью, Minor 2). Память кончилась —
+       фаза своих планов кончилась; вызывающий скажет об этом. */
+    if (distinct) { free(distinct); return n_distinct; }
+    size_t room = SCHED_OWN_SEEN_MAX - t->n_own_seen;
+    if (n > room) { n = room; t->own_seen_full = 1; }
     if (!fill) return n;
     t->fb_queue = 0;
     for (size_t k = 0; k < n; k++) {
         snprintf(t->plans[k], sizeof t->plans[k], "%s", pick[k]->text);
         snprintf(t->plan_boxes[k], sizeof t->plan_boxes[k], "%s", owner[k]->id);
-        if (t->n_own_seen < SCHED_OWN_SEEN_MAX) t->own_seen[t->n_own_seen++] = fnv1a(pick[k]->text);
+        t->own_seen[t->n_own_seen++] = fnv1a(pick[k]->text);
     }
     t->own_probed = 0;
     return n;
@@ -6804,12 +6833,17 @@ static void own_first_continue(d2k_sched *s, task *t) {
     /* Испытанные на проводе свои планы полный прогон второй раз не берёт. */
     for (size_t k = 0; k < t->n_plans && k < 32; k++) {
         if (!(t->own_probed & (1u << k))) continue;
-        if (t->n_tried < sizeof t->tried / sizeof t->tried[0])
-            t->tried[t->n_tried++] = fnv1a(t->plans[k]);
+        tried_add(t, (uint32_t)fnv1a(t->plans[k]));
     }
     t->own_probed = 0;
     t->seed_use = 1;
     t->own_first = 3;
+    /* СРОК ЖИЗНИ — ЗАНОВО (задача 49, повторное ревью A). Фаза своих планов
+       конечна сама (каждый текст в очереди один раз), а полному замеру нужен
+       свой целый SCHED_TASK_LIFE_MS: иначе десятки своих планов съедали бы
+       его срок, и цель, которую замер нашёл бы, уходила в отдых. Страховка
+       от зацикливания остаётся у каждой фазы. */
+    t->started_ms = s->now_ms;
     t->n_plans = t->n_known = t->next_plan = 0;
     t->exec_refused = t->exec_probed = 0;
     t->cached_measure_valid = 0;
@@ -7942,6 +7976,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         }
 
         if (t->state == T_PLANNING) {
+            if (t->tried_full == 1) {
+                t->tried_full = 2;
+                say(s, "по %s список испытанных планов полон (%d) — дальше уже испытанный "
+                       "план может быть предложен повторно", t->name, SCHED_TRIED_MAX);
+            }
             if (now_ms < t->rx_retry_after_ms) continue;
             int inst = install_next(s, t);
             if (inst == -2) {
@@ -7959,12 +7998,27 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        tried, как в own_first_continue. */
                     for (size_t k = 0; k < t->n_plans && k < 32; k++) {
                         if (!(t->own_probed & (1u << k))) continue;
-                        if (t->n_tried < sizeof t->tried / sizeof t->tried[0])
-                            t->tried[t->n_tried++] = fnv1a(t->plans[k]);
+                        tried_add(t, (uint32_t)fnv1a(t->plans[k]));
                     }
                     t->own_probed = 0;
                     trial_retire(s, t);
                     ver_close(t);
+                    /* Фаза оборвана не концом своих планов (повторное ревью,
+                       Minor 1–2): кончился бюджет кандидатов или память
+                       own_seen. Сказать прямо, сколько НЕ испытано, и не
+                       называть их «не подтвердившимися». */
+                    if (t->probes >= SCHED_MAX_PROBES || t->own_seen_full) {
+                        size_t left = (t->next_plan < t->n_plans ? t->n_plans - t->next_plan : 0) +
+                                      own_first_plans(s, t, 2);
+                        say(s, "по %s свои подтверждённые планы испытаны не все: %s; "
+                               "НЕ испытано %zu — продолжаю полный замер донора",
+                            t->name, t->own_seen_full
+                                ? "их больше, чем помнит фаза своих планов"
+                                : "кончился бюджет кандидатов задачи", left);
+                        own_first_continue(s, t);
+                        moved++;
+                        continue;
+                    }
                     size_t more = own_first_plans(s, t, 1);
                     if (more > 0) {
                         t->n_plans = t->n_known = more;

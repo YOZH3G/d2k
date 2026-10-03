@@ -10993,6 +10993,79 @@ own_first_test:
             ver_fail_first = 0;
         }
 
+        /* (c4) ЗАДАЧА 49, повторное ревью A: фаза своих планов не съедает
+           срок полного замера. Свои планы шли 9 мин, полный замер — ещё 3:
+           от начала поиска 12 мин, больше SCHED_TASK_LIFE_MS. Замер обязан
+           дойти до вердикта, а не быть брошенным «не уложился». */
+        {
+            d2k_catalog c = {0};
+            char pa[40], pb[40];
+            own_box(&c, "box-life-a", pa, 41, 1, "a.life.own", 6, D2K_SHAPE_MODERN, 4, 1790000100, 0);
+            own_box(&c, "box-life-b", pb, 42, 1, "b.life.own", 6, D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_HANDSHAKE;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            tcp_wait_until_stop = 1; tcp_release_waiters = 0; tcp_saw_stop = 0;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5);
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42151;
+            d2k_ev h = ev_hello(6, 42151, "life.target.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42151); d2k_sched_event(s, &su);
+            for (int i = 0; i < 40 && !said("пробую свои подтверждённые планы"); i++) spin(s, 20);
+            skip_ahead(s, 9 * 60 * 1000);
+            for (int i = 0; i < 60 && tcp_calls == 0; i++) { skip_ahead(s, 6000); spin(s, 20); }
+            CHECK(tcp_calls == 1, "own-first life: полный замер не начался после своих планов");
+            skip_ahead(s, 3 * 60 * 1000);
+            spin(s, 40);
+            tcp_release_waiters = 1;
+            settle(s);
+            CHECK(!tcp_saw_stop && !said("не уложился"),
+                  "own-first life: фаза своих планов съела срок полного замера");
+            CHECK(said("прямой замер не подтвердил блокировку") || said("вердикт:"),
+                  "own-first life: полный замер не дошёл до итога");
+            tcp_wait_until_stop = 0; tcp_release_waiters = 0;
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+
+        /* (c5) Повторное ревью, Minor 1: своих планов больше бюджета
+           кандидатов задачи. Кончился бюджет — так и сказано, с числом НЕ
+           испытанных; «не подтвердились» про неиспытанные не говорится; дальше
+           полный замер. Порции после бюджета не прокручиваются. */
+        {
+            int budget = (int)(D2K_PROPS_QUESTIONS + 8 + D2K_RX_VOLUME_PLAN_VARIANTS +
+                               d2k_fallback_arms());
+            int n_own = budget + 3;
+            d2k_catalog c = {0};
+            for (int k = 0; k < n_own; k++) {
+                char box[32], tgt[48], id[40];
+                snprintf(box, sizeof box, "box-budget-%d", k);
+                snprintf(tgt, sizeof tgt, "b%d.budget.own", k);
+                own_box(&c, box, id, (unsigned)(100 + k), 1, tgt, 6, D2K_SHAPE_MODERN, 4,
+                        1790002000 - k, 0);
+            }
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_HANDSHAKE;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5);
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42161;
+            d2k_ev h = ev_hello(6, 42161, "budget.target.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42161); d2k_sched_event(s, &su);
+            for (int i = 0; i < 4000 && tcp_calls == 0; i++) { skip_ahead(s, 1000); spin(s, 3); }
+            settle(s);
+            CHECK(tcp_calls == 1, "own-first budget: полный замер не пошёл после бюджета своих планов");
+            CHECK(said("НЕ испытано"), "own-first budget: не сказано, сколько своих планов не испытано");
+            CHECK(!said("свои подтверждённые планы не подтвердились"),
+                  "own-first budget: неиспытанные планы названы неподтвердившимися");
+            CHECK(ver_calls < n_own, "own-first budget: испытано больше, чем позволяет бюджет");
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+
         /* (d) Формы, транспорты и семейства не смешиваются; помеченная к
            перепроверке и выключенная привязка — не подтверждённое знание. */
         {
