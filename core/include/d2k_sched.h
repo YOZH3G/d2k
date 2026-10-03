@@ -184,6 +184,16 @@ typedef d2k_vres (*d2k_sched_tcp_seeded_fn)(const char *ip, uint16_t port,
                                             const volatile sig_atomic_t *stop,
                                             const d2k_base_seed *seed);
 extern d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook;
+/* ПРИНИМАЕТ ЛИ АДРЕС ДАННЫЕ (задача 54, fix round 1 I2). Перепроверка
+ * адреса, у которого есть вердикт address, начинается с этого вопроса ДО
+ * любого зонда с триггером: один нейтральный байт, ожидание подтверждения TCP
+ * сервера (d2k_probe_data_ack), до первого подтверждения из трёх.
+ * Возврат: 1 — подтверждён; 0 — тишина на всех повторах; <0 — не измерено.
+ * probes — сколько соединений стоил вопрос. NULL — вопроса нет, перепроверка
+ * идёт обычным путём. */
+typedef int (*d2k_sched_tcp_ack_fn)(const char *ip, uint16_t port, uint32_t mark,
+                                    const volatile sig_atomic_t *stop, int *probes);
+extern d2k_sched_tcp_ack_fn d2k_sched_tcp_ack_hook;
 /* То же для QUIC: базовый вопрос — контроль живости и прямой зонд нашим
  * Initial (d2k_quic_base); полный прогон с ответом — d2k_quic_run_seeded.
  * NULL (умолчание) — шага своих планов для QUIC нет, прогон как прежде. */

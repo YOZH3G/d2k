@@ -399,6 +399,7 @@ d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
 d2k_sched_ech_resolve_fn d2k_sched_ech_resolve_hook = d2k_ech_resolve;
 d2k_sched_tcp_fn  d2k_sched_tcp_base_hook = NULL;
 d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook = NULL;
+d2k_sched_tcp_ack_fn d2k_sched_tcp_ack_hook = NULL;
 d2k_sched_quic_base_fn  d2k_sched_quic_base_hook = NULL;
 d2k_sched_quic_seeded_fn d2k_sched_quic_seeded_hook = NULL;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
@@ -636,6 +637,13 @@ typedef struct {
        этими байтами. Флаг stop для этого не годится — его взводит и
        join_worker. */
     int        snap_stop;
+    /* ЗАДАЧА 54, I2. addr_recheck — адрес задачи держит вердикт address, и
+       прогон начинается с нейтрального байта до любого триггера (ставит
+       главный поток при старте поиска, снимает рабочий, задав вопрос).
+       addr_ack — исход этого вопроса в текущем прогоне: 1 подтверждён,
+       2 тишина (вердикт address подтверждён без триггеров), 0 не задавался. */
+    int        addr_recheck;
+    int        addr_ack;
     uint8_t    snap[2048];
     size_t     snap_len;
     /* То же для QUIC: целый Initial клиента ЭТОЙ цели, пойманный во время
@@ -989,13 +997,25 @@ typedef struct {
     int        exhausted;
     int        ech_input;
     int        late_rst_only; /* глушит только поздние RST/объёмные триггеры */
-    /* ЗАДАЧА 54: замер доказал, что адрес не принимает данных (вердикт
-       address). Отсрочка — только для ЭТОГО адреса: у имени бывают другие
-       адреса, и их тишина не доказана. */
-    int        addr_dead;
-    char       addr[INET6_ADDRSTRLEN];
     int        used;
 } target_cooldown;
+
+/* МЁРТВЫЙ АДРЕС (задача 54). Замер доказал, что адрес после рукопожатия не
+   принимает данных (вердикт address). Ключ — имя+транспорт+семейство+АДРЕС,
+   отдельно от отсрочек имени: у имени бывают другие адреса, их исходы эту
+   запись не трогают, и она не глушит их (fix round 1, I1). Запись живёт и
+   после срока: её ступень растёт 10/30/60 мин, пока перепроверка (один
+   нейтральный байт до любого триггера, I2) снова видит тишину. Снимается,
+   только когда этот адрес данные принял. */
+typedef struct {
+    char       name[256];
+    uint8_t    transport;
+    uint8_t    family;
+    char       addr[INET6_ADDRSTRLEN];
+    uint8_t    streak;
+    int64_t    until_ms;
+    int        used;
+} dead_address;
 
 /* Первый поздний RST цели, ждущий второго по независимому flow key. */
 typedef struct {
@@ -1028,6 +1048,7 @@ struct d2k_sched {
     seen_name    seen[SCHED_SEEN];
     size_t       seen_next;   /* кольцо: старое вытесняется, а не отказывает */
     target_cooldown cooldowns[SCHED_COOLDOWN_SLOTS];
+    dead_address    dead_addrs[SCHED_COOLDOWN_SLOTS];
     late_rst_pending late_rst[SCHED_LATE_RST_SLOTS];
     size_t       late_rst_next;
     struct { d2k_resource ref; int64_t expires_ms; } resources[8];
@@ -1496,19 +1517,54 @@ static target_cooldown *cooldown_find(d2k_sched *s, const char *name,
     return NULL;
 }
 
+static dead_address *dead_find(d2k_sched *s, const char *name, uint8_t transport,
+                               uint8_t family, const char *addr) {
+    if (!s || !name || !name[0] || !addr || !addr[0]) { return NULL; }
+    for (size_t i = 0; i < SCHED_COOLDOWN_SLOTS; i++) {
+        dead_address *d = &s->dead_addrs[i];
+        if (d->used && d->transport == transport && d->family == (family ? family : 4) &&
+            strcmp(d->name, name) == 0 && strcmp(d->addr, addr) == 0) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+static int64_t clear_backoff_ms(unsigned streak);
+
+/* Ступень лестницы мёртвого адреса; возвращает отсрочку. */
+static int64_t dead_step(d2k_sched *s, const task *t) {
+    dead_address *d = dead_find(s, t->name, t->transport, t->family, t->ip);
+    if (!d) {
+        /* Свободная запись, иначе та, чья отсрочка кончилась раньше всех. */
+        for (size_t i = 0; i < SCHED_COOLDOWN_SLOTS; i++) {
+            dead_address *c = &s->dead_addrs[i];
+            if (!c->used) { d = c; break; }
+            if (!d || c->until_ms < d->until_ms) { d = c; }
+        }
+        memset(d, 0, sizeof *d);
+        snprintf(d->name, sizeof d->name, "%s", t->name);
+        snprintf(d->addr, sizeof d->addr, "%s", t->ip);
+        d->transport = t->transport;
+        d->family = t->family ? t->family : 4;
+        d->used = 1;
+    }
+    if (d->streak < UINT8_MAX) { d->streak++; }
+    int64_t delay = clear_backoff_ms(d->streak);
+    d->until_ms = s->now_ms + delay;
+    return delay;
+}
+
+static void dead_clear(d2k_sched *s, const task *t) {
+    dead_address *d = dead_find(s, t->name, t->transport, t->family, t->ip);
+    if (d) { memset(d, 0, sizeof *d); }
+}
+
 static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
-                           uint8_t family, uint8_t signal_code, const char *srv_ip,
-                           int64_t *remaining_ms) {
+                           uint8_t family, uint8_t signal_code, int64_t *remaining_ms) {
     target_cooldown *c = cooldown_find(s, name, transport, family);
     if (!c) { return 0; }
     if (s->now_ms >= c->until_ms) { return 0; }
-    if (c->addr_dead) {
-        /* Мёртвый адрес мёртв для любого симптома; другой адрес имени —
-           другое наблюдение и мерится сразу. */
-        if (!srv_ip || strcmp(srv_ip, c->addr) != 0) { return 0; }
-        if (remaining_ms) { *remaining_ms = c->until_ms - s->now_ms; }
-        return 1;
-    }
     /* Неубедительная пара поздних RST (вид 3) говорит только о позднем
        обрыве ответа. Блокировка на рукопожатии (обычный RST, таймаут SNI) —
        другое наблюдение и мерится сразу (финальное ревью, п.4). */
@@ -1559,8 +1615,8 @@ static target_cooldown *cooldown_victim(d2k_sched *s) {
 }
 
 /* kind: 0 = direct CLEAR, 1 = anti-bot challenge, 2 = exhausted/incomplete search,
-   3 = inconclusive late-RST pair (suppresses only late-RST/volume triggers),
-   4 = the measured address accepts no data (TCP verdict address, task 54). */
+   3 = inconclusive late-RST pair (suppresses only late-RST/volume triggers).
+   A dead address (task 54) is not a name cooldown: see dead_address. */
 static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     if (!s || !t || !t->name[0]) { return; }
     target_cooldown *c = cooldown_find(s, t->name, t->transport, t->family);
@@ -1572,12 +1628,6 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
         c->family = t->family;
         c->used = 1;
     }
-    if (kind != 4 && c->addr_dead) {
-        /* Любой другой исход по имени — уже не про мёртвый адрес. */
-        c->addr_dead = 0;
-        c->addr[0] = '\0';
-        c->negative_streak = 0;
-    }
     if (kind == 1) {
         c->challenge = 1;
         c->exhausted = 0;
@@ -1587,21 +1637,6 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
         return;
     }
     if (c->challenge && s->now_ms < c->until_ms) { return; }
-    if (kind == 4) {
-        /* Нарастающая отсрочка, как у повторного CLEAR: блок адреса может
-           быть снят, и проверять это надо, но не каждые 10 минут. Счёт
-           ведётся только подряд идущими блоками ТОГО ЖЕ адреса. */
-        if (!c->addr_dead || strcmp(c->addr, t->ip) != 0) { c->negative_streak = 0; }
-        if (c->negative_streak < UINT8_MAX) { c->negative_streak++; }
-        c->addr_dead = 1;
-        snprintf(c->addr, sizeof c->addr, "%s", t->ip);
-        c->challenge = 0;
-        c->exhausted = 0;
-        c->late_rst_only = 0;
-        c->signal_code = t->trigger_code;
-        c->until_ms = s->now_ms + clear_backoff_ms(c->negative_streak);
-        return;
-    }
     if (kind == 3) {
         /* Не ослаблять уже действующий общий запрет вида 2. */
         if (c->exhausted && !c->late_rst_only && s->now_ms < c->until_ms) { return; }
@@ -2082,6 +2117,38 @@ static void *worker_run(void *vp) {
        (family_reuse == 1). Поле 02.10.2026: объём первым ждал 14–20 с
        таймаута «нет TLS» на целях, режущихся на рукопожатии. QUIC сюда не
        попадает. */
+    if (t->transport == 6 && t->addr_recheck && d2k_sched_tcp_ack_hook && !t->stop) {
+        /* ЗАДАЧА 54, I2. Перепроверка адреса с вердиктом address — ПЕРВЫМ
+           вопросом, до любого зонда с триггером (база, свои планы, дерево):
+           коробка, которая наказывает адрес за увиденный триггер, иначе
+           выглядела бы мёртвым адресом. Один байт, без имени. */
+        int probes = 0;
+        int rc = d2k_sched_tcp_ack_hook(t->ip, t->port, s->measure_mark, &t->stop, &probes);
+        pthread_mutex_lock(&s->mu);
+        t->addr_recheck = 0;
+        t->addr_ack = rc > 0 ? 1 : rc == 0 ? 2 : 0;
+        if (rc == 0) {
+            memset(&t->res, 0, sizeof t->res);
+            t->res.verdict = D2K_V_ADDRESS;
+            snprintf(t->res.reason, sizeof t->res.reason,
+                     "перепроверка: сервер по-прежнему не подтверждает нейтральный байт "
+                     "(0 из 3), триггеров в этот раз не было");
+            ask_settle(t, probes);
+            t->res_ready = 1;
+            pthread_mutex_unlock(&s->mu);
+            ssize_t ign_ack = write(s->wake[1], "w", 1); (void)ign_ack;
+            return NULL;
+        }
+        pthread_mutex_unlock(&s->mu);
+        if (rc > 0) {
+            say(s, "по %s адрес %s принял нейтральный байт — вердикт address снят: прежнее "
+                   "молчание вызывал триггер; иду обычным путём", t->name, t->ip);
+        } else {
+            say(s, "по %s нейтральный байт перепроверки адреса %s не измерен (локальная "
+                   "ошибка или подтверждение TCP не наблюдается) — вердикт address не "
+                   "подтверждён и не снят, перепроверка идёт обычным путём", t->name, t->ip);
+        }
+    }
     if (t->transport == 6 && t->ech_offer) {
         /* НАСТОЯЩИЙ ECH ИЛИ GREASE (задача 41). По байтам они неотличимы
          * намеренно (RFC 9849 §6.2): Chromium/Electron без ECHConfig шлёт
@@ -4916,6 +4983,9 @@ static int start_search(d2k_sched *s, task *t) {
                        !t->family_reuse && own_first_plans(s, t, 0) > 0 ? 1 : 0;
     t->researched = 1;
     t->state = T_ASKING;
+    t->addr_ack = 0;
+    t->addr_recheck = t->transport == 6 &&
+                      dead_find(s, t->name, t->transport, t->family, t->ip) != NULL;
     t->asked_shape = t->ech_offer ? D2K_LINK_SHAPE_ECH_TCP :
         (uint8_t)(t->transport == 17 ? D2K_SHAPE_UNKNOWN : d2k_hello_shape(t->trig, t->trig_len));
     if (start_worker(s, t, JOB_CLASSIFY) != 0) {
@@ -5743,18 +5813,22 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         return 0;
     }
     int64_t cooldown_left_ms = 0;
-    char cool_srv[INET6_ADDRSTRLEN];
-    {
-        uint16_t cool_port = 0;
-        server_of(ev, cool_srv, sizeof cool_srv, &cool_port);
+    if (ev->transport == 6) {
+        /* Мёртвый адрес мёртв для любого симптома; другие адреса имени — своё
+           наблюдение (задача 54). */
+        char srv[INET6_ADDRSTRLEN];
+        uint16_t srv_port = 0;
+        server_of(ev, srv, sizeof srv, &srv_port);
+        dead_address *d = dead_find(s, name, ev->transport, ev->family, srv);
+        if (d && s->now_ms < d->until_ms) {
+            say(s, "по %s (TCP) замер отложен после блока адреса %s ещё примерно %lld мин",
+                name, srv, (long long)((d->until_ms - s->now_ms + 59999) / 60000));
+            return 0;
+        }
     }
-    if (cooldown_blocks(s, name, ev->transport, ev->family, ev->code, cool_srv,
-                        &cooldown_left_ms)) {
+    if (cooldown_blocks(s, name, ev->transport, ev->family, ev->code, &cooldown_left_ms)) {
         target_cooldown *cool = cooldown_find(s, name, ev->transport, ev->family);
-        char addr_reason[INET6_ADDRSTRLEN + 32];
-        snprintf(addr_reason, sizeof addr_reason, "блока адреса %s", cool_srv);
-        const char *reason = cool && cool->addr_dead ? addr_reason :
-                             cool && cool->challenge ? "антибот-ответа" :
+        const char *reason = cool && cool->challenge ? "антибот-ответа" :
                              cool && cool->exhausted ? "неподтверждённого прошлого замера" :
                              "повторного CLEAR";
         /* Транспорт — часть ключа отдыха и называется вслух: поле 03.10,
@@ -7481,6 +7555,19 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
+            if (t->addr_ack == 2) {
+                /* Перепроверка мёртвого адреса: тишина без единого триггера —
+                   вердикт подтверждён, ступень лестницы растёт. */
+                t->addr_ack = 0;
+                int64_t delay_ms = dead_step(s, t);
+                say(s, "по %s адрес %s не принимает данных (%s) — средствами d2k это не "
+                       "обходится; повторная проверка этого адреса через %lld мин",
+                    t->name, t->ip, r.reason, (long long)((delay_ms + 59999) / 60000));
+                task_fail(s, t, now_ms);
+                moved++;
+                continue;
+            }
+            if (t->addr_ack == 1 && t->transport == 6) { dead_clear(s, t); }
             if (t->ech_regrade) {
                 /* GREASE (задача 49): тот же вход, теперь как обычное
                    приветствие — сперва свои подтверждённые планы той же
@@ -7686,24 +7773,41 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++; continue;
             }
             if (r.verdict == D2K_V_ADDRESS && t->transport == 6 && !volume_proven &&
+                !t->ech_trial && t->addr_ack == 1) {
+                /* ЗАДАЧА 54, I2. Этот же прогон начался с подтверждённого
+                   нейтрального байта, а после триггеров адрес замолчал: это
+                   штраф коробки за триггер, а не блок адреса. Address здесь
+                   был бы ложью; честно — неубедительно. */
+                t->addr_ack = 0;
+                say(s, "по %s адрес %s принимает данные до триггера и глохнет только после "
+                       "триггера — это штраф коробки, а не блок адреса; результат неубедителен, "
+                       "повторный замер отложен на %lld мин",
+                    t->name, t->ip, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
+                cooldown_record(s, t, 2);
+                task_fail(s, t, now_ms);
+                moved++;
+                continue;
+            }
+            if (r.verdict == D2K_V_ADDRESS && t->transport == 6 && !volume_proven &&
                 !t->ech_trial) {
                 /* ЗАДАЧА 54. Адрес после рукопожатия не принимает данных —
-                   это доказанный исход, а не «неубедительно»: план тут не
-                   поможет никакой (десинк меняет вид байт, а не доставку),
-                   и кругом по 10 минут гонять замер незачем. Каталог не
-                   трогаем: это наблюдение об адресе, не решение. */
-                cooldown_record(s, t, 4);
-                target_cooldown *cool = cooldown_find(s, t->name, t->transport, t->family);
-                int64_t delay_ms = cool ? clear_backoff_ms(cool->negative_streak)
-                                        : SCHED_CLEAR_BACKOFF_1_MS;
+                   доказанный исход, а не «неубедительно»: план тут не поможет
+                   никакой (десинк меняет вид байт, а не доставку). Отсрочка —
+                   этому адресу, лестницей; каталог не трогаем. Сюда же идёт
+                   address дерева после полного перебора при поручительстве за
+                   контроль (control_vouched; планировщик его не ставит). */
+                int64_t delay_ms = dead_step(s, t);
                 say(s, "по %s адрес %s не принимает данных (%s) — средствами d2k это не "
-                       "обходится; повторная проверка этого адреса через %lld мин, другие "
-                       "адреса имени мерятся как обычно",
+                       "обходится; повторная проверка этого адреса через %lld мин (сначала "
+                       "одним нейтральным байтом, без триггера), другие адреса имени мерятся "
+                       "как обычно",
                     t->name, t->ip, r.reason, (long long)((delay_ms + 59999) / 60000));
                 task_fail(s, t, now_ms);
                 moved++;
                 continue;
             }
+            if (t->transport == 6) { dead_clear(s, t); }
+            t->addr_ack = 0;
             if (!verdict_proves_block(r.verdict) && !volume_proven && !t->ech_trial) {
                 say(s, "по %s прямой замер не подтвердил блокировку (%s: %s) — "
                        "подбор и применение обхода не запускаю",

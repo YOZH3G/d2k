@@ -42,6 +42,12 @@
 #ifndef SO_MARK
 #define SO_MARK 36
 #endif
+/* Роутеры — Linux: без TIOCOUTQ вопрос neutral-ack молча выродился бы в
+ * «не наблюдается», и замер вернулся бы к перебору по таймаутам (задача 54).
+ * Пусть это будет видно в день сборки, а не в поле. */
+#if defined(__linux__) && !defined(TIOCOUTQ)
+#error "TIOCOUTQ не определён: подтверждение данных (neutral-ack) не наблюдается"
+#endif
 #if defined(__APPLE__) && !defined(SO_NWRITE)
 #define SO_NWRITE 0x1024 /* скрыт строгим _POSIX_C_SOURCE */
 #endif

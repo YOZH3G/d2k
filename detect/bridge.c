@@ -385,6 +385,38 @@ static int base_stop(void *ctx)
     return b->base_done || stop_asked((void *)(uintptr_t)b->task_stop);
 }
 
+/* ПЕРЕПРОВЕРКА МЁРТВОГО АДРЕСА (задача 54, fix round 1 I2): тот же вопрос,
+ * что в дереве (neutral-ack), но отдельно и ПЕРВЫМ — до любого триггера.
+ * До первого подтверждения из repeats (умолчание измерителя); тишина на всех
+ * — 0, подтверждение — 1, локальная ошибка/ненаблюдаемо/отмена — -1.
+ * probes — сколько соединений стоил вопрос. */
+int d2k_detect_sched_tcp_ack(const char *ip, uint16_t port, uint32_t mark,
+                             const volatile sig_atomic_t *stop, int *probes)
+{
+    d2k_opts opt;
+    char ports[16], err[160];
+    int i;
+    if (probes) { *probes = 0; }
+    if (!ip || !ip[0] || port == 0) { return -1; }
+    memset(&opt, 0, sizeof opt);
+    d2k_opts_defaults(&opt);
+    opt.mark = mark;
+    opt.cancel.fn = stop_asked;
+    opt.cancel.ctx = (void *)(uintptr_t)stop;
+    snprintf(ports, sizeof ports, "%u", (unsigned)port);
+    for (i = 0; i < opt.repeats; i++) {
+        int rc;
+        if (stop_asked((void *)(uintptr_t)stop)) { return -1; }
+        err[0] = '\0';
+        rc = d2k_probe_data_ack(ip, ports, &opt, err, sizeof err);
+        if (rc == -2) { return -1; }
+        if (probes) { (*probes)++; }
+        if (rc < 0) { return -1; }
+        if (rc > 0) { return 1; }
+    }
+    return 0;
+}
+
 d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
                                    d2k_hello trigger, d2k_hello control,
                                    uint32_t mark, int repeats,

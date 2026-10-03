@@ -1656,6 +1656,19 @@ static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
     confirm_transport(cat, link_fd, target, cport, 6);
 }
 
+/* Задача 54: нейтральный байт перепроверки мёртвого адреса. */
+static int ack_calls;
+static int ack_answer;
+static char ack_last_ip[64];
+static int stub_ack(const char *ip, uint16_t port, uint32_t mark,
+                    const volatile sig_atomic_t *stop, int *probes) {
+    (void)port; (void)mark; (void)stop;
+    ack_calls++;
+    snprintf(ack_last_ip, sizeof ack_last_ip, "%s", ip ? ip : "");
+    if (probes) *probes = ack_answer > 0 ? 1 : 3;
+    return ack_answer;
+}
+
 /* ЗАДАЧА 32: базовый вопрос донора отдельно от полного прогона. base_blocked —
    «триггер целиком не прошёл ни разу», это и есть подтверждённая блокировка на
    рукопожатии, после которой планировщик сначала пробует свои планы. */
@@ -2830,72 +2843,174 @@ int main(int argc, char **argv) {
     tcp_answer = D2K_V_OPAQUE;
 
     /* ЗАДАЧА 54. Поле 04.10, cdn.cookielaw.org: адрес 104.18.86.42 после
-       рукопожатия не принимает никаких данных, замер это теперь доказывает
-       (вердикт address). Это не «результат неубедителен» с десятиминутным
-       кругом: обходить содержимым нечего, повторная проверка адреса — по
-       нарастающей отсрочке (10/30/60 мин), и только ЭТОГО адреса: другой
-       адрес того же имени (104.18.87.42 у владельца работает) мерится сразу. */
+       рукопожатия не принимает никаких данных, замер это доказывает (вердикт
+       address). Это не «результат неубедителен» с десятиминутным кругом:
+       отсрочка нарастает 10/30/60 мин и ключ у неё — имя+адрес+семейство
+       (fix round 1, I1); перепроверка такого адреса начинается с ОДНОГО
+       нейтрального байта до любого зонда с триггером (I2): тишина — вердикт
+       подтверждён без триггеров, подтверждение — молчание вызывал триггер,
+       вердикт снят, обычный путь. */
     {
         d2k_catalog c_addr = {0};
         d2k_sched *s = d2k_sched_new(&c_addr, sv[0], 0x2d);
         CHECK(s != NULL, "task54: планировщик не завёлся");
         if (s) {
             const char *name = "dead.address.example";
+            d2k_sched_tcp_ack_hook = stub_ack;
             tcp_calls = quic_calls = 0;
+            ack_calls = 0; ack_answer = 0;
             tcp_answer = D2K_V_ADDRESS;
             saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
-            d2k_ev h1 = ev_hello(6, 41301, name);
-            d2k_sched_event(s, &h1);
-            d2k_ev r1 = ev_suspect(6, 41301);
-            CHECK(d2k_sched_event(s, &r1) == 1, "task54: подозрение не запустило замер");
-            settle(s);
-            CHECK(tcp_calls == 1 && strcmp(tcp_last_ip, "127.0.0.1") == 0,
+            /* A — 127.0.0.1 (мёртвый), B — 127.0.0.2 (DNS чередует). */
+            #define T54_EV(port, last, code_) do { \
+                d2k_ev h_ = ev_hello(6, (port), name); h_.low_ip[3] = (last); \
+                d2k_sched_event(s, &h_); \
+                d2k_ev r_ = ev_suspect(6, (port)); r_.low_ip[3] = (last); \
+                if (code_) r_.code = (code_); \
+                t54_rc = d2k_sched_event(s, &r_); settle(s); } while (0)
+            int t54_rc;
+            T54_EV(41301, 1, 0);
+            CHECK(t54_rc == 1 && tcp_calls == 1 && strcmp(tcp_last_ip, "127.0.0.1") == 0,
                   "task54: замер адреса не прошёл");
+            CHECK(ack_calls == 0, "task54: первый замер спросил нейтральный байт вне дерева");
             CHECK(!said("результат неубедителен"),
                   "task54: доказанный блок адреса назван неубедительным");
             CHECK(said("по dead.address.example адрес 127.0.0.1 не принимает данных"),
                   "task54: блок адреса не назван в журнале");
+            CHECK(said("через 10 мин"), "task54: первая ступень не 10 мин");
             CHECK(bindings_of(&c_addr, name, 6) == 0 && c_addr.n_boxes == 0,
                   "task54: блок адреса записал обход");
 
-            /* Через 11 минут прежний 10-минутный круг запускал бы тот же
-               замер снова; теперь первая отсрочка — 10 мин, вторая — 30. */
-            skip_ahead(s, 11 * 60 * 1000);
-            d2k_ev h2 = ev_hello(6, 41302, name);
-            d2k_sched_event(s, &h2);
-            d2k_ev r2 = ev_suspect(6, 41302);
-            d2k_sched_event(s, &r2);
-            settle(s);
-            CHECK(tcp_calls == 2, "task54: по истечении первой отсрочки адрес не перепроверен");
+            /* Другой адрес имени мерится сразу и исходом (inconclusive,
+               отсрочка имени вида 2) лестницу A не сбрасывает (I1). */
+            tcp_answer = D2K_V_INCONCLUSIVE;
+            skip_ahead(s, 3 * 60 * 1000); /* задача имени отдыхает 2 мин после исхода */
+            T54_EV(41302, 2, 0);
+            CHECK(t54_rc == 1 && tcp_calls == 2 && strcmp(tcp_last_ip, "127.0.0.2") == 0,
+                  "task54: отсрочка мёртвого адреса заглушила другой адрес имени");
+
+            /* +11 мин: перепроверка A — нейтральный байт ПЕРВЫМ, без
+               триггера; тишина — вердикт подтверждён, ступень 30 мин. */
             skip_ahead(s, 11 * 60 * 1000);
             saidbuf[0] = '\0';
-            d2k_ev h3 = ev_hello(6, 41303, name);
-            d2k_sched_event(s, &h3);
-            d2k_ev r3 = ev_suspect(6, 41303);
-            r3.code = D2K_SUSPECT_RST; /* другой симптом того же мёртвого адреса */
-            CHECK(d2k_sched_event(s, &r3) == 0,
-                  "task54: повторный блок адреса не удлинил отсрочку");
-            settle(s);
-            CHECK(tcp_calls == 2, "task54: мёртвый адрес перемерен до конца второй отсрочки");
+            T54_EV(41303, 1, D2K_SUSPECT_RST);
+            CHECK(t54_rc == 1 && ack_calls == 1 && strcmp(ack_last_ip, "127.0.0.1") == 0,
+                  "task54: перепроверка мёртвого адреса не начала с нейтрального байта");
+            CHECK(tcp_calls == 2, "task54: перепроверка мёртвого адреса слала триггер");
+            CHECK(said("через 30 мин"), "task54: вторая ступень не 30 мин");
+            /* B в это время — снова неубедительно (DNS чередует). */
+            tcp_answer = D2K_V_INCONCLUSIVE;
+            skip_ahead(s, 11 * 60 * 1000);
+            T54_EV(41304, 2, 0);
+            CHECK(tcp_calls == 3, "task54: другой адрес не измерен после своей отсрочки");
+            /* A ещё в 30-минутной отсрочке, любой симптом. */
+            skip_ahead(s, 3 * 60 * 1000);
+            T54_EV(41305, 1, D2K_SUSPECT_RST);
+            CHECK(t54_rc == 0 && ack_calls == 1 && tcp_calls == 3,
+                  "task54: исход другого адреса снял отсрочку мёртвого");
             CHECK(said("замер отложен после блока адреса 127.0.0.1"),
                   "task54: причина отсрочки не названа");
+            /* +31 мин от перепроверки: третья ступень 60 мин. */
+            skip_ahead(s, 20 * 60 * 1000);
+            saidbuf[0] = '\0';
+            T54_EV(41306, 1, 0);
+            CHECK(ack_calls == 2 && tcp_calls == 3 && said("через 60 мин"),
+                  "task54: третья ступень не 60 мин");
+            /* Потолок: следующая ступень тоже 60 мин. */
+            skip_ahead(s, 59 * 60 * 1000);
+            T54_EV(41307, 1, 0);
+            CHECK(t54_rc == 0 && ack_calls == 2, "task54: потолок 60 мин не держится");
+            skip_ahead(s, 2 * 60 * 1000);
+            saidbuf[0] = '\0';
+            T54_EV(41308, 1, 0);
+            CHECK(ack_calls == 3 && said("через 60 мин"), "task54: после потолка ступень не 60 мин");
 
-            /* Другой адрес того же имени — другое наблюдение: мерится сразу. */
-            d2k_ev h4 = ev_hello(6, 41304, name);
-            h4.low_ip[3] = 2;
-            d2k_sched_event(s, &h4);
-            d2k_ev r4 = ev_suspect(6, 41304);
-            r4.low_ip[3] = 2;
+            /* I2, вторая ветка: байт подтверждён — молчание вызывал триггер;
+               вердикт адреса снят, дальше обычный путь с триггером. */
+            skip_ahead(s, 61 * 60 * 1000);
+            saidbuf[0] = '\0';
+            ack_answer = 1;
             tcp_answer = D2K_V_INCONCLUSIVE;
-            CHECK(d2k_sched_event(s, &r4) == 1,
-                  "task54: отсрочка мёртвого адреса заглушила другой адрес имени");
-            settle(s);
-            CHECK(tcp_calls == 3 && strcmp(tcp_last_ip, "127.0.0.2") == 0,
-                  "task54: другой адрес имени не измерен");
+            T54_EV(41309, 1, 0);
+            CHECK(ack_calls == 4 && tcp_calls == 4 && strcmp(tcp_last_ip, "127.0.0.1") == 0,
+                  "task54: подтверждённый байт не открыл обычный путь");
+            CHECK(said("вердикт address снят"), "task54: снятие вердикта не названо");
+            /* Снят по-настоящему: следующая перепроверка без байта. */
+            skip_ahead(s, 11 * 60 * 1000);
+            T54_EV(41310, 1, 0);
+            CHECK(ack_calls == 4 && tcp_calls == 5, "task54: снятый вердикт адреса снова спрашивал байт");
+
+            /* Байт подтверждён, а дерево снова сказало address: адрес глохнет
+               только после триггера — это штраф, а не блок адреса. */
+            tcp_answer = D2K_V_ADDRESS; ack_answer = 0;
+            skip_ahead(s, 11 * 60 * 1000);
+            T54_EV(41311, 1, 0);              /* address, ступень 1 */
+            skip_ahead(s, 11 * 60 * 1000);
+            ack_answer = 1; saidbuf[0] = '\0';
+            T54_EV(41312, 1, 0);              /* перепроверка: ACK, дерево: address */
+            CHECK(said("глохнет только после триггера"),
+                  "task54: штраф после триггера выдан за блок адреса");
+            CHECK(!said("не принимает данных"), "task54: штраф записан как блок адреса");
+            #undef T54_EV
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c_addr);
+
+        /* IPv6: тот же ключ с семейством. */
+        d2k_catalog c6 = {0};
+        s = d2k_sched_new(&c6, sv[0], 0x2d);
+        if (s) {
+            tcp_calls = 0; ack_calls = 0; ack_answer = 0;
+            tcp_answer = D2K_V_ADDRESS;
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            d2k_ev h = ev_hello(6, 41320, "dead6.example");
+            h.family = 6; memset(h.low_ip, 0, 16); h.low_ip[15] = 1;
+            memset(h.high_ip, 0, 16); h.high_ip[0] = 0xfd; h.high_ip[15] = 2;
+            d2k_sched_event(s, &h);
+            d2k_ev r = ev_suspect(6, 41320);
+            r.family = 6; memcpy(r.low_ip, h.low_ip, 16); memcpy(r.high_ip, h.high_ip, 16);
+            d2k_sched_event(s, &r);
+            settle(s);
+            CHECK(tcp_calls == 1 && said("адрес ::1 не принимает данных"),
+                  "task54/v6: блок адреса IPv6 не установлен");
+            skip_ahead(s, 3 * 60 * 1000);
+            d2k_ev h2 = h; h2.high_port = 41321; d2k_sched_event(s, &h2);
+            d2k_ev r2 = r; r2.high_port = 41321;
+            CHECK(d2k_sched_event(s, &r2) == 0 && tcp_calls == 1,
+                  "task54/v6: отсрочка адреса IPv6 не держится");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c6);
+
+        /* Найденные раньше привязки имени вердикт address не трогает. */
+        d2k_catalog cb = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        confirm_once(&cb, sv[0], "bound.dead.example", 41330);
+        size_t before = bindings_of(&cb, "bound.dead.example", 6);
+        CHECK(before >= 1, "task54: фикстура привязки не подтверждена");
+        s = d2k_sched_new(&cb, sv[0], 0x2d);
+        if (s) {
+            tcp_calls = 0;
+            tcp_answer = D2K_V_ADDRESS;
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            d2k_ev h = ev_hello(6, 41331, "bound.dead.example");
+            h.low_ip[3] = 9; /* другой адрес того же имени */
+            d2k_sched_event(s, &h);
+            d2k_ev r = ev_suspect(6, 41331); r.low_ip[3] = 9;
+            d2k_sched_event(s, &r);
+            settle(s);
+            CHECK(said("адрес 127.0.0.9 не принимает данных"),
+                  "task54: фикстура с привязками не дошла до вердикта address");
+            CHECK(bindings_of(&cb, "bound.dead.example", 6) == before,
+                  "task54: вердикт address тронул найденные привязки имени");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cb);
+        d2k_sched_tcp_ack_hook = NULL;
         tcp_answer = D2K_V_OPAQUE;
     }
 
