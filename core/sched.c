@@ -3371,7 +3371,11 @@ static size_t known_plans(d2k_sched *s, task *t) {
    уже привязанный к этой цели, не предлагается снова: он и не помог.
    Уже испытанные в этой задаче тексты (tried) не повторяются.
 
-   Порядок — по свежести подтверждения (задача 49), порция — не больше
+   Порядок — по числу успехов плана, затем по свежести подтверждения. Не
+   «свежее первым» (так было с задачи 49 до поля 04.10): свежий план с
+   короткой историей «подтверждался» ответом почти без тела раньше плана,
+   который снимает объёмную заморозку и подтверждён на десятках имён, — и
+   картинки Discord с Cloudflare встали. Порция — не больше
    очереди задачи (SCHED_MAX_PLANS); уже поставленные в очередь (own_seen) не
    повторяются. fill — записать порцию в очередь задачи.
    В tried план попадает, только если реально испытан на проводе
@@ -3450,7 +3454,8 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
             /* Тот же текст в другой коробке — тот же план: остаётся лучший. */
             size_t dup = n;
             for (size_t k = 0; k < n; k++) if (!strcmp(pick[k]->text, p->text)) dup = k;
-            int better_than_dup = dup < n && newest > fresh[dup];
+            int better_than_dup = dup < n && (p->successes > pick[dup]->successes ||
+                (p->successes == pick[dup]->successes && newest > fresh[dup]));
             if (dup < n && !better_than_dup) continue;
             if (dup < n) {
                 for (size_t k = dup; k + 1 < n; k++) {
@@ -3459,7 +3464,9 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
                 n--;
             }
             size_t at = n;
-            while (at > 0 && newest > fresh[at - 1]) at--;
+            while (at > 0 && (p->successes > pick[at - 1]->successes ||
+                              (p->successes == pick[at - 1]->successes && newest > fresh[at - 1])))
+                at--;
             if (at >= SCHED_MAX_PLANS) continue;
             if (n == SCHED_MAX_PLANS) n--;
             for (size_t k = n; k > at; k--) {
