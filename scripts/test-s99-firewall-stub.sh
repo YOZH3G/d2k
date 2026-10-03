@@ -12,7 +12,12 @@ ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 S99=$ROOT/files/S99d2k
 TMP=$(mktemp -d)
 SLEEPER=
-cleanup() { [ -z "$SLEEPER" ] || kill "$SLEEPER" 2>/dev/null || true; rm -rf "$TMP"; }
+HU_OTHER=
+cleanup() {
+    [ -z "$SLEEPER" ] || kill "$SLEEPER" 2>/dev/null || true
+    [ -z "$HU_OTHER" ] || kill "$HU_OTHER" 2>/dev/null || true
+    rm -rf "$TMP"
+}
 trap cleanup EXIT HUP INT TERM
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "PASS: $*"; }
@@ -132,7 +137,7 @@ ok "without xt_addrtype the service starts with explicit broadcast exclusions"
 
 # --- Leftover d2k-rst: rules (filter OUTPUT, both families) ------------------
 rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
-sleep 300 & SLEEPER=$!
+sleep 300 >/dev/null 2>&1 & SLEEPER=$!
 dead=999990
 while kill -0 "$dead" 2>/dev/null; do dead=$((dead + 1)); done
 mkdir -p "$TMP/proc/$$" "$TMP/proc/$SLEEPER"
@@ -167,5 +172,43 @@ done
 grep -q 'rst_rules_down dead' "$S99" || fail "engine_stop does not clean dead-owner RST rules"
 grep -q 'rst_rules_down all' "$S99" || fail "stop does not clean d2k RST rules"
 ok "stop removes leftover d2k-rst: rules in both families and nothing else"
+
+# --- Миграция с прокси d2khttp (задача 51) ------------------------------------
+rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
+v4() { FW_STATE="$TMP/fw" "$TMP/bin/iptables" -w "$@"; }
+v4 -t nat -N D2K_HTTP
+v4 -t nat -A D2K_HTTP -p tcp --dport 80 -j REDIRECT --to-ports 18080
+v4 -t nat -I PREROUTING -j D2K_HTTP
+v4 -t mangle -N D2K_HTTP_MARK
+v4 -t mangle -A D2K_HTTP_MARK -m mark --mark 0x30 -j CONNMARK --save-mark
+v4 -t mangle -I OUTPUT -j D2K_HTTP_MARK
+v4 -t nat -A PREROUTING -j FOREIGN_NAT
+S99_SNIPPET='fw_up && fw_installed' s99 || fail "fw_up over the old d2khttp rules failed"
+! rules iptables nat | grep -q D2K_HTTP || fail "old nat D2K_HTTP survived fw_up"
+! rules iptables mangle | grep -q D2K_HTTP_MARK || fail "old D2K_HTTP_MARK survived fw_up"
+rules iptables nat | grep -qx -- '-A PREROUTING -j FOREIGN_NAT' || fail "migration removed a foreign nat rule"
+! rules iptables mangle | grep -q 18080 || fail "the :18080 proxy exclusion is still installed"
+! rules iptables nat | grep -q REDIRECT || fail "a port-80 REDIRECT is still installed"
+S99_SNIPPET='fw_down' s99
+ok "fw_up removes the old d2khttp nat/mangle rules and adds none"
+
+# Старый pid-файл d2khttp: гасится только процесс с именем d2khttp (ревью M3).
+sleep 300 >/dev/null 2>&1 & HU_OTHER=$!
+mkdir -p "$TMP/proc/$HU_OTHER"
+printf 'sshd\n' > "$TMP/proc/$HU_OTHER/comm"
+printf '%s\n' "$HU_OTHER" > "$TMP/run/d2k-http.pid"
+if S99_SNIPPET='HU_PID=$RUN/d2k-http.pid; legacy_http_present' s99; then
+    kill "$HU_OTHER"; fail "a reused pid of a foreign process counted as d2khttp"
+fi
+S99_SNIPPET='HU_PID=$RUN/d2k-http.pid; legacy_http_stop' s99
+kill -0 "$HU_OTHER" 2>/dev/null || fail "legacy cleanup killed a foreign process by a stale pid"
+[ ! -e "$TMP/run/d2k-http.pid" ] || fail "stale d2khttp pid file kept"
+printf 'd2khttp\n' > "$TMP/proc/$HU_OTHER/comm"
+printf '%s\n' "$HU_OTHER" > "$TMP/run/d2k-http.pid"
+S99_SNIPPET='HU_PID=$RUN/d2k-http.pid; legacy_http_present' s99 || fail "a live d2khttp not seen"
+S99_SNIPPET='HU_PID=$RUN/d2k-http.pid; legacy_http_stop' s99
+i=0; while kill -0 "$HU_OTHER" 2>/dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+if kill -0 "$HU_OTHER" 2>/dev/null; then kill "$HU_OTHER"; fail "a live d2khttp was not stopped"; fi
+ok "legacy d2khttp cleanup checks the process name, not the pid alone"
 
 echo "S99d2k firewall (stub): all checks passed"

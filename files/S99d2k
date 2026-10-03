@@ -152,10 +152,31 @@ D2K_PPE_CONFIG=$CONF
 [ -r "$PPE_LIB" ] && . "$PPE_LIB"
 
 # Остаток прежней версии: живой d2khttp или его nat-перехват порта 80.
+# Процесс узнаётся по имени, а не по одному pid: старый pid-файл мог
+# пережить перезагрузку, и его номер уже у чужого процесса (ревью M3).
+legacy_http_pid() {
+    [ -f "$HU_PID" ] || return 1
+    lpid=$(cat "$HU_PID" 2>/dev/null)
+    case "$lpid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(cat "$PROC_DIR/$lpid/comm" 2>/dev/null)" = d2khttp ] || return 1
+    echo "$lpid"
+}
 legacy_http_present() {
-    running "$HU_PID" && return 0
+    legacy_http_pid >/dev/null && return 0
     iptables -t nat -C PREROUTING -j D2K_HTTP 2>/dev/null && return 0
     return 1
+}
+legacy_http_stop() {
+    if lpid=$(legacy_http_pid); then
+        kill "$lpid" 2>/dev/null
+        i=0
+        while [ -d "$PROC_DIR/$lpid" ] && kill -0 "$lpid" 2>/dev/null && [ $i -lt 30 ]; do
+            i=$((i + 1))
+            sleep 0.1 2>/dev/null || sleep 1
+        done
+        kill -0 "$lpid" 2>/dev/null && kill -9 "$lpid" 2>/dev/null
+    fi
+    rm -f "$HU_PID"
 }
 
 say() { echo "$NAME: $*"; }
@@ -875,7 +896,7 @@ engine_stop() {
     # и успеть восстановить их, пока служба останавливается.
     stop_pidfile "$HL_PID"
     fw_down
-    stop_pidfile "$HU_PID"
+    legacy_http_stop
     fastnat_restore
     stop_pidfile "$CT_PID"
     stop_pidfile "$DP_PID"
@@ -930,7 +951,7 @@ status() {
 # Руками она тоже годится.
 reapply() {
     running "$DP_PID" || die "датапат не работает — ставить правила не для кого"
-    stop_pidfile "$HU_PID"
+    legacy_http_stop
     fw_up || { fw_down; die "не поставить полный набор правил"; }
     say "правила поставлены заново"
 }
