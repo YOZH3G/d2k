@@ -32,10 +32,17 @@ scontent.whatsapp.net graph.whatsapp.com v.whatsapp.com static.whatsapp.net
 mmg.whatsapp.net pps.whatsapp.net`
 
 Any other name, escape, extra key or trailing data → 400; nothing is resolved.
-Reply 200 `{"results":{"host":["a.b.c.d",…],…}}`: IPv4 A records from the VPS's
-own `getaddrinfo`, at most 8 distinct per name, in request order; a name that did
-not resolve (or was reached after the ~10 s request deadline) gets `[]`. The
-12 s per-connection alarm remains the hard limit.
+Reply 200 `{"results":{"host":["a.b.c.d",…],…}}`: the union of IPv4 A records from
+the VPS's own `getaddrinfo` and from direct UDP queries to 1.1.1.1, 8.8.8.8 and
+9.9.9.9 (Meta's GeoDNS answers for each resolver's location, so one source alone
+may give only an edge that is dead from the router). The public queries go out
+for all names at once and are awaited for at most 1.5 s, only while that still
+fits before the deadline; replies must match the query ID and question, and
+truncated or malformed ones are ignored; CNAMEs are followed only inside the
+answer section. Per name: the VPS answer first, then each resolver in order, at
+most 8 distinct, in request order; a name with nothing (or reached after the
+~10 s request deadline) gets `[]`. The 12 s per-connection alarm remains the
+hard limit. The VPS needs outbound UDP 53 to those three resolvers.
 
 There is no authentication: the answer is public DNS data for a fixed list, and a
 secret embedded in public router code would protect nothing. Protection is the
