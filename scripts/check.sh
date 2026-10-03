@@ -68,6 +68,8 @@ find scripts spike -name '*.sh' -print0 | xargs -0 shellcheck -s sh
 sh scripts/test-instagram-dns.sh
 sh scripts/test-ppe-deoffload.sh
 sh scripts/test-instagram-dns-scheduler.sh
+sh scripts/test-s99-firewall-stub.sh
+sh scripts/test-install-manifest.sh
 node scripts/test-runtime-files.cjs
 node scripts/test-log-maintenance.cjs
 node scripts/test-log-maintenance-process.cjs

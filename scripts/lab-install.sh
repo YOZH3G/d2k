@@ -94,6 +94,8 @@ cp scripts/select-panel-ip.sh scripts/architecture.sh scripts/check-cpu.sh "$REL
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
 cp builds/d2ktg-linux-arm64 "$REL/builds/d2ktg-linux-$ARCH"
+# Released static HTTP-upgrade listener, as in the published package.
+cp builds/d2khttp-linux-arm64 "$REL/builds/d2khttp-linux-$ARCH"
 make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
@@ -102,6 +104,7 @@ cp internal/web/assets/favicon.svg "$REL/internal/web/assets/"
 mkdir -p "$REL/internal/web/assets/fonts"
 cp internal/web/assets/fonts/onest.woff2 internal/web/assets/fonts/OFL-onest.txt internal/web/assets/fonts/jbmono.woff2 internal/web/assets/fonts/OFL-jbmono.txt "$REL/internal/web/assets/fonts/"
 cp files/S99d2k files/config files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
+cp files/d2k-ppe-deoffload.sh files/d2k-log-maintenance.sh "$REL/files/"
 cp files/d2k-tg-firewall.sh files/d2k-tg-watchdog.sh files/d2k-instagram-dns.sh \
     files/d2k-instagram-dns-scheduler.sh files/meta-ranges.txt files/tg-roots.pem "$REL/files/"
 cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fake/"
@@ -109,6 +112,11 @@ cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fak
 # the production VPS or Telegram. Point its copied template to closed local ports.
 sed -i 's|^TG_RELAY_URL=.*|TG_RELAY_URL=wss://127.0.0.1:11443/ws|; s/^TG_ENROLL_PORT=.*/TG_ENROLL_PORT=11444/' "$REL/files/config"
 sed -i 's|^PROBE_URL=.*|PROBE_URL=https://127.0.0.1:11443/|; s/^PROBE_IP=.*/PROBE_IP=127.0.0.1/' "$REL/files/d2k-tg-watchdog.sh"
+# Every path the installer will fetch must be staged: with D2K_LOCAL it dies
+# on the first missing file, before installing anything (install.sh fetch).
+for staged in $(sed -n 's/^fetch "\([^"]*\)".*/\1/p' scripts/install.sh | sed "s/\\\$ARCH/$ARCH/"); do
+    [ -s "$REL/$staged" ] || fail "лабораторный пакет без $staged — установщик его потребует"
+done
 
 # Keenetic DNS lifecycle is exercised with a stateful ndmc double. curl is
 # wrapped only for the external resolver and Instagram probes; the real curl

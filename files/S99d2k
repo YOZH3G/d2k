@@ -132,6 +132,11 @@ DNS_SCHED_PID=$RUN/d2k-instagram-dns-scheduler.pid
 TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
 unset TG_RELAY_SECRET TG_RELAY_URL TG_IDENTITY TG_CA_BUNDLE
 FW_LOCK=${FW_LOCK:-/tmp/d2k-fw-operation.lock}
+# Метка «IPv6 не обслуживается»: ip6tables mangle на этой прошивке нет
+# (без компонента IPv6 или без ip6table_mangle). fw_installed тогда не ждёт
+# IPv6-правил, а fw_down метку снимает.
+FW_V4ONLY=$RUN/fw-ipv4-only
+PROC_DIR=/proc
 
 # Разгрузка окна рукопожатия от аппаратного ускорителя Keenetic (-j PPE с
 # connskip): без неё поток уходит мимо netfilter, и d2k не видит ответов.
@@ -186,7 +191,15 @@ fw_family_up() (
     local local_routes httpup_mark_num mark_num probe_mark_num measure_mark_num late_from
     late_from=$(late_rst_from) || return 1
 
-    "$fw_tool" -t mangle -N "$CHAIN_OUT" 2>/dev/null || return 1
+    # Код 3 — таблица mangle этого семейства непригодна вовсе (нет утилиты,
+    # нет таблицы): для IPv6 это не отказ, а работа только по IPv4.
+    command -v "$fw_tool" >/dev/null 2>&1 || return 3
+    # Отказ создать цепочку при живой таблице (её список читается, -w ждёт
+    # замок xtables) — обычная ошибка, а не отсутствие семейства.
+    if ! "$fw_tool" -t mangle -N "$CHAIN_OUT" 2>/dev/null; then
+        "$fw_tool" -w -t mangle -n -L POSTROUTING >/dev/null 2>&1 && return 1
+        return 3
+    fi
     "$fw_tool" -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
 
     # Keenetic's DNS proxy talks to local encrypted-DNS helpers on dynamic
@@ -397,8 +410,22 @@ ppe_down() {
     d2k_ppe_remove
 }
 
+# Без IPv4 работы нет. Без ip6tables mangle (код 3) служба работает по
+# IPv4 и предупреждает: IPv6-трафик идёт мимо d2k, как без него. Любой иной
+# отказ IPv6 — настоящая ошибка, и fw_up откатывает оба семейства.
 fw_up_unlocked() {
-    fw_family_up iptables && fw_family_up ip6tables || return 1
+    fw_family_up iptables || return 1
+    rc6=0
+    fw_family_up ip6tables || rc6=$?
+    case $rc6 in
+        0) rm -f "$FW_V4ONLY" ;;
+        3)
+            fw_family_down ip6tables
+            { mkdir -p "$RUN" && : > "$FW_V4ONLY"; } || return 1
+            say "ВНИМАНИЕ: ip6tables mangle недоступна (нет IPv6 в прошивке или модуля ip6table_mangle) — d2k работает только по IPv4, IPv6-трафик идёт без обработки"
+            ;;
+        *) return 1 ;;
+    esac
     ppe_up
 }
 
@@ -432,7 +459,38 @@ fw_family_down() (
     done
 )
 
-fw_down_unlocked() { ppe_down; fw_family_down iptables; fw_family_down ip6tables; }
+fw_down_unlocked() { ppe_down; fw_family_down iptables; fw_family_down ip6tables; rm -f "$FW_V4ONLY"; }
+
+# ПРАВИЛА ПОДАВЛЕНИЯ RST. d2kc и d2k-detect на время зонда ставят в filter
+# OUTPUT правило «-p tcp --sport P --tcp-flags RST RST -m comment --comment
+# d2k-rst:PID -j DROP» и снимают его сами; процесс, убитый сигналом KILL,
+# оставляет его висеть. Снимаются только правила этой точной формы с портом
+# зонда (30000-54999), как их опознаёт detect/raw.c:
+#   dead — владелец мёртв (остановка движка: живой поиск панели сохраняет своё);
+#   all  — ещё и владелец-процесс d2k (остановка службы, удаление).
+rst_owner_removable() {
+    kill -0 "$1" 2>/dev/null || return 0
+    [ "$2" = all ] || return 1
+    case "$(cat "$PROC_DIR/$1/comm" 2>/dev/null)" in d2k*) return 0 ;; esac
+    return 1
+}
+
+rst_rules_down() {
+    for fw_tool in iptables ip6tables; do
+        command -v "$fw_tool" >/dev/null 2>&1 || continue
+        rules=$("$fw_tool" -w -S OUTPUT 2>/dev/null || "$fw_tool" -S OUTPUT 2>/dev/null) || continue
+        printf '%s\n' "$rules" | sed -n \
+            's/^-A OUTPUT -p tcp \(-m tcp \)\{0,1\}--sport \([0-9][0-9]*\) --tcp-flags RST RST -m comment --comment "\{0,1\}d2k-rst:\([1-9][0-9]*\)"\{0,1\} -j DROP *$/\2 \3/p' |
+        while read -r port owner; do
+            [ "$port" -ge 30000 ] && [ "$port" -le 54999 ] || continue
+            rst_owner_removable "$owner" "$1" || continue
+            "$fw_tool" -w -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST \
+                -m comment --comment "d2k-rst:$owner" -j DROP 2>/dev/null ||
+            "$fw_tool" -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST \
+                -m comment --comment "d2k-rst:$owner" -j DROP 2>/dev/null || true
+        done
+    done
+}
 
 # Сторож: вернуть снесённую разгрузку, не трогая правил очереди. Под тем же
 # замком, что fw_up, — иначе вставка может лечь между снятием и постановкой.
@@ -575,7 +633,10 @@ fw_family_installed() (
     return 0
 )
 
-fw_installed() { fw_family_installed iptables && fw_family_installed ip6tables; }
+fw_installed() {
+    fw_family_installed iptables || return 1
+    [ -f "$FW_V4ONLY" ] || fw_family_installed ip6tables
+}
 
 # --- запуск --------------------------------------------------------------
 
@@ -865,6 +926,7 @@ engine_stop() {
     fastnat_restore
     stop_pidfile "$CT_PID"
     stop_pidfile "$DP_PID"
+    rst_rules_down dead
     rm -f "$SOCK"
     say "движок остановлен"
 }
@@ -875,6 +937,7 @@ stop() {
     engine_stop
     stop_pidfile "$PN_PID"
     stop_pidfile "$LM_PID"
+    rst_rules_down all
     rm -f "$LIVE"
     say "служба остановлена"
 }
@@ -896,6 +959,7 @@ status() {
     running "$HL_PID" && echo "  сторож правил: работает (pid $(cat $HL_PID))" \
                       || echo "  сторож правил: не работает"
     fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
+    [ ! -f "$FW_V4ONLY" ] || echo "  IPv6: не обслуживается — нет ip6tables mangle, работа только по IPv4"
     if command -v d2k_ppe_status >/dev/null 2>&1; then
         d2k_ppe_status
     fi

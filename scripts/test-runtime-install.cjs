@@ -17,8 +17,21 @@ try {
   for (const command of ['curl', 'ip', 'ipset', 'openssl']) {
     fs.writeFileSync(path.join(tmp, 'bin', command), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   }
+  // iptables doubles: no d2k chains; filter OUTPUT holds RST-drop rules left
+  // by a killed d2k process (owner PID gone), a foreign one and a live owner's.
   for (const command of ['iptables', 'ip6tables']) {
-    fs.writeFileSync(path.join(tmp, 'bin', command), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(tmp, 'bin', command), `#!/bin/sh
+printf '${command} %s\\n' "$*" >> "$IPT_CALLS"
+case "$*" in
+  *"-S OUTPUT"*) [ "\${IPT_RST:-0}" = 1 ] || exit 0
+    printf '%s\\n' '-P OUTPUT ACCEPT' \\
+      '-A OUTPUT -p tcp -m tcp --sport 40750 --tcp-flags RST RST -m comment --comment d2k-rst:2147480001 -j DROP' \\
+      '-A OUTPUT -p tcp -m tcp --sport 40751 --tcp-flags RST RST -m comment --comment other:2147480001 -j DROP' \\
+      '-A OUTPUT -p tcp -m tcp --sport 40752 --tcp-flags RST RST -m comment --comment d2k-rst:${process.pid} -j DROP'
+    exit 0 ;;
+esac
+exit 1
+`, { mode: 0o755 });
   }
   fs.writeFileSync(path.join(tmp, 'bin/start-stop-daemon'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n', { mode: 0o755 });
   fixture('scripts/architecture.sh', '#!/bin/sh\nprintf "amd64\\n"\n');
@@ -47,7 +60,8 @@ try {
       .replaceAll('/tmp/d2k', runtime);
     fs.writeFileSync(path.join(tmp, `${name}.sh`), script);
   }
-  const env = { ...process.env, PATH: `${tmp}/bin:${process.env.PATH}`, D2K_LOCAL: `${tmp}/source`, CALLS: `${tmp}/calls`, D2K_KEEP_STATE: '1' };
+  const iptCalls = path.join(tmp, 'ipt-calls');
+  const env = { ...process.env, PATH: `${tmp}/bin:${process.env.PATH}`, D2K_LOCAL: `${tmp}/source`, CALLS: `${tmp}/calls`, IPT_CALLS: iptCalls, D2K_KEEP_STATE: '1' };
   function run(name, extraEnv = {}) {
     const result = spawnSync('/bin/sh', [path.join(tmp, `${name}.sh`)], { env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 10000 });
     assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -108,7 +122,26 @@ try {
   fs.writeFileSync(path.join(customRuntime, 'log-tail.QRSTUV'), 'stale');
   fs.writeFileSync(path.join(customRuntime, 'unrelated'), 'keep');
   fs.appendFileSync(path.join(tmp, 'opt/d2k/config'), `D2K_RUNTIME_DIR='${customRuntime}'\n`);
-  run('uninstall');
+  // Init is gone: the fallback still restores the NAT accelerator setting it
+  // saved, removes its own MASQUERADE and leftover RST-drop rules, and its /tmp files.
+  const fastnat = path.join(tmp, 'proc/sys/net/netfilter/nf_conntrack_fastnat');
+  fs.mkdirSync(path.dirname(fastnat), { recursive: true }); fs.writeFileSync(fastnat, '0\n');
+  fs.writeFileSync(path.join(tmp, 'opt/d2k/run/fastnat.saved'), '1\n');
+  const tmpLeft = [`${runtime}-fw-heal.last`, `${runtime}-instagram-dns-last-attempt`];
+  for (const f of tmpLeft) fs.writeFileSync(f, '1');
+  for (const d of [`${runtime}-fw-heal.lock`, `${runtime}-fw-operation.lock`]) { fs.mkdirSync(d); fs.writeFileSync(path.join(d, 'pid'), '2147480001'); }
+  fs.rmSync(iptCalls, { force: true });
+  run('uninstall', { IPT_RST: '1' });
+  assert.equal(fs.readFileSync(fastnat, 'utf8').trim(), '1', 'uninstall fallback must restore the saved fastnat value');
+  const ipt = fs.readFileSync(iptCalls, 'utf8');
+  for (const tool of ['iptables', 'ip6tables']) {
+    assert(ipt.includes(`${tool} -w -D OUTPUT -p tcp --sport 40750 --tcp-flags RST RST -m comment --comment d2k-rst:2147480001 -j DROP`), `${tool}: leftover d2k-rst rule of a dead owner not removed`);
+    assert(!ipt.includes(`${tool} -w -D OUTPUT -p tcp --sport 40751`), `${tool}: foreign RST rule touched`);
+    assert(!ipt.includes(`${tool} -w -D OUTPUT -p tcp --sport 40752`), `${tool}: RST rule of a live non-d2k process touched`);
+  }
+  assert(ipt.includes('iptables -t nat -D POSTROUTING -p udp -m mark --mark 0x2d -j MASQUERADE'), 'uninstall fallback must remove its own MASQUERADE');
+  for (const f of tmpLeft) assert(!fs.existsSync(f), `uninstall left ${f}`);
+  for (const d of [`${runtime}-fw-heal.lock`, `${runtime}-fw-operation.lock`]) assert(!fs.existsSync(d), `uninstall left stale lock ${d}`);
   assert(calls().includes('dns-remove'), 'uninstall must remove the owned DNS pins through the manifest helper');
   const sched = calls().indexOf('d2k-instagram-dns-scheduler.pid');
   assert(sched >= 0 && sched < calls().indexOf('dns-remove'), 'uninstall must stop the DNS scheduler before removing its pins');

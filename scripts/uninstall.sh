@@ -58,6 +58,51 @@ if [ -f "$DIR/run/d2k-log-maintenance.pid" ]; then
     start-stop-daemon -K -q -p "$DIR/run/d2k-log-maintenance.pid" 2>/dev/null || true
 fi
 [ ! -x "$DIR/d2k-tg-firewall.sh" ] || "$DIR/d2k-tg-firewall.sh" stop >/dev/null 2>&1 || true
+
+# Ускоритель NAT: init выключал его на время работы и запомнил прежнее
+# значение в run/fastnat.saved. Без init вернуть его некому, кроме нас, и
+# сделать это надо до удаления run/.
+FASTNAT=/proc/sys/net/netfilter/nf_conntrack_fastnat
+if [ -f "$DIR/run/fastnat.saved" ] && [ -w "$FASTNAT" ]; then
+    saved=$(cat "$DIR/run/fastnat.saved" 2>/dev/null || true)
+    case "$saved" in
+        ''|*[!0-9]*) ;;
+        *) echo "$saved" > "$FASTNAT" 2>/dev/null || say "не удалось вернуть прежний nf_conntrack_fastnat=$saved" ;;
+    esac
+fi
+
+# Правила подавления RST (filter OUTPUT, «-m comment --comment d2k-rst:PID»)
+# ставят d2kc и d2k-detect на время зонда; убитый процесс оставляет их висеть.
+# Снимаются только правила этой точной формы с портом зонда и владельцем —
+# мёртвым или процессом d2k; правило чужого процесса и чужие правила остаются.
+for fw_tool in iptables ip6tables; do
+    command -v "$fw_tool" >/dev/null 2>&1 || continue
+    rst_rules=$("$fw_tool" -w -S OUTPUT 2>/dev/null || "$fw_tool" -S OUTPUT 2>/dev/null || true)
+    printf '%s\n' "$rst_rules" | sed -n \
+        's/^-A OUTPUT -p tcp \(-m tcp \)\{0,1\}--sport \([0-9][0-9]*\) --tcp-flags RST RST -m comment --comment "\{0,1\}d2k-rst:\([1-9][0-9]*\)"\{0,1\} -j DROP *$/\2 \3/p' |
+    while read -r port owner; do
+        [ "$port" -ge 30000 ] && [ "$port" -le 54999 ] || continue
+        if kill -0 "$owner" 2>/dev/null; then
+            case "$(cat "/proc/$owner/comm" 2>/dev/null)" in d2k*) ;; *) continue ;; esac
+        fi
+        "$fw_tool" -w -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST \
+            -m comment --comment "d2k-rst:$owner" -j DROP 2>/dev/null ||
+        "$fw_tool" -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST \
+            -m comment --comment "d2k-rst:$owner" -j DROP 2>/dev/null || true
+    done
+done
+
+# Своё правило MASQUERADE для UDP-посылок датапата (init ставит его по метке
+# MARK). Метка читается из конфигурации без исполнения её текста.
+own_mark=0x2d
+if [ -r "$DIR/config" ]; then
+    cfg_mark=$(sed -n 's/^[[:space:]]*MARK=//p' "$DIR/config" | tail -n 1 | tr -d "\"'")
+    case "$cfg_mark" in
+        0x[0-9a-fA-F]*) case "${cfg_mark#0x}" in *[!0-9a-fA-F]*) ;; *) own_mark=$cfg_mark ;; esac ;;
+        [1-9]*) case "$cfg_mark" in *[!0-9]*) ;; *) own_mark=$cfg_mark ;; esac ;;
+    esac
+fi
+while iptables -t nat -D POSTROUTING -p udp -m mark --mark "$own_mark" -j MASQUERADE 2>/dev/null; do :; done
 if command -v ipset >/dev/null 2>&1; then
     ipset destroy d2k_tg_dc 2>/dev/null || true
     ipset destroy d2k_tg_dc6 2>/dev/null || true
@@ -107,11 +152,18 @@ rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2kt
 # Remove only d2kc snapshots explicitly named as D2K pre-install/work backups.
 # These were created during router development and are not user configuration.
 rm -f "$SBIN"/d2kc.before-d2k-* "$SBIN"/d2kc.pre-goal-* "$SBIN"/d2kc.pre-sched-*
-rm -f "$DIR/d2k-ppe-deoffload.sh"
+rm -f "$DIR/d2k-ppe-deoffload.sh" "$DIR/d2k-fw-heal.sh"
 rm -f "$DIR/d2k-tg-firewall.sh" "$DIR/d2k-tg-watchdog.sh" "$DIR/d2k-instagram-dns.sh" \
     "$DIR/d2k-instagram-dns-scheduler.sh" "$DIR/d2k-log-maintenance.sh" \
     "$DIR/files/meta-ranges.txt" "$DIR/files/tg-roots.pem"
 rm -rf "$DIR/run" "$DIR/log" "$DIR/panel"
+# Свои файлы в /tmp: отметки сторожа и планировщика, брошенные замки.
+rm -f /tmp/d2k-fw-heal.last /tmp/d2k-instagram-dns-last-attempt
+for lock in /tmp/d2k-fw-heal.lock /tmp/d2k-fw-operation.lock; do
+    [ -d "$lock" ] && [ ! -L "$lock" ] || continue
+    rm -f "$lock/pid"
+    rmdir "$lock" 2>/dev/null || true
+done
 
 cleanup_runtime() (
     runtime=$1
