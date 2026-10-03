@@ -192,3 +192,66 @@ int d2k_nat_outside_family(const char *path, uint8_t proto,
     fclose(f);
     return found;
 }
+
+/* ОБХОД ТАБЛИЦЫ СОЕДИНЕНИЙ РАДИ СЧЁТЧИКОВ (задача 50, раунд 2) — контракт в
+   d2k_nat.h. Тот же грубый разбор по именам, что выше; строка без счётчиков
+   (accounting выключен) пропускается — «не знаем» не равно «ноль». */
+int d2k_ct_walk(const char *path, uint8_t proto, d2k_ct_fn fn, void *ctx) {
+    if (!path || !fn) { return -1; }
+    const char *pname = (proto == 6) ? "tcp" : (proto == 17) ? "udp" : NULL;
+    if (!pname) { return -1; }
+    FILE *f = fopen(path, "r");
+    if (!f) { return -1; }
+    char line[1024], work[1024];
+    int seen = 0;
+    while (fgets(line, sizeof line, f)) {
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] != '\n' && !feof(f)) {
+            int c;
+            while ((c = fgetc(f)) != EOF && c != '\n') { }
+            continue;
+        }
+        uint8_t family;
+        if (strncmp(line, "ipv4", 4) == 0) family = 4;
+        else if (strncmp(line, "ipv6", 4) == 0) family = 6;
+        else continue;
+        /* Имя транспорта — третье слово строки («ipv4 2 udp 17 …»). */
+        {
+            const char *q = line;
+            int word = 0, ok = 0;
+            while (*q && word < 3) {
+                while (*q == ' ') q++;
+                const char *w = q;
+                while (*q && *q != ' ') q++;
+                if (++word == 3) ok = (size_t)(q - w) == strlen(pname) &&
+                                      strncmp(w, pname, strlen(pname)) == 0;
+            }
+            if (!ok) continue;
+        }
+        memcpy(work, line, len + 1);
+        char *next = NULL;
+        char *v_src = field_after(work, "src", &next);
+        if (!v_src) continue;
+        char *v_dst = field_after(next, "dst", &next);
+        if (!v_dst) continue;
+        char *v_sport = field_after(next, "sport", &next);
+        if (!v_sport) continue;
+        char *v_dport = field_after(next, "dport", &next);
+        if (!v_dport) continue;
+        char *v_opk = field_after(next, "packets", &next);
+        if (!v_opk) continue;
+        char *v_rpk = field_after(next, "packets", &next);
+        if (!v_rpk) continue;
+        uint8_t src[16], dst[16];
+        if (parse_address(v_src, family, src) != 0 ||
+            parse_address(v_dst, family, dst) != 0) continue;
+        uint16_t sp = htons((uint16_t)atoi(v_sport));
+        uint16_t dp = htons((uint16_t)atoi(v_dport));
+        uint64_t opk = strtoull(v_opk, NULL, 10);
+        uint64_t rpk = strtoull(v_rpk, NULL, 10);
+        fn(ctx, family, src, (const uint8_t *)&sp, dst, (const uint8_t *)&dp, opk, rpk);
+        seen++;
+    }
+    fclose(f);
+    return seen;
+}

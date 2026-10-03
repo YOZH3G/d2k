@@ -41,6 +41,8 @@
 #define D2K_SUSPECT_RST_AFTER_APP 5 /* RST после TLS app-data в любом направлении; измерить RX */
 #define D2K_SUSPECT_FIN_RETRY 6 /* повтор FIN клиента без ответа после ответа сервера
                                   (с планом и без); только RX-замер */
+#define D2K_SUSPECT_QUIC_STALL 7 /* QUIC замолчал после рукопожатия: сервер молчит,
+                                    клиент повторяет; только замер данными QUIC */
 
 const char *d2k_suspect_text(uint8_t code);
 

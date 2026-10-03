@@ -147,6 +147,8 @@ struct d2k_session {
      * разные строки, и наличие одной ничего не говорит о другой. */
     int      rev_seen[4];
     int      udp_reverse_hook;
+    /* Таблица соединений для счётчиков QUIC (NULL — D2K_NAT_PROC). */
+    const char *ct_path;
 
     int      shape_armed[4];
     uint8_t  shape_name[4][256];
@@ -719,6 +721,9 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
            Ответ по нему тоже наблюдаем: иначе обратный трафик выглядел бы
            полным молчанием. Это не проверка протокола или успеха обхода. */
         if (fl->saw_hello || fl->saw_initial) {
+            if (fl->rev_after_hello == 0 && now_ns >= fl->hello_ns) {
+                fl->quic_rtt_ns = now_ns - fl->hello_ns;
+            }
             fl->rev_after_hello++;
             fl->last_rev_after_hello_ns = now_ns;
             if (fl->stun_txid_valid) {
@@ -2206,6 +2211,10 @@ void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed) {
     if (s) { s->udp_reverse_hook = installed != 0; }
 }
 
+void d2k_session_set_ct_path(d2k_session *s, const char *path) {
+    if (s) { s->ct_path = path; }
+}
+
 int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
                                uint64_t now_ns, d2k_key *key_out) {
     d2k_packet_view ip;
@@ -2638,6 +2647,72 @@ static void sweep_udp_one(void *ctx, d2k_flow *f) {
     suspect(c->s, c->now_ns, &f->key, f, D2K_SUSPECT_SILENT, NULL);
 }
 
+/* QUIC ЗАМОЛЧАЛ ПОСЛЕ РУКОПОЖАТИЯ (задача 50, раунд 2; поле 04.10, rua.gr в
+ * Safari и curl --http3-only).
+ *
+ * Рукопожатие прошло, сервер прислал ещё сколько-то пакетов — и замолчал
+ * насовсем (на ppp0 пусто), а клиент шлёт повторы по PTO. Очередь видит у UDP
+ * первые 8 пакетов каждой стороны, поэтому смотрим счётчики conntrack:
+ *   - кандидат: поток с Initial (с именем или без), ответ в очереди был,
+ *     подозрения ещё нет, не зонд контроллера;
+ *   - обратный счётчик ушёл ЗА то, что видела очередь (rev_pkts): сервер
+ *     прошёл дальше рукопожатия, иначе это молчание рукопожатия, у которого
+ *     свой детектор (sweep_udp_one);
+ *   - обратный счётчик стоит не меньше PTO (RFC 9002 §6.2: первый PTO = 3R,
+ *     пол секунда как у окна повтора FIN — шаг обхода тоже секунда);
+ *   - за это время клиент послал не меньше ТРЁХ пакетов. Без ответа законно
+ *     остаются два: последний ACK на последние данные сервера (ACK без
+ *     запроса подтверждения ответа не требует) и CONNECTION_CLOSE (RFC 9000
+ *     §10.2: на него не отвечают). Третий — повтор в тишину: живой сервер на
+ *     пакет, требующий подтверждения, ответил бы за RTT + max_ack_delay.
+ * Это подозрение, не диагноз: контроллер обязан воспроизвести остановку
+ * своим запросом HTTP/3, прежде чем что-то подбирать. */
+struct ct_ctx {
+    d2k_session *s;
+    uint64_t now_ns;
+    size_t told;
+};
+
+static int quic_watch(const d2k_flow *f) {
+    return f->key.proto == 17 && (f->saw_hello || f->saw_initial) &&
+           f->rev_after_hello > 0 && !f->suspected && !f->controller_probe &&
+           !f->voice_ssrc_valid && !f->stun_txid_valid;
+}
+
+static void want_ct(void *ctx, d2k_flow *f) {
+    if (quic_watch(f)) { *(int *)ctx = 1; }
+}
+
+static void ct_line(void *ctx, uint8_t family, const uint8_t *src,
+                    const uint8_t *sport_be, const uint8_t *dst,
+                    const uint8_t *dport_be, uint64_t orig, uint64_t reply) {
+    struct ct_ctx *c = ctx;
+    d2k_addr a, b;
+    memset(&a, 0, sizeof a); memset(&b, 0, sizeof b);
+    a.family = b.family = family;
+    memcpy(a.bytes, src, family == 6 ? 16 : 4);
+    memcpy(b.bytes, dst, family == 6 ? 16 : 4);
+    d2k_key k;
+    if (d2k_key_make_addr(&k, 17, &a, &b, sport_be, dport_be) < 0) { return; }
+    d2k_flow *f = d2k_track_find(c->s->uflows, &k);
+    if (!f || !quic_watch(f)) { return; }
+    if (!f->ct_known || reply != f->ct_reply) {
+        f->ct_known = 1;
+        f->ct_reply = reply;
+        f->ct_reply_ns = c->now_ns;
+        f->ct_orig_mark = orig;
+        return;
+    }
+    if (reply <= f->rev_pkts || orig < f->ct_orig_mark || orig - f->ct_orig_mark < 3) {
+        return;
+    }
+    uint64_t pto = 3 * f->quic_rtt_ns;
+    if (pto < NS_PER_S) { pto = NS_PER_S; }
+    if (c->now_ns < f->ct_reply_ns || c->now_ns - f->ct_reply_ns < pto) { return; }
+    c->told++;
+    suspect(c->s, c->now_ns, &f->key, f, D2K_SUSPECT_QUIC_STALL, NULL);
+}
+
 size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns) {
     if (!s) {
         return 0;
@@ -2645,6 +2720,14 @@ size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns) {
     struct sweep_ctx c = { s, now_ns, 0 };
     d2k_track_walk(s->flows, sweep_one, &c);
     d2k_track_walk(s->uflows, sweep_udp_one, &c);
+    /* Таблица соединений читается, только когда есть кого смотреть. */
+    int want = 0;
+    d2k_track_walk(s->uflows, want_ct, &want);
+    if (want) {
+        struct ct_ctx cc = { s, now_ns, 0 };
+        (void)d2k_ct_walk(s->ct_path ? s->ct_path : D2K_NAT_PROC, 17, ct_line, &cc);
+        c.told += cc.told;
+    }
     return c.told;
 }
 

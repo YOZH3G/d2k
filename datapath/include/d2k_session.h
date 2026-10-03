@@ -168,6 +168,9 @@ uint64_t d2k_session_routed_flows(const d2k_session *s);
    установлено. Нужен для распознавания полной тишины на заблокированном QUIC,
    где обратный пакет физически не может прийти. По умолчанию выключено. */
 void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed);
+/* Файл таблицы соединений для счётчиков QUIC-потоков (d2k_ct_walk); NULL —
+   /proc/net/nf_conntrack. Для тестов. */
+void d2k_session_set_ct_path(d2k_session *s, const char *path);
 
 /* Начать/завершить внешнее удержание split QUIC. Begin вызывается до обработки
  * первой кандидатной датаграммы; payload никогда не склеивается здесь. */

@@ -45,6 +45,7 @@ const char *d2k_suspect_text(uint8_t code) {
     case D2K_SUSPECT_SILENT:  return "ответа на приветствие не было";
     case D2K_SUSPECT_RST_CUT: return "снят чужой сброс в ответ на приветствие";
     case D2K_SUSPECT_RST_AFTER_APP: return "сброс клиента или сервера после TLS app-data; проверить объём ответа";
+    case D2K_SUSPECT_QUIC_STALL: return "QUIC: сервер замолчал после рукопожатия, клиент повторяет; проверить ответ своим запросом";
     case D2K_SUSPECT_FIN_RETRY: return "FIN клиента повторён без ответа после ответа сервера; проверить объём ответа";
     default:                  return "подозрение без кода";
     }

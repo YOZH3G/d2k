@@ -14,7 +14,9 @@
  * результатом). ClientHello внутри несёт имя example.com.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include "d2k_session.h"
 #include "d2k_journal.h"
@@ -1579,7 +1581,139 @@ static int frag_nat6(const char *path, uint8_t proto, const uint8_t *src,
     return 0;
 }
 
+/* --- QUIC ЗАМОЛЧАЛ ПОСЛЕ РУКОПОЖАТИЯ (задача 50, раунд 2) ---------------
+ *
+ * Поле 04.10: Safari и curl --http3-only на rua.gr. Рукопожатие проходит,
+ * сервер присылает ещё несколько пакетов данных и замолкает НАСОВСЕМ (на ppp0
+ * пусто), клиент повторяет короткие пакеты по PTO (1, 2, 3, 4, 6, 10… с).
+ * Очередь видит лишь первые 8 пакетов каждой стороны; остальное видно только
+ * по счётчикам conntrack: прямой растёт, обратный стоит. Подделка таблицы —
+ * файлом, как у d2k_nat. */
+static char ct_path[] = "/tmp/d2k-t50-ct-XXXXXX";
+static void ct_write(uint16_t cport, uint64_t orig, uint64_t reply, int acct) {
+    FILE *f = fopen(ct_path, "w");
+    if (!f) return;
+    fprintf(f, "ipv4     2 udp      17 29 src=10.0.0.9 dst=1.2.3.4 sport=40000 dport=443 "
+               "packets=3 bytes=100 src=1.2.3.4 dst=88.87.93.11 sport=443 dport=40000 "
+               "packets=3 bytes=100 mark=0 use=2\n");
+    if (acct)
+        fprintf(f, "ipv4     2 udp      17 112 src=192.168.1.67 dst=1.2.3.4 sport=%u dport=443 "
+                   "packets=%llu bytes=6974 src=1.2.3.4 dst=88.87.93.11 sport=443 dport=%u "
+                   "packets=%llu bytes=8308 [ASSURED] mark=0 use=2\n",
+                (unsigned)cport, (unsigned long long)orig, (unsigned)cport,
+                (unsigned long long)reply);
+    else
+        fprintf(f, "ipv4     2 udp      17 112 src=192.168.1.67 dst=1.2.3.4 sport=%u dport=443 "
+                   "src=1.2.3.4 dst=88.87.93.11 sport=443 dport=%u [ASSURED] mark=0 use=2\n",
+                (unsigned)cport, (unsigned)cport);
+    fclose(f);
+}
+
+static uint8_t last_suspect_code(const d2k_session *s) {
+    const d2k_journal *j = d2k_session_journal(s);
+    uint8_t code = 0;
+    for (size_t i = 0; i < d2k_journal_count(j); i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e && e->kind == D2K_JRN_SUSPECT) code = e->code;
+    }
+    return code;
+}
+
+/* Поток с именем: Initial клиента, rev ответных пакетов в окне очереди. */
+static d2k_session *stall_flow(uint16_t cport, int rev) {
+    const uint64_t S = 1000000000ull;
+    d2k_session *s = d2k_session_new(64, 64);
+    if (!s) return NULL;
+    d2k_session_set_ct_path(s, ct_path);
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    size_t n = build_udp_pkt(pkt, cport, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 1 * S, buf, sizeof buf, &r);
+    const uint8_t any[40] = {0x40};
+    for (int i = 0; i < rev; i++) {
+        n = build_udp_rev_pkt(pkt, cport, any, sizeof any);
+        d2k_session_packet(s, pkt, n, 1 * S + 50000000ull + (uint64_t)i, buf, sizeof buf, &r);
+    }
+    return s;
+}
+
+static void test_quic_post_handshake_stall(void) {
+    const uint64_t S = 1000000000ull;
+    int fd = mkstemp(ct_path);
+    CHECK(fd >= 0, "временный файл таблицы соединений");
+    if (fd < 0) return;
+    close(fd);
+
+    /* Обрыв: сервер дал 14 пакетов (очередь видела 8), дальше молчит; клиент
+       шлёт повторы. */
+    d2k_session *s = stall_flow(50400, 8);
+    ct_write(50400, 12, 14, 1);
+    d2k_session_sweep(s, 2 * S);
+    ct_write(50400, 13, 14, 1);
+    d2k_session_sweep(s, 3 * S);
+    CHECK(d2k_session_suspects(s) == 0, "два пакета клиента в тишину уже объявлены обрывом");
+    ct_write(50400, 15, 14, 1);
+    d2k_session_sweep(s, 4 * S);
+    CHECK(last_suspect_code(s) == D2K_SUSPECT_QUIC_STALL,
+          "QUIC замолчал после рукопожатия, клиент повторяет — подозрения нет");
+    ct_write(50400, 25, 14, 1);
+    d2k_session_sweep(s, 9 * S);
+    CHECK(d2k_session_suspects(s) == 1, "один поток дал больше одного подозрения");
+    d2k_session_free(s);
+
+    /* Рабочий QUIC: обратный счётчик растёт — ни при каком числе пакетов клиента. */
+    s = stall_flow(50401, 8);
+    for (int i = 0; i < 10; i++) {
+        ct_write(50401, 20 + 50 * (uint64_t)i, 30 + 900 * (uint64_t)i, 1);
+        d2k_session_sweep(s, (uint64_t)(2 + i) * S);
+    }
+    CHECK(d2k_session_suspects(s) == 0, "рабочая загрузка по QUIC объявлена обрывом");
+    d2k_session_free(s);
+
+    /* Обычное окончание: последний ACK клиента и его CONNECTION_CLOSE остаются
+       без ответа законно — два пакета в тишину не обрыв. */
+    s = stall_flow(50402, 8);
+    ct_write(50402, 20, 40, 1);
+    d2k_session_sweep(s, 2 * S);
+    ct_write(50402, 22, 40, 1);
+    d2k_session_sweep(s, 30 * S);
+    CHECK(d2k_session_suspects(s) == 0, "ACK и CONNECTION_CLOSE клиента объявлены обрывом");
+    d2k_session_free(s);
+
+    /* Обратный счётчик не ушёл за окно очереди: это молчание рукопожатия,
+       у него свой детектор (SILENT), не этот. */
+    s = stall_flow(50403, 1);
+    ct_write(50403, 3, 1, 1);
+    d2k_session_sweep(s, 1 * S + 100000000ull);
+    ct_write(50403, 9, 1, 1);
+    d2k_session_sweep(s, 1 * S + 900000000ull);
+    CHECK(last_suspect_code(s) != D2K_SUSPECT_QUIC_STALL,
+          "молчание до конца рукопожатия выдано за обрыв после него");
+    d2k_session_free(s);
+
+    /* Счётчиков в таблице нет (accounting выключен) — сказать нечего. */
+    s = stall_flow(50404, 8);
+    ct_write(50404, 0, 0, 0);
+    d2k_session_sweep(s, 2 * S);
+    d2k_session_sweep(s, 6 * S);
+    CHECK(d2k_session_suspects(s) == 0, "строка без счётчиков дала подозрение");
+    d2k_session_free(s);
+
+    /* Тишина короче PTO: клиент шлёт три пакета за полсекунды — сервер ещё
+       мог не успеть ответить. */
+    s = stall_flow(50405, 8);
+    ct_write(50405, 12, 14, 1);
+    d2k_session_sweep(s, 2 * S);
+    ct_write(50405, 15, 14, 1);
+    d2k_session_sweep(s, 2 * S + 500000000ull);
+    CHECK(d2k_session_suspects(s) == 0, "тишина короче PTO объявлена обрывом");
+    d2k_session_free(s);
+
+    unlink(ct_path);
+}
+
 int main(void) {
+    test_quic_post_handshake_stall();
     {
         d2k_session *s = d2k_session_new(32, 32);
         uint8_t pkt[1400], out[8192]; char err[128]; d2k_plan *p = NULL;

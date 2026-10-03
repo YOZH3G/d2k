@@ -94,4 +94,23 @@ typedef int (*d2k_nat_family_fn)(const char *path, uint8_t proto,
     uint8_t family, uint8_t *out_src, uint16_t *out_sport);
 extern d2k_nat_family_fn d2k_nat_family_hook;
 
+/* СЧЁТЧИКИ ПАКЕТОВ ПОТОКОВ (задача 50, раунд 2).
+ *
+ * Очередь видит у UDP только первые восемь пакетов в каждую сторону
+ * (connbytes 0:8). Глухой обрыв QUIC после рукопожатия наступает позже:
+ * сервер замолкает, а клиент продолжает слать повторы по PTO. Видно это
+ * только по счётчикам conntrack: прямой растёт, обратный стоит. Счётчики
+ * ведёт ядро и для потоков вне очереди; поле 04.10: у UDP они живые и на
+ * загрузке 280 МБ (ускоритель UDP-поток не забирает).
+ *
+ * Обходит строки транспорта proto; для каждой, где есть прямой и обратный
+ * кортежи и ОБА счётчика пакетов, зовёт fn с прямым кортежем (адреса — 4 или
+ * 16 байт по family, порты в сетевом порядке) и счётчиками направлений.
+ * Возвращает число отданных строк; -1 — таблицы нет. */
+typedef void (*d2k_ct_fn)(void *ctx, uint8_t family, const uint8_t *src,
+                          const uint8_t *sport_be, const uint8_t *dst,
+                          const uint8_t *dport_be, uint64_t orig_pkts,
+                          uint64_t reply_pkts);
+int d2k_ct_walk(const char *path, uint8_t proto, d2k_ct_fn fn, void *ctx);
+
 #endif /* D2K_NAT_H */
