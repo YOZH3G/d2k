@@ -6342,7 +6342,10 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          /* Перенос не меняет отпечаток коробки плана: цель
                             этой коробкой не измерялась (задача 32, I1). */
                          wall_s(s, now_ms), transferred ? NULL : &t->fp);
-    if (t->group_block_proven)
+    /* Блок доказан полным замером ИЛИ базовым вопросом донора перед своими
+       планами (0/3 — рукопожатие режется): оба — опыт для семейства. Без
+       второго семейства не учились бы на основном пути (поле 03.10). */
+    if (t->group_block_proven || (t->own_first == 2 && t->res.base_blocked))
         group_record(s, t, D2K_GROUP_BLOCKED_CONFIRMED, plan_id, rec_shape, now_ms);
     if (t->ech_offer) {
         for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {

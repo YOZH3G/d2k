@@ -11073,6 +11073,43 @@ own_first_test:
             d2k_sched_rx_ver_hook = saved_rx;
         }
 
+        /* (a-fam) Блок доказан базовым вопросом (0/3), свой план подтверждён
+           своим зондом: это такой же опыт для семейства, как после полного
+           замера. Иначе семейства перестают учиться — свои планы стали
+           основным путём (поле 03.10: googlevideo QUIC rr16/r1/rr12 на одном
+           плане, записан только rr16). Имя в настоящей зоне: у выдуманной нет
+           базового домена, и семейства там не бывает вовсе. */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-fam-own", pid, 2, 3, "a.famtest.org", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched_rx_ver_hook = stub_rx_counting;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = vol_calls = layered_identity_calls = 0;
+            ver_answer_port = 42109;
+            d2k_ev h = ev_hello(6, 42109, "b.famtest.org"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42109); d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 42109); d2k_sched_event(s, &ap);
+            spin(s, 40);
+            CHECK(said("ПОДТВЕРЖДЕНО собственным зондом") && tcp_calls == 0,
+                  "own-first fam: свой план не подтвердился до полного замера");
+            int own_vote = 0;
+            for (size_t i = 0; c.groups && i < c.groups->n_observations; i++)
+                if (!strcmp(c.groups->observations[i].name, "b.famtest.org") &&
+                    !strcmp(c.groups->observations[i].plan_id, pid) &&
+                    (c.groups->observations[i].evidence & D2K_GROUP_BLOCKED_CONFIRMED)) own_vote = 1;
+            CHECK(own_vote, "own-first fam: подтверждение своим планом не записано опытом семейства");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_rx_ver_hook = saved_rx;
+        }
+
         /* (a2) ЗАДАЧА 49: GREASE ECH (любой Chromium) — те же свои планы до
            полного замера. Поле 03.10: meduza.io IPv6 со снимком ECH offer
            шёл 4:37 полным деревом (104 зонда), хотя plan-680fbe00 той же
