@@ -816,7 +816,7 @@ test-quicconn-rtx: test_quicconn_rtx
 
 .PHONY: test-quicconn6
 TESTS += test_quicconn_rtx
-TESTS += test_quicconn6 test_volume test_volume_context test_httpup_logic test_httpup_relay
+TESTS += test_quicconn6 test_volume test_volume_context test_httpup_logic
 TESTS += test_catalog_sync
 
 test_catalog_sync: test_catalog_sync.c $(SRC:.c=.o) $(HDR)
@@ -848,10 +848,8 @@ test_httpup_logic: test_httpup_logic.c httpup_logic.c include/d2k_httpup.h
 test-httpup-logic: test_httpup_logic
 	./test_httpup_logic
 
-.PHONY: release-httpup test-volume test-httpup-logic
-release-httpup:
-	mkdir -p $(BUILDDIR)
-	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) -static -Wl,-S -Os -std=c11 -Wall -Wextra -Werror -Iinclude -o $(BUILDDIR)/d2khttp-linux-$(ARCH) httpup.c httpup_logic.c -lpthread
+# Прокси d2khttp убран (задача 51): разбор портала теперь вызывает датапат.
+.PHONY: test-volume test-httpup-logic
 check: test-quicconn6
 test-quicconn6: test_quicconn6
 	./test_quicconn6
@@ -910,11 +908,3 @@ test-quic-original-arms: test_quic_original_arms
 test-quic-run-order: test_quic_run_order
 	./test_quic_run_order
 
-test_httpup_relay: test_httpup_relay.c httpup.c include/d2k_httpup.h
-	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -o $@ test_httpup_relay.c $(TEST_LDFLAGS)
-
-test-httpup-relay: test_httpup_relay
-	./test_httpup_relay
-
-.PHONY: test-httpup-relay
-check: test-httpup-relay

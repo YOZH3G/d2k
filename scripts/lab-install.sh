@@ -115,8 +115,6 @@ cp scripts/select-panel-ip.sh scripts/architecture.sh scripts/check-cpu.sh "$REL
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
 cp builds/d2ktg-linux-arm64 "$REL/builds/d2ktg-linux-$ARCH"
-# Released static HTTP-upgrade listener, as in the published package.
-cp builds/d2khttp-linux-arm64 "$REL/builds/d2khttp-linux-$ARCH"
 make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"

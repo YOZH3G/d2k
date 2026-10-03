@@ -19,7 +19,5 @@ for ARCH in $ARCHES; do
             TARGET_FLAGS="$TARGET_FLAGS" ZIG="$BUILD_ZIG" BUILDDIR="$OUT" \
             COMMIT="$COMMIT" BUILT="$BUILT" DIRTY="$DIRTY" VERSION="${VERSION:-0.1.0-mvp}"
     done
-    make -C "$ROOT/core" release-httpup ARCH="$ARCH" TARGET="$TARGET" \
-        TARGET_FLAGS="$TARGET_FLAGS" ZIG="$BUILD_ZIG" BUILDDIR="$OUT"
     ARCH="$ARCH" ZIG="$BUILD_ZIG" OUT="$OUT" sh "$ROOT/scripts/build-openssl-tg.sh"
 done

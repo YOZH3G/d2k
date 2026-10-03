@@ -17,7 +17,7 @@ for arch in $ARCHES; do
         riscv64) cpu=riscv64 ;;
         *) echo "Unknown architecture: $arch" >&2; exit 1 ;;
     esac
-    for component in d2kd d2kc d2kpanel d2ktg d2khttp; do
+    for component in d2kd d2kc d2kpanel d2ktg; do
         bin="$ROOT/builds/$component-linux-$arch"
         test -s "$bin"
         readelf -h "$bin" >/dev/null
@@ -26,13 +26,9 @@ for arch in $ARCHES; do
         fi
         case "$component" in
             d2kd) timeout 20 "qemu-$cpu" "$bin" --help >/dev/null 2>&1 ;;
-            d2kc|d2khttp)
+            d2kc)
                 rc=0
-                if [ "$component" = d2khttp ]; then
-                    timeout 20 "qemu-$cpu" "$bin" --help >/dev/null 2>&1 || rc=$?
-                else
-                    timeout 20 "qemu-$cpu" "$bin" >/dev/null 2>&1 || rc=$?
-                fi
+                timeout 20 "qemu-$cpu" "$bin" >/dev/null 2>&1 || rc=$?
                 [ "$rc" = 2 ] || { echo "$bin: expected usage exit 2, got $rc" >&2; exit 1; }
                 ;;
             *) timeout 20 "qemu-$cpu" "$bin" --version ;;

@@ -39,7 +39,7 @@ exit 1
   fixture('builds/d2kpanel-linux-amd64', '#!/bin/sh\necho features=telegram-control\n');
   fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3\n');
   fixture('builds/d2kd-linux-amd64', '#!/bin/sh\nexit 0\n');
-  for (const name of ['d2kc', 'd2khttp']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
+  for (const name of ['d2kc']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
   fixture('files/S99d2k', '#!/bin/sh\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
   for (const name of ['d2k-fw-heal.sh', 'd2k-ppe-deoffload.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
@@ -68,7 +68,11 @@ exit 1
     return result.stdout;
   }
   const calls = () => { try { return fs.readFileSync(path.join(tmp, 'calls'), 'utf8'); } catch { return ''; } };
+  // Upgrade from a release that shipped the port-80 proxy (task 51): its binary goes away.
+  fs.mkdirSync(path.join(tmp, 'opt/sbin'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'opt/sbin/d2khttp'), '#!/bin/sh\nexit 2\n', { mode: 0o755 });
   const installOut = run('install');
+  assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2khttp')), 'upgrade must remove the old d2khttp proxy binary');
   // The first DNS refresh (15 names, possibly silent edges) must not hold the
   // installer: the service's scheduler runs it in the background with a log.
   assert(!calls().includes('dns-refresh'), 'installer must not run the DNS refresh synchronously');
