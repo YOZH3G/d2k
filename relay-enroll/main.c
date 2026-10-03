@@ -10,6 +10,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
+#include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
 #include <sched.h>
@@ -40,6 +42,15 @@
 #define RESOLVE_RES_OPTIONS "timeout:2 attempts:1"
 #define RESOLVE_NAME_BUDGET 4
 #define LOCK_WAIT_MS 1000
+/* Meta's GeoDNS answers for the resolver's location, so the VPS resolver
+   alone may give one address that is dead from the router. Independent public
+   resolvers are asked too, all names at once over UDP, and the union is kept. */
+#define PUBLIC_RESOLVERS 3
+#define PUBLIC_WAIT_MS 1500
+#define PUBLIC_PHASE_MS 2000
+#define DNS_MAX_ANSWERS 32
+#define DNS_QUERY_LIMIT 300
+static const char *const public_resolvers[PUBLIC_RESOLVERS]={"1.1.1.1","8.8.8.8","9.9.9.9"};
 #define RESOLVE_REPLY_LIMIT 8192
 #define REGISTER_PER_IP 6
 #define REGISTER_TOTAL 120
@@ -182,10 +193,189 @@ static int system_resolve(const char *host,uint32_t *out,size_t cap) {
 }
 static resolve_fn resolver=system_resolve; /* replaced by the tests */
 
-static time_t monotonic_seconds(void) {
-    struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts)!=0)return 0;return ts.tv_sec;
+static int64_t monotonic_ms(void) {
+    struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts)!=0)return 0;
+    return (int64_t)ts.tv_sec*1000+ts.tv_nsec/1000000;
 }
-static time_t (*clock_now)(void)=monotonic_seconds; /* replaced by the tests */
+static int64_t (*clock_ms)(void)=monotonic_ms; /* replaced by the tests */
+static time_t monotonic_seconds(void){return (time_t)(monotonic_ms()/1000);}
+static time_t clock_now(void){return (time_t)(clock_ms()/1000);}
+
+/* ---- Direct DNS A queries --------------------------------------------- */
+
+static size_t dns_build_query(uint16_t id,const char *name,uint8_t *out,size_t cap) {
+    size_t off=12,len=strlen(name);
+    if(cap<12+len+2+4||len>253)return 0;
+    memset(out,0,12);out[0]=(uint8_t)(id>>8);out[1]=(uint8_t)id;out[2]=0x01;out[5]=1; /* RD, QDCOUNT 1 */
+    while(*name){
+        const char *dot=strchr(name,'.');size_t n=dot?(size_t)(dot-name):strlen(name);
+        if(n<1||n>63)return 0;
+        out[off++]=(uint8_t)n;memcpy(out+off,name,n);off+=n;name+=n;if(*name=='.')name++;
+    }
+    out[off++]=0;out[off++]=0;out[off++]=1;out[off++]=0;out[off++]=1; /* A, IN */
+    return off;
+}
+
+static unsigned dns16(const uint8_t *p){return (unsigned)p[0]<<8|p[1];}
+
+/* Decodes a (possibly compressed) name at *off into lower-case dotted text.
+   *off moves past the name as stored; pointers must point backwards. */
+static int dns_read_name(const uint8_t *msg,size_t len,size_t *off,char out[256]) {
+    size_t pos=*off,used=0;int jumped=0,hops=0;
+    for(;;){
+        if(pos>=len)return -1;
+        unsigned c=msg[pos];
+        if(c==0){if(!jumped)*off=pos+1;break;}
+        if((c&0xc0)==0xc0){
+            if(pos+1>=len||++hops>16)return -1;
+            size_t target=(c&0x3f)<<8|msg[pos+1];
+            if(target>=pos)return -1;
+            if(!jumped){*off=pos+2;jumped=1;}
+            pos=target;continue;
+        }
+        if(c&0xc0||pos+1+c>len||used+c+1>255)return -1;
+        if(used)out[used++]='.';
+        for(unsigned i=0;i<c;i++){char ch=(char)msg[pos+1+i];out[used++]=(ch>='A'&&ch<='Z')?(char)(ch+32):ch;}
+        pos+=1+c;
+    }
+    out[used]='\0';return 0;
+}
+
+/* A records for qname, following CNAMEs inside the answer section only.
+   The reply must match the query's ID and question exactly; truncated,
+   erroneous or malformed replies yield -1. */
+static int dns_parse_reply(const uint8_t *msg,size_t len,const uint8_t *query,size_t qlen,
+                           const char *qname,uint32_t *out,size_t cap) {
+    if(len<qlen||qlen<12+5)return -1;
+    if(msg[0]!=query[0]||msg[1]!=query[1])return -1;            /* ID */
+    if(!(msg[2]&0x80)||(msg[2]&0x78)||(msg[2]&0x02))return -1;   /* QR, opcode 0, not TC */
+    if((msg[3]&0x0f)!=0)return -1;                               /* RCODE */
+    if(dns16(msg+4)!=1||memcmp(msg+12,query+12,qlen-12)!=0)return -1;
+    unsigned answers=dns16(msg+6);size_t off=qlen;
+    struct { unsigned type; char owner[256],target[256]; uint32_t a; } *rr=NULL;
+    size_t kept=0;
+    rr=calloc(DNS_MAX_ANSWERS,sizeof(*rr));if(!rr)return -1;
+    for(unsigned i=0;i<answers;i++){
+        char owner[256];
+        if(dns_read_name(msg,len,&off,owner)!=0||off+10>len){free(rr);return -1;}
+        unsigned type=dns16(msg+off),klass=dns16(msg+off+2),rdlen=dns16(msg+off+8);off+=10;
+        if(off+rdlen>len){free(rr);return -1;}
+        if(kept<DNS_MAX_ANSWERS&&klass==1){
+            if(type==1&&rdlen==4){rr[kept].type=1;strcpy(rr[kept].owner,owner);memcpy(&rr[kept].a,msg+off,4);kept++;}
+            else if(type==5){
+                size_t t=off;char target[256];
+                if(dns_read_name(msg,off+rdlen,&t,target)!=0||t!=off+rdlen){free(rr);return -1;}
+                rr[kept].type=5;strcpy(rr[kept].owner,owner);strcpy(rr[kept].target,target);kept++;
+            }
+        }
+        off+=rdlen;
+    }
+    char current[256];snprintf(current,sizeof(current),"%s",qname);
+    size_t n=0;
+    for(int hop=0;hop<8;hop++){
+        for(size_t i=0;i<kept;i++){
+            if(rr[i].type!=1||strcmp(rr[i].owner,current)!=0)continue;
+            size_t k;for(k=0;k<n;k++)if(out[k]==rr[i].a)break;
+            if(k==n&&n<cap)out[n++]=rr[i].a;
+        }
+        size_t i;for(i=0;i<kept;i++)if(rr[i].type==5&&strcmp(rr[i].owner,current)==0)break;
+        if(i==kept||strcmp(rr[i].target,current)==0)break;
+        snprintf(current,sizeof(current),"%s",rr[i].target);
+    }
+    free(rr);return (int)n;
+}
+
+/* One datagram per send; recv waits up to timeout_ms for any reply and
+   returns its length, 0 on timeout, <0 when no server can answer any more. */
+typedef struct dns_transport {
+    void *ctx;
+    int (*open)(void *ctx);
+    int (*send)(void *ctx,size_t server,const uint8_t *query,size_t len);
+    int (*recv)(void *ctx,size_t *server,uint8_t *buf,size_t cap,int timeout_ms);
+    void (*close)(void *ctx);
+} dns_transport;
+
+typedef struct { int fd[PUBLIC_RESOLVERS]; } udp_dns;
+static int udp_open(void *ctx) {
+    udp_dns *u=ctx;int any=0;
+    for(size_t i=0;i<PUBLIC_RESOLVERS;i++){
+        struct sockaddr_in a={.sin_family=AF_INET,.sin_port=htons(53)};
+        u->fd[i]=socket(AF_INET,SOCK_DGRAM,0);
+        /* connect() also drops datagrams from any other source. */
+        if(u->fd[i]>=0&&(inet_pton(AF_INET,public_resolvers[i],&a.sin_addr)!=1||
+           connect(u->fd[i],(struct sockaddr *)&a,sizeof(a))!=0)){close(u->fd[i]);u->fd[i]=-1;}
+        if(u->fd[i]>=0)any=1;
+    }
+    return any?0:-1;
+}
+static int udp_send(void *ctx,size_t server,const uint8_t *query,size_t len) {
+    udp_dns *u=ctx;if(server>=PUBLIC_RESOLVERS||u->fd[server]<0)return -1;
+    return send(u->fd[server],query,len,0)==(ssize_t)len?0:-1;
+}
+static int udp_recv(void *ctx,size_t *server,uint8_t *buf,size_t cap,int timeout_ms) {
+    udp_dns *u=ctx;struct pollfd p[PUBLIC_RESOLVERS];size_t map[PUBLIC_RESOLVERS],n=0;
+    for(size_t i=0;i<PUBLIC_RESOLVERS;i++)if(u->fd[i]>=0){p[n].fd=u->fd[i];p[n].events=POLLIN;p[n].revents=0;map[n++]=i;}
+    if(!n)return -1;
+    int r=poll(p,(nfds_t)n,timeout_ms);if(r<=0)return 0;
+    for(size_t i=0;i<n;i++){
+        if(!p[i].revents)continue;
+        ssize_t got=recv(p[i].fd,buf,cap,0);
+        if(got<=0){close(u->fd[map[i]]);u->fd[map[i]]=-1;return 0;} /* e.g. ICMP refused */
+        *server=map[i];return (int)got;
+    }
+    return 0;
+}
+static void udp_close(void *ctx) {
+    udp_dns *u=ctx;for(size_t i=0;i<PUBLIC_RESOLVERS;i++)if(u->fd[i]>=0){close(u->fd[i]);u->fd[i]=-1;}
+}
+static udp_dns udp_state;
+static dns_transport udp_transport={&udp_state,udp_open,udp_send,udp_recv,udp_close};
+static dns_transport *public_dns=&udp_transport; /* replaced by the tests */
+
+typedef struct { uint32_t a[RESOLVE_MAX_ADDRESSES]; size_t n; } addr_set;
+static void addr_add(addr_set *set,const uint32_t *a,size_t n) {
+    for(size_t i=0;i<n&&set->n<RESOLVE_MAX_ADDRESSES;i++){
+        size_t k;for(k=0;k<set->n;k++)if(set->a[k]==a[i])break;
+        if(k==set->n)set->a[set->n++]=a[i];
+    }
+}
+
+/* Asks every public resolver for every name at once and waits at most
+   PUBLIC_WAIT_MS. Answers land in pub[name][server]. */
+static void public_phase(const int *order,size_t count,addr_set pub[][PUBLIC_RESOLVERS]) {
+    uint8_t queries[RESOLVE_MAX_NAMES][DNS_QUERY_LIMIT];size_t qlen[RESOLVE_MAX_NAMES];
+    unsigned char answered[RESOLVE_MAX_NAMES*PUBLIC_RESOLVERS]={0};
+    uint16_t base=0;if(RAND_bytes((unsigned char *)&base,sizeof(base))!=1)base=(uint16_t)getpid();
+    if(!public_dns||public_dns->open(public_dns->ctx)!=0)return;
+    size_t pending=0;
+    for(size_t i=0;i<count;i++){
+        qlen[i]=dns_build_query(0,resolve_hosts[order[i]],queries[i],sizeof(queries[i]));
+        if(!qlen[i])continue;
+        for(size_t s=0;s<PUBLIC_RESOLVERS;s++){
+            uint16_t id=(uint16_t)(base+i*PUBLIC_RESOLVERS+s);uint8_t q[DNS_QUERY_LIMIT];
+            memcpy(q,queries[i],qlen[i]);q[0]=(uint8_t)(id>>8);q[1]=(uint8_t)id;
+            if(public_dns->send(public_dns->ctx,s,q,qlen[i])==0)pending++;
+            else answered[i*PUBLIC_RESOLVERS+s]=1;
+        }
+    }
+    int64_t start=clock_ms();
+    while(pending){
+        int64_t left=PUBLIC_WAIT_MS-(clock_ms()-start);if(left<=0)break;
+        uint8_t reply[512];size_t server=0;
+        int got=public_dns->recv(public_dns->ctx,&server,reply,sizeof(reply),(int)left);
+        if(got<0)break;
+        if(got<12)continue;
+        size_t k=(uint16_t)(dns16(reply)-base);
+        if(k>=count*PUBLIC_RESOLVERS||k%PUBLIC_RESOLVERS!=server||answered[k])continue;
+        size_t i=k/PUBLIC_RESOLVERS;uint8_t q[DNS_QUERY_LIMIT];
+        memcpy(q,queries[i],qlen[i]);q[0]=reply[0];q[1]=reply[1];
+        uint32_t a[RESOLVE_MAX_ADDRESSES];
+        int n=dns_parse_reply(reply,(size_t)got,q,qlen[i],resolve_hosts[order[i]],a,RESOLVE_MAX_ADDRESSES);
+        if(n<0)continue; /* malformed or mismatched: wait for a valid one */
+        answered[k]=1;pending--;addr_add(&pub[i][server],a,(size_t)n);
+    }
+    public_dns->close(public_dns->ctx);
+}
 
 static void json_space(const char **p,const char *end) {
     while(*p<end&&(**p==' '||**p=='\t'||**p=='\r'||**p=='\n'))(*p)++;
@@ -230,19 +420,23 @@ static int handle_resolve(const char *body,size_t length,char *out,size_t cap,si
     }while(json_char(&p,end,','));
     if(!json_char(&p,end,']')||!json_char(&p,end,'}'))return 400;
     json_space(&p,end);if(p!=end)return 400;
+    /* Public resolvers first in time (bounded, all at once), only when the
+       phase and the reply still fit before the deadline. */
+    addr_set pub[RESOLVE_MAX_NAMES][PUBLIC_RESOLVERS];memset(pub,0,sizeof(pub));
+    if(!deadline||clock_ms()+PUBLIC_PHASE_MS<=(int64_t)deadline*1000)public_phase(order,count,pub);
     size_t used=0;int n;
 #define EMIT(...) do{n=snprintf(out+used,cap-used,__VA_ARGS__);if(n<0||(size_t)n>=cap-used)return 502;used+=(size_t)n;}while(0)
     EMIT("{\"results\":{");
     for(size_t i=0;i<count;i++){
         const char *host=resolve_hosts[order[i]];
-        uint32_t raw[32],unique[RESOLVE_MAX_ADDRESSES];size_t got=0,kept=0;
+        uint32_t raw[32];size_t got=0;addr_set set={.n=0};
         if(!deadline||clock_now()+RESOLVE_NAME_BUDGET<=deadline){
             int r=resolver(host,raw,sizeof(raw)/sizeof(raw[0]));got=r>0?(size_t)r:0;
         }
-        for(size_t j=0;j<got&&kept<RESOLVE_MAX_ADDRESSES;j++){
-            size_t k;for(k=0;k<kept;k++)if(unique[k]==raw[j])break;
-            if(k==kept)unique[kept++]=raw[j];
-        }
+        /* The VPS's own answer first, then each public resolver in order. */
+        addr_add(&set,raw,got);
+        for(size_t s=0;s<PUBLIC_RESOLVERS;s++)addr_add(&set,pub[i][s].a,pub[i][s].n);
+        const uint32_t *unique=set.a;size_t kept=set.n;
         EMIT("%s\"%s\":[",i?",":"",host);
         for(size_t j=0;j<kept;j++){
             char text[INET_ADDRSTRLEN];struct in_addr a={.s_addr=unique[j]};
