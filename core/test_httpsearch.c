@@ -39,6 +39,16 @@ static void test_judge(void) {
           "не-HTTP принят за ответ");
     CHECK(d2k_hs_judge("rutracker.org", "HTTP/1.1", 8, 98000, 99000) == D2K_HS_GARBAGE,
           "обрывок строки статуса принят за ответ");
+    /* Ответ сервера на ПРИМАНКУ — не ответ цели (повторное ревью I-A). */
+    static const char to_decoy[] = "HTTP/1.1 301 Moved\r\nLocation: https://disk.rzd.ru/\r\n\r\n";
+    CHECK(d2k_hs_judge("rutracker.org", to_decoy, sizeof to_decoy - 1, 98000, 99000) == D2K_HS_DECOY,
+          "ответ с именем приманки принят за ответ цели");
+    static const char misdirected[] = "HTTP/1.1 421 Misdirected Request\r\n\r\n";
+    CHECK(d2k_hs_judge("rutracker.org", misdirected, sizeof misdirected - 1, 98000, 99000) == D2K_HS_DECOY,
+          "421 принят за ответ цели");
+    static const char bad[] = "HTTP/1.1 400 Bad Request\r\nServer: nginx\r\n\r\n";
+    CHECK(d2k_hs_judge("rutracker.org", bad, sizeof bad - 1, 98000, 99000) == D2K_HS_DECOY,
+          "400 (склейка приманки с запросом) принят за ответ цели");
 }
 
 /* Кандидаты: каждый — годный план протокола http, исполнимый на запросе. */
@@ -384,6 +394,11 @@ static void test_measured_poison(void) {
     d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
     CHECK(d2k_httpsearch_measured_poison(hs, "ttl=5 badsum") == 0, "измеренная порча не принята");
     CHECK(d2k_httpsearch_measured_poison(hs, "tcpts") != 0, "порча, которую HTTP-исполнитель не повторит, принята");
+    /* Одна ttl приманку до сервера не останавливает наверняка: HTTP-сервер
+       бывает ближе TLS-сервера, по которому ttl подбирали (повторное ревью
+       I-A). Только вместе с badsum или seqshift. */
+    CHECK(d2k_httpsearch_measured_poison(hs, "ttl=5") != 0, "приманка только с ttl принята");
+    CHECK(d2k_httpsearch_measured_poison(hs, "ttl=6 seqshift=-66000") == 0, "ttl+seqshift не принята");
     CHECK(d2k_httpsearch_measured_poison(hs, "badsum") == 0, "измеренная badsum не принята");
     int64_t now = 1000;
     d2k_httpsearch_portal(hs, "c.example", 4, IP, now);
@@ -393,11 +408,13 @@ static void test_measured_poison(void) {
     CHECK(strstr(f.last_probe_plan, "fake payload=1") && strstr(f.last_probe_plan, "ttl=5") &&
           strstr(f.last_probe_plan, "badsum"), "третий вопрос — не измеренная порча");
     trial(hs, &f, &now, 1, D2K_HS_INJECTED);
-    CHECK(strstr(f.last_probe_plan, "badsum") && !strstr(f.last_probe_plan, "ttl="),
+    CHECK(strstr(f.last_probe_plan, "ttl=6") && strstr(f.last_probe_plan, "seqshift=-66000"),
           "четвёртый вопрос — не вторая измеренная порча");
     trial(hs, &f, &now, 1, D2K_HS_INJECTED);
-    CHECK(!d2k_httpsearch_busy(hs) && !strstr(f.last_probe_plan, "seqshift"),
-          "при измеренной порче заданы и заготовки");
+    CHECK(strstr(f.last_probe_plan, "badsum") && !strstr(f.last_probe_plan, "ttl="),
+          "пятый вопрос — не третья измеренная порча");
+    trial(hs, &f, &now, 1, D2K_HS_INJECTED);
+    CHECK(!d2k_httpsearch_busy(hs), "при измеренной порче заданы и заготовки");
     /* Извлечение из текста подтверждённого TLS-плана (как в каталоге). */
     static const char tls[] = "d2k-plan 1 1\nid 00\nproto tcp tls\npayload 1 16\npayload 2 41\n"
         "poison 1 badsum\npoison 2 ttl=4\nsplit hello_middle +0\n"
@@ -414,6 +431,8 @@ static void test_measured_poison(void) {
     CHECK(d2k_hs_candidate_text("fake:ttl=5+badsum", id, text, sizeof text) == 0 &&
           strstr(text, "poison 1 ttl=5 badsum"), "ключ измеренной порчи не собирается в план");
     CHECK(d2k_hs_candidate_text("fake:tcpts", id, text, sizeof text) != 0, "негодный ключ порчи собран");
+    CHECK(d2k_hs_candidate_text("fake:ttl=5", id, text, sizeof text) != 0,
+          "ключ приманки только с ttl собран (например, из старого http-plans.txt)");
     d2k_httpsearch_free(hs);
 }
 

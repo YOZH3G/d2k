@@ -58,7 +58,10 @@ typedef enum {
     D2K_HS_SILENT,        /* ответа нет до срока */
     D2K_HS_RESET,         /* сброс */
     D2K_HS_CLOSED,        /* закрытие без ответа */
-    D2K_HS_CONNECT_FAIL   /* соединение не установилось */
+    D2K_HS_CONNECT_FAIL,  /* соединение не установилось */
+    D2K_HS_DECOY          /* ответ на приманку: имя приманки в ответе или
+                             400/421 — сервер получил склейку приманки с
+                             запросом, а не запрос цели */
 } d2k_hs_answer;
 
 const char *d2k_hs_answer_name(d2k_hs_answer a);
@@ -133,7 +136,10 @@ d2k_httpsearch *d2k_httpsearch_new(const d2k_hs_ops *ops);
 void d2k_httpsearch_free(d2k_httpsearch *hs);
 /* Порча приманки, измеренная на этой линии (строка признаков плана: «badsum»,
  * «ttl=N», «seqshift=N»; прочие — tcpts, ipidzero — HTTP-исполнитель без
- * шаблона потока не повторит, такая строка не принимается). 0 — принята. */
+ * шаблона потока не повторит, такая строка не принимается). ttl — только
+ * вместе с badsum или seqshift: одна ttl подобрана под TLS-сервер и может
+ * довести приманку до более близкого HTTP-сервера, а тот примет её как
+ * запрос (повторное ревью I-A). 0 — принята. */
 int d2k_httpsearch_measured_poison(d2k_httpsearch *hs, const char *spec);
 /* Признаки порчи приманок из текста плана (строки «poison N …», на которые
  * ссылается «fake … poison=N»). Сколько записано в out. */

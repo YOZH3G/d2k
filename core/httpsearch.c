@@ -47,6 +47,7 @@ const char *d2k_hs_answer_name(d2k_hs_answer a) {
     case D2K_HS_RESET:        return "сброс";
     case D2K_HS_CLOSED:       return "закрытие без ответа";
     case D2K_HS_CONNECT_FAIL: return "соединение не установилось";
+    case D2K_HS_DECOY:        return "ответ на приманку, не на запрос цели";
     default:                  return "нет";
     }
 }
@@ -64,6 +65,19 @@ d2k_hs_answer d2k_hs_judge(const char *host, const char *head, size_t n,
     char portal[256];
     if (host && d2k_httpup_portal_location(host, head, n, portal, sizeof portal)) {
         return D2K_HS_INJECTED;
+    }
+    /* ПРИМАНКА ДОШЛА ДО СЕРВЕРА (повторное ревью I-A): сервер принял её
+       байты за начало запроса и ответил на склейку — 400/421 или ответ про
+       имя приманки. Это не ответ цели, и подтверждать по нему план нельзя:
+       такой план отдавал бы серверу приманку вместо каждого запроса. */
+    int code = (head[9] - '0') * 100 + (head[10] - '0') * 10 + (head[11] - '0');
+    if (code == 400 || code == 421) { return D2K_HS_DECOY; }
+    {
+        static const char decoy[] = HS_DECOY;
+        const size_t dl = sizeof decoy - 1;
+        for (size_t i = 0; i + dl <= n; i++) {
+            if (!strncasecmp(head + i, decoy, dl)) { return D2K_HS_DECOY; }
+        }
     }
     /* То же правило, что у датапата (http80.c): сервер не может ответить
        раньше, чем запрос дошёл до него и вернулся. */
@@ -234,6 +248,8 @@ static int poison_key_spec(const char *key, char *spec, size_t cap) {
         if (k < 0 || (size_t)k >= cap - pos) { return -1; }
         pos += (size_t)k;
     }
+    /* ttl одна приманку до сервера не останавливает наверняка. */
+    if (have_ttl && !have_bad && !have_seq) { return -1; }
     return pos ? 0 : -1;
 }
 
