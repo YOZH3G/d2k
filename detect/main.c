@@ -186,9 +186,9 @@ static void print_json(const d2k_result *r)
  * не должен спотыкаться о прогресс, а человек увидит его в терминале рядом. */
 static void print_progress(void *ctx, const d2k_obs *o)
 {
-    long *t0 = ctx;
+    int64_t *t0 = ctx;
     fprintf(stderr, "  [%4ld с] %-28s прошло=%d не прошло=%d %s\n",
-            (d2k_now_ms() - *t0) / 1000, o->probe, o->pass, o->fail, o->err);
+            (long)((d2k_now_ms() - *t0) / 1000), o->probe, o->pass, o->fail, o->err);
     fflush(stderr);
 }
 
@@ -406,7 +406,7 @@ int main(int argc, char **argv)
         (void)d2k_trigger_control("d2k", &opt.control, err, sizeof(err));
     }
 
-    long progress_t0 = d2k_now_ms();
+    int64_t progress_t0 = d2k_now_ms();
     if (progress) {
         opt.on_obs = print_progress;
         opt.on_obs_ctx = &progress_t0;

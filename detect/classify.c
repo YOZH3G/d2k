@@ -69,12 +69,17 @@ const char *d2k_resp_name(d2k_resp_verdict v)
     }
 }
 
-long d2k_now_ms(void)
+int64_t d2k_clock_offset_ms;
+
+int64_t d2k_now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000L) + d2k_clock_offset_ms;
 }
+/* Ширина закреплена при сборке: кросс-сборка под mipsel упадёт здесь, если
+ * часы снова станут long. */
+typedef char d2k_now_ms_is_64bit[sizeof(d2k_now_ms()) == 8 ? 1 : -1];
 
 void d2k_sleep_ms(int ms)
 {
@@ -352,7 +357,7 @@ static int once_probe(const char *host, const char *port, const d2k_trigger *tr,
     uint8_t buf[4096]; /* private to this measurement, not another worker's reply */
     ssize_t n;
     struct pollfd pfd;
-    long deadline;
+    int64_t deadline;
 
     err[0] = '\0';
     fd = dial_marked(host, port, opt->timeout_ms, opt->mark, err, errcap);
@@ -526,19 +531,19 @@ static void bind_decoy(d2k_poison *p, const d2k_opts *opt)
 
 static pthread_mutex_t g_selftest_mu = PTHREAD_MUTEX_INITIALIZER;
 static int  g_selftest_ok[2];
-static long g_selftest_at[2];
+static int64_t g_selftest_at[2];
 static int  g_raw_err_streak[2];
 
 static int fam_ix(uint8_t family) { return family == 6 ? 1 : 0; }
 
 /* Возраст кэшированной самопроверки в мс или -1, если кэша нет. */
-static long selftest_cached_age(uint8_t family)
+static int64_t selftest_cached_age(uint8_t family)
 {
-    long age = -1;
+    int64_t age = -1;
     int k = fam_ix(family);
     pthread_mutex_lock(&g_selftest_mu);
     if (g_selftest_ok[k]) {
-        long d = d2k_now_ms() - g_selftest_at[k];
+        int64_t d = d2k_now_ms() - g_selftest_at[k];
         if (d >= 0 && d < D2K_SELFTEST_TTL_MS) {
             age = d;
         } else {
@@ -653,7 +658,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
     d2k_poison cands[8];
     int ncands;
     d2k_dprops props0;
-    long age;
+    int64_t age;
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = strchr(host, ':') ? AF_INET6 : AF_INET;
@@ -685,7 +690,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
          * пропустили, а взяли из кэша, и что зондов она не стоила. */
         d2k_obs *obs = d2k_trace_add(res, "raw-selftest:кэш");
         snprintf(obs->err, sizeof(obs->err),
-                 "прошла %ld с назад в этом процессе, зондов не было", age / 1000);
+                 "прошла %ld с назад в этом процессе, зондов не было", (long)(age / 1000));
         obs_done(opt, obs);
         res->raw_selftest_cached = 1;
     } else if (!raw_selftest(ip4, family, pnum, opt, res)) {
@@ -844,7 +849,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
 {
     char host[160], port[16];
     const char *colon;
-    long start;
+    int64_t start;
     d2k_tally base, one, lng, last;
     int cut1[1];
     int reass;
@@ -853,7 +858,12 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     d2k_opts_defaults(opt);
     start = d2k_now_ms();
     memset(res, 0, sizeof(*res));
+    /* Отложенные снятия правил подавления RST — перед пачкой зондов, а не
+     * только перед следующей вставкой: прогон без сырого слоя или простой
+     * d2kc иначе держал бы неснятое правило часами (ревью detect, I2). */
+    d2k_raw_flush_pending();
     res->rst_fail_base = d2k_raw_rst_fail_count();
+    res->raw_dial_base = d2k_raw_dial_count();
     snprintf(res->target, sizeof(res->target), "%s", addr);
     res->repeats = opt->repeats;
     res->trigger_len = (int)tr->len;
@@ -1114,7 +1124,7 @@ done:
     if (d2k_detect_stopped(&opt->cancel)) {
         res->stopped = 1;
     }
-    res->duration_ms = d2k_now_ms() - start;
+    res->duration_ms = (long)(d2k_now_ms() - start);
 }
 
 /* Linux глушит SIGPIPE флагом на вызов; на macOS его нет — там опция сокета.

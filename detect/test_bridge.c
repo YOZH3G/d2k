@@ -26,6 +26,9 @@ static int base_stop_before, base_stop_other, base_stop_after;
 /* raw.o is not linked here: the adapter only asks whether the kernel-RST
  * suppression rule ever failed in this process. */
 unsigned long d2k_raw_rst_fail_count(void) { return (unsigned long)rule_failed; }
+/* Сырые соединения потока: по умолчанию прогон ходил сырым слоем. */
+static int dialled = 1;
+unsigned long d2k_raw_dial_count(void) { return (unsigned long)dialled; }
 
 /* Ход измерителя (задача 48): sched.o здесь не линкуется, приёмник
  * планировщика подменён записью вызовов. */
@@ -250,6 +253,18 @@ int main(void)
     r = measure();
     CHECK(r.owns_search && strstr(r.reason, "не подавлен") == NULL);
     rule_failed = 0;
+    memset(&answer, 0, sizeof answer);
+    /* Финальное ревью detect, I1: прогон, который сырым слоем не ходил вовсе,
+       пометку «RST не подавлен» не получает и владения поиском не теряет —
+       даже если счётчик отказов потока почему-то сдвинулся. */
+    rule_failed = 1;
+    dialled = 0;
+    answer.raw_usable = 1;
+    snprintf(answer.reason, sizeof answer.reason, "содержимое важно");
+    r = measure();
+    CHECK(r.owns_search && strstr(r.reason, "не подавлен") == NULL);
+    rule_failed = 0;
+    dialled = 1;
     memset(&answer, 0, sizeof answer);
 
     /* Базовый вопрос донора отдельно (задача 32): тот же измеритель, та же

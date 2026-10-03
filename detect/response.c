@@ -128,7 +128,7 @@ int d2k_resp_handshake12(const char *host, const char *port, const char *sni,
     struct addrinfo hints, *ai = NULL;
     int fd = -1, rc = 0;
     int to = resp_timeout(opt);
-    long deadline;
+    int64_t deadline;
     enum { RESPONSE_CAP = 65536 };
     uint8_t *buf; /* heap-owned: each handshake has its own partial records */
     size_t have = 0;

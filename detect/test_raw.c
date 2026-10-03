@@ -332,11 +332,20 @@ static void test_dial_survives_missing_rst_rule(void)
  * --sport 39842/39408/39354 и 40750 без единого идущего поиска — удаление не
  * удалось (замок xtables у NDM/сторожа), и о нём забыли. Неснятое правило
  * повторяется сразу и потом перед каждой следующей правкой правил. */
+static int exit_pipe_fd = -1;
+static int exit_hook(const char *cmd)
+{
+    size_t n = strlen(cmd);
+    if (write(exit_pipe_fd, cmd, n) < 0 || write(exit_pipe_fd, "\n", 1) < 0) return -1;
+    return 0;
+}
 static int del_fail_left;
 static int del_fail_code = 4 << 8;
+static int check_code = 1 << 8; /* -C: правила нет */
 static int flaky_del_hook(const char *cmd)
 {
     test_rule_hook(cmd);
+    if (strstr(cmd, " -C OUTPUT")) return check_code;
     if (strstr(cmd, " -D OUTPUT") && del_fail_left > 0) { del_fail_left--; return del_fail_code; }
     return 0;
 }
@@ -377,7 +386,8 @@ static void test_failed_release_is_retried(void)
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 100;
     CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
     raw_close(&c);
-    CHECK(rule_count == 2); /* -I и один -D: правила нет — снимать нечего */
+    /* -I, -D (exit 1) и -C, подтвердивший отсутствие (финальное ревью, I2). */
+    CHECK(rule_count == 3 && strstr(rule_cmds[2], " -C OUTPUT") != NULL);
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 0;
     CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
     CHECK(rule_count == 1 && strstr(rule_cmds[0], " -I OUTPUT") != NULL);
@@ -401,7 +411,163 @@ static void test_failed_release_is_retried(void)
     c.rule_up = 0;
     raw_close(&c);
     del_fail_left = 0;
+    /* Брошенная на ходу запись не потеряна: её снимет выход процесса. */
+    CHECK(d2k_raw_pending_count() == 1);
+    retry_pending_releases(1);
+    CHECK(d2k_raw_pending_count() == 0);
     d2k_raw_rule_hook = raw_rule_system;
+}
+
+/* Модель одного правила в OUTPUT для проверок жизненного цикла. */
+static int m_up, m_kill_ins, m_kill_commits, m_del_generic_left;
+static int model_hook(const char *cmd)
+{
+    test_rule_hook(cmd);
+    if (strstr(cmd, " -I OUTPUT")) {
+        if (!m_kill_ins || m_kill_commits) m_up = 1;
+        return m_kill_ins ? D2K_RAW_RULE_KILLED : 0;
+    }
+    if (strstr(cmd, " -D OUTPUT")) {
+        if (m_del_generic_left > 0) { m_del_generic_left--; return 1 << 8; } /* OTHER_PROBLEM */
+        if (m_up) { m_up = 0; return 0; }
+        return 1 << 8; /* Bad rule */
+    }
+    if (strstr(cmd, " -C OUTPUT")) return m_up ? 0 : 1 << 8;
+    return 0;
+}
+
+/* Финальное ревью detect, I2. */
+static void test_rule_lifecycle_has_no_leaks(void)
+{
+    static const uint8_t dst[4] = {198, 51, 100, 9};
+    raw_conn c;
+    char err[160] = "";
+    pthread_once(&g_sweep_once, sweep_noop);
+    d2k_raw_rule_hook = model_hook;
+    size_t pend0 = d2k_raw_pending_count();
+
+    /* 1. Вставку убили по сроку, но iptables успел зафиксировать правило:
+          правило снимается сразу, хотя rule_up = 0 и raw_close его не тронет. */
+    m_up = 0; m_kill_ins = 1; m_kill_commits = 1; m_del_generic_left = 0;
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    unsigned long f0 = d2k_raw_rst_fail_count();
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(c.rule_up == 0 && m_up == 0);
+    CHECK(d2k_raw_rst_fail_count() == f0 + 1);
+    CHECK(rule_count == 2 && strstr(rule_cmds[1], " -D OUTPUT") != NULL);
+    raw_close(&c);
+    CHECK(d2k_raw_pending_count() == pend0);
+
+    /* 2. Убитая вставка без фиксации: -D отвечает exit 1, -C подтверждает
+          отсутствие — запись не копится. */
+    m_up = 0; m_kill_ins = 1; m_kill_commits = 0;
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(rule_count == 3 && strstr(rule_cmds[2], " -C OUTPUT") != NULL);
+    raw_close(&c);
+    CHECK(d2k_raw_pending_count() == pend0 && m_up == 0);
+
+    /* 3. -D отвечает exit 1 по общей ошибке, а правило стоит (-C = 0): на
+          слово не верим, запись остаётся в отложенных... */
+    m_kill_ins = 0; m_del_generic_left = 2;
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(c.rule_up == 1 && m_up == 1);
+    raw_close(&c);
+    CHECK(m_up == 1 && d2k_raw_pending_count() == pend0 + 1);
+    /* ...и снимается без новой вставки — перед следующей пачкой зондов. */
+    rule_count = 0;
+    d2k_raw_flush_pending();
+    CHECK(m_up == 0 && d2k_raw_pending_count() == pend0);
+    CHECK(rule_count == 1 && strstr(rule_cmds[0], " -D OUTPUT") != NULL);
+    /* Пустой список — ни одной команды. */
+    rule_count = 0;
+    d2k_raw_flush_pending();
+    CHECK(rule_count == 0);
+
+    /* 4. Выход процесса снимает отложенное (atexit). Ребёнок оставляет одно
+          неснятое правило и выходит; его команды пишутся в канал. */
+    {
+        int p[2];
+        CHECK(pipe(p) == 0);
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(p[0]);
+            m_up = 0; m_kill_ins = 0; m_del_generic_left = 4;
+            dial_recv_fd = -1; outgoing_count = 0;
+            if (raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) != 0) _exit(3);
+            raw_close(&c);
+            if (d2k_raw_pending_count() != pend0 + 1) _exit(4);
+            exit_pipe_fd = p[1];
+            d2k_raw_rule_hook = exit_hook;
+            exit(0);
+        }
+        close(p[1]);
+        char buf[512];
+        size_t got = 0;
+        ssize_t n;
+        while (got < sizeof buf - 1 && (n = read(p[0], buf + got, sizeof buf - 1 - got)) > 0) got += (size_t)n;
+        buf[got] = '\0';
+        close(p[0]);
+        int st = 0;
+        CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        CHECK(strstr(buf, " -D OUTPUT") != NULL);
+    }
+    m_del_generic_left = 0;
+    d2k_raw_rule_hook = raw_rule_system;
+}
+
+/* Финальное ревью detect, I1: счётчики отказов правила и сырых соединений —
+ * потока. Отказ вставки в соседнем рабочем потоке не метит этот прогон. */
+static unsigned long other_fail_delta, other_dial_delta;
+static void *failing_worker(void *arg)
+{
+    static const uint8_t dst[4] = {198, 51, 100, 10};
+    raw_conn c;
+    char err[160] = "";
+    (void)arg;
+    unsigned long f0 = d2k_raw_rst_fail_count(), d0 = d2k_raw_dial_count();
+    rule_rc = 2 << 8; rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    if (raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0) raw_close(&c);
+    other_fail_delta = d2k_raw_rst_fail_count() - f0;
+    other_dial_delta = d2k_raw_dial_count() - d0;
+    rule_rc = 0;
+    return NULL;
+}
+
+static void test_rst_failures_are_per_thread(void)
+{
+    pthread_t th;
+    pthread_once(&g_sweep_once, sweep_noop);
+    d2k_raw_rule_hook = test_rule_hook;
+    unsigned long mine_f = d2k_raw_rst_fail_count(), mine_d = d2k_raw_dial_count();
+    CHECK(pthread_create(&th, NULL, failing_worker, NULL) == 0);
+    pthread_join(th, NULL);
+    CHECK(other_fail_delta == 1 && other_dial_delta == 1);
+    CHECK(d2k_raw_rst_fail_count() == mine_f && d2k_raw_dial_count() == mine_d);
+    d2k_raw_rule_hook = raw_rule_system;
+}
+
+/* Финальное ревью detect, M7: часы — 64 бита. Аптайм за 24,8 и 49,7 сутками
+ * не ломает ни срок команды правила, ни ожидание ответа. */
+static void test_clock_survives_long_uptime(void)
+{
+    int64_t saved = d2k_clock_offset_ms;
+    d2k_clock_offset_ms = (int64_t)50 * 24 * 3600 * 1000; /* > 2^32 мс */
+    CHECK(d2k_now_ms() > (int64_t)4294967296LL);
+    int dl = g_rule_deadline_ms;
+    g_rule_deadline_ms = 300;
+    int64_t t0 = d2k_now_ms();
+    CHECK(raw_rule_system("exit 0") == 0); /* не убита сразу */
+    CHECK(raw_rule_system("exec sleep 30") == D2K_RAW_RULE_KILLED);
+    CHECK(d2k_now_ms() - t0 >= 300 && d2k_now_ms() - t0 < 3000);
+    g_rule_deadline_ms = dl;
+    d2k_clock_offset_ms = (int64_t)0x7fffffffLL - 50; /* у самой границы long32 */
+    t0 = d2k_now_ms();
+    CHECK(raw_rule_system("exit 0") == 0);
+    CHECK(d2k_now_ms() >= t0);
+    d2k_clock_offset_ms = saved;
 }
 
 /* Ревью 49 (решение 3): голый -w ждёт замок без срока, а ждём мы под общим
@@ -411,9 +577,9 @@ static void test_rule_command_is_bounded(void)
 {
     int saved = g_rule_deadline_ms;
     g_rule_deadline_ms = 200;
-    long t0 = d2k_now_ms();
+    int64_t t0 = d2k_now_ms();
     int rc = raw_rule_system("exec sleep 30");
-    long took = d2k_now_ms() - t0;
+    int64_t took = d2k_now_ms() - t0;
     CHECK(rc != 0 && took < 3000);
     CHECK(raw_rule_system("exit 0") == 0);
     CHECK(raw_rule_system("exit 1") != 0);
@@ -475,6 +641,12 @@ int main(void)
     test_dial_survives_missing_rst_rule();
     test_failed_release_is_retried();
     test_rule_command_is_bounded();
+    test_rule_lifecycle_has_no_leaks();
+    test_rst_failures_are_per_thread();
+    test_clock_survives_long_uptime();
+    /* Ни одной отложенной записи на выходе: atexit не должен звать iptables. */
+    CHECK(d2k_raw_pending_count() == 0);
+    d2k_raw_rule_hook = test_rule_hook;
     if (failures) { return 1; }
     puts("raw: checksum, connection-owned receives and concurrent ports passed (no network)");
     return 0;

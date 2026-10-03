@@ -190,12 +190,16 @@ typedef struct {
     raw_buffers *buffers; /* heap-owned: do not grow the router worker stack */
 } raw_conn;
 
-/* Сколько раз не удалось закрыть ядру рот. Счётчик, а не вечный флаг: отказ
- * делает недостоверными отрицательные исходы ТОГО прогона, в котором случился
- * (прогон сравнивает счётчик со своим стартом, res->rst_fail_base); d2kc
- * живёт сутками, и давний отказ под чужим замком xtables не должен метить
- * все последующие прогоны. */
-static unsigned long g_rst_rule_failures;
+/* Сколько раз не удалось закрыть ядру рот — СЧЁТЧИК ПОТОКА, а не процесса
+ * (финальное ревью detect, I1). Прогон сравнивает его со своим стартом
+ * (res->rst_fail_base); прогон идёт целиком в одном рабочем потоке, а
+ * задача 38 гоняет несколько классификаторов сразу. Общий на процесс
+ * счётчик метил чужой прогон отказом вставки соседа — и измеренный split
+ * PREFIX/WHOLE соседа выбрасывался вместе с owns_search. Рядом — счётчик
+ * сырых соединений потока: пометка «RST не подавлен» уместна, только если
+ * этот прогон сам ходил сырым слоем. */
+static __thread unsigned long t_rst_rule_failures;
+static __thread unsigned long t_raw_dials;
 
 /* Запуск команды правила iptables. Крючок — для теста без root и iptables;
  * в работе это system(). */
@@ -224,7 +228,7 @@ static int raw_rule_system(const char *cmd)
         _exit(127);
     }
     setpgid(pid, pid);
-    long deadline = d2k_now_ms() + g_rule_deadline_ms;
+    int64_t deadline = d2k_now_ms() + g_rule_deadline_ms;
     for (;;) {
         int st = 0;
         pid_t w = waitpid(pid, &st, WNOHANG);
@@ -234,7 +238,7 @@ static int raw_rule_system(const char *cmd)
             kill(-pid, SIGKILL);
             kill(pid, SIGKILL);
             while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-            return -1;
+            return D2K_RAW_RULE_KILLED;
         }
         struct timespec ts = {0, 10 * 1000 * 1000};
         nanosleep(&ts, NULL);
@@ -246,18 +250,12 @@ static pthread_once_t g_seed_once = PTHREAD_ONCE_INIT;
 static pthread_once_t g_sweep_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_raw_state = PTHREAD_MUTEX_INITIALIZER;
 
-unsigned long d2k_raw_rst_fail_count(void)
-{
-    unsigned long n;
-    pthread_mutex_lock(&g_raw_state);
-    n = g_rst_rule_failures;
-    pthread_mutex_unlock(&g_raw_state);
-    return n;
-}
+unsigned long d2k_raw_rst_fail_count(void) { return t_rst_rule_failures; }
+unsigned long d2k_raw_dial_count(void) { return t_raw_dials; }
 
 static void seed_init(void)
 {
-    srandom((unsigned)(d2k_now_ms() ^ (long)getpid()));
+    srandom((unsigned)((uint64_t)d2k_now_ms() ^ (uint64_t)getpid()));
     g_sport_counter = (uint32_t)(random() % 25000);
 }
 
@@ -331,14 +329,16 @@ static void sweep_stale_rst_rules(void)
  * без единого поиска). Неудавшееся удаление повторяется сразу, затем
  * запоминается и повторяется перед каждой следующей правкой правил. */
 #define RST_PENDING_MAX 64
-/* Сколько всего попыток снять одно правило (две сразу и отложенные), прежде
- * чем бросить запись. С -w отказ «замок занят» не возвращается, и прочие
- * отказы (истёк срок команды, iptables не запустился) повтором не лечатся
- * бесконечно; брошенное правило снимет уборка следующего процесса. */
+/* Сколько попыток снять одно правило (сразу и отложенно перед правками
+ * правил и прогонами), прежде чем перестать повторять его на ходу. Запись при
+ * этом НЕ теряется: при выходе процесса снимается ещё раз (atexit), а что
+ * останется — снимет уборка следующего запуска (владелец уже мёртв). Пока
+ * процесс жив, чужая уборка правило не тронет: владелец жив. */
 #define RST_RELEASE_ATTEMPTS 5
 static struct { uint16_t sport; uint8_t family; int attempts; } g_rst_pending[RST_PENDING_MAX];
 static size_t g_rst_pending_n;
 static int g_rst_abandon_said;
+static pthread_once_t g_atexit_once = PTHREAD_ONCE_INIT;
 
 static int rst_rule_cmd(const char *op, uint16_t sport, uint8_t family)
 {
@@ -351,11 +351,21 @@ static int rst_rule_cmd(const char *op, uint16_t sport, uint8_t family)
     return d2k_raw_rule_hook(cmd);
 }
 
-/* -D снял правило или правила уже нет (exit 1, «Bad rule»: NDM перестроил
- * netfilter) — в обоих случаях снимать больше нечего. */
-static int rst_release_done(int rc)
+static int rc_exit1(int rc)
 {
-    return rc == 0 || (rc > 0 && WIFEXITED(rc) && WEXITSTATUS(rc) == 1);
+    return rc > 0 && WIFEXITED(rc) && WEXITSTATUS(rc) == 1;
+}
+
+/* Одна попытка снять правило; 1 — правила больше нет. Exit 1 у -D в 1.4.21 —
+ * и «правила нет» (NDM перестроил netfilter), и общий OTHER_PROBLEM (ENOMEM,
+ * сбой фиксации), поэтому на слово -D не верим: отсутствие подтверждает -C
+ * (exit 1 — правила нет; 0 — правило ещё стоит; прочее — не знаем). */
+static int rst_delete_once(uint16_t sport, uint8_t family)
+{
+    int rc = rst_rule_cmd("-D", sport, family);
+    if (rc == 0) return 1;
+    if (!rc_exit1(rc)) return 0;
+    return rc_exit1(rst_rule_cmd("-C", sport, family));
 }
 
 static void rst_abandon(uint16_t sport, uint8_t family)
@@ -363,23 +373,80 @@ static void rst_abandon(uint16_t sport, uint8_t family)
     if (g_rst_abandon_said) return;
     g_rst_abandon_said = 1;
     fprintf(stderr, "d2k: правило подавления RST (%s, порт %u) не снято за %d попыток — "
-                    "его снимет уборка следующего процесса\n",
+                    "больше не повторяю до выхода процесса; при выходе попробую ещё раз, "
+                    "оставшееся снимет уборка следующего запуска d2k\n",
             family == 6 ? "ip6tables" : "iptables", (unsigned)sport, RST_RELEASE_ATTEMPTS);
 }
 
-/* Под g_raw_state. */
-static void retry_pending_releases(void)
+static void raw_atexit(void);
+static void register_atexit(void) { (void)atexit(raw_atexit); }
+
+/* Под g_raw_state. Запомнить правило, которое снять не удалось. */
+static void rst_remember(uint16_t sport, uint8_t family, int attempts)
+{
+    pthread_once(&g_atexit_once, register_atexit);
+    if (g_rst_pending_n < RST_PENDING_MAX) {
+        g_rst_pending[g_rst_pending_n].sport = sport;
+        g_rst_pending[g_rst_pending_n].family = family;
+        g_rst_pending[g_rst_pending_n].attempts = attempts;
+        g_rst_pending_n++;
+    } else {
+        rst_abandon(sport, family);
+    }
+}
+
+/* Под g_raw_state. final — выход процесса: каждая запись ещё раз, в том числе
+ * исчерпавшие попытки. */
+static void retry_pending_releases(int final)
 {
     size_t k = 0;
     while (k < g_rst_pending_n) {
-        int rc = rst_rule_cmd("-D", g_rst_pending[k].sport, g_rst_pending[k].family);
-        if (!rst_release_done(rc) && ++g_rst_pending[k].attempts < RST_RELEASE_ATTEMPTS) {
-            k++;
+        if (!final && g_rst_pending[k].attempts >= RST_RELEASE_ATTEMPTS) { k++; continue; }
+        if (rst_delete_once(g_rst_pending[k].sport, g_rst_pending[k].family)) {
+            g_rst_pending[k] = g_rst_pending[--g_rst_pending_n];
             continue;
         }
-        if (!rst_release_done(rc)) rst_abandon(g_rst_pending[k].sport, g_rst_pending[k].family);
-        g_rst_pending[k] = g_rst_pending[--g_rst_pending_n];
+        if (++g_rst_pending[k].attempts >= RST_RELEASE_ATTEMPTS && !final) {
+            rst_abandon(g_rst_pending[k].sport, g_rst_pending[k].family);
+        }
+        k++;
     }
+}
+
+/* Под g_raw_state. Снять правило: сразу дважды, иначе запомнить. */
+static void rst_release_locked(uint16_t sport, uint8_t family)
+{
+    if (!rst_delete_once(sport, family) && !rst_delete_once(sport, family)) {
+        rst_remember(sport, family, 2);
+    }
+}
+
+/* Отложенные снятия — и тогда, когда новых правок правил нет (d2kc простаивает
+ * или прогон обходится без сырого слоя): перед каждой пачкой зондов (старт
+ * прогона классификатора) и при выходе процесса. */
+void d2k_raw_flush_pending(void)
+{
+    pthread_mutex_lock(&g_raw_state);
+    if (g_rst_pending_n) retry_pending_releases(0);
+    pthread_mutex_unlock(&g_raw_state);
+}
+
+size_t d2k_raw_pending_count(void)
+{
+    size_t n;
+    pthread_mutex_lock(&g_raw_state);
+    n = g_rst_pending_n;
+    pthread_mutex_unlock(&g_raw_state);
+    return n;
+}
+
+static void raw_atexit(void)
+{
+    /* На выходе рабочие потоки уже собраны (d2k_sched_free); если замок всё же
+     * занят — не ждать его, выход важнее. */
+    if (pthread_mutex_trylock(&g_raw_state) != 0) return;
+    if (g_rst_pending_n) retry_pending_releases(1);
+    pthread_mutex_unlock(&g_raw_state);
 }
 
 static int suppress_kernel_rst(uint16_t sport, uint8_t family)
@@ -388,10 +455,16 @@ static int suppress_kernel_rst(uint16_t sport, uint8_t family)
     /* Old router iptables cannot be relied on to serialize our commands.
      * Protect only rule edits, not the network lifetime of the probe. */
     pthread_mutex_lock(&g_raw_state);
-    retry_pending_releases();
+    retry_pending_releases(0);
     rc = rst_rule_cmd("-I", sport, family);
     if (rc != 0) {
-        g_rst_rule_failures++;
+        t_rst_rule_failures++;
+        /* Вставку убили по сроку: с -w iptables мог дождаться замка и
+         * зафиксировать правило за миг до SIGKILL. Правило, о котором мы не
+         * знаем, не снимет никто, пока процесс жив, — снимаем его сами (ревью
+         * detect, I2). Ненулевой код самого iptables означает, что фиксации
+         * не было: снимать нечего. */
+        if (rc == D2K_RAW_RULE_KILLED) rst_release_locked(sport, family);
     }
     pthread_mutex_unlock(&g_raw_state);
     return rc == 0;
@@ -400,17 +473,7 @@ static int suppress_kernel_rst(uint16_t sport, uint8_t family)
 static void release_kernel_rst(uint16_t sport, uint8_t family)
 {
     pthread_mutex_lock(&g_raw_state);
-    if (!rst_release_done(rst_rule_cmd("-D", sport, family)) &&
-        !rst_release_done(rst_rule_cmd("-D", sport, family))) {
-        if (g_rst_pending_n < RST_PENDING_MAX) {
-            g_rst_pending[g_rst_pending_n].sport = sport;
-            g_rst_pending[g_rst_pending_n].family = family;
-            g_rst_pending[g_rst_pending_n].attempts = 2;
-            g_rst_pending_n++;
-        } else {
-            rst_abandon(sport, family);
-        }
-    }
+    rst_release_locked(sport, family);
     pthread_mutex_unlock(&g_raw_state);
 }
 
@@ -757,7 +820,7 @@ static int raw_send_syn(raw_conn *c)
 /* recv возвращает следующий сегмент ОТ НАШЕГО пира. */
 static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
                     const uint8_t **payload, size_t *plen,
-                    long deadline, const d2k_detect_stop *cancel)
+                    int64_t deadline, const d2k_detect_stop *cancel)
 {
     uint8_t *buf = c->buffers->recv;
     for (;;) {
@@ -809,7 +872,7 @@ static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
 static int raw_read_payload(raw_conn *c, int timeout_ms, const d2k_detect_stop *cancel,
                             uint8_t *out, size_t cap, size_t *outlen)
 {
-    long deadline = d2k_now_ms() + timeout_ms;
+    int64_t deadline = d2k_now_ms() + timeout_ms;
     while (d2k_now_ms() < deadline) {
         uint8_t flags;
         if (d2k_detect_stopped(cancel)) {
@@ -855,7 +918,7 @@ static void raw_close(raw_conn *c)
 static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *cancel,
                          char *err, size_t errcap)
 {
-    long deadline;
+    int64_t deadline;
     d2k_poison none;
 
     memset(&none, 0, sizeof(none));
@@ -974,8 +1037,9 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
      * пишет данные. Отказ iptables (нет бинарника, роутер только на nft) —
      * своя поломка, а не свойство сети: вернув ошибку, мы роняли
      * самопроверку, и цель уходила в «обойти нечем». Факт отказа не молчит:
-     * он считается в g_rst_rule_failures (трасса вердикта и адаптер
+     * он считается в t_rst_rule_failures потока (трасса вердикта и адаптер
      * планировщика сравнивают d2k_raw_rst_fail_count со стартом прогона). */
+    t_raw_dials++;
     c->rule_up = suppress_kernel_rst(c->sport, family);
 
     if (raw_handshake(c, timeout_ms, cancel, err, errcap) != 0) {
@@ -1314,6 +1378,9 @@ senderr:
  * это сказать (см. res.RawUsable в эталоне), а не промолчать. */
 int d2k_raw_supported(void) { return 0; }
 unsigned long d2k_raw_rst_fail_count(void) { return 0; }
+unsigned long d2k_raw_dial_count(void) { return 0; }
+void d2k_raw_flush_pending(void) {}
+size_t d2k_raw_pending_count(void) { return 0; }
 
 int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,

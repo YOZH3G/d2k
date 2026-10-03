@@ -239,6 +239,8 @@ typedef struct {
      * недостоверен, только если отказ случился в НЁМ (d2kc живёт сутками,
      * и один давний отказ не должен метить все последующие прогоны). */
     unsigned long rst_fail_base;
+    /* Счётчик сырых соединений потока на старте: ходил ли прогон сырым слоем. */
+    unsigned long raw_dial_base;
 
     d2k_obs trace[D2K_TRACE_MAX];
     int     ntrace;
@@ -318,7 +320,17 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
 /* --- сырой слой (raw.c) ------------------------------------------------- */
 
 int  d2k_raw_supported(void);
+/* Счётчики ПОТОКА (прогон идёт в одном потоке целиком): отказы вставки
+ * правила подавления RST и сырые соединения. Прогон сравнивает их со своим
+ * стартом; чужой поток на них не влияет. */
 unsigned long d2k_raw_rst_fail_count(void);
+unsigned long d2k_raw_dial_count(void);
+/* Повторить отложенные снятия правил (перед пачкой зондов; при выходе
+ * процесса — само, через atexit). Сколько их сейчас — для теста и журнала. */
+void d2k_raw_flush_pending(void);
+size_t d2k_raw_pending_count(void);
+/* Код возврата команды правила, убитой по сроку (не статус waitpid). */
+#define D2K_RAW_RULE_KILLED (-2)
 /* Запуск команды правила подавления RST (iptables -I/-D). По умолчанию
  * system(); тест подменяет, чтобы проверить зонд без root и iptables.
  * Есть только там, где есть сырой слой (Linux или тестовая сборка). */
@@ -370,7 +382,12 @@ int d2k_trigger_control(const char *tag, d2k_trigger *out, char *err, size_t err
 
 /* --- мелочи, общие для модулей ------------------------------------------ */
 
-long d2k_now_ms(void);
+/* Монотонные миллисекунды, ВСЕГДА 64 бита: на mipsel/armv7 long — 32 бита, и
+ * tv_sec*1000L переполнялся на 24,8 сутках аптайма (ревью detect M7), ломая
+ * сроки зондов и команд правил. Хранить результат — только в int64_t. */
+int64_t d2k_now_ms(void);
+/* Сдвиг часов для теста (имитация долгого аптайма); в работе 0. */
+extern int64_t d2k_clock_offset_ms;
 void d2k_sleep_ms(int ms);
 d2k_obs *d2k_trace_add(d2k_result *res, const char *probe);
 void d2k_note(d2k_result *res, const char *fmt, ...);
