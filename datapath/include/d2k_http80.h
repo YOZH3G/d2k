@@ -48,7 +48,8 @@ typedef struct d2k_http80 d2k_http80;
 typedef struct {
     int action;            /* D2K_HTTP80_* */
     int injection;         /* ЭТОТ пакет — первая узнанная вставка потока */
-    int answered;          /* вместо вставки клиент получает 307 */
+    int answered;          /* 307 ушёл клиенту (ставит d2k_http80_swap) */
+    size_t flow;           /* REPLACE: чей поток (для d2k_http80_swap) */
     size_t len;            /* REPLACE: длина пакета в out */
     size_t rst_len;        /* REPLACE: длина RST к серверу в rst (0 — не собран) */
     uint8_t family;        /* 4 или 6 */
@@ -64,6 +65,7 @@ typedef struct {
     uint64_t requests;     /* разобранных запросов GET/HEAD */
     uint64_t injections;   /* узнанных вставок (по потоку один раз) */
     uint64_t answered;     /* из них заменено на 307 */
+    uint64_t swap_failed;  /* вердикт с заменой не принят — ушла вставка */
     uint64_t dropped;      /* снятых пакетов сервера после замены */
     uint64_t evicted;      /* потоков, вытесненных из полной таблицы */
 } d2k_http80_stats;
@@ -80,9 +82,31 @@ int d2k_http80_https(const d2k_http80 *h, const char *host, uint64_t now_ns);
 
 /* Один пакет из очереди (IPv4/IPv6, целиком, с заголовком IP). Решение и
  * подробности — в r. out/rst — буферы для пакета-замены и RST к серверу. */
+/* kstamp_ns — метка приёма пакета ядром (NFQA_TIMESTAMP), 0 — нет. Если она
+ * есть у SYN, SYN/ACK, запроса и ответа, RTT и задержка ответа считаются по
+ * ней: задержка очереди и самого d2kd в замер не входит (ревью M1). Иначе —
+ * по now_ns, как раньше. */
 void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t now_ns,
+                       uint64_t kstamp_ns,
                        uint8_t *out, size_t out_cap, uint8_t *rst, size_t rst_cap,
                        d2k_http80_res *r);
+
+/* Исполнение REPLACE (ревью I3) — обязательный второй шаг. Пока его не было,
+ * поток ничьим не считается: ни RST, ни снятия копий. Порядок:
+ *   verdict_payload(out) — ядро выпускает 307 вместо вставки;
+ *   удалось → поток «отвечен», send_rst(rst), дальше сервер снимается; 1;
+ *   не удалось → verdict_accept() выпускает вставку как есть, поток остаётся
+ *   «вставка пропущена» (копия пройдёт, RST не идёт); 0.
+ * Отказ ядра ВНУТРИ вердикта (nfqnl_mangle → NF_DROP, только при нехватке
+ * памяти) отсюда не виден: ядро о нём не сообщает. */
+typedef struct {
+    int (*verdict_payload)(void *ctx, const uint8_t *pkt, size_t len);
+    int (*verdict_accept)(void *ctx);
+    int (*send_rst)(void *ctx, const uint8_t *pkt, size_t len);
+    void *ctx;
+} d2k_http80_io;
+int d2k_http80_swap(d2k_http80 *h, d2k_http80_res *r, const uint8_t *out, const uint8_t *rst,
+                    const d2k_http80_io *io);
 
 d2k_http80_stats d2k_http80_get_stats(const d2k_http80 *h);
 

@@ -128,6 +128,16 @@ int d2k_nl_packet(const d2k_nl_msg *m, d2k_nl_pkt *out) {
                 out->have_mark = 1;
             }
             break;
+        case D2K_NFQA_TIMESTAMP:
+            if (vlen >= 16) {
+                uint64_t sec = (uint64_t)n32(val) << 32 | n32(val + 4);
+                uint64_t usec = (uint64_t)n32(val + 8) << 32 | n32(val + 12);
+                if (sec && usec < 1000000u && sec < 18000000000ull) {
+                    out->tstamp_ns = sec * 1000000000ull + usec * 1000u;
+                    out->have_tstamp = 1;
+                }
+            }
+            break;
         case D2K_NFQA_IFINDEX_OUTDEV:
             if (vlen >= 4) {
                 out->outdev = n32(val);

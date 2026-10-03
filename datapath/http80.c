@@ -18,6 +18,7 @@ enum {
     ST_OPEN,       /* видели SYN/ACK: RTT замерен, ISN сервера известен */
     ST_REQUEST,    /* видели запрос GET/HEAD целиком */
     ST_INJECTED,   /* вставка узнана и пропущена как есть */
+    ST_SWAP,       /* 307 собран, ждёт d2k_http80_swap; пакеты проходят */
     ST_ANSWERED,   /* вместо вставки ушёл 307: сервер по потоку снимается */
     ST_DONE        /* решать больше нечего */
 };
@@ -27,6 +28,7 @@ typedef struct {
     uint8_t client[16], server[16];
     uint16_t cport, sport;
     uint64_t t_syn, t_req, touched, rtt;
+    uint64_t k_syn, k_req, krtt;   /* то же по меткам ядра; 0 — нет */
     uint32_t server_next, client_next;
     char host[256];
     char target[D2K_HTTP80_TARGET_MAX];
@@ -125,7 +127,12 @@ static uint16_t fold(uint32_t acc) {
     return (uint16_t)~acc;
 }
 
-/* IP + TCP без опций. Адреса — из потока, поля IP (TOS/TTL/метка потока) —
+/* Без опций TCP — и без метки времени (TSopt), даже если поток её
+   договорил: значения TSval сервера у нас нет. Linux и Windows такой сегмент
+   принимают; стек, строго бросающий не-RST без TSopt (RFC 7323 §3.2), 307
+   отбросит — но и вставку провайдера, у которой TSopt по полю, скорее всего,
+   тоже нет (ревью M2).
+   IP + TCP без опций. Адреса — из потока, поля IP (TOS/TTL/метка потока) —
    из пакета, который заменяем; у RST — обычные 64. */
 static size_t build(uint8_t family, const uint8_t *src, const uint8_t *dst,
                     uint16_t sport, uint16_t dport, uint32_t seq, uint32_t ack,
@@ -210,6 +217,7 @@ static flow *make(d2k_http80 *h, uint8_t family, const uint8_t *client, uint16_t
 }
 
 void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t now,
+                       uint64_t ks,
                        uint8_t *out, size_t out_cap, uint8_t *rst, size_t rst_cap,
                        d2k_http80_res *r) {
     if (!r) { return; }
@@ -242,6 +250,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
             else { memset(f->host, 0, sizeof f->host); }
             f->state = ST_SYN;
             f->t_syn = now;
+            f->k_syn = ks;
             f->touched = now;
             return;
         }
@@ -255,6 +264,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
                                           f->target, sizeof f->target)) {
                 f->state = ST_REQUEST;
                 f->t_req = now;
+                f->k_req = ks;
                 f->client_next = seq + (uint32_t)plen;
                 h->st.requests++;
             } else {
@@ -269,6 +279,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
     if ((flags & 0x12) == 0x12) {              /* SYN/ACK */
         if (f->state == ST_SYN && now >= f->t_syn) {
             f->rtt = now - f->t_syn;
+            f->krtt = ks && f->k_syn && ks > f->k_syn ? ks - f->k_syn : 0;
             f->server_next = seq + 1;
             f->client_next = ack;
             f->state = ST_OPEN;
@@ -287,7 +298,13 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
     /* Первый ответ сервера с нагрузкой: решение принимается здесь и один раз. */
     f->state = ST_DONE;
     uint64_t dt = now >= f->t_req ? now - f->t_req : 0;
-    if (seq != f->server_next || ack != f->client_next || f->rtt == 0 || dt * 2 >= f->rtt ||
+    uint64_t rtt = f->rtt;
+    if (f->krtt && f->k_req && ks >= f->k_req) {
+        /* Все четыре метки ядра есть: замер без задержки очереди и d2kd. */
+        rtt = f->krtt;
+        dt = ks - f->k_req;
+    }
+    if (seq != f->server_next || ack != f->client_next || rtt == 0 || dt * 2 >= rtt ||
         !d2k_httpup_portal_location(f->host, (const char *)pay, plen,
                                     r->portal, sizeof r->portal)) {
         r->portal[0] = '\0';
@@ -301,7 +318,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
     memcpy(r->server, f->server, sizeof r->server);
     r->client_port = f->cport;
     r->server_port = f->sport;
-    r->rtt_ns = f->rtt;
+    r->rtt_ns = rtt;
     r->reply_ns = dt;
     memcpy(r->host, f->host, sizeof r->host);
 
@@ -318,10 +335,29 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
                          NULL, 0, rst, rst_cap)
                  : 0;
     if (!n || !m) { return; }   /* не собралось — вставка проходит как есть */
-    f->state = ST_ANSWERED;
-    h->st.answered++;
-    r->answered = 1;
+    f->state = ST_SWAP;
+    r->flow = (size_t)(f - h->flows);
     r->action = D2K_HTTP80_REPLACE;
     r->len = n;
     r->rst_len = m;
+}
+
+int d2k_http80_swap(d2k_http80 *h, d2k_http80_res *r, const uint8_t *out, const uint8_t *rst,
+                    const d2k_http80_io *io) {
+    if (!h || !r || !io || r->action != D2K_HTTP80_REPLACE || r->flow >= D2K_HTTP80_FLOWS) {
+        return 0;
+    }
+    flow *f = &h->flows[r->flow];
+    if (f->state != ST_SWAP || io->verdict_payload(io->ctx, out, r->len) != 0) {
+        if (f->state == ST_SWAP) { f->state = ST_INJECTED; }
+        h->st.swap_failed++;
+        r->answered = 0;
+        (void)io->verdict_accept(io->ctx);
+        return 0;
+    }
+    f->state = ST_ANSWERED;
+    h->st.answered++;
+    r->answered = 1;
+    (void)io->send_rst(io->ctx, rst, r->rst_len);
+    return 1;
 }

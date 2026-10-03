@@ -509,10 +509,50 @@ static void http80_log(const d2k_http80_res *r, const char *outcome) {
     a.family = r->family;
     memcpy(a.bytes, r->server, sizeof a.bytes);
     (void)d2k_addr_text(&a, srv, sizeof srv);
-    fprintf(stderr, "d2kd: HTTP %s (%s:%u): вставка провайдера — 30x на %s через %" PRIu64
+    fprintf(stderr, "d2kd: HTTP %s (IPv%u %s:%u): вставка провайдера — 30x на %s через %" PRIu64
                     " мкс после запроса при RTT потока %" PRIu64 " мкс; %s\n",
-            r->host, srv, (unsigned)r->server_port, r->portal,
+            r->host, (unsigned)r->family, srv, (unsigned)r->server_port, r->portal,
             r->reply_ns / 1000u, r->rtt_ns / 1000u, outcome);
+}
+
+/* Вердикты и RST для d2k_http80_swap: настоящие очередь и сырой сокет. */
+typedef struct { d2k_nfq *q; d2k_raw *raw; uint32_t id; } http80_ctx;
+
+static int http80_io_payload(void *c, const uint8_t *p, size_t n) {
+    http80_ctx *x = c;
+    char err[200];
+    if (d2k_nfq_verdict_payload(x->q, x->id, D2K_NF_ACCEPT, p, n, err, sizeof err) != 0) {
+        st.verdict_fail++;
+        fprintf(stderr, "d2kd: %s\n", err);
+        return -1;
+    }
+    st.accepted++;
+    return 0;
+}
+
+static int http80_io_accept(void *c) {
+    http80_ctx *x = c;
+    char err[200];
+    if (d2k_nfq_verdict(x->q, x->id, D2K_NF_ACCEPT, err, sizeof err) != 0) {
+        st.verdict_fail++;
+        fprintf(stderr, "d2kd: %s\n", err);
+        return -1;
+    }
+    st.accepted++;
+    return 0;
+}
+
+static int http80_io_rst(void *c, const uint8_t *p, size_t n) {
+    http80_ctx *x = c;
+    char err[200];
+    if (d2k_raw_send(x->raw, p, n, err, sizeof err) != 0) {
+        int e = errno;
+        st.send_fail++;
+        log_send_fail("RST к серверу после 307: ", err, e);
+        return -1;
+    }
+    st.emitted++;
+    return 0;
 }
 
 /* Событие контроллеру: по нему он проверяет HTTPS имени (D2K_EV_HTTP_PORTAL). */
@@ -538,13 +578,13 @@ static void http80_event(d2k_ctl *ctl, const d2k_http80_res *r) {
    отправлен), 0 — дальше обычным путём. Заменять и снимать — только в
    режиме apply с сырым сокетом: в наблюдении трафик не трогается. */
 static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
-                       const uint8_t *p, size_t n, uint64_t t) {
+                       const uint8_t *p, size_t n, uint64_t t, uint64_t kstamp) {
     if (!http80) { return 0; }
     static uint8_t out[D2K_HTTP80_TARGET_MAX + 1024];
     static uint8_t rst[128];
     char err[200];
     d2k_http80_res r;
-    d2k_http80_packet(http80, p, n, t, raw ? out : NULL, raw ? sizeof out : 0,
+    d2k_http80_packet(http80, p, n, t, kstamp, raw ? out : NULL, raw ? sizeof out : 0,
                       rst, sizeof rst, &r);
     if (r.injection) { http80_event(ctl, &r); }
     if (r.action == D2K_HTTP80_DROP && raw) {
@@ -558,30 +598,21 @@ static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
     }
     if (r.action != D2K_HTTP80_REPLACE || !raw) {
         if (r.injection) {
-            http80_log(&r, raw ? "HTTPS имени не подтверждён — пропущена клиенту как есть"
+            http80_log(&r, raw ? "HTTPS имени не подтверждён и не срезан — пропущена клиенту как есть"
                                : "наблюдение — пропущена как есть");
         }
         return 0;
     }
-    if (d2k_nfq_verdict_payload(q, id, D2K_NF_ACCEPT, out, r.len, err, sizeof err) != 0) {
-        /* Замена не ушла — значит, ядро выпустит вставку как есть. RST к
-           серверу тогда не нужен: поток клиента цел. */
-        st.verdict_fail++;
-        fprintf(stderr, "d2kd: %s\n", err);
-        http80_log(&r, "замена на 307 не ушла — пропущена как есть");
-        if (d2k_nfq_verdict(q, id, D2K_NF_ACCEPT, err, sizeof err) != 0) {
-            fprintf(stderr, "d2kd: %s\n", err);
-        }
-        return 1;
-    }
-    st.accepted++;
-    if (d2k_raw_send(raw, rst, r.rst_len, err, sizeof err) != 0) {
-        st.send_fail++;
-        log_send_fail("RST к серверу после 307: ", err, errno);
+    /* Одна строка на каждую замену: по ней полевая проверка видит, что 307
+       ушёл, или что ядро не приняло вердикт и ушла сама вставка. */
+    http80_ctx x = {q, raw, id};
+    d2k_http80_io io = {http80_io_payload, http80_io_accept, http80_io_rst, &x};
+    if (d2k_http80_swap(http80, &r, out, rst, &io)) {
+        http80_log(&r, "замена: клиенту 307 на https, серверу RST");
     } else {
-        st.emitted++;
+        http80_log(&r, "замена НЕ ушла (вердикт с заменой отвергнут) — вставка пропущена как есть, "
+                       "поток не тронут");
     }
-    http80_log(&r, "HTTPS имени подтверждён — клиенту 307 на https, серверу RST");
     return 1;
 }
 
@@ -1008,6 +1039,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Метки времени приёма у пакетов очереди (NFQA_TIMESTAMP): ядро ставит
+       их, только когда кто-то включил SO_TIMESTAMP. По ним http80 меряет RTT
+       без задержки очереди и самой службы (задача 51, ревью M1). Отказ — не
+       беда: замер идёт по своим часам, как раньше. */
+    {
+        int one = 1;
+        if (setsockopt(d2k_nfq_fd(q), SOL_SOCKET, SO_TIMESTAMP, &one, sizeof one) != 0) {
+            fprintf(stderr, "d2kd: метки времени ядра недоступны (%s) — RTT HTTP по своим часам\n",
+                    strerror(errno));
+        }
+    }
+
     d2k_ctl *ctl = NULL;
     if (ctl_path) {
         ctl = d2k_ctl_open(ctl_path, err, sizeof err);
@@ -1293,7 +1336,8 @@ int main(int argc, char **argv) {
                     st.bytes += np.payload_len;
                     if (np.have_payload && !np.truncated &&
                         http80_step(q, mode == MODE_APPLY ? raw : NULL, ctl, np.id,
-                                    np.payload, np.payload_len, t)) {
+                                    np.payload, np.payload_len, t,
+                                    np.have_tstamp ? np.tstamp_ns : 0)) {
                         continue;
                     }
 

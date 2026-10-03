@@ -80,7 +80,7 @@ static const char INJECT[] =
 #define SISN 5000000u
 
 static uint8_t b[4096];
-#define PKT(h, p, n, t, res) d2k_http80_packet((h), (p), (n), (t), out, sizeof out, rst, sizeof rst, (res))
+#define PKT(h, p, n, t, res) d2k_http80_packet((h), (p), (n), (t), 0, out, sizeof out, rst, sizeof rst, (res))
 static d2k_http80_res r;
 static uint8_t out[2048], rst[128];
 
@@ -224,6 +224,21 @@ static void test_garbage(void) {
     d2k_http80_free(h);
 }
 
+/* Вердикт и RST — подделки: замер того, что датапат сделал бы с очередью. */
+typedef struct { int fail_verdict, payload_calls, accept_calls, rst_calls; size_t payload_len; } fake_io;
+static int io_payload(void *c, const uint8_t *p, size_t n) {
+    fake_io *f = c; (void)p; f->payload_calls++; f->payload_len = n;
+    return f->fail_verdict ? -1 : 0;
+}
+static int io_accept(void *c) { ((fake_io *)c)->accept_calls++; return 0; }
+static int io_rst(void *c, const uint8_t *p, size_t n) {
+    (void)p; (void)n; ((fake_io *)c)->rst_calls++; return 0;
+}
+static int swap(d2k_http80 *h, d2k_http80_res *res, fake_io *f) {
+    d2k_http80_io io = {io_payload, io_accept, io_rst, f};
+    return d2k_http80_swap(h, res, out, rst, &io);
+}
+
 static int ip4_header_ok(const uint8_t *p) {
     uint32_t acc = 0;
     for (size_t i = 0; i < 20; i += 2) { acc += rd16(p + i); }
@@ -243,9 +258,16 @@ static void test_answer(int v6) {
     open_flow(h, &f, T, GET);
     size_t n = pkt(&f, 0, F_ACK | F_PSH | F_FIN, SISN + 1, req_end, INJECT, b);
     PKT(h, b, n, T + 99 * MS + 700000ull, &r);
-    CHECK(r.injection && r.answered && r.action == D2K_HTTP80_REPLACE,
+    CHECK(r.injection && r.action == D2K_HTTP80_REPLACE,
           v6 ? "IPv6: вставка при подтверждённом HTTPS не заменена" :
                "вставка при подтверждённом HTTPS не заменена");
+    {
+        d2k_http80_res keep = r;
+        fake_io io = {0, 0, 0, 0, 0};
+        CHECK(swap(h, &keep, &io) == 1 && keep.answered && io.payload_calls == 1 &&
+              io.payload_len == keep.len && io.rst_calls == 1 && io.accept_calls == 0,
+              "удачная замена: не тот порядок вердикта и RST");
+    }
 
     char want[1024];
     size_t wl = d2k_httpup_redirect_https("RuTracker.org", "/forum/index.php", want, sizeof want);
@@ -306,6 +328,61 @@ static void test_answer(int v6) {
     d2k_http80_free(h);
 }
 
+/* Ядро не приняло вердикт с заменой (ревью I3): вставка уходит как есть,
+   поток не «отвечен», серверу RST не идёт, вторая копия не снимается. */
+static void test_swap_failure(void) {
+    d2k_http80 *h = d2k_http80_new();
+    CHECK(d2k_http80_set_https(h, "rutracker.org", 13, 1000 * MS) == 0, "имя не принято");
+    flow f = flow4(58000);
+    open_flow(h, &f, 0, GET);
+    uint32_t req_end = CISN + 1 + (uint32_t)strlen(GET);
+    size_t n = pkt(&f, 0, F_ACK | F_PSH | F_FIN, SISN + 1, req_end, INJECT, b);
+    PKT(h, b, n, 99 * MS + 700000ull, &r);
+    CHECK(r.action == D2K_HTTP80_REPLACE, "замена не предложена");
+    fake_io io = {1, 0, 0, 0, 0};
+    CHECK(swap(h, &r, &io) == 0 && !r.answered, "неудачная замена сочтена удачной");
+    CHECK(io.payload_calls == 1 && io.accept_calls == 1 && io.rst_calls == 0,
+          "после неудачной замены не выпущен оригинал или ушёл RST");
+    PKT(h, b, n, 99 * MS + 900000ull, &r);
+    CHECK(r.action == D2K_HTTP80_PASS && !r.injection, "вторая копия снята после неудачной замены");
+    d2k_http80_stats st = d2k_http80_get_stats(h);
+    CHECK(st.answered == 0 && st.swap_failed == 1 && st.dropped == 0, "счётчики неудачи не те");
+    d2k_http80_free(h);
+}
+
+/* Задержка самого d2kd (ревью M1): SYN/ACK пролежал в очереди 200 мс. По
+   своим часам d2kd RTT 300 мс, и настоящий ответ через 60 мс выглядит
+   вставкой. Метки ядра (приём пакета) дают настоящие 98 мс — не вставка. */
+static void test_kernel_clock(void) {
+    d2k_http80 *h = d2k_http80_new();
+    flow f = flow4(59000);
+    const uint64_t K = 1700000000ull * 1000000000ull;
+    size_t n = pkt(&f, 1, F_SYN, CISN, 0, NULL, b);
+    d2k_http80_packet(h, b, n, 0, K, out, sizeof out, rst, sizeof rst, &r);
+    n = pkt(&f, 0, F_SYN | F_ACK, SISN, CISN + 1, NULL, b);
+    d2k_http80_packet(h, b, n, 300 * MS, K + 98 * MS, out, sizeof out, rst, sizeof rst, &r);
+    n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
+    d2k_http80_packet(h, b, n, 301 * MS, K + 99 * MS, out, sizeof out, rst, sizeof rst, &r);
+    n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, CISN + 1 + (uint32_t)strlen(GET), INJECT, b);
+    d2k_http80_packet(h, b, n, 361 * MS, K + 159 * MS, out, sizeof out, rst, sizeof rst, &r);
+    CHECK(!r.injection, "задержка d2kd превратила настоящий ответ во вставку");
+    d2k_http80_free(h);
+
+    /* Тот же поток, ответ через 0,7 мс по меткам ядра — вставка. */
+    h = d2k_http80_new();
+    n = pkt(&f, 1, F_SYN, CISN, 0, NULL, b);
+    d2k_http80_packet(h, b, n, 0, K, out, sizeof out, rst, sizeof rst, &r);
+    n = pkt(&f, 0, F_SYN | F_ACK, SISN, CISN + 1, NULL, b);
+    d2k_http80_packet(h, b, n, 300 * MS, K + 98 * MS, out, sizeof out, rst, sizeof rst, &r);
+    n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
+    d2k_http80_packet(h, b, n, 301 * MS, K + 99 * MS, out, sizeof out, rst, sizeof rst, &r);
+    n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, CISN + 1 + (uint32_t)strlen(GET), INJECT, b);
+    d2k_http80_packet(h, b, n, 302 * MS, K + 99 * MS + 700000ull, out, sizeof out, rst, sizeof rst, &r);
+    CHECK(r.injection && r.rtt_ns == 98 * MS && r.reply_ns == 700000ull,
+          "вставка по меткам ядра не узнана или замер не по ядру");
+    d2k_http80_free(h);
+}
+
 static void test_https_table(void) {
     d2k_http80 *h = d2k_http80_new();
     CHECK(d2k_http80_set_https(h, "", 0, 10) != 0, "пустое имя принято");
@@ -342,7 +419,7 @@ static void test_https_table(void) {
     f = flow4(57001);
     open_flow(h, &f, 0, GET);
     n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, CISN + 1 + (uint32_t)strlen(GET), INJECT, b);
-    d2k_http80_packet(h, b, n, 99 * MS + 700000ull, out, 64, rst, sizeof rst, &r);
+    d2k_http80_packet(h, b, n, 99 * MS + 700000ull, 0, out, 64, rst, sizeof rst, &r);
     CHECK(r.injection && r.action == D2K_HTTP80_PASS, "замена без места не прошла как есть");
     d2k_http80_free(h);
 }
@@ -356,6 +433,8 @@ int main(void) {
     test_answer(0);
     test_answer(1);
     test_https_table();
+    test_swap_failure();
+    test_kernel_clock();
     if (fails) {
         printf("test_http80: провалов %d\n", fails);
         return 1;

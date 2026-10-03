@@ -53,6 +53,7 @@
 #define D2K_NFQA_PACKET_HDR   1
 #define D2K_NFQA_VERDICT_HDR  2
 #define D2K_NFQA_MARK         3
+#define D2K_NFQA_TIMESTAMP    4
 #define D2K_NFQA_IFINDEX_OUTDEV 6
 #define D2K_NFQA_PAYLOAD     10
 #define D2K_NFQA_CAP_LEN     13
@@ -127,6 +128,11 @@ typedef struct {
        OUTPUT и FORWARD. Нужен шлюзу маршрута (d2k_routemark_gate). */
     uint32_t outdev;
     int have_outdev;
+    /* Метка времени приёма пакета ядром (NFQA_TIMESTAMP, стенные часы, нс).
+       Есть, когда ядро ставит skb->tstamp (кто-то включил SO_TIMESTAMP).
+       Без задержки самой очереди и d2kd (задача 51, ревью M1). */
+    uint64_t tstamp_ns;
+    int have_tstamp;
     /* Ядро отдало меньше, чем было на проводе: copy_range обрезал. Работать с
      * таким пакетом нельзя — мы рассуждали бы о куске, считая его целым. */
     int truncated;

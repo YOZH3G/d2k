@@ -203,6 +203,13 @@ int main(void) {
         wn32(odev, 7);
         pos = put(buf, pos, D2K_NFQA_IFINDEX_OUTDEV, odev, sizeof odev, 1);
 
+        /* Метка времени ядра (задача 51, ревью M1): sec и usec, be64. */
+        uint8_t ts[16];
+        memset(ts, 0, sizeof ts);
+        wn32(ts + 4, 1700000000u);
+        wn32(ts + 12, 123456u);
+        pos = put(buf, pos, D2K_NFQA_TIMESTAMP, ts, sizeof ts, 1);
+
         uint8_t pay[40];
         for (size_t i = 0; i < sizeof pay; i++) {
             pay[i] = (uint8_t)i;
@@ -225,6 +232,8 @@ int main(void) {
         CHECK(p.hook == 3, "hook потерян");
         CHECK(p.have_mark && p.mark == 0x1234, "метка потеряна");
         CHECK(p.have_outdev && p.outdev == 7, "выходной интерфейс потерян");
+        CHECK(p.have_tstamp && p.tstamp_ns == 1700000000ull * 1000000000ull + 123456000ull,
+              "метка времени ядра потеряна");
         CHECK(p.have_payload && p.payload_len == 40, "нагрузка потеряна");
         CHECK(p.payload && p.payload[0] == 0 && p.payload[39] == 39,
               "содержимое нагрузки не то");
