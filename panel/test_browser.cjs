@@ -9,9 +9,9 @@ const chrome=spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 const now=Date.now(),iso=s=>new Date(now-s*1000).toISOString();
 const fixture={knowledge:{
  searches:[
-  {target:'rutracker.org',family:4,transport:6,ip:'104.21.32.39',port:443,phase:'распознаём поведение',since:iso(40),attempts:0,probes:1,candidate:'',source:'выведен из замера'},
+  {target:'rutracker.org',family:4,transport:6,ip:'104.21.32.39',port:443,phase:'распознаём поведение',since:iso(40),attempts:0,probes:5,candidate:'',source:'',question:'принимает ли ответ на усечённое приветствие'},
   {target:'video.example',family:6,transport:17,ip:'2001:db8::5',port:443,phase:'проверяем готовое узнанной коробки',since:iso(200),attempts:1,probes:3,candidate:'план поставлен',source:'готовый план узнанной коробки'},
-  {target:'queued.example',family:4,transport:6,ip:'192.0.2.7',port:443,phase:'ожидает безопасного слота замера',since:iso(20),attempts:0,probes:0,candidate:'',source:'выведен из замера'}
+  {target:'queued.example',family:4,transport:6,ip:'192.0.2.7',port:443,phase:'ожидает безопасного слота замера',since:iso(20),attempts:0,probes:0,candidate:'',source:''}
  ],
  groups:[{suffix:'example.com',transport:6,family:4,shape:1,evidence_count:3,plan_id:'plan-a',probe_path:'/',ech_origin:'',active:true,
   evidence:['a.example.com','b.example.com','c.example.com'],exceptions:[{name:'skip.example.com'}]}],
@@ -106,6 +106,13 @@ async function main(){
 
   // Шкала фаз совпадает с этапом оригинала.
   assert.equal(await evaluate('document.querySelector(".search .track-step[data-state=now]").textContent'),'Распознаём');
+
+  // Карточка этапа «Распознаём»: последний вопрос и счётчик зондов, без устаревшего источника.
+  assert.equal(await evaluate('document.querySelector(".search .search-question").textContent'),'Вопрос коробке: принимает ли ответ на усечённое приветствие');
+  assert.equal(await evaluate('document.querySelector(".search .search-question").hidden'),false);
+  assert.match(await evaluate('document.querySelector(".search").textContent'),/5 зондов/);
+  assert.doesNotMatch(await evaluate('document.querySelector(".search").textContent'),/выведен из замера/);
+  assert.equal(await evaluate('[...document.querySelectorAll(".search")].filter(x=>!x.querySelector(".search-question").hidden).length'),1,'question only on the classifier card');
 
   // Раскладка на ширинах содержимого.
   for(const [name,width,height] of [['narrow',320,740],['phone',390,844],['tablet',768,1024],['laptop',1280,800],['wide',1920,1080]]){

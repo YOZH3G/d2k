@@ -413,6 +413,11 @@ main { min-width: 0; padding-bottom: 80px; }
   content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 10px;
   border-radius: 50%; background: var(--signal); vertical-align: 1px;
 }
+.search-question {
+  grid-column: 1 / -1; margin-top: 4px;
+  font-size: 0.875rem; color: var(--ink-3); overflow-wrap: anywhere;
+}
+.search-question[hidden] { display: none; }
 .search[data-done="true"] .search-phase::before { background: var(--ok); }
 
 .track {

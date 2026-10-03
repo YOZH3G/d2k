@@ -832,12 +832,14 @@
       meta: el(doc, "div", "search-meta"),
       clock: el(doc, "div", "search-clock"),
       phase: el(doc, "p", "search-phase"),
+      question: el(doc, "p", "search-question"),
       track: el(doc, "div", "track")
     };
     li.__parts.track.setAttribute("aria-hidden", "true");
     li.__parts.fill = el(doc, "span", "track-fill");
     li.__parts.puck = el(doc, "span", "track-puck");
-    add(li, li.__parts.target, li.__parts.clock, li.__parts.meta, li.__parts.phase, li.__parts.track);
+    li.__parts.question.hidden = true;
+    add(li, li.__parts.target, li.__parts.clock, li.__parts.meta, li.__parts.phase, li.__parts.question, li.__parts.track);
     void s;
     return li;
   };
@@ -875,6 +877,10 @@
         p.phase.textContent = phaseText;
       }
     }
+    var classifying = s.phase === TRACK[2].phases[0] && !!str(s.question);
+    p.question.hidden = !classifying;
+    var qText = classifying ? "Вопрос коробке: " + str(s.question) : "";
+    if (p.question.textContent !== qText) p.question.textContent = qText;
     var tr = trackFor(s.phase);
     li.setAttribute("data-done", String(!!tr && !tr.voice && tr.at === TRACK.length - 1));
     if (!tr) { p.track.hidden = true; return; }

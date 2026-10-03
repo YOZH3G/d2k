@@ -11,8 +11,8 @@ const payload = {
     version:'local-design-preview', stages:[], absent:[], taken:'2026-10-01T12:30:00Z' },
   knowledge: {linked:true, targets:3, confirms:8, probes_used:12,
     searches:[
-      {target:'rutracker.org',shape:2,proto:'tls12',family:4,transport:6,ip:'104.21.32.39',port:443,source:'выведен из замера',phase:'распознаём поведение',since:-48,attempts:0,probes:1},
-      {target:'meduza.io',shape:1,proto:'tls13',family:4,transport:6,ip:'172.67.70.12',port:443,source:'выведен из замера',candidate:'план поставлен',phase:'проверяем выведенный план',since:-203,attempts:2,probes:4},
+      {target:'rutracker.org',shape:2,proto:'tls12',family:4,transport:6,ip:'104.21.32.39',port:443,source:'',question:'принимает ли ответ на усечённое приветствие',phase:'распознаём поведение',since:-48,attempts:0,probes:5},
+      {target:'meduza.io',shape:1,proto:'tls13',family:4,transport:6,ip:'172.67.70.12',port:443,source:'выведен из замера',question:'',candidate:'план поставлен',phase:'проверяем выведенный план',since:-203,attempts:2,probes:4},
       {target:'rr3---sn-gvnuxaxjvh-nbjl.googlevideo.com',shape:3,proto:'quic',family:6,transport:17,ip:'2a00:1450:4010:c0e::5e',port:443,source:'готовый план узнанной коробки',phase:'подтверждено, смотрим живой трафик',since:-611,attempts:1,probes:3}
     ],
     groups:[
