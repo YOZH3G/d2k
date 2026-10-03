@@ -857,6 +857,13 @@ static int qp_verify_bound(const uint8_t *p, size_t n, d2k_hello msg) {
             (scid_len && memcmp(p + 6, msg.bytes + so + 1, scid_len) != 0)) {
             return -1;
         }
+        /* RFC 9000 §17.2.5.2: Retry с пустым токеном отбрасывается, как и
+           Retry, чей SCID пуст или равен DCID нашего Initial. */
+        size_t at = 6 + rd;
+        if (at >= n) return -1;
+        size_t rs = p[at++];
+        if (rs == 0 || at + rs + 16 >= n) return -1;   /* пустой SCID или токен */
+        if (rs == dcid_len && memcmp(p + at, msg.bytes + dcid_off, dcid_len) == 0) return -1;
         return d2k_qw_retry_verify(version, msg.bytes + dcid_off, dcid_len, p, n) == 0 ? 0 : -1;
     }
     qp_hdr h;
@@ -1605,7 +1612,11 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
     }
     /* pad_to у d2k_qc — длина ClientHello: добиваем до ClientHello фильтра,
        тогда и датаграмма выходит длиной с Initial фильтра. */
-    snprintf(d.note, sizeof d.note, "hello d2k_qc, ClientHello %zu как у Initial %zu фильтра, GET %.32s",
+    /* После Retry (и в повторах по PTO) Initial уходит БЕЗ воздействия:
+       ровно так поток плана ведёт датапат — session.c пропускает Initial
+       потока, где план уже применён («поток уже показывал приветствие»). */
+    snprintf(d.note, sizeof d.note, "hello d2k_qc, ClientHello %zu как у Initial %zu фильтра, "
+             "GET %.32s; после Retry Initial без воздействия, как датапат",
              filter_ch, filter_len, path);
     d2k_qc_opts o;
     memset(&o, 0, sizeof o);
@@ -1628,7 +1639,7 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
             snprintf(d.reason, sizeof d.reason, "этап данных не состоялся: %.120s", err);
             return d;
         }
-        d.verdict = d2k_quic_arm_data_judge(0, 0, 0);
+        d.verdict = d2k_quic_arm_data_judge(0, 0, 0, 0);
         snprintf(d.reason, sizeof d.reason, "фильтр прошёл, рукопожатия нет: %.120s", err);
         return d;
     }
@@ -1651,23 +1662,40 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
         return d;
     }
     uint64_t bytes = 0, last = 0;
-    int complete = 0, closed = 0;
+    int complete = 0, closed = 0, status = 0;
+    /* Начало ответа — ради HEADERS: тот же разбор кода, что у проверки
+       плана (verify.c), чтобы правило было одно и в предусловии. */
+    uint8_t head[8192];
+    size_t head_len = 0;
     int64_t start = qp_now_ms(), progress_at = start;
-    while (!complete && bytes < D2K_QUIC_ARM_DATA_BYTES) {
+    while (!(complete && status) && (bytes < D2K_QUIC_ARM_DATA_BYTES || !status)) {
         int64_t now = qp_now_ms();
         if (now - progress_at >= (int64_t)step || now - start >= (int64_t)(4u * step)) break;
         long n = d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 200, err, sizeof err);
         if (n < 0) { closed = 1; }
+        if (n > 0 && head_len < sizeof head) {
+            size_t take = (size_t)n < sizeof head - head_len ? (size_t)n : sizeof head - head_len;
+            memcpy(head + head_len, buf, take);
+            head_len += take;
+        }
+        if (!status && head_len > 0) {
+            int st = 0;
+            if (d2k_h3_status(head, head_len, &st) == 0) status = st;
+        }
         d2k_qc_app_progress(c, &bytes, &complete);
         if (bytes > last) { last = bytes; progress_at = qp_now_ms(); }
         if (closed) break;
     }
     d2k_qc_app_progress(c, &bytes, &complete);
     d.app_bytes = bytes;
-    d.verdict = d2k_quic_arm_data_judge(1, bytes, complete);
+    d.verdict = d2k_quic_arm_data_judge(1, status, bytes, complete);
     if (d.verdict == D2K_QAD_PASS) {
-        snprintf(d.reason, sizeof d.reason, "рукопожатие и %llu байт данных%s",
-                 (unsigned long long)bytes, complete ? ", ответ целиком" : "");
+        snprintf(d.reason, sizeof d.reason, "рукопожатие, HTTP %d и %llu байт данных%s",
+                 status, (unsigned long long)bytes, complete ? ", ответ целиком" : "");
+    } else if (!status || status == 451) {
+        snprintf(d.reason, sizeof d.reason, "рукопожатие есть, %s (%llu байт)%s%.80s",
+                 status ? "HTTP 451 — отказ, не успех" : "заголовков ответа HTTP/3 нет",
+                 (unsigned long long)bytes, closed ? ": " : "", closed ? err : "");
     } else {
         snprintf(d.reason, sizeof d.reason, "рукопожатие есть, поток оборван на %llu байт%s%.80s",
                  (unsigned long long)bytes, closed ? ": " : "", closed ? err : "");

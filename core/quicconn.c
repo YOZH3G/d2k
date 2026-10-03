@@ -553,6 +553,11 @@ static int recv_dgram(d2k_qc *c, int wait_ms, char *err, size_t errcap) {
                 h.dcid_len != c->scid_len ||
                 memcmp(buf + off + h.dcid_off, c->scid, c->scid_len) != 0 ||
                 h.scid_len == 0 || h.scid_len > sizeof c->dcid ||
+                /* RFC 9000 §17.2.5.2: пустой токен и SCID, равный нашему
+                   исходному DCID, — отбросить. */
+                h.token_len == 0 ||
+                (h.scid_len == c->odcid_len &&
+                 memcmp(buf + off + h.scid_off, c->odcid, c->odcid_len) == 0) ||
                 h.token_len > sizeof c->retry_token ||
                 d2k_qw_retry_verify(c->version, c->odcid, c->odcid_len,
                                     buf + off, h.packet_len) != 0) {

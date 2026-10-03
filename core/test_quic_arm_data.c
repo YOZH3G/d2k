@@ -39,7 +39,8 @@ static int fails;
 
 /* --- стенд: UDP-сервер с режимами ответа ------------------------------- */
 
-enum { M_SILENT, M_BOUND, M_RETRY, M_RETRY_BADTAG, M_RETRY_FOREIGN, M_VN, M_FAKE_KEYS, M_WRONG_CID };
+enum { M_SILENT, M_BOUND, M_RETRY, M_RETRY_BADTAG, M_RETRY_FOREIGN, M_RETRY_NOTOKEN, M_RETRY_NOSCID,
+       M_RETRY_SCID_IS_DCID, M_VN, M_FAKE_KEYS, M_WRONG_CID };
 
 #define MAX_SEEN 256
 static volatile int g_mode;
@@ -103,6 +104,20 @@ static void *stand_run(void *arg) {
         switch (g_mode) {
         case M_BOUND:
             if (ours) ol = server_initial(dcid, h.dcid_len, scid, h.scid_len, out, sizeof out);
+            break;
+        case M_RETRY_NOTOKEN:
+        case M_RETRY_NOSCID:
+        case M_RETRY_SCID_IS_DCID:
+            /* Верный тег, наш SCID, но пустой токен / пустой SCID / SCID,
+               равный DCID нашего Initial — RFC 9000 §17.2.5.2: отбросить. */
+            if (ours && h.token_len == 0) {
+                const uint8_t *rs = g_mode == M_RETRY_SCID_IS_DCID ? dcid : other;
+                size_t rsl = g_mode == M_RETRY_NOSCID ? 0
+                           : g_mode == M_RETRY_SCID_IS_DCID ? h.dcid_len : sizeof other;
+                size_t tl = g_mode == M_RETRY_NOTOKEN ? 0 : 3;
+                ol = d2k_qw_retry_build(out, sizeof out, D2K_QW_V1, dcid, h.dcid_len,
+                                        scid, h.scid_len, rs, rsl, (const uint8_t *)"tok", tl);
+            }
             break;
         case M_RETRY:
         case M_RETRY_BADTAG:
@@ -182,6 +197,9 @@ static void test_bound_replies_only(uint16_t port) {
         {M_RETRY, 3, "Retry нашему SCID с верным тегом от нашего DCID проходит фильтр"},
         {M_RETRY_BADTAG, 0, "Retry с неверным тегом не проходит фильтр"},
         {M_RETRY_FOREIGN, 0, "Retry чужому CID не проходит фильтр"},
+        {M_RETRY_NOTOKEN, 0, "Retry с пустым токеном не проходит фильтр (RFC 9000 §17.2.5.2)"},
+        {M_RETRY_NOSCID, 0, "Retry с пустым SCID не проходит фильтр"},
+        {M_RETRY_SCID_IS_DCID, 0, "Retry, чей SCID равен DCID нашего Initial, не проходит фильтр"},
         {M_VN, 0, "Version Negotiation не делает плечо успешным"},
         {M_FAKE_KEYS, 0, "ответ на приманку (её ключи и CID) не засчитывается"},
         {M_WRONG_CID, 0, "Initial на наших ключах, но не нашему SCID, не засчитывается"},
@@ -242,28 +260,39 @@ static void test_judge(void) {
     d2k_qw_ranges_add(&r, 1000, 2000, 1);
     d2k_qw_ranges_add(&r, 0, 1000, 0);
     CHECK(d2k_qw_ranges_complete(&r) && d2k_qw_ranges_bytes(&r) == 3000, "FIN и все байты до него — ответ целиком");
-    CHECK(d2k_quic_arm_data_judge(1, d2k_qw_ranges_bytes(&r), d2k_qw_ranges_complete(&r)) == D2K_QAD_PASS,
+    CHECK(d2k_quic_arm_data_judge(1, 200, d2k_qw_ranges_bytes(&r), d2k_qw_ranges_complete(&r)) == D2K_QAD_PASS,
           "полный короткий ответ (3 КБ) — прошло");
     /* Дыра перед FIN — не целиком, ниже порога — обрыв. */
     d2k_qw_ranges_reset(&r);
     d2k_qw_ranges_add(&r, 0, 1000, 0);
     d2k_qw_ranges_add(&r, 2000, 1000, 1);
     CHECK(!d2k_qw_ranges_complete(&r) && d2k_qw_ranges_bytes(&r) == 2000, "дыра перед FIN — ответ не целиком");
-    CHECK(d2k_quic_arm_data_judge(1, d2k_qw_ranges_bytes(&r), d2k_qw_ranges_complete(&r)) == D2K_QAD_CUT,
+    CHECK(d2k_quic_arm_data_judge(1, 200, d2k_qw_ranges_bytes(&r), d2k_qw_ranges_complete(&r)) == D2K_QAD_CUT,
           "дыра перед FIN — не прошло");
     /* Поток встал на 6 КБ без FIN — обрыв. */
     d2k_qw_ranges_reset(&r);
     for (uint64_t off = 0; off < 6144; off += 1024) d2k_qw_ranges_add(&r, off, 1024, 0);
     d2k_qw_ranges_add(&r, 0, 1024, 0); /* повтор не считается дважды */
     CHECK(d2k_qw_ranges_bytes(&r) == 6144 && r.n == 1, "повтор кадра не раздувает счёт");
-    CHECK(d2k_quic_arm_data_judge(1, d2k_qw_ranges_bytes(&r), d2k_qw_ranges_complete(&r)) == D2K_QAD_CUT,
+    CHECK(d2k_quic_arm_data_judge(1, 200, d2k_qw_ranges_bytes(&r), d2k_qw_ranges_complete(&r)) == D2K_QAD_CUT,
           "рукопожатие есть, поток встал на 6 КБ без FIN — не прошло");
-    CHECK(d2k_quic_arm_data_judge(1, D2K_QUIC_ARM_DATA_BYTES, 0) == D2K_QAD_PASS,
+    CHECK(d2k_quic_arm_data_judge(1, 200, D2K_QUIC_ARM_DATA_BYTES, 0) == D2K_QAD_PASS,
           "не меньше порога без FIN — прошло");
-    CHECK(d2k_quic_arm_data_judge(1, D2K_QUIC_ARM_DATA_BYTES - 1, 0) == D2K_QAD_CUT,
+    CHECK(d2k_quic_arm_data_judge(1, 200, D2K_QUIC_ARM_DATA_BYTES - 1, 0) == D2K_QAD_CUT,
           "на байт меньше порога без FIN — обрыв");
-    CHECK(d2k_quic_arm_data_judge(0, 100000, 1) == D2K_QAD_NO_HANDSHAKE,
+    CHECK(d2k_quic_arm_data_judge(0, 200, 100000, 1) == D2K_QAD_NO_HANDSHAKE,
           "без рукопожатия данных не бывает");
+    /* Пустой поток с FIN — не ответ; без HEADERS нет ответа — правило
+       плеча совпадает с проверкой плана (verify.c ждёт код ответа). */
+    d2k_qw_ranges_reset(&r);
+    d2k_qw_ranges_add(&r, 0, 0, 1);
+    CHECK(!d2k_qw_ranges_complete(&r), "пустой поток с FIN — не ответ целиком");
+    CHECK(d2k_quic_arm_data_judge(1, 0, 3000, 1) == D2K_QAD_CUT,
+          "полный поток без заголовков HTTP/3 — не прошло (как у проверки плана)");
+    CHECK(d2k_quic_arm_data_judge(1, 0, D2K_QUIC_ARM_DATA_BYTES, 0) == D2K_QAD_CUT,
+          "порог данных без заголовков — не прошло");
+    CHECK(d2k_quic_arm_data_judge(1, 451, 3000, 1) == D2K_QAD_CUT,
+          "HTTP 451 — отказ, не успех плеча");
     CHECK(D2K_QUIC_ARM_DATA_BYTES >= 16384 && D2K_QUIC_ARM_DATA_BYTES <= 32768,
           "порог в пределах 16–32 КБ");
 }
@@ -389,13 +418,24 @@ static void test_data_stage_follows_retry(uint16_t port) {
     d2k_quic_arm_data d = d2k_quic_arm_data_hook(&q, TARGET, "/big.css", port, 100, 0);
     struct timespec nap = {0, 50000000L};
     (void)nanosleep(&nap, NULL);
-    int plain = 0, with_token = 0;
+    int plain = 0, with_token = 0, decoys_before = 0, decoys_after_retry = 0;
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_seen_n; i++) {
-        if (g_seen_port[i] != d.local_port || !g_seen_ours[i]) continue;
+        if (g_seen_port[i] != d.local_port) continue;
+        if (!g_seen_ours[i]) {
+            if (with_token || plain) decoys_after_retry++; else decoys_before++;
+            continue;
+        }
         if (g_seen_token[i] == 3) with_token++; else if (g_seen_token[i] == 0) plain++;
     }
     pthread_mutex_unlock(&g_mu);
+    /* Датапат (session.c) пропускает Initial потока с уже применённым
+       планом как есть — и Initial после Retry тоже. Плечо обязано мерить то
+       же: воздействие только перед первым Initial. */
+    CHECK(decoys_before == 2 && decoys_after_retry == 0,
+          "после Retry Initial с токеном уходит без воздействия, как в датапате");
+    CHECK(strstr(d.note, "после Retry Initial без воздействия") != NULL,
+          "трасса говорит, что Initial после Retry без воздействия");
     CHECK(d.local_port && plain >= 1 && with_token >= 1,
           "этап данных идёт за верным Retry: Initial с его токеном на той же четвёрке");
     CHECK(d.verdict == D2K_QAD_NO_HANDSHAKE, "Retry без рукопожатия плечо не засчитывает");

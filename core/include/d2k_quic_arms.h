@@ -19,7 +19,7 @@ typedef struct {
     d2k_quic_arm_data_verdict verdict;
     uint64_t app_bytes;   /* данные ответа на запрос, прошедшие после рукопожатия */
     uint16_t local_port;  /* местный порт соединения — свежая четвёрка */
-    char note[160];      /* приветствие и путь этапа (в трассу шага) */
+    char note[256];      /* приветствие и путь этапа (в трассу шага) */
     char reason[256];
 } d2k_quic_arm_data;
 

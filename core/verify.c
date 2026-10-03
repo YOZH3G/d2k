@@ -1221,7 +1221,7 @@ d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_
         r.body_bytes = bytes;
         r.body_complete = complete;
         /* То же правило, что у этапа данных плеча (d2k_quic_arm_data_judge). */
-        if (d2k_quic_arm_data_judge(1, bytes, complete) == D2K_QAD_PASS) {
+        if (d2k_quic_arm_data_judge(1, r.status, bytes, complete) == D2K_QAD_PASS) {
             r.level = D2K_VER_APPLICATION;
             snprintf(r.reason, sizeof r.reason,
                      "заголовки HTTP/3 получены, статус %d, данных %llu байт%s", r.status,

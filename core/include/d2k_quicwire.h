@@ -230,7 +230,7 @@ void     d2k_qw_ranges_reset(d2k_qw_ranges *r);
 void     d2k_qw_ranges_add(d2k_qw_ranges *r, uint64_t off, uint64_t len, int fin);
 /* Сколько разных байт потока принято. */
 uint64_t d2k_qw_ranges_bytes(const d2k_qw_ranges *r);
-/* 1 — FIN принят и все байты [0; fin_off) пришли. */
+/* 1 — FIN принят, fin_off > 0 и все байты [0; fin_off) пришли. */
 int      d2k_qw_ranges_complete(const d2k_qw_ranges *r);
 
 #endif /* D2K_QUICWIRE_H */

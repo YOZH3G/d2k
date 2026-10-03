@@ -526,6 +526,7 @@ uint64_t d2k_qw_ranges_bytes(const d2k_qw_ranges *r) {
 
 int d2k_qw_ranges_complete(const d2k_qw_ranges *r) {
     if (!r || !r->fin) { return 0; }
-    if (r->fin_off == 0) { return 1; }
+    /* Пустой поток с FIN — не ответ: ни заголовков, ни тела (раунд 2). */
+    if (r->fin_off == 0) { return 0; }
     return r->n >= 1 && r->start[0] == 0 && r->end[0] >= r->fin_off;
 }

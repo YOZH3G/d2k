@@ -413,14 +413,18 @@ typedef enum {
 
 /* Вердикт по наблюдениям одного соединения — без сети и одно правило для
  * этапа данных плеча (quicprobe.c) и проверки плана (verify.c): handshake —
- * рукопожатие дошло до прикладных ключей, app_bytes — разных байт ответа
- * принято, complete — FIN и все байты до него без дыр (d2k_qc_app_progress).
- * Полный ответ (FIN под прикладными ключами коробке не подделать) — успех
- * при любом размере; поток, вставший без него, обязан донести порог. */
-static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge(int handshake,
+ * рукопожатие дошло до прикладных ключей, status — код из HEADERS HTTP/3
+ * ответа (0 — заголовков нет), app_bytes — разных байт ответа принято,
+ * complete — FIN, ненулевой поток и все байты до FIN без дыр
+ * (d2k_qc_app_progress). Без заголовков ответа нет вовсе (пустой поток с
+ * FIN — не ответ); 451 — юридический отказ, не успех. Полный ответ (FIN под
+ * прикладными ключами коробке не подделать) — успех при любом размере;
+ * поток, вставший без него, обязан донести порог. */
+static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge(int handshake, int status,
                                                                 uint64_t app_bytes,
                                                                 int complete) {
     if (!handshake) return D2K_QAD_NO_HANDSHAKE;
+    if (status <= 0 || status == 451) return D2K_QAD_CUT;
     if (complete || app_bytes >= D2K_QUIC_ARM_DATA_BYTES) return D2K_QAD_PASS;
     return D2K_QAD_CUT;
 }
@@ -442,7 +446,7 @@ typedef struct {
     uint64_t data_bytes;
     /* Каким приветствием и по какому пути шёл этап данных (раунд 1, m1):
        клиент d2k_qc, добивка до длины Initial фильтра. */
-    char data_note[160];
+    char data_note[256];
 } d2k_quic_arm_step;
 
 typedef struct {

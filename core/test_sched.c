@@ -450,11 +450,26 @@ static char quic_last_trig[256];
 static char quic_last_ctl[256];
 static uint32_t quic_last_mark;
 
+/* Задача 39: QUIC-проверка плана по известному ресурсу. Делегирует общему
+   stub_ver (транспорт 17) и запоминает путь — настоящий хук пошёл бы в сеть. */
+static int quic_path_ver_calls;
+static char quic_path_ver_last[512];
+static d2k_ver_result stub_quic_path_ver(int use_fd, const char *ip, uint16_t port,
+                                         const char *sni, int deadline_ms,
+                                         size_t hello_wire, const char *path) {
+    quic_path_ver_calls++;
+    snprintf(quic_path_ver_last, sizeof quic_path_ver_last, "%s", path ? path : "");
+    return stub_ver(use_fd, ip, port, 17, sni, deadline_ms, hello_wire, D2K_SHAPE_UNKNOWN);
+}
+
+/* Задача 39: путь, которым этап данных плеча спрашивает цель (вход в arm). */
+static char quic_last_path[512];
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
                           d2k_hello trigger, d2k_hello control, uint32_t mark,
                           d2k_quic_arm *arm) {
     (void)port;
     quic_last_mark = mark;
+    snprintf(quic_last_path, sizeof quic_last_path, "%s", arm ? arm->probe_path : "");
     int call_index = quic_calls++;
     if (call_index < 2 && trigger.bytes && trigger.len <= sizeof quic_seen_triggers[0]) {
         memcpy(quic_seen_triggers[call_index], trigger.bytes, trigger.len);
@@ -1790,6 +1805,7 @@ int main(int argc, char **argv) {
     d2k_sched_ver_hook = stub_ver;
     d2k_sched_rx_ver_hook = stub_ver;
     d2k_sched_rx_gzip_ver_hook = stub_ver;
+    d2k_sched_quic_path_ver_hook = stub_quic_path_ver;
     d2k_sched_mark_hook = stub_mark;
     d2k_sched_spawn_hook = stub_spawn;
     d2k_sched_cpu_hook = stub_cpu;
@@ -7276,6 +7292,85 @@ rx_volume_tests:
         d2k_sched_vol_path_hook = d2k_volume_probe_path;
         d2k_sched_path_ver_hook = d2k_verify_probe_path_on;
         vol_rx_cut = 0;
+    }
+    /* Задача 39, раунд 2: сохранённый путь подтверждённой QUIC-привязки
+       читается обратно, когда HTML-подсказки TCP уже нет (новый
+       планировщик — как после перезапуска). Ключ формы у QUIC-привязки —
+       D2K_LINK_SHAPE_QUIC, не форма TLS-приветствия. Путь идёт и в этап
+       данных плеча, и в проверку плана; в ключ семейства QUIC он не входит. */
+    {
+        d2k_catalog c = {0};
+        uint16_t saved = g_server_port; g_server_port = 443;
+        static const char *names[3] = {"a1.cdn-qres.com", "b1.cdn-qres.com", "c1.cdn-qres.com"};
+        quic_answer = D2K_V_OPAQUE; arm_kind = D2K_QA_BLOB;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        /* 1. Подтверждаем QUIC-привязки на публичном адресе (подсказки нет — «/»). */
+        for (int n = 0; n < 3; n++) {
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            d2k_sched_set_say(s, collect_say, NULL);
+            uint16_t cport = (uint16_t)(41700 + n);
+            ver_answer_port = cport; forget_sent();
+            d2k_ev h = ev_hello(17, cport, names[n]);
+            inet_pton(AF_INET, "8.8.8.8", h.low_ip);
+            d2k_sched_event(s, &h);
+            d2k_ev sh; CHECK(quic_shape(&sh, names[n]) == 0, "QUIC shape fixture");
+            d2k_sched_event(s, &sh);
+            d2k_ev su = ev_suspect(17, cport); memcpy(su.low_ip, h.low_ip, 4);
+            d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(17, cport); memcpy(ap.low_ip, h.low_ip, 4);
+            d2k_sched_event(s, &ap);
+            spin(s, 40);
+            d2k_sched_free(s);
+        }
+        const d2k_cat_binding *qb = binding_of(&c, names[0], 17);
+        CHECK(qb && qb->shape == D2K_LINK_SHAPE_QUIC, "QUIC binding fixture confirmed");
+        /* 2. Сохранённый свидетель-ресурс на привязках, подсказок нет. */
+        for (size_t i = 0; i < c.n_boxes; i++)
+            for (size_t j = 0; j < c.boxes[i].n_binds; j++)
+                if (c.boxes[i].binds[j].transport == 17)
+                    snprintf(c.boxes[i].binds[j].probe_path,
+                             sizeof c.boxes[i].binds[j].probe_path, "/static/app.css");
+        for (int n = 0; n < 3; n++) {
+            quic_last_path[0] = 0; quic_path_ver_calls = 0; quic_path_ver_last[0] = 0;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = 0; d2k_sched_set_say(s, collect_say, NULL);
+            uint16_t cport = (uint16_t)(41710 + n);
+            ver_answer_port = cport; forget_sent();
+            d2k_ev h = ev_hello(17, cport, names[n]);
+            inet_pton(AF_INET, "8.8.8.8", h.low_ip);
+            d2k_sched_event(s, &h);
+            d2k_ev sh; CHECK(quic_shape(&sh, names[n]) == 0, "QUIC shape fixture");
+            d2k_sched_event(s, &sh);
+            d2k_ev su = ev_suspect(17, cport); memcpy(su.low_ip, h.low_ip, 4);
+            su.planned = D2K_LINK_PLANNED_NO;
+            d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(17, cport); memcpy(ap.low_ip, h.low_ip, 4);
+            d2k_sched_event(s, &ap);
+            spin(s, 40);
+            char want[160];
+            snprintf(want, sizeof want, "по %s RX и кандидат проверяются по публичному stylesheet /static/app.css", names[n]);
+            CHECK(said(want),
+                  "confirmed QUIC binding path not read back after the hint is gone");
+            CHECK(!strcmp(quic_last_path, "/static/app.css"),
+                  "QUIC arm data stage did not receive the saved resource path");
+            CHECK(quic_path_ver_calls > 0 && !strcmp(quic_path_ver_last, "/static/app.css"),
+                  "QUIC plan verification did not go by the saved resource path");
+            if (!said("публичному stylesheet /static/app.css")) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s);
+        }
+        /* 3. Ключ семейства QUIC — «/», путь-подсказка в него не входит. */
+        d2k_group_key gk = {0}; gk.transport = 17; gk.family = 4; gk.shape = D2K_LINK_SHAPE_QUIC;
+        strcpy(gk.probe_path, "/static/app.css");
+        CHECK(c.groups && !d2k_group_match(c.groups, "d1.cdn-qres.com", &gk),
+              "QUIC family key must not carry the resource path");
+        strcpy(gk.probe_path, "/");
+        CHECK(c.groups && d2k_group_match(c.groups, "d1.cdn-qres.com", &gk),
+              "QUIC family learned with \"/\" despite the resource path (previous matching)");
+        printf("QUIC resource path: binding read back, measure=%s, verify calls %d (%s)\n",
+               quic_last_path, quic_path_ver_calls, quic_path_ver_last);
+        d2k_catalog_free(&c); g_server_port = saved;
     }
     /* IPv4 success is only a candidate for IPv6. A failed native baseline
        checks it on an isolated native socket; own APPLIED and complete

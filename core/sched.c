@@ -1897,7 +1897,11 @@ static void *worker_run(void *vp) {
                 SCHED_VERIFY_STEP_MS, trig.len,
                 d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY,
                 encoding, 0, t->measure_path);
-        } else if (t->transport == 17 && t->measure_path[0] && verifier == d2k_sched_ver_hook) {
+        } else if (t->transport == 17 && t->measure_path[0]) {
+            /* For QUIC `verifier` is always d2k_sched_ver_hook: rx_phase
+               moves only in layered_rx_result, which requires a modern TLS
+               hello shape -- a QUIC Initial never has one -- and the RX hook
+               is chosen only for transport 6. No further condition needed. */
             vr = d2k_sched_quic_path_ver_hook(a_use_fd, t->ip, t->port, t->name,
                 SCHED_VERIFY_STEP_MS, trig.len, t->measure_path);
         } else vr = verifier(a_use_fd, t->ip, t->port, t->transport,
@@ -4508,7 +4512,10 @@ static void select_resource_path(d2k_sched *s, task *t) {
     /* Confirmed witness survives restart; never borrow proof across family
        or TLS shape. A live HTML hint contains no protocol proof at all. */
     const d2k_cat_binding *best = NULL;
-    d2k_shape shape = d2k_hello_shape(t->trig, t->trig_len);
+    /* QUIC bindings are stored with D2K_LINK_SHAPE_QUIC (verify_confirm);
+       a QUIC Initial never parses as a TLS hello shape. */
+    uint8_t shape = t->transport == 17 ? (uint8_t)D2K_LINK_SHAPE_QUIC
+                                       : (uint8_t)d2k_hello_shape(t->trig, t->trig_len);
     for (size_t bi = 0; bi < s->cat->n_boxes; bi++)
         for (size_t j = 0; j < s->cat->boxes[bi].n_binds; j++) {
             const d2k_cat_binding *bd = &s->cat->boxes[bi].binds[j];
@@ -5165,6 +5172,14 @@ static int family_recovery_eligible(const d2k_sched *s,const task *t) {
         installed_family_ready(s,t,0,1);
 }
 
+/* Путь в ключе семейства (задача 39, раунд 2). У TCP он часть контекста
+   замера (RX-проба по ресурсу). У QUIC путь — только подсказка, каким
+   ресурсом спросить данные плеча и проверки, а не свойство коробки: ключ
+   семейства QUIC всегда «/», как до задачи 39. */
+static const char *group_path(uint8_t transport, const char *path) {
+    return transport == 17 || !path || !path[0] ? "/" : path;
+}
+
 static int family_recovery_start(d2k_sched *s, task *t) {
     if(t->family_fast || t->trigger_planned!=D2K_LINK_PLANNED_YES ||
        t->rx_volume_only || t->ech_offer || !installed_family_ready(s,t,0,1)) return 0;
@@ -5174,7 +5189,7 @@ static int family_recovery_start(d2k_sched *s, task *t) {
        !d2k_cat_shape_fits((uint8_t)d2k_hello_shape(t->trig,t->trig_len),t->trigger_shape)) return 0;
     d2k_group_key key;
     if(d2k_group_key_make(&key,t->transport,t->family,t->trigger_shape,
-                         t->measure_path[0]?t->measure_path:"/","")) return 0;
+                         group_path(t->transport,t->measure_path),"")) return 0;
     const d2k_domain_group *g=d2k_group_match(s->cat->groups,t->name,&key);
     if(!g) return 0;
     t->n_plans=t->n_known=t->next_plan=0; t->fb_queue=0;
@@ -5213,7 +5228,7 @@ static int family_recovery_start(d2k_sched *s, task *t) {
                        (bd->transport?bd->transport:6)==key.transport &&
                        (bd->family?bd->family:4)==key.family &&
                        d2k_cat_shape_fits(bd->shape,key.shape) &&
-                       !strcmp(bd->probe_path[0]?bd->probe_path:"/",key.probe_path) &&
+                       !strcmp(group_path(key.transport,bd->probe_path),key.probe_path) &&
                        !strcmp(bd->ech_origin,key.ech_origin)) confirmed=1;
                 }
                 if(!confirmed) continue;
@@ -5903,7 +5918,7 @@ static void group_record(d2k_sched *s, const task *t, unsigned evidence,
     snprintf(o.name, sizeof o.name, "%s", t->name);
     snprintf(o.plan_id, sizeof o.plan_id, "%s", plan_id ? plan_id : "");
     if (d2k_group_key_make(&o.key, t->transport, t->family, shape,
-            t->measure_path[0] ? t->measure_path : "/", t->ech_offer ? t->ech_origin : "")) {
+            group_path(t->transport, t->measure_path), t->ech_offer ? t->ech_origin : "")) {
         say(s, "по %s контекст слишком длинный для обучения области; точный обход сохранён", t->name);
         return;
     }
