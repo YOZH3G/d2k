@@ -2009,7 +2009,7 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
                                size_t *next_addr, int residual_detected, uint16_t port,
                                const char *sni, d2k_hello trigger,
                                uint32_t wait_ms, uint32_t mark, int *all_marked,
-                               const qp_budget *start) {
+                               const qp_budget *start, int junk_asked, int frames_asked) {
     /* Ровно 16 нулей — тот же мусор, что и у оригинала (questions.go:97), и
        ровно те байты, которые потом уйдут в строке стратегии
        (blob=0x000...0): слать случайное, а рекомендовать нули значило бы
@@ -2028,9 +2028,13 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
         /* УЖЕ ОТВЕЧЕНО СТРАТЕГИЕЙ (задача 40): «мусор» — тот же вопрос, что
            остаточное разрешение, «кадры» — тот же, что разрез CRYPTO.
            Повтор исхода не изменит. Исход остаётся в свойстве и в трассе. */
-        if (*slot != D2K_PROP_UNKNOWN &&
-            (q->slot == offsetof(d2k_quic_props, junk_ahead) ||
-             q->slot == offsetof(d2k_quic_props, split_crypto))) {
+        /* Заданный стратегией вопрос не задаётся снова ни при каком исходе —
+           и при «ответа нет» после повтора (круг 1): лишний зонд исхода не
+           изменит. */
+        if ((q->slot == offsetof(d2k_quic_props, junk_ahead) &&
+             (junk_asked || *slot != D2K_PROP_UNKNOWN)) ||
+            (q->slot == offsetof(d2k_quic_props, split_crypto) &&
+             (frames_asked || *slot != D2K_PROP_UNKNOWN))) {
             if (qi < D2K_QTRACE_MAX) {
                 d2k_quic_step *st = &r->qtrace[qi];
                 snprintf(st->label, sizeof st->label, "%s (стратегия)", q->label);
@@ -2181,7 +2185,8 @@ int d2k_quic_props_findings(const d2k_quic_props *p, char *out, size_t cap) {
           "клиента; ставится ответом вопроса стратегии с этапом данных." },
         { offsetof(d2k_quic_props, split_datagrams),
           "приветствие, разложенное на две датаграммы, проходит — коробка их не собирает. "
-          "Исполнить нечем по той же причине, что и разрез на кадры: движок так не умеет." },
+          "Движок так не умеет: второму пакету нужен свой номер, а следующий номер принадлежит "
+          "клиенту — сервер отбросил бы его настоящий пакет как повтор." },
         { offsetof(d2k_quic_props, version2),
           "Initial второй версии проходит — коробка знает только первую. На живом пакете версию "
           "не переписать: она входит в связанные данные AEAD, и правка ломает рукопожатие самого "
@@ -2591,7 +2596,9 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                            clean-address control consumes the first spare IP. */
                         qp_questions_step(&r, pool, n_pool, &next_addr, residual,
                                           port, sni, trigger, dyn_wait, mark,
-                                          &all_marked, &start);
+                                          &all_marked, &start,
+                                          arm ? arm->clearance_asked : 0,
+                                          arm ? arm->split_asked : 0);
                     }
                 }
             }

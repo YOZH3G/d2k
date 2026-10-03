@@ -1067,7 +1067,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     d2k_actions acts;
     memset(&acts, 0, sizeof acts);
     if (d2k_plan_apply(use, fl, &in, &acts) != 0) {
-        out->skipped = "план неприменим к этому пакету";
+        out->skipped = acts.refuse_why ? acts.refuse_why : "план неприменим к этому пакету";
         refuse(s, now_ns, &key, out->skipped);
         d2k_actions_free(&acts);
         return;

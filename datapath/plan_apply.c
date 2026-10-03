@@ -503,8 +503,15 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
                    нетронутым, а не «почти так, как мерили». */
                 uint8_t *re = malloc(e->len);
                 size_t re_len = 0;
-                if (!re || d2k_quic_initial_split_crypto(e->bytes, e->len, re, e->len,
-                                                         &re_len) != 0 || re_len != e->len) {
+                int src = re ? d2k_quic_initial_split_crypto(e->bytes, e->len, re, e->len,
+                                                             &re_len) : -1;
+                if (src != 0 || re_len != e->len) {
+                    /* Причина — вызывающему (журнал отказов): разрез, которого
+                       не мерили, не выдаётся за применённый план. */
+                    out->refuse_why = src == D2K_QUIC_SPLIT_NO_NAME
+                        ? "разрез CRYPTO: имени нет в этой датаграмме "
+                          "(ClientHello шире датаграммы) — такой разрез не мерили"
+                        : "разрез CRYPTO неприменим: не Initial, чужой кадр или нет добивки";
                     free(re); free(pts); emit_vec_free(v, n); return -1;
                 }
                 e->owned_bytes = re;

@@ -510,6 +510,27 @@ static void test_strategy_questions_on_wire(uint16_t port) {
     seen_reset();
     t = d2k_quic_ask_arm_hook(&q, TARGET, port, 150, 0, &sent);
     CHECK(sent == 3 && t.pass == 3, "разрешение: фильтр 3/3 на привязанный ответ");
+    /* Круг 1 (M3a): и в фильтре безобидная датаграмма и Initial — одна
+       четвёрка: на каждом порту ровно одна 16-байтная датаграмма, затем наш
+       Initial; порты попыток разные. */
+    (void)nanosleep(&nap, NULL);
+    {
+        uint16_t fp[8];
+        int nfp = 0, good = 0;
+        pthread_mutex_lock(&g_mu);
+        for (int i = 0; i < g_seen_n && nfp < 8; i++) {
+            if (!g_seen_ours[i]) continue;
+            int benign_before = 0;
+            for (int j = 0; j < i; j++)
+                if (g_seen_port[j] == g_seen_port[i] && !g_seen_ours[j] &&
+                    g_seen_len[j] == D2K_QUIC_BENIGN_LEN) benign_before++;
+            if (benign_before == 1) good++;
+            fp[nfp++] = g_seen_port[i];
+        }
+        pthread_mutex_unlock(&g_mu);
+        CHECK(nfp == 3 && good == 3 && all_distinct(fp, nfp),
+              "разрешение, фильтр: на каждой свежей четвёрке одна безобидная датаграмма, затем Initial");
+    }
     seen_reset();
     d = d2k_quic_arm_data_hook(&q, TARGET, NULL, port, 100, 0);
     (void)nanosleep(&nap, NULL);

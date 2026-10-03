@@ -3,7 +3,7 @@
 #include "d2k_quic_arms.h"
 #include "d2k_quichello.h"
 #include "d2k_quic.h"
-static int calls, fails, lose_base_mark;
+static int calls, fails, lose_base_mark, junk16_asks;
 static int fragment_calls;
 static size_t first_prefix;
 static uint8_t first_arm_hello[2048];
@@ -23,6 +23,7 @@ static d2k_tally ask(const char *ip,uint16_t port,const uint8_t *pre,size_t len,
     d2k_hello msg,uint32_t wait,uint32_t mark,int n,uint32_t *rtt,int *ref,int *sent,uint8_t *ttl) {
     (void)ip;(void)port;(void)wait;(void)mark;
     if(pre && !first_prefix) first_prefix=len;
+    if(pre && len==16) junk16_asks++;
     if(pre) {
         uint8_t hello[2048]; size_t hello_len=0;
         CHECK(d2k_quic_client_hello(msg.bytes,msg.len,hello,sizeof hello,&hello_len)==0);
@@ -129,6 +130,11 @@ int main(void) {
     CHECK(fragment_calls==2 && arm.frag_kind==1 && arm.frag_survives==D2K_PROP_YES);
     CHECK(data_calls==4); /* quic5, copies 6, ttl 3, frag pos8; never the survival control */
     CHECK(strategy_calls==4 && arm.strategy==D2K_QS_LADDER); /* два вопроса, по одному повтору */
+    /* Круг 1: заданное до предела повторов не задаётся снова — ни приманкой
+       0x00…0 перебора, ни «мусором»/«кадрами» вопросника. */
+    CHECK(junk16_asks==0 && arm.clearance_asked && arm.split_asked);
+    CHECK(r.qtrace[0].sent==0 && r.qtrace[1].sent==0);
+    CHECK(r.qprops.junk_ahead==D2K_PROP_UNKNOWN && r.qprops.split_crypto==D2K_PROP_UNKNOWN);
     CHECK(arm.n_trace>=4 && arm.trace[0].answered==1 && arm.trace[3].answered==1);
     /* The scheduler's known large resource reaches the data stage. */
     calls=0;first_prefix=0;fragment_calls=0;data_calls=0;
@@ -153,8 +159,11 @@ int main(void) {
     calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='N';
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
-    CHECK(arm.kind==D2K_QA_NOT_FOUND && arm.strategy==D2K_QS_NONE && !arm.incomplete);
-    CHECK(strategy_calls==2 && data_calls==0 && fragment_calls==0 && first_prefix==0);
+    /* Круг 1: приманки не перебираются, но вопросы фрагментации задаются;
+       стенд пропускает фрагменты — план из ответа. */
+    CHECK(arm.kind==D2K_QA_FRAG && arm.strategy==D2K_QS_FRAG && arm.frag_kind==1 &&
+          arm.frag_survives==D2K_PROP_YES && !arm.incomplete);
+    CHECK(strategy_calls==2 && data_calls==1 && fragment_calls==2 && first_prefix==0);
     CHECK(r.qprops.junk_ahead==D2K_PROP_NO && r.qprops.split_crypto==D2K_PROP_NO);
     CHECK(r.qtrace[0].sent==0 && r.qtrace[1].sent==0);
     strategy_mode='U';

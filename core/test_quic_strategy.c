@@ -21,6 +21,8 @@ static int fails, calls, data_calls;
    состоялся. Строка — по символу на повтор вопроса. */
 static const char *ans_clear, *ans_split;
 static int i_clear, i_split, ladder_calls, ladder_pass, marked_ok;
+/* Круг 1: форма фрагментации, которая проходит (0 — фрагменты не доживают). */
+static int frag_ok_shape;
 static d2k_quic_arm_question seen[64];
 
 static char next_answer(const d2k_quic_arm_question *q) {
@@ -42,7 +44,9 @@ static d2k_tally probe(const d2k_quic_arm_question *q, void *u, int *sent) {
     if (!a) {
         ladder_calls++;
         *sent = 3;
-        if (ladder_pass && !q->control && !q->frag) t.pass = 3; else t.fail = 3;
+        if ((ladder_pass && !q->control && !q->frag) ||
+            (frag_ok_shape && (q->control || q->frag == frag_ok_shape))) t.pass = 3;
+        else t.fail = 3;
         return t;
     }
     if (a == 'E') { *sent = 0; t.err = t.fail = 3; return t; }
@@ -93,15 +97,27 @@ int main(void) {
     CHECK(calls == 2 && r.probes == 6 && data_calls == 1 && ladder_calls == 0);
     CHECK(seen[1].split == 1 && !seen[1].blob_len);
 
-    /* 3. Оба «нет»: обход не найден быстро, приманки не перебираются. */
+    /* 3. Оба «нет»: приманки не перебираются, но вопросы IP-фрагментации —
+          это вопросы замера, не перебор (круг 1): контроль выживания задан,
+          фрагменты не доживают — обход не найден. */
     r = run("N", "N", 0, 1);
     CHECK(r.kind == D2K_QA_NOT_FOUND && !r.incomplete && r.strategy == D2K_QS_NONE);
-    CHECK(calls == 2 && r.probes == 6 && ladder_calls == 0 && data_calls == 0);
+    CHECK(calls == 3 && r.probes == 9 && ladder_calls == 1 && data_calls == 0);
+    CHECK(seen[2].control && r.frag_survives == D2K_PROP_NO);
     CHECK(strstr(r.reason, "не найден") != NULL);
+    for (int i = 0; i < calls && i < 64; i++) CHECK(!(seen[i].blob_len && !seen[i].benign));
+
+    /* 3б. Оба «нет», фрагменты доживают и форма 3 проходит — план из ответа. */
+    frag_ok_shape = 3;
+    r = run("N", "N", 0, 1);
+    CHECK(r.kind == D2K_QA_FRAG && r.frag_kind == 3 && r.frag_survives == D2K_PROP_YES);
+    CHECK(r.strategy == D2K_QS_FRAG && r.len == 0 && !r.incomplete);
+    CHECK(calls == 2 + 1 + 3 && ladder_calls == 4 && data_calls == 1);
+    frag_ok_shape = 0;
 
     /* 4. Фильтр прошёл, а поток оборван — это решающее «нет», не повтор. */
     r = run("C", "C", 0, 1);
-    CHECK(r.kind == D2K_QA_NOT_FOUND && calls == 2 && data_calls == 2 && ladder_calls == 0);
+    CHECK(r.kind == D2K_QA_NOT_FOUND && calls == 3 && data_calls == 2 && ladder_calls == 1);
     CHECK(r.clearance == D2K_PROP_NO && r.split_crypto == D2K_PROP_NO);
 
     /* 5. Неустойчивый ответ — один повтор; решающий второй ответ принимается. */
@@ -113,10 +129,15 @@ int main(void) {
           стратегия из ответов не собирается — запасной перебор askArms. */
     r = run("MR", "N", 0, 1);
     CHECK(r.clearance == D2K_PROP_UNKNOWN && r.split_crypto == D2K_PROP_NO);
-    CHECK(ladder_calls == 14 && calls == 3 + 14);
+    /* Круг 1: вопрос, заданный до предела повторов, перебор не задаёт снова
+       (0x00…0 ×1 — тот же вопрос). */
+    CHECK(r.clearance_asked && r.split_asked);
+    CHECK(ladder_calls == 13 && calls == 3 + 13);
     CHECK(r.strategy == D2K_QS_LADDER && r.kind == D2K_QA_NOT_FOUND);
-    CHECK(r.n_trace == 3 + 14 && r.n_trace <= D2K_QUIC_ARM_STEPS);
-    CHECK(r.probes == 3 * (3 + 14));
+    CHECK(r.n_trace == 3 + 13 && r.n_trace <= D2K_QUIC_ARM_STEPS);
+    CHECK(r.probes == 3 * (3 + 13));
+    for (int i = 3; i < calls && i < 64; i++)
+        CHECK(!(seen[i].blob_len == 16 && seen[i].copies == 1 && !seen[i].ttl));
 
     /* 7. Не отправилось оба раза — тоже неизмеримо; запасной перебор находит. */
     ladder_pass = 1;
@@ -140,6 +161,7 @@ int main(void) {
     CHECK(calls == 1 && !strcmp(seen[0].addr, pool[1]));
     CHECK(r.clearance == D2K_PROP_NO && r.split_crypto == D2K_PROP_UNKNOWN);
     CHECK(r.incomplete && r.kind == D2K_QA_NOT_FOUND && ladder_calls == 0);
+    CHECK(r.clearance_asked && !r.split_asked); /* адреса не было — вопрос не задан */
 
     /* 9. Метка не подтверждена — верить нельзя. */
     marked_ok = 0;

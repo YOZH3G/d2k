@@ -19,6 +19,7 @@
 /* Task 40: the split executor is the core function the question used. */
 #include "d2k_quic.h"
 #include "../core/test_quic_vector.h"
+#include "../core/test_quic_pq.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -547,6 +548,18 @@ static void test_quicsplit(void) {
     d2k_actions b = {0};
     CHECK(d2k_plan_apply(p, NULL, &in, &b) != 0, "not an Initial: refused, original passes as is");
     d2k_actions_free(&b);
+    /* Task 40 round 1 (I1): Chrome ML-KEM ClientHello, name in datagram 2.
+       Datagram 1 is never resealed with an unmeasured cut: explicit refusal. */
+    static uint8_t d1[1500], d2[1500];
+    size_t l1 = 0, l2 = 0;
+    CHECK(d2k_test_pq_initials("example.com", d1, &l1, d2, &l2) == 0, "PQ fixture builds");
+    in.payload = d1; in.payload_len = l1;
+    d2k_actions c = {0};
+    CHECK(d2k_plan_apply(p, NULL, &in, &c) != 0 && c.n == 0,
+          "name not in the first datagram: split refused, nothing emitted");
+    CHECK(c.refuse_why && strstr(c.refuse_why, "имени нет"),
+          "refusal names its reason (name not in this datagram)");
+    d2k_actions_free(&c);
     d2k_plan_free(p);
 }
 

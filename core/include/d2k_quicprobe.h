@@ -389,7 +389,8 @@ typedef enum {
     D2K_QS_NONE = 0,   /* ответы получены, обхода нет (или подбор не шёл) */
     D2K_QS_CLEARANCE,  /* одна безобидная датаграмма перед Initial */
     D2K_QS_SPLIT,      /* разрез ClientHello на кадры CRYPTO */
-    D2K_QS_LADDER      /* ответа нет — запасной перебор askArms */
+    D2K_QS_LADDER,     /* ответа нет — запасной перебор askArms */
+    D2K_QS_FRAG        /* оба ответа «нет», IP-фрагментация (вопрос замера) прошла */
 } d2k_quic_strategy;
 
 /* ЧЕСТНЫЙ ЗАМЕР ПЛЕЧА (задача 39). Вопрос оригинала — «ответил ли сервер на
@@ -497,6 +498,11 @@ typedef struct {
        результата. */
     int8_t            clearance;
     int8_t            split_crypto;
+    /* Вопрос задан (дошёл до провода хотя бы раз) — с любым исходом.
+       Заданный до предела повторов вопрос в этом поиске второй раз не
+       задаётся ни перебором, ни вопросником (круг 1). */
+    int8_t            clearance_asked;
+    int8_t            split_asked;
     d2k_quic_strategy strategy;
 } d2k_quic_arm;
 

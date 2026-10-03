@@ -21,6 +21,7 @@
 #include "d2k_quic.h"
 #include "d2k_quichello.h"
 #include "d2k_nat.h"
+#include "../core/test_quic_pq.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -682,6 +683,41 @@ static const uint8_t plan_qsplit[] = {
     0x01, 0x03, 0x00, 0x01, 0x00,
     0x01, 0x0f, 0x00, 0x01, 0x01
 };
+
+/* Задача 40, круг 1 (I1): ClientHello размера Chrome с ML-KEM, имя во
+ * второй датаграмме. Hold собирает имя и просит replay первой датаграммы;
+ * разрез на ней невыполним честно — явный отказ в журнале, план не
+ * «применён», датаграммы уходят как есть. */
+static void test_quic_crypto_split_name_in_second(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    d2k_plan *p = NULL;
+    char err[160];
+    uint8_t d1[1500], d2[1500], pkt[1600], buf[4096];
+    size_t l1 = 0, l2 = 0;
+    d2k_result r;
+    CHECK(s && d2k_plan_load(plan_qsplit, sizeof plan_qsplit, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, 1, p) == 0 &&
+          d2k_test_pq_initials("example.com", d1, &l1, d2, &l2) == 0,
+          "split/PQ fixture");
+    if (!s || !l1) { d2k_session_free(s); return; }
+    size_t refused0 = count_plan_refused(s);
+    d2k_key key;
+    size_t n = build_udp_pkt(pkt, 51900, 443, d1, l1);
+    CHECK(d2k_session_udp_hold_begin(s, pkt, n, 1000, &key) == 1, "PQ: hold began");
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(r.udp_hold_wait && !r.applied, "PQ: datagram 1 held, no name yet");
+    n = build_udp_pkt(pkt, 51900, 443, d2, l2);
+    d2k_session_packet(s, pkt, n, 1100, buf, sizeof buf, &r);
+    CHECK(r.udp_hold_ready && !r.applied, "PQ: name assembled, replay requested");
+    d2k_session_udp_hold_replay(s, &key);
+    n = build_udp_pkt(pkt, 51900, 443, d1, l1);
+    d2k_session_packet(s, pkt, n, 1200, buf, sizeof buf, &r);
+    CHECK(!r.applied && r.n_out == 0 && r.verdict == D2K_VERDICT_ACCEPT,
+          "PQ: split not applied to datagram 1, it passes as is");
+    CHECK(count_plan_refused(s) == refused0 + 1, "PQ: refusal counted in the journal");
+    CHECK(r.skipped && strstr(r.skipped, "имени нет"), "PQ: refusal reason is explicit");
+    d2k_session_free(s);
+}
 
 static void test_quic_crypto_split_plan(void) {
     d2k_session *s = d2k_session_new(64, 32);
@@ -1555,6 +1591,7 @@ int main(void) {
     test_quic_retry_resets_assembly();
     test_quic_original_after_fakes();
     test_quic_crypto_split_plan();
+    test_quic_crypto_split_name_in_second();
     test_discord_voice();
     test_voice_trial_live_flow();
     test_nameless_initial();

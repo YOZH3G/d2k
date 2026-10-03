@@ -19,6 +19,7 @@
 #include "d2k_quic.h"
 #include "d2k_quicwire.h"
 #include "test_quic_vector.h"
+#include "test_quic_pq.h"
 
 static int fails;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s (line %d)\n", msg, __LINE__); fails++; } \
@@ -99,9 +100,15 @@ static void check_v1_vector(void) {
           f2[0].off + f2[0].len == f1[0].len, "хвост первым, голова вторым, без дыр и наложений");
     CHECK(name_in_one_frame(f1, nf1, "example.com") && !name_in_one_frame(f2, nf2, "example.com"),
           "имя целиком не лежит ни в одном кадре");
-    CHECK(pad2 + 1 + d2k_qw_varint_len(f2[0].off) + d2k_qw_varint_len(f2[0].len) +
-          d2k_qw_varint_len(f2[1].len) == pad1 + d2k_qw_varint_len(f1[0].len) ||
-          pad2 < pad1, "добивка отдала место заголовку второго кадра");
+    /* Добивка отдала РОВНО столько, сколько выросли заголовки кадров:
+       было 1 + varint(0) + varint(len); стало два таких заголовка. */
+    if (nf1 == 1 && nf2 == 2) {
+        size_t was = 1 + d2k_qw_varint_len(f1[0].off) + d2k_qw_varint_len(f1[0].len);
+        size_t now = 1 + d2k_qw_varint_len(f2[0].off) + d2k_qw_varint_len(f2[0].len) +
+                     1 + d2k_qw_varint_len(f2[1].off) + d2k_qw_varint_len(f2[1].len);
+        CHECK(ping1 == 0 && ping2 == 0 && pad2 + now == pad1 + was,
+              "добивка уменьшилась ровно на рост заголовков кадров");
+    }
 }
 
 static void check_coalesced_tail(void) {
@@ -151,33 +158,51 @@ static void check_unknown_frame(void) {
     size_t out_len = 0;
     CHECK(pl > 0 && d2k_quic_initial_split_crypto(pkt, pl, out, sizeof out, &out_len) == -1,
           "кадр, который разбор не знает, — отказ (не выбрасываем чужое)");
-    /* Без добивки места под второй кадр нет. */
-    uint8_t tight[60];
-    size_t t = 0;
-    tight[t++] = 0x06; tight[t++] = 0x00; tight[t++] = 56;
-    for (int i = 0; i < 56; i++) tight[t++] = (uint8_t)(i + 1);
+    /* Имя есть, но без добивки места под второй кадр нет. ClientHello —
+       настоящий, из вектора RFC 9001 A.2. */
+    uint8_t ch[1500], tight[1500];
+    size_t chl = 0, t = 0;
+    CHECK(d2k_quic_client_hello(d2k_test_v1_initial, sizeof d2k_test_v1_initial, ch, sizeof ch,
+                                &chl) == 0, "ClientHello вектора");
+    tight[t++] = 0x06; tight[t++] = 0x00;
+    t += d2k_qw_varint_write(tight + t, sizeof tight - t, chl);
+    memcpy(tight + t, ch, chl); t += chl;
     hl = d2k_qw_long_hdr(hdr, sizeof hdr, D2K_QW_V1, D2K_QW_LT_INITIAL, dcid, 8, NULL, 0, 2, t);
     pl = d2k_qw_seal(&k, 1, hdr, hl, 0, 2, tight, t, pkt, sizeof pkt);
     CHECK(pl > 0 && d2k_quic_initial_split_crypto(pkt, pl, out, sizeof out, &out_len) == -1,
-          "нет добивки под заголовок второго кадра — отказ, а не датаграмма длиннее");
-    /* С добивкой, без имени: режется пополам самый длинный кадр. */
+          "имя есть, добивки под заголовок второго кадра нет — отказ, а не датаграмма длиннее");
+    /* С добивкой, но без имени: резать нечего — разрез вне имени никто не
+       мерил (задача 40, круг 1, I1). Отказ «имени нет», а не догадка. */
     uint8_t roomy[200];
     memset(roomy, 0, sizeof roomy);
-    memcpy(roomy, tight, t);
-    roomy[t] = 0x01; /* PING сохраняется */
+    roomy[0] = 0x06; roomy[1] = 0x00; roomy[2] = 56; /* 56 байт без ClientHello */
+    for (int i = 0; i < 56; i++) roomy[3 + i] = (uint8_t)(i + 1);
+    roomy[59] = 0x01; /* PING */
     hl = d2k_qw_long_hdr(hdr, sizeof hdr, D2K_QW_V1, D2K_QW_LT_INITIAL, dcid, 8, NULL, 0, 2,
                          sizeof roomy);
     pl = d2k_qw_seal(&k, 1, hdr, hl, 5, 2, roomy, sizeof roomy, pkt, sizeof pkt);
-    uint8_t p2[1500];
-    size_t pl2 = 0, nf = 0, pad = 0, ping = 0;
-    uint64_t pn = 0;
-    frame fr[8];
-    d2k_qw_hdr h;
-    CHECK(pl > 0 && d2k_quic_initial_split_crypto(pkt, pl, out, sizeof out, &out_len) == 0 &&
-          out_len == pl && open_frames(out, out_len, p2, &pl2, &pn, fr, &nf, &pad, &ping, &h) == 0 &&
-          pn == 5 && nf == 2 && ping == 1 && fr[0].off == 28 && fr[0].len == 28 &&
-          fr[1].off == 0 && fr[1].len == 28 && fr[0].data[0] == 29,
-          "без имени: самый длинный кадр пополам, хвост первым, PING и номер пакета на месте");
+    CHECK(pl > 0 && d2k_quic_initial_split_crypto(pkt, pl, out, sizeof out, &out_len) ==
+          D2K_QUIC_SPLIT_NO_NAME, "без имени в датаграмме — отказ «имени нет»");
+}
+
+/* ClientHello размера Chrome с ML-KEM: две датаграммы, имя во второй. */
+static void check_name_in_second_datagram(void) {
+    uint8_t d1[1500], d2[1500], out[1500];
+    size_t l1 = 0, l2 = 0, out_len = 0;
+    CHECK(d2k_test_pq_initials("example.com", d1, &l1, d2, &l2) == 0 && l1 == 1200 && l2 == 1200,
+          "fixture: две Initial-датаграммы по 1200");
+    char name[64];
+    CHECK(d2k_quic_sni(d1, l1, name, sizeof name) != 0, "в первой датаграмме имени нет");
+    d2k_quic_assembly a;
+    d2k_quic_assembly_init(&a);
+    int r1 = d2k_quic_assembly_feed(&a, d1, l1, name, sizeof name);
+    int r2 = d2k_quic_assembly_feed(&a, d2, l2, name, sizeof name);
+    CHECK(r1 == 0 && r2 == 1 && !strcmp(name, "example.com"),
+          "fixture настоящий: имя собирается только из обеих датаграмм");
+    CHECK(d2k_quic_initial_split_crypto(d1, l1, out, sizeof out, &out_len) ==
+          D2K_QUIC_SPLIT_NO_NAME, "первая датаграмма без имени: разрез отказан");
+    CHECK(d2k_quic_initial_split_crypto(d2, l2, out, sizeof out, &out_len) != 0,
+          "вторая датаграмма (поток не с нуля): разрез не выдумывается");
 }
 
 int main(void) {
@@ -185,6 +210,7 @@ int main(void) {
     check_coalesced_tail();
     check_refusals();
     check_unknown_frame();
+    check_name_in_second_datagram();
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }
     puts("QUIC split CRYPTO: passed");
     return 0;

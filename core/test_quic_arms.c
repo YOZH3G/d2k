@@ -1059,6 +1059,15 @@ static void quic_strategy_compose_checks(void) {
           "QUIC разрешение: не одна безобидная датаграмма перед Initial");
     CHECK(d2k_plan_text_to_tlv(plan, tlv, sizeof tlv, &n, err, sizeof err) == 0,
           "QUIC разрешение: план не переводится в TLV");
+    /* Круг 1 (I2): «длина» взяла, но разрешение мерили без удлинения —
+       план ровно «одна безобидная датаграмма перед Initial». */
+    p.longer = D2K_PROP_YES;
+    CHECK(d2k_quic_compose_plan(&cl, &p, plan, sizeof plan) == 0 &&
+          !strstr(plan, "udplen") && !strstr(plan, "ipfrag") && !strstr(plan, "quicsplit") &&
+          strstr(plan, "repeats=1 gap_us=0 place=before\n") &&
+          strncmp(plan, "d2k-plan 1 9\n", 13) != 0,
+          "QUIC разрешение+длина: в план попало неизмеренное удлинение");
+    p.longer = D2K_PROP_UNKNOWN;
 
     /* Разрез CRYPTO: одна запись quicsplit, исполнитель 10, без приманок;
        «длина» с ним не склеивается — такого сочетания никто не мерил. */

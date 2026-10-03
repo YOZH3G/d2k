@@ -1607,9 +1607,12 @@ int d2k_quic_compose_plan(const d2k_quic_arm *arm, const d2k_quic_props *p,
         return arm->original && arm->len == 0 ? quic_split_plan_text(buf, cap) : -1;
     }
     const d2k_quic_arm *use = quic_arm_found(arm) ? arm : NULL;
+    /* Задача 40, круг 1: план остаточного разрешения — РОВНО одна безобидная
+       датаграмма перед Initial; «длину» вместе с ним не мерили. */
+    int clearance = use && use->strategy == D2K_QS_CLEARANCE;
     return quic_plan_text(use, use ? use->bytes : NULL, use ? use->len : 0,
                           p->junk_ahead == D2K_PROP_YES,
-                          p->longer == D2K_PROP_YES ? QUIC_UDPLEN_INCREMENT : 0u,
+                          (p->longer == D2K_PROP_YES && !clearance) ? QUIC_UDPLEN_INCREMENT : 0u,
                           buf, cap);
 }
 
