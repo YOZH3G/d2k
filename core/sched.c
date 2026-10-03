@@ -3518,7 +3518,13 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
                 memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
                 t->n_plans++;
             }
-            if (arm_found) {
+            if (arm_found && (t->arm.strategy == D2K_QS_CLEARANCE ||
+                              t->arm.strategy == D2K_QS_SPLIT)) {
+                /* Задача 40: план собран из ответа вопроса, приманки не
+                   перебирались. */
+                say(s, "по %s (QUIC) стратегия из замера за %d %s: %s",
+                    t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
+            } else if (arm_found) {
                 say(s, "по %s (QUIC) плечо подобрано за %d %s: %s",
                     t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
             } else {
@@ -3526,14 +3532,17 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
                     t->name, t->arm.incomplete ? "поиск не завершён" : "перебор исчерпан");
             }
             int fake_from_arm = arm_found && t->arm.kind != D2K_QA_FRAG;
-            if (qp->junk_ahead == D2K_PROP_YES) {
+            if (qp->junk_ahead == D2K_PROP_YES && t->arm.strategy != D2K_QS_CLEARANCE) {
                 say(s, fake_from_arm
                     ? "по %s (QUIC) «мусор перед Initial» взял, но у донора его вытесняет фальшивка плеча"
                     : "по %s (QUIC) в план: «мусор перед Initial» — 16 нулевых байт ×2 перед Initial",
                     t->name);
             }
             if (qp->longer == D2K_PROP_YES) {
-                if (t->arm.frag_kind) {
+                if (t->arm.kind == D2K_QA_SPLIT) {
+                    say(s, "по %s (QUIC) «длина» взяла, но с разрезом CRYPTO её не мерили — "
+                           "в план не входит", t->name);
+                } else if (t->arm.frag_kind) {
                     say(s, "по %s (QUIC) «длина» взяла, но у донора udplen стоит после drop "
                            "фрагментации и на провод не попадает — в план не входит", t->name);
                 } else {

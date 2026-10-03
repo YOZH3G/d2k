@@ -59,9 +59,23 @@ static d2k_tally fragment(const char *ip,uint16_t port,int shape,d2k_hello h,uin
     fragment_calls++;
     d2k_tally t={0};t.pass=n;t.marked=1;*sent=n;return t;
 }
+/* Задача 40: вопросы стратегии (остаточное разрешение, разрез CRYPTO) идут
+   раньше лестницы. 'U' — ответ не решающий (1/3 оба раза): лестница
+   askArms остаётся запасным путём, и её порядок проверяется как прежде;
+   'Y' — разрешение есть; 'N' — оба «нет». */
+static char strategy_mode='U';
+static int strategy_calls;
 static d2k_tally arm_probe(const d2k_quic_arm_question *q,const char *sni,
     uint16_t port,uint32_t wait,uint32_t mark,int *sent) {
     uint8_t initial[1500];size_t initial_len=0;
+    if(q->benign || q->split) {
+        d2k_tally t={0};t.marked=1;*sent=D2K_QUIC_REPEATS;strategy_calls++;
+        CHECK(sni && !strcmp(sni,"target.example"));
+        if(strategy_mode=='U'){t.pass=1;t.fail=D2K_QUIC_REPEATS-1;}
+        else if(strategy_mode=='Y' && q->benign) t.pass=D2K_QUIC_REPEATS;
+        else t.fail=D2K_QUIC_REPEATS;
+        return t;
+    }
     /* Fragment survival names nothing: the wire layer draws a fresh donor
        neutralName() per repeat (arms.go:204-205), never the control
        snapshot's name or the scheduler decoy. */
@@ -114,6 +128,8 @@ int main(void) {
     CHECK(arm.original && arm.len==1200 && arm.ttl==3 && arm.copies==6);
     CHECK(fragment_calls==2 && arm.frag_kind==1 && arm.frag_survives==D2K_PROP_YES);
     CHECK(data_calls==4); /* quic5, copies 6, ttl 3, frag pos8; never the survival control */
+    CHECK(strategy_calls==4 && arm.strategy==D2K_QS_LADDER); /* два вопроса, по одному повтору */
+    CHECK(arm.n_trace>=4 && arm.trace[0].answered==1 && arm.trace[3].answered==1);
     /* The scheduler's known large resource reaches the data stage. */
     calls=0;first_prefix=0;fragment_calls=0;data_calls=0;
     memset(&arm,0,sizeof arm);
@@ -122,7 +138,27 @@ int main(void) {
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
     CHECK(data_calls==4 && !strcmp(arm.probe_path,want_path));
+    /* Задача 40: остаточное разрешение есть — план из ответа, перебора нет,
+       «мусор» вопросника второй раз не задаётся. */
     want_path[0]=0; memset(&arm,0,sizeof arm);
+    calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='Y';
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(r.verdict==D2K_V_OPAQUE && arm.kind==D2K_QA_BLOB && arm.strategy==D2K_QS_CLEARANCE);
+    CHECK(arm.len==D2K_QUIC_BENIGN_LEN && arm.copies==1 && strategy_calls==1 && data_calls==1);
+    CHECK(fragment_calls==0 && first_prefix==0);
+    CHECK(r.qprops.junk_ahead==D2K_PROP_YES && r.qtrace[0].sent==0);
+    /* Оба «нет»: обход не найден, приманки не перебираются. */
+    memset(&arm,0,sizeof arm);
+    calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='N';
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(arm.kind==D2K_QA_NOT_FOUND && arm.strategy==D2K_QS_NONE && !arm.incomplete);
+    CHECK(strategy_calls==2 && data_calls==0 && fragment_calls==0 && first_prefix==0);
+    CHECK(r.qprops.junk_ahead==D2K_PROP_NO && r.qprops.split_crypto==D2K_PROP_NO);
+    CHECK(r.qtrace[0].sent==0 && r.qtrace[1].sent==0);
+    strategy_mode='U';
+    memset(&arm,0,sizeof arm);
     calls=0;first_prefix=0;lose_base_mark=1;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},99,&arm);

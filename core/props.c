@@ -46,8 +46,9 @@ static d2k_quic_arm_data original_data(const d2k_quic_arm_question *q, void *use
     return d2k_quic_arm_data_hook(q,w->target_sni,w->path,w->port,w->wait_ms,w->mark);
 }
 
-d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
-    d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark) {
+static d2k_quic_arm wire_measure(d2k_quic_arm (*run)(d2k_quic_arm_context *),
+    d2k_quic_arm_context *ctx, uint16_t port, d2k_hello trigger, d2k_hello control,
+    uint32_t wait_ms, uint32_t mark) {
     original_wire wire={.port=port,.wait_ms=wait_ms,.mark=mark,.path=ctx?ctx->path:NULL};
     if(d2k_quic_sni(trigger.bytes,trigger.len,wire.target_sni,sizeof wire.target_sni)!=0) {
         wire.target_sni[0]='\0';
@@ -67,10 +68,23 @@ d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
     d2k_quic_arm_context local=*ctx;
     local.probe=original_probe; local.user=&wire;
     local.data=original_data; local.data_user=&wire;
-    d2k_quic_arm r=d2k_quic_original_arms(&local);
+    d2k_quic_arm r=run(&local);
     if(ctx->path) snprintf(r.probe_path,sizeof r.probe_path,"%s",ctx->path);
     ctx->next=local.next; ctx->marked=local.marked;
     return r;
+}
+
+d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
+    d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark) {
+    return wire_measure(d2k_quic_original_arms,ctx,port,trigger,control,wait_ms,mark);
+}
+
+/* Задача 40: рабочий путь подбора — сначала вопросы стратегии, перебор
+   askArms только запасной (d2k_quic_strategy_arms); провод и этап данных
+   те же. */
+d2k_quic_arm d2k_quic_strategy_measure(d2k_quic_arm_context *ctx, uint16_t port,
+    d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark) {
+    return wire_measure(d2k_quic_strategy_arms,ctx,port,trigger,control,wait_ms,mark);
 }
 
 /* Legacy transport test helper. The runtime preserves original fake bytes. */

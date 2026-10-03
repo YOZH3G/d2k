@@ -11,7 +11,40 @@ typedef struct {
     const uint8_t *blob;
     size_t blob_len;
     int copies, ttl, frag, control;
+    /* Задача 40. split: 1 — ClientHello нашего Initial разрезан на два кадра
+       CRYPTO, хвост первым (d2k_quic_initial_split_crypto); blob при нём
+       пуст. benign: blob — безобидная датаграмма вопроса «остаточное
+       разрешение» (D2K_QUIC_BENIGN), а не приманка перебора. */
+    int split, benign;
 } d2k_quic_arm_question;
+
+/* БЕЗОБИДНАЯ ДАТАГРАММА ВОПРОСА «ОСТАТОЧНОЕ РАЗРЕШЕНИЕ» (задача 40).
+ *
+ * Heitmann et al., FOCI 2026: для части имён (discord.com, *.googlevideo.com,
+ * play.google.com …) коробка не трогает Initial, если по той же четвёрке
+ * раньше ушли незапрещённые данные. Вопрос: одна такая датаграмма, затем наш
+ * Initial на той же свежей четвёрке.
+ *
+ * Форма — 16 нулевых байт, и выбрана она по трём причинам:
+ *   - коробке её не разобрать как Initial: первый байт 0x00 — короткий
+ *     заголовок с погашенным фиксированным битом, 16 байт меньше любого
+ *     Initial (RFC 9000 §14.1: не меньше 1200);
+ *   - серверу отвечать на неё нечем: пакет с нулевым фиксированным битом
+ *     отбрасывается (RFC 9000 §17.3.1), а для сброса без состояния он мал
+ *     (§10.3) — ответ на сокете вопроса остаётся только ответом на наш
+ *     Initial; случайные байты с первым 0xC0.. выглядели бы длинным
+ *     заголовком чужой версии и могли бы вызвать Version Negotiation;
+ *   - это те же байты, что «мусор» оригинала (questions.go:97) и приманка
+ *     0x00…0 askArms, и датапат их уже исполняет (fake place=before): что
+ *     мерили, то и ставится, без новой грамматики плана.
+ * Копия одна: вопрос ровно про «первой ушла безобидная датаграмма». */
+#define D2K_QUIC_BENIGN_LEN 16
+extern const uint8_t d2k_quic_benign[D2K_QUIC_BENIGN_LEN];
+
+/* Сколько опросов могут стоить два вопроса стратегии: каждый — до одного
+   повтора, пока исход не решающий (правило задачи 35). Бюджет Run выводится
+   и из этого числа. */
+#define D2K_QUIC_STRATEGY_ASKS_MAX 4u
 typedef d2k_tally (*d2k_quic_arm_probe_fn)(const d2k_quic_arm_question *, void *, int *);
 
 /* Порог и вердикты этапа данных — d2k_quicprobe.h (D2K_QUIC_ARM_DATA_BYTES). */
@@ -53,6 +86,10 @@ typedef struct {
     void (*spent)(void *limit_user, uint32_t ms);
     /* Путь запроса этапа данных (d2k_quic_arm.probe_path); NULL — «/». */
     const char *path;
+    /* Задача 40: на вопрос «остаточное разрешение» уже получен решающий
+       ответ «нет» — запасной перебор не задаёт его второй раз под видом
+       приманки 0x00…0 ×1 (тот же вопрос, исход известен). */
+    int benign_answered;
 } d2k_quic_arm_context;
 
 /* Runtime transport for one original askArms question. It receives the SNI
@@ -66,6 +103,29 @@ typedef d2k_tally (*d2k_quic_ask_arm_fn)(const d2k_quic_arm_question *,
 extern d2k_quic_ask_arm_fn d2k_quic_ask_arm_hook;
 
 d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *ctx);
+
+/* СТРАТЕГИЯ ИЗ ОТВЕТОВ (задача 40) — рабочий путь подбора QUIC.
+ *
+ * Два вопроса, каждый — фильтр (ответ сервера, привязанный к нашему Initial,
+ * 3/3) и этап данных (d2k_quic_arm_data_judge), на свежей четвёрке, по тому
+ * же правилу адресов, что у askArms:
+ *   1. остаточное разрешение: D2K_QUIC_BENIGN первой, затем Initial.
+ *      Да → kind D2K_QA_BLOB, байты D2K_QUIC_BENIGN, copies 1,
+ *      strategy D2K_QS_CLEARANCE; дальше ничего не спрашивается.
+ *   2. разрез ClientHello на два кадра CRYPTO. Да → kind D2K_QA_SPLIT,
+ *      strategy D2K_QS_SPLIT.
+ * Оба решающих «нет» → D2K_QA_NOT_FOUND, «обход по QUIC не найден»: приманки
+ * не перебираются (браузер уйдёт на TCP). Решающий исход — 3/3 с итогом
+ * этапа данных либо 0/3; иначе (1–2 из 3, не отправилось, этап данных не
+ * состоялся) вопрос повторяется ОДИН раз. Остался без решающего ответа хотя
+ * бы один вопрос — запасной путь: d2k_quic_original_arms (strategy
+ * D2K_QS_LADDER), его трасса дописывается следом. clearance/split_crypto
+ * несут ответы (D2K_PROP_*). Метка не подтверждена — D2K_QA_FLAKY. */
+d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *ctx);
+/* Рабочий адаптер стратегии (props.c): те же провод и этап данных, что у
+ * d2k_quic_original_measure; запасной перебор — его же лестница. */
+d2k_quic_arm d2k_quic_strategy_measure(d2k_quic_arm_context *ctx, uint16_t port,
+    d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark);
 /* Immutable instrument data; NULL is not replaced with a similar packet. */
 const uint8_t *d2k_quic_original_blob(size_t index, size_t *len, const char **name);
 d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,

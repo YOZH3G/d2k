@@ -16,11 +16,74 @@ const uint8_t *d2k_quic_original_blob(size_t index, size_t *len, const char **na
     *len=sizes[index]; if(name) *name=names[index]; return bytes[index];
 }
 
+const uint8_t d2k_quic_benign[D2K_QUIC_BENIGN_LEN] = {0};
+
+/* Исход одного опроса: 1 прошло (фильтр 3/3 и этап данных), 0 не прошло.
+   *measured — смысл askArms: все попытки ушли, и этап данных (если был)
+   состоялся. *retry (может быть NULL) — исход НЕ решающий и спросить ещё
+   раз есть на чём: не отправилось, повторы разошлись (1–2 из 3) или этап
+   данных не состоялся. Решающий исход — measured без retry. */
+static int ask_q(d2k_quic_arm_context *c, d2k_quic_arm *r, d2k_quic_arm_question *q,
+                 const char *label, int *measured, int *retry) {
+    *measured=0;
+    if(retry) *retry=0;
+    q->label=label;
+    if(r->n_trace>=D2K_QUIC_ARM_STEPS) { r->incomplete=1; return 0; }
+    d2k_quic_arm_step *step=&r->trace[r->n_trace++];
+    snprintf(step->label,sizeof step->label,"%s",label);
+    if(c && c->can_ask && !c->can_ask(c->limit_user)) {
+        r->incomplete=1; step->not_measured=2; return 0;
+    }
+    if(!c || !c->probe || !c->pool || !c->n_pool || (c->residual && c->next>=c->n_pool)) {
+        r->incomplete=1; step->not_measured=1; return 0;
+    }
+    q->addr=c->pool[c->residual ? c->next++ : 0];
+    snprintf(step->addr,sizeof step->addr,"%s",q->addr);
+    int sent=0;
+    d2k_tally t=c->probe(q,c->user,&sent);
+    step->sent=sent; step->answered=t.pass;
+    if(sent>0) r->probes+=sent;
+    if(!t.marked) c->marked=0;
+    /* Unsent/local failures are not negative network observations. An
+       ECONNREFUSED refusal (probe.go:643/663) is not err (quic_ask_ex counts
+       it as fail): donor measure probe.go:573-574 keeps Refused out of
+       NotBuilt, so askArms.ask
+       (arms.go:69-94) treats the question as asked and not passed. */
+    if(sent!=D2K_QUIC_REPEATS || t.err>0) {
+        r->incomplete=1; step->not_measured=3; if(retry) *retry=1; return 0;
+    }
+    *measured=1;
+    if(t.pass!=D2K_QUIC_REPEATS) {
+        /* 0/3 — решающее «нет»; 1–2 из 3 — повторы разошлись. */
+        if(t.pass>0 && retry) *retry=1;
+        return 0;
+    }
+    /* Fragment survival is a reachability control on a neutral name, not an
+       arm; its answer is the original question. */
+    if(q->control || !c->data) return 1;
+    /* Task 39: the cheap filter passed; the arm counts only if real
+       application data flows after a handshake with the same action. */
+    struct timespec t0,t1;
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    d2k_quic_arm_data d=c->data(q,c->data_user);
+    clock_gettime(CLOCK_MONOTONIC,&t1);
+    if(c->spent) {
+        int64_t ms=(int64_t)(t1.tv_sec-t0.tv_sec)*1000+(t1.tv_nsec-t0.tv_nsec)/1000000L;
+        c->spent(c->limit_user,ms>0?(uint32_t)ms:0u);
+    }
+    step->data=(int)d.verdict; step->data_bytes=d.app_bytes;
+    snprintf(step->data_note,sizeof step->data_note,"%s",d.note);
+    if(d.verdict==D2K_QAD_PASS) return 1;
+    if(d.verdict==D2K_QAD_NOT_RUN) {
+        r->incomplete=1; step->not_measured=3; *measured=0; if(retry) *retry=1;
+    }
+    return 0;
+}
+
 /* Direct port of askArms.ask + addrPool.take. Never demand a second IP when
  * the already measured residual policy says to remain on the pinned address. */
 static int ask(d2k_quic_arm_context *c, d2k_quic_arm *r, int blob, int copies,
                int ttl, int frag, int control, int *measured) {
-    *measured=0;
     d2k_quic_arm_question q={0};
     q.copies=copies; q.ttl=ttl; q.frag=frag; q.control=control;
     const char *name="";
@@ -33,55 +96,19 @@ static int ask(d2k_quic_arm_context *c, d2k_quic_arm *r, int blob, int copies,
     else if(ttl) snprintf(label,sizeof label,"фальшивка %s с TTL %d",name,ttl);
     else if(copies>1) snprintf(label,sizeof label,"фальшивка %s ×%d",name,copies);
     else snprintf(label,sizeof label,"фальшивка %s",name);
-    q.label=label;
-    d2k_quic_arm_step *step=&r->trace[r->n_trace++]; /* max 18 questions */
-    snprintf(step->label,sizeof step->label,"%s",label);
-    if(c && c->can_ask && !c->can_ask(c->limit_user)) {
-        r->incomplete=1; step->not_measured=2; return 0;
-    }
-    if(!c || !c->probe || !c->pool || !c->n_pool || (c->residual && c->next>=c->n_pool)) {
-        r->incomplete=1; step->not_measured=1; return 0;
-    }
-    q.addr=c->pool[c->residual ? c->next++ : 0];
-    snprintf(step->addr,sizeof step->addr,"%s",q.addr);
-    int sent=0;
-    d2k_tally t=c->probe(&q,c->user,&sent);
-    step->sent=sent; step->answered=t.pass;
-    if(sent>0) r->probes+=sent;
-    if(!t.marked) c->marked=0;
-    /* Unsent/local failures are not negative network observations. An
-       ECONNREFUSED refusal (probe.go:643/663) is not err (quic_ask_ex counts
-       it as fail): donor measure probe.go:573-574 keeps Refused out of
-       NotBuilt, so askArms.ask
-       (arms.go:69-94) treats the question as asked and not passed. */
-    if(sent!=D2K_QUIC_REPEATS || t.err>0) { r->incomplete=1; step->not_measured=3; return 0; }
-    *measured=1;
-    if(t.pass!=D2K_QUIC_REPEATS) return 0;
-    /* Fragment survival is a reachability control on a neutral name, not an
-       arm; its answer is the original question. */
-    if(control || !c->data) return 1;
-    /* Task 39: the cheap filter passed; the arm counts only if real
-       application data flows after a handshake with the same action. */
-    struct timespec t0,t1;
-    clock_gettime(CLOCK_MONOTONIC,&t0);
-    d2k_quic_arm_data d=c->data(&q,c->data_user);
-    clock_gettime(CLOCK_MONOTONIC,&t1);
-    if(c->spent) {
-        int64_t ms=(int64_t)(t1.tv_sec-t0.tv_sec)*1000+(t1.tv_nsec-t0.tv_nsec)/1000000L;
-        c->spent(c->limit_user,ms>0?(uint32_t)ms:0u);
-    }
-    step->data=(int)d.verdict; step->data_bytes=d.app_bytes;
-    snprintf(step->data_note,sizeof step->data_note,"%s",d.note);
-    if(d.verdict==D2K_QAD_PASS) return 1;
-    if(d.verdict==D2K_QAD_NOT_RUN) { r->incomplete=1; step->not_measured=3; *measured=0; }
-    return 0;
+    return ask_q(c,r,&q,label,measured,NULL);
 }
 
 d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
     d2k_quic_arm r; memset(&r,0,sizeof r); r.kind=D2K_QA_NOT_FOUND; r.original=1;
     int chosen=-1, measured=0;
     /* 1. All original intrinsic fakes, in original order. */
-    for(int b=0;b<5;b++) if(ask(c,&r,b,1,0,0,0,&measured)) { chosen=b; break; }
+    for(int b=0;b<5;b++) {
+        /* 0x00…0 ×1 — ровно вопрос «остаточное разрешение»; на него уже есть
+           решающее «нет» (задача 40), второй раз он исхода не изменит. */
+        if(b==4 && c && c->benign_answered) continue;
+        if(ask(c,&r,b,1,0,0,0,&measured)) { chosen=b; break; }
+    }
     /* 2. Either the successful fake, or quic5 then fake_default_quic. */
     int candidates[2]={chosen>=0?chosen:0,3};
     int nc=chosen>=0?1:2;
@@ -118,5 +145,95 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
     snprintf(r.reason,sizeof r.reason,"original askArms: %s copies=%d ttl=%d frag=%d%s",
              chosen>=0?r.blob_name:"no fake",r.copies,r.ttl,r.frag_kind,
              r.incomplete?"; incomplete questions":"");
+    return r;
+}
+
+/* ---------------------------------------------------------------------
+ * СТРАТЕГИЯ ИЗ ОТВЕТОВ (задача 40) — см. d2k_quic_arms.h.
+ * --------------------------------------------------------------------- */
+
+/* Один вопрос стратегии: до одного повтора, пока исход не решающий.
+   Возвращает D2K_PROP_YES/NO или UNKNOWN (ответа нет). */
+static int8_t strategy_ask(d2k_quic_arm_context *c, d2k_quic_arm *r,
+                           const d2k_quic_arm_question *shape, const char *label) {
+    for(int attempt=0;attempt<2;attempt++) {
+        d2k_quic_arm_question q=*shape;
+        int measured=0, retry=0;
+        int ok=ask_q(c,r,&q,label,&measured,&retry);
+        if(ok) return D2K_PROP_YES;
+        if(measured && !retry) return D2K_PROP_NO;
+        if(!retry) break; /* адрес или бюджет кончились — повтор не на чем */
+    }
+    return D2K_PROP_UNKNOWN;
+}
+
+static const char *prop_word(int8_t v) {
+    return v==D2K_PROP_YES ? "прошло" : v==D2K_PROP_NO ? "не прошло" : "ответа нет";
+}
+
+d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
+    d2k_quic_arm r; memset(&r,0,sizeof r);
+    r.kind=D2K_QA_NOT_FOUND; r.original=1; r.strategy=D2K_QS_NONE;
+    r.clearance=D2K_PROP_UNKNOWN; r.split_crypto=D2K_PROP_UNKNOWN;
+
+    d2k_quic_arm_question benign={0};
+    benign.blob=d2k_quic_benign; benign.blob_len=D2K_QUIC_BENIGN_LEN;
+    benign.copies=1; benign.benign=1;
+    r.clearance=strategy_ask(c,&r,&benign,
+        "остаточное разрешение: безобидная датаграмма первой, затем Initial");
+    if(r.clearance==D2K_PROP_YES) {
+        memcpy(r.bytes,d2k_quic_benign,D2K_QUIC_BENIGN_LEN);
+        r.len=D2K_QUIC_BENIGN_LEN;
+        snprintf(r.blob_name,sizeof r.blob_name,"benign16");
+        r.copies=1; r.kind=D2K_QA_BLOB; r.strategy=D2K_QS_CLEARANCE;
+        r.incomplete=0; /* решающий ответ получен: прежний неустойчивый опрос — не пробел */
+        snprintf(r.reason,sizeof r.reason,
+                 "остаточное разрешение: одна безобидная датаграмма (%u нулевых байт) перед Initial",
+                 (unsigned)D2K_QUIC_BENIGN_LEN);
+    } else {
+        d2k_quic_arm_question split={0};
+        split.split=1;
+        r.split_crypto=strategy_ask(c,&r,&split,"ClientHello двумя кадрами CRYPTO, хвост первым");
+        if(r.split_crypto==D2K_PROP_YES) {
+            r.kind=D2K_QA_SPLIT; r.strategy=D2K_QS_SPLIT; r.incomplete=0;
+            snprintf(r.reason,sizeof r.reason,
+                     "разрез ClientHello на два кадра CRYPTO проходит (остаточное разрешение: %s)",
+                     prop_word(r.clearance));
+        } else if(r.clearance==D2K_PROP_NO && r.split_crypto==D2K_PROP_NO) {
+            r.incomplete=0;
+            snprintf(r.reason,sizeof r.reason,
+                     "обход по QUIC не найден: безобидная датаграмма первой и разрез CRYPTO "
+                     "не прошли — приманки не перебираются, браузер уйдёт на TCP");
+        } else {
+            /* Неизмеримо: запасной путь — перебор приманок оригинала. */
+            int strategy_incomplete=r.incomplete;
+            d2k_quic_arm_context local=*c;
+            local.benign_answered=(r.clearance==D2K_PROP_NO);
+            d2k_quic_arm l=d2k_quic_original_arms(&local);
+            c->next=local.next; c->marked=local.marked;
+            size_t head=r.n_trace;
+            int probes=r.probes;
+            int8_t cl=r.clearance, sp=r.split_crypto;
+            d2k_quic_arm_step steps[D2K_QUIC_ARM_STEPS];
+            memcpy(steps,r.trace,head*sizeof steps[0]);
+            r=l;
+            size_t room=D2K_QUIC_ARM_STEPS-head;
+            size_t take=l.n_trace<room?l.n_trace:room;
+            memmove(r.trace+head,l.trace,take*sizeof r.trace[0]);
+            memcpy(r.trace,steps,head*sizeof steps[0]);
+            r.n_trace=head+take;
+            r.probes+=probes;
+            r.clearance=cl; r.split_crypto=sp;
+            r.strategy=D2K_QS_LADDER;
+            r.incomplete=r.incomplete||strategy_incomplete||take<l.n_trace;
+            /* Причина перебора — его собственная строка, урезанная так,
+               чтобы вместе с заголовком влезть в r.reason. */
+            snprintf(r.reason,sizeof r.reason,
+                     "ответа нет (разрешение: %s, разрез CRYPTO: %s) — запасной перебор: %.90s",
+                     prop_word(cl),prop_word(sp),l.reason);
+            return r;
+        }
+    }
+    if(c && !c->marked) r.kind=D2K_QA_FLAKY;
     return r;
 }

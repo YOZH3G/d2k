@@ -78,6 +78,13 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
                 fail(err, errlen, "udplen требует minexec=9 и ненулевого прироста"); return -1;
             }
             break;
+        case REC_QSPLIT:
+            /* minexec=10: старый исполнитель записи не знает и выпустил бы
+               Initial целым — то есть не то, что мерили. Форма одна. */
+            if (rd16(b + 6) < 10 || ln != 1 || b[off] != 1) {
+                fail(err, errlen, "quicsplit требует minexec=10 и форму 1"); return -1;
+            }
+            break;
         case REC_OOB:
             if (rd16(b + 6) < 8 || ln != 3 || rd16(b + off) > ANCHOR_SNI_MIDDLE) {
                 fail(err, errlen, "oob требует minexec=8, якорь и один байт"); return -1;
@@ -204,6 +211,14 @@ static int check_refs(const d2k_plan *p, char *err, size_t errlen) {
         p->order || p->input_len || p->input_tls || p->settle_us ||
         p->segment_size || p->wire_profile || p->guards || p->oob_enabled)) {
         fail(err, errlen, "udplen требует UDP без фрагментации, разрезов и TCP-операций");
+        return -1;
+    }
+    /* Разрез CRYPTO — отдельное измеренное действие: с фрагментами и
+       удлинением его не мерили, а TCP-операций у датаграммы нет. */
+    if (p->qsplit && (p->transport != 17 || p->ipfrag || p->udplen || p->n_splits ||
+        p->n_seqovls || p->order || p->input_len || p->input_tls || p->settle_us ||
+        p->segment_size || p->wire_profile || p->guards || p->oob_enabled)) {
+        fail(err, errlen, "quicsplit требует UDP без фрагментации, удлинения и TCP-операций");
         return -1;
     }
     if (p->oob_enabled && (p->minexec < 8 || p->transport != 6 || p->proto != 1 ||
@@ -365,6 +380,12 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
                 d2k_plan_free(p); fail(err, errlen, "повторная запись udplen"); return -1;
             }
             p->udplen = rd16(v);
+            break;
+        case REC_QSPLIT:
+            if (p->qsplit) {
+                d2k_plan_free(p); fail(err, errlen, "повторная запись quicsplit"); return -1;
+            }
+            p->qsplit = v[0];
             break;
         case REC_OOB:
             p->oob_enabled = 1;

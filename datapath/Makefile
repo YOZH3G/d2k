@@ -178,8 +178,8 @@ test_ctl: test_ctl.c ctl.o ctlsrv.o session.o hold.o capture.o nat.o journal.o t
 	    track.o tls.o wire.o wire_udp.o plans.o plan_parse.o plan_apply.o \
 	    $(COREOBJ) $(LDFLAGS)
 
-test_plans: test_plans.c plans.o plan_parse.o plan_apply.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_plans.c plans.o plan_parse.o plan_apply.o $(LDFLAGS)
+test_plans: test_plans.c plans.o plan_parse.o plan_apply.o $(COREOBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_plans.c plans.o plan_parse.o plan_apply.o $(COREOBJ) $(LDFLAGS)
 
 test_journal: test_journal.c journal.o track.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_journal.c journal.o track.o $(LDFLAGS)
@@ -241,11 +241,11 @@ test_wire: test_wire.c wire.o $(HDR)
 test_wire_udp: test_wire_udp.c wire_udp.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_wire_udp.c wire_udp.o $(LDFLAGS)
 
-test_plan_apply: test_plan_apply.c plan_parse.o plan_apply.o wire_udp.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_plan_apply.c plan_parse.o plan_apply.o wire_udp.o $(LDFLAGS)
+test_plan_apply: test_plan_apply.c plan_parse.o plan_apply.o wire_udp.o $(COREOBJ) $(HDR) $(CORE_DIR)/test_quic_vector.h
+	$(CC) $(CFLAGS) -o $@ test_plan_apply.c plan_parse.o plan_apply.o wire_udp.o $(COREOBJ) $(LDFLAGS)
 
-planlab: planlab.c plan_parse.o plan_apply.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ planlab.c plan_parse.o plan_apply.o $(LDFLAGS)
+planlab: planlab.c plan_parse.o plan_apply.o $(COREOBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ planlab.c plan_parse.o plan_apply.o $(COREOBJ) $(LDFLAGS)
 
 # Стенд управляющего сокета: тот же разбор команд и та же сессия, что в d2kd,
 # но пакеты собираются на месте. Нужен, чтобы Go-клиент проверялся против
@@ -320,7 +320,7 @@ san:
 		/tmp/d2k-san-$$t; \
 	done
 	@echo "== planlab =="
-	@$(CC) $(SANFLAGS) -o /tmp/d2k-san-planlab planlab.c plan_parse.c plan_apply.c
+	@$(CC) $(SANFLAGS) -o /tmp/d2k-san-planlab planlab.c plan_parse.c plan_apply.c $(CORESRC)
 	@/tmp/d2k-san-planlab testdata/fake_before.tlv testdata/one_hello.txt >/dev/null
 	@echo "санитайзеры: все проверки прошли"
 
@@ -356,8 +356,8 @@ cross:
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2kd-mipsel $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) || exit 1
 	@echo "== planlab целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/planlab-a64 \
-		planlab.c plan_parse.c plan_apply.c || exit 1
-	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/planlab-mipsel planlab.c plan_parse.c plan_apply.c || exit 1
+		planlab.c plan_parse.c plan_apply.c $(CORESRC) || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/planlab-mipsel planlab.c plan_parse.c plan_apply.c $(CORESRC) || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, служба линкуется"
 
 # Служба ДЛЯ ЭТОЙ ЖЕ МАШИНЫ. Не удобство, а проверка: лаборатория установки

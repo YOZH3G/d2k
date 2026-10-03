@@ -49,6 +49,7 @@ static uint16_t g_seen_port[MAX_SEEN];
 static size_t g_seen_token[MAX_SEEN]; /* длина токена Initial (после Retry) */
 static size_t g_seen_len[MAX_SEEN];
 static int g_seen_ours[MAX_SEEN];
+static int g_seen_split[MAX_SEEN]; /* первый кадр CRYPTO с ненулевым смещением */
 static volatile int g_seen_n;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -70,6 +71,27 @@ static size_t server_initial(const uint8_t *key_dcid, size_t key_len,
     return d2k_qw_seal(&k, 1, hdr, hl, 0, 1, body, sizeof body, out, cap);
 }
 
+/* Смещение первого кадра CRYPTO в клиентском Initial (-1 — не Initial или
+   не раскрылся). Хвост первым — признак разреза задачи 40. */
+static long first_crypto_off(const uint8_t *p, size_t n) {
+    d2k_qw_hdr h;
+    if (d2k_qw_hdr_parse(p, n, 0, &h) != 0 || !h.long_hdr || h.type != D2K_QW_LT_INITIAL) return -1;
+    uint8_t sec[32], plain[2048];
+    d2k_qw_keys k;
+    size_t pl = 0;
+    uint64_t pn = 0;
+    if (d2k_qw_initial_secret(h.version, p + h.dcid_off, h.dcid_len, D2K_QW_CLIENT, sec) != 0 ||
+        d2k_qw_keys_from_secret(h.version, sec, &k) != 0 ||
+        h.packet_len > sizeof plain || d2k_qw_open(&k, &h, p, 0, plain, &pl, &pn) != 0) return -1;
+    size_t i = 0;
+    while (i < pl && (plain[i] == 0x00 || plain[i] == 0x01)) i++;
+    if (i >= pl || plain[i] != 0x06) return -1;
+    uint64_t off = 0;
+    size_t w = 0;
+    if (d2k_qw_varint_read(plain + i + 1, pl - i - 1, &off, &w) != 0) return -1;
+    return (long)off;
+}
+
 static void *stand_run(void *arg) {
     (void)arg;
     for (;;) {
@@ -86,6 +108,7 @@ static void *stand_run(void *arg) {
             g_seen_len[g_seen_n] = (size_t)n;
             g_seen_ours[g_seen_n] = ours;
             g_seen_token[g_seen_n] = 0;
+            g_seen_split[g_seen_n] = first_crypto_off(buf, (size_t)n) > 0;
             {
                 d2k_qw_hdr th;
                 if (d2k_qw_hdr_parse(buf, (size_t)n, 0, &th) == 0 && th.long_hdr &&
@@ -443,6 +466,67 @@ static void test_data_stage_follows_retry(uint16_t port) {
           "трасса этапа: каким приветствием и по какому пути");
 }
 
+#ifndef HEAD_API
+/* --- задача 40: вопросы стратегии на проводе ----------------------------- */
+
+static void test_strategy_questions_on_wire(uint16_t port) {
+    g_mode = M_BOUND;
+    /* Разрез CRYPTO: три свежих Initial, у каждого хвост первым, сервер
+       собирает имя и отвечает на НАШ Initial. */
+    seen_reset();
+    d2k_quic_arm_question q;
+    memset(&q, 0, sizeof q);
+    q.label = "разрез CRYPTO"; q.addr = "127.0.0.1"; q.split = 1;
+    int sent = 0;
+    d2k_tally t = d2k_quic_ask_arm_hook(&q, TARGET, port, 150, 0, &sent);
+    struct timespec nap = {0, 50000000L};
+    (void)nanosleep(&nap, NULL);
+    int ours = 0, split = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_seen_n; i++) { ours += g_seen_ours[i]; split += g_seen_ours[i] && g_seen_split[i]; }
+    pthread_mutex_unlock(&g_mu);
+    CHECK(sent == 3 && t.pass == 3, "разрез CRYPTO: сервер собирает имя и отвечает 3/3");
+    CHECK(ours == 3 && split == 3, "разрез CRYPTO: каждый Initial фильтра — хвостом первым");
+
+    /* Этап данных разреза: первый Initial соединения разрезан, тем же
+       кодом, что у датапата. */
+    seen_reset();
+    d2k_quic_arm_data d = d2k_quic_arm_data_hook(&q, TARGET, NULL, port, 100, 0);
+    (void)nanosleep(&nap, NULL);
+    int first_split = -1;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_seen_n; i++) {
+        if (g_seen_port[i] == d.local_port && g_seen_ours[i]) { first_split = g_seen_split[i]; break; }
+    }
+    pthread_mutex_unlock(&g_mu);
+    CHECK(d.local_port && first_split == 1, "этап данных: первый Initial соединения разрезан");
+    CHECK(d.verdict == D2K_QAD_NO_HANDSHAKE, "этап данных разреза: стенд без рукопожатия — не прошло");
+
+    /* Остаточное разрешение: ровно одна безобидная датаграмма, затем Initial
+       на той же четвёрке — и в фильтре, и на этапе данных. */
+    memset(&q, 0, sizeof q);
+    q.label = "разрешение"; q.addr = "127.0.0.1"; q.benign = 1;
+    q.blob = d2k_quic_benign; q.blob_len = D2K_QUIC_BENIGN_LEN; q.copies = 1;
+    seen_reset();
+    t = d2k_quic_ask_arm_hook(&q, TARGET, port, 150, 0, &sent);
+    CHECK(sent == 3 && t.pass == 3, "разрешение: фильтр 3/3 на привязанный ответ");
+    seen_reset();
+    d = d2k_quic_arm_data_hook(&q, TARGET, NULL, port, 100, 0);
+    (void)nanosleep(&nap, NULL);
+    int before = 0, at = -1;
+    size_t blen = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_seen_n; i++) {
+        if (g_seen_port[i] != d.local_port) continue;
+        if (g_seen_ours[i]) { at = before; break; }
+        before++; blen = g_seen_len[i];
+    }
+    pthread_mutex_unlock(&g_mu);
+    CHECK(d.local_port && at == 1 && before == 1 && blen == D2K_QUIC_BENIGN_LEN,
+          "разрешение: одна безобидная датаграмма 16 байт, затем Initial той же четвёрки");
+}
+#endif
+
 int main(void) {
     int old_local = d2k_quic_allow_local;
     d2k_quic_allow_local = 1;
@@ -455,6 +539,7 @@ int main(void) {
     test_ladder_with_data_stage();
     test_fresh_ports(port);
     test_data_stage_follows_retry(port);
+    test_strategy_questions_on_wire(port);
 #endif
     d2k_quic_allow_local = old_local;
     if (fails) { printf("test_quic_arm_data: %d FAIL\n", fails); return 1; }

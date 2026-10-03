@@ -34,7 +34,10 @@
  * Version 8 adds per-fake TLS random/session-ID runtime modifiers. */
 /* Version 9 adds REC_UDPLEN: the whole UDP payload is re-emitted with N
  * appended zero bytes (zapret udplen increment=N, donor QUIC compose). */
-#define D2K_EXEC_VERSION 9
+/* Version 10 adds REC_QSPLIT: the client's Initial is re-sealed with the
+ * ClientHello split into two CRYPTO frames, tail first, same length and
+ * packet number (core d2k_quic_initial_split_crypto, task 40). */
+#define D2K_EXEC_VERSION 10
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_WIRE_TCP_TEMPLATE 2
 #define D2K_SCHEMA_MAX   1

@@ -935,19 +935,20 @@ int main(int argc, char **argv) {
                       strcmp(argv[1], "--ipv6-fragments") == 0)) return fails ? 1 : 0;
 
     /* --- БЮДЖЕТ ПОКРЫВАЕТ ХУДШИЙ ПУТЬ RUN. Худший путь: база на
-     * d2k_quic_wait_ms (3 с донора), затем 27 опросов по dyn_wait = 3×RTT в
-     * [1,5; 6] с: прямой зонд, повторный контроль, 18 вопросов askArms
+     * d2k_quic_wait_ms (3 с донора), затем 31 опрос по dyn_wait = 3×RTT в
+     * [1,5; 6] с: прямой зонд, повторный контроль, до 4 опросов стратегии
+     * (задача 40: два вопроса с одним повтором), 18 вопросов askArms
      * (5 фальшивок + 2×2 копии + 4 TTL + выживаемость + 4 формы фрагментов),
      * 7 вопросов questions.go. Прежние (1+2+20+3)×3000 мс = 78 с обрывали его
      * уже при RTT 1 с (3 + 27×3 = 84 с). */
     {
         uint32_t saved_wait = d2k_quic_wait_ms;
         d2k_quic_wait_ms = D2K_QUIC_WAIT_MS_DEFAULT;
-        CHECK(d2k_quic_budget_ms(1000) >= 3000u + 27u * 3000u,
-              "бюджет при RTT 1 с меньше худшего пути 3000 + 27×3000 мс");
-        CHECK(d2k_quic_budget_ms(10000) >= 3000u + 27u * D2K_QUIC_RTT_WAIT_CEIL_MS,
+        CHECK(d2k_quic_budget_ms(1000) >= 3000u + 31u * 3000u,
+              "бюджет при RTT 1 с меньше худшего пути 3000 + 31×3000 мс");
+        CHECK(d2k_quic_budget_ms(10000) >= 3000u + 31u * D2K_QUIC_RTT_WAIT_CEIL_MS,
               "бюджет при потолке ожидания меньше худшего пути");
-        CHECK(d2k_quic_budget_ms(0) >= 3000u + 27u * D2K_QUIC_RTT_WAIT_FLOOR_MS,
+        CHECK(d2k_quic_budget_ms(0) >= 3000u + 31u * D2K_QUIC_RTT_WAIT_FLOOR_MS,
               "бюджет при полу ожидания меньше худшего пути");
         uint32_t saved_budget = d2k_quic_budget_s;
         d2k_quic_budget_s = 2;
@@ -1362,8 +1363,18 @@ int main(int argc, char **argv) {
         CHECK(d2k_quic_props_findings(&p, out, sizeof out) == 1 &&
               strstr(out, "кадра CRYPTO") != NULL,
               "взявший приём обязан быть назван человеку");
-        CHECK(strstr(out, "не умеет") != NULL,
-              "находку нельзя выдавать за готовый обход: движок её не исполняет");
+        /* Задача 40: разрез CRYPTO движок теперь исполняет (quicsplit) —
+           находка обязана сказать это, а не «не умеет». */
+        CHECK(strstr(out, "quicsplit") != NULL && strstr(out, "не умеет") == NULL,
+              "исполнимый разрез CRYPTO назван исполнимым");
+        p.split_crypto = D2K_PROP_UNKNOWN;
+        p.split_datagrams = D2K_PROP_YES;
+        CHECK(d2k_quic_props_findings(&p, out, sizeof out) == 1 &&
+              strstr(out, "не умеет") != NULL,
+              "находку нельзя выдавать за готовый обход: две датаграммы движок не исполняет");
+        p.split_datagrams = D2K_PROP_UNKNOWN;
+        p.split_crypto = D2K_PROP_YES;
+        (void)d2k_quic_props_findings(&p, out, sizeof out);
 
         p.version2 = D2K_PROP_YES;
         p.low_source_port = D2K_PROP_YES;

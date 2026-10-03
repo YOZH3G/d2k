@@ -129,6 +129,29 @@ int d2k_quic_client_hello(const uint8_t *p, size_t n,
  * остальное (целое приветствие, не Initial, не ClientHello). */
 int d2k_quic_hello_incomplete(const uint8_t *p, size_t n);
 
+/* РАЗРЕЗ CLIENTHELLO НА КАДРЫ CRYPTO ВНУТРИ ОДНОГО INITIAL (задача 40).
+ *
+ * Раскрывает первый пакет датаграммы ключами из его DCID и перекладывает
+ * CRYPTO: кадр, в котором лежит середина имени (а без имени — самый длинный
+ * кадр), режется надвое, хвост идёт первым; прочие кадры CRYPTO и PING
+ * сохраняются, место под заголовок нового кадра берётся из PADDING. Пакет
+ * запечатывается теми же ключами с тем же номером: длина датаграммы,
+ * версия, DCID, SCID, токен и номер пакета не меняются, склеенный за ним
+ * хвост датаграммы переносится как есть. Одна функция для вопроса замера
+ * (core/quicprobe.c) и для исполнителя плана (datapath/plan_apply.c): что
+ * мерили, то и исполняется.
+ *
+ * Две датаграммы вместо одной здесь не делаются намеренно: второму пакету
+ * нужен свой номер, а следующий номер уже принадлежит клиенту — сервер
+ * отбросил бы его настоящий пакет как повтор.
+ *
+ * 0 — out[0..n) собран (cap >= n). -1 — не Initial v1/v2, тег не сошёлся,
+ * в пакете кадр, кроме CRYPTO/PING/PADDING, резать нечего или добивки не
+ * хватает под заголовок второго кадра; out тогда не считается собранным. */
+D2K_WARN_UNUSED
+int d2k_quic_initial_split_crypto(const uint8_t *in, size_t n,
+                                  uint8_t *out, size_t cap, size_t *out_len);
+
 /* Stateful counterpart for a real UDP flow. Feed Initial datagrams in any
  * order; return 0 while the contiguous CRYPTO prefix has no SNI, 1 when the
  * ClientHello contains a complete SNI, and -1 for a packet that cannot belong

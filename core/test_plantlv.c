@@ -242,6 +242,34 @@ int main(void) {
               "комментарий провенанса изменил TLV");
     }
 
+    /* quicsplit — разрез ClientHello на кадры CRYPTO внутри Initial
+       (задача 40). Запись 0x010f, один байт формы (1 — кадры CRYPTO, хвост
+       первым), исполнитель 10, только UDP, без фрагментации и удлинения. */
+    {
+        uint8_t out[256];size_t n=0;char err[200],text[256];
+        int rc=d2k_plan_text_to_tlv("d2k-plan 1 10\nproto udp quic\nquicsplit 1\norder forward\n",
+                                    out,sizeof out,&n,err,sizeof err);
+        if(rc)printf("quicsplit: %s\n",err);
+        CHECK(rc==0,"quicsplit 1 не переведён");
+        static const uint8_t rec[]={0x01,0x0f,0x00,0x01,0x01};
+        int found=0;
+        for(size_t i=12;i+sizeof rec<=n;i++) if(!memcmp(out+i,rec,sizeof rec)) found=1;
+        CHECK(rc==0&&found,"quicsplit 1 не дал записи 010f 0001 01");
+        CHECK(rc==0&&out[7]==10,"quicsplit: исполнитель не 10");
+        const char *bad[]={"quicsplit 0\n","quicsplit 2\n","quicsplit\n","quicsplit 1 1\n",
+            "quicsplit 1\nquicsplit 1\n","quicsplit 1\nipfrag 1\n","quicsplit 1\nudplen 100\n",
+            "quicsplit 1\nsplit payload_start +1\n","quicsplit 1\norder reverse\n"};
+        for(size_t i=0;i<sizeof bad/sizeof bad[0];i++) {
+            snprintf(text,sizeof text,"d2k-plan 1 10\nproto udp quic\n%s",bad[i]);
+            CHECK(d2k_plan_text_to_tlv(text,out,sizeof out,&n,err,sizeof err)!=0,
+                  "invalid/conflicting quicsplit text accepted");
+        }
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 9\nproto udp quic\nquicsplit 1\n",
+              out,sizeof out,&n,err,sizeof err)!=0,"quicsplit with old executor");
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 10\nproto tcp tls\nquicsplit 1\n",
+              out,sizeof out,&n,err,sizeof err)!=0,"quicsplit with TCP text");
+    }
+
     /* Строгий разбор: усечённое слово и число вне ширины поля — отказ. */
     {
         uint8_t out[512]; size_t n=0; char err[200], text[512];

@@ -333,6 +333,18 @@ test_quicwire: test_quicwire.c quicwire.o crypto.o $(HDR)
 test_quic: test_quic.c quic.o quicwire.o crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quic.c quic.o quicwire.o crypto.o $(TEST_LDFLAGS)
 
+# Задача 40: разрез ClientHello на кадры CRYPTO — одна функция ядра для
+# вопроса замера и исполнителя датапата.
+test_quic_split: test_quic_split.c quic.o quicwire.o crypto.o $(HDR) test_quic_vector.h
+	$(CC) $(CFLAGS) -o $@ test_quic_split.c quic.o quicwire.o crypto.o $(TEST_LDFLAGS)
+
+.PHONY: test-quic-split
+test-quic-split: test_quic_split
+	./test_quic_split
+
+check: test-quic-split
+TESTS += test_quic_split
+
 test_quicprobe: test_quicprobe.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quicprobe.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(TEST_LDFLAGS)
 
@@ -496,8 +508,8 @@ test_d2kc_proto: test_d2kc_proto.c $(HDR)
 
 check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify test-volume test-httpup-logic test-measured
 
-test_measured: test_measured.c compose.o plantlv.o hello.o meas.o link.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h ../datapath/wire.c ../datapath/include/d2k_session.h
-	$(CC) $(CFLAGS) -o $@ test_measured.c compose.o plantlv.o hello.o meas.o link.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
+test_measured: test_measured.c compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h ../datapath/wire.c ../datapath/include/d2k_session.h
+	$(CC) $(CFLAGS) -o $@ test_measured.c compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
 
 test-measured: test_measured
 	./test_measured
@@ -519,7 +531,7 @@ SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=al
 # ниже (D2KASK_BIN), иначе санитайзер проверял бы только ТЕСТ, а не саму
 # утилиту, которую он должен ловить прежде всего.
 san-measured: hello_profiles.inc
-	$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-test_measured test_measured.c compose.c plantlv.c hello.c meas.c link.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread
+	$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-test_measured test_measured.c compose.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread
 	/tmp/d2k-core-san-test_measured
 
 .PHONY: san-measured
@@ -598,7 +610,7 @@ cross: hello_profiles.inc
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quicprobe-mipsel \
 		test_quicprobe.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c quicconn.c h3.c -lpthread || exit 1
 	@echo "== original QUIC arm regressions целиком =="
-	@set -e; for t in test_ipfrag test_quic_original_arms test_quic_run_order test_quic_fresh_repeats test_quic_arm_data; do \
+	@set -e; for t in test_ipfrag test_quic_original_arms test_quic_run_order test_quic_fresh_repeats test_quic_arm_data test_quic_strategy test_quic_split; do \
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-$$t-a64 $$t.c $(SRC) -lpthread; \
 		$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-$$t-mipsel $$t.c $(SRC) -lpthread; \
 	done
@@ -674,9 +686,9 @@ cross: hello_profiles.inc
 		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
 	@echo "== test_measured целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_measured-a64 \
-		test_measured.c compose.c plantlv.c hello.c meas.c link.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
+		test_measured.c compose.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_measured-mipsel \
-		test_measured.c compose.c plantlv.c hello.c meas.c link.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
+		test_measured.c compose.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
 	@echo "== test_d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_d2kask-a64 \
 		test_d2kask.c hello.c link.c -lpthread || exit 1
@@ -852,6 +864,18 @@ clean:
 
 test_quic_original_arms: test_quic_original_arms.c quicarms.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< quicarms.o $(TEST_LDFLAGS)
+
+# Задача 40: стратегия из ответов (остаточное разрешение, разрез CRYPTO)
+# раньше перебора приманок — на подменённых ответах.
+test_quic_strategy: test_quic_strategy.c quicarms.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< quicarms.o $(TEST_LDFLAGS)
+
+.PHONY: test-quic-strategy
+test-quic-strategy: test_quic_strategy
+	./test_quic_strategy
+
+check: test-quic-strategy
+TESTS += test_quic_strategy
 
 test_quic_run_order: test_quic_run_order.c $(SRC) $(HDR) hello_profiles.inc
 	$(CC) $(CFLAGS) -o $@ $< $(SRC) $(TEST_LDFLAGS)

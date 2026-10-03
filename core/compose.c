@@ -1464,7 +1464,18 @@ static int fb_arm_at(size_t idx, fb_arm *a) {
 
 static int quic_arm_found(const d2k_quic_arm *a) {
     return a && (a->kind == D2K_QA_BLOB || a->kind == D2K_QA_COPIES ||
-                 a->kind == D2K_QA_TTL || a->kind == D2K_QA_FRAG);
+                 a->kind == D2K_QA_TTL || a->kind == D2K_QA_FRAG ||
+                 a->kind == D2K_QA_SPLIT);
+}
+
+/* Задача 40: разрез ClientHello на два кадра CRYPTO внутри того же Initial —
+   ответ вопроса стратегии, исполнитель 10 (quicsplit 1). Одно действие: ни
+   приманок, ни «длины» — с ними сочетание не мерили. */
+static int quic_split_plan_text(char *buf, size_t cap) {
+    size_t pos = 0;
+    return append_fmt(buf, cap, &pos,
+                      "d2k-plan 1 10\nid 00000000000000000000000000000000\n"
+                      "proto udp quic\nquicsplit 1\norder forward\n");
 }
 
 /* Один сборщик QUIC-плана на оба входа (плечо askArms и свойства вопросника)
@@ -1580,6 +1591,9 @@ static int quic_plan_text(const d2k_quic_arm *arm, const uint8_t *blob, size_t b
 int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
                       char *buf, size_t cap) {
     if (!arm || !buf || cap == 0 || !quic_arm_found(arm)) { return -1; }
+    if (arm->kind == D2K_QA_SPLIT) {
+        return arm->original && !blen ? quic_split_plan_text(buf, cap) : -1;
+    }
     return quic_plan_text(arm, blob, blen, 0, 0, buf, cap);
 }
 
@@ -1589,6 +1603,9 @@ int d2k_quic_compose_plan(const d2k_quic_arm *arm, const d2k_quic_props *p,
     /* Метки опытов не подтверждены — верить нельзя ни плечу, ни свойствам
        того же прогона. */
     if (arm && arm->kind == D2K_QA_FLAKY) { return -1; }
+    if (arm && arm->kind == D2K_QA_SPLIT) {
+        return arm->original && arm->len == 0 ? quic_split_plan_text(buf, cap) : -1;
+    }
     const d2k_quic_arm *use = quic_arm_found(arm) ? arm : NULL;
     return quic_plan_text(use, use ? use->bytes : NULL, use ? use->len : 0,
                           p->junk_ahead == D2K_PROP_YES,

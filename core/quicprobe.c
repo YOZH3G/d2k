@@ -1142,14 +1142,18 @@ static int qp_neutral_control_sni(char out[24]) {
     return 0;
 }
 
-static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
+/* crypto_split (задача 40): свежий Initial каждой попытки уходит с
+   ClientHello, разрезанным на два кадра CRYPTO (d2k_quic_initial_split_crypto
+   — та же функция, что исполняет план в датапате). Только вместе с
+   fresh_sni; не разрезалось — попытка не отправляется. */
+static d2k_tally quic_ask_core(const char *addr, uint16_t port,
                               const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
                               int prefix_copies, int src_port, const char *split_sni,
                               d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                               int repeats, uint32_t *rtt_ms_out, int *refused_out,
                               int *sent_out, uint8_t *ttl_in_out, qp_verify_fn verify,
                               const d2k_ipfrag_plan *fragment, const char *fresh_sni,
-                              int neutral_control) {
+                              int neutral_control, int crypto_split) {
     d2k_tally t;
     memset(&t, 0, sizeof t);
     t.marked = 1;
@@ -1247,6 +1251,11 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
             if (d2k_quic_probe_initial(fresh_sni, copies[i], COPY_CAP, &clen) == 0) {
                 sent[i].bytes = copies[i];
                 sent[i].len = clen;
+                if (crypto_split) {
+                    sent[i] = d2k_quic_initial_split_crypto(copies[i], clen, tails[i],
+                                                            COPY_CAP, &tlen) == 0
+                        ? (d2k_hello){tails[i], tlen} : (d2k_hello){NULL, 0};
+                }
             } else {
                 sent[i] = (d2k_hello){NULL,0};
             }
@@ -1465,6 +1474,19 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
     return t;
 }
 
+static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
+                              const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
+                              int prefix_copies, int src_port, const char *split_sni,
+                              d2k_hello msg, uint32_t wait_ms, uint32_t mark,
+                              int repeats, uint32_t *rtt_ms_out, int *refused_out,
+                              int *sent_out, uint8_t *ttl_in_out, qp_verify_fn verify,
+                              const d2k_ipfrag_plan *fragment, const char *fresh_sni,
+                              int neutral_control) {
+    return quic_ask_core(addr, port, prefix, prefix_len, prefix_ttl, prefix_copies, src_port,
+                         split_sni, msg, wait_ms, mark, repeats, rtt_ms_out, refused_out,
+                         sent_out, ttl_in_out, verify, fragment, fresh_sni, neutral_control, 0);
+}
+
 static d2k_tally quic_fragment(const char *addr,uint16_t port,int shape,d2k_hello msg,
     uint32_t wait_ms,uint32_t mark,int repeats,int *sent_out) {
     d2k_ipfrag_plan p;
@@ -1497,6 +1519,10 @@ static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
     size_t prefix_len=q->blob_len;
     int ttl=q->ttl;
     int copies=q->copies>1?q->copies:1;
+    if(q->split && (q->frag || q->blob_len || neutral)) {
+        if(sent_out)*sent_out=0;
+        return bad; /* разрез CRYPTO мерится один, без приманок и фрагментов */
+    }
     if(q->frag) {
         if(q->blob_len || d2k_ipfrag_shape(q->frag,&plan)!=0) {
             if(sent_out)*sent_out=0;
@@ -1511,9 +1537,9 @@ static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
     d2k_hello no_snapshot={NULL,0};
     /* Arm answers are bound to our Initial only (qp_verify_bound, task 39);
        the fragment-survival control keeps the donor's reply criterion. */
-    return quic_ask_ex(q->addr,port,prefix,prefix_len,ttl,copies,0,NULL,
+    return quic_ask_core(q->addr,port,prefix,prefix_len,ttl,copies,0,NULL,
         no_snapshot,wait_ms,mark,D2K_QUIC_REPEATS,NULL,NULL,sent_out,NULL,
-        neutral?qp_verify_aead:qp_verify_bound,fragment,neutral?NULL:sni,neutral);
+        neutral?qp_verify_aead:qp_verify_bound,fragment,neutral?NULL:sni,neutral,q->split);
 }
 d2k_quic_ask_arm_fn d2k_quic_ask_arm_hook=quic_ask_arm;
 
@@ -1564,6 +1590,18 @@ static int qp_arm_first_send(int fd, const uint8_t *initial, size_t len, void *u
         qp_send_prefix(fd, a->family, a->q->blob, a->q->blob_len, a->q->ttl,
                        a->q->copies > 1 ? a->q->copies : 1) != 0) {
         return -1;
+    }
+    uint8_t split[D2K_QW_MAX_DGRAM];
+    if (a->q->split) {
+        /* Задача 40: тот же разрез, что у фильтра и у датапата. Не
+           разрезался — этап не состоялся (наша сторона), а не «не прошло». */
+        size_t sl = 0;
+        if (len > sizeof split ||
+            d2k_quic_initial_split_crypto(initial, len, split, sizeof split, &sl) != 0) {
+            return -1;
+        }
+        initial = split;
+        len = sl;
     }
     if (send(fd, initial, len, 0) != (ssize_t)len) {
         return -1;
@@ -1929,10 +1967,13 @@ static const qp_question qp_list[] = {
 #define QP_N_QUESTIONS (sizeof qp_list / sizeof qp_list[0])
 
 /* ОПРОСЫ ХУДШЕГО ПУТИ RUN после базовой живости, каждый ждёт dyn_wait:
-   прямой зонд и повторный контроль (probe.go:322-355), вся лестница askArms
-   (D2K_QUIC_ARM_QUESTIONS_MAX) и все вопросы таблицы выше. Сейчас
-   2 + 18 + 7 = 27. Из этого числа — и только из него — выводится бюджет. */
-#define QP_RUN_DYN_POLLS (2u + D2K_QUIC_ARM_QUESTIONS_MAX + (unsigned)QP_N_QUESTIONS)
+   прямой зонд и повторный контроль (probe.go:322-355), вопросы стратегии с
+   одним повтором каждый (D2K_QUIC_STRATEGY_ASKS_MAX, задача 40), вся
+   лестница askArms (D2K_QUIC_ARM_QUESTIONS_MAX) и все вопросы таблицы выше.
+   Сейчас 2 + 4 + 18 + 7 = 31. Из этого числа — и только из него — выводится
+   бюджет. */
+#define QP_RUN_DYN_POLLS (2u + D2K_QUIC_STRATEGY_ASKS_MAX + D2K_QUIC_ARM_QUESTIONS_MAX + \
+                          (unsigned)QP_N_QUESTIONS)
 
 /* deriveTimeout донора (probe.go:404-418): 3×RTT в [пол; потолок]. */
 static uint32_t qp_dyn_wait(uint32_t rtt_ms) {
@@ -1977,13 +2018,34 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
 
     char took[192];
     size_t tn = 0;
-    int n_budget = 0, n_addr = 0, n_unbuilt = 0, n_profile = 0;
+    int n_budget = 0, n_addr = 0, n_unbuilt = 0, n_profile = 0, n_strategy = 0;
     uint8_t shaped[D2K_QW_MAX_DGRAM], scratch[D2K_QW_MAX_DGRAM];
 
     for (size_t qi = 0; qi < QP_N_QUESTIONS; qi++) {
         const qp_question *q = &qp_list[qi];
         int8_t *slot = (int8_t *)&r->qprops + q->slot;
 
+        /* УЖЕ ОТВЕЧЕНО СТРАТЕГИЕЙ (задача 40): «мусор» — тот же вопрос, что
+           остаточное разрешение, «кадры» — тот же, что разрез CRYPTO.
+           Повтор исхода не изменит. Исход остаётся в свойстве и в трассе. */
+        if (*slot != D2K_PROP_UNKNOWN &&
+            (q->slot == offsetof(d2k_quic_props, junk_ahead) ||
+             q->slot == offsetof(d2k_quic_props, split_crypto))) {
+            if (qi < D2K_QTRACE_MAX) {
+                d2k_quic_step *st = &r->qtrace[qi];
+                snprintf(st->label, sizeof st->label, "%s (стратегия)", q->label);
+                st->sent = 0;
+                st->answered = 0;
+                st->outcome = *slot;
+            }
+            n_strategy++;
+            if (*slot == D2K_PROP_YES && tn + strlen(q->label) + 2 < sizeof took) {
+                if (tn) { took[tn++] = ','; }
+                memcpy(took + tn, q->label, strlen(q->label));
+                tn += strlen(q->label);
+            }
+            continue;
+        }
         if (!budget_left(start)) {
             n_budget++;
             continue;
@@ -2094,6 +2156,7 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
     } else {
         reason_append(r, "; вопросы(%d): не взял ни один", (int)QP_N_QUESTIONS);
     }
+    if (n_strategy) { reason_append(r, "; %d отвечено стратегией", n_strategy); }
     if (n_budget) { reason_append(r, "; не задано %d (бюджет)", n_budget); }
     if (n_addr) { reason_append(r, "; не задано %d (адреса)", n_addr); }
     if (n_unbuilt) { reason_append(r, "; не задано %d (не собралось)", n_unbuilt); }
@@ -2114,8 +2177,8 @@ int d2k_quic_props_findings(const d2k_quic_props *p, char *out, size_t cap) {
     static const struct { size_t slot; const char *text; } texts[] = {
         { offsetof(d2k_quic_props, split_crypto),
           "приветствие, разложенное на два кадра CRYPTO, проходит — коробка их не пересобирает. "
-          "Движок так не умеет: расшифровать Initial он может, а собрать и зашифровать обратно нет. "
-          "Это новая функция lua-desync, а не настройка существующей." },
+          "Исполнимо (задача 40): план quicsplit — датапат перекладывает кадры CRYPTO в Initial "
+          "клиента; ставится ответом вопроса стратегии с этапом данных." },
         { offsetof(d2k_quic_props, split_datagrams),
           "приветствие, разложенное на две датаграммы, проходит — коробка их не собирает. "
           "Исполнить нечем по той же причине, что и разрез на кадры: движок так не умеет." },
@@ -2503,10 +2566,21 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                                 .spent=arm_budget_spent,
                                 .path=arm_path[0]?arm_path:NULL};
                             if (budget_left(&start)) {
-                                *arm = d2k_quic_original_measure(&context, port, trigger, control, dyn_wait, mark);
+                                /* Задача 40: сначала вопросы стратегии
+                                   (остаточное разрешение, разрез CRYPTO),
+                                   перебор askArms — только запасной. */
+                                *arm = d2k_quic_strategy_measure(&context, port, trigger, control, dyn_wait, mark);
                                 next_addr = context.next;
                                 r.probes += arm->probes;
                                 if (!context.marked) all_marked = 0;
+                                /* Те же вопросы, что «мусор» и «кадры»
+                                   вопросника: решающий ответ стратегии
+                                   ложится в их свойства, и вопросник их
+                                   второй раз не задаёт. */
+                                if (arm->clearance != D2K_PROP_UNKNOWN)
+                                    r.qprops.junk_ahead = arm->clearance;
+                                if (arm->split_crypto != D2K_PROP_UNKNOWN)
+                                    r.qprops.split_crypto = arm->split_crypto;
                             } else {
                                 arm->original = 1; arm->incomplete = 1;
                                 snprintf(arm->reason, sizeof arm->reason, "budget exhausted before askArms");

@@ -40,7 +40,8 @@ enum {
     REC_DELAY     = 0x010b,
     REC_IPFRAG    = 0x010c,
     REC_OOB       = 0x010d,
-    REC_UDPLEN    = 0x010e
+    REC_UDPLEN    = 0x010e,
+    REC_QSPLIT    = 0x010f
 };
 
 /* Якоря семантических позиций. */
@@ -116,6 +117,11 @@ struct d2k_plan {
        байты не меняются (донор compose, questions.go:331-334). План с ним
        владеет нагрузкой: оригинал снимается, уходит удлинённая копия. */
     uint16_t udplen;
+    /* РАЗРЕЗ CLIENTHELLO НА КАДРЫ CRYPTO внутри того же Initial (задача 40);
+       0 — записи нет, 1 — два кадра, хвост первым. Нагрузка пересобирается
+       функцией ядра d2k_quic_initial_split_crypto — той же, которой задан
+       вопрос замера; план владеет нагрузкой, как при udplen. */
+    uint8_t qsplit;
 
     struct d2k_payload *payloads; size_t n_payloads;
     struct d2k_poison  *poisons;  size_t n_poisons;

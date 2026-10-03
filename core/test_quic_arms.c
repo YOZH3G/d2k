@@ -1037,8 +1037,62 @@ static void quic_props_compose_checks(void) {
     }
 }
 
+/* Задача 40: планы стратегии из ответов. */
+static void quic_strategy_compose_checks(void) {
+    char plan[4096];
+    uint8_t tlv[8192]; size_t n = 0; char err[200];
+    d2k_quic_props p;
+    memset(&p, 0, sizeof p);
+
+    /* Остаточное разрешение: РОВНО одна безобидная датаграмма перед Initial —
+       то, что мерили (не две копии «мусора» донора). */
+    d2k_quic_arm cl;
+    memset(&cl, 0, sizeof cl);
+    cl.kind = D2K_QA_BLOB; cl.original = 1; cl.strategy = D2K_QS_CLEARANCE;
+    cl.len = D2K_QUIC_BENIGN_LEN; cl.copies = 1;
+    memcpy(cl.bytes, d2k_quic_benign, D2K_QUIC_BENIGN_LEN);
+    p.junk_ahead = D2K_PROP_YES; /* тот же ответ лежит и в свойстве */
+    CHECK(d2k_quic_compose_plan(&cl, &p, plan, sizeof plan) == 0 &&
+          strstr(plan, "payload 1 00000000000000000000000000000000\n") &&
+          strstr(plan, "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n") &&
+          !strstr(plan, "ttl=") && !strstr(plan, "pace"),
+          "QUIC разрешение: не одна безобидная датаграмма перед Initial");
+    CHECK(d2k_plan_text_to_tlv(plan, tlv, sizeof tlv, &n, err, sizeof err) == 0,
+          "QUIC разрешение: план не переводится в TLV");
+
+    /* Разрез CRYPTO: одна запись quicsplit, исполнитель 10, без приманок;
+       «длина» с ним не склеивается — такого сочетания никто не мерил. */
+    d2k_quic_arm sp;
+    memset(&sp, 0, sizeof sp);
+    sp.kind = D2K_QA_SPLIT; sp.original = 1; sp.strategy = D2K_QS_SPLIT;
+    memset(&p, 0, sizeof p);
+    p.split_crypto = D2K_PROP_YES;
+    p.longer = D2K_PROP_YES;
+    CHECK(d2k_quic_compose_plan(&sp, &p, plan, sizeof plan) == 0 &&
+          !strncmp(plan, "d2k-plan 1 10\n", 14) && strstr(plan, "proto udp quic\n") &&
+          strstr(plan, "quicsplit 1\n") && !strstr(plan, "fake ") && !strstr(plan, "udplen") &&
+          !strstr(plan, "ipfrag"),
+          "QUIC разрез: не план quicsplit 1 исполнителя 10 без прочих действий");
+    CHECK(d2k_plan_text_to_tlv(plan, tlv, sizeof tlv, &n, err, sizeof err) == 0,
+          "QUIC разрез: план не переводится в TLV");
+    /* Свойство «кадры» без плеча стратегии плана не даёт: исполнитель
+       появился вместе с вопросом стратегии, и только её ответ его ставит. */
+    d2k_quic_arm nf;
+    memset(&nf, 0, sizeof nf);
+    nf.kind = D2K_QA_NOT_FOUND; nf.original = 1;
+    memset(&p, 0, sizeof p);
+    p.split_crypto = D2K_PROP_YES;
+    CHECK(d2k_quic_compose_plan(&nf, &p, plan, sizeof plan) != 0,
+          "QUIC: свойство «кадры» само по себе стало планом");
+    /* Неполное плечо разреза (не original) — не план. */
+    sp.original = 0;
+    CHECK(d2k_quic_compose_plan(&sp, &p, plan, sizeof plan) != 0,
+          "QUIC разрез: плечо не из замера стало планом");
+}
+
 int main(void) {
     quic_props_compose_checks();
+    quic_strategy_compose_checks();
     /* Сохраняем боевые крючки — они же используются другими тестами при
        линковке в один процесс (см. Makefile: test_quic_arms собирает
        quicprobe.o целиком) — подмена обязана быть временной. */

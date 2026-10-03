@@ -671,6 +671,55 @@ static void test_quic_original_after_fakes(void) {
     d2k_session_free(s);
 }
 
+/* Задача 40: план «разрез ClientHello на кадры CRYPTO». Исполнение — одна
+ * посылка: наш собственный Initial той же длины с переложенными кадрами, копия
+ * в очереди снимается (порядок задачи 42: оригинал уходит нашей посылкой).
+ * Повтор Initial после завершённого исполнения идёт нетронутым, как у любого
+ * плана QUIC. */
+static const uint8_t plan_qsplit[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 10, 0, 0, 0, 3,
+    0x00, 0x02, 0x00, 0x02, 17, 2,
+    0x01, 0x03, 0x00, 0x01, 0x00,
+    0x01, 0x0f, 0x00, 0x01, 0x01
+};
+
+static void test_quic_crypto_split_plan(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    d2k_plan *p = NULL;
+    char err[160];
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    CHECK(s && d2k_plan_load(plan_qsplit, sizeof plan_qsplit, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, 1, p) == 0,
+          "crypto-split plan fixture");
+    if (!s) { return; }
+    size_t n = build_udp_pkt(pkt, 51800, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(r.applied && r.n_out == 1 && r.verdict == D2K_VERDICT_DROP && r.first_payload == 0,
+          "crypto split: one own Initial, the queued copy is dropped");
+    if (r.n_out == 1) {
+        const uint8_t *o = buf + r.out[0].off;
+        uint8_t want[1500];
+        size_t want_len = 0;
+        char name[64];
+        CHECK(r.out[0].len == n && r.out[0].delay_us == 0, "same datagram length, no delay");
+        CHECK(!memcmp(o + 12, pkt + 12, 8) && !memcmp(o + 20, pkt + 20, 4) && o[8] == pkt[8],
+              "client tuple and TTL kept");
+        CHECK(d2k_quic_initial_split_crypto(v1_initial, sizeof v1_initial, want, sizeof want,
+                                            &want_len) == 0 &&
+              !memcmp(o + 28, want, want_len), "wire bytes are the core split (what was measured)");
+        CHECK(memcmp(o + 28, v1_initial, sizeof v1_initial) != 0, "the Initial did change");
+        CHECK(d2k_quic_sni(o + 28, r.out[0].len - 28, name, sizeof name) == 0 &&
+              !strcmp(name, "example.com"), "server assembles the same name");
+    }
+    for (size_t i = 0; i <= r.n_out; i++) d2k_session_sent(s, 1001 + i, &r.key, r.execution_id);
+    CHECK(d2k_session_done(s) == 1, "split Initial + verdict complete the execution");
+    d2k_session_packet(s, pkt, n, 1300000000ull, buf, sizeof buf, &r);
+    CHECK(!r.applied && r.n_out == 0 && r.verdict == D2K_VERDICT_ACCEPT,
+          "a retransmit after a completed split execution passes untouched");
+    d2k_session_free(s);
+}
+
 /* После QUIC Retry клиент начинает новый Initial с новым DCID. Старый
  * stateful-контекст не должен отбрасывать такой пакет как «чужой» и оставлять
  * поток без имени навсегда. */
@@ -1505,6 +1554,7 @@ int main(void) {
     test_quic_held_initial_replay_is_first_packet();
     test_quic_retry_resets_assembly();
     test_quic_original_after_fakes();
+    test_quic_crypto_split_plan();
     test_discord_voice();
     test_voice_trial_live_flow();
     test_nameless_initial();

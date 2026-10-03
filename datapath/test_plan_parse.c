@@ -57,6 +57,29 @@ int main(void) {
         CHECK(!loads(b,sizeof b-1), "empty fragment record accepted");
     }
 
+    /* REC_QSPLIT (0x010f): разрез ClientHello на кадры CRYPTO (задача 40),
+       исполнитель 10, только UDP, без фрагментации и удлинения. */
+    {
+        uint8_t b[] = {'D','2','K','P',0,1,0,10,0,0,0,3,
+                       0,2,0,2,17,2, 1,3,0,1,0, 1,15,0,1,1};
+        CHECK(loads(b,sizeof b), "quicsplit plan rejected");
+        b[7]=9; CHECK(!loads(b,sizeof b), "quicsplit requires executor 10");
+        b[7]=10; b[27]=0; CHECK(!loads(b,sizeof b), "quicsplit form 0 accepted");
+        b[27]=2; CHECK(!loads(b,sizeof b), "unmeasured quicsplit form accepted");
+        b[27]=1; b[16]=6; CHECK(!loads(b,sizeof b), "quicsplit accepted for TCP");
+        b[16]=17; b[22]=1; CHECK(!loads(b,sizeof b), "quicsplit with reverse order accepted");
+        b[22]=0;
+        uint8_t d[] = {'D','2','K','P',0,1,0,10,0,0,0,4,
+                       0,2,0,2,17,2, 1,3,0,1,0, 1,15,0,1,1, 1,15,0,1,1};
+        CHECK(!loads(d,sizeof d), "repeated quicsplit accepted");
+        uint8_t f[] = {'D','2','K','P',0,1,0,10,0,0,0,4,
+                       0,2,0,2,17,2, 1,3,0,1,0, 1,15,0,1,1, 1,12,0,1,1};
+        CHECK(!loads(f,sizeof f), "quicsplit with ipfrag accepted");
+        uint8_t u[] = {'D','2','K','P',0,1,0,10,0,0,0,4,
+                       0,2,0,2,17,2, 1,3,0,1,0, 1,15,0,1,1, 1,14,0,2,0,100};
+        CHECK(!loads(u,sizeof u), "quicsplit with udplen accepted (combination never measured)");
+    }
+
     /* REC_UDPLEN (0x010e): удлинение датаграммы, исполнитель 9, только UDP. */
     {
         uint8_t b[] = {'D','2','K','P',0,1,0,9,0,0,0,3,

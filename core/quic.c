@@ -692,3 +692,155 @@ int d2k_quic_assembly_feed(d2k_quic_assembly *a, const uint8_t *p, size_t n,
     out[sni_len] = '\0';
     return 1;
 }
+
+/* ---------------------------------------------------------------------
+ * Разрез ClientHello на кадры CRYPTO (задача 40).
+ *
+ * Пакет раскрывается ключами из своего же DCID, кадры CRYPTO
+ * перекладываются, пакет запечатывается заново ТЕМИ ЖЕ ключами с ТЕМ ЖЕ
+ * номером и той же длиной. Повтор одноразового вектора GCM здесь ничего не
+ * раскрывает: ключи Initial публичны по построению (RFC 9001 §5.2), а
+ * исходник на провод не уходит — уходит только переложенный.
+ *
+ * Разрез — посередине имени, если имя собирается из CRYPTO этой датаграммы,
+ * иначе посередине самого длинного кадра. Хвост первым: RFC 9000 §19.6 не
+ * требует возрастания смещений внутри пакета, сервер собирает поток по
+ * смещениям, а коробка, читающая кадры по одному, видит обрывок имени.
+ * Место под заголовок второго кадра берётся из PADDING; его нет — отказ,
+ * удлинять датаграмму здесь нельзя (длина — тоже форма, и её никто не мерил).
+ * --------------------------------------------------------------------- */
+
+#define SPLIT_MAX_FRAMES 64
+
+typedef struct {
+    uint64_t off;
+    size_t len;
+    size_t data; /* смещение данных в plain */
+} split_frame;
+
+static int put_split_frame(uint8_t *body, size_t cap, size_t *pos,
+                           uint64_t off, const uint8_t *data, size_t len) {
+    size_t b = *pos;
+    if (b >= cap) { return -1; }
+    body[b++] = 0x06;
+    size_t w = d2k_qw_varint_write(body + b, cap - b, off);
+    if (w == 0) { return -1; }
+    b += w;
+    w = d2k_qw_varint_write(body + b, cap - b, (uint64_t)len);
+    if (w == 0) { return -1; }
+    b += w;
+    if (len > cap - b) { return -1; }
+    memcpy(body + b, data, len);
+    *pos = b + len;
+    return 0;
+}
+
+int d2k_quic_initial_split_crypto(const uint8_t *in, size_t n,
+                                  uint8_t *out, size_t cap, size_t *out_len) {
+    if (!in || !out || !out_len || cap < n) { return -1; }
+    d2k_qw_hdr h;
+    if (d2k_qw_hdr_parse(in, n, 0, &h) != 0 || !h.long_hdr ||
+        h.type != D2K_QW_LT_INITIAL ||
+        (h.version != D2K_QUIC_V1 && h.version != D2K_QUIC_V2) ||
+        h.packet_len > n || h.packet_len > D2K_QUIC_MAX_DGRAM) {
+        return -1;
+    }
+    uint8_t secret[32];
+    d2k_qw_keys k;
+    if (d2k_qw_initial_secret(h.version, in + h.dcid_off, h.dcid_len,
+                              D2K_QW_CLIENT, secret) != 0 ||
+        d2k_qw_keys_from_secret(h.version, secret, &k) != 0) {
+        return -1;
+    }
+    uint8_t plain[D2K_QUIC_MAX_DGRAM];
+    size_t plain_len = 0;
+    uint64_t pn = 0;
+    if (d2k_qw_open(&k, &h, in, 0, plain, &plain_len, &pn) != 0) { return -1; }
+    if (h.length_claimed < plain_len + 16) { return -1; }
+    size_t pn_len = h.length_claimed - plain_len - 16;
+    if (pn_len < 1 || pn_len > 4) { return -1; }
+
+    split_frame fr[SPLIT_MAX_FRAMES];
+    size_t nfr = 0, pings = 0;
+    for (size_t i = 0; i < plain_len;) {
+        uint8_t t = plain[i];
+        if (t == 0x00) { i++; continue; }          /* PADDING */
+        if (t == 0x01) { pings++; i++; continue; } /* PING */
+        if (t != 0x06 || nfr == SPLIT_MAX_FRAMES) {
+            return -1; /* ACK, CONNECTION_CLOSE и прочее не перекладываем */
+        }
+        i++;
+        uint64_t off = 0, len = 0;
+        size_t w = 0;
+        if (read_varint(plain + i, plain_len - i, &off, &w) != 0) { return -1; }
+        i += w;
+        if (read_varint(plain + i, plain_len - i, &len, &w) != 0) { return -1; }
+        i += w;
+        if (len > plain_len - i) { return -1; }
+        fr[nfr].off = off;
+        fr[nfr].len = (size_t)len;
+        fr[nfr].data = i;
+        nfr++;
+        i += (size_t)len;
+    }
+    if (nfr == 0) { return -1; }
+
+    /* Где резать: середина имени в координатах потока CRYPTO. */
+    size_t target = SPLIT_MAX_FRAMES, cut = 0;
+    uint8_t stream[D2K_QUIC_MAX_DGRAM];
+    size_t filled = crypto_stream_of(in, h.packet_len, stream, sizeof stream);
+    size_t sni_off = 0, sni_len = 0;
+    if (filled && find_client_hello_sni(stream, filled, &sni_off, &sni_len) == 0 &&
+        sni_len >= 2) {
+        uint64_t mid = (uint64_t)sni_off + sni_len / 2;
+        for (size_t f = 0; f < nfr; f++) {
+            if (fr[f].off < mid && mid < fr[f].off + fr[f].len) {
+                target = f;
+                cut = (size_t)(mid - fr[f].off);
+                break;
+            }
+        }
+    }
+    if (target == SPLIT_MAX_FRAMES) {
+        size_t best = 0;
+        for (size_t f = 0; f < nfr; f++) {
+            if (fr[f].len > best) { best = fr[f].len; target = f; }
+        }
+        if (best < 2) { return -1; }
+        cut = best / 2;
+    }
+
+    uint8_t body[D2K_QUIC_MAX_DGRAM];
+    size_t b = 0;
+    const split_frame *tf = &fr[target];
+    if (put_split_frame(body, plain_len, &b, tf->off + cut, plain + tf->data + cut,
+                        tf->len - cut) != 0 ||
+        put_split_frame(body, plain_len, &b, tf->off, plain + tf->data, cut) != 0) {
+        return -1;
+    }
+    for (size_t f = 0; f < nfr; f++) {
+        if (f != target &&
+            put_split_frame(body, plain_len, &b, fr[f].off, plain + fr[f].data, fr[f].len) != 0) {
+            return -1;
+        }
+    }
+    if (pings > plain_len - b) { return -1; }
+    memset(body + b, 0x01, pings);
+    b += pings;
+    memset(body + b, 0x00, plain_len - b); /* PADDING до прежней длины */
+
+    /* Заголовок до номера пакета — дословно; первый байт без защиты:
+       старшие биты как на проводе, зарезервированные — нули, длину номера
+       допишет d2k_qw_seal. */
+    uint8_t hdr[D2K_QUIC_MAX_DGRAM];
+    memcpy(hdr, in, h.pn_offset);
+    hdr[0] = (uint8_t)(in[0] & 0xf0u);
+    size_t made = d2k_qw_seal(&k, 1, hdr, h.pn_offset, pn, pn_len, body, plain_len,
+                              out, cap);
+    if (made != h.packet_len) { return -1; }
+    if (n > h.packet_len) {
+        memcpy(out + h.packet_len, in + h.packet_len, n - h.packet_len);
+    }
+    *out_len = n;
+    return 0;
+}

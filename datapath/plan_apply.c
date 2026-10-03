@@ -18,6 +18,7 @@
 
 #include "d2k_plan.h"
 #include "plan_internal.h"
+#include "d2k_quic.h" /* d2k_quic_initial_split_crypto — задача 40 */
 
 /* Разрешение якоря. Невычислимый якорь — ОТКАЗ, а не нулевое смещение:
  * молчаливый ноль исполнил бы не тот план, который измеряли. */
@@ -386,7 +387,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
        Оригинал, отпущенный ядром, уходит когда ему угодно. */
     int owns_payload = (n_pts > 0) || (p->n_seqovls > 0) || (p->pace_us > 0) ||
                        (p->settle_us > 0) || (p->delay_us > 0) || p->ipfrag ||
-                       p->udplen;
+                       p->udplen || p->qsplit;
     /* Оригинал, отданный ядру после наших сырых фальшивок, может не уйти
        вовсе (см. own_after_fakes в d2k_plan.h). Тогда правда — последняя
        посылка плана, сразу за фальшивками, без собственной паузы. */
@@ -494,6 +495,21 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
             e->seq = in->seq + (uint32_t)start;
             e->bytes = in->payload + start;
             e->len = end - start;
+            if (p->qsplit) {
+                /* Тот же разрез, что задал вопрос замера (ядро), в копии:
+                   вход принадлежит пакету. Разрезов при qsplit нет
+                   (plan_parse.c), кусок один и он весь пакет. Не Initial,
+                   чужой кадр, нет добивки — отказ целиком: пакет уйдёт
+                   нетронутым, а не «почти так, как мерили». */
+                uint8_t *re = malloc(e->len);
+                size_t re_len = 0;
+                if (!re || d2k_quic_initial_split_crypto(e->bytes, e->len, re, e->len,
+                                                         &re_len) != 0 || re_len != e->len) {
+                    free(re); free(pts); emit_vec_free(v, n); return -1;
+                }
+                e->owned_bytes = re;
+                e->bytes = re;
+            }
             if (p->udplen) {
                 /* zapret udplen: payload .. pattern("\x00", 1, increment).
                    Копия, а не правка на месте: вход принадлежит пакету, и

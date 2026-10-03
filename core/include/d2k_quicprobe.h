@@ -367,8 +367,10 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
  * (не больше cap). */
 size_t d2k_quic_build_pool(const char *ip, const char *sni, char pool[][D2K_QUIC_ADDR_LEN], size_t cap);
 
-/* QUIC arm result. The runtime uses d2k_quic_run -> original askArms:
- * intrinsic fakes, copies 6/11, TTL 3/5/8/12, then exact fragment questions.
+/* QUIC arm result. The runtime uses d2k_quic_run -> d2k_quic_strategy_arms
+ * (task 40): residual clearance and CRYPTO split questions first; the
+ * original askArms ladder (intrinsic fakes, copies 6/11, TTL 3/5/8/12, then
+ * exact fragment questions) runs only when those answers are unmeasurable.
  * The old d2k_quic_pick_arm remains only for legacy transport regression
  * tests; its separate-IP confirmation and derived fake are NOT the runtime
  * algorithm. An observed fake is a candidate, not application success. */
@@ -378,8 +380,17 @@ typedef enum {
     D2K_QA_TTL,       /* фальшивке потребовался укороченный TTL, взятый развёрткой (см. ttl) */
     D2K_QA_FRAG,      /* потребовалась IP-фрагментация (см. reason) */
     D2K_QA_NOT_FOUND, /* честный отрицательный результат — см. reason (бюджет/пул/каталог) */
-    D2K_QA_FLAKY      /* измерению верить нельзя — расхождение повторов, см. reason */
+    D2K_QA_FLAKY,     /* измерению верить нельзя — расхождение повторов, см. reason */
+    D2K_QA_SPLIT      /* задача 40: ClientHello двумя кадрами CRYPTO (quicsplit 1) */
 } d2k_quic_arm_kind;
+
+/* Чем собран результат подбора (задача 40, d2k_quic_strategy_arms). */
+typedef enum {
+    D2K_QS_NONE = 0,   /* ответы получены, обхода нет (или подбор не шёл) */
+    D2K_QS_CLEARANCE,  /* одна безобидная датаграмма перед Initial */
+    D2K_QS_SPLIT,      /* разрез ClientHello на кадры CRYPTO */
+    D2K_QS_LADDER      /* ответа нет — запасной перебор askArms */
+} d2k_quic_strategy;
 
 /* ЧЕСТНЫЙ ЗАМЕР ПЛЕЧА (задача 39). Вопрос оригинала — «ответил ли сервер на
  * наш Initial» — остаётся дешёвым первым фильтром: не прошедшее его плечо
@@ -433,7 +444,8 @@ static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge(int handshake, i
  * fakes + 2 candidates x 2 copy counts + 4 TTLs + fragment survival + 4
  * fragment shapes = 18 questions. The Run budget is derived from it. */
 #define D2K_QUIC_ARM_QUESTIONS_MAX 18u
-#define D2K_QUIC_ARM_STEPS 20
+/* 18 вопросов askArms плюс до 4 опросов стратегии (задача 40). */
+#define D2K_QUIC_ARM_STEPS 24
 typedef struct {
     char label[192];
     char addr[D2K_QUIC_ADDR_LEN];
@@ -481,6 +493,11 @@ typedef struct {
        если это законченная строка и d2k_resource_path_ok; d2k_quic_run и
        d2k_quic_run_seeded сохраняют его, обнуляя остальной результат. */
     char              probe_path[512];
+    /* Задача 40: ответы вопросов стратегии (D2K_PROP_*) и источник
+       результата. */
+    int8_t            clearance;
+    int8_t            split_crypto;
+    d2k_quic_strategy strategy;
 } d2k_quic_arm;
 
 /* One original run: arm search happens before properties with the SAME pool.

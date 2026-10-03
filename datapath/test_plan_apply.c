@@ -16,6 +16,9 @@
 /* UDP length/checksum of the lengthened datagram are checked on the real
    wire builder, not on the emit fields alone. */
 #include "d2k_wire.h"
+/* Task 40: the split executor is the core function the question used. */
+#include "d2k_quic.h"
+#include "../core/test_quic_vector.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -502,6 +505,51 @@ static void test_own_after_fakes(void) {
     }
 }
 
+/* quicsplit — разрез ClientHello на кадры CRYPTO внутри Initial (задача 40).
+ * Исполнитель отдаёт РОВНО то, что даёт функция ядра, которой пользовался
+ * вопрос замера: одна посылка той же длины вместо оригинала. Не Initial —
+ * отказ целиком, оригинал уходит нетронутым. */
+static void test_quicsplit(void) {
+    static const uint8_t plan[] = {'D','2','K','P',0,1,0,10,0,0,0,3,
+        0,2,0,2,17,2, 1,3,0,1,0, 1,15,0,1,1};
+    char err[160];
+    d2k_plan *p = NULL;
+    int rc = d2k_plan_load(plan, sizeof plan, &p, err, sizeof err);
+    if (rc) printf("quicsplit plan rejected: %s\n", err);
+    CHECK(rc == 0, "quicsplit plan loads");
+    if (!p) return;
+    static uint8_t initial[1200], want[1500];
+    memcpy(initial, d2k_test_v1_initial, sizeof initial);
+    size_t want_len = 0;
+    CHECK(d2k_quic_initial_split_crypto(initial, sizeof initial, want, sizeof want, &want_len) == 0,
+          "core split builds");
+    d2k_pkt in = {0};
+    d2k_actions a = {0};
+    in.payload = initial; in.payload_len = sizeof initial;
+    CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0, "quicsplit applies to a real Initial");
+    CHECK(a.fate == D2K_ORIG_DROP, "split Initial replaces the original");
+    CHECK(a.n == 1 && a.v[0].kind == D2K_EMIT_PAYLOAD, "quicsplit emits exactly one payload");
+    if (a.n == 1) {
+        const d2k_emit *e = &a.v[0];
+        CHECK(e->len == sizeof initial && e->bytes && memcmp(e->bytes, want, want_len) == 0,
+              "emitted bytes are the core split, same length");
+        CHECK(memcmp(initial, d2k_test_v1_initial, sizeof initial) == 0,
+              "input packet not modified in place");
+        CHECK(e->ipfrag == 0 && e->pre_len == 0 && e->delay_us == 0, "no other action attached");
+        char name[64];
+        CHECK(e->bytes && d2k_quic_sni(e->bytes, e->len, name, sizeof name) == 0 &&
+              strcmp(name, "example.com") == 0, "server still assembles the same name");
+    }
+    d2k_actions_free(&a);
+    static uint8_t junk[1200];
+    memset(junk, 0xab, sizeof junk);
+    in.payload = junk; in.payload_len = sizeof junk;
+    d2k_actions b = {0};
+    CHECK(d2k_plan_apply(p, NULL, &in, &b) != 0, "not an Initial: refused, original passes as is");
+    d2k_actions_free(&b);
+    d2k_plan_free(p);
+}
+
 int main(void) {
     d2k_plan *p = NULL;
     char err[160];
@@ -512,6 +560,7 @@ int main(void) {
 
     test_tls_fake_modifiers();
     test_udplen();
+    test_quicsplit();
     test_own_after_fakes();
 
     /* A TCP route hint must not turn one QUIC datagram into fragments. */
