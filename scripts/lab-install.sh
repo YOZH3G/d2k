@@ -73,7 +73,7 @@ nfq6_direct() {
 
 echo "== подготовка контейнера =="
 apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq iptables ipset openssl ca-certificates >/dev/null 2>&1
+apt-get install -y -qq iptables ipset iproute2 openssl ca-certificates >/dev/null 2>&1
 command -v start-stop-daemon >/dev/null || fail "нет start-stop-daemon — установщик на такой системе не работает"
 
 case "$(uname -m)" in
