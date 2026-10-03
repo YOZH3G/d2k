@@ -31,7 +31,19 @@
 #include <unistd.h>
 
 #define PROOF_SIZE 120
-#define MAX_CHILDREN 16
+/* Connections are admitted in three pools so one route cannot starve the
+   other: the handshake/header phase, /register and /resolve. A client
+   moves from the first into its route's pool once its headers are read. */
+#define POOL_PENDING 16
+#define POOL_REGISTER 8
+#define POOL_RESOLVE 8
+#define MAX_CHILDREN (POOL_PENDING+POOL_REGISTER+POOL_RESOLVE)
+/* Open connections per client address, whatever their phase. */
+#define CONN_PER_IP 2
+/* TLS handshake plus request headers must arrive within this time; only
+   then does the route's own (longer) budget start. */
+#define HEADER_DEADLINE_SECONDS 4
+#define REQUEST_ALARM_SECONDS 12
 #define HEADER_LIMIT 4096
 #define RESOLVE_BODY_LIMIT 2048
 #define RESOLVE_MAX_NAMES 32
@@ -54,9 +66,12 @@ static const char *const public_resolvers[PUBLIC_RESOLVERS]={"1.1.1.1","8.8.8.8"
 #define RESOLVE_REPLY_LIMIT 8192
 #define REGISTER_PER_IP 6
 #define REGISTER_TOTAL 120
-#define RESOLVE_PER_IP 4
-#define RESOLVE_TOTAL 60
-#define RATE_SLOTS 120
+/* Routers refresh once a day, spread over 01:00-05:00 local time; repeated
+   names are answered from the cache below, so a request costs no DNS. */
+#define RESOLVE_PER_IP 6
+#define RESOLVE_TOTAL 600
+#define RATE_SLOTS 600
+#define CACHE_TTL_SECONDS 600
 
 enum { ROUTE_NONE, ROUTE_HEALTH, ROUTE_REGISTER, ROUTE_RESOLVE };
 
@@ -73,13 +88,26 @@ static const char *const resolve_hosts[]={
     /* META_HOSTS_END */
 };
 
+#define RESOLVE_HOST_COUNT (sizeof(resolve_hosts)/sizeof(resolve_hosts[0]))
+
 typedef struct { uint32_t ip; unsigned count; } ip_bucket;
 typedef struct { time_t minute; unsigned total,used; ip_bucket ips[RATE_SLOTS]; } rate_limit;
+/* One open connection: its child's PID (0 while forking), client address
+   and route (ROUTE_NONE while in the handshake/header phase). */
+typedef struct { int used; pid_t pid; uint32_t ip; int route; } conn_slot;
 /* Children decide by route after reading the request line, so the counters
    live in memory shared with every forked child. owner is the PID holding
    the lock (0: free). */
-typedef struct { atomic_int owner; rate_limit registration,resolution; } shared_limits;
+typedef struct { atomic_int owner; rate_limit registration,resolution; conn_slot conns[MAX_CHILDREN]; } shared_limits;
 static volatile sig_atomic_t stopping;
+
+typedef struct { uint32_t a[RESOLVE_MAX_ADDRESSES]; size_t n; } addr_set;
+/* Shared per-name answers, one entry per allowlisted name (so the cache is
+   bounded by the allowlist); expires is a monotonic second. */
+typedef struct { time_t expires; addr_set set; } cache_entry;
+typedef struct { atomic_int owner; cache_entry entries[RESOLVE_HOST_COUNT]; } shared_cache;
+static shared_cache *answer_cache; /* NULL: no cache */
+static unsigned header_deadline_seconds=HEADER_DEADLINE_SECONDS; /* shortened by the tests */
 
 static int rate_allow(rate_limit *limit,uint32_t ip,time_t now,unsigned per_ip,unsigned total) {
     time_t minute=now/60;
@@ -102,23 +130,69 @@ static shared_limits *shared_limits_create(void) {
    a waiting child. The critical section is a few instructions: a holder that
    is dead (SIGKILL, OOM) or that keeps the lock for the whole wait has lost
    it, and the lock is taken over instead of wedging every later child. */
-static void limits_lock(shared_limits *limits,sigset_t *old) {
+static void shared_lock(atomic_int *owner,sigset_t *old) {
     sigset_t all;sigfillset(&all);
     int me=(int)getpid(),seen=0;
     for(int waited=0;;waited++){
         sigprocmask(SIG_BLOCK,&all,old);
         int expected=0;
-        if(atomic_compare_exchange_strong(&limits->owner,&expected,me))return;
+        if(atomic_compare_exchange_strong(owner,&expected,me))return;
         if(waited==0)seen=expected;
         int stale=expected!=seen?0:(kill(expected,0)!=0&&errno==ESRCH)||waited>=LOCK_WAIT_MS;
         if(expected!=seen){seen=expected;waited=0;}
-        if(stale&&atomic_compare_exchange_strong(&limits->owner,&expected,me))return;
+        if(stale&&atomic_compare_exchange_strong(owner,&expected,me))return;
         sigprocmask(SIG_SETMASK,old,NULL);
         struct timespec pause_ms={0,1000000};nanosleep(&pause_ms,NULL);
     }
 }
-static void limits_unlock(shared_limits *limits,const sigset_t *old) {
-    atomic_store(&limits->owner,0);sigprocmask(SIG_SETMASK,old,NULL);
+static void shared_unlock(atomic_int *owner,const sigset_t *old) {
+    atomic_store(owner,0);sigprocmask(SIG_SETMASK,old,NULL);
+}
+static void limits_lock(shared_limits *limits,sigset_t *old){shared_lock(&limits->owner,old);}
+static void limits_unlock(shared_limits *limits,const sigset_t *old){shared_unlock(&limits->owner,old);}
+
+/* Parent, before fork: a slot for a new connection, or -1 when the client
+   already has CONN_PER_IP open or the handshake/header phase is full. */
+static int conn_admit(shared_limits *limits,uint32_t ip) {
+    sigset_t old;limits_lock(limits,&old);
+    int free_slot=-1;unsigned pending=0,same=0;
+    for(int i=0;i<MAX_CHILDREN;i++){
+        conn_slot *c=&limits->conns[i];
+        if(!c->used){if(free_slot<0)free_slot=i;continue;}
+        if(c->route!=ROUTE_REGISTER&&c->route!=ROUTE_RESOLVE)pending++;
+        if(c->ip==ip)same++;
+    }
+    if(free_slot>=0&&pending<POOL_PENDING&&same<CONN_PER_IP){
+        conn_slot *c=&limits->conns[free_slot];c->used=1;c->pid=0;c->ip=ip;c->route=ROUTE_NONE;
+    }else free_slot=-1;
+    limits_unlock(limits,&old);return free_slot;
+}
+static void conn_set_pid(shared_limits *limits,int slot,pid_t pid) {
+    if(slot<0||slot>=MAX_CHILDREN)return;
+    sigset_t old;limits_lock(limits,&old);limits->conns[slot].pid=pid;limits_unlock(limits,&old);
+}
+static void conn_release_slot(shared_limits *limits,int slot) {
+    if(slot<0||slot>=MAX_CHILDREN)return;
+    sigset_t old;limits_lock(limits,&old);memset(&limits->conns[slot],0,sizeof(limits->conns[slot]));limits_unlock(limits,&old);
+}
+/* Parent, after reaping a child (also one killed by its alarm). */
+static void conn_release_pid(shared_limits *limits,pid_t pid) {
+    if(pid<=0)return;
+    sigset_t old;limits_lock(limits,&old);
+    for(int i=0;i<MAX_CHILDREN;i++)if(limits->conns[i].used&&limits->conns[i].pid==pid)memset(&limits->conns[i],0,sizeof(limits->conns[i]));
+    limits_unlock(limits,&old);
+}
+/* Child, after its headers: 1 when the route's own pool has room (the slot
+   then counts there), 0 when it is full. /health and errors are not pooled. */
+static int conn_route(shared_limits *limits,int slot,int route) {
+    if(route!=ROUTE_REGISTER&&route!=ROUTE_RESOLVE)return 1;
+    if(slot<0||slot>=MAX_CHILDREN)return 1;
+    unsigned cap=route==ROUTE_REGISTER?POOL_REGISTER:POOL_RESOLVE,in=0;
+    sigset_t old;limits_lock(limits,&old);
+    for(int i=0;i<MAX_CHILDREN;i++)if(i!=slot&&limits->conns[i].used&&limits->conns[i].route==route)in++;
+    int ok=in<cap;
+    if(ok)limits->conns[slot].route=route;
+    limits_unlock(limits,&old);return ok;
 }
 
 /* 200 when the route may proceed, 429 when its own counter is exhausted.
@@ -332,12 +406,32 @@ static udp_dns udp_state;
 static dns_transport udp_transport={&udp_state,udp_open,udp_send,udp_recv,udp_close};
 static dns_transport *public_dns=&udp_transport; /* replaced by the tests */
 
-typedef struct { uint32_t a[RESOLVE_MAX_ADDRESSES]; size_t n; } addr_set;
 static void addr_add(addr_set *set,const uint32_t *a,size_t n) {
     for(size_t i=0;i<n&&set->n<RESOLVE_MAX_ADDRESSES;i++){
         size_t k;for(k=0;k<set->n;k++)if(set->a[k]==a[i])break;
         if(k==set->n)set->a[set->n++]=a[i];
     }
+}
+
+static shared_cache *answer_cache_create(void) {
+    shared_cache *cache=mmap(NULL,sizeof(*cache),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    if(cache==MAP_FAILED)return NULL;
+    memset(cache,0,sizeof(*cache));atomic_init(&cache->owner,0);return cache;
+}
+static int cache_get(int index,addr_set *out) {
+    if(!answer_cache)return 0;
+    sigset_t old;shared_lock(&answer_cache->owner,&old);
+    const cache_entry *e=&answer_cache->entries[index];
+    int hit=e->set.n>0&&e->expires>clock_now();
+    if(hit)*out=e->set;
+    shared_unlock(&answer_cache->owner,&old);return hit;
+}
+/* Only non-empty answers: a failed lookup is retried by the next request. */
+static void cache_put(int index,const addr_set *set) {
+    if(!answer_cache||!set->n)return;
+    sigset_t old;shared_lock(&answer_cache->owner,&old);
+    answer_cache->entries[index].set=*set;answer_cache->entries[index].expires=clock_now()+CACHE_TTL_SECONDS;
+    shared_unlock(&answer_cache->owner,&old);
 }
 
 /* Asks every public resolver for every name at once and waits at most
@@ -420,23 +514,30 @@ static int handle_resolve(const char *body,size_t length,char *out,size_t cap,si
     }while(json_char(&p,end,','));
     if(!json_char(&p,end,']')||!json_char(&p,end,'}'))return 400;
     json_space(&p,end);if(p!=end)return 400;
+    /* Cached names need no DNS; the rest are looked up together. */
+    addr_set answers[RESOLVE_MAX_NAMES];int cached[RESOLVE_MAX_NAMES]={0},missing[RESOLVE_MAX_NAMES];size_t misses=0;
+    for(size_t i=0;i<count;i++){answers[i].n=0;if(cache_get(order[i],&answers[i]))cached[i]=1;else missing[misses++]=order[i];}
     /* Public resolvers first in time (bounded, all at once), only when the
        phase and the reply still fit before the deadline. */
     addr_set pub[RESOLVE_MAX_NAMES][PUBLIC_RESOLVERS];memset(pub,0,sizeof(pub));
-    if(!deadline||clock_ms()+PUBLIC_PHASE_MS<=(int64_t)deadline*1000)public_phase(order,count,pub);
+    if(misses&&(!deadline||clock_ms()+PUBLIC_PHASE_MS<=(int64_t)deadline*1000))public_phase(missing,misses,pub);
+    for(size_t i=0,m=0;i<count;i++){
+        if(cached[i])continue;
+        uint32_t raw[32];size_t got=0;
+        if(!deadline||clock_now()+RESOLVE_NAME_BUDGET<=deadline){
+            int r=resolver(resolve_hosts[order[i]],raw,sizeof(raw)/sizeof(raw[0]));got=r>0?(size_t)r:0;
+        }
+        /* The VPS's own answer first, then each public resolver in order. */
+        addr_add(&answers[i],raw,got);
+        for(size_t s=0;s<PUBLIC_RESOLVERS;s++)addr_add(&answers[i],pub[m][s].a,pub[m][s].n);
+        m++;cache_put(order[i],&answers[i]);
+    }
     size_t used=0;int n;
 #define EMIT(...) do{n=snprintf(out+used,cap-used,__VA_ARGS__);if(n<0||(size_t)n>=cap-used)return 502;used+=(size_t)n;}while(0)
     EMIT("{\"results\":{");
     for(size_t i=0;i<count;i++){
         const char *host=resolve_hosts[order[i]];
-        uint32_t raw[32];size_t got=0;addr_set set={.n=0};
-        if(!deadline||clock_now()+RESOLVE_NAME_BUDGET<=deadline){
-            int r=resolver(host,raw,sizeof(raw)/sizeof(raw[0]));got=r>0?(size_t)r:0;
-        }
-        /* The VPS's own answer first, then each public resolver in order. */
-        addr_add(&set,raw,got);
-        for(size_t s=0;s<PUBLIC_RESOLVERS;s++)addr_add(&set,pub[i][s].a,pub[i][s].n);
-        const uint32_t *unique=set.a;size_t kept=set.n;
+        const uint32_t *unique=answers[i].a;size_t kept=answers[i].n;
         EMIT("%s\"%s\":[",i?",":"",host);
         for(size_t j=0;j<kept;j++){
             char text[INET_ADDRSTRLEN];struct in_addr a={.s_addr=unique[j]};
@@ -498,20 +599,21 @@ static void reply_json(SSL *ssl,const char *body,size_t length) {
 
 static void reply(SSL *ssl,int code) {
     const char *reason=code==200?"OK":code==204?"No Content":code==400?"Bad Request":
-        code==404?"Not Found":code==409?"Conflict":code==429?"Too Many Requests":"Bad Gateway";
+        code==404?"Not Found":code==409?"Conflict":code==429?"Too Many Requests":
+        code==503?"Service Unavailable":"Bad Gateway";
     char response[256];
     int n=snprintf(response,sizeof(response),"HTTP/1.1 %d %s\r\nContent-Length: 0\r\n"
         "Cache-Control: no-store\r\n%sConnection: close\r\n\r\n",code,reason,
-        code==429?"Retry-After: 60\r\n":"");
+        code==429?"Retry-After: 60\r\n":code==503?"Retry-After: 30\r\n":"");
     if(n>0&&(size_t)n<sizeof(response))ssl_write_all(ssl,response,(size_t)n);
 }
 
-static void serve_client(int fd,const char *peer,uint32_t peer_ip,shared_limits *limits,const char *certificate,
-                         const char *key,const char *secret,uint16_t upstream_port) {
-    /* A wall-clock limit also bounds byte-at-a-time slow senders and DNS. */
-    alarm(12);
-    time_t deadline=monotonic_seconds()+RESOLVE_DEADLINE_SECONDS;
-    struct timeval timeout={.tv_sec=8,.tv_usec=0};
+static void serve_client(int fd,const char *peer,uint32_t peer_ip,shared_limits *limits,int slot,
+                         const char *certificate,const char *key,const char *secret,uint16_t upstream_port) {
+    /* A short wall-clock limit for the handshake and headers bounds idle and
+       byte-at-a-time clients before they reach a route's pool. */
+    alarm(header_deadline_seconds);
+    struct timeval timeout={.tv_sec=(time_t)header_deadline_seconds,.tv_usec=0};
     (void)setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
     (void)setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
     SSL_CTX *ctx=SSL_CTX_new(TLS_server_method());SSL *ssl=NULL;
@@ -527,6 +629,14 @@ static void serve_client(int fd,const char *peer,uint32_t peer_ip,shared_limits 
     if(strlen(headers)!=used){reply(ssl,400);goto done;}
     int route=ROUTE_NONE;
     int code=parse_headers(headers,&length,&route);
+    /* The route's own budget starts now; DNS and the body fit inside it. */
+    alarm(REQUEST_ALARM_SECONDS);
+    time_t deadline=monotonic_seconds()+RESOLVE_DEADLINE_SECONDS;
+    timeout.tv_sec=8;
+    (void)setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+    (void)setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
+    /* A full pool turns the client away before it spends a rate counter. */
+    if(!conn_route(limits,slot,route)){reply(ssl,503);goto done;}
     /* Each route spends only its own counter, also on malformed requests. */
     if(route_status(limits,route,peer_ip,time(NULL))==429){reply(ssl,429);goto done;}
     if(code!=200){reply(ssl,code);goto done;}
@@ -587,19 +697,24 @@ int main(int argc,char **argv) {
     struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(port),.sin_addr={.s_addr=htonl(INADDR_ANY)}};
     if(bind(listener,(struct sockaddr *)&addr,sizeof(addr))!=0||listen(listener,32)!=0){close(listener);perror("enrollment listener");return 1;}
     fprintf(stderr,"D2K C enrollment listening on %u\n",(unsigned)port);
-    unsigned children=0;shared_limits *limits=shared_limits_create();
+    shared_limits *limits=shared_limits_create();
     if(!limits){close(listener);fputs("cannot allocate rate limits\n",stderr);return 1;}
+    answer_cache=answer_cache_create();
+    if(!answer_cache)fputs("no shared /resolve cache; every request asks DNS\n",stderr);
     while(!stopping){
-        while(waitpid(-1,NULL,WNOHANG)>0)if(children)children--;
+        pid_t done;while((done=waitpid(-1,NULL,WNOHANG))>0)conn_release_pid(limits,done);
         struct sockaddr_in peer;socklen_t peer_len=sizeof(peer);
         int fd=accept(listener,(struct sockaddr *)&peer,&peer_len);
         if(fd<0){if(errno==EINTR)continue;break;}
-        if(children>=MAX_CHILDREN){close(fd);continue;}
         char ip[INET_ADDRSTRLEN];if(!inet_ntop(AF_INET,&peer.sin_addr,ip,sizeof(ip))){close(fd);continue;}
+        /* Per-address and handshake-phase caps are applied before TLS. */
+        int slot=conn_admit(limits,peer.sin_addr.s_addr);
+        if(slot<0){close(fd);continue;}
         pid_t pid=fork();
         if(pid==0){close(listener);(void)signal(SIGTERM,SIG_DFL);(void)signal(SIGINT,SIG_DFL);
-            serve_client(fd,ip,peer.sin_addr.s_addr,limits,certificate,key,secret,upstream);OPENSSL_cleanse(secret,sizeof(secret));_exit(0);}
-        close(fd);if(pid>0)children++;
+            serve_client(fd,ip,peer.sin_addr.s_addr,limits,slot,certificate,key,secret,upstream);OPENSSL_cleanse(secret,sizeof(secret));_exit(0);}
+        close(fd);
+        if(pid>0)conn_set_pid(limits,slot,pid);else conn_release_slot(limits,slot);
     }
     close(listener);OPENSSL_cleanse(secret,sizeof(secret));return 0;
 }

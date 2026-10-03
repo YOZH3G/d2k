@@ -23,6 +23,15 @@ static void test_proof(void) {
     tg_identity_cleanup(&identity);unlink(path);rmdir(directory);
 }
 
+static void test_resolve_budget_sizes(void) {
+    /* I1: 600 /resolve per minute fleet-wide, 6 per address. */
+    assert(RESOLVE_TOTAL==600&&RESOLVE_PER_IP==6&&RATE_SLOTS>=RESOLVE_TOTAL);
+    rate_limit *limit=calloc(1,sizeof(*limit));assert(limit);
+    for(uint32_t i=0;i<RESOLVE_TOTAL;i++)assert(rate_allow(limit,i+1,60,RESOLVE_PER_IP,RESOLVE_TOTAL));
+    assert(!rate_allow(limit,999999,60,RESOLVE_PER_IP,RESOLVE_TOTAL));
+    free(limit);
+}
+
 static void test_rate_limit(void) {
     rate_limit limit={0};time_t now=120;
     for(int i=0;i<6;i++)assert(rate_allow(&limit,1,now,REGISTER_PER_IP,REGISTER_TOTAL));
@@ -68,6 +77,10 @@ static int fake_resolve(const char *host,uint32_t *out,size_t cap) {
     }
     if(strcmp(host,"v.whatsapp.com")==0)for(uint32_t i=0;i<12&&n<cap;i++)out[n++]=htonl(0x39900000u+i);
     return (int)n;
+}
+
+static int other_resolve(const char *host,uint32_t *out,size_t cap) {
+    (void)host;if(!cap)return 0;out[0]=htonl(0x0a0a0a0au);return 1;
 }
 
 static int resolve_json(const char *body,char *out,size_t cap) {
@@ -168,8 +181,10 @@ static void make_cert(void) {
 }
 static int full_request(shared_limits *limits,uint32_t ip,const char *request,size_t length,char *reply,size_t cap) {
     int sv[2];assert(socketpair(AF_UNIX,SOCK_STREAM,0,sv)==0);
+    int slot=conn_admit(limits,ip);assert(slot>=0);
     pid_t child=fork();assert(child>=0);
-    if(child==0){close(sv[0]);serve_client(sv[1],"192.0.2.9",ip,limits,cert_path,cert_path,"test-only",1);_exit(0);}
+    if(child==0){close(sv[0]);serve_client(sv[1],"192.0.2.9",ip,limits,slot,cert_path,cert_path,"test-only",1);_exit(0);}
+    conn_set_pid(limits,slot,child);
     close(sv[1]);
     SSL_CTX *ctx=SSL_CTX_new(TLS_client_method());assert(ctx);SSL_CTX_set_verify(ctx,SSL_VERIFY_NONE,NULL);
     SSL *ssl=SSL_new(ctx);assert(ssl&&SSL_set_fd(ssl,sv[0])==1&&SSL_connect(ssl)==1);
@@ -177,7 +192,7 @@ static int full_request(shared_limits *limits,uint32_t ip,const char *request,si
     size_t used=0;
     for(;;){size_t n=0;if(SSL_read_ex(ssl,reply+used,cap-1-used,&n)!=1||!n)break;used+=n;assert(used<cap-1);}
     reply[used]='\0';SSL_free(ssl);SSL_CTX_free(ctx);close(sv[0]);
-    int status=0;assert(waitpid(child,&status,0)==child&&WIFEXITED(status));
+    int status=0;assert(waitpid(child,&status,0)==child&&WIFEXITED(status));conn_release_pid(limits,child);
     int code=0;assert(sscanf(reply,"HTTP/1.1 %3d",&code)==1);return code;
 }
 static int post(shared_limits *limits,uint32_t ip,const char *path,const char *body,size_t length,char *reply,size_t cap) {
@@ -207,7 +222,79 @@ static void test_full_path(void) {
     assert(post(limits,11,"/register",(const char *)proof,sizeof(proof),reply,sizeof(reply))==400);
     const char health[]="GET /health HTTP/1.1\r\nHost: relay\r\n\r\n";
     assert(full_request(limits,11,health,sizeof(health)-1,reply,sizeof(reply))==204);
+    /* I1: a cached name is answered from the shared cache, without DNS. */
+    answer_cache=answer_cache_create();assert(answer_cache);
+    assert(post(limits,13,"/resolve",good,strlen(good),reply,sizeof(reply))==200);
+    resolver=other_resolve;
+    assert(post(limits,13,"/resolve",good,strlen(good),reply,sizeof(reply))==200);
+    assert(strstr(reply,"{\"results\":{\"instagram.com\":[\"157.240.0.174\",\"57.144.248.34\"]}}"));
+    /* I2: a full /resolve pool answers 503; /register keeps its own pool. */
+    int held[POOL_RESOLVE];
+    for(int i=0;i<POOL_RESOLVE;i++){held[i]=conn_admit(limits,(uint32_t)(100+i));assert(held[i]>=0);
+        conn_set_pid(limits,held[i],(pid_t)(900000+i));assert(conn_route(limits,held[i],ROUTE_RESOLVE));}
+    assert(post(limits,14,"/resolve",good,strlen(good),reply,sizeof(reply))==503);
+    assert(strstr(reply,"Retry-After: "));
+    assert(post(limits,14,"/register",(const char *)proof,sizeof(proof),reply,sizeof(reply))==400);
+    for(int i=0;i<POOL_RESOLVE;i++)conn_release_pid(limits,(pid_t)(900000+i));
+    assert(post(limits,14,"/resolve",good,strlen(good),reply,sizeof(reply))==200);
+    /* A client that sends nothing is closed at the short header deadline. */
+    header_deadline_seconds=1;
+    int sv[2];assert(socketpair(AF_UNIX,SOCK_STREAM,0,sv)==0);
+    int slot=conn_admit(limits,15);assert(slot>=0);
+    time_t began=time(NULL);pid_t child=fork();assert(child>=0);
+    if(child==0){close(sv[0]);serve_client(sv[1],"192.0.2.9",15,limits,slot,cert_path,cert_path,"test-only",1);_exit(0);}
+    close(sv[1]);int status=0;assert(waitpid(child,&status,0)==child);conn_release_pid(limits,child);
+    assert(time(NULL)-began<=3);close(sv[0]);header_deadline_seconds=HEADER_DEADLINE_SECONDS;
+    munmap(answer_cache,sizeof(*answer_cache));answer_cache=NULL;
     resolver=system_resolve;unlink(cert_path);
+}
+
+/* I2: separate pools per route, a per-IP connection cap and a pending cap,
+   all released by PID when the child is reaped. */
+static void test_conn_pools(void) {
+    shared_limits *limits=shared_limits_create();assert(limits);
+    int a=conn_admit(limits,1),b=conn_admit(limits,1);assert(a>=0&&b>=0&&a!=b);
+    assert(conn_admit(limits,1)<0);                 /* per-IP concurrency */
+    conn_set_pid(limits,a,4001);conn_set_pid(limits,b,4002);
+    conn_release_pid(limits,4001);assert(conn_admit(limits,1)>=0);
+    shared_limits *p=shared_limits_create();assert(p);
+    for(int i=0;i<POOL_PENDING;i++){int s=conn_admit(p,(uint32_t)(10+i));assert(s>=0);conn_set_pid(p,s,5000+i);}
+    assert(conn_admit(p,99)<0);                     /* handshake/header phase is capped */
+    for(int i=0;i<POOL_REGISTER;i++){
+        int s=-1;for(int k=0;k<MAX_CHILDREN;k++)if(p->conns[k].pid==5000+i)s=k;
+        assert(s>=0&&conn_route(p,s,i<POOL_RESOLVE?ROUTE_RESOLVE:ROUTE_REGISTER));
+    }
+    /* Pending slots moved into the /resolve pool: new connections fit again,
+       but a ninth /resolve does not, while /register still has room. */
+    int s=conn_admit(p,200);assert(s>=0);conn_set_pid(p,s,6000);
+    assert(!conn_route(p,s,ROUTE_RESOLVE));
+    assert(conn_route(p,s,ROUTE_REGISTER));
+    assert(conn_route(p,s,ROUTE_HEALTH)); /* health is never pooled */
+    conn_release_pid(p,5000);
+    int t=conn_admit(p,201);assert(t>=0);conn_set_pid(p,t,6001);assert(conn_route(p,t,ROUTE_RESOLVE));
+    munmap(limits,sizeof(*limits));munmap(p,sizeof(*p));
+}
+
+/* I1: answers are cached per name for CACHE_TTL_SECONDS; empty answers are
+   not cached; capacity is the fixed allowlist. */
+static void test_answer_cache(void) {
+    answer_cache=answer_cache_create();assert(answer_cache);
+    resolver=fake_resolve;clock_ms=fake_clock;fake_ms=1000000; /* public_dns is no_dns here (main) */
+    char out[RESOLVE_REPLY_LIMIT],first[RESOLVE_REPLY_LIMIT];size_t used=0;
+    const char *body="{\"hosts\":[\"instagram.com\",\"i.instagram.com\"]}";
+    int before=fake_calls;
+    assert(handle_resolve(body,strlen(body),first,sizeof(first),&used,0)==200);
+    assert(fake_calls==before+2);
+    assert(handle_resolve(body,strlen(body),out,sizeof(out),&used,0)==200);
+    assert(strcmp(out,first)==0);
+    assert(fake_calls==before+3); /* instagram.com cached; empty i.instagram.com asked again */
+    fake_ms+=(CACHE_TTL_SECONDS-1)*1000;
+    assert(handle_resolve(body,strlen(body),out,sizeof(out),&used,0)==200&&fake_calls==before+4);
+    fake_ms+=2000;                /* expired */
+    assert(handle_resolve(body,strlen(body),out,sizeof(out),&used,0)==200&&fake_calls==before+6);
+    assert(sizeof(answer_cache->entries)/sizeof(answer_cache->entries[0])==sizeof(resolve_hosts)/sizeof(resolve_hosts[0]));
+    munmap(answer_cache,sizeof(*answer_cache));answer_cache=NULL;
+    resolver=system_resolve;clock_ms=monotonic_ms;
 }
 
 /* ---- Task 45: several independent resolvers ---------------------------- */
@@ -436,4 +523,4 @@ static void test_upstream_contract(void) {
 int main(void){(void)signal(SIGPIPE,SIG_IGN);
     /* Unit tests never reach real DNS servers. */
     public_dns=&no_dns;
-    test_proof();test_rate_limit();test_route_limits();test_http_boundaries();test_resolve();test_resolve_budget();test_dns_parse();test_dns_cname_chain();public_dns=&fake_dns;test_resolver_union();test_silent_resolvers();public_dns=&no_dns;test_lock_recovery();test_full_path();test_upstream_contract();puts("C enrollment server: proof, rate limits, HTTP boundaries, /resolve (budget, resolver union, DNS parsing, lock recovery, full TLS path) and upstream contract passed");return 0;}
+    test_proof();test_resolve_budget_sizes();test_rate_limit();test_conn_pools();test_route_limits();test_http_boundaries();test_resolve();test_resolve_budget();test_dns_parse();test_dns_cname_chain();public_dns=&fake_dns;test_resolver_union();test_silent_resolvers();public_dns=&no_dns;test_lock_recovery();test_answer_cache();test_full_path();test_upstream_contract();puts("C enrollment server: proof, rate limits, HTTP boundaries, /resolve (budget, cache, resolver union, DNS parsing, lock recovery, full TLS path), connection pools and upstream contract passed");return 0;}

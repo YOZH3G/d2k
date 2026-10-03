@@ -41,14 +41,21 @@ fits before the deadline; replies must match the query ID and question, and
 truncated or malformed ones are ignored; CNAMEs are followed only inside the
 answer section. Per name: the VPS answer first, then each resolver in order, at
 most 8 distinct, in request order; a name with nothing (or reached after the
-~10 s request deadline) gets `[]`. The 12 s per-connection alarm remains the
+~10 s request deadline) gets `[]`. The 12 s alarm after the headers remains the
 hard limit. The VPS needs outbound UDP 53 to those three resolvers.
+A non-empty answer is cached per name for 10 minutes in memory shared with the
+children (one entry per allowlisted name, so the cache is bounded); a request whose
+names are all cached costs no DNS and returns at once. Empty answers are not cached.
 
 There is no authentication: the answer is public DNS data for a fixed list, and a
 secret embedded in public router code would protect nothing. Protection is the
-name allowlist, body limit, the existing child/deadline limits and a separate rate
-limit — 4 requests per source IP/minute and 60 total/minute — that never shares a
-counter with `/register` (6/IP, 120 total). Counters are per route and live in
+name allowlist, body limit, the connection limits below and a separate rate
+limit — 6 requests per source IP/minute and 600 total/minute — that never shares a
+counter with `/register` (6/IP, 120 total). Connections are admitted in separate
+pools: at most 16 in the TLS handshake/header phase, then 8 for `/register` and 8
+for `/resolve` (a full pool answers 503 with `Retry-After: 30` before any rate
+counter is spent), and at most 2 open connections per client address. The
+handshake and headers must arrive within 4 s. Counters are per route and live in
 memory shared with the forked children; `/health` is not counted. A child that
 dies holding the counter lock cannot wedge the service: the lock is taken over
 from a dead holder, or after one second. Lookups are bounded (`RES_OPTIONS`
