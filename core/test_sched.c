@@ -201,6 +201,7 @@ static int vol_direct_complete;
 static int resource_fixture;
 static int resource_volume_calls, resource_verify_calls;
 
+static int vol_rx_packets; /* задача 55: пакеты на обрыве identity */
 static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
                                int plain, int tls12, size_t hello_wire,
                                uint32_t mark) {
@@ -220,6 +221,7 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     r.rx_tls_unavailable = vol_rx_tls_unavailable;
     r.rx_direct_complete = vol_direct_complete;
     r.rx_at_kb = vol_rx_at_kb;
+    r.rx_cut_packets = vol_rx_cut ? vol_rx_packets : 0;
     r.rx_expected_kb = 96;
     r.rx_compressed_complete = vol_rx_cut;
     if (resource_fixture) {
@@ -316,6 +318,14 @@ static int ver_last_fd = -2;
 static int ver_socket_family;
 static uint8_t ver_last_shape;
 
+/* ЗАДАЧА 55: исход проверки бюджета потока по номеру обращения (1..n) и
+   бюджет, с которым зонд позван (поточная настройка d2k_verify). Пусто —
+   проверка «не просилась» (0), как у прежних тестов. */
+static int ver_budget_seq[8];
+static int ver_budget_n;
+static unsigned ver_budget_seen[8];
+static int ver_budget_status = 200;
+
 static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_t transport,
                                const char *sni, int deadline_ms, size_t hello_wire,
                                uint8_t client_shape) {
@@ -355,6 +365,16 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
                   ? D2K_VER_HANDSHAKE : ver_answer;
     r.status = (r.level == D2K_VER_APPLICATION) ? 200 : 0;
     r.local_limit = r.level == D2K_VER_APPLICATION ? 0 : ver_local_limit;
+    if (ver_calls >= 1 && ver_calls <= 8) ver_budget_seen[ver_calls - 1] = d2k_verify_budget_get();
+    if (r.level == D2K_VER_APPLICATION && ver_calls >= 1 && ver_calls <= ver_budget_n) {
+        unsigned b = d2k_verify_budget_get();
+        r.status = ver_budget_status;
+        r.budget = ver_budget_seq[ver_calls - 1];
+        r.budget_need = 2 * b;
+        r.budget_packets = r.budget == D2K_BUDGET_PASSED ? 2 * b : r.budget == D2K_BUDGET_CUT ? b : 9;
+        r.budget_requests = r.budget == D2K_BUDGET_NOT_APPLICABLE ? 1 : 6;
+        snprintf(r.budget_note, sizeof r.budget_note, "подменённый бюджет %d", r.budget);
+    }
     /* Тот же местный конец, что в ключах событий этого теста (ev_hello). */
     memcpy(r.local_ip4, ver_local_ip4, sizeof r.local_ip4);
     r.family = ver_socket_family == AF_INET6 ? 6 : 4;
@@ -8044,7 +8064,9 @@ rx_volume_tests:
         d2k_sched_set_say(s, collect_say, NULL);
         vol_answer = D2K_VOL_PASSED;
         vol_rx_cut = 1;
-        tcp_calls = 0;
+        vol_rx_packets = 26; /* задача 55: бюджет коробки из её замера */
+        tcp_calls = 0; ver_calls = 0;
+        memset(ver_budget_seen, 0, sizeof ver_budget_seen);
         d2k_verdict rx_tcp_was = tcp_answer;
         tcp_answer = D2K_V_CLEAR; /* объём — после CLEAR классификатора (задача 30) */
         d2k_ev h = ev_hello(6, 40081, "непрофильная.цель");
@@ -8062,7 +8084,9 @@ rx_volume_tests:
         CHECK(sent_contains_plan_payload("hcaptcha.com"),
               "RX-volume не приоритизировал fake-SNI/multisplit-кандидат");
         if (!sent_contains_plan_payload("hcaptcha.com")) { fprintf(stderr, "%s\n", saidbuf); }
-        vol_rx_cut = 0;
+        CHECK(ver_calls >= 1 && ver_budget_seen[0] == 26,
+              "задача 55: кандидат испытан не с бюджетом из замера коробки (пакеты на обрыве identity)");
+        vol_rx_cut = 0; vol_rx_packets = 0;
         tcp_answer = rx_tcp_was;
         d2k_sched_free(s);
         d2k_catalog_free(&cRx);
@@ -11912,6 +11936,239 @@ own_first_test:
             CHECK(said("срок фазы своих планов"), "own-first life cap: конец фазы по сроку не сказан");
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+
+        /* ---- ЗАДАЧА 55: проверка бюджета потока (поле 04.10, Cloudflare) ----
+           (n1) cdn.discordapp.com: план без приманки (только разрез) отвечает
+           403, а посреди повторов сервер замолкает на 25 пакетах — НЕ
+           подтверждён; план с приманкой первым держит поток — подтверждён,
+           привязка помечена «бюджет пройден». Бюджет без замера коробки — 25. */
+        {
+            d2k_catalog c = {0};
+            char p_split[40], p_fake[40];
+            own_box(&c, "box-428176d8", p_split, 61, 9, "media.budget.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000500, 0);
+            own_box(&c, "box-e67d8c22", p_fake, 62, 2, "discord.budget.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1; ver_fail_first = 0;
+            ver_budget_n = 2; ver_budget_seq[0] = D2K_BUDGET_CUT; ver_budget_seq[1] = D2K_BUDGET_PASSED;
+            ver_budget_status = 403;
+            memset(ver_budget_seen, 0, sizeof ver_budget_seen);
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5); forget_sent();
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42301;
+            d2k_ev h = ev_hello(6, 42301, "cdn.budget.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42301); d2k_sched_event(s, &su);
+            for (int i = 0; i < 60 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 100);
+                d2k_ev ap = ev_applied(6, 42301); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            CHECK(sent_first_split_index(61) == 0 && sent_first_split_index(62) == 1,
+                  "budget: стенд — свои планы не в порядке «успехи, затем свежесть»");
+            CHECK(said("посреди повторов") && said("не подтверждаю"),
+                  "budget: обрыв посреди повторов не назван под кандидатом");
+            const d2k_cat_binding *bd = binding_of(&c, "cdn.budget.own", 6);
+            CHECK(bd && !strcmp(bd->plan_id, p_fake) && bd->budget == D2K_CAT_BUDGET_PASSED,
+                  "budget: подтверждён план, не прошедший бюджет, или отметка не записана");
+            CHECK(ver_budget_seen[0] == D2K_BUDGET_FIELD_PACKETS && ver_budget_seen[1] == D2K_BUDGET_FIELD_PACKETS,
+                  "budget: без замера коробки бюджет зонда не 25 (поле 04.10)");
+            CHECK(said("бюджет потока пройден") && said("50"),
+                  "budget: строка подтверждения без числа пакетов и исхода");
+            CHECK(tcp_calls == 0, "budget: полный замер пошёл, хотя свой план прошёл бюджет");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_budget_n = 0; ver_budget_status = 200;
+        }
+
+        /* (n2) Keep-alive не дают («не применимо»): подтверждение прежнее,
+           привязка помечена «бюджет не проверен». */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-ka", pid, 63, 3, "ka.budget.own", 6, D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1; ver_fail_first = 0;
+            ver_budget_n = 1; ver_budget_seq[0] = D2K_BUDGET_NOT_APPLICABLE;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5); forget_sent();
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42302;
+            d2k_ev h = ev_hello(6, 42302, "close.budget.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42302); d2k_sched_event(s, &su);
+            for (int i = 0; i < 60 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 100);
+                d2k_ev ap = ev_applied(6, 42302); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            const d2k_cat_binding *bd = binding_of(&c, "close.budget.own", 6);
+            CHECK(bd && !strcmp(bd->plan_id, pid) && bd->budget == D2K_CAT_BUDGET_UNCHECKED,
+                  "budget n/a: подтверждение не прежнее или привязка не помечена «не проверен»");
+            CHECK(said("бюджет потока не проверен"), "budget n/a: исход не назван");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_budget_n = 0;
+        }
+
+        /* (n3) Установка: из двух включённых привязок одного ключа ставится
+           прошедшая бюджет, а не новейшая непроверенная; без отметок —
+           новейшая, как прежде. Каталог не правится. */
+        for (int marked = 0; marked < 2; marked++) {
+            d2k_catalog c = {0};
+            char p_old[40], p_new[40];
+            own_box(&c, "box-sel-old", p_old, 71, 5, "sel.budget.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            own_box(&c, "box-sel-new", p_new, 72, 1, "sel.budget.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000900, 0);
+            if (marked) c.boxes[0].binds[0].budget = D2K_CAT_BUDGET_PASSED;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            int old_at = sent_first_split_index(71), new_at = sent_first_split_index(72);
+            CHECK(marked ? (old_at >= 0 && new_at < 0) : (old_at < 0 && new_at >= 0),
+                  marked ? "budget install: поставлена новейшая непроверенная, а не прошедшая бюджет"
+                         : "budget install: без отметок поставлена не новейшая");
+            CHECK(c.n_boxes == 2 && c.boxes[0].n_binds == 1 && c.boxes[1].n_binds == 1,
+                  "budget install: каталог правился выбором установки");
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+
+        /* (n4) Подозрение с потока ПОД планом: привязанный план не исключается
+           вслепую, а испытывается ПЕРВЫМ с бюджетом. Прошёл — подозрение
+           ложное, привязка переподтверждена, другие планы не пробуются.
+           (n5) Оборвался — исключён, дальше свои планы по порядку. */
+        for (int cut = 0; cut < 2; cut++) {
+            d2k_catalog c = {0};
+            char p_bound[40], p_other[40];
+            const char *name = cut ? "gw-cut.bound.own" : "gw.bound.own";
+            own_box(&c, "box-bound", p_bound, 81, 2, name, 6, D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            own_box(&c, "box-other", p_other, 82, 9, "other.bound.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000500, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1; ver_fail_first = 0;
+            ver_budget_n = 2;
+            ver_budget_seq[0] = cut ? D2K_BUDGET_CUT : D2K_BUDGET_PASSED;
+            ver_budget_seq[1] = D2K_BUDGET_PASSED;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5); forget_sent();
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            uint16_t port = (uint16_t)(42310 + cut);
+            ver_answer_port = port;
+            d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, port); su.planned = D2K_LINK_PLANNED_YES;
+            d2k_sched_event(s, &su);
+            for (int i = 0; i < 60 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 100);
+                d2k_ev ap = ev_applied(6, port); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            CHECK(sent_first_split_index(81) == 0,
+                  "budget suspicion: план, под которым пришло подозрение, не испытан первым");
+            const d2k_cat_binding *bd = NULL;
+            for (size_t i = 0; i < c.n_boxes; i++)
+                for (size_t j = 0; j < c.boxes[i].n_binds; j++)
+                    if (!strcmp(c.boxes[i].binds[j].target, name) &&
+                        c.boxes[i].binds[j].budget == D2K_CAT_BUDGET_PASSED) bd = &c.boxes[i].binds[j];
+            if (!cut) {
+                CHECK(ver_calls == 1 && sent_first_split_index(82) < 0 && tcp_calls == 0,
+                      "budget suspicion: после прохода бюджета пробовались другие планы");
+                CHECK(bd && !strcmp(bd->plan_id, p_bound) && bd->successes >= 3,
+                      "budget suspicion: привязка не переподтверждена с отметкой бюджета");
+                CHECK(said("подозрение было ложным"), "budget suspicion: ложное подозрение не названо");
+            } else {
+                CHECK(sent_first_split_index(82) == 1 && ver_calls == 2,
+                      "budget suspicion: после обрыва привязанного плана свои не пошли по порядку");
+                CHECK(bd && !strcmp(bd->plan_id, p_other),
+                      "budget suspicion: прошедший бюджет свой план не подтверждён");
+            }
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_budget_n = 0;
+        }
+
+        /* (n6) QUIC: то же по новым потокам HTTP/3. abc2b3eb (одна короткая
+           приманка) режется на 25 датаграммах — не подтверждён; 389a3920
+           (приманки Initial) проходит — подтверждён с отметкой. */
+        {
+            d2k_catalog c = {0};
+            char p_min[40], p_fakes[40];
+            own_box(&c, "box-q-min", p_min, 91, 7, "media.qbudget.own", 17, D2K_LINK_SHAPE_QUIC, 4,
+                    1790000500, 0);
+            own_box(&c, "box-q-fakes", p_fakes, 92, 3, "rutracker.qbudget.own", 17, D2K_LINK_SHAPE_QUIC, 4,
+                    1790000000, 0);
+            d2k_sched_quic_base_hook = stub_quic_base;
+            d2k_sched_quic_seeded_hook = stub_quic_seeded;
+            quic_answer = D2K_V_INCONCLUSIVE; base_blocked_answer = 1;
+            ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+            ver_budget_n = 2; ver_budget_seq[0] = D2K_BUDGET_CUT; ver_budget_seq[1] = D2K_BUDGET_PASSED;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            quic_base_calls = quic_seeded_calls = quic_calls = base_calls = ver_calls = 0;
+            ver_answer_port = 42320;
+            forget_sent();
+            d2k_ev h = ev_hello(17, 42320, "cdn.qbudget.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 42320); d2k_sched_event(s, &su);
+            for (int i = 0; i < 60 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 100);
+                d2k_ev ap = ev_applied(17, 42320); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            const d2k_cat_binding *bd = binding_of(&c, "cdn.qbudget.own", 17);
+            CHECK(ver_calls == 2 && ver_last_transport == 17 && said("посреди повторов"),
+                  "budget QUIC: обрыв посреди потоков HTTP/3 не отверг первый план");
+            CHECK(bd && !strcmp(bd->plan_id, p_fakes) && bd->budget == D2K_CAT_BUDGET_PASSED,
+                  "budget QUIC: подтверждён не прошедший бюджет план");
+            CHECK(ver_budget_seen[0] == D2K_BUDGET_FIELD_PACKETS,
+                  "budget QUIC: зонд QUIC позван без бюджета");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_quic_base_hook = NULL;
+            d2k_sched_quic_seeded_hook = NULL;
+            quic_answer = D2K_V_OPAQUE;
+            ver_budget_n = 0;
+        }
+
+        /* (n7) Бюджет — свойство коробки: у коробки плана записан замер
+           обрыва identity (26 пакетов) — зонд зовётся с ним, а не с 25. */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-measured", pid, 64, 3, "measured.budget.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            d2k_cat_signal *rv = &c.boxes[0].fp.sig[c.boxes[0].fp.n_sig++];
+            memset(rv, 0, sizeof *rv);
+            snprintf(rv->kind, sizeof rv->kind, "rx-volume");
+            rv->volume = 20; rv->seen = 1; rv->packets = 26;
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1; ver_fail_first = 0;
+            ver_budget_n = 1; ver_budget_seq[0] = D2K_BUDGET_PASSED;
+            memset(ver_budget_seen, 0, sizeof ver_budget_seen);
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5); forget_sent();
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42330;
+            d2k_ev h = ev_hello(6, 42330, "box.budget.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42330); d2k_sched_event(s, &su);
+            for (int i = 0; i < 60 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 100);
+                d2k_ev ap = ev_applied(6, 42330); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            CHECK(ver_budget_seen[0] == 26 && said("замер коробки box-measured"),
+                  "budget box: бюджет зонда не взят из замера коробки");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_budget_n = 0;
         }
 
         d2k_sched_tcp_base_hook = saved_base;
