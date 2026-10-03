@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 
 #include "d2k_ctq.h"
 #include "d2k_nl.h"
@@ -118,7 +119,7 @@ int d2k_ct_counters_parse(const uint8_t *buf, size_t len, uint32_t seq,
             if (type == D2K_CTA_COUNTERS_REPLY) have_r = counter(v, vl, &r) == 0;
             off += align4(alen);
         }
-        if (!have_o || !have_r) return -1;
+        if (!have_o || !have_r) return 2;
         if (orig_pkts) *orig_pkts = o;
         if (reply_pkts) *reply_pkts = r;
         return 0;
@@ -141,10 +142,50 @@ int d2k_ct_query_fd(int fd, uint32_t seq, const d2k_ct_tuple *t,
         ssize_t got = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
         if (got <= 0) break;
         int r = d2k_ct_counters_parse(buf, (size_t)got, seq, orig_pkts, reply_pkts);
-        if (r == 0) { rc = 0; break; }
-        if (r == 1) { rc = -1; break; }
+        if (r == 0 || r == 1 || r == 2) { rc = r; break; }
     }
     return rc;
+}
+
+/* Код ошибки ядра (errno Linux, положительный) в ответе на seq; 0 — ответ
+   не ошибка; -1 — ответа на seq нет. */
+static int reply_errno(const uint8_t *buf, size_t len, uint32_t seq) {
+    d2k_nl_iter it;
+    d2k_nl_msg m;
+    d2k_nl_iter_init(&it, buf, len);
+    while (d2k_nl_next(&it, &m)) {
+        if (m.seq != seq) continue;
+        int32_t e = 0;
+        if (d2k_nl_errno(&m, &e) == 0) return e < 0 ? -e : e;
+        return 0;
+    }
+    return -1;
+}
+
+int d2k_ct_probe_fd(int fd, uint32_t seq, int wait_ms) {
+    if (fd < 0) return 0;
+    d2k_ct_tuple t;
+    memset(&t, 0, sizeof t);       /* 0.0.0.0:0 → 0.0.0.0:0 udp: такой записи нет */
+    t.family = 4;
+    t.proto = 17;
+    uint8_t req[128];
+    size_t n = d2k_ct_get_req(req, sizeof req, seq, &t);
+    if (!n || send(fd, req, n, MSG_DONTWAIT) != (ssize_t)n) return 0;
+    struct pollfd p;
+    p.fd = fd; p.events = POLLIN; p.revents = 0;
+    for (int i = 0; i < 8; i++) {
+        if (poll(&p, 1, wait_ms) <= 0) return 0;     /* молчание — недоступно */
+        uint8_t buf[4096];
+        ssize_t got = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (got <= 0) return 0;
+        int e = reply_errno(buf, (size_t)got, seq);
+        if (e < 0) continue;                         /* чужой ответ */
+        /* ENOENT (2): подсистема на месте, записи просто нет. Ответ-запись
+           (e == 0) — тоже на месте. Остальное: EOPNOTSUPP, EPROTONOSUPPORT,
+           ENOSYS, EINVAL, EPERM — нет. */
+        return e == 2 || e == 0;
+    }
+    return 0;
 }
 
 #ifdef __linux__

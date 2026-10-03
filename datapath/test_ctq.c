@@ -78,7 +78,7 @@ int main(void) {
         uint8_t no[64];
         memcpy(no, rsp, 20);
         no[0] = 20; no[1] = 0;
-        CHECK(d2k_ct_counters_parse(no, 20, 7, &o, &r) == -1, "запись без счётчиков дала числа");
+        CHECK(d2k_ct_counters_parse(no, 20, 7, &o, &r) == 2, "запись без счётчиков дала числа");
     }
     /* 3. Ошибка ядра: записи нет (-ENOENT). */
     {
@@ -117,8 +117,55 @@ int main(void) {
         CHECK(d2k_ct_query_fd(sv[0], 200, &t, &o, &r) == 0 && o == 14 && r == 7,
               "свой ответ за устаревшим чужим не найден");
     }
+    /* Запись без счётчиков (accounting выключен) — свой код: d2kd скажет об
+       этом один раз (раунд 4, M-n2). */
+    {
+        uint8_t no[64];
+        memcpy(no, rsp, 20);
+        no[0] = 20; no[1] = 0;
+        no[8] = 201; no[9] = no[10] = no[11] = 0;
+        CHECK(send(sv[1], no, 20, 0) == 20, "no-acct send");
+        CHECK(d2k_ct_query_fd(sv[0], 201, &t, &o, &r) == 2, "запись без счётчиков не отличена");
+    }
     close(sv[0]); close(sv[1]);
     CHECK(d2k_ct_query_fd(-1, 1, &t, &o, &r) == -1, "запрос без сокета");
+
+    /* 5. Раунд 4, N2: проба доступности при старте. Ответ ядра на GET
+       несуществующей записи: ENOENT — ctnetlink есть; EOPNOTSUPP,
+       EPROTONOSUPPORT, ENOSYS, EINVAL — нет (подсистема не зарегистрирована,
+       модуль не загрузился); молчание — тоже нет. Номера — Linux. */
+    {
+        static const struct { int32_t err; int want; const char *what; } cases[] = {
+            { -2, 1, "ENOENT" }, { -95, 0, "EOPNOTSUPP" }, { -93, 0, "EPROTONOSUPPORT" },
+            { -38, 0, "ENOSYS" }, { -22, 0, "EINVAL" }, { -1, 0, "EPERM" },
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            int p[2];
+            CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, p) == 0, "socketpair");
+            fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL, 0) | O_NONBLOCK);
+            uint8_t er[36];
+            memset(er, 0, sizeof er);
+            er[0] = 36; er[4] = 2;            /* NLMSG_ERROR */
+            uint32_t seq = 77;
+            memcpy(er + 8, &seq, 4);
+            memcpy(er + 16, &cases[i].err, 4);
+            CHECK(send(p[1], er, sizeof er, 0) == (ssize_t)sizeof er, "err send");
+            int got = d2k_ct_probe_fd(p[0], 77, 50);
+            if (got != cases[i].want) {
+                printf("ПРОВАЛ: проба при %s дала %d\n", cases[i].what, got); fails++;
+            }
+            close(p[0]); close(p[1]);
+        }
+        /* Молчание — недоступно, и ждём не дольше заданного. */
+        int p[2];
+        CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, p) == 0, "socketpair");
+        fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL, 0) | O_NONBLOCK);
+        double a0 = now_ms();
+        CHECK(d2k_ct_probe_fd(p[0], 78, 50) == 0, "молчание ядра принято за доступный ctnetlink");
+        CHECK(now_ms() - a0 < 500.0, "проба ждала дольше своего срока");
+        close(p[0]); close(p[1]);
+        CHECK(d2k_ct_probe_fd(-1, 1, 50) == 0, "проба без сокета");
+    }
 
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }
     printf("ctnetlink по кортежу: все проверки прошли\n");

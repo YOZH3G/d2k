@@ -383,11 +383,41 @@ static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n)
  * и уйти они обязаны при любом исходе плана. */
 /* Счётчики потока у ядра по кортежу (детектор «QUIC замолчал», задача 50,
    раунд 3): один неблокирующий запрос ctnetlink на наблюдаемый поток. */
-typedef struct { int fd; uint32_t seq; } ct_link;
+typedef struct { int fd; uint32_t seq; int up; int told_off; int told_acct; } ct_link;
 static int ct_query(void *ctx, const d2k_ct_tuple *t, uint64_t *o, uint64_t *r) {
     ct_link *c = ctx;
     if (++c->seq == 0) { c->seq = 1; }
-    return d2k_ct_query_fd(c->fd, c->seq, t, o, r);
+    int rc = d2k_ct_query_fd(c->fd, c->seq, t, o, r);
+    if (rc == 2 && !c->told_acct) {
+        c->told_acct = 1;
+        fprintf(stderr, "d2kd: в записях conntrack нет счётчиков (nf_conntrack_acct выключен) — "
+                        "детектор тишины QUIC ничего не видит\n");
+    }
+    return rc;
+}
+
+static ct_link ctl_ct = { -1, 0, 0, 0, 0 };
+
+/* Проба ctnetlink (раунд 4, N2): при старте и на обновлении правил/маршрутов,
+   НИКОГДА на пакетах. Недоступен — запросов по потокам нет вовсе (иначе ядро
+   звало бы модпроб на каждый GET), строка в журнал — один раз. */
+static void ct_probe(d2k_session *sess, int startup) {
+    if (!sess || ctl_ct.up) { return; }
+    if (ctl_ct.fd < 0) { ctl_ct.fd = d2k_ct_open(); }
+    if (++ctl_ct.seq == 0) { ctl_ct.seq = 1; }
+    if (ctl_ct.fd >= 0 && d2k_ct_probe_fd(ctl_ct.fd, ctl_ct.seq, startup ? 200 : 0) == 1) {
+        ctl_ct.up = 1;
+        d2k_session_set_ct_query(sess, ct_query, &ctl_ct);
+        if (ctl_ct.told_off) {
+            fprintf(stderr, "d2kd: ctnetlink появился — детектор тишины QUIC включён\n");
+        }
+        return;
+    }
+    d2k_session_set_ct_query(sess, NULL, NULL);
+    if (!ctl_ct.told_off) {
+        ctl_ct.told_off = 1;
+        fprintf(stderr, "d2kd: детектор тишины QUIC выключен: нет ctnetlink\n");
+    }
 }
 
 static int out_verdict(void *ctx, uint32_t id, uint32_t verdict) {
@@ -935,14 +965,7 @@ int main(int argc, char **argv) {
     if (sess && udp_reverse_hook) {
         d2k_session_set_udp_reverse_hook(sess, 1);
     }
-    static ct_link ctl_ct = { -1, 0 };
-    ctl_ct.fd = d2k_ct_open();
-    if (sess && ctl_ct.fd >= 0) {
-        d2k_session_set_ct_query(sess, ct_query, &ctl_ct);
-    } else if (sess) {
-        fprintf(stderr, "d2kd: ctnetlink недоступен — детектор «QUIC замолчал после "
-                        "рукопожатия» выключен (пакеты не задерживаются)\n");
-    }
+    ct_probe(sess, 1);
     /* Вместимость ячейки — «сколько байт унесёт способ отправки», а не
        «сколько байт пакета мы берём у ядра» (--copy-range): посылка плана
        бывает длиннее пришедшего, перекрытие несёт приставку сверх нагрузки.
@@ -1139,6 +1162,7 @@ int main(int argc, char **argv) {
         }
         if (now_ns() >= next_routes) {
             routes_refresh();
+            ct_probe(sess, 0);
             last_routes = now_ns();
             next_routes = last_routes + D2K_ROUTEMARK_REFRESH_NS;
         }
