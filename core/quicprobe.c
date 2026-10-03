@@ -2266,7 +2266,9 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
     d2k_vres r;
     memset(&r, 0, sizeof r);
     char arm_path[sizeof ((d2k_quic_arm *)0)->probe_path] = "";
+    int arm_split_unfit = 0;
     if(arm) {
+        arm_split_unfit = arm->split_unfit != 0;
         /* Input only when the caller filled it: a terminated, public resource
            path (d2k_resource_path_ok). Anything else -- including an
            uninitialised arm -- means "/". */
@@ -2275,6 +2277,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
             memcpy(arm_path,arm->probe_path,strlen(arm->probe_path)+1);
         memset(arm,0,sizeof *arm); arm->kind=D2K_QA_NOT_FOUND;
         memcpy(arm->probe_path,arm_path,sizeof arm_path);
+        arm->split_unfit = arm_split_unfit;
     }
 
     /* ОДИН guard на весь класс "структурно непригодный вход" — было разведено
@@ -2599,7 +2602,8 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                                 .next=next_addr, .residual=residual, .marked=all_marked,
                                 .can_ask=arm_budget_left, .limit_user=&start,
                                 .spent=arm_budget_spent,
-                                .path=arm_path[0]?arm_path:NULL};
+                                .path=arm_path[0]?arm_path:NULL,
+                                .no_split=arm_split_unfit};
                             if (budget_left(&start)) {
                                 /* Задача 40: сначала вопросы стратегии
                                    (остаточное разрешение, разрез CRYPTO),

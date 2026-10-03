@@ -576,7 +576,6 @@ typedef struct {
 
     int64_t    started_ms; /* active search/lifecycle budget begins on launch */
     int64_t    began_ms;   /* when this search began, for the card and verdict line only (task 49) */
-    int        began_carry; /* began_ms set by own_first_continue for the very next launch */
     int64_t    queued_ms;  /* independent age of a queued suspicion */
     uint64_t   queued_event;
     /* «Горячая» цель (задача 29): по ждущей в очереди пришло новое
@@ -1024,7 +1023,6 @@ struct d2k_sched {
     seen_name    seen[SCHED_SEEN];
     size_t       seen_next;   /* кольцо: старое вытесняется, а не отказывает */
     target_cooldown cooldowns[SCHED_COOLDOWN_SLOTS];
-    size_t       cooldown_next;
     late_rst_pending late_rst[SCHED_LATE_RST_SLOTS];
     size_t       late_rst_next;
     struct { d2k_resource ref; int64_t expires_ms; } resources[8];
@@ -1032,6 +1030,14 @@ struct d2k_sched {
     struct { char name[256]; uint8_t bytes[2048]; size_t len;
              uint8_t family; int64_t observed_ms; } ech_inputs[8];
     size_t ech_input_next;
+    /* ИМЕНА, ЧЕЙ КЛИЕНТ ШЛЁТ QUIC ClientHello ШИРЕ ДАТАГРАММЫ (финальное
+       ревью core, I1): снимок пришёл обрывком (on_shape). Разрез CRYPTO
+       такому клиенту не исполнится — датапат режет только датаграмму с
+       именем и отказывает «имени нет в этой датаграмме», — поэтому план
+       разреза для имени не строится и не подтверждается. Кольцо: старое
+       вытесняется. */
+    struct { char name[256]; uint8_t family; } quic_multi[16];
+    size_t quic_multi_next;
     int64_t      last_measure_start_ms;
     int          measure_start_seen;
 
@@ -1516,14 +1522,36 @@ static int64_t clear_backoff_ms(unsigned streak) {
     return SCHED_CLEAR_BACKOFF_MAX_MS;
 }
 
+/* КОГО ВЫТЕСНИТЬ ИЗ КОЛЬЦА ОТСРОЧЕК (финальное ревью core, M6). Кольцо
+   конечно, но писать его по кругу значило снимать действующую 60-минутную
+   антибот-паузу раньше срока, когда в доме много неудачных целей. Порядок:
+   свободная запись; истёкшая (дольше всех истёкшая); действующая не-антибот
+   с ближайшим концом; и только если ВСЁ кольцо — действующие антибот-паузы,
+   та из них, что кончится раньше. */
+static target_cooldown *cooldown_victim(d2k_sched *s) {
+    target_cooldown *best = NULL;
+    int best_rank = 4;
+    for (size_t i = 0; i < SCHED_COOLDOWN_SLOTS; i++) {
+        target_cooldown *c = &s->cooldowns[i];
+        int rank = !c->used ? 0
+                 : s->now_ms >= c->until_ms ? 1
+                 : !c->challenge ? 2 : 3;
+        if (rank == 0) return c;
+        if (rank < best_rank || (rank == best_rank && c->until_ms < best->until_ms)) {
+            best = c;
+            best_rank = rank;
+        }
+    }
+    return best;
+}
+
 /* kind: 0 = direct CLEAR, 1 = anti-bot challenge, 2 = exhausted/incomplete search,
    3 = inconclusive late-RST pair (suppresses only late-RST/volume triggers). */
 static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     if (!s || !t || !t->name[0]) { return; }
     target_cooldown *c = cooldown_find(s, t->name, t->transport, t->family);
     if (!c) {
-        c = &s->cooldowns[s->cooldown_next];
-        s->cooldown_next = (s->cooldown_next + 1) % SCHED_COOLDOWN_SLOTS;
+        c = cooldown_victim(s);
         memset(c, 0, sizeof *c);
         snprintf(c->name, sizeof c->name, "%s", t->name);
         c->transport = t->transport;
@@ -1765,6 +1793,7 @@ typedef struct {
     d2k_sched *s; task *t; int use_fd;
     uint8_t trig[2048], ctrl[2048];
     size_t trig_len, ctrl_len;
+    int split_unfit; /* решено главным потоком (quic_split_unfit) */
 } worker_arg;
 
 d2k_vres d2k_sched_ech_baseline_result(const d2k_ver_result *baseline,
@@ -1895,6 +1924,7 @@ static void *worker_run(void *vp) {
     d2k_sched *s = a->s;
     task *t = a->t;
     int a_use_fd = a->use_fd;
+    int a_split_unfit = a->split_unfit;
     uint8_t trigger_bytes[2048], control_bytes[2048];
     memcpy(trigger_bytes, a->trig, a->trig_len);
     memcpy(control_bytes, a->ctrl, a->ctrl_len);
@@ -2158,6 +2188,7 @@ static void *worker_run(void *vp) {
            with one residual-aware address pool. Never restart search here. */
         /* Task 39 round 1: the arm data stage asks the known large resource. */
         snprintf(t->arm.probe_path, sizeof t->arm.probe_path, "%s", t->measure_path);
+        t->arm.split_unfit = a_split_unfit;
         r = seed && d2k_sched_quic_seeded_hook
             ? d2k_sched_quic_seeded_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm, seed)
             : d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm);
@@ -2207,17 +2238,46 @@ static void *worker_run(void *vp) {
     return NULL;
 }
 
+static void contact_close(task *t);
+
+/* --- разрез CRYPTO и клиент шире датаграммы (финальное ревью core, I1) --- */
+
+static int quic_text_is_split(const char *text) {
+    return text && strstr(text, "\nquicsplit ") != NULL;
+}
+
+static int quic_client_multi(const d2k_sched *s, const char *name, uint8_t family) {
+    uint8_t f = family ? family : 4;
+    for (size_t k = 0; k < sizeof s->quic_multi / sizeof s->quic_multi[0]; k++)
+        if (s->quic_multi[k].name[0] && s->quic_multi[k].family == f &&
+            !strcmp(s->quic_multi[k].name, name)) return 1;
+    return 0;
+}
+
+/* Неприменим ли разрез CRYPTO клиенту этой цели. Снимок клиента был обрывком
+   (ClientHello шире датаграммы) — неприменим. Целый снимок клиента —
+   применим. Снимка нет вовсе — решает раскладка измеряемого Initial: разрез
+   предлагается, только если вход, которым мерили, — ClientHello в одной
+   датаграмме (так он и подтвердится зондом, и так его исполнит датапат). */
+static int quic_split_unfit(const d2k_sched *s, const task *t) {
+    if (t->transport != 17) return 0;
+    if (!t->by_addr && quic_client_multi(s, t->name, t->family)) return 1;
+    if (t->trig_snapped) return 0;
+    return t->trig_len == 0 || d2k_quic_hello_incomplete(t->trig, t->trig_len);
+}
+
 static int start_worker(d2k_sched *s, task *t, task_job job) {
     worker_arg *a = malloc(sizeof *a);
     if (!a) { return -1; }
     a->s = s; a->t = t;
     a->trig_len = t->trig_len; a->ctrl_len = t->ctrl_len;
+    a->split_unfit = quic_split_unfit(s, t);
     memcpy(a->trig, t->trig, t->trig_len);
     memcpy(a->ctrl, t->ctrl, t->ctrl_len);
     /* Сокет вопроса забирается ЗДЕСЬ, в главном потоке, и поле задачи
        очищается сразу: два владельца одного дескриптора — двойное закрытие. */
     a->use_fd = job == JOB_CONTACT ? t->prop_bound_fd : job == JOB_VERIFY ? t->probe_fd : -1;
-    if (job == JOB_CONTACT) { t->prop_bound_fd = -1; }
+    if (job == JOB_CONTACT) { t->prop_bound_fd = -1; contact_close(t); }
     if (job == JOB_VERIFY) { t->probe_fd = -1; }
     t->job = job;
     t->res_ready = 0;
@@ -2540,6 +2600,17 @@ static void prop_close(task *t) {
     t->prop_fd = -1;
 }
 
+/* Сокет обращения, который рабочий поток JOB_CONTACT вернул, а задача ещё
+   не приняла в prop_fd (финальное ревью core, M2): срок жизни проверяется
+   раньше разбора состояния, и задача, умершая в T_PROPS_CONTACT, теряла
+   помеченный TCP-сокет. Звать только после join_worker. */
+static void contact_close(task *t) {
+    if (t->c_fd > 0) {
+        close(t->c_fd);
+    }
+    t->c_fd = -1;
+}
+
 /* Закрывает сокет зонда подтверждения. Не зовёт d2k_verify_close на нуле по
    той же причине, по которой prop_close не верит нулю выше: обнулённая задача
    это fd == 0, а ноль — законный дескриптор, и «закрыть пустое» означало бы
@@ -2566,6 +2637,7 @@ static void task_reset(task *t) {
     t->prop_q = -1;
     t->probe_fd = -1;   /* та же ловушка нуля, что у prop_fd */
     t->ver.fd = -1; /* та же ловушка нуля, что у prop_fd, — см. prop_close */
+    t->c_fd = -1;   /* и у сокета обращения (contact_close) */
 }
 
 /* Отправляет план следующего задаваемого вопроса. 0 — отправлен (ждём ack),
@@ -2699,6 +2771,7 @@ static void prop_finish(d2k_sched *s, task *t) {
 
 static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     join_worker(t);
+    contact_close(t);
     /* И вопрос, и кандидат — каждый своим ключом (задача 20). Прежде порт
        вопроса проверялся первым и, оставшись в памяти после вопросов, уводил
        снятие на давно снятый вопрос, а стоящий кандидат оставался. */
@@ -2731,6 +2804,7 @@ static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
 
 static void task_done(task *t) {
     join_worker(t);
+    contact_close(t);
     prop_close(t);
     ver_close(t);
     task_reset(t);
@@ -2987,6 +3061,13 @@ static int install_next(d2k_sched *s, task *t) {
     while (t->next_plan < t->n_plans) {
         if (t->probes >= SCHED_MAX_PROBES) { return -1; }
         const char *text = t->plans[t->next_plan++];
+        if (t->transport == 17 && quic_text_is_split(text) && quic_split_unfit(s, t)) {
+            /* Свой/готовый план разреза другой цели этому клиенту не
+               исполнится (финальное ревью core, I1): не ставим и не судим. */
+            say(s, "по %s (QUIC) план разреза CRYPTO пропускаю: ClientHello клиента "
+                   "шире датаграммы — датапат его не исполнит", t->name);
+            continue;
+        }
         snprintf(t->box_id, sizeof t->box_id, "%s", t->plan_boxes[t->next_plan - 1]);
         t->probes++;
         s->probes_used++;
@@ -3621,6 +3702,12 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
            askArms; rebuilding a similar ClientHello would install another
            hypothesis. */
         const d2k_quic_props *qp = &r->qprops;
+        if (t->arm.kind == D2K_QA_SPLIT && quic_split_unfit(s, t)) {
+            say(s, "по %s (QUIC) разрез CRYPTO прошёл замер, но клиенту неприменим: его "
+                   "ClientHello шире датаграммы (или вход замера не в одной датаграмме) — "
+                   "план разреза не строю", t->name);
+            return;
+        }
         int arm_found = t->arm.kind != D2K_QA_NOT_FOUND;
         char text[sizeof t->plans[0]];
         if (t->arm.original && d2k_quic_compose_plan(&t->arm, qp, text, sizeof text) == 0) {
@@ -4104,6 +4191,7 @@ void d2k_sched_free(d2k_sched *s) {
         join_worker(&s->tasks[i]);
         /* Сокеты обращений закрываем сами: поток к этому моменту уже вернулся,
            а дескриптор принадлежит задаче, а не ему. */
+        contact_close(&s->tasks[i]);
         prop_close(&s->tasks[i]);
         ver_close(&s->tasks[i]);
     }
@@ -5400,10 +5488,12 @@ static int family_recovery_start(d2k_sched *s, task *t) {
 
 static int launch_task(d2k_sched *s, task *t) {
     t->started_ms = s->clock_seen ? s->now_ms : 0;
-    /* Новый поиск (перемер по снимку и т.п.) считает время с себя; только
-       переход «свои планы → полный замер» переносит начало поиска. */
-    if (!t->began_carry) t->began_ms = 0;
-    t->began_carry = 0;
+    /* Новый поиск (перемер по снимку и т.п.) считает время с себя. Переход
+       «свои планы → полный замер» сюда не приходит (own_first_continue зовёт
+       start_search и переносит began_ms сам), поэтому переносить отсюда
+       нечего: прежний флаг переноса доживал до СЛЕДУЮЩЕГО запуска и отдавал
+       перемеру начало прошлого поиска (финальное ревью core, M1). */
+    t->began_ms = 0;
     t->queued_ms = 0;
     if (t->by_addr) {
         quic_addr_start(s, t);
@@ -5718,6 +5808,20 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
                               &t->watch_shape_port);
                 }
             }
+            /* QUIC: подтверждённый разрез CRYPTO не исполнился потоку клиента
+               (финальное ревью core, I1). Причина, которую датапат так
+               называет, — ClientHello шире датаграммы; проверяется снимком
+               приветствия клиента, а не догадкой: обрывок снимет привязку
+               к повторной проверке (quic_note_multi). */
+            if (t->transport == 17 && !t->watch_shape_pending &&
+                t->n_plans > 0 && t->next_plan > 0 && t->next_plan <= t->n_plans &&
+                quic_text_is_split(t->plans[t->next_plan - 1])) {
+                char err[128];
+                if (d2k_link_arm_shape_family(s->link_fd, t->name, 17,
+                                              t->family, err, sizeof err) == 0) {
+                    t->watch_shape_pending = 1;
+                }
+            }
             say(s, "по %s подозрение о потоке, к которому план НЕ ПРИМЕНЯЛСЯ "
                    "— уликой против подтверждённого "
                    "плана не считаю, наблюдение продолжаю", t->name);
@@ -5866,9 +5970,68 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     t->fb_next = 0;
     t->rx_volume_next_variant = 0;
     t->exec_refused = t->exec_probed = 0;
+    /* Состояние фазы своих планов, RX-начала и ECH — тоже прошлого поиска
+       (финальное ревью core, M3): новый вход вправе снова проверить свои
+       планы, начать обычным путём, а не «остаточным RX-блоком», и заново
+       решить про ECH по новым байтам. */
+    memset(t->own_seen, 0, sizeof t->own_seen);
+    t->n_own_seen = 0;
+    t->own_seen_full = 0;
+    t->own_probed = 0;
+    t->rx_bootstrap_only = 0;
+    t->family_reuse = 0;
+    t->ech_grease = 0;
     say(s, "по %s привязка добыта заготовкой, а снимок клиента есть — "
            "перемеряю снимком: %zu байт", t->name, len);
     (void)launch_or_queue(s, t);
+}
+
+/* Клиент имени шлёт ClientHello шире датаграммы — так сообщил датапат
+   снимком-обрывком (финальное ревью core, I1). Запоминается для будущих
+   поисков; подтверждённая привязка этого имени с планом разреза CRYPTO
+   помечается к повторной проверке и снимается с провода: клиенту она не
+   исполняется (датапат отказывает «имени нет в этой датаграмме»), и считать
+   её подтверждённой нельзя. Удаления нет — только пометка, как у CLEAR. */
+static void quic_note_multi(d2k_sched *s, const char *name, uint8_t family) {
+    if (!quic_client_multi(s, name, family)) {
+        size_t n = sizeof s->quic_multi / sizeof s->quic_multi[0];
+        size_t slot = s->quic_multi_next++ % n;
+        snprintf(s->quic_multi[slot].name, sizeof s->quic_multi[slot].name, "%s", name);
+        s->quic_multi[slot].family = family;
+    }
+    if (!s->cat) return;
+    size_t marked = 0;
+    char err[200];
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t j = 0; j < b->n_binds; j++) {
+            d2k_cat_binding *bd = &b->binds[j];
+            if (!bd->enabled || bd->recheck_since || strcmp(bd->kind, "name") ||
+                strcmp(bd->target, name) || (bd->transport ? bd->transport : 6) != 17 ||
+                (bd->family ? bd->family : 4) != family) continue;
+            const char *text = NULL;
+            for (size_t k = 0; k < b->n_plans && !text; k++)
+                if (!strcmp(b->plans[k].id, bd->plan_id)) text = b->plans[k].text;
+            if (!quic_text_is_split(text)) continue;
+            bd->recheck_since = wall_s(s, s->now_ms);
+            bd->recheck_mono_ms = s->now_ms ? s->now_ms : 1;
+            b->updated = bd->recheck_since;
+            uint8_t wire_shape = bd->shape ? bd->shape : (uint8_t)D2K_LINK_SHAPE_GRANDFATHER;
+            if (d2k_link_del_name_family(s->link_fd, name, 17, wire_shape, family,
+                                         err, sizeof err) != 0) {
+                say(s, "по %s привязку %s не удалось снять с провода: %s",
+                    name, bd->plan_id, err);
+            }
+            marked++;
+        }
+    }
+    if (marked) {
+        s->cat->revision++;
+        s->sync_pending = 1;
+        say(s, "по %s (QUIC) клиент шлёт ClientHello шире датаграммы — подтверждённый "
+               "разрез CRYPTO ему не исполняется: привязок к повторной проверке %zu "
+               "(сняты с провода, в каталоге сохранены)", name, marked);
+    }
 }
 
 static void on_shape(d2k_sched *s, const d2k_ev *ev) {
@@ -5897,6 +6060,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
             say(s, "снимок QUIC по %s (%zu байт) — обрывок ClientHello, приветствие "
                    "не в одной датаграмме; не заменяю им вход измерителя, цель "
                    "мерится собственным Initial (PROFILE)", name, ev->shape_len);
+            quic_note_multi(s, name, ev->family ? ev->family : 4);
             return;
         }
     } else {
@@ -6111,6 +6275,17 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         say(s, "по %s план %s: сертификат не совпал с запрошенным именем; "
                "это диагностический признак, не доказательство заглушки",
             t->name, plan_id);
+    }
+    if (t->transport == 17 && quic_text_is_split(text) && quic_split_unfit(s, t)) {
+        /* Зонд шлёт ClientHello одной датаграммой, и разрез ему исполнился;
+           клиенту этой цели — нет (финальное ревью core, I1). */
+        say(s, "по %s план %s (разрез CRYPTO) зонду исполнился, а клиенту — нет: "
+               "его ClientHello шире датаграммы. Подтверждать не буду, беру "
+               "следующего кандидата", t->name, plan_id);
+        trial_retire(s, t);
+        ver_close(t);
+        t->state = T_PLANNING;
+        return;
     }
     int unfit_here = 0;
     for (size_t k = 0; k < t->unfit_seen; k++) {
@@ -6838,6 +7013,9 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
    Снимок клиента, пришедший во время испытания, берётся сразу — иначе
    прогон пошёл бы заготовкой и перезапустился бы после конца. */
 static void own_first_continue(d2k_sched *s, task *t) {
+    /* Фазу может оборвать и срок жизни посреди испытания: рабочий поток
+       зонда сперва присоединяется, потом снимается его опыт. */
+    join_worker(t);
     trial_retire(s, t);
     ver_close(t);
     /* Испытанные на проводе свои планы полный прогон второй раз не берёт. */
@@ -6878,7 +7056,6 @@ static void own_first_continue(d2k_sched *s, task *t) {
     char name[sizeof t->name];
     snprintf(name, sizeof name, "%s", t->name);
     t->began_ms = began; /* перезапуск окна не «омолаживает» поиск на карточке */
-    t->began_carry = 1;
     if (!start_search(s, t))
         say(s, "по %s полный замер не запустился — задача снята, следующее "
                "подозрение начнёт поиск заново", name);
@@ -7140,6 +7317,26 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                    неудача: план уже подтверждён зондом и записан, снимать его
                    (task_fail) не за что. Просто освобождаем место. */
                 task_done(t);
+            } else if (t->own_first == 2) {
+                /* СРОК ФАЗЫ СВОИХ ПЛАНОВ (финальное ревью core, I2). Фаза
+                   своих планов идёт на сроке запуска; упёршись в него, она
+                   кончается так же, как по бюджету: дальше полный замер
+                   донора со своим целым сроком (own_first_continue). Провал
+                   в отдых здесь означал бы, что следующая задача начнёт с
+                   пустым own_seen и проиграет те же свои планы снова, а
+                   полный замер не начнётся никогда. */
+                join_worker(t);
+                for (size_t k = 0; k < t->n_plans && k < 32; k++) {
+                    if (!(t->own_probed & (1u << k))) continue;
+                    tried_add(t, (uint32_t)fnv1a(t->plans[k]));
+                }
+                t->own_probed = 0;
+                size_t left = (t->next_plan < t->n_plans ? t->n_plans - t->next_plan : 0) +
+                              own_first_plans(s, t, 2);
+                say(s, "по %s срок фазы своих планов (%d мин) истёк: свои подтверждённые "
+                       "планы испытаны не все, НЕ испытано %zu — продолжаю полный замер донора",
+                    t->name, SCHED_TASK_LIFE_MS / 60000, left);
+                own_first_continue(s, t);
             } else if ((t->state == T_VOICE_TRIAL || t->state == T_VOICE_WATCH) &&
                        voice_trial_owned(t)) {
                 /* Следующего разговора с доказательством за срок не было —
@@ -7600,6 +7797,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             }
             join_worker(t);
             if (!t->c_ok) {
+                contact_close(t);
                 /* Обращение не состоялось (транспорт) — вопрос не измерен. */
                 if (prop_send_next(s, t, now_ms) != 0) {
                     prop_finish(s, t);
@@ -7610,6 +7808,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 if (t->state != T_PLANNING) { continue; }
             } else {
                 t->prop_fd = t->c_fd;
+                t->c_fd = -1; /* владелец теперь prop_fd */
                 t->prop_flow.family = t->family;
                 memcpy(t->prop_flow.a_ip, t->c_ip, sizeof t->prop_flow.a_ip);
                 t->prop_flow.a_port = t->c_port;

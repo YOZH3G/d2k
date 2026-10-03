@@ -90,6 +90,9 @@ typedef struct {
        решающего ответа или до предела повторов) — запасной перебор не задаёт
        его второй раз под видом приманки 0x00…0 ×1 (тот же вопрос). */
     int benign_answered;
+    /* Финальное ревью core, I1: разрез CRYPTO клиенту неприменим (ClientHello
+       шире датаграммы) — вопрос о нём не задаётся, он не может стать планом. */
+    int no_split;
 } d2k_quic_arm_context;
 
 /* Runtime transport for one original askArms question. It receives the SNI

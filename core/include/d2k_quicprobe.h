@@ -518,6 +518,12 @@ typedef struct {
     int8_t            clearance_asked;
     int8_t            split_asked;
     d2k_quic_strategy strategy;
+    /* ВХОД (финальное ревью core, I1): разрез CRYPTO этому клиенту
+       неприменим — его ClientHello шире одной датаграммы (снимок клиента был
+       обрывком; датапат режет только датаграмму с именем и отказывает).
+       Вопрос «разрез CRYPTO» тогда не задаётся: его ответ не может стать
+       планом. Сохраняется d2k_quic_run так же, как probe_path. */
+    int               split_unfit;
 } d2k_quic_arm;
 
 /* One original run: arm search happens before properties with the SAME pool.

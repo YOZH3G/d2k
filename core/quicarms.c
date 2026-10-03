@@ -213,14 +213,20 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
     } else {
         d2k_quic_arm_question split={0};
         split.split=1;
-        r.split_crypto=strategy_ask(c,&r,&split,"ClientHello двумя кадрами CRYPTO, хвост первым",
-                                    &r.split_asked);
+        /* Финальное ревью core, I1: клиенту, чей ClientHello шире
+           датаграммы, разрез CRYPTO не исполнится (датапат отказывает: имени
+           нет в датаграмме). Ответ этого вопроса планом стать не может, и
+           вопрос не задаётся; для выбора пути он считается «нет». */
+        int no_split = c && c->no_split;
+        if(!no_split)
+            r.split_crypto=strategy_ask(c,&r,&split,"ClientHello двумя кадрами CRYPTO, хвост первым",
+                                        &r.split_asked);
         if(r.split_crypto==D2K_PROP_YES) {
             r.kind=D2K_QA_SPLIT; r.strategy=D2K_QS_SPLIT; r.incomplete=0;
             snprintf(r.reason,sizeof r.reason,
                      "разрез ClientHello на два кадра CRYPTO проходит (остаточное разрешение: %s)",
                      prop_word(r.clearance));
-        } else if(r.clearance==D2K_PROP_NO && r.split_crypto==D2K_PROP_NO) {
+        } else if(r.clearance==D2K_PROP_NO && (r.split_crypto==D2K_PROP_NO || no_split)) {
             /* Перебор приманок не нужен, но IP-фрагментация — отдельные
                вопросы замера (круг 1): задаются, и при ответе «да» план
                собирается из него. */
@@ -229,14 +235,21 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
             if(r.frag_kind) {
                 r.kind=D2K_QA_FRAG; r.strategy=D2K_QS_FRAG;
                 snprintf(r.reason,sizeof r.reason,
-                         "разрешение и разрез CRYPTO не прошли; IP-фрагментация формы %d прошла "
-                         "(приманки не перебирались)", r.frag_kind);
+                         "разрешение не прошло, разрез CRYPTO %s; IP-фрагментация формы %d прошла "
+                         "(приманки не перебирались)",
+                         no_split ? "клиенту неприменим (ClientHello шире датаграммы)" : "не прошёл",
+                         r.frag_kind);
             } else {
-                snprintf(r.reason,sizeof r.reason,
-                         "обход по QUIC не найден: разрешение, разрез CRYPTO и фрагменты (%s) "
-                         "не прошли; приманки не перебираются, браузер уйдёт на TCP",
-                         r.frag_survives==D2K_PROP_NO ? "фрагменты не доживают" :
-                         r.frag_survives==D2K_PROP_YES ? "ни одна форма" : "не измерена");
+                const char *fw = r.frag_survives==D2K_PROP_NO ? "фрагменты не доживают" :
+                                 r.frag_survives==D2K_PROP_YES ? "ни одна форма" : "не измерена";
+                if(no_split)
+                    snprintf(r.reason,sizeof r.reason,
+                             "обход по QUIC не найден: разрешение и фрагменты (%s) не прошли, "
+                             "разрез CRYPTO клиенту неприменим; браузер уйдёт на TCP", fw);
+                else
+                    snprintf(r.reason,sizeof r.reason,
+                             "обход по QUIC не найден: разрешение, разрез CRYPTO и фрагменты (%s) "
+                             "не прошли; приманки не перебираются, браузер уйдёт на TCP", fw);
             }
         } else {
             /* Неизмеримо: запасной путь — перебор приманок оригинала. */

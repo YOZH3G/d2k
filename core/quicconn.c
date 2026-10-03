@@ -553,7 +553,12 @@ static int recv_dgram(d2k_qc *c, int wait_ms, char *err, size_t errcap) {
         } else if (h.type == D2K_QW_LT_HANDSHAKE) {
             lvl = D2K_QW_LEVEL_HANDSHAKE;
         } else if (h.type == D2K_QW_LT_RETRY) {
-            if (c->retry_count != 0 || h.version != c->version ||
+            /* RFC 9000 §17.2.5.2: второй Retry, Retry после любого пакета
+               сервера и Retry с неверным тегом клиент ОТБРАСЫВАЕТ, а не рвёт
+               соединение (финальное ревью core, M7): наш DCID виден на пути,
+               и поздний поддельный Retry иначе обрывал проверку раньше срока.
+               Retry занимает датаграмму до конца — дальше разбирать нечего. */
+            if (c->retry_count != 0 || c->peer_cid_fixed || h.version != c->version ||
                 h.dcid_len != c->scid_len ||
                 memcmp(buf + off + h.dcid_off, c->scid, c->scid_len) != 0 ||
                 h.scid_len == 0 || h.scid_len > sizeof c->dcid ||
@@ -565,8 +570,7 @@ static int recv_dgram(d2k_qc *c, int wait_ms, char *err, size_t errcap) {
                 h.token_len > sizeof c->retry_token ||
                 d2k_qw_retry_verify(c->version, c->odcid, c->odcid_len,
                                     buf + off, h.packet_len) != 0) {
-                say(err, errcap, "недействительный или повторный Retry");
-                return -1;
+                break;
             }
             memcpy(c->dcid, buf + off + h.scid_off, h.scid_len);
             c->dcid_len = h.scid_len;

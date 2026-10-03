@@ -84,6 +84,39 @@ int main(void) {
     d2k_qc_close(c);
     close(server);
 
+    /* Финальное ревью core, M7 (RFC 9000 §17.2.5.2): второй или
+       недействительный Retry клиент ОТБРАСЫВАЕТ, а не рвёт соединение.
+       Наш DCID виден на пути, и поздний поддельный Retry иначе обрывал
+       проверку раньше срока. */
+    for (int mode = 0; mode < 4; mode++) {
+        c = app_conn(&server);
+        c->scid_len = 8; memset(c->scid, 0x11, 8);
+        c->odcid_len = 8; memset(c->odcid, 0x22, 8);
+        memcpy(c->dcid, c->odcid, 8); c->dcid_len = 8;
+        if (mode == 1) c->retry_count = 1;       /* Retry уже был */
+        if (mode == 3) c->peer_cid_fixed = 1;    /* сервер уже ответил пакетом */
+        static const uint8_t rscid[8] = {9, 9, 9, 9, 9, 9, 9, 9};
+        uint8_t rb[256];
+        size_t rl = d2k_qw_retry_build(rb, sizeof rb, D2K_QW_V1, c->odcid, 8,
+                                       c->scid, 8, rscid, sizeof rscid,
+                                       (const uint8_t *)"tok", 3);
+        CHECK(rl > 0, "retry fixture");
+        if (mode == 2) rb[rl - 1] ^= 1;          /* испорченный тег */
+        struct sockaddr_in ca; socklen_t cl = sizeof ca;
+        assert(getsockname(c->fd, (struct sockaddr *)&ca, &cl) == 0);
+        CHECK(sendto(server, rb, rl, 0, (struct sockaddr *)&ca, cl) == (ssize_t)rl, "retry sent");
+        int r = recv_dgram(c, 500, err, sizeof err);
+        if (mode == 0) {
+            CHECK(r == 2 && c->retry_pending == 1, "first valid Retry is taken");
+        } else {
+            CHECK(r == 0, "second/invalid/late Retry is discarded, not a connection failure");
+            CHECK(c->retry_pending == 0 && c->dcid[0] == 0x22,
+                  "discarded Retry changes nothing in the connection");
+        }
+        d2k_qc_close(c);
+        close(server);
+    }
+
     if (!fails) { puts("QUIC: request retransmit timer survives sliced reads"); }
     return fails != 0;
 }

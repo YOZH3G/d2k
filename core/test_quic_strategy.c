@@ -107,6 +107,22 @@ int main(void) {
     CHECK(strstr(r.reason, "не найден") != NULL);
     for (int i = 0; i < calls && i < 64; i++) CHECK(!(seen[i].blob_len && !seen[i].benign));
 
+    /* 3а. Финальное ревью core, I1: клиенту разрез CRYPTO неприменим
+          (ClientHello шире датаграммы). Вопрос о разрезе не задаётся даже
+          там, где коробка его пропустила бы; разрешения нет — дальше вопросы
+          фрагментации, как при «нет». */
+    {
+        ans_clear = "N"; ans_split = "Y"; i_clear = i_split = 0;
+        calls = data_calls = ladder_calls = 0;
+        d2k_quic_arm_context ctx = {.pool = pool, .n_pool = 1, .next = 1, .residual = 0,
+                                    .probe = probe, .marked = 1, .data = data, .no_split = 1};
+        r = d2k_quic_strategy_arms(&ctx);
+        CHECK(r.kind != D2K_QA_SPLIT && r.strategy != D2K_QS_SPLIT);
+        CHECK(i_split == 0 && !r.split_asked && r.split_crypto == D2K_PROP_UNKNOWN);
+        for (int i = 0; i < calls && i < 64; i++) CHECK(!seen[i].split);
+        CHECK(r.kind == D2K_QA_NOT_FOUND && seen[1].control && strstr(r.reason, "неприменим"));
+    }
+
     /* 3б. Оба «нет», фрагменты доживают и форма 3 проходит — план из ответа. */
     frag_ok_shape = 3;
     r = run("N", "N", 0, 1);

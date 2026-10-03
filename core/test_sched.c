@@ -33,6 +33,7 @@
 #define _XOPEN_SOURCE 700 /* strptime under -std=c99 on glibc/musl */
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +82,9 @@ static int tcp_owns_search;
 static int tcp_found_arm;
 static size_t tcp_last_wire;
 static d2k_verdict quic_answer = D2K_V_OPAQUE;
+/* Вход плеча «разрез CRYPTO клиенту неприменим», с которым позвали вопросник
+   (финальное ревью core, I1); -1 — не звали. */
+static int quic_last_split_unfit = -1;
 static char tcp_last_ip[64], quic_last_sni[256], quic_last_ip[64];
 static uint8_t quic_seen_triggers[2][2048];
 static size_t quic_seen_trigger_lens[2];
@@ -280,6 +284,11 @@ static d2k_quic_arm stub_arm(const char *ip, uint16_t port, const char *sni,
     a.copies = 6;
     a.ttl = 3;
     a.probes = 4;
+    if (arm_kind == D2K_QA_SPLIT) {
+        /* Ответ вопроса стратегии «разрез CRYPTO»: план без блоба. */
+        a.len = 0; a.copies = 0; a.ttl = 0;
+        a.strategy = D2K_QS_SPLIT;
+    }
     if(arm_fragment_shape) {
         a.frag_kind=arm_fragment_shape;a.frag_survives=D2K_PROP_YES;
         if(arm_kind==D2K_QA_FRAG){a.len=0;a.copies=0;a.ttl=0;}
@@ -534,6 +543,7 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
     d2k_vres r;
     memset(&r, 0, sizeof r);
     r.verdict = quic_answer;
+    quic_last_split_unfit = arm ? arm->split_unfit : -1;
     memset(arm, 0, sizeof *arm);
     arm->kind = D2K_QA_NOT_FOUND;
     if (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX || r.verdict == D2K_V_WHOLE)
@@ -828,6 +838,31 @@ static const char *live_task_entry(d2k_sched *s, const char *target) {
     }
     unlink(path);
     return entry;
+}
+
+/* "since" активного поиска цели — из блока "searches", а не первой
+   встречной записи с этим именем (у подтверждённой цели раньше идёт её
+   привязка в каталоге). Пусто — поиска нет. */
+static void search_since(d2k_sched *s, const char *target, char *out, size_t cap) {
+    char path[] = "/tmp/d2k-task-since-XXXXXX";
+    out[0] = 0;
+    int fd = mkstemp(path);
+    if (fd < 0) return;
+    close(fd);
+    if (d2k_sched_write_live(s, path, "catalog.json") == 0) {
+        FILE *f = fopen(path, "r");
+        static char body[65536];
+        body[0] = 0;
+        if (f) { size_t got = fread(body, 1, sizeof body - 1, f); body[got] = 0; fclose(f); }
+        const char *sr = strstr(body, "\"searches\"");
+        char needle[300];
+        snprintf(needle, sizeof needle, "\"target\": \"%s\"", target);
+        const char *at = sr ? strstr(sr, needle) : NULL;
+        const char *e = at ? strstr(at, "\"since\": ") : NULL;
+        const char *end = at ? strchr(at, '}') : NULL;
+        if (e && end && e < end) snprintf(out, cap, "%.40s", e);
+    }
+    unlink(path);
 }
 
 /* Зонды ОДНОЙ активной задачи из живого файла ("probes" её записи). -1 —
@@ -4992,6 +5027,90 @@ shape_test:
         d2k_sched_free(s);
     }
 
+    /* ФИНАЛЬНОЕ РЕВЬЮ CORE, I1: разрез CRYPTO (quicsplit) и клиент, чей
+       ClientHello шире датаграммы (Chrome с ML-KEM). Датапат режет только
+       датаграмму с именем и такому клиенту отказывает; зонд шлёт ClientHello
+       одной датаграммой и разрез подтверждает. Без защиты цель «подтверждена»
+       и пересматривается каждые 10 минут. */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        quic_answer = D2K_V_OPAQUE; arm_kind = D2K_QA_SPLIT;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+
+        /* (a) Снимок клиента — обрывок: разрез не спрашивается и не строится. */
+        quic_calls = 0; quic_last_split_unfit = -1; ver_calls = 0;
+        d2k_ev sh;
+        CHECK(quic_shape_first_of_two(&sh, "pq.split.example") == 0, "I1: обрывок не собран");
+        d2k_sched_event(s, &sh);
+        ver_answer_port = 40081;
+        d2k_ev h = ev_hello(17, 40081, "pq.split.example"); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40081); d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev ap = ev_applied(17, 40081); d2k_sched_event(s, &ap);
+        spin(s, 40);
+        CHECK(quic_calls == 1 && quic_last_split_unfit == 1,
+              "I1: вопроснику не сказано, что разрез клиенту неприменим");
+        CHECK(said("план разреза не строю") && !binding_of(&c, "pq.split.example", 17),
+              "I1: разрез CRYPTO построен/подтверждён клиенту шире датаграммы");
+
+        /* (b) Снимка нет, вход замера (PROFILE) — одна датаграмма: разрез
+           предлагается и подтверждается. */
+        quic_calls = 0; quic_last_split_unfit = -1;
+        ver_answer_port = 40082;
+        forget_sent();
+        d2k_ev h2 = ev_hello(17, 40082, "single.split.example"); d2k_sched_event(s, &h2);
+        d2k_ev su2 = ev_suspect(17, 40082); d2k_sched_event(s, &su2);
+        settle(s);
+        d2k_ev ap2 = ev_applied(17, 40082); d2k_sched_event(s, &ap2);
+        spin(s, 40);
+        CHECK(quic_calls == 1 && quic_last_split_unfit == 0,
+              "I1: однодатаграммному входу разрез запрещён");
+        d2k_cat_binding *bd = binding_mut(&c, "single.split.example", 17);
+        CHECK(bd && !bd->recheck_since, "I1: разрез CRYPTO для однодатаграммного входа не подтверждён");
+        int succ0 = bd ? bd->successes : -1;
+
+        /* (c) Подтверждённый разрез не исполнился потоку клиента
+           (planned=NO): снимок заказан; обрывок — привязка к повторной
+           проверке, снята с провода. */
+        forget_sent();
+        d2k_ev h3 = ev_hello(17, 40083, "single.split.example"); d2k_sched_event(s, &h3);
+        d2k_ev su3 = ev_suspect(17, 40083); su3.planned = D2K_LINK_PLANNED_NO;
+        d2k_sched_event(s, &su3);
+        spin(s, 5);
+        CHECK(sent_command_count(D2K_CMD_ARM_SHAPE, NULL, 0) == 1,
+              "I1: неисполненный разрез не заказал снимок клиента");
+        d2k_ev sh3;
+        CHECK(quic_shape_first_of_two(&sh3, "single.split.example") == 0, "I1: обрывок (c) не собран");
+        d2k_sched_event(s, &sh3);
+        spin(s, 5);
+        bd = binding_mut(&c, "single.split.example", 17);
+        CHECK(bd && bd->recheck_since != 0,
+              "I1: разрез, не исполняющийся клиенту, остался подтверждённым");
+        CHECK(said("привязок к повторной проверке"), "I1: снятие разреза не сказано");
+
+        /* (d) Следующий поиск той же цели разрез не переподтверждает. */
+        d2k_ev h4 = ev_hello(17, 40084, "single.split.example"); d2k_sched_event(s, &h4);
+        d2k_ev su4 = ev_suspect(17, 40084); d2k_sched_event(s, &su4); /* наблюдение кончено */
+        spin(s, 5);
+        quic_calls = 0; quic_last_split_unfit = -1;
+        ver_answer_port = 40085;
+        d2k_ev h5 = ev_hello(17, 40085, "single.split.example"); d2k_sched_event(s, &h5);
+        d2k_ev su5 = ev_suspect(17, 40085); d2k_sched_event(s, &su5);
+        for (int i = 0; i < 30 && quic_calls == 0; i++) { skip_ahead(s, 6000); spin(s, 40); }
+        settle(s);
+        d2k_ev ap5 = ev_applied(17, 40085); d2k_sched_event(s, &ap5);
+        spin(s, 40);
+        bd = binding_mut(&c, "single.split.example", 17);
+        CHECK(quic_last_split_unfit == 1 && bd && bd->recheck_since != 0 && bd->successes == succ0,
+              "I1: разрез CRYPTO переподтверждён клиенту шире датаграммы");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        arm_kind = D2K_QA_BLOB;
+    }
+
     /* A late TCP snapshot must stop a search based on the synthetic profile,
        then start exactly one search with the captured ClientHello. */
     {
@@ -6170,6 +6289,60 @@ lifecycle_test:
                          : "lifecycle/question: ранний APPLIED вопроса потерян в T_PROPS_CONTACT");
         CHECK(!said("жду подтверждения полного исполнения"),
               "lifecycle/question: ответ ждёт применения, которое уже пришло");
+        d2k_sched_free(s); d2k_catalog_free(&c4);
+        if (peer >= 0) close(peer);
+        close(lfd);
+        g_server_port = saved_port;
+    }
+    {
+        /* Финальное ревью core, M2: срок жизни истёк, пока вопрос о свойствах
+           стоял в T_PROPS_CONTACT (поток обращения вернулся, задача его ещё
+           не приняла). Сокет обращения закрывается вместе с задачей, а не
+           остаётся висеть в d2kc, живущем сутками. */
+        uint16_t saved_port = g_server_port;
+        int lfd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(0x7f000001);
+        int bound = 0;
+        for (uint16_t port = 19600; port < 19700 && !bound; port++) {
+            a.sin_port = htons(port);
+            bound = (bind(lfd, (struct sockaddr *)&a, sizeof a) == 0);
+        }
+        socklen_t al = sizeof a;
+        CHECK(lfd >= 0 && bound && getsockname(lfd, (struct sockaddr *)&a, &al) == 0 &&
+              listen(lfd, 4) == 0, "lifecycle/contact-life: стенд-цель не слушает");
+        g_server_port = ntohs(a.sin_port);
+        d2k_catalog c4 = {0};
+        d2k_sched *s = d2k_sched_new(&c4, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_OPAQUE; tcp_owns_search = tcp_found_arm = 0;
+        d2k_ev h = ev_hello(6, 41349, "contact-life.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 41349);
+        d2k_sched_event(s, &su);
+        for (int i = 0; i < 200 && !said("спрашиваю коробку о свойствах"); i++) tick_once(s);
+        int peer = -1;
+        for (int i = 0; i < 400 && peer < 0; i++) {
+            struct pollfd p2; p2.fd = lfd; p2.events = POLLIN; p2.revents = 0;
+            if (poll(&p2, 1, 5) > 0) { peer = accept(lfd, NULL, NULL); if (peer >= 0) break; }
+            tick_once(s);
+        }
+        CHECK(peer >= 0 && !said("ушёл с местного порта"),
+              "lifecycle/contact-life: стенд не воспроизводит T_PROPS_CONTACT");
+        skip_ahead(s, 11 * 60 * 1000);
+        int closed = 0;
+        for (int i = 0; i < 200 && peer >= 0 && !closed; i++) {
+            struct pollfd p3; p3.fd = peer; p3.events = POLLIN; p3.revents = 0;
+            if (poll(&p3, 1, 10) > 0) {
+                char b[4096];
+                ssize_t n = recv(peer, b, sizeof b, 0);
+                if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) closed = 1;
+            }
+        }
+        CHECK(closed, "lifecycle/contact-life: сокет обращения пережил задачу (утечка дескриптора)");
         d2k_sched_free(s); d2k_catalog_free(&c4);
         if (peer >= 0) close(peer);
         close(lfd);
@@ -8143,6 +8316,63 @@ rx_volume_tests:
             settle(s);
             CHECK(ver_calls == 2,
                   "challenge-backoff не истёк: цель навсегда исключена из перепроверки");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
+    }
+
+    /* Финальное ревью core, M6: кольцо отсрочек конечно (128), но
+       действующая антибот-пауза (60 мин) не вытесняется, пока есть чем
+       её заменить: сначала свободные и истёкшие записи, затем действующие
+       не-антибот. Прежде кольцо писалось по кругу, и 128 прямых CLEAR
+       снимали паузу раньше срока. */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_CHALLENGE;
+        ver_fail_first = 0;
+        ver_answer_port = 40250;
+        ver_calls = tcp_calls = 0;
+        forget_sent();
+        CHECK(s != NULL, "планировщик кольца отсрочек не завёлся");
+        if (s) {
+            d2k_ev h = ev_hello(6, 40250, "challenge-ring.example");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 40250);
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(ver_calls == 1, "кольцо: антибот-челлендж не получен");
+            tcp_answer = D2K_V_CLEAR;
+            /* Половина CLEAR истекает (10 мин), затем ещё 128 — кольцо
+               переполняется и истёкшими, и действующими записями. */
+            for (int round = 0; round < 2; round++) {
+                for (int k = 0; k < 128; k++) {
+                    char nm[64];
+                    snprintf(nm, sizeof nm, "clear-ring-%d-%d.example", round, k);
+                    uint16_t port = (uint16_t)(43000 + round * 200 + k);
+                    int before = tcp_calls;
+                    skip_ahead(s, 300);
+                    d2k_ev hk = ev_hello(6, port, nm);
+                    d2k_sched_event(s, &hk);
+                    d2k_ev sk = ev_suspect(6, port);
+                    d2k_sched_event(s, &sk);
+                    for (int i = 0; i < 400 && tcp_calls == before; i++) tick_once(s);
+                    spin(s, 4);
+                }
+                if (round == 0) skip_ahead(s, 11 * 60 * 1000);
+            }
+            int t0 = tcp_calls, v0 = ver_calls;
+            tcp_answer = D2K_V_PREFIX;
+            d2k_ev h2 = ev_hello(6, 40251, "challenge-ring.example");
+            d2k_sched_event(s, &h2);
+            d2k_ev su2 = ev_suspect(6, 40251);
+            d2k_sched_event(s, &su2);
+            settle(s);
+            CHECK(tcp_calls == t0 && ver_calls == v0,
+                  "кольцо отсрочек вытеснило действующую антибот-паузу");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c);
@@ -11445,6 +11675,94 @@ own_first_test:
             d2k_sched_quic_seeded_hook = NULL;
         }
         quic_answer = D2K_V_OPAQUE;
+
+        /* (l) Финальное ревью core, M1 + M3. Поиск со своими планами (свой
+           не помог → полный замер подтвердил заготовкой), затем снимок
+           клиента — перемер. Перемер — НОВЫЙ поиск: время на карточке от его
+           начала (began_carry не переживает свой запуск), и фаза своих
+           планов предлагает их заново (own_seen сброшен). */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-remeasure", pid, 2, 3, "remeasure-first.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 1; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42201;
+            const char *nm = "remeasure-second.own";
+            d2k_ev h = ev_hello(6, 42201, nm); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42201); d2k_sched_event(s, &su);
+            char since0[64] = "", since1[64] = "";
+            for (int i = 0; i < 400 && !said("пробую свои подтверждённые планы"); i++) tick_once(s);
+            search_since(s, nm, since0, sizeof since0);
+            for (int i = 0; i < 40 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 200);
+                d2k_ev ap = ev_applied(6, 42201); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            const d2k_cat_binding *bd = binding_of(&c, nm, 6);
+            CHECK(tcp_calls == 1 && bd && bd->input == D2K_INPUT_PROFILE,
+                  "remeasure: стенд — полный замер не подтвердил заготовкой после своих планов");
+            skip_ahead(s, 5 * 60 * 1000);
+            spin(s, 5);
+            d2k_ev sh;
+            CHECK(tls_shape_event(&sh, nm, D2K_SHAPE_MODERN) == 0, "remeasure: снимок не собран");
+            d2k_sched_event(s, &sh);
+            for (int i = 0; i < 400 && !said("перемеряю снимком"); i++) tick_once(s);
+            CHECK(said("перемеряю снимком"), "remeasure: перемер снимком не начался");
+            search_since(s, nm, since1, sizeof since1);
+            for (int i = 0; i < 400 && said_count("пробую свои подтверждённые планы до") < 2 &&
+                            tcp_calls < 2; i++) tick_once(s);
+            CHECK(since0[0] && since1[0] && strcmp(since0, since1) != 0,
+                  "remeasure/M1: перемер унаследовал начало прошлого поиска (began_carry)");
+            /* Перемер предлагает И свой план чужой коробки (уже испытанный
+               прошлым поиском), И только что подтверждённый план цели. */
+            CHECK(said("пробую свои подтверждённые планы до полного замера: 2"),
+                  "remeasure/M3: перемер не предложил свои планы заново (own_seen не сброшен)");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_app_after_tcp_search = 0;
+        }
+
+        /* (m) Финальное ревью core, I2: фаза своих планов упёрлась в срок
+           жизни задачи. Фаза кончается и идёт полный замер (со своим сроком),
+           а не отдых и повтор тех же своих планов следующей задачей. */
+        {
+            int n_own = 40;
+            d2k_catalog c = {0};
+            for (int k = 0; k < n_own; k++) {
+                char box[32], tgt[48], id[40];
+                snprintf(box, sizeof box, "box-lifecap-%d", k);
+                snprintf(tgt, sizeof tgt, "l%d.lifecap.own", k);
+                own_box(&c, box, id, (unsigned)(200 + k), 1, tgt, 6, D2K_SHAPE_MODERN, 4,
+                        1790003000 - k, 0);
+            }
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_HANDSHAKE;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5);
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42211;
+            d2k_ev h = ev_hello(6, 42211, "lifecap.target.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42211); d2k_sched_event(s, &su);
+            for (int i = 0; i < 400 && tcp_calls == 0; i++) { skip_ahead(s, 30000); spin(s, 3); }
+            settle(s);
+            CHECK(ver_calls < n_own, "own-first life cap: стенд — свои планы уложились в срок");
+            CHECK(tcp_calls == 1, "own-first life cap: после срока своих планов полный замер не пошёл");
+            CHECK(said_count("пробую свои подтверждённые планы до полного замера") == 1,
+                  "own-first life cap: свои планы проиграны заново");
+            CHECK(!said("не уложился") && !said("временно отложен"),
+                  "own-first life cap: срок фазы своих планов провалил задачу в отдых");
+            CHECK(said("срок фазы своих планов"), "own-first life cap: конец фазы по сроку не сказан");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
 
         d2k_sched_tcp_base_hook = saved_base;
         d2k_sched_rx_ver_hook = saved_rx;
