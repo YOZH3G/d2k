@@ -711,6 +711,40 @@ start_log_maintenance() {
     fi
 }
 
+# МОДУЛИ ЯДРА. На Keenetic модули Netfilter лежат в прошивке файлами
+# /lib/modules/<ядро>/*.ko, но сами не загружаются: modprobe из Entware ищет
+# в /opt/lib/modules, которого там нет (опыт z2k, lib/utils.sh). Поле
+# 03.10.2026, Keenetic mipsel: xt_addrtype/xt_comment не загружены — служба не
+# стартовала. Загружаем сами; отсутствие модуля — не отказ здесь: правило,
+# которому он нужен, либо имеет запасной путь, либо назовёт себя при отказе.
+MODULES_DIR=${D2K_MODULES_DIR:-/lib/modules}
+D2K_MODULES="nfnetlink_queue xt_NFQUEUE xt_conntrack xt_connbytes xt_multiport xt_mark xt_connmark xt_CONNMARK xt_addrtype xt_comment ip6table_mangle"
+module_present() {
+    case "$1" in
+        xt_NFQUEUE|xt_CONNMARK)
+            grep -qw "${1#xt_}" "$PROC_DIR/net/ip_tables_targets" 2>/dev/null && return 0 ;;
+        nfnetlink_queue) [ -e "$PROC_DIR/net/netfilter/nfnetlink_queue" ] && return 0 ;;
+        ip6table_mangle) grep -qw mangle "$PROC_DIR/net/ip6_tables_names" 2>/dev/null && return 0 ;;
+        xt_*) grep -qw "${1#xt_}" "$PROC_DIR/net/ip_tables_matches" 2>/dev/null && return 0 ;;
+    esac
+    lsmod 2>/dev/null | grep -q "^$1 "
+}
+load_modules() {
+    kver=$(uname -r 2>/dev/null)
+    for m in $D2K_MODULES; do
+        module_present "$m" && continue
+        modprobe "$m" 2>/dev/null && module_present "$m" && continue
+        ko=
+        for d in "$MODULES_DIR/$kver" "$MODULES_DIR"; do
+            [ -f "$d/$m.ko" ] && { ko="$d/$m.ko"; break; }
+        done
+        [ -n "$ko" ] || ko=$(find "$MODULES_DIR" -name "$m.ko" -type f 2>/dev/null | head -1)
+        if [ -n "$ko" ] && insmod "$ko" 2>/dev/null; then
+            say "загружен модуль ядра $m"
+        fi
+    done
+}
+
 start_engine() {
     [ "$MODE" = "off" ] && { say "MODE=off — запуск запрещён"; return 1; }
     [ -x "$DPBIN" ] || die "нет $DPBIN"
@@ -773,6 +807,7 @@ start_engine() {
         if ! running "$HU_PID"; then engine_stop; die "HTTP-upgrade listener завершился сразу"; fi
     fi
 
+    load_modules
     fw_up || { engine_stop; die "не поставить правила"; }
 
     # После правил, но до контроллера: к моменту первого приветствия таблица
@@ -1008,6 +1043,7 @@ reapply() {
         start-stop-daemon -S -b -m -p "$HU_PID" -x "$HTTPUPBIN" -- \
             --port "$HTTPUP_PORT" --mark "$HTTPUP_MARK" || die "HTTP-upgrade listener не запустился"
     fi
+    load_modules
     fw_up || { fw_down; die "не поставить полный набор правил"; }
     say "правила поставлены заново"
 }

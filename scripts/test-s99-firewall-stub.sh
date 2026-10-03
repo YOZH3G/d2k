@@ -130,6 +130,40 @@ rules iptables mangle | grep -qx -- "-A D2K_OUT -d 255.255.255.255 -j RETURN" ||
 ! rules iptables mangle | grep -q addrtype || fail "addrtype rule present although unsupported"
 ok "without xt_addrtype the service starts with explicit broadcast exclusions"
 
+# Модули ядра лежат файлами в прошивке, но не загружены (Keenetic: modprobe из
+# Entware ищет в /opt/lib/modules) — служба загружает их сама через insmod.
+# Уже доступные (в /proc/net/ip_tables_matches) не трогаются.
+mkdir -p "$TMP/mods/9.9-test" "$TMP/proc/net"
+for m in xt_addrtype xt_comment xt_conntrack; do : > "$TMP/mods/9.9-test/$m.ko"; done
+printf 'multiport\nconnbytes\nmark\nconnmark\n' > "$TMP/proc/net/ip_tables_matches"
+printf 'NFQUEUE\nCONNMARK\n' > "$TMP/proc/net/ip_tables_targets"
+cat > "$TMP/bin/uname" <<'EOF2'
+#!/bin/sh
+echo 9.9-test
+EOF2
+cat > "$TMP/bin/modprobe" <<'EOF2'
+#!/bin/sh
+exit 1
+EOF2
+cat > "$TMP/bin/insmod" <<'EOF2'
+#!/bin/sh
+echo "$1" >> "$INSMOD_LOG"
+EOF2
+cat > "$TMP/bin/lsmod" <<'EOF2'
+#!/bin/sh
+exit 0
+EOF2
+chmod +x "$TMP/bin/uname" "$TMP/bin/modprobe" "$TMP/bin/insmod" "$TMP/bin/lsmod"
+: > "$TMP/insmod.log"
+out=$(S99_SNIPPET='load_modules' s99 D2K_MODULES_DIR="$TMP/mods" INSMOD_LOG="$TMP/insmod.log" 2>&1) || { echo "$out" >&2; fail "load_modules failed"; }
+for m in xt_addrtype xt_comment xt_conntrack; do
+    grep -q "/$m.ko$" "$TMP/insmod.log" || fail "$m not loaded from the firmware tree"
+done
+! grep -q "multiport\|connbytes\|NFQUEUE" "$TMP/insmod.log" || fail "an already available module was reloaded"
+printf '%s\n' "$out" | grep -q "загружен модуль ядра xt_addrtype" || fail "module load not reported"
+rm -f "$TMP/bin/uname" "$TMP/bin/modprobe" "$TMP/bin/insmod" "$TMP/bin/lsmod"
+ok "kernel modules present as files are loaded by the service itself"
+
 # --- Leftover d2k-rst: rules (filter OUTPUT, both families) ------------------
 rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
 sleep 300 & SLEEPER=$!
