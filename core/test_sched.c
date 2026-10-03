@@ -89,6 +89,11 @@ static char quic_seen_targets[2][256], quic_seen_controls[2][256];
 static pthread_mutex_t snapshot_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t snapshot_cv = PTHREAD_COND_INITIALIZER;
 static int snapshot_enabled, snapshot_entered, snapshot_release, snapshot_ok;
+/* Задача 48: подменённый измеритель сообщает ход (два вопроса по 500 зондов —
+   число заведомо больше бюджета кандидатов, чтобы утечку нельзя было спутать
+   со счётом проверки),
+   как настоящий через on_obs, и только потом ждёт отпуска на snapshot_cv. */
+static int tcp_progress_notes;
 static int ver_snapshot_enabled, ver_snapshot_entered, ver_snapshot_release;
 
 static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
@@ -157,6 +162,11 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
         r.have_arm = 1; r.arm.badsum = 1;
         r.arm_input.trigger_len = trigger.len;
         (void)d2k_hello_sni(trigger.bytes, trigger.len, &r.arm_input.sni_off, &r.arm_input.sni_len);
+    }
+    if (tcp_progress_notes) {
+        d2k_sched_progress_note("split", 0, 500);
+        d2k_sched_progress_note("poison:seqovl-1", 0, 500);
+        r.probes = 1000;
     }
     if (snapshot_enabled) {
         uint8_t before[2048];
@@ -787,6 +797,32 @@ static int live_probes_used(d2k_sched *s) {
     }
     unlink(path);
     return v;
+}
+
+/* Запись ОДНОЙ активной задачи из живого файла (до закрывающей скобки).
+   Пустая строка — задачи нет среди активных или файл не прочитан. */
+static const char *live_task_entry(d2k_sched *s, const char *target) {
+    static char entry[4096];
+    char path[] = "/tmp/d2k-task-entry-XXXXXX";
+    entry[0] = 0;
+    int fd = mkstemp(path);
+    if (fd < 0) return entry;
+    close(fd);
+    if (d2k_sched_write_live(s, path, "catalog.json") == 0) {
+        FILE *f = fopen(path, "r");
+        static char body[65536];
+        body[0] = 0;
+        if (f) { size_t got = fread(body, 1, sizeof body - 1, f); body[got] = 0; fclose(f); }
+        char needle[300];
+        snprintf(needle, sizeof needle, "\"target\": \"%s\"", target);
+        const char *at = strstr(body, needle);
+        const char *end = at ? strchr(at, '}') : NULL;
+        if (at && end && (size_t)(end - at) < sizeof entry) {
+            memcpy(entry, at, (size_t)(end - at)); entry[end - at] = 0;
+        }
+    }
+    unlink(path);
+    return entry;
 }
 
 /* Зонды ОДНОЙ активной задачи из живого файла ("probes" её записи). -1 —
@@ -2586,6 +2622,47 @@ int main(int argc, char **argv) {
         snapshot_enabled = 0; tcp_answer = D2K_V_OPAQUE;
     }
 
+    /* Задача 48: ход классификатора виден, пока он работает. Полный прогон
+     * дерева на трудной цели идёт минутами (meduza.io IPv6 03.10: 102 зонда,
+     * 4 мин 20 с), и «probes: 0» без вопроса не отличить от зависания. Поле
+     * source («откуда план») у задачи без плана — ложь: только при проверке. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        snapshot_enabled = 1; snapshot_entered = snapshot_release = snapshot_ok = 0;
+        tcp_progress_notes = 1;
+        tcp_answer = D2K_V_OPAQUE;
+        d2k_ev h = ev_hello(6, 39977, "progress.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 39977);
+        d2k_sched_event(s, &su);
+        pthread_mutex_lock(&snapshot_mu);
+        while (!snapshot_entered) { pthread_cond_wait(&snapshot_cv, &snapshot_mu); }
+        pthread_mutex_unlock(&snapshot_mu);
+        const char *e = live_task_entry(s, "progress.example");
+        CHECK(strstr(e, "\"phase\": \"распознаём поведение\"") != NULL,
+              "progress fixture is not in the classifier phase");
+        CHECK(strstr(e, "\"probes\": 1000,") != NULL,
+              "running classifier probes are not visible in live.json");
+        CHECK(strstr(e, "\"question\": \"poison:seqovl-1\"") != NULL,
+              "running classifier question is not visible in live.json");
+        CHECK(strstr(e, "\"source\": \"\"") != NULL && !strstr(e, "выведен из замера"),
+              "a task without a plan under trial claims a plan source");
+        pthread_mutex_lock(&snapshot_mu);
+        snapshot_release = 1; pthread_cond_broadcast(&snapshot_cv);
+        pthread_mutex_unlock(&snapshot_mu);
+        settle(s);
+        /* Вернувшийся измеритель больше не «спрашивает»: его зонды не
+           переносятся в счётчик кандидатов (бюджет SCHED_MAX_PROBES) и не
+           складываются второй раз с итогом r.probes. */
+        e = live_task_entry(s, "progress.example");
+        CHECK(!strstr(e, "\"question\": \"poison:seqovl-1\""),
+              "a finished classifier keeps reporting its last question");
+        int p = live_task_probes(s, "progress.example");
+        CHECK(p >= 0 && p < 1000, "classifier probes leaked into the verifier counter after return");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        snapshot_enabled = 0; tcp_progress_notes = 0; tcp_answer = D2K_V_OPAQUE;
+    }
     /* Complete cached input is used; an observable SNI prefix is not.
        Neither case needs a second visit to obtain the cached observation. */
     for (int partial = 0; partial < 2; partial++) {
@@ -3340,6 +3417,12 @@ admission_only_run:
                                       "%Y-%m-%dT%H:%M:%SZ", &tm)) queued_at = timegm(&tm);
                 CHECK(queued_at >= time(NULL) - 30 && queued_at <= time(NULL) + 30,
                       "queued task reports its admission time, not router boot time");
+                /* Задача 48: в очереди плана нет — и источника плана нет. */
+                const char *row_end = row ? strchr(row, '}') : NULL;
+                const char *src = row ? strstr(row, "\"source\": ") : NULL;
+                CHECK(src && row_end && src < row_end &&
+                      !strncmp(src, "\"source\": \"\"", strlen("\"source\": \"\"")),
+                      "queued task claims a plan source");
                 CHECK(strstr(body, "\"measurements\": {\"active\": 2, \"limit\": 2, "
                                    "\"queued\": 1, \"cores\": null, \"free_pct\": null, "
                                    "\"mem_avail_mb\": null, \"mem_total_mb\": null, "

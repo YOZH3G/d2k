@@ -26,6 +26,22 @@ static int base_stop_before, base_stop_other, base_stop_after;
 /* raw.o is not linked here: the adapter only asks whether the kernel-RST
  * suppression rule ever failed in this process. */
 int d2k_raw_rst_rule_failed(void) { return rule_failed; }
+
+/* Ход измерителя (задача 48): sched.o здесь не линкуется, приёмник
+ * планировщика подменён записью вызовов. */
+static int progress_calls, progress_probes;
+static char progress_last[160];
+void d2k_sched_progress_note(const char *question, int pass, int fail)
+{
+    progress_calls++;
+    progress_probes += pass + fail;
+    snprintf(progress_last, sizeof progress_last, "%s", question);
+}
+static void progress_reset(void)
+{
+    progress_calls = progress_probes = 0;
+    progress_last[0] = '\0';
+}
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "bridge:%d: %s\n", __LINE__, #c); failures++; \
 } } while (0)
@@ -45,6 +61,8 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         memset(&other, 0, sizeof other); memset(&whole, 0, sizeof whole);
         snprintf(other.probe, sizeof other.probe, "split");
         snprintf(whole.probe, sizeof whole.probe, "whole");
+        other.fail = 3;
+        whole.pass = 1; whole.fail = 2;
         base_stop_before = opt->cancel.fn(opt->cancel.ctx);
         opt->on_obs(opt->on_obs_ctx, &other);
         base_stop_other = opt->cancel.fn(opt->cancel.ctx);
@@ -226,11 +244,14 @@ int main(void)
     /* Базовый вопрос донора отдельно (задача 32): тот же измеритель, та же
        метка/повторы/контроль, но без ответного направления и сырого слоя;
        блокировка — ни одного прохода и ни одной ошибки транспорта. */
+    progress_reset();
     r = measure_base(0, 2, "");
     CHECK(r.base_blocked && r.verdict == D2K_V_INCONCLUSIVE && r.probes == 2);
     CHECK(seen_name[0] == '\0' && seen.no_raw == 1);
     CHECK(seen.mark == 0x2d && seen.repeats == 2 && seen.control.len == 3);
     CHECK(base_stop_before == 0 && base_stop_other == 0 && base_stop_after == 1);
+    /* Базовый вопрос тоже отдаёт ход, не теряя своей остановки на "whole". */
+    CHECK(progress_calls == 2 && progress_probes == 6 && strcmp(progress_last, "whole") == 0);
     r = measure_base(2, 0, "");
     CHECK(!r.base_blocked && r.verdict == D2K_V_CLEAR);
     r = measure_base(1, 1, "");
@@ -250,11 +271,17 @@ int main(void)
         seed.valid = 1; seed.repeats = 2; seed.pass = 0; seed.fail = 2;
         memset(&answer, 0, sizeof answer);
         answer.verdict = D2K_DV_PREFIX;
+        progress_reset();
         r = d2k_detect_sched_tcp_seeded("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321, NULL, &seed);
         CHECK(seen.seed_whole == 1 && seen.seed_repeats == 2 && seen.seed_pass == 0 &&
-              seen.seed_fail == 2 && seen.on_obs == NULL && r.verdict == D2K_V_PREFIX);
+              seen.seed_fail == 2 && r.verdict == D2K_V_PREFIX);
+        /* Полный прогон отдаёт ход планировщику: каждый вопрос с его зондами. */
+        CHECK(seen.on_obs != NULL);
+        CHECK(progress_calls == 2 && progress_probes == 6 && strcmp(progress_last, "whole") == 0);
+        progress_reset();
         r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321);
         CHECK(seen.seed_whole == 0);
+        CHECK(progress_calls == 2 && progress_probes == 6 && strcmp(progress_last, "whole") == 0);
     }
     memset(&answer, 0, sizeof answer);
 

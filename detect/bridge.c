@@ -24,6 +24,7 @@
 #include "d2k_arm.h"
 #include "d2k_hello.h"
 #include "d2k_verdict.h"
+#include "d2k_sched.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -202,6 +203,16 @@ static int bridge_input(const char *ip, uint16_t port,
     return 0;
 }
 
+/* ХОД — ПЛАНИРОВЩИКУ (задача 48). Каждый заданный вопрос с его зондами
+ * уходит в d2k_sched_progress_note: полный прогон на трудной цели идёт
+ * минутами, и без этого панель видит «0 зондов» и ни одного вопроса.
+ * Наблюдение то же, что печатает --progress, ни на что в дереве не влияет. */
+static void progress_seen(void *ctx, const d2k_obs *o)
+{
+    (void)ctx;
+    d2k_sched_progress_note(o->probe, o->pass, o->fail);
+}
+
 /* Полный прогон; seed — ответ уже заданного базового вопроса тем же входом
  * (d2k_opts.seed_whole), NULL — прогон спрашивает базу сам. */
 static d2k_vres sched_tcp(const char *ip, uint16_t port,
@@ -227,6 +238,8 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
         opt.seed_fail = seed->fail;
         snprintf(opt.seed_err, sizeof(opt.seed_err), "%s", seed->err);
     }
+    opt.on_obs = progress_seen;
+    opt.on_obs_ctx = NULL;
     d2k_classify_run(addr, &tr, &opt, &res);
 
     if (res.stopped) {
@@ -349,6 +362,7 @@ typedef struct {
 
 static void base_seen(void *ctx, const d2k_obs *o)
 {
+    progress_seen(NULL, o);
     if (strcmp(o->probe, "whole") == 0) { ((base_ctx *)ctx)->base_done = 1; }
 }
 

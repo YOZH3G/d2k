@@ -195,6 +195,15 @@ typedef d2k_vres (*d2k_sched_quic_seeded_fn)(const char *ip, uint16_t port, cons
                                              d2k_quic_arm *arm, const d2k_base_seed *seed);
 extern d2k_sched_quic_seeded_fn d2k_sched_quic_seeded_hook;
 
+/* ХОД ИЗМЕРИТЕЛЯ (задача 48). Полный прогон дерева идёт минутами, а
+ * крючки выше возвращают только итог. Измеритель, работающий в рабочем
+ * потоке планировщика, сообщает сюда каждый заданный вопрос: имя (как в
+ * трассе: "split", "poison:seqovl-1") и сколько зондов он стоил. Планировщик
+ * отдаёт это в live.json у поиска в фазе «распознаём поведение» — "probes" и
+ * "question". Вне рабочего потока планировщика (CLI, тесты измерителя)
+ * вызов ничего не делает. Не влияет ни на вердикт, ни на бюджет кандидатов. */
+void d2k_sched_progress_note(const char *question, int pass, int fail);
+
 /* Голосовой измеритель блокирует на сетевых ответах и запускается
  * асинхронно; крючок позволяет проверить scheduler без сети. */
 typedef d2k_voice_res (*d2k_sched_voice_fn)(const d2k_voice_opt *opt);

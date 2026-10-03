@@ -882,6 +882,12 @@ typedef struct {
                              ступени RX-лестницы перед ним — из замера */
     unsigned   rx_volume_next_variant;
     int        res_ready;   /* пишется потоком под мьютексом планировщика */
+    /* Ход идущего прогона измерителя (задача 48): зонды и последний заданный
+       вопрос. Пишет рабочий поток через d2k_sched_progress_note под s->mu,
+       обнуляет start_worker. В счётчик кандидатов t->probes (бюджет
+       SCHED_MAX_PROBES) не переносится: это опыты измерителя, не кандидаты. */
+    int        ask_probes;
+    char       ask_question[96];
     /* Подобранное плечо QUIC и признак того, что подбор состоялся. Отдельно
        от вердикта: «плечо не найдено» и «вердикта нет» — разные утверждения,
        и складывать их в одно поле значило бы потерять различие. */
@@ -1829,6 +1835,28 @@ static uint64_t seed_input_of(const uint8_t *bytes, size_t len, const char *ip, 
     return h ^ len;
 }
 
+/* Приёмник хода — у потока, а не у задачи: сигнатуры пяти крючков измерителя
+   не меняются, а ход идёт ровно из того потока, что ведёт задачу. */
+typedef struct { d2k_sched *s; task *t; } progress_sink;
+static __thread progress_sink g_progress_sink;
+
+void d2k_sched_progress_note(const char *question, int pass, int fail) {
+    progress_sink *k = &g_progress_sink;
+    if (!k->s || !k->t || !question) { return; }
+    size_t n = strlen(question);
+    if (n >= sizeof k->t->ask_question) {
+        /* Обрезка по границе символа UTF-8: имена свойств — кириллица. */
+        n = sizeof k->t->ask_question - 1;
+        while (n > 0 && ((unsigned char)question[n] & 0xc0) == 0x80) { n--; }
+    }
+    pthread_mutex_lock(&k->s->mu);
+    if (pass > 0) { k->t->ask_probes += pass; }
+    if (fail > 0) { k->t->ask_probes += fail; }
+    memcpy(k->t->ask_question, question, n);
+    k->t->ask_question[n] = '\0';
+    pthread_mutex_unlock(&k->s->mu);
+}
+
 static void *worker_run(void *vp) {
     worker_arg *a = (worker_arg *)vp;
     d2k_sched *s = a->s;
@@ -1840,6 +1868,12 @@ static void *worker_run(void *vp) {
     d2k_hello trig = {trigger_bytes, a->trig_len};
     d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len};
     free(a);
+    /* Ход сообщает только прогон измерителя (JOB_CLASSIFY); поток живёт ровно
+       одну задачу, поэтому снимать приёмник не нужно. */
+    if (t->job == JOB_CLASSIFY) {
+        g_progress_sink.s = s;
+        g_progress_sink.t = t;
+    }
 
     if (t->job == JOB_VOICE) {
         d2k_voice_opt opt;
@@ -2138,6 +2172,10 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     if (job == JOB_VERIFY) { t->probe_fd = -1; }
     t->job = job;
     t->res_ready = 0;
+    /* Новый поток — новый ход: прошлый прогон (база задачи 32, повтор по
+       снимку) своих зондов этому не передаёт. Прежний поток уже присоединён. */
+    t->ask_probes = 0;
+    t->ask_question[0] = '\0';
     /* ФЛАГ «БРОСАЙ» — СВЕЖИЙ У КАЖДОГО ПОТОКА.
        Его взводит join_worker, дожидаясь предыдущего, и снимает только
        task_reset. Задача, которая начинает замер ЗАНОВО не через сброс
@@ -3911,11 +3949,32 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         fputs(", \"since\": ", f);
         int64_t admitted_ms = t->state == T_QUEUED ? t->queued_ms : t->started_ms;
         json_time(f, wall_s(s, admitted_ms ? admitted_ms : s->now_ms));
-        fprintf(f, ", \"attempts\": %zu, \"probes\": %d, ", t->next_plan, t->probes);
-        fputs("\"candidate\": ", f);
+        /* Ход измерителя (задача 48): пока идёт прогон, зонды — его, а вопрос
+           — последний заданный. Иначе «probes: 0» минутами не отличить от
+           зависания. Копия под мьютексом: пишет рабочий поток. */
+        int ask_probes = 0;
+        char question[sizeof t->ask_question];
+        question[0] = '\0';
+        if (t->state == T_ASKING) {
+            pthread_mutex_lock(&s->mu);
+            ask_probes = t->ask_probes;
+            memcpy(question, t->ask_question, sizeof question);
+            pthread_mutex_unlock(&s->mu);
+            question[sizeof question - 1] = '\0';
+        }
+        fprintf(f, ", \"attempts\": %zu, \"probes\": %d, ", t->next_plan, t->probes + ask_probes);
+        fputs("\"question\": ", f);
+        json_str(f, question);
+        fputs(", \"candidate\": ", f);
         json_str(f, t->next_plan > 0 ? "план поставлен" : "");
+        /* Откуда план, КОТОРЫЙ ИСПЫТЫВАЕМ — только пока он испытывается. У
+           задачи в очереди или в замере плана нет, и «выведен из замера» там
+           читалось как «цель исключена». */
+        int trying = t->state == T_TRIAL_SETTLE || t->state == T_VERIFY ||
+                     t->state == T_VERIFY_WAIT;
         fputs(", \"source\": ", f);
-        json_str(f, t->n_known > 0 && t->next_plan <= t->n_known
+        json_str(f, !trying ? ""
+                        : t->n_known > 0 && t->next_plan <= t->n_known
                         ? "готовый план узнанной коробки"
                         : t->fb_queue && (t->next_plan ? t->next_plan - 1 : 0) >= t->fb_from
                         ? "запасной перебор" : "выведен из замера");
