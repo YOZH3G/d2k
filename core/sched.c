@@ -576,6 +576,7 @@ typedef struct {
 
     int64_t    started_ms; /* active search/lifecycle budget begins on launch */
     int64_t    began_ms;   /* when this search began, for the card and verdict line only (task 49) */
+    int        began_carry; /* began_ms set by own_first_continue for the very next launch */
     int64_t    queued_ms;  /* independent age of a queued suspicion */
     uint64_t   queued_event;
     /* «Горячая» цель (задача 29): по ждущей в очереди пришло новое
@@ -5399,6 +5400,10 @@ static int family_recovery_start(d2k_sched *s, task *t) {
 
 static int launch_task(d2k_sched *s, task *t) {
     t->started_ms = s->clock_seen ? s->now_ms : 0;
+    /* Новый поиск (перемер по снимку и т.п.) считает время с себя; только
+       переход «свои планы → полный замер» переносит начало поиска. */
+    if (!t->began_carry) t->began_ms = 0;
+    t->began_carry = 0;
     t->queued_ms = 0;
     if (t->by_addr) {
         quic_addr_start(s, t);
@@ -6870,6 +6875,7 @@ static void own_first_continue(d2k_sched *s, task *t) {
     char name[sizeof t->name];
     snprintf(name, sizeof name, "%s", t->name);
     t->began_ms = began; /* перезапуск окна не «омолаживает» поиск на карточке */
+    t->began_carry = 1;
     if (!start_search(s, t))
         say(s, "по %s полный замер не запустился — задача снята, следующее "
                "подозрение начнёт поиск заново", name);
