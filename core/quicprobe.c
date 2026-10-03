@@ -1730,7 +1730,9 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
        больше: обрыву нужно RTO тишины и два PING без ответа. */
     d2k_qstall st;
     d2k_qstall_init(&st, d2k_qc_rtt_ms(c), start, d2k_qc_rx_wire_bytes(c));
-    int stalled = 0;
+    int stalled = 0, budget = 0;
+    uint64_t tx0 = 0, rx0 = 0;
+    d2k_qc_dgrams(c, &tx0, &rx0);
     int64_t limit = (int64_t)(4u * step);
     if (limit < 4 * st.rto_ms) limit = 4 * st.rto_ms;
     (void)progress_at;
@@ -1740,6 +1742,14 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
         if (now - start >= limit) break;
         int act = d2k_qstall_step(&st, now, d2k_qc_rx_wire_bytes(c));
         if (act == D2K_QSTALL_STALLED) { stalled = 1; break; }
+        {
+            uint64_t tx = 0, rx = 0;
+            d2k_qc_dgrams(c, &tx, &rx);
+            if (d2k_quic_budget_ok(tx - tx0, rx - rx0, status, now, st.last_rx_ms, st.rto_ms)) {
+                budget = 1;
+                break;
+            }
+        }
         if (act == D2K_QSTALL_PROBE) { (void)d2k_qc_ping(c, err, sizeof err); }
         long n = d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 200, err, sizeof err);
         if (n < 0) { closed = 1; }
@@ -1761,10 +1771,11 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
     free(head);
     d2k_qc_app_progress(c, &bytes, &complete);
     d.app_bytes = bytes;
-    /* Соединение оборвалось ошибкой посреди ответа — тоже не «медленно». */
-    if (closed && !complete) stalled = 1;
+    /* Раунд 4 (M-n1): ошибка соединения — не молчание. CONNECTION_CLOSE
+       сервера доказывает, что он жив; разбор и сокет — наша сторона. Обрыв —
+       только тишина, доказанная PING (d2k_qstall). */
     d.verdict = d2k_quic_arm_data_judge3(1, status, bytes, complete, stalled,
-                                         q->need_complete, head_full);
+                                         q->need_complete, head_full, budget);
     if (d.verdict == D2K_QAD_NOT_RUN && head_full && status <= 0) {
         snprintf(d.reason, sizeof d.reason,
                  "заголовки ответа HTTP/3 длиннее %d байт — наш предел, не обрыв линии",
@@ -1777,7 +1788,8 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
                  (unsigned long long)bytes);
     } else if (d.verdict == D2K_QAD_PASS) {
         snprintf(d.reason, sizeof d.reason, "рукопожатие, HTTP %d и %llu байт данных%s",
-                 status, (unsigned long long)bytes, complete ? ", ответ целиком" : "");
+                 status, (unsigned long long)bytes, complete ? ", ответ целиком" :
+                 budget ? ", поток прошёл бюджет коробки (2×25 пакетов), сервер ещё шлёт" : "");
     } else if (!status || status == 451) {
         snprintf(d.reason, sizeof d.reason, "рукопожатие есть, %s (%llu байт)%s%.80s",
                  status ? "HTTP 451 — отказ, не успех" : "заголовков ответа HTTP/3 нет",

@@ -806,6 +806,15 @@ check: test-quicconn-rtx
 test-quicconn-rtx: test_quicconn_rtx
 	./test_quicconn_rtx
 
+test_quicconn_fc: test_quicconn_fc.c quicconn.c quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quicconn_fc.c quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+
+.PHONY: test-quicconn-fc
+test-quicconn-fc: test_quicconn_fc
+	./test_quicconn_fc
+check: test-quicconn-fc
+TESTS += test_quicconn_fc
+
 .PHONY: test-quicconn6
 TESTS += test_quicconn_rtx
 TESTS += test_quicconn6 test_volume test_volume_context test_httpup_logic test_httpup_relay

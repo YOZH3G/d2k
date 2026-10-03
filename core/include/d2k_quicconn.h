@@ -111,6 +111,8 @@ int d2k_qc_handshake_done(const d2k_qc *c);
 /* RTT рукопожатия, мс: от первого Initial до первой датаграммы сервера
    (0 — не измерен). Задача 50, раунд 3. */
 int64_t d2k_qc_rtt_ms(const d2k_qc *c);
+/* Датаграммы соединения в обе стороны (задача 50, раунд 4: бюджет коробки). */
+void d2k_qc_dgrams(const d2k_qc *c, uint64_t *tx, uint64_t *rx);
 /* PING под прикладными ключами — кадр, требующий подтверждения: живой сервер
    отвечает на него за RTT + max_ack_delay (RFC 9000 §19.2). */
 int d2k_qc_ping(d2k_qc *c, char *err, size_t errcap);

@@ -515,12 +515,25 @@ static inline int d2k_qstall_step(d2k_qstall *st, int64_t now_ms, uint64_t rx_by
  * ответ целиком (поиск по обрыву после рукопожатия: свой прямой запрос и
  * плечи на ТОМ ЖЕ пути сравниваются полным ответом). Сервер жив, а ответ не
  * успел — НЕ обрыв: этап не измерен (NOT_RUN), как и наш предел заголовков. */
+/* БЮДЖЕТ КОРОБКИ (задача 50, раунд 4; то же правило берёт задача 55 для
+ * подтверждений). Коробка рвёт поток после бюджета пакетов: у QUIC 04.10 —
+ * 14–17 пакетов сервера. Поток, который пронёс вдвое больше пакетов в обе
+ * стороны, а сервер всё ещё шлёт (датаграмма от него моложе RTO), бюджет
+ * прошёл — обход большого ресурса засчитывается, не дожидаясь конца ответа. */
+#define D2K_QUIC_BOX_BUDGET_PKTS 25u
+static inline int d2k_quic_budget_ok(uint64_t tx_pkts, uint64_t rx_pkts, int status,
+                                     int64_t now_ms, int64_t last_rx_ms, int64_t rto_ms) {
+    return status > 0 && tx_pkts + rx_pkts >= 2u * D2K_QUIC_BOX_BUDGET_PKTS &&
+           now_ms - last_rx_ms < rto_ms;
+}
+
 static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge3(int handshake, int status,
         uint64_t app_bytes, int complete, int stalled, int need_complete,
-        int headers_too_long) {
+        int headers_too_long, int budget_ok) {
     if (!handshake) return D2K_QAD_NO_HANDSHAKE;
     if (status == 451) return D2K_QAD_CUT;
     if (status > 0 && complete) return D2K_QAD_PASS;
+    if (status > 0 && budget_ok && !stalled) return D2K_QAD_PASS;
     if (stalled) return D2K_QAD_CUT;
     if (status <= 0 && headers_too_long) return D2K_QAD_NOT_RUN;
     if (!need_complete && status > 0 && app_bytes >= D2K_QUIC_ARM_DATA_BYTES) return D2K_QAD_PASS;

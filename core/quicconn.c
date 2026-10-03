@@ -69,6 +69,9 @@
  * оценка, что у max_udp_payload_size ниже: 1492 (PPPoE) минус заголовки
  * IPv4 и UDP. Принимаем с запасом: сервер вправе слать до 65527. */
 #define DGRAM_OUT 1452
+/* Окна, объявленные в транспортных параметрах (tp_build). */
+#define D2K_QC_STREAM_WIN 262144u
+#define D2K_QC_CONN_WIN   1048576u
 #define DGRAM_IN  2048
 
 typedef struct {
@@ -155,6 +158,17 @@ struct d2k_qc {
        первого Initial) — основа RTO для «встал». */
     int64_t  sent0_ms;
     int64_t  rtt_ms;
+    /* ЧЕСТНЫЙ ПРИЁМНИК (задача 50, раунд 4). Кредит, выданный серверу: окно
+       потока ответа и соединения. Расширяется, когда принята половина окна
+       (RFC 9000 §4.2); без этого сервер вставал на 256 КБ, и ответ больше
+       окна не завершался никогда. Ноль — начальные значения из
+       транспортных параметров (D2K_QC_STREAM_WIN / D2K_QC_CONN_WIN). */
+    uint64_t fc_stream_limit, fc_conn_limit;
+    uint64_t rx_want_high;   /* наибольший конец данных потока ответа */
+    uint64_t rx_other;       /* байты прочих потоков (счёт сверху) */
+    int      credit_due;     /* 1 — MAX_STREAM_DATA, 2 — MAX_DATA */
+    /* Датаграммы обоих направлений — для «потока хватило на бюджет». */
+    uint64_t tx_dgrams, rx_dgrams;
 
     uint8_t  local_addr[16];
     uint8_t  family;
@@ -299,6 +313,7 @@ static int send_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
         say(err, errcap, "датаграмма не ушла: %s", strerror(errno));
         return -1;
     }
+    c->tx_dgrams++;
     return 0;
 }
 
@@ -322,10 +337,10 @@ static size_t tp_build(const d2k_qc *c, uint8_t *out, size_t cap) {
     size_t o = 0;
     o += tp_put_int(v + o, sizeof v - o, 0x01, 30000);     /* max_idle_timeout */
     o += tp_put_int(v + o, sizeof v - o, 0x03, 1452);      /* max_udp_payload_size */
-    o += tp_put_int(v + o, sizeof v - o, 0x04, 1048576);   /* initial_max_data */
-    o += tp_put_int(v + o, sizeof v - o, 0x05, 262144);    /* bidi_local */
-    o += tp_put_int(v + o, sizeof v - o, 0x06, 262144);    /* bidi_remote */
-    o += tp_put_int(v + o, sizeof v - o, 0x07, 262144);    /* uni */
+    o += tp_put_int(v + o, sizeof v - o, 0x04, D2K_QC_CONN_WIN);   /* initial_max_data */
+    o += tp_put_int(v + o, sizeof v - o, 0x05, D2K_QC_STREAM_WIN); /* bidi_local */
+    o += tp_put_int(v + o, sizeof v - o, 0x06, D2K_QC_STREAM_WIN); /* bidi_remote */
+    o += tp_put_int(v + o, sizeof v - o, 0x07, D2K_QC_STREAM_WIN); /* uni */
     o += tp_put_int(v + o, sizeof v - o, 0x08, 16);        /* max_streams_bidi */
     o += tp_put_int(v + o, sizeof v - o, 0x09, 16);        /* max_streams_uni */
     o += tp_put_int(v + o, sizeof v - o, 0x0e, 2);         /* active_connection_id_limit */
@@ -496,6 +511,25 @@ static int frames_in(d2k_qc *c, d2k_qw_level lvl, const uint8_t *p, size_t n,
                    зонду незачем, а притворяться, что разобрали, нельзя. */
                 int mine = c->have_want ? (sid == c->want_stream)
                                         : (c->rx_len == 0 || c->rx_stream == sid);
+                if (lvl == D2K_QW_LEVEL_APP) {
+                    /* Кредит: половина окна принята — расширить. */
+                    if (mine && c->have_want) {
+                        if (off + len > c->rx_want_high) c->rx_want_high = off + len;
+                        uint64_t lim = c->fc_stream_limit ? c->fc_stream_limit : D2K_QC_STREAM_WIN;
+                        if (c->rx_want_high + D2K_QC_STREAM_WIN / 2 > lim) {
+                            c->fc_stream_limit = c->rx_want_high + D2K_QC_STREAM_WIN;
+                            c->credit_due |= 1;
+                        }
+                    } else {
+                        c->rx_other += len;
+                    }
+                    uint64_t used = c->rx_want_high + c->rx_other;
+                    uint64_t clim = c->fc_conn_limit ? c->fc_conn_limit : D2K_QC_CONN_WIN;
+                    if (used + D2K_QC_CONN_WIN / 2 > clim) {
+                        c->fc_conn_limit = used + D2K_QC_CONN_WIN;
+                        c->credit_due |= 2;
+                    }
+                }
                 if (mine) {
                     c->rx_stream = sid;
                     if (off < STREAM_BUF) {
@@ -541,6 +575,7 @@ static int recv_dgram(d2k_qc *c, int wait_ms, char *err, size_t errcap) {
         return -1;
     }
     c->rx_wire_bytes += (uint64_t)n;
+    c->rx_dgrams++;
     if (!c->rtt_ms && c->sent0_ms) {
         int64_t d = now_ms() - c->sent0_ms;
         c->rtt_ms = d > 0 ? d : 1;
@@ -1078,13 +1113,24 @@ long d2k_qc_stream_recv(d2k_qc *c, uint64_t *stream_out, uint8_t *buf, size_t ca
             (void)send_level(c, D2K_QW_LEVEL_APP, c->last_app, c->last_app_len,
                              0, err, errcap);
         }
-        /* Подтверждаем принятое: сервер не станет досылать, пока молчим. */
+        /* Подтверждаем принятое: сервер не станет досылать, пока молчим.
+           Вместе с ACK — расширение кредита, если половина окна принята. */
         level *L = &c->lv[D2K_QW_LEVEL_APP];
-        if (L->ack_due && L->tx.have) {
-            uint8_t ab[32];
-            size_t an = build_ack(ab, sizeof ab, L->largest_rx);
+        if ((L->ack_due || c->credit_due) && L->tx.have) {
+            uint8_t ab[64];
+            size_t an = L->ack_due ? build_ack(ab, sizeof ab, L->largest_rx) : 0;
+            if (c->credit_due & 2) {
+                ab[an++] = FR_MAX_DATA;
+                an += d2k_qw_varint_write(ab + an, sizeof ab - an, c->fc_conn_limit);
+            }
+            if ((c->credit_due & 1) && c->have_want) {
+                ab[an++] = FR_MAX_STREAM_DATA;
+                an += d2k_qw_varint_write(ab + an, sizeof ab - an, c->want_stream);
+                an += d2k_qw_varint_write(ab + an, sizeof ab - an, c->fc_stream_limit);
+            }
             if (an && send_level(c, D2K_QW_LEVEL_APP, ab, an, 0, err, errcap) == 0) {
                 L->ack_due = 0;
+                c->credit_due = 0;
             }
         }
     }
@@ -1099,6 +1145,10 @@ int d2k_qc_peer_name(const d2k_qc *c) { return c ? c->peer_name : -1; }
 uint64_t d2k_qc_rx_wire_bytes(const d2k_qc *c) { return c ? c->rx_wire_bytes : 0; }
 int d2k_qc_handshake_done(const d2k_qc *c) { return c ? c->handshake_done : 0; }
 int64_t d2k_qc_rtt_ms(const d2k_qc *c) { return c ? c->rtt_ms : 0; }
+void d2k_qc_dgrams(const d2k_qc *c, uint64_t *tx, uint64_t *rx) {
+    if (tx) *tx = c ? c->tx_dgrams : 0;
+    if (rx) *rx = c ? c->rx_dgrams : 0;
+}
 
 int d2k_qc_ping(d2k_qc *c, char *err, size_t errcap) {
     if (!c) return -1;

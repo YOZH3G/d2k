@@ -171,15 +171,26 @@ static void stall_machine(void) {
     CHECK(st.rto_ms == 1500);
 
     /* Вердикт этапа данных (раунд 3). */
-    CHECK(d2k_quic_arm_data_judge3(1, 200, 5000, 1, 0, 1, 0) == D2K_QAD_PASS);   /* ответ целиком */
-    CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 1, 1, 0) == D2K_QAD_CUT);         /* встал до заголовков */
-    CHECK(d2k_quic_arm_data_judge3(1, 200, 9000, 0, 1, 1, 0) == D2K_QAD_CUT);    /* встал посреди */
-    CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 0, 1, 0) == D2K_QAD_NOT_RUN);     /* жив, но не успел */
-    CHECK(d2k_quic_arm_data_judge3(1, 200, 40000, 0, 0, 1, 0) == D2K_QAD_NOT_RUN); /* нужен целый */
-    CHECK(d2k_quic_arm_data_judge3(1, 200, 40000, 0, 0, 0, 0) == D2K_QAD_PASS);  /* прежнее правило */
-    CHECK(d2k_quic_arm_data_judge3(1, 451, 300, 1, 0, 1, 0) == D2K_QAD_CUT);
-    CHECK(d2k_quic_arm_data_judge3(0, 0, 0, 0, 0, 1, 0) == D2K_QAD_NO_HANDSHAKE);
-    CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 0, 1, 1) == D2K_QAD_NOT_RUN);     /* наш предел заголовков */
+    CHECK(d2k_quic_arm_data_judge3(1, 200, 5000, 1, 0, 1, 0, 0) == D2K_QAD_PASS);   /* ответ целиком */
+    CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 1, 1, 0, 0) == D2K_QAD_CUT);         /* встал до заголовков */
+    CHECK(d2k_quic_arm_data_judge3(1, 200, 9000, 0, 1, 1, 0, 0) == D2K_QAD_CUT);    /* встал посреди */
+    CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 0, 1, 0, 0) == D2K_QAD_NOT_RUN);     /* жив, но не успел */
+    CHECK(d2k_quic_arm_data_judge3(1, 200, 40000, 0, 0, 1, 0, 0) == D2K_QAD_NOT_RUN); /* нужен целый */
+    CHECK(d2k_quic_arm_data_judge3(1, 200, 40000, 0, 0, 0, 0, 0) == D2K_QAD_PASS);  /* прежнее правило */
+    CHECK(d2k_quic_arm_data_judge3(1, 451, 300, 1, 0, 1, 0, 0) == D2K_QAD_CUT);
+    CHECK(d2k_quic_arm_data_judge3(0, 0, 0, 0, 0, 1, 0, 0) == D2K_QAD_NO_HANDSHAKE);
+    CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 0, 1, 1, 0) == D2K_QAD_NOT_RUN);     /* наш предел заголовков */
+    /* Раунд 4, N1: бюджет коробки. Поток, пронёсший 2 × 25 пакетов при живом
+       сервере, засчитывается до конца ответа — обход большого ресурса не
+       становится «обрывом». Встал — всё равно обрыв. */
+    CHECK(d2k_quic_arm_data_judge3(1, 200, 60000, 0, 0, 1, 0, 1) == D2K_QAD_PASS);
+    CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 0, 1, 0, 1) == D2K_QAD_NOT_RUN);
+    CHECK(d2k_quic_arm_data_judge3(1, 200, 9000, 0, 1, 1, 0, 0) == D2K_QAD_CUT);
+    CHECK(D2K_QUIC_BOX_BUDGET_PKTS == 25);
+    CHECK(d2k_quic_budget_ok(30, 20, 200, 5000, 4900, 1000) == 1);    /* 50 пакетов, сервер шлёт */
+    CHECK(d2k_quic_budget_ok(30, 19, 200, 5000, 4900, 1000) == 0);    /* 49 — мало */
+    CHECK(d2k_quic_budget_ok(30, 20, 0, 5000, 4900, 1000) == 0);      /* нет ответа HTTP */
+    CHECK(d2k_quic_budget_ok(30, 20, 200, 5000, 3900, 1000) == 0);    /* сервер замолчал RTO */
 }
 
 static void post_handshake_stall(void) {
