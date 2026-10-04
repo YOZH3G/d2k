@@ -9,6 +9,8 @@ const controller = process.env.D2K_TEST_BINARY || path.resolve(__dirname, '../co
 const runner = process.env.D2K_TEST_RUNNER || '';
 const runnerArgs = (process.env.D2K_TEST_RUNNER_ARGS || '').split(/\s+/).filter(Boolean);
 
+let VALID = 0;
+
 async function trial(version, legacy = false) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd2k-greet-'));
   const socket = path.join(dir, 'ctl.sock');
@@ -46,7 +48,7 @@ async function trial(version, legacy = false) {
       child.on('close', code => resolve({ code }));
     });
     clearTimeout(deadline);
-    if (version === 4 && !legacy) {
+    if (version === VALID && !legacy) {
       assert.equal(result.timeout, true, `valid peer rejected: ${output}`);
       assert.match(output, /d2kc: запущен/, `controller stayed alive without completing startup: ${output}`);
     } else {
@@ -71,9 +73,14 @@ async function trial(version, legacy = false) {
     path.resolve(__dirname, '../datapath/include/d2k_ctl.h');
   const header = fs.readFileSync(headerPath, 'utf8');
   assert.match(header, /#define D2K_EV_PROTO\s+0x000A/);
+  // Действующая версия — из заголовка, а не числом в тесте: тест с
+  // зашитой «4» отвергал собственный датапат с версии 5.
+  const m = header.match(/#define D2K_CTL_PROTO_VERSION\s+(\d+)/);
+  assert.ok(m, 'D2K_CTL_PROTO_VERSION not found');
+  VALID = Number(m[1]);
   await trial(null);
-  await trial(3);
-  await trial(3, true);
-  await trial(4);
+  await trial(VALID - 1);
+  await trial(VALID - 1, true);
+  await trial(VALID);
   console.log('controller refuses silent and incompatible datapaths before any command: pass');
 })().catch(e => { console.error(e); process.exitCode = 1; });
