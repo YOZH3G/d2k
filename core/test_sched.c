@@ -12131,6 +12131,137 @@ own_first_test:
             d2k_sched_free(s); d2k_catalog_free(&cq);
         }
 
+        /* (f) ПОЛЕ 04.10.2026, updates.discord.com: приложение Discord ходит
+           коротким приветствием TLS 1.2 (179 байт, форма 2 в подозрении), а
+           снимка к началу поиска ещё нет. Задача мерила ЗАГОТОВКОЙ TLS 1.3,
+           own_first_plans брал свой план формы 1, зонд вёл TLS 1.3, и
+           привязка легла формой 1 — датапат отказывал потокам приложения
+           («отказов по форме приветствия»), обновление не проходило.
+           Форма клиента известна из подозрения: заготовка, свои планы,
+           зонд и привязка — той же формы, что у клиента. */
+        {
+            /* (f1) Своих планов формы 1.2 нет — план формы 1.3 клиенту 1.2 не
+               переносится; замер идёт приветствием старой формы. */
+            d2k_catalog c = {0};
+            char pm[40];
+            own_box(&c, "box-modern-only", pm, 41, 3, "modern.app.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = 0;
+            memset(tcp_last_trig, 0, sizeof tcp_last_trig); tcp_last_wire = 0;
+            ver_answer_port = 42171;
+            d2k_ev h = ev_hello(6, 42171, "updates.app.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42171); su.client_shape = D2K_SHAPE_LEGACY;
+            d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 42171); d2k_sched_event(s, &ap);
+            spin(s, 40);
+            CHECK(!said("пробую свои подтверждённые планы") && base_calls == 0,
+                  "shape f1: клиенту TLS 1.2 предложен свой план формы TLS 1.3");
+            CHECK(tcp_calls >= 1 &&
+                  d2k_hello_shape(tcp_last_trig, tcp_last_wire) == D2K_SHAPE_LEGACY,
+                  "shape f1: замер клиента TLS 1.2 шёл приветствием другой формы");
+            CHECK(binding_shape(&c, "updates.app.own", 6, D2K_SHAPE_MODERN) == NULL,
+                  "shape f1: клиенту TLS 1.2 записана привязка формы TLS 1.3");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+        {
+            /* (f2) Свой план формы 1.2 есть: он и переносится, зонд TLS 1.2,
+               привязка формы 1.2. Снимок клиента (та же форма) приходит
+               ПОСЛЕ ответа базы — посреди испытания своих планов. */
+            d2k_catalog c = {0};
+            char pm[40], pl[40];
+            own_box(&c, "box-modern-app", pm, 42, 5, "modern.app2.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            own_box(&c, "box-legacy-app", pl, 43, 3, "legacy.app2.own", 6, D2K_SHAPE_LEGACY, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = 0; ver_last_shape = 0;
+            ver_answer_port = 42172;
+            d2k_ev h = ev_hello(6, 42172, "updates.app2.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42172); su.client_shape = D2K_SHAPE_LEGACY;
+            d2k_sched_event(s, &su);
+            for (int i = 0; i < 400 && !said("пробую свои подтверждённые"); i++) tick_once(s);
+            d2k_ev sh;
+            CHECK(tls_shape_event(&sh, "updates.app2.own", D2K_SHAPE_LEGACY) == 0,
+                  "shape f2: снимок TLS 1.2 не собран");
+            d2k_sched_event(s, &sh);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 42172); d2k_sched_event(s, &ap);
+            spin(s, 40);
+            CHECK(base_calls == 1 && said("пробую свои подтверждённые планы до полного замера: 1"),
+                  "shape f2: клиенту TLS 1.2 не предложен свой план формы TLS 1.2");
+            CHECK(ver_calls >= 1 && ver_last_shape == (uint8_t)D2K_SHAPE_LEGACY,
+                  "shape f2: свой план испытан не зондом TLS 1.2");
+            const d2k_cat_binding *lg = binding_shape(&c, "updates.app2.own", 6, D2K_SHAPE_LEGACY);
+            CHECK(lg != NULL && !strcmp(lg->plan_id, pl) && lg->level >= 3,
+                  "shape f2: привязка клиента TLS 1.2 легла не формой TLS 1.2");
+            CHECK(binding_shape(&c, "updates.app2.own", 6, D2K_SHAPE_MODERN) == NULL,
+                  "shape f2: клиенту TLS 1.2 записана привязка формы TLS 1.3");
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            CHECK(sent_set_name_shape("updates.app2.own", D2K_SHAPE_LEGACY) == 1 &&
+                  sent_set_name_shape("updates.app2.own", D2K_SHAPE_MODERN) == 0,
+                  "shape f2: датапату не ушла постоянная привязка формы TLS 1.2");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+        {
+            /* (f3) Обратное направление и две формы на одном имени: у имени
+               уже есть привязка формы 1.2 (приложение), в ячейке снимка —
+               приветствие 1.2 этого имени, а подозрение пришло от браузера
+               формы 1.3. Мерить и подтверждать надо формой 1.3, не байтами
+               чужого клиента; привязка 1.2 остаётся. */
+            d2k_catalog c = {0};
+            char pm[40], pl[40];
+            own_box(&c, "box-modern-br", pm, 44, 3, "modern.app3.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            own_box(&c, "box-legacy-br", pl, 45, 3, "updates.app3.own", 6, D2K_SHAPE_LEGACY, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched_rx_ver_hook = stub_rx_counting;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = 0; ver_last_shape = 0;
+            ver_answer_port = 42173;
+            d2k_ev sh;
+            CHECK(tls_shape_event(&sh, "updates.app3.own", D2K_SHAPE_LEGACY) == 0,
+                  "shape f3: снимок TLS 1.2 не собран");
+            sh.low_ip[0] = 127; sh.low_ip[3] = 1; sh.low_port = g_server_port;
+            sh.high_ip[0] = 192; sh.high_ip[1] = 168; sh.high_ip[2] = 1; sh.high_ip[3] = 67;
+            sh.high_port = 42170; /* другой поток: приложение, не браузер */
+            d2k_sched_event(s, &sh);
+            d2k_ev h = ev_hello(6, 42173, "updates.app3.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42173); su.client_shape = D2K_SHAPE_MODERN;
+            d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 42173); d2k_sched_event(s, &ap);
+            spin(s, 40);
+            CHECK(!said("повторяю поиск его байтами"),
+                  "shape f3: поиск браузера перезапущен байтами другого клиента");
+            CHECK(ver_calls >= 1 && ver_last_shape == (uint8_t)D2K_SHAPE_MODERN,
+                  "shape f3: клиенту TLS 1.3 план испытан зондом другой формы");
+            const d2k_cat_binding *md = binding_shape(&c, "updates.app3.own", 6, D2K_SHAPE_MODERN);
+            CHECK(md != NULL && !strcmp(md->plan_id, pm) && md->level >= 3,
+                  "shape f3: клиенту TLS 1.3 привязка не легла формой TLS 1.3");
+            const d2k_cat_binding *lg = binding_shape(&c, "updates.app3.own", 6, D2K_SHAPE_LEGACY);
+            CHECK(lg != NULL && !strcmp(lg->plan_id, pl) && lg->enabled && lg->level >= 3,
+                  "shape f3: привязка формы TLS 1.2 того же имени задета");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_rx_ver_hook = saved_rx;
+        }
+
         /* (e) База донора не показала блокировки рукопожатия — своих планов
            не пробуем, идёт полный замер как прежде (рабочий трафик не
            подбирается, подозрение не равно блокировке). */
