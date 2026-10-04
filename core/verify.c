@@ -1159,8 +1159,11 @@ static d2k_ver_result verify_probe13_on(int use_fd, const char *ip, uint16_t por
 }
 
 static void ech_http_denial(d2k_ver_result *r) {
-    if (r->status >= 400 && r->level != D2K_VER_DENIED && r->level != D2K_VER_BLOCKPAGE) {
-        /* An origin refusal/rate limit is not permission to hammer it. */
+    if (r->status == 429 && r->level != D2K_VER_DENIED && r->level != D2K_VER_BLOCKPAGE) {
+        /* A rate limit is not permission to hammer the origin. Other 4xx are
+           the application's own answer through ECH (field 04.10: the witness
+           cdn.discordapp.com answers 403 at "/"), and a Cloudflare challenge
+           is recognised by its own markers before this point. */
         r->level = D2K_VER_CHALLENGE;
         snprintf(r->reason, sizeof r->reason, "ECH origin ответил HTTP %d; подбор не должен усиливать отказ сервера", r->status);
     }

@@ -421,7 +421,13 @@ int main(void) {
     struct { int code; d2k_ver_level before, after; } ech[] = {
         {451,D2K_VER_DENIED,D2K_VER_DENIED},
         {403,D2K_VER_BLOCKPAGE,D2K_VER_BLOCKPAGE},
-        {403,D2K_VER_APPLICATION,D2K_VER_CHALLENGE},
+        /* Поле 04.10: корень свидетеля cdn.discordapp.com всегда отвечает
+           403 — это ответ приложения через ECH, а не антибот (challenge
+           распознаётся по своим признакам, cf-mitigated). Пауза — только
+           на явное ограничение частоты. */
+        {403,D2K_VER_APPLICATION,D2K_VER_APPLICATION},
+        {404,D2K_VER_APPLICATION,D2K_VER_APPLICATION},
+        {429,D2K_VER_APPLICATION,D2K_VER_CHALLENGE},
         {200,D2K_VER_APPLICATION,D2K_VER_APPLICATION},
     };
     for (size_t i=0;i<sizeof ech/sizeof ech[0];i++) {
