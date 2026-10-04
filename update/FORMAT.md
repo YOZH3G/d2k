@@ -484,7 +484,8 @@ Production installs it in stable bootstrap storage outside releases. Commands:
   from an independent one-second heartbeat thread so downloads cannot block it.
   On exit or heartbeat loss, boot kills/reaps its owned worker group first,
   then obtains maintenance and independently recovers. It does not respawn a
-  failed worker in a loop. Worker argv is trusted bootstrap CLI, never HTTP.
+  failed worker in a loop. Worker argv is trusted bootstrap CLI, never HTTP. FD5 ownership registration
+  below is mandatory in the supervised worker context.
 - Test/standalone CLI may precede the command with `--root DIR --runtime DIR`;
   defaults are `/opt/d2k` and `/tmp/d2k`. There is no HTTP root override.
 
@@ -504,3 +505,73 @@ interface. Missing adapter fails closed. Task7 must supply actual config/state,
 loopback panel and ALL datapath/TG NAT/ipset/filter rule checks; these are not
 claimed by callback fixtures. Boot uses Linux default executable/heartbeat
 observations against the restored release and volatile runtime directory.
+
+
+### Offline process ownership (boot v1, unreleased correction)
+
+The bootstrap supervisor additionally inherits an anonymous nonblocking Unix
+stream control socket as **FD5** into the worker. Task9 must set
+`ctx.boot_control_fd = 5` before calling transaction APIs in `--boot-worker`
+mode. Values <=2 select the standalone path, not supervised mode. Heartbeat FD3
+is independent; the one-second heartbeat thread never shares the control stream.
+Control requests are serialized by the transaction worker; no runtime/service
+process may use or retain FD5. Offline executables and candidate startup probes
+explicitly close the worker's FD3/FD5 handles (probe FD3 is its own new pipe).
+
+Frames are exactly eight bytes: four ASCII tag bytes followed by a u32 positive
+PID, big endian (2..INT32_MAX). Request `D2GR` registers an offline child;
+`D2GU` unregisters it. Reply `D2GA` echoes the exact PID. No text/newline, shell
+command, path or arbitrary action exists in these frames. Up to 16 outstanding
+owned groups are accepted. Duplicate/unknown PID, wrong tag, invalid PID/group,
+overflow or failed acknowledgement fails the operation closed. Worker request
+and acknowledgement I/O is bounded to five seconds. On macOS the socket uses
+SO_NOSIGPIPE; Linux sends suppress SIGPIPE.
+
+The offline child starts **held behind a pipe gate**, still in the worker PGID,
+with a Linux parent-death signal and a parent identity recheck. A closed gate
+also aborts without exec; no descendants can exist while held. Supervisor accepts
+registration only while that PID is in its worker's process group, remembers
+ownership **before** acknowledgement, then replies. Only after receiving ACK may
+the worker move the held child to PGID=child PID and release exec. Thus death
+before registration leaves the held child in the already-owned worker group;
+death after ACK leaves it either there or in a registered group. There is no
+unowned executable interval.
+
+On normal offline completion or its existing five-second self-check timeout,
+the worker kills/reaps the direct child and requests unregister. Bootstrap kills
+any remaining members and accepts unregister only once the complete group is
+gone. Linux bootstrap is a child subreaper and waits only for its known worker
+and registered PGIDs, including adopted descendants. On worker death it kills
+and reaps these same groups **before** recovery; ordinary service groups are not
+registered, enumerated or killed. Group cleanup has a five-second completion
+bound; if killed writers cannot be confirmed gone, bootstrap returns RECOVERY
+without touching persistent state. Standalone invocation retains bounded local
+process-group kill/cleanup without the FD5 protocol.
+
+### Terminal retry, snapshot framing, outstanding space
+
+A visible COMMITTED/ROLLED_BACK record is insufficient for successful recovery:
+a worker can die after record rename and before journal-directory fsync.
+After reconciling current/receipt, recovery retries `d2ku_journal_store` with
+exactly the observed generation and payload. The journal layer re-syncs the
+visible record inode and parent; any failure propagates and the sequence is not
+advanced. The regression cuts execution *before* the real terminal directory
+fsync, rather than after a successful barrier.
+
+Snapshot hashing encodes hierarchy. Each node begins with u16 permission bits,
+then D/F type, then NUL-terminated basename. File nodes additionally prefix
+content with its u64 big-endian length and retain the decimal `/length/` suffix.
+Directory nodes contain sorted children followed by byte FF; this delimiter
+cannot be the leading permission byte of a node. Moving a file beneath a
+previously empty sibling directory therefore changes the seal. This framing is
+fixed before initial production release of boot v1; no deployed snapshot
+migration is implied.
+
+Free-space checks charge only outstanding allocation. Before unpacking a new
+release: selected ABI's signed file range plus personal snapshot/restore reserve.
+Other ABI file ranges are excluded. If that release directory is already
+prepared, and again under lock after preparation, only the remaining personal
+snapshot/restore reserve is charged; current free space already reflects the
+allocated release. `transaction.available_bytes` is an optional platform/test
+seam; absent callback reads real root fstatvfs. Archive bytes are already present
+in the authenticated request's archive descriptor before transaction staging.

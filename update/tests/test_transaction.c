@@ -33,6 +33,38 @@ static void executable_archive(fixture *f, const char *path) {
     assert(write(f->r.archive_fd, tar, total) == (ssize_t)total);
     free(tar);
 }
+static d2ku_rc selected_space(void *arg, uint64_t *bytes) {
+    fixture *f = arg;
+    struct stat st;
+    *bytes = fstatat(f->c.root_dirfd, "releases/B", &st, 0) ? 35 : 32;
+    return D2KU_OK;
+}
+static void space_accounting(void) {
+    fixture f;
+    d2ku_status s = {0};
+    setup(&f);
+    f.c.transaction.available_bytes = selected_space;
+    f.m.package_count = 2;
+    f.m.file_count = 2;
+    f.m.packages[1] = f.m.packages[0];
+    strcpy(f.m.packages[1].abi, "arm");
+    f.m.packages[1].abi_len = 3;
+    strcpy(f.m.packages[1].artifact, "arm.tar");
+    f.m.packages[1].artifact_len = 7;
+    f.m.packages[1].file_offset = 1;
+    f.m.packages[1].size = 8192;
+    f.m.files[1] = f.m.files[0];
+    f.m.files[1].size = 4096;
+    assert(d2ku_install(&f.c, &f.r, &s) == D2KU_OK);
+    cleanup(&f);
+    setup(&f);
+    f.r.expected_manifest_sha256[0] = 9;
+    assert(d2ku_install(&f.c, &f.r, &s) == D2KU_BUSY);
+    f.r.expected_manifest_sha256[0] = 1;
+    f.c.transaction.available_bytes = selected_space;
+    assert(d2ku_install(&f.c, &f.r, &s) == D2KU_OK);
+    cleanup(&f);
+}
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--boot-probe")) {
         char mode[16] = {0};
@@ -52,6 +84,7 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    space_accounting();
     fixture f;
     d2ku_status s = {0};
     d2ku_journal j;

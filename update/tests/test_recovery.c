@@ -1,4 +1,76 @@
 #include "transaction_fixture.h"
+static int terminal_cut, terminal_syncs;
+static d2ku_rc before_terminal_sync(void *arg, int fd) {
+    fixture *f = arg;
+    struct stat a, b;
+    int d = openat(f->c.root_dirfd, "update-state", O_RDONLY | O_DIRECTORY);
+    assert(d >= 0);
+    assert(!fstat(d, &a) && !fstat(fd, &b));
+    close(d);
+    d2ku_journal j;
+    if (a.st_ino == b.st_ino && a.st_dev == b.st_dev &&
+        d2ku_journal_load(&f->c, &j) == D2KU_OK && j.phase == D2KU_COMMITTED) {
+        terminal_syncs++;
+        if (terminal_cut == 1)
+            _exit(77);
+        if (terminal_cut == 2)
+            return D2KU_IO;
+    }
+    return fsync(fd) ? D2KU_IO : D2KU_OK;
+}
+static void terminal_durability(void) {
+    fixture f;
+    setup(&f);
+    pid_t p = fork();
+    assert(p >= 0);
+    if (!p) {
+        d2ku_status s = {0};
+        terminal_cut = 1;
+        f.c.sync_fd = before_terminal_sync;
+        (void)d2ku_install(&f.c, &f.r, &s);
+        _exit(99);
+    }
+    int w;
+    assert(waitpid(p, &w, 0) == p && WIFEXITED(w) && WEXITSTATUS(w) == 77);
+    d2ku_journal j;
+    assert(d2ku_journal_load(&f.c, &j) == D2KU_OK && j.phase == D2KU_COMMITTED);
+    uint64_t seq = j.sequence;
+    f.c.sync_fd = before_terminal_sync;
+    terminal_cut = 2;
+    terminal_syncs = 0;
+    d2ku_status s = {0};
+    assert(d2ku_recover(&f.c, &s) == D2KU_IO);
+    assert(terminal_syncs > 0);
+    terminal_cut = 0;
+    terminal_syncs = 0;
+    assert(d2ku_recover(&f.c, &s) == D2KU_OK && terminal_syncs > 0);
+    assert(d2ku_journal_load(&f.c, &j) == D2KU_OK && j.sequence == seq);
+    cleanup(&f);
+}
+static void relocated_snapshot(void) {
+    fixture f;
+    setup(&f);
+    assert(!mkdirat(f.c.root_dirfd, "state/a", 0700));
+    put(f.c.root_dirfd, "state/b", "x");
+    pid_t p = fork();
+    assert(p >= 0);
+    if (!p) {
+        d2ku_status s = {0};
+        f.crash_phase = D2KU_SWITCHING;
+        f.c.sync_fd = sync_crash;
+        (void)d2ku_install(&f.c, &f.r, &s);
+        _exit(99);
+    }
+    int w;
+    assert(waitpid(p, &w, 0) == p && WIFEXITED(w) && WEXITSTATUS(w) == 77);
+    assert(!renameat(f.c.root_dirfd, "snapshots/operation-1/state/b",
+                     f.c.root_dirfd, "snapshots/operation-1/state/a/b"));
+    put(f.c.root_dirfd, "state/knowledge", "valid live state");
+    d2ku_status s = {0};
+    assert(d2ku_recover(&f.c, &s) == D2KU_RECOVERY);
+    check_file(f.c.root_dirfd, "state/knowledge", "valid live state");
+    cleanup(&f);
+}
 int main(int argc, char **argv) {
     if (argc > 1) {
         if (!strcmp(argv[1], "--pulse")) {
@@ -24,6 +96,8 @@ int main(int argc, char **argv) {
         assert(d2ku_supervise(&f.c, argv[0], args, &s) == D2KU_HEALTH);
         cleanup(&f);
     }
+    terminal_durability();
+    relocated_snapshot();
     for (int phase = D2KU_PREPARED; phase <= D2KU_COMMITTED; phase++) {
         fixture f;
         setup(&f);

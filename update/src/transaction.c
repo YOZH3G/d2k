@@ -352,6 +352,11 @@ static d2ku_rc tree(d2ku_ctx *c, int src, const char *name, int dst,
             free(names[k]);
         }
         free(names);
+        if (r == D2KU_OK && hash) {
+            const unsigned char end_directory = 0xff;
+            if (EVP_DigestUpdate(hash, &end_directory, 1) != 1)
+                r = D2KU_IO;
+        }
         if (r == D2KU_OK && b >= 0) {
             if (fchmod(b, st.st_mode & 0777))
                 r = D2KU_IO;
@@ -366,6 +371,14 @@ static d2ku_rc tree(d2ku_ctx *c, int src, const char *name, int dst,
     if (st.st_size < 0 || UINT64_MAX - *bytes < (uint64_t)st.st_size)
         return D2KU_IO;
     *bytes += (uint64_t)st.st_size;
+    if (hash) {
+        unsigned char length[8];
+        uint64_t size = (uint64_t)st.st_size;
+        for (unsigned k = 0; k < 8; k++)
+            length[7 - k] = (unsigned char)(size >> (8 * k));
+        if (EVP_DigestUpdate(hash, length, sizeof length) != 1)
+            return D2KU_IO;
+    }
     int a = openat(src, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (a < 0)
         return D2KU_IO;
@@ -494,12 +507,30 @@ static d2ku_rc space(d2ku_ctx *c, const d2ku_manifest *m) {
     if (n > UINT64_MAX / 2)
         return D2KU_IO;
     n *= 2; /* snapshot and atomic restore copy */
-    if (m)
-        for (size_t k = 0; k < m->file_count; k++) {
+    if (m) {
+        if (m->package_count > D2KU_PACKAGES_MAX ||
+            m->file_count > D2KU_FILES_MAX)
+            return D2KU_INVALID;
+        const d2ku_package *selected = NULL;
+        for (size_t k = 0; k < m->package_count; k++)
+            if (!strcmp(m->packages[k].abi, c->abi))
+                selected = &m->packages[k];
+        if (!selected || selected->file_offset > m->file_count ||
+            selected->file_count > m->file_count - selected->file_offset)
+            return D2KU_INCOMPATIBLE;
+        for (size_t k = selected->file_offset;
+             k < selected->file_offset + selected->file_count; k++) {
             if (UINT64_MAX - n < m->files[k].size)
                 return D2KU_IO;
             n += m->files[k].size;
         }
+    }
+    if (c->transaction.available_bytes) {
+        uint64_t available;
+        d2ku_rc rc =
+            c->transaction.available_bytes(c->transaction.arg, &available);
+        return rc == D2KU_OK ? (available >= n ? D2KU_OK : D2KU_IO) : rc;
+    }
     struct statvfs v;
     if (fstatvfs(c->root_dirfd, &v))
         return D2KU_IO;
@@ -746,20 +777,46 @@ static void child_stop(child_probe *p) {
         p->fd = -1;
     }
 }
-static d2ku_rc child_run(int dir, const char *binary, const char *option,
-                         const char *expected) {
-    int pipefd[2];
+static d2ku_rc child_run(d2ku_ctx *c, int dir, const char *binary,
+                         const char *option, const char *expected) {
+    int pipefd[2], gate[2];
     if (pipe(pipefd))
         return D2KU_IO;
-    pid_t p = fork();
-    if (p < 0) {
+    if (pipe(gate)) {
         close(pipefd[0]);
         close(pipefd[1]);
         return D2KU_IO;
     }
-    if (!p) {
-        setpgid(0, 0);
+    pid_t parent = getpid(), p = fork();
+    if (p < 0) {
         close(pipefd[0]);
+        close(pipefd[1]);
+        close(gate[0]);
+        close(gate[1]);
+        return D2KU_IO;
+    }
+    if (!p) {
+#ifdef __linux__
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() != parent)
+            _exit(126);
+#else
+        (void)parent;
+#endif
+        close(gate[1]);
+        close(pipefd[0]);
+        if (c->boot_control_fd > 2) {
+            close(c->boot_control_fd);
+            close(3);
+        }
+        unsigned char release;
+        ssize_t n;
+        do {
+            n = read(gate[0], &release, 1);
+        } while (n < 0 && errno == EINTR);
+        close(gate[0]);
+        if (n != 1 || release != 0xa5)
+            _exit(126);
+
         if (dup2(pipefd[1], STDOUT_FILENO) < 0 || fchdir(dir))
             _exit(126);
         close(pipefd[1]);
@@ -773,8 +830,28 @@ static d2ku_rc child_run(int dir, const char *binary, const char *option,
         execl(path, binary, option, (char *)NULL);
         _exit(127);
     }
-    setpgid(p, p);
+    close(gate[0]);
     close(pipefd[1]);
+    d2ku_rc registered = d2ku_boot_group(c, p, 1);
+    int grouped =
+        registered == D2KU_OK
+            ? (c->transaction.process_group
+                   ? c->transaction.process_group(c->transaction.arg, p, p)
+                   : setpgid(p, p))
+            : -1;
+    const unsigned char release = 0xa5;
+    d2ku_rc released =
+        grouped == 0 ? writeall(c, gate[1], &release, 1) : D2KU_IO;
+    close(gate[1]);
+    if (released != D2KU_OK) {
+        kill(p, SIGKILL);
+        while (waitpid(p, NULL, 0) < 0 && errno == EINTR) {
+        }
+        if (registered == D2KU_OK)
+            (void)d2ku_boot_group(c, p, 0);
+        close(pipefd[0]);
+        return D2KU_IO;
+    }
     fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
     char b[128];
     size_t n = 0;
@@ -813,7 +890,9 @@ static d2ku_rc child_run(int dir, const char *binary, const char *option,
         }
     }
     close(pipefd[0]);
-    return r;
+    d2ku_rc cleaned = c->boot_control_fd > 2 ? d2ku_boot_group(c, p, 0)
+                                             : d2ku_group_cleanup(p);
+    return cleaned == D2KU_OK ? r : cleaned;
 }
 static d2ku_rc offline_check(d2ku_ctx *c, int dir, const char *id) {
     if (c->transaction.offline)
@@ -823,14 +902,14 @@ static d2ku_rc offline_check(d2ku_ctx *c, int dir, const char *id) {
     char expected[68];
     snprintf(expected, sizeof expected, "%s\n", id);
     for (size_t k = 0; k < 5; k++) {
-        d2ku_rc r = child_run(dir, bins[k], "--release-id", expected);
+        d2ku_rc r = child_run(c, dir, bins[k], "--release-id", expected);
         if (r != D2KU_OK)
             return r;
-        r = child_run(dir, bins[k], "--self-check", NULL);
+        r = child_run(c, dir, bins[k], "--self-check", NULL);
         if (r != D2KU_OK)
             return r;
     }
-    return child_run(dir, "d2k-update", "--boot-protocol", "1\n");
+    return child_run(c, dir, "d2k-update", "--boot-protocol", "1\n");
 }
 static d2ku_rc probe_start(d2ku_ctx *c, const char *id, child_probe *p) {
     memset(p, 0, sizeof *p);
@@ -866,6 +945,8 @@ static d2ku_rc probe_start(d2ku_ctx *c, const char *id, child_probe *p) {
         (void)parent;
 #endif
         setpgid(0, 0);
+        if (c->boot_control_fd > 2)
+            close(c->boot_control_fd);
         close(fds[0]);
         if (fchdir(d))
             _exit(126);
@@ -1039,8 +1120,10 @@ d2ku_rc d2ku_tx_recover_locked(d2ku_ctx *c, d2ku_status *s) {
             return failed(c, &j);
         /* Reconcile visible terminal record against current; boot service start
          * is separately adapter-owned. Never restore a stale snapshot after
-         * commit. */
-        return D2KU_OK;
+         * commit. The visible generation may predate its directory fsync.
+         * Exact-generation retry re-syncs that inode and its parent before
+         * recovery accepts it as durable; no new generation is invented. */
+        return d2ku_journal_store(c, &j);
     }
     if (receipt(c, j.old_release_id, h) != D2KU_OK ||
         memcmp(h, j.old_manifest_sha256, 32))
@@ -1324,7 +1407,7 @@ static d2ku_rc execute(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s,
     rc = bind_current(c, r);
     if (rc != D2KU_OK)
         goto out;
-    rc = space(c, rollback ? NULL : r->manifest);
+    rc = space(c, NULL); /* prepared release is already allocated */
     if (rc != D2KU_OK)
         goto out;
     if (rollback) {
@@ -1462,7 +1545,10 @@ d2ku_rc d2ku_install(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s) {
     rc = request_valid(c, r, 0);
     if (rc != D2KU_OK)
         return rc;
-    rc = space(c, r->manifest);
+    int allocated = release_dir(c, r->release_id);
+    if (allocated >= 0)
+        close(allocated);
+    rc = space(c, allocated >= 0 ? NULL : r->manifest);
     if (rc != D2KU_OK)
         return rc; /* Package preparation takes place before stopping or holding
                       maintenance. */

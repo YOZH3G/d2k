@@ -134,12 +134,15 @@ typedef struct {
     d2ku_rc (*offline)(void *, int release_fd, const char *release);
     d2ku_rc (*updater_probe)(void *, const char *action, const char *release);
     d2ku_rc (*wait_ms)(void *, unsigned ms);
+    d2ku_rc (*available_bytes)(void *, uint64_t *); /* NULL: root fstatvfs */
+    int (*process_group)(void *, pid_t, pid_t); /* NULL: POSIX setpgid */
     d2ku_snapshot_path paths[D2KU_SNAPSHOT_PATHS_MAX];
     size_t path_count;
 } d2ku_transaction_ops;
 struct d2ku_ctx {
     d2ku_transaction_ops transaction;
     int maintenance_lock_fd; /* internal, valid only during transaction callbacks */
+    int boot_control_fd; /* task9: inherited FD5; <=2 means standalone */
     /* Local health adapters: callbacks are read-only and cannot infer success
      * from PID alone. Absent callbacks use Linux proc, dirfd-relative state,
      * loopback HTTP and read-only iptables-save. runtime_dirfd must be supplied

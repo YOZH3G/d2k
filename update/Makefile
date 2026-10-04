@@ -12,7 +12,7 @@ $(BUILD)/test_manifest: tests/test_manifest.c src/manifest.c include/d2k_update.
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_manifest.c src/manifest.c $(LDFLAGS) $(LDLIBS) -o $@
 clean:
-	rm -f $(BUILD)/test_manifest $(BUILD)/test_transport $(BUILD)/test_package $(BUILD)/test_schedule $(BUILD)/test_journal $(BUILD)/test_health $(BUILD)/test_health_local $(BUILD)/test_health_fifo $(BUILD)/test_runtime_signal $(BUILD)/test_transaction $(BUILD)/test_recovery $(BUILD)/d2k-update-boot
+	rm -f $(BUILD)/test_manifest $(BUILD)/test_transport $(BUILD)/test_package $(BUILD)/test_schedule $(BUILD)/test_journal $(BUILD)/test_health $(BUILD)/test_health_local $(BUILD)/test_health_fifo $(BUILD)/test_runtime_signal $(BUILD)/test_transaction $(BUILD)/test_recovery $(BUILD)/d2k-update-boot $(BUILD)/test_offline_ownership
 
 .PHONY: check-schedule
 check-schedule: $(BUILD)/test_schedule
@@ -76,8 +76,9 @@ TRANSACTION_SRC = src/transaction.c src/recover.c src/journal.c src/package.c sr
 check: check-transaction check-recovery
 check-transaction: $(BUILD)/test_transaction
 	$(BUILD)/test_transaction
-check-recovery: $(BUILD)/test_recovery
+check-recovery: $(BUILD)/test_recovery $(BUILD)/test_offline_ownership
 	$(BUILD)/test_recovery
+	$(BUILD)/test_offline_ownership
 $(BUILD)/test_transaction: tests/test_transaction.c tests/transaction_fixture.h $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_transaction.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
@@ -88,3 +89,6 @@ boot: $(BUILD)/d2k-update-boot
 $(BUILD)/d2k-update-boot: src/boot_main.c $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/boot_main.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD)/test_offline_ownership: tests/test_offline_ownership.c tests/transaction_fixture.h $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_offline_ownership.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
