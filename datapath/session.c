@@ -107,6 +107,8 @@ struct d2k_session {
     uint64_t     pay_late;         /* прямая, но за окном поиска */
     uint64_t     pay_not_hello;    /* разобрали и это не приветствие */
     uint8_t      last_nonhello_first;
+    /* Открытый HTTP, keep-alive: см. d2k_payload_stats. */
+    uint64_t     http_later, http_unaligned, http_open_end;
     uint64_t     sni_in_next_seg;
     uint64_t     captured_hellos;
 
@@ -1801,20 +1803,63 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         s->pay_late++;
     }
 
-    /* ЗАПРОС HTTP — ВХОД ПЛАНА ОБХОДА HTTP (задача 51, шаг 4). Только
+    /* ЗАПРОС HTTP — ВХОД ПЛАНА ОБХОДА HTTP (задача 51, шаг 4). Первый —
        первая нагрузка клиента ровно с начала потока (SYN видели), один раз
        на поток. TLS-признаков (saw_hello) не взводит: подозрения, обмены и
-       приветствия TLS к такому потоку отношения не имеют. */
+       приветствия TLS к такому потоку отношения не имеют.
+
+       СЛЕДУЮЩИЕ ЗАПРОСЫ СОЕДИНЕНИЯ (keep-alive, поле 04.10.2026: GET / под
+       планом получил 200, GET /False/ на том же соединении — вставку 302).
+       Граница — из потока клиента: конец заголовка + Content-Length
+       предыдущего запроса. Запрос, начинающийся ровно на ней, с начала
+       сегмента, — вход плана своего имени, как первый. Всё прочее —
+       конвейер внутри сегмента, сегмент через границу, пропущенная граница
+       (очередь видит после окна только сегменты с PSH), не запрос на
+       границе — идёт как есть, считается, и граница дальше не ищется. */
     int http_hello = 0;
     size_t http_off = 0, http_len = 0;
     /* Порт 80 (ревью M-1): Host без порта означает 80, и запрос на другой
        порт — не наш вход. */
-    if (!fl->saw_hello && fwd && !fl->http_checked && fl->saw_syn &&
-        t[2] == 0 && t[3] == 80 &&
-        in_seq == fl->syn_seq + 1u && payload_len >= 5 &&
-        (pkt[payload_off] == 'G' || pkt[payload_off] == 'H')) {
-        fl->http_checked = 1;
-        http_hello = d2k_http_hello(pkt + payload_off, payload_len, &http_off, &http_len);
+    if (!fl->saw_hello && fwd && t[2] == 0 && t[3] == 80) {
+        d2k_http_req hr;
+        int later = 0;
+        if (!fl->http_checked && fl->saw_syn && in_seq == fl->syn_seq + 1u) {
+            fl->http_checked = 1;
+            http_hello = d2k_http_request(pkt + payload_off, payload_len, &hr);
+            fl->http_flow = (uint8_t)http_hello;
+        } else if (fl->http_conn) {
+            const int32_t d = (int32_t)(in_seq - fl->http_next);
+            if (d == 0) {
+                http_hello = d2k_http_request(pkt + payload_off, payload_len, &hr);
+                later = http_hello;
+                if (!http_hello) {
+                    fl->http_conn = 0;              /* на границе не запрос */
+                    s->http_unaligned++;
+                }
+            } else if (d > 0 ||
+                       (int32_t)(in_seq + (uint32_t)payload_len - fl->http_next) > 0) {
+                /* Граница пропущена или лежит внутри сегмента. Сегмент
+                   целиком до границы — тело или повтор: не наше. */
+                fl->http_conn = 0;
+                s->http_unaligned++;
+            }
+        }
+        if (http_hello) {
+            http_off = hr.host_off;
+            http_len = hr.host_len;
+            if (later) { s->http_later++; }
+            fl->http_conn = 0;
+            if (!hr.end_known) {
+                s->http_open_end++;
+            } else if (hr.end < payload_len) {
+                /* Следующий запрос внутри этого же сегмента (конвейер):
+                   разрезать его нечем, граница дальше неизвестна. */
+                s->http_unaligned++;
+            } else {
+                fl->http_conn = 1;
+                fl->http_next = in_seq + (uint32_t)hr.end;
+            }
+        }
     }
 
     if (!fl->saw_hello && fwd && fl->fwd_pkts <= D2K_HELLO_WINDOW && !http_hello) {
@@ -2055,11 +2100,19 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         out->skipped = "не ClientHello";
         return 0;
     }
-    if (fl->plan_done) {
+    if (fl->plan_done && !http_hello) {
         /* План описывает обработку начала соединения. Применить его дважды
            значит послать фальшивку в середину потока, где она уже ничего не
-           значит, а вреда наделает. */
+           значит, а вреда наделает. Исключение — следующий запрос HTTP на
+           своей границе: у него своё «начало» (номер, Host), и коробка
+           смотрит его так же, как первый (keep-alive, поле 04.10.2026). */
         out->skipped = "план уже применён к этому потоку";
+        return 0;
+    }
+    if (http_hello && fl->sends_left) {
+        /* Посылки прошлого запроса ещё не все отчитались (отложенные куски,
+           разнос): новое исполнение затёрло бы учёт прежнего. Как есть. */
+        out->skipped = "прошлое исполнение плана на потоке ещё не завершено";
         return 0;
     }
 
@@ -2398,6 +2451,8 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
         fl->damaged || fl->routed) {
         return 0;
     }
+    /* Поток открытого HTTP: следующие запросы — не хвост приветствия TLS. */
+    if (fl->http_flow) { return 0; }
 
     /* КУСОК ПРИВЕТСТВИЯ МОЖЕТ ПРИЙТИ НЕ ПЕРВЫМ, И ЕГО ТОЖЕ НАДО УДЕРЖАТЬ.
      *
@@ -3062,6 +3117,9 @@ void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out) {
     out->capture_rejected = s->capture.rejected;
     out->capture_expired = s->capture.expired;
     out->capture_full = s->capture.full;
+    out->http_later = s->http_later;
+    out->http_unaligned = s->http_unaligned;
+    out->http_open_end = s->http_open_end;
 }
 
 const d2k_journal *d2k_session_journal(const d2k_session *s) {

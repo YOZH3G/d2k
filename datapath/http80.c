@@ -366,27 +366,62 @@ int d2k_http80_swap(d2k_http80 *h, d2k_http80_res *r, const uint8_t *out, const 
 
 static int lc(uint8_t c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 
-int d2k_http_hello(const uint8_t *p, size_t n, size_t *host_off, size_t *host_len) {
-    if (!p || !host_off || !host_len) { return 0; }
-    size_t m;
-    if (n >= 5 && !memcmp(p, "GET /", 5)) { m = 4; }
-    else if (n >= 6 && !memcmp(p, "HEAD /", 6)) { m = 5; }
-    else { return 0; }
+static int name_is(const uint8_t *p, size_t i, size_t e, const char *lname) {
+    size_t n = strlen(lname);
+    if (e - i < n) { return 0; }
+    for (size_t k = 0; k < n; k++) {
+        if (lc(p[i + k]) != (uint8_t)lname[k]) { return 0; }
+    }
+    return 1;
+}
+
+int d2k_http_request(const uint8_t *p, size_t n, d2k_http_req *r) {
+    if (!p || !r) { return 0; }
+    memset(r, 0, sizeof *r);
+    /* Метод — заглавные латинские буквы (GET, HEAD, POST, PUT…), затем
+       origin-form: путь с «/». CONNECT (authority-form), «OPTIONS *» и
+       прокси-форма (absolute-form) — не наш вход. */
+    size_t m = 0;
+    while (m < n && m < 20 && p[m] >= 'A' && p[m] <= 'Z') { m++; }
+    if (m == 0 || m + 2 > n || p[m] != ' ' || p[m + 1] != '/') { return 0; }
     /* Строка запроса: путь без пробелов и управляющих, затем HTTP/1.x. */
-    size_t i = m;
+    size_t i = m + 1;
     while (i < n && p[i] > 0x20 && p[i] != 0x7f) { i++; }
     if (i + 10 > n || memcmp(p + i, " HTTP/1.", 8) || (p[i + 8] != '0' && p[i + 8] != '1') ||
         p[i + 9] != '\r' || i + 10 >= n || p[i + 10] != '\n') { return 0; }
     i += 11;
-    int found = 0;
+    int found = 0, n_len = 0, open_end = 0;
     size_t off = 0, len = 0;
+    uint64_t body = 0;
     /* Строки заголовка, пока они целиком в этом сегменте. */
     while (i < n) {
         size_t e = i;
         while (e + 1 < n && !(p[e] == '\r' && p[e + 1] == '\n')) { e++; }
         if (e + 1 >= n) { break; }            /* строка не кончилась здесь */
-        if (e == i) { break; }                /* конец заголовка */
-        if (e - i >= 5 && lc(p[i]) == 'h' && lc(p[i + 1]) == 'o' && lc(p[i + 2]) == 's' &&
+        if (e == i) {                         /* конец заголовка */
+            r->head_len = e + 2;
+            break;
+        }
+        if (name_is(p, i, e, "content-length:")) {
+            /* Одно значение, только цифры (OWS вокруг). Два Content-Length
+               или мусор — конец запроса не знаем. */
+            size_t v = i + 15;
+            while (v < e && (p[v] == ' ' || p[v] == '\t')) { v++; }
+            size_t ve = e;
+            while (ve > v && (p[ve - 1] == ' ' || p[ve - 1] == '\t')) { ve--; }
+            uint64_t cl = 0;
+            int ok = ve > v && ve - v <= 10;
+            for (size_t k = v; ok && k < ve; k++) {
+                if (p[k] < '0' || p[k] > '9') { ok = 0; break; }
+                cl = cl * 10u + (uint64_t)(p[k] - '0');
+            }
+            if (!ok || n_len++) { open_end = 1; }
+            body = cl;
+        } else if (name_is(p, i, e, "transfer-encoding:") || name_is(p, i, e, "upgrade:")) {
+            /* chunked и т. п. — конец только разбором тела; Upgrade — после
+               ответа 101 поток уже не HTTP. Границы дальше не знаем. */
+            open_end = 1;
+        } else if (e - i >= 5 && lc(p[i]) == 'h' && lc(p[i + 1]) == 'o' && lc(p[i + 2]) == 's' &&
             lc(p[i + 3]) == 't' && p[i + 4] == ':') {
             if (found++) { return 0; }
             size_t v = i + 5;
@@ -432,7 +467,21 @@ int d2k_http_hello(const uint8_t *p, size_t n, size_t *host_off, size_t *host_le
         i = e + 2;
     }
     if (found != 1) { return 0; }
-    *host_off = off;
-    *host_len = len;
+    r->host_off = off;
+    r->host_len = len;
+    /* Конец запроса известен, только если заголовок кончился здесь и тело
+       задано одним Content-Length (или его нет). */
+    if (r->head_len && !open_end && r->head_len + body <= 0x7fffffffu) {
+        r->end_known = 1;
+        r->end = r->head_len + body;
+    }
+    return 1;
+}
+
+int d2k_http_hello(const uint8_t *p, size_t n, size_t *host_off, size_t *host_len) {
+    d2k_http_req r;
+    if (!host_off || !host_len || !d2k_http_request(p, n, &r)) { return 0; }
+    *host_off = r.host_off;
+    *host_len = r.host_len;
     return 1;
 }

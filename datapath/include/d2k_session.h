@@ -388,6 +388,14 @@ typedef struct {
     uint64_t sni_next_seg;
     /* Bounded observational capture, separate from Plan application. */
     uint64_t capture_complete, capture_rejected, capture_expired, capture_full;
+    /* ОТКРЫТЫЙ HTTP, KEEP-ALIVE (поле 04.10.2026). http_later — следующие
+     * запросы соединения, узнанные на границе (с начала сегмента);
+     * http_unaligned — граница запроса не на начале сегмента: конвейер в
+     * одном сегменте, сегмент через границу, пропущенная граница, не запрос
+     * на границе — дальше поток идёт как есть; http_open_end — конец запроса
+     * не определить (chunked, заголовок не кончился в сегменте, Upgrade) —
+     * дальше как есть. */
+    uint64_t http_later, http_unaligned, http_open_end;
 } d2k_payload_stats;
 
 void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out);
