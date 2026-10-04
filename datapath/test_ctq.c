@@ -167,6 +167,54 @@ int main(void) {
         CHECK(d2k_ct_probe_fd(-1, 1, 50) == 0, "проба без сокета");
     }
 
+    /* 6. Задача 56: TCP — счётчики и СОСТОЯНИЕ одним ответом. Ответ ядра
+       роутера KN-1811 04.10.2026 на GET по кортежу живого потока Mac →
+       173.194.221.119:443 (ESTABLISHED, packets 12/1 по /proc в тот же миг),
+       целиком, как пришёл. */
+    {
+        uint8_t tr[400];
+        size_t tn = unhex(
+            "7401000000010200070000007b23000002000000340001801400018008000100c0a8014308000200adc2dd77"
+            "1c000280050001000600000006000200f22000000600030001bb0000340002801400018008000100adc2dd77"
+            "0800020058575d0b1c00028005000100060000000600020001bb000006000300f22000000800030000200"
+            "19e08000700000004ac1c0009800c000100000000000000000c0c00020000000000000033e61c000a800c00"
+            "010000000000000000010c000200000000000000003c300004802c00018005000100030000000500020006"
+            "0000000500030000000000060004000300000006000500000000000800080000000000080018000001000028"
+            "001980080000002500000008000100210000000a000200685edd83161a0000080003000000000138001a8008"
+            "0000000000000008000100000000000c000200000000000000000005000300000000000500040000000000050"
+            "005000000000008000c008acddbed08000b0000000002", tr, sizeof tr);
+        CHECK(tn == 372, "фикстура TCP-ответа ядра собрана не той длины");
+        d2k_ct_info ti;
+        memset(&ti, 0xee, sizeof ti);
+        CHECK(d2k_ct_info_parse(tr, tn, 7, &ti) == 0 && ti.orig_pkts == 12 && ti.reply_pkts == 1,
+              "TCP-ответ ядра: счётчики не разобраны (ждали 12/1)");
+        CHECK(ti.tcp_state_known && ti.tcp_state == D2K_CT_TCP_ESTABLISHED,
+              "TCP-ответ ядра: состояние ESTABLISHED не прочитано");
+        /* У UDP-ответа состояния TCP нет — «не сказано», а не ESTABLISHED. */
+        memset(&ti, 0xee, sizeof ti);
+        CHECK(d2k_ct_info_parse(rsp, rn, 7, &ti) == 0 && !ti.tcp_state_known,
+              "у записи без CTA_PROTOINFO выдумано состояние TCP");
+        /* Неотвечающий сокет: и этот запрос не ждёт. */
+        int q[2];
+        CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, q) == 0, "socketpair");
+        fcntl(q[0], F_SETFL, fcntl(q[0], F_GETFL, 0) | O_NONBLOCK);
+        double b = now_ms();
+        for (int i = 0; i < 100; i++) {
+            CHECK(d2k_ct_query_info_fd(q[0], (uint32_t)(300 + i), &t, &ti) == -1,
+                  "молчащий сокет дал состояние");
+            char drain[256];
+            while (recv(q[1], drain, sizeof drain, MSG_DONTWAIT) > 0) { }
+        }
+        CHECK(now_ms() - b < 50.0, "сто TCP-запросов в молчащий сокет заняли больше 50 мс");
+        tr[8] = 44; tr[9] = tr[10] = tr[11] = 0;
+        CHECK(send(q[1], tr, tn, 0) == (ssize_t)tn, "tcp send");
+        memset(&ti, 0, sizeof ti);
+        CHECK(d2k_ct_query_info_fd(q[0], 44, &t, &ti) == 0 && ti.tcp_state_known &&
+              ti.tcp_state == D2K_CT_TCP_ESTABLISHED && ti.reply_pkts == 1,
+              "запрос по сокету не вернул состояние TCP");
+        close(q[0]); close(q[1]);
+    }
+
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }
     printf("ctnetlink по кортежу: все проверки прошли\n");
     return 0;

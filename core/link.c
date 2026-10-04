@@ -323,6 +323,9 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
             out->planned = rest[6];
         }
         if (rlen >= 8) out->client_shape = rest[7];
+        /* v12: число при записи, u16 BE (D2K_SUSPECT_TCP_STALL — оценка
+           пакетов с данными). Нет байт — ноль, «не сказано». */
+        if (rlen >= 10) out->num = (uint32_t)rest[8] << 8 | rest[9];
         break;
     case D2K_EV_STATS:
         /* Счётчики необязательны по длине: старый датапат их не слал вовсе, и
@@ -586,6 +589,30 @@ int d2k_link_set_https(int fd, const char *name, uint32_t ttl_s, char *err, size
     g_scratch[4] = (uint8_t)(D2K_CMD_SET_HTTPS >> 8); g_scratch[5] = (uint8_t)D2K_CMD_SET_HTTPS;
     if (write_all(fd, g_scratch, o) != 0) {
         say(err, errcap, "SET_HTTPS не отправился: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int d2k_link_set_stall_budgets(int fd, const uint16_t *b, size_t n, char *err, size_t errcap) {
+    if (fd < 0 || n > D2K_STALL_BUDGETS_MAX || (n && !b)) {
+        say(err, errcap, "бюджетов потока больше %d или нет сокета", D2K_STALL_BUDGETS_MAX);
+        return -1;
+    }
+    size_t o = HDR;
+    g_scratch[o++] = (uint8_t)n;
+    for (size_t i = 0; i < n; i++) {
+        if (!b[i]) { say(err, errcap, "нулевой бюджет потока"); return -1; }
+        g_scratch[o++] = (uint8_t)(b[i] >> 8);
+        g_scratch[o++] = (uint8_t)b[i];
+    }
+    uint32_t plen = (uint32_t)(o - HDR + 2);
+    g_scratch[0] = (uint8_t)(plen >> 24); g_scratch[1] = (uint8_t)(plen >> 16);
+    g_scratch[2] = (uint8_t)(plen >> 8); g_scratch[3] = (uint8_t)plen;
+    g_scratch[4] = (uint8_t)(D2K_CMD_SET_STALL_BUDGETS >> 8);
+    g_scratch[5] = (uint8_t)D2K_CMD_SET_STALL_BUDGETS;
+    if (write_all(fd, g_scratch, o) != 0) {
+        say(err, errcap, "SET_STALL_BUDGETS не отправился: %s", strerror(errno));
         return -1;
     }
     return 0;

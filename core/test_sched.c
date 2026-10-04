@@ -3642,6 +3642,160 @@ int main(int argc, char **argv) {
         d2k_catalog_free(&c50);
     }
 
+    /* ЗАДАЧА 56. «TCP встал на бюджете коробки» (Safari на mailsuite.com и
+       www.romfea.gr, 04.10): соединение открыто, сервер глух, клиент говорит в
+       тишину, пакетов с данными к тишине — в полосе бюджета. Второго потока
+       не ждём (Safari держит одно соединение на источник): одиночное
+       подозрение — ровно одна RX-volume-пара, не поиск; второе того же имени,
+       пока пара идёт, второй пары не даёт. Под планом — так же (наблюдение
+       заменяется узким замером). Если коробка цели измерена, полоса
+       сверяется с ЕЁ бюджетом. Повтор FIN без плана по-прежнему ждёт второго
+       потока. */
+    {
+        d2k_catalog c56 = {0};
+        d2k_sched *s = d2k_sched_new(&c56, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для TCP-обрыва на бюджете не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            vol_calls = tcp_calls = 0;
+            vol_answer = D2K_VOL_PASSED;
+            vol_rx_cut = 0;
+            settle(s);
+            const char *name = "stall.mailsuite.test";
+            d2k_ev h = ev_hello(6, 41070, name);
+            d2k_sched_event(s, &h);
+            d2k_ev f = ev_suspect(6, 41070);
+            f.code = D2K_SUSPECT_TCP_STALL; f.planned = D2K_LINK_PLANNED_NO; f.num = 24;
+            CHECK(d2k_sched_event(s, &f) == 1,
+                  "одиночный TCP-обрыв на бюджете не запустил RX-замер");
+            d2k_ev h2 = ev_hello(6, 41071, name);
+            d2k_sched_event(s, &h2);
+            d2k_ev f2 = ev_suspect(6, 41071);
+            f2.code = D2K_SUSPECT_TCP_STALL; f2.planned = D2K_LINK_PLANNED_NO; f2.num = 25;
+            d2k_sched_event(s, &f2);
+            settle(s);
+            CHECK(vol_calls == 1 && tcp_calls == 0,
+                  "TCP-обрыв на бюджете не прошёл ровно одну RX-volume-пару (без поиска)");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c56);
+
+        /* Под планом — тоже сразу один узкий замер. */
+        c56 = (d2k_catalog){0};
+        s = d2k_sched_new(&c56, sv[0], 0x2d);
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            vol_calls = tcp_calls = 0;
+            settle(s);
+            const char *name = "stall-planned.test";
+            d2k_ev h = ev_hello(6, 41072, name);
+            d2k_sched_event(s, &h);
+            d2k_ev f = ev_suspect(6, 41072);
+            f.code = D2K_SUSPECT_TCP_STALL; f.planned = D2K_LINK_PLANNED_YES; f.num = 25;
+            CHECK(d2k_sched_event(s, &f) == 1, "TCP-обрыв под планом не запустил RX-замер");
+            settle(s);
+            CHECK(vol_calls == 1 && tcp_calls == 0,
+                  "TCP-обрыв под планом не прошёл ровно одну RX-volume-пару");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c56);
+
+        /* Коробка цели измерена: бюджет 16 (адресные диапазоны хостинга).
+           Поток на 25 — вне её полосы, замера нет; на 17 — есть. */
+        c56 = (d2k_catalog){0};
+        char pid[40];
+        own_box(&c56, "box-16", pid, 64, 3, "stall.hz.test", 6, D2K_SHAPE_MODERN, 4,
+                1790000000, 0);
+        d2k_cat_signal *rv = &c56.boxes[0].fp.sig[c56.boxes[0].fp.n_sig++];
+        memset(rv, 0, sizeof *rv);
+        snprintf(rv->kind, sizeof rv->kind, "rx-volume");
+        rv->volume = 16; rv->seen = 1; rv->packets = 16;
+        s = d2k_sched_new(&c56, sv[0], 0x2d);
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            vol_calls = tcp_calls = 0;
+            settle(s);
+            d2k_ev h = ev_hello(6, 41074, "stall.hz.test");
+            d2k_sched_event(s, &h);
+            d2k_ev f = ev_suspect(6, 41074);
+            f.code = D2K_SUSPECT_TCP_STALL; f.planned = D2K_LINK_PLANNED_YES; f.num = 25;
+            d2k_sched_event(s, &f);
+            settle(s);
+            CHECK(vol_calls == 0, "TCP-обрыв вне бюджета коробки цели запустил замер");
+            CHECK(said("вне бюджета её коробки"), "отказ по бюджету коробки цели не назван");
+            d2k_ev h2 = ev_hello(6, 41076, "stall.hz.test");
+            d2k_sched_event(s, &h2);
+            d2k_ev f2 = ev_suspect(6, 41076);
+            f2.code = D2K_SUSPECT_TCP_STALL; f2.planned = D2K_LINK_PLANNED_YES; f2.num = 17;
+            d2k_sched_event(s, &f2);
+            settle(s);
+            CHECK(vol_calls == 1, "TCP-обрыв на бюджете коробки цели (16) не запустил замер");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c56);
+    }
+
+    /* ЗАДАЧА 56. Бюджеты коробок уходят датапату командой после прохода по
+       каталогу: полевой 25 и измеренные. Каталог без измерений — команды нет
+       (датапат и так держит полевой). */
+    {
+        d2k_catalog cb = {0};
+        char pid[40];
+        own_box(&cb, "box-26", pid, 64, 3, "budget.push.test", 6, D2K_SHAPE_MODERN, 4,
+                1790000000, 0);
+        d2k_sched *s = d2k_sched_new(&cb, sv[0], 0x2d);
+        if (s) {
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            int frames = 0;
+            for (size_t off = 0; off + 6 <= sent_len;) {
+                const uint8_t *p = sentbuf + off;
+                uint32_t n = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+                if (n < 2 || n > sent_len - off - 4) break;
+                if (((uint16_t)p[4] << 8 | p[5]) == D2K_CMD_SET_STALL_BUDGETS) frames++;
+                off += 4 + n;
+            }
+            CHECK(frames == 0, "каталог без измеренных бюджетов прислал команду бюджетов");
+            d2k_sched_free(s);
+        }
+        d2k_cat_signal *rv = &cb.boxes[0].fp.sig[cb.boxes[0].fp.n_sig++];
+        memset(rv, 0, sizeof *rv);
+        snprintf(rv->kind, sizeof rv->kind, "rx-volume");
+        rv->volume = 20; rv->seen = 1; rv->packets = 26;
+        s = d2k_sched_new(&cb, sv[0], 0x2d);
+        if (s) {
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            int frames = 0, ok = 0;
+            for (size_t off = 0; off + 6 <= sent_len;) {
+                const uint8_t *p = sentbuf + off;
+                uint32_t n = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+                if (n < 2 || n > sent_len - off - 4) break;
+                if (((uint16_t)p[4] << 8 | p[5]) == D2K_CMD_SET_STALL_BUDGETS) {
+                    frames++;
+                    ok = n == 2 + 5 && p[6] == 2 && (p[7] << 8 | p[8]) == 25 &&
+                         (p[9] << 8 | p[10]) == 26;
+                }
+                off += 4 + n;
+            }
+            CHECK(frames == 1 && ok, "бюджеты коробок (25 и 26) не ушли датапату одной командой");
+            forget_sent(); d2k_sched_sync(s); sync_out(s);
+            frames = 0;
+            for (size_t off = 0; off + 6 <= sent_len;) {
+                const uint8_t *p = sentbuf + off;
+                uint32_t n = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+                if (n < 2 || n > sent_len - off - 4) break;
+                if (((uint16_t)p[4] << 8 | p[5]) == D2K_CMD_SET_STALL_BUDGETS) frames++;
+                off += 4 + n;
+            }
+            CHECK(frames == 0, "неизменные бюджеты отправлены повторно");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cb);
+    }
+
     /* ЗАДАЧА 50, РАУНД 2. «QUIC замолчал после рукопожатия» (Safari на
        rua.gr) — QUIC-поиск своего протокола, и вопросник обязан мерить
        ответ своим запросом (arm.data_cut), а не только ответ на Initial.

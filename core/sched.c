@@ -1230,6 +1230,11 @@ struct d2k_sched {
     /* Разовая строка: пакеты потока на этой прошивке не считаются, проверка
        бюджета выключена (ядро без TCP_INFO data_segs, задача 55). */
     int          budget_uncountable_said;
+    /* Бюджеты коробок, которые держит датапат для детектора «TCP встал на
+       бюджете» (задача 56). Новый датапат держит полевой; d2kc живёт одно
+       подключение (разрыв — выход), поэтому начальное значение — его. */
+    uint16_t     stall_sent[D2K_STALL_BUDGETS_MAX];
+    size_t       n_stall_sent;
     /* Сколько раз ПОСТОЯННЫЙ отказ пришёл на поток настоящего клиента при
        том, что план на цели стоит. Это не свойство коробки и не промах
        кандидата: это наша непереносимость — «подтверждено» в каталоге при
@@ -1642,7 +1647,8 @@ static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
        обрыве ответа. Блокировка на рукопожатии (обычный RST, таймаут SNI) —
        другое наблюдение и мерится сразу (финальное ревью, п.4). */
     if (c->late_rst_only && !c->challenge &&
-        signal_code != D2K_SUSPECT_RST_AFTER_APP && signal_code != D2K_SUSPECT_FIN_RETRY) {
+        signal_code != D2K_SUSPECT_RST_AFTER_APP && signal_code != D2K_SUSPECT_FIN_RETRY &&
+        signal_code != D2K_SUSPECT_TCP_STALL) {
         return 0;
     }
     /* A changed symptom after a direct CLEAR is fresh evidence. Do not let a
@@ -1741,7 +1747,95 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
 /* Какое позднее закрытие пришло — для журнала; порог у них общий. */
 static const char *late_close_what(uint8_t code) {
     return code == D2K_SUSPECT_FIN_RETRY ? "повтор FIN без ответа после ответа сервера"
+         : code == D2K_SUSPECT_TCP_STALL ? "поток TCP встал на бюджете коробки, соединение открыто"
                                          : "поздний RST после app-data";
+}
+
+/* Разброс бюджета один и тот же в датапате (полоса детектора) и в RX-примете
+   объёма; полевой бюджет — тоже. Разойдутся — сборка остановится здесь. */
+typedef char d2k_stall_slack_is_volume_slack
+    [D2K_TCP_STALL_SLACK == D2K_VOLUME_PACKET_SLACK ? 1 : -1];
+typedef char d2k_stall_field_is_verify_field
+    [D2K_TCP_STALL_FIELD_BUDGET == D2K_BUDGET_FIELD_PACKETS ? 1 : -1];
+
+/* Измеренный бюджет потока коробки (rx-volume, задача 55) — 0, если нет. */
+static int box_stall_budget(const d2k_cat_box *b) {
+    for (size_t i = 0; i < b->fp.n_sig; i++) {
+        if (!strcmp(b->fp.sig[i].kind, "rx-volume") && b->fp.sig[i].packets > 0 &&
+            b->fp.sig[i].packets <= 0xffff) {
+            return b->fp.sig[i].packets;
+        }
+    }
+    return 0;
+}
+
+static int budget_listed(const uint16_t *v, size_t n, int b) {
+    for (size_t i = 0; i < n; i++) { if (v[i] == b) return 1; }
+    return 0;
+}
+
+/* Бюджеты коробок, за которыми имя записано в каталоге (привязка по имени,
+   TCP): коробка цели известна — полоса сверяется с её бюджетом. */
+static size_t name_stall_budgets(const d2k_sched *s, const char *name, uint16_t *out,
+                                 size_t cap) {
+    size_t n = 0;
+    for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
+        const d2k_cat_box *b = &s->cat->boxes[bi];
+        int bud = box_stall_budget(b);
+        if (!bud || budget_listed(out, n, bud)) continue;
+        for (size_t i = 0; i < b->n_binds && n < cap; i++) {
+            const d2k_cat_binding *bd = &b->binds[i];
+            if (bd->enabled && !strcmp(bd->kind, "name") && !strcmp(bd->target, name) &&
+                (bd->transport ? bd->transport : 6) == 6) {
+                out[n++] = (uint16_t)bud;
+                break;
+            }
+        }
+    }
+    return n;
+}
+
+/* «TCP встал на бюджете» (задача 56): датапат сверил оценку пакетов с
+   бюджетами всех коробок; здесь — с бюджетом коробки ЭТОЙ цели, если он
+   измерен. 1 — в полосе (или коробка цели не измерена). */
+static int tcp_stall_in_name_band(d2k_sched *s, const char *name, const d2k_ev *ev) {
+    uint16_t own[D2K_STALL_BUDGETS_MAX];
+    size_t n = name_stall_budgets(s, name, own, D2K_STALL_BUDGETS_MAX);
+    if (n == 0) return 1;
+    for (size_t i = 0; i < n; i++) {
+        if (ev->num + (uint32_t)D2K_TCP_STALL_SLACK >= own[i] &&
+            ev->num <= (uint32_t)own[i] + (uint32_t)D2K_TCP_STALL_SLACK)
+            return 1;
+    }
+    say(s, "по %s поток TCP встал на %u пакетах с данными — вне бюджета её коробки "
+           "(%u ± %d): это не обрыв коробки, замер не запускаю",
+        name, (unsigned)ev->num, (unsigned)own[0], D2K_TCP_STALL_SLACK);
+    return 0;
+}
+
+/* Бюджеты для датапата: полевой (цели неизмеренных коробок) и измеренные
+   бюджеты коробок каталога. Шлётся, только когда список изменился. */
+static void stall_budgets_push(d2k_sched *s) {
+    uint16_t v[D2K_STALL_BUDGETS_MAX];
+    size_t n = 0;
+    v[n++] = D2K_TCP_STALL_FIELD_BUDGET;
+    for (size_t bi = 0; s->cat && bi < s->cat->n_boxes && n < D2K_STALL_BUDGETS_MAX; bi++) {
+        int bud = box_stall_budget(&s->cat->boxes[bi]);
+        if (bud && !budget_listed(v, n, bud)) v[n++] = (uint16_t)bud;
+    }
+    if (n == s->n_stall_sent && !memcmp(v, s->stall_sent, n * sizeof *v)) return;
+    char err[160];
+    if (d2k_link_set_stall_budgets(s->link_fd, v, n, err, sizeof err) != 0) {
+        say(s, "бюджеты коробок датапату не отправились: %s", err);
+        return;
+    }
+    memcpy(s->stall_sent, v, n * sizeof *v);
+    s->n_stall_sent = n;
+    char list[96] = "";
+    for (size_t i = 0, o = 0; i < n && o < sizeof list; i++)
+        o += (size_t)snprintf(list + o, sizeof list - o, "%s%u", i ? ", " : "", (unsigned)v[i]);
+    say(s, "датапат: бюджеты потока для «TCP встал на бюджете» — %s пакетов (± %d)",
+        list, D2K_TCP_STALL_SLACK);
 }
 
 /* Порог позднего закрытия (поздний RST после app-data или повтор FIN без
@@ -4475,6 +4569,8 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     s->link_fd = link_fd;
     s->mark = mark;
     s->measure_mark = mark;
+    s->stall_sent[0] = D2K_TCP_STALL_FIELD_BUDGET;
+    s->n_stall_sent = 1;
     s->meas_limit = SCHED_DEFAULT_ACTIVE_MEASUREMENTS;
     s->limit_logged = SCHED_DEFAULT_ACTIVE_MEASUREMENTS;
     s->wake[0] = s->wake[1] = -1;
@@ -5240,6 +5336,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
     if (s->sync_box >= s->cat->n_boxes) {
         if (sync_areas(s)) return 1;
         s->sync_active = 0;
+        stall_budgets_push(s);
         if (s->sync_sent > 0 || s->sync_skipped > 0 || s->sync_weak > 0 ||
             s->sync_unshaped > 0 || s->sync_recheck > 0) {
             say(s, "каталог: поставлено планов по подтверждённым привязкам: %d%s",
@@ -6393,7 +6490,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     task *t = task_of(s, name, ev->transport, ev->family);
     int ordinary_tcp_rst = ev->transport == 6 && ev->code == D2K_SUSPECT_RST;
     const int late_app_rst = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
-        ev->code == D2K_SUSPECT_FIN_RETRY;
+        ev->code == D2K_SUSPECT_FIN_RETRY || ev->code == D2K_SUSPECT_TCP_STALL;
     if (t && t->state == T_VOICE_TRIAL && voice_trial_owned(t) &&
         is_voice_class(t->name, t->transport) && !voice_trial_same_context(t, ev)) {
         /* ОПЫТ ЖДЁТ РАЗГОВОРА К ДРУГОЙ ТОЧКЕ (финальное ревью, п.1). Задача
@@ -6424,6 +6521,21 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
        по независимому потоку в окне. Повтор FIN под планом (05e24fa) по-
        прежнему меряется сразу: его датапат шлёт только о потоке, к которому
        применён собственный план. */
+    /* «TCP встал на бюджете» (задача 56) порога второго потока НЕ ждёт — как
+       QUIC-обрыв (задача 50): Safari держит одно соединение HTTP/2 на источник,
+       и второй вставший поток имени в 30 с не появляется. Замер 04.10 на
+       роутере (отчёт задачи 56): 4 подозрения за 9 минут живого браузинга,
+       все — обрывы (mailsuite на AWS, Hetzner 178.104.16.59 дважды с
+       разницей 41 с, Cloudflare), сервер ни разу не ответил даже на закрытие;
+       порог по второму потоку не пропустил бы ни одного. Сигнал у него того
+       же рода, что повтор FIN в тишину: клиент говорит, сервер глух (датапат
+       требует трёх пакетов клиента без ответа), плюс полоса бюджета. Ворота —
+       сама RX-пара identity/gzip: подбор только после воспроизведённого
+       обрыва на бюджете, неподтверждённая пара — отдых позднего закрытия. */
+    if (ev->code == D2K_SUSPECT_TCP_STALL && ev->transport == 6 &&
+        !tcp_stall_in_name_band(s, name, ev)) {
+        return 0;
+    }
     const int late_close_needs_repeat = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
         (ev->code == D2K_SUSPECT_FIN_RETRY && ev->planned == D2K_LINK_PLANNED_NO);
     if (late_close_needs_repeat && (!t || t->state == T_WATCHING) &&

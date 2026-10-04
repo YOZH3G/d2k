@@ -45,6 +45,12 @@
 #define D2K_CTA_COUNTERS_BYTES    2
 #define D2K_CTA_COUNTERS32_PACKETS 3
 #define D2K_NLA_F_NESTED          0x8000
+/* Состояние TCP у conntrack (задача 56): CTA_PROTOINFO → CTA_PROTOINFO_TCP →
+   CTA_PROTOINFO_TCP_STATE, u8; значения — enum tcp_conntrack ядра. */
+#define D2K_CTA_PROTOINFO         4
+#define D2K_CTA_PROTOINFO_TCP     1
+#define D2K_CTA_PROTOINFO_TCP_STATE 1
+#define D2K_CT_TCP_ESTABLISHED    3
 
 /* Кортеж прямого направления: адреса 4 или 16 байт по family, порты в
    сетевом порядке (как в пакете). */
@@ -55,6 +61,14 @@ typedef struct {
     uint8_t sport_be[2], dport_be[2];
 } d2k_ct_tuple;
 
+/* Что ядро сказало о потоке. Состояние TCP есть не всегда (UDP, старое
+   ядро): без него «соединение ещё установлено» не доказано. */
+typedef struct {
+    uint64_t orig_pkts, reply_pkts;
+    uint8_t  tcp_state;        /* enum tcp_conntrack, если tcp_state_known */
+    uint8_t  tcp_state_known;
+} d2k_ct_info;
+
 /* Запрос CT_GET по кортежу. Длина сообщения или 0, если не поместилось. */
 size_t d2k_ct_get_req(uint8_t *o, size_t cap, uint32_t seq, const d2k_ct_tuple *t);
 
@@ -64,12 +78,19 @@ size_t d2k_ct_get_req(uint8_t *o, size_t cap, uint32_t seq, const d2k_ct_tuple *
 int d2k_ct_counters_parse(const uint8_t *buf, size_t len, uint32_t seq,
                           uint64_t *orig_pkts, uint64_t *reply_pkts);
 
+/* То же, со состоянием TCP (d2k_ct_info). Коды возврата — как у
+   d2k_ct_counters_parse. */
+int d2k_ct_info_parse(const uint8_t *buf, size_t len, uint32_t seq, d2k_ct_info *out);
+
 /* Спросить по уже открытому сокету fd: послать и забрать ответ БЕЗ ожидания.
    0 — счётчики; 1 — ошибка ядра (записи нет); 2 — запись без счётчиков
    (accounting выключен); -1 — ответа нет. Всё, кроме 0, — «не знаем». Чужие
    и устаревшие ответы в сокете вычитываются и отбрасываются. */
 int d2k_ct_query_fd(int fd, uint32_t seq, const d2k_ct_tuple *t,
                     uint64_t *orig_pkts, uint64_t *reply_pkts);
+
+/* То же с d2k_ct_info: счётчики и состояние TCP одним запросом. */
+int d2k_ct_query_info_fd(int fd, uint32_t seq, const d2k_ct_tuple *t, d2k_ct_info *out);
 
 /* ПРОБА ДОСТУПНОСТИ (раунд 4, N2). Где nf_conntrack_netlink не загружен, ядро
    на каждый GET синхронно зовёт request_module внутри sendmsg — модпроб на

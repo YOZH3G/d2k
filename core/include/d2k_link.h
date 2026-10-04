@@ -108,7 +108,9 @@ typedef struct {
                                собственную неудачу (посылка не покинула машину),
                                а не решение коробки; ноль — «причина не
                                кодирована», обычный отказ применить план */
-    uint32_t num;           /* EXCHANGE: сколько байт; ACK: (ok<<8)|reason */
+    uint32_t num;           /* EXCHANGE: сколько байт; ACK: (ok<<8)|reason;
+                               SUSPECT (v12): у D2K_SUSPECT_TCP_STALL — оценка
+                               пакетов с данными обеих сторон к началу тишины */
     uint8_t  seen_types;    /* EXCHANGE: маска встреченных типов, бит (тип-20) */
     /* SUSPECT: ПРИМЕНЯЛСЯ ЛИ ПЛАН К ПОТОКУ, о котором подозрение.
      *
@@ -289,6 +291,10 @@ int  d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap);
 /* Имя с подтверждённым HTTPS на ttl_s секунд (D2K_CMD_SET_HTTPS, v10,
  * задача 51); ноль снимает. Подтверждение — обычным D2K_EV_ACK. */
 int  d2k_link_set_https(int fd, const char *name, uint32_t ttl_s, char *err, size_t errcap);
+/* Бюджеты потока коробок для детектора «TCP встал на бюджете» (v12, задача
+   56): n значений (0..D2K_STALL_BUDGETS_MAX), каждый не ноль; n == 0 —
+   полевой бюджет датапата. */
+int  d2k_link_set_stall_budgets(int fd, const uint16_t *b, size_t n, char *err, size_t errcap);
 
 int  d2k_link_set_name(int fd, const char *name, uint8_t transport,
                        const char *plan_text, uint8_t shape,

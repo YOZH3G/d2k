@@ -1596,7 +1596,7 @@ static unsigned ct_queries;
 static void ct_write(uint16_t cport, uint64_t orig, uint64_t reply, int acct) {
     fake_ct.cport = cport; fake_ct.orig = orig; fake_ct.reply = reply; fake_ct.acct = acct;
 }
-static int fake_ct_query(void *ctx, const d2k_ct_tuple *t, uint64_t *orig, uint64_t *reply) {
+static int fake_ct_query(void *ctx, const d2k_ct_tuple *t, d2k_ct_info *out) {
     (void)ctx;
     ct_queries++;
     static const uint8_t cli[4] = {192, 168, 1, 67}, srv[4] = {1, 2, 3, 4};
@@ -1605,7 +1605,7 @@ static int fake_ct_query(void *ctx, const d2k_ct_tuple *t, uint64_t *orig, uint6
     /* Прямой кортеж — клиент → сервер, как его ведёт conntrack. */
     if (t->family != 4 || t->proto != 17 || memcmp(t->src, cli, 4) || memcmp(t->dst, srv, 4) ||
         dp != 443 || sp != fake_ct.cport || !fake_ct.acct) return -1;
-    *orig = fake_ct.orig; *reply = fake_ct.reply;
+    out->orig_pkts = fake_ct.orig; out->reply_pkts = fake_ct.reply;
     return 0;
 }
 

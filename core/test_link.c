@@ -612,6 +612,24 @@ int main(void) {
         }
     }
     {
+        /* v12 (задача 56): хвостом SUSPECT — число при записи, u16 BE; у «TCP
+           встал на бюджете» это оценка пакетов с данными. Без хвоста — ноль. */
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (SUSPECT v12) не создался");
+        if (sv[0] >= 0) {
+            uint8_t rest[10] = { D2K_SUSPECT_TCP_STALL, 0, 0, 0, 0, 0, D2K_LINK_PLANNED_NO, 1, 0, 25 };
+            send_synthetic(sv[1], D2K_EV_SUSPECT, rest, sizeof rest);
+            d2k_ev ev; char e[200] = {0};
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0 &&
+                  ev.code == D2K_SUSPECT_TCP_STALL && ev.num == 25,
+                  "оценка пакетов в подозрении «TCP встал на бюджете» потеряна");
+            send_synthetic(sv[1], D2K_EV_SUSPECT, rest, 8);
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0 && ev.num == 0,
+                  "подозрение без хвоста v12 получило выдуманное число");
+            close(sv[0]); close(sv[1]);
+        }
+    }
+    {
         /* Короткое подозрение (только код) — законный вход, а не отказ:
            старый датапат подробностей не слал. Поля обязаны остаться нулями,
            а не мусором. */

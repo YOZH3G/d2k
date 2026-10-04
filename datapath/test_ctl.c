@@ -508,7 +508,131 @@ static void test_set_https(void) {
     unlink(SOCK);
 }
 
+/* ЗАДАЧА 56: бюджеты коробок едут командой (v12), подозрение «TCP встал на
+   бюджете» везёт оценку пакетов с данными — байтами на проводе. */
+static d2k_ct_info stall_ct;
+static int stall_ct_query(void *ctx, const d2k_ct_tuple *t, d2k_ct_info *out) {
+    (void)ctx;
+    if (t->proto != 6) return -1;
+    *out = stall_ct;
+    return 0;
+}
+static size_t build_rev(uint8_t *o, uint16_t cport, uint8_t flags, uint32_t seq,
+                        const uint8_t *pay, size_t paylen) {
+    size_t total = build_pkt(o, cport, pay, paylen);
+    uint8_t lan[4] = {192, 168, 1, 67}, wan[4] = {93, 184, 216, 34};
+    memcpy(o + 12, wan, 4);
+    memcpy(o + 16, lan, 4);
+    wr16(o + 20, 443);
+    wr16(o + 22, cport);
+    wr32(o + 24, seq);
+    o[33] = flags;
+    return total;
+}
+static void test_tcp_stall_wire(void) {
+    unlink(SOCK);
+    char err[160];
+    d2k_ctl *c = d2k_ctl_open(SOCK, err, sizeof err);
+    CHECK(c != NULL, "сокет для SET_STALL_BUDGETS не создался");
+    if (!c) { return; }
+    int cli = dial();
+    d2k_ctl_accept(c);
+    struct timeval tv = { 2, 0 };
+    (void)setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    d2k_session *sess = d2k_session_new(16, 16);
+    d2k_ctlsrv cx;
+    memset(&cx, 0, sizeof cx);
+    cx.sess = sess;
+    cx.ctl = c;
+    uint16_t cmd = 0, got[D2K_STALL_BUDGETS_MAX];
+    int ok = 0;
+    uint8_t reason = 0;
+    uint8_t body[32] = { 2, 0, 16, 0, 26 };
+    d2k_ctlsrv_command(&cx, D2K_CMD_SET_STALL_BUDGETS, body, 5);
+    d2k_ctl_flush(c);
+    CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && cmd == D2K_CMD_SET_STALL_BUDGETS && ok,
+          "SET_STALL_BUDGETS не подтверждён");
+    CHECK(d2k_session_stall_budgets(sess, got, D2K_STALL_BUDGETS_MAX) == 2 &&
+          got[0] == 16 && got[1] == 26, "бюджеты коробок не дошли до сессии");
+    /* Негодное: длина не сходится, больше предела, нулевой бюджет — отказ,
+       прежние бюджеты на месте. */
+    d2k_ctlsrv_command(&cx, D2K_CMD_SET_STALL_BUDGETS, body, 4);
+    d2k_ctl_flush(c);
+    CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok && reason == D2K_ACK_BAD_ARGS,
+          "обрезанный SET_STALL_BUDGETS принят");
+    uint8_t many[1 + 2 * (D2K_STALL_BUDGETS_MAX + 1)];
+    memset(many, 0, sizeof many);
+    many[0] = D2K_STALL_BUDGETS_MAX + 1;
+    for (size_t i = 0; i <= D2K_STALL_BUDGETS_MAX; i++) many[2 + 2 * i] = 20;
+    d2k_ctlsrv_command(&cx, D2K_CMD_SET_STALL_BUDGETS, many, sizeof many);
+    d2k_ctl_flush(c);
+    CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok, "бюджетов сверх предела принято");
+    uint8_t zero[3] = { 1, 0, 0 };
+    d2k_ctlsrv_command(&cx, D2K_CMD_SET_STALL_BUDGETS, zero, 3);
+    d2k_ctl_flush(c);
+    CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok, "нулевой бюджет принят");
+    CHECK(d2k_session_stall_budgets(sess, got, D2K_STALL_BUDGETS_MAX) == 2 && got[1] == 26,
+          "отвергнутая команда испортила бюджеты");
+    uint8_t none[1] = { 0 };
+    d2k_ctlsrv_command(&cx, D2K_CMD_SET_STALL_BUDGETS, none, 1);
+    d2k_ctl_flush(c);
+    CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok &&
+          d2k_session_stall_budgets(sess, got, D2K_STALL_BUDGETS_MAX) == 1 &&
+          got[0] == D2K_TCP_STALL_FIELD_BUDGET, "пустой список не вернул полевой бюджет");
+
+    /* Поток: SYN, SYN-ACK, приветствие, одна запись app-data сервера; ядро:
+       обратный 25 и стоит. Оценка 1 + 1 + (25 - 2) = 25. */
+    d2k_session_set_ct_query(sess, stall_ct_query, NULL);
+    const uint64_t S = 1000000000ull;
+    uint8_t hello[512], pkt[1024], obuf[2048];
+    size_t hl = build_hello(hello, "stall.example");
+    d2k_result r;
+    size_t n = build_pkt(pkt, 40300, NULL, 0);
+    pkt[33] = 0x02; wr32(pkt + 24, 999);
+    d2k_session_packet(sess, pkt, n, 1 * S, obuf, sizeof obuf, &r);
+    n = build_rev(pkt, 40300, 0x12, 4999, NULL, 0);
+    d2k_session_packet(sess, pkt, n, 1 * S + 50000000ull, obuf, sizeof obuf, &r);
+    n = build_pkt(pkt, 40300, hello, hl);
+    d2k_session_packet(sess, pkt, n, 1 * S + 50000001ull, obuf, sizeof obuf, &r);
+    const uint8_t app[100] = { 0x17, 0x03, 0x03, 0x00, 0x5f };
+    n = build_rev(pkt, 40300, 0x18, 5000, app, sizeof app);
+    d2k_session_packet(sess, pkt, n, 1 * S + 100000000ull, obuf, sizeof obuf, &r);
+    memset(&stall_ct, 0, sizeof stall_ct);
+    stall_ct.orig_pkts = 14; stall_ct.reply_pkts = 25;
+    stall_ct.tcp_state_known = 1; stall_ct.tcp_state = D2K_CT_TCP_ESTABLISHED;
+    d2k_session_sweep(sess, 2 * S);
+    stall_ct.orig_pkts = 17;   /* клиент говорит в тишину */
+    d2k_session_sweep(sess, 4 * S + 100000000ull);
+    uint64_t seen = 0;
+    d2k_ctlsrv_pump(c, sess, &seen);
+    d2k_ctl_flush(c);
+    int found = 0;
+    for (int i = 0; i < 8 && !found; i++) {
+        uint16_t type = 0;
+        uint8_t ev[256];
+        ssize_t m = read_event(cli, &type, ev, sizeof ev);
+        if (m < 0) break;
+        if (type != D2K_EV_SUSPECT) continue;
+        found = 1;
+        CHECK(m == (ssize_t)(D2K_KEY_WIRE_LEN + 10), "тело SUSPECT без оценки пакетов");
+        CHECK(ev[D2K_KEY_WIRE_LEN] == D2K_SUSPECT_TCP_STALL, "код «TCP встал на бюджете» потерян");
+        if (m >= (ssize_t)(D2K_KEY_WIRE_LEN + 10)) {
+            CHECK((ev[D2K_KEY_WIRE_LEN + 8] << 8 | ev[D2K_KEY_WIRE_LEN + 9]) == 25,
+                  "оценка пакетов с данными не доехала (ждали 25)");
+        }
+    }
+    CHECK(found, "подозрение «TCP встал на бюджете» не вышло на провод");
+    CHECK(strcmp(d2k_suspect_text(D2K_SUSPECT_TCP_STALL),
+                 "TCP: сервер замолчал на бюджете коробки, соединение открыто; проверить объём ответа") == 0,
+          "у кода 8 нет своего текста");
+    close(cli);
+    d2k_ctl_poll(c, d2k_ctlsrv_command, &cx);
+    d2k_ctl_close(c);
+    d2k_session_free(sess);
+}
+
 int main(void) {
+    test_tcp_stall_wire();
     test_probe_owner_disconnect();
     check_proto_greeting();
     test_set_https();
