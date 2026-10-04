@@ -307,6 +307,8 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
     out.verdict = map_verdict(res.verdict);
     out.split_gap_us = (uint32_t)opt.write_gap_ms * 1000u;
     snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);
+    out.split_pos = res.split_pos;
+    out.probes = res.probes;
     if (refused.first[0]) {
         size_t n;
         if (!res.has_hit) {

@@ -416,6 +416,17 @@ int main(void)
         CHECK(strstr(r.reason, "буфер травится") != NULL);
         CHECK(strstr(r.reason, "«syndata»") != NULL && strstr(r.reason, "«oob»") != NULL);
         CHECK(strstr(r.reason, "SYN") != NULL);
+        /* Счёт зондов и точка разреза доходят до планировщика (поле 04.10
+           после 06cb9fd: «за 268 с и 0 зондов замера» — правка фильтра
+           выронила out.probes и out.split_pos). */
+        sweep_pass = NULL;
+        memset(&answer, 0, sizeof answer);
+        answer.verdict = D2K_DV_PREFIX; answer.split_pos = 5; answer.probes = 17;
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        CHECK(r.verdict == D2K_V_PREFIX && r.split_pos == 5 && r.probes == 17);
+        sweep_pass = box_takes;
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        CHECK(r.have_arm);
         /* Фильтр пропускает всё, что план выражает. */
         memset(&p, 0, sizeof p);
         p.badsum = 1; p.repeats = 7;
