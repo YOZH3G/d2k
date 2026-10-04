@@ -1895,6 +1895,34 @@ static int stub_ech_resolve(const char *origin, uint32_t mark, d2k_ech_config *c
     return 0;
 }
 
+/* Повтор ECH-приветствия клиента (поле 04.10): что ему дали и что он ответил.
+   replay_answer_ok — ServerHello на повтор (коробка пропустила), иначе
+   тишина. Местный конец — тот же, что у stub_ver: событие применения
+   теста ищет поток зонда по ver_answer_port. */
+static int replay_calls;
+static size_t replay_last_len;
+static int replay_answer_ok = 1;
+static d2k_ver_result stub_replay(int use_fd, const char *ip, uint16_t port,
+                                  const uint8_t *hello, size_t len, int deadline_ms) {
+    (void)ip; (void)port; (void)hello; (void)deadline_ms;
+    if (use_fd >= 0) close(use_fd);
+    __atomic_add_fetch(&replay_calls, 1, __ATOMIC_SEQ_CST);
+    replay_last_len = len;
+    d2k_ver_result r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1; r.name_ok = -1; r.family = 4;
+    memcpy(r.local_ip4, ver_local_ip4, 4);
+    memcpy(r.local_addr, ver_local_ip4, 4);
+    r.local_port = ver_answer_port;
+    r.level = replay_answer_ok ? D2K_VER_HANDSHAKE : D2K_VER_TRANSPORT;
+    r.replay_proof = replay_answer_ok;
+    r.budget = D2K_BUDGET_NOT_APPLICABLE;
+    snprintf(r.budget_note, sizeof r.budget_note, "подменённый повтор: пакеты не считаются");
+    snprintf(r.reason, sizeof r.reason, "%s", replay_answer_ok
+             ? "подменённый повтор: ServerHello" : "подменённый повтор: тишина");
+    return r;
+}
+
 int main(int argc, char **argv) {
     d2k_sched_mark_fn saved_mark = d2k_sched_mark_hook;
     int voice_only = argc == 2 && strcmp(argv[1], "--voice-only") == 0;
@@ -2475,19 +2503,25 @@ int main(int argc, char **argv) {
                 CHECK(said("GREASE"), "ECH: GREASE не назван в журнале");
                 CHECK(said("напрямую проходит"), "ECH: GREASE-поиск не дошёл до итога");
             } else {
-                CHECK(tcp_calls == 0,
-                      "ECH: настоящий ECH мерился обычным приветствием внешнего имени");
-                CHECK(said("не проверено"), "ECH: настоящий ECH без свидетеля — нет честного «не проверено»");
-                CHECK(!said("напрямую проходит"), "ECH: настоящий ECH без свидетеля объявлен CLEAR");
-                /* Повтор подозрения в окне не заводит тот же бесплодный опыт. */
+                /* ПОЛЕ 04.10.2026, Chrome → Cloudflare: свидетеля нет — мерим
+                   байтами самого клиента (его ECH-приветствие повтором на
+                   тот же адрес), а не обычным приветствием внешнего имени.
+                   Повтор проходит — обходить нечего, плана нет. */
+                CHECK(tcp_calls == 1 && tcp_last_wire == ech_len,
+                      "ECH replay: без свидетеля база не мерилась байтами клиента");
+                CHECK(said("байтами клиента"), "ECH replay: замер повтором не назван в журнале");
+                CHECK(said("напрямую проходит"), "ECH replay: проходящий повтор не дал «обходить нечего»");
+                CHECK(!said("ПОДТВЕРЖДЕНО") && total_bindings(&empty) == 0,
+                      "ECH replay: проходящий повтор завёл план");
+                /* Повтор подозрения в окне не заводит тот же опыт. */
                 saidbuf[0] = '\0';
                 d2k_ev h2 = ev_hello(6, 41150, nm);
                 d2k_sched_event(s, &h2);
                 d2k_ev su2 = ev_suspect(6, 41150);
                 d2k_sched_event(s, &su2);
                 settle(s);
-                CHECK(tcp_calls == 0 && !said("начинаю поиск"),
-                      "ECH: «не проверено» не отложило повтор");
+                CHECK(tcp_calls == 1 && !said("начинаю поиск"),
+                      "ECH replay: «напрямую проходит» не отложило повтор");
             }
             if (mode == 2)
                 CHECK(ech_resolve_calls >= 2, "ECH: свидетель на том же адресе не проверен по HTTPS RR");
@@ -2513,6 +2547,7 @@ int main(int argc, char **argv) {
             snprintf(c.boxes[0].binds[0].ech_origin, sizeof c.boxes[0].binds[0].ech_origin,
                      "%s", "origin.ech.example");
         d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        d2k_sched_replay_ver_hook = stub_replay; replay_calls = 0;
         tcp_answer = D2K_V_CLEAR; tcp_calls = 0;
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         saidbuf[0] = '\0';
@@ -2529,6 +2564,8 @@ int main(int argc, char **argv) {
         settle(s);
         CHECK(said("собственный witness: origin.ech.example"),
               "ECH cross-family: свидетель ECH-привязки IPv6 не подхвачен для IPv4");
+        CHECK(replay_calls == 0 && tcp_calls == 0 && !said("байтами клиента"),
+              "ECH cross-family: при известном свидетеле пошёл повтор приветствия клиента");
         CHECK(!said("своего свидетеля нет") && !said("своего ECH-свидетеля нет"),
               "ECH cross-family: IPv4 объявлен «не проверено» при известном свидетеле");
         if (fails) fprintf(stderr, "%s\n", saidbuf);
@@ -2546,10 +2583,19 @@ int main(int argc, char **argv) {
      * открытым текстом на ДРУГОМ адресе — оно и свидетель (своё
      * наблюдение, не список). (c) Имя без ECH-конфигурации второй раз по
      * HTTPS RR не спрашивается. */
-    for (int mode = 0; mode < 2; mode++) {
+    /* (q) ПОЛЕ 04.10.2026, чистый каталог: свидетель rua.gr (HTTPS RR даёт
+     * ту же конфигурацию cloudflare-ech.com) был в каталоге, но 32 места
+     * кандидатов заняли имена, виденные открытым текстом на ДРУГИХ адресах,
+     * — до своих привязок очередь не дошла, и d2kc сказал «своего
+     * ECH-свидетеля нет». Своё подтверждённое знание (любой транспорт)
+     * идёт раньше случайных имён чужих адресов. */
+    for (int mode = 0; mode < 3; mode++) {
         const char *nm = "ech-public.example";
         d2k_catalog c = {0};
         char pid[40];
+        if (mode == 2)
+            own_box(&c, "box-wit-quic", pid, 2, 2, "origin.ech.example", 17, D2K_LINK_SHAPE_QUIC, 4,
+                    1780000000, 0);
         if (mode == 0) {
             own_box(&c, "box-wit-old", pid, 2, 2, "origin.ech.example", 6, D2K_SHAPE_MODERN, 4,
                     1780000000, 0);
@@ -2574,6 +2620,16 @@ int main(int argc, char **argv) {
             o.low_ip[3] = 10;
             d2k_sched_event(s, &o);
         }
+        if (mode == 2) {
+            for (int k = 0; k < 40; k++) {
+                char other[64];
+                snprintf(other, sizeof other, "flood%d.example", k);
+                d2k_ev o = ev_hello(6, (uint16_t)(43000 + k), other);
+                o.low_ip[2] = 7; o.low_ip[3] = (uint8_t)(10 + k);
+                d2k_sched_event(s, &o);
+            }
+        }
+        d2k_sched_replay_ver_hook = stub_replay; replay_calls = 0;
         uint8_t eb[2048]; size_t el = 0;
         CHECK(ech_offer_hello(nm, eb, sizeof eb, &el) == 0, "ECH witness: fixture");
         d2k_ev h = ev_hello(6, (uint16_t)(41192 + mode), nm); d2k_sched_event(s, &h);
@@ -2583,9 +2639,10 @@ int main(int argc, char **argv) {
         d2k_sched_event(s, &sh);
         d2k_ev su = ev_suspect(6, (uint16_t)(41192 + mode)); d2k_sched_event(s, &su);
         settle(s);
-        CHECK(!said("своего ECH-свидетеля нет"),
+        CHECK(said("ECH-свидетель найден: origin.ech.example") && replay_calls == 0,
               mode == 0 ? "ECH witness (r): свидетель старше 4 последних привязок не найден"
-                        : "ECH witness (f): имя, видённое на другом адресе, не стало свидетелем");
+              : mode == 1 ? "ECH witness (f): имя, видённое на другом адресе, не стало свидетелем"
+                          : "ECH witness (q): своя привязка вытеснена именами чужих адресов");
         if (mode == 1) {
             /* (c) Повторный поиск: plain-other.example (без ECH) не
                переспрашивается — ответ HTTPS RR запомнен. */
@@ -2601,6 +2658,78 @@ int main(int argc, char **argv) {
         }
         if (fails) fprintf(stderr, "%s\n", saidbuf);
         d2k_sched_free(s); d2k_catalog_free(&c);
+        d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* ПОЛЕ 04.10.2026, чистый каталог, Chrome → Cloudflare с настоящим ECH
+     * (внешнее имя cloudflare-ech.com): коробка глушит рукопожатие по самому
+     * расширению ECH, свидетеля нет — «не проверено», и nnmclub/kinozal/rua
+     * в Chrome не открывались. Теперь мерим байтами клиента: (o) повтор
+     * его ECH-приветствия без плана не проходит (база донора 0/3), свой
+     * план коробки (другая цель, TLS 1.3) подтверждается повтором тех же
+     * байт под планом — ServerHello, уровень рукопожатия — и ложится на
+     * внешнее имя формой ECH, без свидетеля и с бюджетом «не проверен».
+     * (n) Своих планов нет — обычный путь кандидатов замера, проверка тем же
+     * повтором. */
+    for (int mode = 0; mode < 2; mode++) {
+        const char *nm = "ech-public.example";
+        d2k_catalog c = {0};
+        char pid[40] = "";
+        if (mode == 0)
+            own_box(&c, "box-ech-own", pid, 2, 3, "rua.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+        d2k_sched_tcp_fn saved_base = d2k_sched_tcp_base_hook;
+        d2k_sched_tcp_base_hook = mode == 0 ? stub_base : NULL;
+        base_blocked_answer = 1;
+        d2k_sched_replay_ver_hook = stub_replay;
+        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        replay_answer_ok = 1; replay_calls = 0; replay_last_len = 0;
+        tcp_answer = mode == 0 ? D2K_V_OPAQUE : D2K_V_PREFIX;
+        tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0; ver_app_after_tcp_search = 0;
+        base_calls = tcp_calls = ver_calls = vol_calls = 0; tcp_last_wire = 0;
+        uint16_t port = (uint16_t)(41230 + mode);
+        ver_answer_port = port;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        uint8_t eb[2048]; size_t el = 0;
+        CHECK(ech_offer_hello(nm, eb, sizeof eb, &el) == 0, "ECH replay: fixture");
+        d2k_ev h = ev_hello(6, port, nm); d2k_sched_event(s, &h);
+        d2k_ev sh; memset(&sh, 0, sizeof sh);
+        sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        memcpy(sh.shape, eb, el); sh.shape_len = el;
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+        for (int i = 0; i < 40 && !said("ПОДТВЕРЖДЕНО"); i++) {
+            spin(s, 200);
+            d2k_ev ap = ev_applied(6, port); d2k_sched_event(s, &ap);
+        }
+        spin(s, 40);
+        if (mode == 0) {
+            CHECK(base_calls == 1 && tcp_last_wire == el,
+                  "ECH replay (o): база не задана байтами клиента");
+            CHECK(tcp_calls == 0, "ECH replay (o): полный замер раньше своих планов");
+        } else {
+            CHECK(tcp_calls == 1 && tcp_last_wire == el,
+                  "ECH replay (n): замер шёл не байтами клиента");
+        }
+        CHECK(replay_calls >= 1 && replay_last_len == el,
+              "ECH replay: кандидат проверен не повтором приветствия клиента");
+        CHECK(ver_calls == 0, "ECH replay: кандидат проверен обычным зондом внешнего имени");
+        const d2k_cat_binding *bd = binding_of(&c, nm, 6);
+        CHECK(bd && bd->shape == D2K_LINK_SHAPE_ECH_TCP && bd->level >= 3 && bd->enabled &&
+              bd->verified_by == D2K_VERBY_REPLAY_HANDSHAKE && !bd->ech_origin[0] &&
+              bd->budget == D2K_CAT_BUDGET_UNCHECKED && bd->family == 4,
+              "ECH replay: привязка внешнего имени не ECH-формы с уровнем рукопожатия");
+        if (mode == 0)
+            CHECK(bd && !strcmp(bd->plan_id, pid), "ECH replay (o): подтверждён не свой план коробки");
+        CHECK(said("уровне рукопожатия") && said("прикладной уровень не измерен"),
+              "ECH replay: граница доказательства не названа");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        d2k_sched_tcp_base_hook = saved_base;
         d2k_sched_ech_resolve_hook = d2k_ech_resolve;
         tcp_answer = D2K_V_OPAQUE;
     }
