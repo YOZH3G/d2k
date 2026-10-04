@@ -30,6 +30,7 @@ static void usage(void) {
         "  --wait       сколько ждать ответа, мс (умолчание 3000)\n"
         "  --mark       метка SO_MARK для зондов; без неё замер про наш же обход\n"
         "  --list       только показать найденные разговоры и выйти\n"
+        "  --discovery  проверить поздний обрыв серией Discord IP Discovery\n"
         "\n"
         "У голоса нет имени: сервер выдаётся на сессию и в публичном DNS его нет.\n"
         "Поэтому адрес берётся из ИДУЩЕГО разговора — сначала позвоните.\n");
@@ -82,6 +83,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(f, "--mark") == 0 && i + 1 < argc) {
             o.mark = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(f, "--list") == 0) { list_only = 1; }
+        else if (strcmp(f, "--discovery") == 0) { o.discovery = 1; }
         else { usage(); return 2; }
     }
 
@@ -122,7 +124,10 @@ int main(int argc, char **argv) {
        этот вывод сняла (ревью, P1-4: он делался зондом, который оракулом быть
        не может), а человеку он печатался по-прежнему. Приём проверяется
        только на самом разговоре, через датапат. */
-    if (r.verdict == D2K_VOICE_BLOCKED) {
+    if (r.discovery_verified) {
+        printf("\nПриём:     %s ×%d; серия Discovery проверена, звук проверяется в приложении\n",
+               r.fake_arm, r.arm_copies);
+    } else if (r.verdict == D2K_VOICE_BLOCKED) {
         printf("\nПриём:     зондом не проверяется — голосовая точка молчит посторонним;\n"
                "           проверять можно только на самом разговоре, через датапат\n");
     }

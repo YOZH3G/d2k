@@ -1,5 +1,11 @@
 /* d2k_voice.h — ГОЛОСОВОЙ ПУТЬ: что происходит с UDP-потоком разговора.
  *
+ * Дополнение 04.10: STUN не является оракулом Discord, но собственный
+ * IP Discovery им оказался. При подозрении на позднее молчание используется
+ * серия ответов с собственными SSRC (voice_discovery.c), а не исторический
+ * replied. Старый STUN/live-путь ниже остаётся для неподдержанных целей.
+ * Успех этой серии не означает проверку звука.
+ *
  * ЧЕМ ЭТОТ ЗАМЕР ОТЛИЧАЕТСЯ ОТ ВСЕХ ОСТАЛЬНЫХ В ПРОЕКТЕ. Подбор по домену
  * целиком стоит на имени: имя вводит человек, имя же меняется в контроле, и
  * разница «наше имя молчит, нейтральное отвечает» и ЕСТЬ измерение. У голоса
@@ -152,6 +158,8 @@ typedef struct {
     const char *blob_dir;     /* NULL — /opt/d2k/files/fake */
     uint32_t    wait_ms;      /* 0 — 3000 */
     uint32_t    mark;
+    int         discovery; /* check sustained Discord replies after suspicion */
+    const uint8_t *known_discovery_prefix; /* exact verified 20-byte prefix */
 } d2k_voice_opt;
 
 typedef struct {
@@ -167,6 +175,7 @@ typedef struct {
     uint8_t  arm_bytes[D2K_VOICE_ARM_MAX];
     size_t   arm_len;
     int      arm_copies;
+    int      discovery_verified; /* own-ID series, not audio proof */
 } d2k_voice_res;
 
 /* Публичный STUN по умолчанию. Замер 04.09.2026 с роутера: Cloudflare на 3478

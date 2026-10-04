@@ -33,7 +33,7 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = stun.c net4.c voice.c meas.c verdict.c crypto.c quicwire.c tls13core.c quicconn.c h3.c quic.c quicprobe.c quicarms.c ipfrag.c props.c hello.c catalog.c match.c compose.c link.c plantlv.c x25519.c tls13.c tls12.c volume.c sched.c quichello.c verify.c
+SRC     = stun.c net4.c voice.c voice_discovery.c meas.c verdict.c crypto.c quicwire.c tls13core.c quicconn.c h3.c quic.c quicprobe.c quicarms.c ipfrag.c props.c hello.c catalog.c match.c compose.c link.c plantlv.c x25519.c tls13.c tls12.c volume.c sched.c quichello.c verify.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicprobe.h include/d2k_quic_arms.h include/d2k_ipfrag.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
           include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
@@ -177,7 +177,10 @@ net4.o: net4.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Голосовой путь (пункт 4): STUN-оракул, цель из живого разговора.
-voice.o: voice.c $(HDR)
+voice_discovery.o: voice_discovery.c include/d2k_voice_discovery.h $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+voice.o: voice.c include/d2k_voice_discovery.h $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 stun.o: stun.c $(HDR)
@@ -386,13 +389,13 @@ test_hello: test_hello.c hello.o $(HDR)
 test_stun: test_stun.c stun.o tls13core.o crypto.o x25519.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_stun.c stun.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
 
-# Голосовой замер с командной строки. Линкуется тем же voice.o, что и тест:
+# Голосовой замер с командной строки. Линкуется тем же voice.o voice_discovery.o, что и тест:
 # второй реализации замера в утилите нет (см. её шапку).
-d2kvoice: d2kvoice.c voice.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ d2kvoice.c voice.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o $(TEST_LDFLAGS)
+d2kvoice: d2kvoice.c voice.o voice_discovery.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ d2kvoice.c voice.o voice_discovery.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o $(TEST_LDFLAGS)
 
-test_voice: test_voice.c voice.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_voice.c voice.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o $(TEST_LDFLAGS)
+test_voice: test_voice.c voice.o voice_discovery.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_voice.c voice.o voice_discovery.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o $(TEST_LDFLAGS)
 
 test_quichello: test_quichello.c quichello.o quic.o quicwire.o hello.o tls13core.o crypto.o x25519.o quicconn.o meas.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quichello.c quichello.o quic.o quicwire.o hello.o tls13core.o crypto.o x25519.o quicconn.o meas.o $(TEST_LDFLAGS)
@@ -621,14 +624,14 @@ cross: hello_profiles.inc
 		test_stun.c stun.c tls13core.c crypto.c x25519.c -lpthread || exit 1
 	@echo "== test_voice целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_voice-a64 \
-		test_voice.c voice.c stun.c net4.c tls13core.c crypto.c x25519.c meas.c -lpthread || exit 1
+		test_voice.c voice.c voice_discovery.c stun.c net4.c tls13core.c crypto.c x25519.c meas.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_voice-mipsel \
-		test_voice.c voice.c stun.c net4.c tls13core.c crypto.c x25519.c meas.c -lpthread || exit 1
+		test_voice.c voice.c voice_discovery.c stun.c net4.c tls13core.c crypto.c x25519.c meas.c -lpthread || exit 1
 	@echo "== d2kvoice целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kvoice-a64 \
-		d2kvoice.c voice.c stun.c net4.c tls13core.c crypto.c x25519.c meas.c -lpthread || exit 1
+		d2kvoice.c voice.c voice_discovery.c stun.c net4.c tls13core.c crypto.c x25519.c meas.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-d2kvoice-mipsel \
-		d2kvoice.c voice.c stun.c net4.c tls13core.c crypto.c x25519.c meas.c -lpthread || exit 1
+		d2kvoice.c voice.c voice_discovery.c stun.c net4.c tls13core.c crypto.c x25519.c meas.c -lpthread || exit 1
 	@echo "== test_quicprobe целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quicprobe-a64 \
 		test_quicprobe.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c quicconn.c h3.c -lpthread || exit 1
@@ -682,11 +685,11 @@ cross: hello_profiles.inc
 	@echo "== test_sched целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_sched-a64 \
 		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_sched-mipsel \
 		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c -lpthread || exit 1
 	@echo "== d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kask-a64 \
@@ -703,11 +706,11 @@ cross: hello_profiles.inc
 	@echo "== d2kc целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-a64 \
 		d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-mipsel \
 		d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
 	@echo "== test_measured целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_measured-a64 \
@@ -747,7 +750,7 @@ DETECT_SRC = ../detect/bridge.c ../detect/classify.c ../detect/poison.c \
 d2kvoice-linux-arm64:
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
-		-o $(BUILDDIR)/d2kvoice-linux-arm64 d2kvoice.c voice.c stun.c net4.c \
+		-o $(BUILDDIR)/d2kvoice-linux-arm64 d2kvoice.c voice.c voice_discovery.c stun.c net4.c \
 		tls13core.c crypto.c x25519.c meas.c -lpthread
 	@ls -l $(BUILDDIR)/d2kvoice-linux-arm64
 
@@ -760,7 +763,7 @@ release: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -static -Wl,-S \
 		-o $(BUILDDIR)/d2kc-linux-$(ARCH) d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c \
-		crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c \
+		crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c \
 		volume.c tls13.c tls12.c tls13core.c x25519.c verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread
 	@ls -l $(BUILDDIR)/d2kc-linux-$(ARCH)
 
@@ -798,10 +801,10 @@ test-sched-modes: test_sched sched.o quichello.o plantlv.o verify.o tls12.o quic
 # verify.o tls12.o quicconn.o quicwire.o h3.o — с 12.09 планировщик испытывает кандидата САМ (d2k_sched_ver_hook,
 # умолчание verify_default зовёт d2k_verify_probe). Тест зонд подменяет, но
 # умолчание всё равно линкуется: крючок — точка подмены, а не условная сборка.
-test_sched: test_sched.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o stun.o \
+test_sched: test_sched.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
             hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
-		voice.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(TEST_LDFLAGS)
+		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 # Стенд test_verify.c — СВОЙ (не общий test_stand.h): он единственный умеет
 # довести рукопожатие TLS 1.3 до конца и умеет НЕ довести, а без этого уровни
@@ -903,11 +906,11 @@ DETECT_OBJ = ../detect/bridge.o ../detect/classify.o ../detect/poison.o \
 $(DETECT_OBJ): FORCE
 	$(MAKE) -C ../detect $(notdir $@)
 
-d2kc: d2kc.c httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o stun.o \
+d2kc: d2kc.c httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
       hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
       $(DETECT_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
-		voice.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
+		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o quicconn.o h3.o \
 		$(DETECT_OBJ) $(TEST_LDFLAGS)
 
 clean:
@@ -943,3 +946,11 @@ test-quic-original-arms: test_quic_original_arms
 test-quic-run-order: test_quic_run_order
 	./test_quic_run_order
 
+
+TESTS += test_voice_discovery
+check: test-voice-discovery
+.PHONY: test-voice-discovery
+test_voice_discovery: test_voice_discovery.c voice.o net4.o voice_discovery.o stun.o meas.o crypto.o tls13core.o x25519.o include/d2k_voice_discovery.h
+	$(CC) $(CFLAGS) -o $@ $< voice.o net4.o voice_discovery.o stun.o meas.o crypto.o tls13core.o x25519.o $(TEST_LDFLAGS)
+test-voice-discovery: test_voice_discovery
+	./test_voice_discovery

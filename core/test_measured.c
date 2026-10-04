@@ -422,6 +422,38 @@ static void rx_volume_fake_sni_split(void) {
     pkt.payload_len = 43;
     CHECK(d2k_plan_apply(p, NULL, &pkt, &out) != 0);
     d2k_actions_free(&out);
+    /* finland14001.discord.media, 04.10: the saved template plan must be
+       executable on a legacy ClientHello too. Its applicability is then
+       measured by the TLS 1.2 verifier, not rejected before any fake is sent.
+       A different SID length leaves the fake template's SID intact. */
+    uint8_t legacy[2048];
+    size_t legacy_len = 0;
+    case_name = "saved RX template on TLS 1.2";
+    CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "finland14001.discord.media",
+                                 legacy, sizeof legacy, &legacy_len) == 0);
+    CHECK(d2k_hello_shape(legacy, legacy_len) == D2K_SHAPE_LEGACY);
+    pkt.payload = legacy; pkt.payload_len = legacy_len; pkt.is_tls13 = 0;
+    CHECK(d2k_hello_sni(legacy, legacy_len, &pkt.sni_off, &pkt.sni_len) == 0);
+    CHECK(legacy[43] == 0);
+    CHECK(d2k_plan_apply(p, NULL, &pkt, &out) == 0);
+    CHECK(out.fate == D2K_ORIG_DROP && out.n == 10);
+    if (out.n == 10) {
+        for (size_t i = 0; i < 8; i++) {
+            CHECK(out.v[i].kind == D2K_EMIT_FAKE && out.v[i].len == 675 &&
+                  out.v[i].seq == BASE && out.v[i].bytes[43] == 32 &&
+                  (out.v[i].poison & D2K_POISON_TCPTS_BACK));
+            CHECK(memcmp(out.v[i].bytes, out.v[0].bytes, 675) == 0);
+        }
+        CHECK(out.v[8].len == 2 && out.v[8].seq == BASE &&
+              memcmp(out.v[8].bytes, legacy, 2) == 0);
+        CHECK(out.v[9].len == legacy_len - 2 && out.v[9].seq == BASE + 2 &&
+              memcmp(out.v[9].bytes, legacy + 2, legacy_len - 2) == 0);
+    }
+    d2k_actions_free(&out);
+    /* A TLS-shaped prefix with an invalid SID is still refused. */
+    legacy[43] = 33;
+    CHECK(d2k_plan_apply(p, NULL, &pkt, &out) != 0);
+    d2k_actions_free(&out);
     d2k_plan_free(p);
 }
 

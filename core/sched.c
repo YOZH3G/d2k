@@ -64,6 +64,7 @@
 #include "d2k_plantlv.h"
 #include "d2k_quicprobe.h"
 #include "d2k_sched.h"
+#include "d2k_voice_discovery.h"
 #include "d2k_verify.h"
 #include "d2k_volume.h"
 #include "d2k_domain.h"
@@ -620,6 +621,9 @@ typedef struct {
     int         voice_flow_bound;
     int         voice_answered;
     int         voice_proven;
+    int         voice_discovery_verified;
+    uint8_t     voice_known_prefix[20];
+    int         voice_known_prefix_valid;
     uint8_t     voice_proof_code;
     int         voice_silent;
     int64_t     voice_watch_ms;
@@ -2236,7 +2240,9 @@ static void *worker_run(void *vp) {
     if (t->job == JOB_VOICE) {
         d2k_voice_opt opt;
         memset(&opt, 0, sizeof opt);
-        opt.mark = s->mark;
+        opt.mark = s->measure_mark;
+        opt.discovery = strcmp(t->name, "@discord-voice") == 0;
+        opt.known_discovery_prefix = t->voice_known_prefix_valid ? t->voice_known_prefix : NULL;
         memcpy(&opt.flow_ip_a, t->voice_flow.a_ip, sizeof opt.flow_ip_a);
         opt.flow_port_a = t->voice_flow.a_port;
         memcpy(&opt.flow_ip_b, t->voice_flow.b_ip, sizeof opt.flow_ip_b);
@@ -5830,6 +5836,24 @@ static int voice_trial_same_context(const task *t, const d2k_ev *ev) {
 }
 
 static void voice_start(d2k_sched *s, task *t) {
+    t->voice_known_prefix_valid=0;
+    for(size_t i=0;i<s->cat->n_boxes && !t->voice_known_prefix_valid;i++) {
+        const d2k_cat_box *box=&s->cat->boxes[i];
+        for(size_t j=0;j<box->n_binds && !t->voice_known_prefix_valid;j++) {
+            const d2k_cat_binding *b=&box->binds[j];
+            if(!b->enabled || !b->confirmed || b->recheck_since || b->level<3 || b->transport!=17 ||
+               b->family!=4 || b->shape!=D2K_LINK_SHAPE_VOICE ||
+               b->verified_by!=D2K_VERBY_VOICE_DISCOVERY ||
+               strcmp(b->kind,"addr") || strcmp(b->target,t->ip))continue;
+            for(size_t k=0;k<box->n_plans;k++) {
+                const d2k_cat_plan *p=&box->plans[k];
+                if(p->enabled && !strcmp(p->id,b->plan_id) &&
+                   d2k_voice_discovery_prefix(p->text,t->voice_known_prefix)){
+                    t->voice_known_prefix_valid=1;break;
+                }
+            }
+        }
+    }
     t->n_plans = 0;
     t->next_plan = 0;
     t->state = T_VOICE_MEASURE;
@@ -5848,9 +5872,12 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
     r = t->voice_res;
     pthread_mutex_unlock(&s->mu);
     join_worker(t);
+    t->voice_discovery_verified = r.discovery_verified;
 
     if (r.verdict != D2K_VOICE_BLOCKED) {
-        say(s, "по %s (голос) временный Plan не ставлю: измерение не подтвердило "
+        if (t->voice_known_prefix_valid && r.verdict == D2K_VOICE_CLEAR) {
+            say(s, "по %s (голос) сохраняю подтверждённый приём: %s", t->name, r.reason);
+        } else say(s, "по %s (голос) временный Plan не ставлю: измерение не подтвердило "
                "блокировку (%s)", t->name, r.reason[0] ? r.reason : "нет причины");
         task_fail(s, t, now_ms);
         return;
@@ -6360,10 +6387,12 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     snprintf(wire, sizeof wire, "%s", text);
     err[0] = '\0';
     int is_stun = t->voice_proof_code == D2K_UDP_PROOF_STUN;
+    /* This measured remedy belongs to the endpoint, not all voice hosts. */
+    int by_address = is_stun || t->voice_discovery_verified;
     int install_rc = -1;
     if (stamp_plan_id(wire, wire_id) == 0 &&
         d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) == 0) {
-        if (is_stun) {
+        if (by_address) {
             uint8_t ip4[4];
             if (inet_pton(AF_INET, t->ip, ip4) == 1) {
                 install_rc = d2k_link_set_addr(s->link_fd, ip4, D2K_LINK_SHAPE_VOICE,
@@ -6390,8 +6419,8 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     }
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          is_stun ? "stun" : "voice",
-                         is_stun ? t->ip : t->name,
-                         is_stun ? "addr" : "name", 17, t->family, D2K_LINK_SHAPE_VOICE,
+                         by_address ? t->ip : t->name,
+                         by_address ? "addr" : "name", 17, t->family, D2K_LINK_SHAPE_VOICE,
                          is_stun ? D2K_VERBY_STUN : D2K_VERBY_VOICE_DISCOVERY,
                          D2K_INPUT_PROFILE,
                          wall_s(s, now_ms), &t->fp);

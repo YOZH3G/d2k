@@ -18,6 +18,7 @@
 #include "d2k_net4.h"
 #include "d2k_stun.h"
 #include "d2k_voice.h"
+#include "d2k_voice_discovery.h"
 
 /* --- цель из живого разговора ------------------------------------------- */
 
@@ -499,6 +500,9 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
 
     char addr[24];
     d2k_ip4_text(r.ip, addr, sizeof addr);
+
+    /* conntrack's replied bit records history, not current progress. */
+    if (o.discovery && d2k_voice_discovery_search(&o, &r)) return r;
 
     /* ===== СЛОЙ 0: ОТВЕЧАЕТ ЛИ ТОЧКА НАСТОЯЩЕМУ КЛИЕНТУ =====
      *

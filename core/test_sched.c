@@ -77,6 +77,8 @@ static int fails;
 
 static int tcp_calls, quic_calls;
 static int voice_calls;
+static int voice_discovery_fixture;
+static int voice_seen_known;
 static d2k_verdict tcp_answer = D2K_V_OPAQUE;
 static int tcp_owns_search;
 static int tcp_found_arm;
@@ -105,7 +107,9 @@ static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
     d2k_voice_res r;
     memset(&r, 0, sizeof r);
     voice_calls++;
-    if (!opt || opt->mark != 0x2d || !opt->flow_port_a || !opt->flow_port_b) { return r; }
+    if (opt && opt->known_discovery_prefix) { voice_seen_known=1; return r; }
+    if (!opt || opt->mark != 0x2d || !opt->flow_port_a || !opt->flow_port_b ||
+        (voice_discovery_fixture && !opt->discovery)) { return r; }
     r.verdict = D2K_VOICE_BLOCKED;
     r.ip = opt->flow_ip_a;
     r.port = opt->flow_port_a;
@@ -116,6 +120,12 @@ static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
     memcpy(r.arm_bytes, "\xa1\xb2\xc3\xd4", 4);
     r.arm_len = 4;
     r.arm_copies = 6;
+    r.discovery_verified = voice_discovery_fixture;
+    if (voice_discovery_fixture) {
+        memset(r.arm_bytes,0,20);
+        memcpy(r.arm_bytes,"\x00\x01\x00\x00\x21\x12\xa4\x42",8);
+        r.arm_len=20; r.arm_copies=1;
+    }
     return r;
 }
 
@@ -10491,6 +10501,55 @@ voice_only_run:
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cS);
+
+        /* A sustained Discovery remedy is scoped to the measured address,
+           not the global @discord-voice classifier label. */
+        memset(&cS, 0, sizeof cS);
+        voice_discovery_fixture = 1;
+        s = d2k_sched_new(&cS, sv[0], 0x2d);
+        if (s) {
+            forget_sent();
+            d2k_ev h = ev_hello(17, 52005, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 52005);
+            d2k_sched_event(s, &su);
+            spin(s, 20); drain();
+            uint8_t src[4], trial[D2K_TRIAL_ID_LEN]; uint16_t sport = 0;
+            CHECK(last_addr_probe_endpoint(src, &sport, trial), "Discovery trial missing");
+            d2k_ev ap = ev_applied(17, 52005);
+            memcpy(ap.trial_id, trial, sizeof trial);
+            d2k_sched_event(s, &ap);
+            d2k_ev ex = ev_exchange(17, 52005, 0);
+            ex.code = D2K_UDP_PROOF_VOICE_DISCOVERY;
+            d2k_sched_event(s, &ex); spin(s, 20); drain();
+            const d2k_cat_binding *bd = binding_of(&cS, "127.0.0.1", 17);
+            CHECK(bd && !strcmp(bd->kind, "addr") && bd->verified_by == D2K_VERBY_VOICE_DISCOVERY,
+                  "sustained Discovery did not retain address scope");
+            CHECK(sent_command_count(D2K_CMD_SET_NAME, NULL, 0) == 0,
+                  "one Discovery endpoint became a global voice policy");
+            d2k_sched_free(s);
+        }
+        s = d2k_sched_new(&cS, sv[0], 0x2d);
+        if (s) {
+            forget_sent(); (void)d2k_sched_sync(s);
+            int rounds = 0;
+            while (d2k_sched_sync_step(s) && rounds++ < 1000) drain();
+            drain(); const uint8_t target[4] = {127,0,0,1};
+            CHECK(sent_set_addr_shape(4, target, D2K_LINK_SHAPE_VOICE) == 1,
+                  "saved Discovery remedy did not restore as address/voice");
+            CHECK(sent_command_count(D2K_CMD_SET_NAME, NULL, 0) == 0,
+                  "restored Discovery remedy became a global voice policy");
+            forget_sent(); voice_seen_known=0;
+            d2k_ev h=ev_hello(17,52005,D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s,&h);
+            d2k_ev su=ev_suspect(17,52005);
+            d2k_sched_event(s,&su);spin(s,20);drain();
+            CHECK(voice_seen_known && sent_command_count(D2K_CMD_SET_ADDR_PROBE,NULL,0)==0,
+                  "working saved Discovery remedy restarted candidate search");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cS);
+        voice_discovery_fixture = 0;
 
         /* Задача 16: подтверждённый STUN/голос того же IP не затирает
            подтверждённую QUIC-привязку по адресу. Каждая едет со своей формой

@@ -147,7 +147,12 @@ static int fake_tls_bytes(const d2k_plan *p, const struct d2k_fake *f,
     size_t fake_rnd, fake_sid, fake_sid_len;
     size_t real_rnd, real_sid, real_sid_len;
     *owned = NULL;
-    if (!in->is_tls13 || tls_ch_layout(in->payload, in->payload_len,
+    /* A saved tcp-template plan also needs to be tried on TLS 1.2. Random
+       and session-ID fields have the same layout; unequal SID lengths are
+       handled below without resizing the template. Keep the older native
+       modifier profile's input contract unchanged. */
+    if ((!in->is_tls13 && p->wire_profile != D2K_WIRE_TCP_TEMPLATE) ||
+        tls_ch_layout(in->payload, in->payload_len,
             p->wire_profile == D2K_WIRE_TCP_TEMPLATE,
             &real_rnd, &real_sid, &real_sid_len) != 0 ||
         tls_ch_layout(pl->bytes, pl->len, 0, &fake_rnd, &fake_sid,
