@@ -133,8 +133,18 @@ static int run_daemon(const char *config_path) {
     (void)sigaction(SIGINT,&sa,NULL);(void)sigaction(SIGTERM,&sa,NULL);(void)signal(SIGPIPE,SIG_IGN);
 
     local.listener=listener;atomic_store(&health_running,1);
-    if(pthread_create(&observer,NULL,health_thread,&local)!=0){log_msg("cannot start local health observer");goto done;}
-    observer_started=1;
+    /* Only the main thread handles termination: it owns stop_requested and
+     * its blocking reconnect wait must receive the signal to be interrupted. */
+    sigset_t termination,original_mask;sigemptyset(&termination);
+    sigaddset(&termination,SIGINT);sigaddset(&termination,SIGTERM);
+    if(pthread_sigmask(SIG_BLOCK,&termination,&original_mask)!=0){log_msg("cannot protect local observer signal mask");goto done;}
+    int create_rc=pthread_create(&observer,NULL,health_thread,&local);
+    if(create_rc==0)observer_started=1;
+    /* Restore even when creation fails; the observer inherited the blocked
+     * mask, while main resumes its original termination delivery policy. */
+    int restore_rc=pthread_sigmask(SIG_SETMASK,&original_mask,NULL);
+    if(restore_rc!=0){log_msg("cannot restore main signal mask");goto done;}
+    if(create_rc!=0){log_msg("cannot start local health observer");goto done;}
     unsigned failures=0,fast_deaths=0;int healthy=0,identity_registered=0;
     while(!stop_requested) {
         atomic_store(&external_available,0);

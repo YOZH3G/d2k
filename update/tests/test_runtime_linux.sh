@@ -36,3 +36,5 @@ read magic actual_pid start mono boot release wire peer connected ready external
 [ "$mono" -gt "$first_mono" ] && [ "$ready" = 1 ] && [ "$external" = 0 ]
 kill "$pid"; wait "$pid"; pid=
 printf '%s\n' 'Telegram local listener remains healthy through external relay failure: PASS'
+
+"$artifacts/test_runtime_signal-linux-arm64" "$artifacts/runtime-linux/d2ktg-linux-arm64" "$work/config" "$work/health" "$work/log" "$work/status"

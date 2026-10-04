@@ -20,7 +20,7 @@ static int local_open(int root,const char *path,int directory) {
     char *p=b;
     for(;;){char *slash=strchr(p,'/');if(slash)*slash=0;
         if(!*p||!strcmp(p,".")||!strcmp(p,"..")){close(dir);return -1;}
-        int flags=O_RDONLY|O_CLOEXEC|O_NOFOLLOW;if(slash||directory)flags|=O_DIRECTORY;
+        int flags=O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK;if(slash||directory)flags|=O_DIRECTORY;
         int fd=openat(dir,p,flags);close(dir);if(fd<0)return -1;
         if(!slash)return fd;
         dir=fd;p=slash+1;
@@ -50,8 +50,9 @@ static d2ku_rc readable_state(d2ku_ctx *c) {
     if(!c->health_state_count||c->health_state_count>8)return D2KU_HEALTH;
     for(size_t i=0;i<c->health_state_count;i++){
         int fd=local_open(c->root_dirfd,c->health_state_paths[i],0);if(fd<0)return D2KU_HEALTH;
-        struct stat st;char b[4096];int ok=fstat(fd,&st)==0&&S_ISREG(st.st_mode);
-        ssize_t n;do{n=read(fd,b,sizeof b);}while(n>0);if(n<0)ok=0;close(fd);if(!ok)return D2KU_HEALTH;
+        struct stat st;char b[4096];
+        if(fstat(fd,&st)!=0||!S_ISREG(st.st_mode)){close(fd);return D2KU_HEALTH;}
+        ssize_t n;do{n=read(fd,b,sizeof b);}while(n>0);close(fd);if(n<0)return D2KU_HEALTH;
     }return D2KU_OK;
 }
 static d2ku_rc local_http(d2ku_ctx *c) {

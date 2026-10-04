@@ -12,7 +12,7 @@ $(BUILD)/test_manifest: tests/test_manifest.c src/manifest.c include/d2k_update.
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_manifest.c src/manifest.c $(LDFLAGS) $(LDLIBS) -o $@
 clean:
-	rm -f $(BUILD)/test_manifest $(BUILD)/test_transport $(BUILD)/test_package $(BUILD)/test_schedule $(BUILD)/test_journal $(BUILD)/test_health $(BUILD)/test_health_local
+	rm -f $(BUILD)/test_manifest $(BUILD)/test_transport $(BUILD)/test_package $(BUILD)/test_schedule $(BUILD)/test_journal $(BUILD)/test_health $(BUILD)/test_health_local $(BUILD)/test_health_fifo $(BUILD)/test_runtime_signal
 
 .PHONY: check-schedule
 check-schedule: $(BUILD)/test_schedule
@@ -54,3 +54,19 @@ $(BUILD)/test_health: tests/test_health.c src/health.c include/d2k_update.h ../r
 $(BUILD)/test_health_local: tests/test_health_local.c src/health.c include/d2k_update.h ../runtime/d2k_runtime.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_health_local.c src/health.c $(LDFLAGS) -o $@
+
+.PHONY: check-health-fifo
+check-health: check-health-fifo
+check-health-fifo: $(BUILD)/test_health_fifo
+	$(BUILD)/test_health_fifo
+$(BUILD)/test_health_fifo: tests/test_health_fifo.c src/health.c include/d2k_update.h ../runtime/d2k_runtime.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_health_fifo.c src/health.c $(LDFLAGS) -o $@
+
+.PHONY: check-runtime-signal
+# Linux only; isolated fixture paths supplied by the runtime smoke harness.
+check-runtime-signal: $(BUILD)/test_runtime_signal
+	$(BUILD)/test_runtime_signal "$(SIGNAL_BINARY)" "$(SIGNAL_CONFIG)" "$(SIGNAL_HEALTH)" "$(SIGNAL_LOG)" "$(SIGNAL_STATUS)"
+$(BUILD)/test_runtime_signal: tests/test_runtime_signal_linux.c ../runtime/d2k_runtime.h
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) tests/test_runtime_signal_linux.c $(LDFLAGS) -o $@
