@@ -458,6 +458,45 @@ static void test_keepalive_later(void) {
     d2k_http80_free(h);
 }
 
+/* ПОЛЕ 04.10.2026, 13:17:59: Safari показал портал провайдера, а у d2kd
+   за всю минуту «запросов 13 → 13» и ни одной вставки — событие
+   контроллеру не родилось вовсе. По одному счётчику запросов не отличить
+   «запроса к :80 не было» (кэш браузера) от «был, но его здесь не разобрать»:
+   соединение открыто до запуска d2kd (keep-alive), запрос не целиком в
+   первом сегменте (большие Cookie), следующий запрос соединения. Каждый
+   такой случай — свой счётчик в сводке. */
+static void test_unseen_counted(void) {
+    d2k_http80 *h = d2k_http80_new();
+    const uint64_t T = 9000 * MS;
+    /* 1. Соединение без SYN в таблице: запрос по keep-alive, открытому до
+       запуска d2kd. */
+    flow a = flow4(53000);
+    size_t n = pkt(&a, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
+    PKT(h, b, n, T, &r);
+    CHECK(r.action == D2K_HTTP80_PASS && !r.injection, "запрос чужого соединения не прошёл как есть");
+    /* Чистый ACK клиента без нагрузки — не запрос, не считается. */
+    n = pkt(&a, 1, F_ACK, CISN + 1, SISN + 1, NULL, b);
+    PKT(h, b, n, T + MS, &r);
+    /* 2. Запрос не целиком в первом сегменте. */
+    flow c = flow4(53001);
+    open_flow(h, &c, T, "GET / HTTP/1.1\r\nHost: www.fast-torrent.ru\r\nCookie: a=b\r\n");
+    /* 3. Второй запрос того же соединения после настоящего ответа. */
+    flow k = flow4(53002);
+    uint32_t req_end = CISN + 1 + (uint32_t)strlen(GET);
+    open_flow(h, &k, T, GET);
+    static const char OK200[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    n = pkt(&k, 0, F_ACK | F_PSH, SISN + 1, req_end, OK200, b);
+    PKT(h, b, n, T + 200 * MS, &r);
+    n = pkt(&k, 1, F_ACK | F_PSH, req_end, SISN + 1 + (uint32_t)strlen(OK200), GET, b);
+    PKT(h, b, n, T + 300 * MS, &r);
+    d2k_http80_stats st = d2k_http80_get_stats(h);
+    CHECK(st.requests == 1, "разобранных запросов не 1");
+    CHECK(st.untracked == 1, "запрос соединения без SYN в таблице не сосчитан");
+    CHECK(st.unparsed == 1, "запрос не целиком в первом сегменте не сосчитан");
+    CHECK(st.later == 1, "следующий запрос соединения не сосчитан");
+    d2k_http80_free(h);
+}
+
 int main(void) {
     test_field_injection(0);
     test_field_injection(1);
@@ -470,6 +509,7 @@ int main(void) {
     test_swap_failure();
     test_kernel_clock();
     test_keepalive_later();
+    test_unseen_counted();
     if (fails) {
         printf("test_http80: провалов %d\n", fails);
         return 1;
