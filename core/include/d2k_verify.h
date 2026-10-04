@@ -112,6 +112,14 @@ typedef struct {
        прикладной уровень НЕ ИЗМЕРЕН: HTTP-запрос на чужом языке ничего не
        доказал бы. Это не D2K_VER_APPLICATION и за него не выдаётся. */
     int      handshake_proof;
+    /* ПОВТОР ECH-ПРИВЕТСТВИЯ КЛИЕНТА (d2k_verify_replay_on): снятые байты
+       клиента ушли со своего сокета, и сервер ответил ServerHello (или
+       HelloRetryRequest) — то есть ровно вход коробки прошёл её на проводе.
+       Уровень — D2K_VER_HANDSHAKE в смысле «граница рукопожатия», НО
+       рукопожатие не завершено: ключей клиента у нас нет, Finished сервера
+       не проверен, прикладной уровень и бюджет потока не измеримы. Это не
+       handshake_proof и не APPLICATION и за них не выдаётся. */
+    int      replay_proof;
     /* Неуспех вызван НАШИМ пределом или нашей ошибкой чтения (заголовки длиннее
        D2K_VERIFY_HEADER_LIMIT, нет памяти), а не поведением линии. Такой
        неуспех не улика против плана и не записывается ему как провал. */
@@ -275,6 +283,17 @@ d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_
 /* Закрывает сокет обращения и обнуляет fd. Безопасна на любом результате, в
  * том числе на том, где обращения не было. */
 void d2k_verify_close(d2k_ver_result *r);
+
+/* ПОВТОР СНЯТОГО ECH-ПРИВЕТСТВИЯ КЛИЕНТА (поле 04.10.2026: Chrome → Cloudflare,
+ * коробка глушит рукопожатие по расширению ECH, своего свидетеля-origin нет).
+ * Шлёт hello байт в байт на новом соединении (use_fd — занятый под пробный
+ * план порт, как у остальных зондов; <0 — свой сокет) и читает ответ до
+ * первого сообщения рукопожатия сервера. Успех — ServerHello/HRR: level
+ * D2K_VER_HANDSHAKE, replay_proof = 1, budget = D2K_BUDGET_NOT_APPLICABLE.
+ * Тревога, молчание, обрыв — D2K_VER_TRANSPORT. Сокет — открыт до
+ * d2k_verify_close. Чужую сессию не продолжает и за свою не выдаёт. */
+d2k_ver_result d2k_verify_replay_on(int use_fd, const char *ip, uint16_t port,
+    const uint8_t *hello, size_t hello_len, int deadline_ms);
 
 /* Explicit origin witness: outer SNI is config.public_name, HTTP authority
  * and certificate-name observation are origin. Never follows another host. */

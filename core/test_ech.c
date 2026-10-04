@@ -1,6 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include "d2k_crypto.h"
 #include "d2k_tls13core.h"
 #include "d2k_verify.h"
@@ -33,6 +38,96 @@ static int contains(const uint8_t *b, size_t n, const char *s) {
     size_t l = strlen(s);
     for (size_t i = 0; i + l <= n; i++) if (!memcmp(b + i, s, l)) return 1;
     return 0;
+}
+
+/* ПОВТОР ECH-ПРИВЕТСТВИЯ КЛИЕНТА (поле 04.10, Chrome → Cloudflare без
+ * свидетеля). Стенд принимает одно соединение, читает ровно присланное и
+ * отвечает по режиму: 0 — ServerHello, 1 — молча закрывает, 2 — тревогой. */
+struct replay_stand {
+    int lfd, mode;
+    uint16_t port;
+    uint8_t got[4096];
+    size_t got_len, want;
+    pthread_t th;
+};
+
+static void *replay_run(void *arg) {
+    struct replay_stand *st = arg;
+    int c = accept(st->lfd, NULL, NULL);
+    if (c < 0) return NULL;
+    struct timeval tv = {2, 0};
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    while (st->got_len < st->want) {
+        ssize_t n = recv(c, st->got + st->got_len, sizeof st->got - st->got_len, 0);
+        if (n <= 0) break;
+        st->got_len += (size_t)n;
+    }
+    if (st->mode == 0) {
+        uint8_t sh[5 + 4 + 2 + 32 + 1 + 2 + 1 + 2] = {22, 3, 3, 0, 4 + 2 + 32 + 1 + 2 + 1 + 2,
+            2, 0, 0, 2 + 32 + 1 + 2 + 1 + 2, 3, 3};
+        for (size_t i = 0; i < 32; i++) sh[11 + i] = (uint8_t)(i + 1);
+        sh[43] = 0; sh[44] = 0x13; sh[45] = 0x01; sh[46] = 0; sh[47] = 0; sh[48] = 0;
+        (void)send(c, sh, sizeof sh, 0);
+        usleep(200000);
+    } else if (st->mode == 2) {
+        const uint8_t alert[7] = {21, 3, 3, 0, 2, 2, 40};
+        (void)send(c, alert, sizeof alert, 0);
+        usleep(200000);
+    }
+    close(c);
+    return NULL;
+}
+
+static int replay_start(struct replay_stand *st, int mode, size_t want) {
+    memset(st, 0, sizeof *st);
+    st->mode = mode; st->want = want;
+    st->lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (st->lfd < 0) return -1;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof a;
+    if (bind(st->lfd, (struct sockaddr *)&a, sizeof a) || listen(st->lfd, 1) ||
+        getsockname(st->lfd, (struct sockaddr *)&a, &al)) { close(st->lfd); return -1; }
+    st->port = ntohs(a.sin_port);
+    return pthread_create(&st->th, NULL, replay_run, st);
+}
+
+static void replay_stop(struct replay_stand *st) {
+    pthread_join(st->th, NULL);
+    close(st->lfd);
+}
+
+static void replay_checks(void) {
+    uint8_t hello[2048]; size_t hl = 0;
+    CHECK(!d2k_hello_from_profile(D2K_SHAPE_MODERN, "cloudflare-ech.com", hello, sizeof hello, &hl));
+    struct replay_stand st;
+    /* (a) ServerHello на те же байты: коробка их пропустила — уровень
+       рукопожатия, НЕ приложения; бюджет потока не применим. */
+    CHECK(!replay_start(&st, 0, hl));
+    d2k_ver_result r = d2k_verify_replay_on(-1, "127.0.0.1", st.port, hello, hl, 2000);
+    replay_stop(&st);
+    CHECK(st.got_len == hl && !memcmp(st.got, hello, hl));
+    CHECK(r.level == D2K_VER_HANDSHAKE && r.replay_proof == 1);
+    CHECK(r.status == 0 && !r.body_complete && !r.ech_accepted && !r.handshake_proof);
+    CHECK(r.budget == D2K_BUDGET_NOT_APPLICABLE && r.budget_note[0]);
+    CHECK(r.fd >= 0 && r.local_port != 0 && r.family == 4);
+    d2k_verify_close(&r);
+    /* (b) Тишина и закрытие: опыт был, доказательства нет. */
+    CHECK(!replay_start(&st, 1, hl));
+    r = d2k_verify_replay_on(-1, "127.0.0.1", st.port, hello, hl, 1000);
+    replay_stop(&st);
+    CHECK(r.level == D2K_VER_TRANSPORT && !r.replay_proof);
+    d2k_verify_close(&r);
+    /* (c) Тревога сервера — не ServerHello. */
+    CHECK(!replay_start(&st, 2, hl));
+    r = d2k_verify_replay_on(-1, "127.0.0.1", st.port, hello, hl, 1000);
+    replay_stop(&st);
+    CHECK(r.level == D2K_VER_TRANSPORT && !r.replay_proof && strstr(r.reason, "тревог"));
+    d2k_verify_close(&r);
+    /* (d) Пустой вход — опыта нет. */
+    r = d2k_verify_replay_on(-1, "127.0.0.1", 9, NULL, 0, 100);
+    CHECK(r.level == D2K_VER_NOT_MEASURED && !r.replay_proof && r.fd < 0);
 }
 
 int main(int argc, char **argv) {
@@ -92,6 +187,7 @@ int main(int argc, char **argv) {
     uint8_t bad[1024]; memcpy(bad, list, len);
     bad[7] = 0; bad[8] = 0x21; /* unsupported KEM, not ordinary TLS fallback */
     CHECK(d2k_ech_config_parse(bad, len, &config) == -1);
+    replay_checks();
     fprintf(stderr, "ECH unit: %s\n", fails ? "FAILED" : "passed");
     return fails ? 1 : 0;
 }

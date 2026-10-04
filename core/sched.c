@@ -408,6 +408,7 @@ static d2k_vres classify_no_cancel(const char *ip, uint16_t port,
 
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
 d2k_sched_ech_resolve_fn d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+d2k_sched_replay_ver_fn d2k_sched_replay_ver_hook = d2k_verify_replay_on;
 d2k_sched_tcp_fn  d2k_sched_tcp_base_hook = NULL;
 d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook = NULL;
 d2k_sched_tcp_ack_fn d2k_sched_tcp_ack_hook = NULL;
@@ -914,7 +915,10 @@ typedef struct {
     int        ech_offer;
     int        ech_trial; /* failed baseline permits hypotheses, not a DPI verdict */
     int        ech_grease;     /* ECH offer оказался GREASE: обычный путь по имени */
-    int        ech_unverified; /* настоящий ECH без своего свидетеля: «не проверено» */
+    /* Настоящий ECH, своего свидетеля нет (поле 04.10.2026): меряем и
+       проверяем кандидатов байтами клиента — его ECH-приветствием повтором
+       на тот же адрес. Подтверждение — уровень рукопожатия (replay_proof). */
+    int        ech_replay;
     /* GREASE распознан рабочим потоком, а свои планы ещё не спрашивались
        (задача 49): поток вернулся без замера, решение own_first принимает
        главный поток (каталог не под s->mu) и запускает поиск заново. */
@@ -2138,7 +2142,11 @@ static void *worker_run(void *vp) {
         /* Проверка бюджета потока (задача 55) — поточная настройка зонда:
            подписи крючков зонда не меняются. Снимается сразу после. */
         d2k_verify_budget_set(a_budget);
-        if (client_alpn_nonhttp(t, alpn, sizeof alpn, &alpn_len)) {
+        if (t->transport == 6 && t->ech_offer && t->ech_replay) {
+            /* Свидетеля нет: кандидат проверяется теми же байтами клиента. */
+            vr = d2k_sched_replay_ver_hook(a_use_fd, t->ip, t->port, trig.bytes, trig.len,
+                                           SCHED_VERIFY_STEP_MS);
+        } else if (client_alpn_nonhttp(t, alpn, sizeof alpn, &alpn_len)) {
             vr = d2k_sched_alpn_ver_hook(a_use_fd, t->ip, t->port, t->name,
                                          SCHED_VERIFY_STEP_MS, trig.len, alpn, alpn_len);
         } else if (t->transport == 6 && t->ech_offer) {
@@ -2237,7 +2245,7 @@ static void *worker_run(void *vp) {
                    "подтверждён и не снят, перепроверка идёт обычным путём", t->name, t->ip);
         }
     }
-    if (t->transport == 6 && t->ech_offer) {
+    if (t->transport == 6 && t->ech_offer && !t->ech_replay) {
         /* НАСТОЯЩИЙ ECH ИЛИ GREASE (задача 41). По байтам они неотличимы
          * намеренно (RFC 9849 §6.2): Chromium/Electron без ECHConfig шлёт
          * расширение со случайными config_id, enc и payload. Отличает их
@@ -2282,6 +2290,8 @@ static void *worker_run(void *vp) {
                 if (match) {
                     snprintf(t->ech_origin, sizeof t->ech_origin, "%s", t->ech_witnesses[i]);
                     real = 1;
+                    say(s, "по %s ECH-свидетель найден: %s — его HTTPS RR несёт ECH-конфигурацию "
+                           "с public_name %s", t->name, t->ech_origin, t->name);
                     break;
                 }
             }
@@ -2313,23 +2323,29 @@ static void *worker_run(void *vp) {
                 return NULL;
             }
         } else if (!t->ech_origin[0]) {
-            /* Настоящий ECH, своего свидетеля (origin с этой конфигурацией)
-             * нет: проверить нечем. Обычным приветствием внешнего имени не
-             * меряем — это другой вопрос, и его «чисто» ничего не говорит о
-             * скрытом имени. Честный быстрый итог — «не проверено». */
+            /* НАСТОЯЩИЙ ECH, СВОЕГО СВИДЕТЕЛЯ НЕТ (поле 04.10.2026, Chrome →
+             * Cloudflare, чистый каталог). Обычным приветствием внешнего
+             * имени не меряем — это другой вопрос: коробка там глушила само
+             * расширение ECH, а обычный cloudflare-ech.com проходил. Вход
+             * коробки — байты клиента, и они у нас есть (снимок): их повтор
+             * на новом соединении к тому же адресу и есть её вопрос. Дальше
+             * обычный путь задачи 32 этими байтами — база донора, свои
+             * планы, полный замер; кандидат проверяется тем же повтором под
+             * планом (ServerHello — уровень рукопожатия: без ключей клиента
+             * дальше не пройти). Решение о своих планах — за главным
+             * потоком (каталог не под s->mu), как у GREASE. */
             pthread_mutex_lock(&s->mu);
             memset(&t->res, 0, sizeof t->res);
             t->res.verdict = D2K_V_INCONCLUSIVE;
-            snprintf(t->res.reason, sizeof t->res.reason,
-                     "настоящий ECH, своего свидетеля нет — не проверено");
-            t->ech_unverified = 1;
+            t->ech_replay = 1;
+            t->ech_regrade = 1;
             t->res_ready = 1;
             pthread_mutex_unlock(&s->mu);
             ssize_t ign_ech0 = write(s->wake[1], "w", 1); (void)ign_ech0;
             return NULL;
         }
     }
-    if (t->transport == 6 && t->ech_offer) {
+    if (t->transport == 6 && t->ech_offer && !t->ech_replay) {
         d2k_ver_result baseline = d2k_verify_probe_ech_origin_on(-1, t->ip, t->port,
             t->name, t->ech_origin, SCHED_VERIFY_STEP_MS, trig.len, s->measure_mark, NULL);
         d2k_vres result = d2k_sched_ech_baseline_result(&baseline, &t->vol, t->ech_origin);
@@ -2362,9 +2378,12 @@ static void *worker_run(void *vp) {
         (void)ign_base;
         return NULL;
     }
-    int volume_first = t->transport == 6 && !t->skip_volume_once &&
+    /* ECH здесь — только повтор байтов клиента без свидетеля: объём меряется
+       обычным приветствием внешнего имени, а это другой вопрос (выше). */
+    int volume_first = t->transport == 6 && !t->skip_volume_once && !t->ech_offer &&
                        (t->rx_volume_only || t->family_reuse == 1);
-    int volume_after = t->transport == 6 && !t->skip_volume_once && !volume_first;
+    int volume_after = t->transport == 6 && !t->skip_volume_once && !t->ech_offer &&
+                       !volume_first;
     if (volume_first) {
         worker_volume(s, t, trig);
         if (worker_volume_cut(s, t)) { return NULL; }
@@ -3812,7 +3831,8 @@ static int bound_plan_here(const d2k_sched *s, const task *t, uint8_t shape,
 }
 
 static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
-    if (!s->cat || (t->transport != 6 && t->transport != 17) || t->by_addr || t->ech_offer)
+    if (!s->cat || (t->transport != 6 && t->transport != 17) || t->by_addr ||
+        (t->ech_offer && !t->ech_replay))
         return 0;
     int quic = t->transport == 17;
     /* Та же форма, что пойдёт в привязку (verify_confirm): QUIC — форма QUIC;
@@ -3820,6 +3840,12 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
     uint8_t want = quic ? (uint8_t)D2K_LINK_SHAPE_QUIC :
                    d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY
                    ? (uint8_t)D2K_SHAPE_LEGACY : (uint8_t)SCHED_PROBE_SHAPE;
+    /* НАСТОЯЩИЙ ECH БЕЗ СВИДЕТЕЛЯ (поле 04.10.2026). Привязка ляжет формой
+       ECH, но планы коробки — те же TCP TLS 1.3 планы других целей (у ECH
+       внешний ClientHello — тоже TLS 1.3), плюс ECH-привязки других внешних
+       имён. Применимость докажет только повтор байтов клиента под планом. */
+    int ech_replay = t->transport == 6 && t->ech_offer && t->ech_replay;
+    uint8_t bound_shape = ech_replay ? (uint8_t)D2K_LINK_SHAPE_ECH_TCP : want;
     const d2k_cat_plan *pick[SCHED_MAX_PLANS];
     const d2k_cat_box *owner[SCHED_MAX_PLANS];
     int64_t fresh[SCHED_MAX_PLANS];
@@ -3829,7 +3855,7 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
        испытывается ПЕРВЫМ с проверкой бюджета (задача 55, §2.3). Прошёл —
        подозрение было ложным; оборвался — дальше по порядку. */
     char bound[40] = "";
-    if (t->trigger_planned == D2K_LINK_PLANNED_YES && bound_plan_here(s, t, want, bound))
+    if (t->trigger_planned == D2K_LINK_PLANNED_YES && bound_plan_here(s, t, bound_shape, bound))
         snprintf(t->bound_plan_id, sizeof t->bound_plan_id, "%s", bound);
     /* fill == 2: сколько ВСЕГО подходящих своих текстов ещё не ставилось в
        очередь (для честной строки, когда фаза обрывается не по их концу). */
@@ -3855,7 +3881,9 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
                     bd->recheck_since || strcmp(bd->kind, "name") ||
                     (bd->transport ? bd->transport : 6) != t->transport ||
                     (bd->family ? bd->family : 4) != t->family ||
-                    bd->shape != want || bd->ech_origin[0] ||
+                    (ech_replay ? !((bd->shape == want && !bd->ech_origin[0]) ||
+                                    bd->shape == D2K_LINK_SHAPE_ECH_TCP)
+                                : (bd->shape != want || bd->ech_origin[0])) ||
                     /* У QUIC подтверждение — только собственным зондом (H3):
                        «UDP + CLIENT» — любой обратный пакет, не доказательство. */
                     (quic && bd->verified_by != D2K_VERBY_PROBE)) continue;
@@ -5320,7 +5348,7 @@ static int start_search(d2k_sched *s, task *t) {
                    d2k_hello_ech_offer(t->trig, t->trig_len, NULL) == 1;
     t->ech_origin[0] = 0;
     t->ech_trial = 0;
-    t->ech_unverified = 0;
+    t->ech_replay = 0;
     t->ech_witness_count = 0;
     if (t->ech_offer) {
         t->asked_shape = D2K_LINK_SHAPE_ECH_TCP;
@@ -5346,10 +5374,15 @@ static int start_search(d2k_sched *s, task *t) {
         /* Кандидаты в свидетели — только своё знание, по убыванию силы:
          * (1) имена, чей ответ HTTPS RR уже назвал это внешнее имя;
          * (2) свидетели других своих ECH-привязок (любая семья);
-         * (3) имена, недавно виденные открытым текстом: сначала на том же
-         *     адресе, затем на любом (CDN раздаёт один public_name на много
-         *     адресов; свежая установка иначе свидетеля не найдёт никогда);
-         * (4) свои подтверждённые TCP-привязки, новые раньше старых.
+         * (3) имена, недавно виденные открытым текстом на том же адресе;
+         * (4) свои подтверждённые привязки имён (любой транспорт), новые
+         *     раньше старых;
+         * (5) имена, недавно виденные открытым текстом на любом адресе (CDN
+         *     раздаёт один public_name на много адресов; свежая установка
+         *     иначе свидетеля не найдёт никогда).
+         * (4) раньше (5): поле 04.10.2026, чистый каталог — 32 места заняли
+         * имена чужих адресов, и rua.gr (своя привязка, HTTPS RR с той же
+         * конфигурацией cloudflare-ech.com) в очередь не попал.
          * Это не утверждение, что кандидат — скрытое имя потока: рабочий
          * поток берёт первого, у кого HTTPS RR даёт ту же конфигурацию. */
         if (!t->ech_origin[0]) {
@@ -5369,7 +5402,38 @@ static int start_search(d2k_sched *s, task *t) {
                 }
             uint8_t addr[16] = {0};
             int have_addr = inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, addr) == 1;
-            for (int same = 1; same >= 0; same--)
+            for (int pass = 0; pass < 3; pass++) {
+                if (pass == 1) {
+                    /* (4) по убыванию времени подтверждения. Транспорт имени
+                       не важен: свидетельствует HTTPS RR имени, а не план. */
+                    int64_t below = INT64_MAX;
+                    while (t->ech_witness_count < SCHED_ECH_WITNESSES) {
+                        const char *pick = NULL;
+                        int64_t best = INT64_MIN;
+                        for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++)
+                            for (size_t j = 0; j < s->cat->boxes[bi].n_binds; j++) {
+                                const d2k_cat_binding *bd = &s->cat->boxes[bi].binds[j];
+                                if (!bd->enabled || bd->level < 3 ||
+                                    strcmp(bd->kind, "name") || !bd->target[0] || bd->ech_origin[0] ||
+                                    bd->confirmed >= below || bd->confirmed <= best) continue;
+                                best = bd->confirmed; pick = bd->target;
+                            }
+                        if (!pick) break;
+                        /* Все привязки с этим временем — разом: равные метки
+                           иначе потерялись бы при строгом «меньше». */
+                        for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++)
+                            for (size_t j = 0; j < s->cat->boxes[bi].n_binds; j++) {
+                                const d2k_cat_binding *bd = &s->cat->boxes[bi].binds[j];
+                                if (bd->enabled && bd->level >= 3 &&
+                                    !strcmp(bd->kind, "name") && bd->target[0] && !bd->ech_origin[0] &&
+                                    bd->confirmed == best)
+                                    ech_witness_add(s, t, bd->target);
+                            }
+                        below = best;
+                    }
+                    continue;
+                }
+                int same = pass == 0; /* (3) тот же адрес, (5) любой */
                 for (size_t i = 0; i < SCHED_SEEN; i++) {
                     const seen_name *w = &s->seen[i];
                     if (!w->used || w->transport != 6 || w->observed_ms + 600000 < s->now_ms) continue;
@@ -5378,31 +5442,6 @@ static int start_search(d2k_sched *s, task *t) {
                              (!memcmp(addr, w->low_ip, bytes) || !memcmp(addr, w->high_ip, bytes));
                     if (at == same) ech_witness_add(s, t, w->name);
                 }
-            /* (4) по убыванию времени подтверждения. */
-            int64_t below = INT64_MAX;
-            while (t->ech_witness_count < SCHED_ECH_WITNESSES) {
-                const char *pick = NULL;
-                int64_t best = INT64_MIN;
-                for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++)
-                    for (size_t j = 0; j < s->cat->boxes[bi].n_binds; j++) {
-                        const d2k_cat_binding *bd = &s->cat->boxes[bi].binds[j];
-                        if (!bd->enabled || bd->level < 3 || bd->transport != 6 ||
-                            strcmp(bd->kind, "name") || !bd->target[0] || bd->ech_origin[0] ||
-                            bd->confirmed >= below || bd->confirmed <= best) continue;
-                        best = bd->confirmed; pick = bd->target;
-                    }
-                if (!pick) break;
-                /* Все привязки с этим временем — разом: равные метки иначе
-                   потерялись бы при строгом «меньше». */
-                for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++)
-                    for (size_t j = 0; j < s->cat->boxes[bi].n_binds; j++) {
-                        const d2k_cat_binding *bd = &s->cat->boxes[bi].binds[j];
-                        if (bd->enabled && bd->level >= 3 && bd->transport == 6 &&
-                            !strcmp(bd->kind, "name") && bd->target[0] && !bd->ech_origin[0] &&
-                            bd->confirmed == best)
-                            ech_witness_add(s, t, bd->target);
-                    }
-                below = best;
             }
         }
         say(s, "по %s обнаружен ECH offer; по HTTPS RR отличаю настоящий ECH от GREASE; "
@@ -6906,7 +6945,16 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         trial_retire(s, t); ver_close(t); t->state = T_PLANNING;
         return;
     }
-    if (t->ech_offer && (!t->ver.ech_accepted || t->ver.name_ok != 1 ||
+    if (t->ech_offer && t->ech_replay) {
+        /* Свидетеля нет: доказательство — только ServerHello на повтор байт
+           клиента под планом. Принятый ECH и ответ origin здесь не
+           измеримы (нет ключей клиента) и не подразумеваются. */
+        if (!t->ver.replay_proof || t->ver.level != D2K_VER_HANDSHAKE) {
+            say(s, "по %s ECH-план не подтверждён: нет ServerHello на повтор приветствия клиента",
+                t->name);
+            trial_retire(s, t); ver_close(t); t->state = T_PLANNING; return;
+        }
+    } else if (t->ech_offer && (!t->ver.ech_accepted || t->ver.name_ok != 1 ||
         t->ver.level != D2K_VER_APPLICATION || !t->ver.body_complete)) {
         say(s, "по %s ECH-план не подтверждён принятым ECH и полным ответом origin", t->name);
         trial_retire(s, t); ver_close(t); t->state = T_PLANNING; return;
@@ -6979,6 +7027,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
                          t->name, t->by_addr ? "addr" : "name", t->transport, t->family, rec_shape,
+                         t->ver.replay_proof ? D2K_VERBY_REPLAY_HANDSHAKE :
                          t->ver.handshake_proof ? D2K_VERBY_PROBE_HANDSHAKE
                                                 : D2K_VERBY_PROBE, rec_input,
                          /* Перенос не меняет отпечаток коробки плана: цель
@@ -6989,7 +7038,9 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        второго семейства не учились бы на основном пути (поле 03.10). */
     if (t->group_block_proven || (t->own_first == 2 && t->res.base_blocked))
         group_record(s, t, D2K_GROUP_BLOCKED_CONFIRMED, plan_id, rec_shape, now_ms);
-    if (t->ech_offer) {
+    /* Подтверждение повтором (свидетеля нет) не стирает известного раньше
+       свидетеля привязки: его HTTPS RR перепроверяется при каждом поиске. */
+    if (t->ech_offer && t->ech_origin[0]) {
         for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
             d2k_cat_box *b = &s->cat->boxes[bi];
             if (strcmp(b->id, box_id)) continue;
@@ -7061,7 +7112,12 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     /* Запоминаем владельца подтверждённого плана. */
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
     s->confirms++;
-    if (t->ver.handshake_proof)
+    if (t->ver.replay_proof)
+        say(s, "по %s (TCP, ECH) ПОДТВЕРЖДЕНО повтором приветствия клиента на уровне "
+               "рукопожатия: %s — ServerHello под планом (план применён к потоку зонда); "
+               "без ключей клиента прикладной уровень не измерен",
+            t->name, plan_id);
+    else if (t->ver.handshake_proof)
         say(s, "по %s (TCP) ПОДТВЕРЖДЕНО собственным зондом на уровне рукопожатия: %s — "
                "TLS с ALPN клиента завершён (план применён к потоку зонда); протокол "
                "клиента не HTTP, прикладной уровень не измерен",
@@ -7071,7 +7127,10 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
            "(план применён к потоку зонда)",
         t->name, t->transport == 17 ? "QUIC" : "TCP", plan_id, t->ver.status);
     /* Одна строка на подтверждение: пакеты и исход проверки бюджета. */
-    if (t->ver.budget == D2K_BUDGET_PASSED || t->ver.budget == D2K_BUDGET_NOT_APPLICABLE)
+    if (t->ver.replay_proof)
+        say(s, "по %s бюджет потока не применим (задача 55): %s — привязка помечена "
+               "«бюджет не проверен»", t->name, t->ver.budget_note);
+    else if (t->ver.budget == D2K_BUDGET_PASSED || t->ver.budget == D2K_BUDGET_NOT_APPLICABLE)
         say(s, "по %s бюджет потока %s: %u пакетов с данными из нужных %u за %u запросов "
                "(бюджет %u — %s): %s", t->name,
             t->ver.budget == D2K_BUDGET_PASSED ? "пройден" : "не проверен",
@@ -8137,8 +8196,16 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                    приветствие — сперва свои подтверждённые планы той же
                    формы, если они есть; иначе полный поиск сразу. */
                 t->ech_regrade = 0;
+                /* Повтор байтов клиента — не семейный путь: тот меряет объём
+                   обычным приветствием имени, а это другой вопрос. */
+                if (t->ech_replay) t->family_reuse = 0;
                 t->own_first = (d2k_sched_tcp_base_hook != NULL) && !t->family_reuse &&
                                own_first_plans(s, t, 0) > 0 ? 1 : 0;
+                if (t->ech_replay)
+                    say(s, "по %s настоящий ECH (внешнее имя — public_name конфигурации), своего "
+                           "ECH-свидетеля нет — меряю байтами клиента: его ECH-приветствие (%zu байт) "
+                           "повтором на %s; кандидата подтвердит ServerHello на тот же повтор "
+                           "под планом", t->name, t->trig_len, t->ip);
                 if (start_worker(s, t, JOB_CLASSIFY) != 0) { task_fail(s, t, now_ms); moved++; continue; }
                 if (t->own_first == 1)
                     say(s, "по %s сначала базовый вопрос донора: если рукопожатие режется, "
@@ -8155,20 +8222,6 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 task_done(t); moved++; continue;
             }
             remember_resources(s, t->vol.resources, t->vol.n_resources);
-            if (t->ech_unverified) {
-                /* Настоящий ECH без своего свидетеля (задача 41): опыта не
-                   было, вердикта нет. Повтор — не раньше общего срока
-                   неубедительного замера: новое ECH-приветствие того же
-                   имени этот срок не снимает (cooldown ech_input). */
-                say(s, "по %s настоящий ECH (внешнее имя — public_name конфигурации), "
-                       "своего ECH-свидетеля нет — не проверено; обычным приветствием "
-                       "внешнего имени не меряю, повтор не раньше чем через %lld мин",
-                    t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
-                cooldown_record(s, t, 2);
-                task_fail(s, t, now_ms);
-                moved++;
-                continue;
-            }
             /* ПРОГОН, ОСТАНОВЛЕННЫЙ РАДИ СНИМКА, — НЕ ВЕРДИКТ (задача 31).
                Поле 02.10.2026, i.ytimg.com: брошенный на первом зонде
                классификатор («о цели не сказано ничего») ушёл в разбор
@@ -8732,7 +8785,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++;
                 continue;
             }
-            if (!t->ver.handshake_proof && layered_rx_result(s, t, now_ms)) { moved++; continue; }
+            if (!t->ver.handshake_proof && !t->ver.replay_proof &&
+                layered_rx_result(s, t, now_ms)) { moved++; continue; }
             if (t->ver.level == D2K_VER_APPLICATION && t->ver.budget == D2K_BUDGET_CUT) {
                 /* ОБРЫВ ПОСРЕДИ ПОВТОРОВ — улика, только если план исполнился на
                    потоке зонда (ревью I-1): тот же порядок, что у подтверждения.
@@ -8766,8 +8820,13 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             /* Доказательство на проводе: полный HTTP-ответ — либо, для
                не-HTTP протокола клиента, завершённое рукопожатие с его ALPN
                (задача 37, F3). Второе — уровень рукопожатия, не приложения. */
+            /* Повтор ECH-приветствия клиента без свидетеля (поле 04.10) —
+               ServerHello на те же байты под планом: тоже граница
+               рукопожатия, и слабее предыдущей (своё рукопожатие не
+               завершено); verify_confirm так его и записывает. */
             int wire_proof = t->ver.level == D2K_VER_APPLICATION ||
-                (t->ver.handshake_proof && t->ver.level == D2K_VER_HANDSHAKE);
+                ((t->ver.handshake_proof || t->ver.replay_proof) &&
+                 t->ver.level == D2K_VER_HANDSHAKE);
             if (!wire_proof) {
                 /* СПЕРВА — НАША ЛИ ЭТО НЕУДАЧА. Зонд мог не дойти до
                    приложения просто потому, что воздействия не было: посылка
@@ -8879,7 +8938,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        зонда открытым. */
                     t->state = T_VERIFY_WAIT;
                     t->ver_until_ms = now_ms + SCHED_VERIFY_STEP_MS;
-                    if (t->ver.handshake_proof)
+                    if (t->ver.replay_proof)
+                        say(s, "по %s на повтор ECH-приветствия клиента пришёл ServerHello с "
+                               "местного порта %u — жду применения плана к его потоку",
+                            t->name, (unsigned)t->ver.local_port);
+                    else if (t->ver.handshake_proof)
                         say(s, "по %s рукопожатие с ALPN клиента завершено с местного порта %u "
                                "— жду применения плана к его потоку",
                             t->name, (unsigned)t->ver.local_port);

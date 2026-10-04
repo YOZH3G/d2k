@@ -227,6 +227,15 @@ typedef int (*d2k_sched_ech_resolve_fn)(const char *origin, uint32_t mark,
                                         d2k_ech_config *config);
 extern d2k_sched_ech_resolve_fn d2k_sched_ech_resolve_hook;
 
+/* Повтор снятого ECH-приветствия клиента под пробным планом (умолчание
+ * d2k_verify_replay_on). Им подтверждается кандидат настоящего ECH, когда
+ * своего свидетеля-origin нет: доказательство — ServerHello, уровень
+ * рукопожатия (replay_proof). Крючок — чтобы проверять это без сети. */
+typedef d2k_ver_result (*d2k_sched_replay_ver_fn)(int use_fd, const char *ip, uint16_t port,
+                                                  const uint8_t *hello, size_t hello_len,
+                                                  int deadline_ms);
+extern d2k_sched_replay_ver_fn d2k_sched_replay_ver_hook;
+
 /* Запуск рабочего потока задачи. NULL (умолчание) — поток заводится как
  * обычно; ненулевой ответ крючка изображает отказ pthread_create. Нужен,
  * чтобы провал запуска замера был воспроизводим в тесте (задача 24): именно

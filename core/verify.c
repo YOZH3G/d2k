@@ -1198,6 +1198,68 @@ d2k_ver_result d2k_verify_probe_ech_origin_on(int use_fd, const char *ip,
                                   hello_wire, use_fd < 0 ? dns_mark : 0, path);
 }
 
+/* ПОВТОР СНЯТОГО ECH-ПРИВЕТСТВИЯ КЛИЕНТА — см. d2k_verify.h. Доказательство
+   той же природы, что вопрос классификатора (trigger.go: ServerHello на
+   байты клиента), только на потоке с пробным планом. Дальше ServerHello
+   дело не идёт по устройству: закрытого ключа клиента нет (шапка
+   d2k_verify.h), поэтому граница названа в reason и в replay_proof. */
+d2k_ver_result d2k_verify_replay_on(int use_fd, const char *ip, uint16_t port,
+    const uint8_t *hello, size_t hello_len, int deadline_ms) {
+    d2k_ver_result r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1;
+    r.name_ok = -1;
+    snprintf(r.reason, sizeof r.reason, "повтор не начинался");
+    if (!hello || hello_len < 6 || !ip || !ip[0]) {
+        if (use_fd >= 0) close(use_fd);
+        snprintf(r.reason, sizeof r.reason, "нет снятого приветствия клиента — повторять нечего");
+        return r;
+    }
+    r.family = strchr(ip, ':') ? 6 : 4;
+    if (d2k_props_contact_on_family(use_fd, ip, port, (d2k_hello){ hello, hello_len },
+                                    r.family, r.local_addr, &r.local_port, &r.fd) != 0) {
+        snprintf(r.reason, sizeof r.reason, "нет TCP для повтора приветствия клиента");
+        return r;
+    }
+    if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);
+    r.level = D2K_VER_TRANSPORT;
+    r.budget = D2K_BUDGET_NOT_APPLICABLE;
+    snprintf(r.budget_note, sizeof r.budget_note,
+             "повтор приветствия клиента: без его ключей поток не продолжить");
+    uint8_t buf[16];
+    size_t have = 0;
+    int64_t until = verify_now_ms() + (deadline_ms > 0 ? deadline_ms : 3000);
+    /* ServerHello узнаётся по шести байтам, тревога — по семи. */
+    while (have < 7 && !(have >= 6 && buf[0] == 22)) {
+        int64_t left = until - verify_now_ms();
+        if (left <= 0) break;
+        struct pollfd pf = {r.fd, POLLIN, 0};
+        int pr = poll(&pf, 1, (int)left);
+        if (pr <= 0) break;
+        ssize_t n = recv(r.fd, buf + have, sizeof buf - have, 0);
+        if (n <= 0) break;
+        have += (size_t)n;
+    }
+    if (have >= 6 && buf[0] == 22 && buf[1] == 3 && buf[5] == 2) {
+        r.level = D2K_VER_HANDSHAKE;
+        r.replay_proof = 1;
+        snprintf(r.reason, sizeof r.reason,
+                 "ServerHello на повтор приветствия клиента: уровень рукопожатия, "
+                 "прикладной не измерен");
+    } else if (have >= 7 && buf[0] == 21) {
+        snprintf(r.reason, sizeof r.reason,
+                 "на повтор приветствия клиента сервер ответил тревогой %u", (unsigned)buf[6]);
+    } else if (have > 0) {
+        snprintf(r.reason, sizeof r.reason,
+                 "на повтор приветствия клиента пришло %zu байт не ServerHello (тип записи %u)",
+                 have, (unsigned)buf[0]);
+    } else {
+        snprintf(r.reason, sizeof r.reason,
+                 "на повтор приветствия клиента ответа нет (тишина или обрыв)");
+    }
+    return r;
+}
+
 d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,
                                    const char *sni, int deadline_ms,
                                    size_t hello_wire) {
