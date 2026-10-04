@@ -10,8 +10,9 @@ const runner = process.env.D2K_TEST_RUNNER || '';
 const runnerArgs = (process.env.D2K_TEST_RUNNER_ARGS || '').split(/\s+/).filter(Boolean);
 
 let VALID = 0;
+const releaseId = process.env.D2K_TEST_RELEASE_ID || 'dev';
 
-async function trial(version, legacy = false) {
+async function trial(version, legacy = false, peerRelease = releaseId) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd2k-greet-'));
   const socket = path.join(dir, 'ctl.sock');
   let peer, child, deadline;
@@ -22,12 +23,17 @@ async function trial(version, legacy = false) {
     connection.on('data', b => { prematureBytes += b.length; });
     if (version !== null) {
       const keySize = legacy ? 13 : 38;
-      const frame = Buffer.alloc(6 + keySize + 6);
-      frame.writeUInt32BE(keySize + 8, 0);
+      const release = Buffer.from(legacy ? '' : peerRelease);
+      const frame = Buffer.alloc(6 + keySize + 6 + (legacy ? 0 : 1 + release.length));
+      frame.writeUInt32BE(frame.length - 4, 0);
       frame.writeUInt16BE(0x000A, 4); // D2K_EV_PROTO (checked against the header below)
       if (!legacy) frame[6] = 4;
       frame.writeUInt16BE(version, 6 + keySize);
       frame.writeUInt32BE(8192, 8 + keySize);
+      if (!legacy) {
+        frame[12 + keySize] = release.length;
+        release.copy(frame, 13 + keySize);
+      }
       connection.write(frame);
     }
   });
@@ -48,7 +54,7 @@ async function trial(version, legacy = false) {
       child.on('close', code => resolve({ code }));
     });
     clearTimeout(deadline);
-    if (version === VALID && !legacy) {
+    if (version === VALID && !legacy && peerRelease === releaseId) {
       assert.equal(result.timeout, true, `valid peer rejected: ${output}`);
       assert.match(output, /d2kc: запущен/, `controller stayed alive without completing startup: ${output}`);
     } else {
@@ -81,6 +87,7 @@ async function trial(version, legacy = false) {
   await trial(null);
   await trial(VALID - 1);
   await trial(VALID - 1, true);
+  await trial(VALID, false, 'wrong-release');
   await trial(VALID);
   console.log('controller refuses silent and incompatible datapaths before any command: pass');
 })().catch(e => { console.error(e); process.exitCode = 1; });
