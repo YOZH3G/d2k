@@ -764,6 +764,17 @@ typedef struct {
     /* План, под которым шёл поток подозрения (planned): испытывается первым
        (задача 55, §2.3); его подтверждение — «подозрение было ложным». */
     char       bound_plan_id[40];
+    /* ЧАСТИЧНЫЙ ОБХОД (поле 04.10 12:24, updates.discord.com): кандидат с
+       доказанным применением снял блок рукопожатия и ответил, но поток
+       оборвался бюджетом посреди повторов. Не провал: поиск идёт дальше за
+       проходящим бюджет, а если такого нет — подтверждается лучший частичный
+       (больше пакетов до обрыва, затем успехи плана) с отметкой «оборван». */
+    int        partial_valid, partial_finishing;
+    char       partial_text[4096]; /* как plans[] */
+    char       partial_box[40];
+    unsigned   partial_pk;
+    int        partial_succ;
+    d2k_ver_result partial_ver;
     /* Сколько первых кандидатов пришло из готовых планов узнанной коробки, а
        не из синтеза по вердикту: различать их нужно на записи успеха (план
        узнанной коробки не заводит новую) и в логе. */
@@ -3180,6 +3191,7 @@ static void prop_finish(d2k_sched *s, task *t) {
 static void quic_deny_install(d2k_sched *s, task *t, int64_t now_ms);
 
 static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
+    t->partial_valid = 0; /* поиск кончился — его частичный обход ему и принадлежал */
     join_worker(t);
     contact_close(t);
     if (t->transport == 17 && t->stall_cut) {
@@ -7094,6 +7106,33 @@ static void budget_cut_reject(d2k_sched *s, task *t) {
             s->sync_pending = 1;
         }
     }
+    /* ЧАСТИЧНЫЙ ОБХОД — лучший запоминается (больше пакетов до обрыва, затем
+       успехи плана в каталоге): если проходящего бюджет не найдётся, он и
+       будет подтверждён в конце поиска (partial_finish). */
+    int succ = 0;
+    for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
+        const d2k_cat_plan *p = plan_by_id(&s->cat->boxes[bi], cut_id);
+        if (p && p->successes > succ) succ = p->successes;
+    }
+    if (!t->partial_valid || t->ver.budget_packets > t->partial_pk ||
+        (t->ver.budget_packets == t->partial_pk && succ > t->partial_succ)) {
+        t->partial_valid = 1;
+        t->partial_pk = t->ver.budget_packets;
+        t->partial_succ = succ;
+        snprintf(t->partial_text, sizeof t->partial_text, "%s", t->plans[t->next_plan - 1]);
+        snprintf(t->partial_box, sizeof t->partial_box, "%s", t->box_id);
+        t->partial_ver = t->ver;
+        t->partial_ver.fd = -1;
+    }
+    /* Оборванный бюджетом приём ЗАМЕРА не кончает поиск (решение 04.10):
+       замер владеет поиском и продолжить свой перебор с этого места не
+       умеет, поэтому дальше — внутренние гипотезы оригинала (запасной
+       список), как у невыразимого приёма (78a70fd). */
+    if (t->transport == 6 && t->search_owned && !t->owned_fallback && t->own_first != 2) {
+        t->owned_fallback = 1;
+        say(s, "по %s приём замера снял рукопожатие, но поток режется бюджетом — это "
+               "частичный обход; ищу проходящий бюджет дальше, в запасном списке", t->name);
+    }
     trial_retire(s, t);
     ver_close(t);
     t->state = T_PLANNING;
@@ -7105,7 +7144,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     uint8_t wire_id[D2K_PLAN_ID_LEN];
     plan_ident(text, plan_id, sizeof plan_id, wire_id);
     budget_uncountable_note(s, t);
-    if (t->own_first == 2 && t->bound_plan_id[0] && !strcmp(t->bound_plan_id, plan_id) &&
+    if (!t->partial_finishing &&
+        t->own_first == 2 && t->bound_plan_id[0] && !strcmp(t->bound_plan_id, plan_id) &&
         t->ver.budget != D2K_BUDGET_PASSED) {
         /* ПЛАН, ПОД КОТОРЫМ ШЁЛ ПОТОК ПОДОЗРЕНИЯ, снимает подозрение ТОЛЬКО
            пройденным бюджетом (ревью I-2). «Не применимо» — не измерение:
@@ -7232,7 +7272,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        проверки (рукопожатие ALPN) — ничего. */
     {
         uint8_t mark = t->ver.budget == D2K_BUDGET_PASSED ? D2K_CAT_BUDGET_PASSED :
-                       t->ver.budget == D2K_BUDGET_NOT_APPLICABLE ? D2K_CAT_BUDGET_UNCHECKED : 0;
+                       t->ver.budget == D2K_BUDGET_NOT_APPLICABLE ? D2K_CAT_BUDGET_UNCHECKED :
+                       t->ver.budget == D2K_BUDGET_CUT ? D2K_CAT_BUDGET_CUT : 0;
         for (size_t bi = 0; mark && bi < s->cat->n_boxes; bi++) {
             d2k_cat_box *b = &s->cat->boxes[bi];
             if (strcmp(b->id, box_id)) continue;
@@ -7242,7 +7283,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                     !strcmp(bd->kind, t->by_addr ? "addr" : "name") &&
                     (bd->family ? bd->family : 4) == t->family && bd->shape == rec_shape &&
                     bd->transport == t->transport &&
-                    (mark == D2K_CAT_BUDGET_PASSED || bd->budget == 0) &&
+                    (mark == D2K_CAT_BUDGET_PASSED || bd->budget == 0 ||
+                     (mark == D2K_CAT_BUDGET_CUT && bd->budget != D2K_CAT_BUDGET_PASSED)) &&
                     bd->budget != mark) {
                     bd->budget = mark;
                     s->cat->revision++;
@@ -7308,10 +7350,16 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
             t->ver.budget == D2K_BUDGET_PASSED ? "пройден" : "не проверен",
             t->ver.budget_packets, t->ver.budget_need, t->ver.budget_requests,
             t->budget_pk, t->budget_src, t->ver.budget_note);
+    else if (t->ver.budget == D2K_BUDGET_CUT)
+        say(s, "по %s частичный обход: рукопожатие снято, поток режется после ~%u пакетов "
+               "(нужно %u, бюджет %u — %s); привязка помечена «оборван», лучший план её заменит",
+            t->name, t->ver.budget_packets, t->ver.budget_need, t->budget_pk, t->budget_src);
     else
         say(s, "по %s бюджет потока не проверялся (%s)", t->name,
             t->ver.handshake_proof ? "протокол клиента не HTTP" : "проверку не просили");
-    if (transferred && t->bound_plan_id[0] && !strcmp(t->bound_plan_id, plan_id))
+    if (!t->partial_finishing) t->partial_valid = 0; /* поиск кончился полным обходом */
+    if (transferred && t->bound_plan_id[0] && !strcmp(t->bound_plan_id, plan_id) &&
+        t->ver.budget == D2K_BUDGET_PASSED)
         say(s, "по %s подозрение было ложным: план %s, под которым шёл поток, переподтверждён "
                "с проверкой бюджета — поиск окончен", t->name, plan_id);
     /* ЧЕЙ КЛИЕНТ ЗАВЁЛ ПОИСК — ТОТ ПРОТОКОЛ И ПОДТВЕРДИЛ.
@@ -7378,6 +7426,36 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
  * датапат старый, либо в тексте плана не нашлось строки id. Сверяем с тем,
  * что записали в план САМИ (install_next). Отсутствующий идентификатор
  * доказательством применения кандидата быть не может. */
+/* КОНЕЦ ПОИСКА БЕЗ ПРОХОДЯЩЕГО БЮДЖЕТ ПЛАНА (решение 04.10): лучший
+   частичный обход подтверждается — человек получает снятый блок
+   рукопожатия (малые обмены, как у программы обновления Discord, умещаются
+   в бюджет), привязка помечена «оборван» (установка ставит её после любой
+   прошедшей и непроверенной), а повторный поиск — не раньше отдыха задачи:
+   следующее подозрение под этим планом проверит его первым, и проходящий
+   бюджет план его заменит. 1 — подтверждено, задача уже в T_WATCHING. */
+static int partial_finish(d2k_sched *s, task *t, int64_t now_ms) {
+    if (!t->partial_valid) return 0;
+    trial_retire(s, t);
+    ver_close(t);
+    snprintf(t->plans[0], sizeof t->plans[0], "%s", t->partial_text);
+    snprintf(t->plan_boxes[0], sizeof t->plan_boxes[0], "%s", t->partial_box);
+    snprintf(t->box_id, sizeof t->box_id, "%s", t->partial_box);
+    t->n_plans = 1;
+    t->next_plan = 1;
+    t->ver = t->partial_ver;
+    t->ver.fd = -1;
+    say(s, "по %s проходящего бюджет плана не нашлось — беру лучший частичный обход "
+           "(~%u пакетов до обрыва)", t->name, t->partial_pk);
+    t->partial_finishing = 1;
+    verify_confirm(s, t, now_ms);
+    t->partial_finishing = 0;
+    t->partial_valid = 0;
+    cooldown_record(s, t, 2);
+    say(s, "по %s повторная проверка частичного обхода — не раньше чем через %lld мин",
+        t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
+    return 1;
+}
+
 static int plan_id_is_ours(const task *t, const d2k_ev *ev) {
     uint8_t present = 0;
     for (size_t i = 0; i < D2K_PLAN_ID_LEN; i++) { present |= ev->plan_id[i]; }
@@ -9336,6 +9414,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     }
                     verdict_to_plans(s, t, &measured);
                     if (t->n_plans == 0) {
+                        if (partial_finish(s, t, now_ms)) { moved++; continue; }
                         say(s, "по %s готовые планы не помогли; прямое измерение "
                                "не дало новых кандидатов", t->name);
                         cooldown_record(s, t, 2);
@@ -9404,6 +9483,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        поиск не завершён, и это не «обхода нет». Только пока
                        кандидаты ЕСТЬ: если они кончились на том же зонде,
                        что и бюджет, правдивее «планы исчерпаны». */
+                    if (partial_finish(s, t, now_ms)) { moved++; continue; }
                     say(s, "по %s бюджет зондов исчерпан (зондов %d из %d) — поиск не "
                            "завершён, это не «обхода нет»; цель отдыхает",
                         t->name, t->probes, SCHED_MAX_PROBES);
@@ -9414,6 +9494,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     moved++;
                     continue;
                 }
+                if (partial_finish(s, t, now_ms)) { moved++; continue; }
                 if (t->fb_queue) {
                     say(s, "по %s выведенные из замера и запасные планы исчерпаны "
                            "(зондов %d) — цель отдыхает", t->name, t->probes);
