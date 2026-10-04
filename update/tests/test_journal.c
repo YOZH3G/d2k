@@ -310,9 +310,49 @@ static void persistent_faults(void)
     fault = 0;
 }
 
+
+static ino_t unreadable_ino;
+static int injected_stat(void *arg, int fd, struct stat *out)
+{
+    (void)arg;
+    struct stat actual;
+    assert(fstat(fd, &actual) == 0);
+    if (actual.st_ino == unreadable_ino) { errno = EIO; return -1; }
+    *out = actual; return 0;
+}
+static void stat_error_blocks_older_generation(void)
+{
+    char path[64]; d2ku_ctx c = context(path);
+    d2ku_journal j = record(1), out, sentinel;
+    assert(d2ku_journal_store(&c, &j) == D2KU_OK);
+    j.sequence = 2; assert(d2ku_journal_store(&c, &j) == D2KU_OK);
+    int d = openat(c.root_dirfd, "update-state", O_RDONLY | O_DIRECTORY);
+    int fd = openat(d, "journal.0", O_RDONLY); struct stat st;
+    assert(fd >= 0 && fstat(fd, &st) == 0); unreadable_ino = st.st_ino; close(fd);
+    c.stat_fd = injected_stat;
+    memset(&sentinel, 0x5a, sizeof sentinel); out = sentinel;
+    /* A syscall failure inspecting newest must not expose older transaction. */
+    assert(d2ku_journal_load(&c, &out) == D2KU_IO);
+    assert(!memcmp(&out, &sentinel, sizeof out));
+    c.stat_fd = NULL;
+    d2ku_persistent_state state = persistent_record(), saved, loaded;
+    assert(d2ku_persistent_store(&c, &state) == D2KU_OK);
+    state.sequence = 2; state.accepted_sequence = 51;
+    assert(d2ku_persistent_store(&c, &state) == D2KU_OK);
+    fd = openat(d, "persistent.0", O_RDONLY);
+    assert(fd >= 0 && fstat(fd, &st) == 0); unreadable_ino = st.st_ino; close(fd);
+    c.stat_fd = injected_stat;
+    memset(&saved, 0x6b, sizeof saved); loaded = saved;
+    /* Same primitive must not expose a stale trust publication/floor. */
+    assert(d2ku_persistent_load(&c, &loaded) == D2KU_IO);
+    assert(!memcmp(&loaded, &saved, sizeof loaded));
+    c.stat_fd = NULL; close(d); cleanup(&c, path);
+}
+
 int main(void)
 {
     generations(); invalid_records(); faults(); lock_crash(); separate_state();
     wire_validation(); crash_windows(); trust_policy_floors(); persistent_faults();
+    stat_error_blocks_older_generation();
     puts("journal tests: ok"); return 0;
 }

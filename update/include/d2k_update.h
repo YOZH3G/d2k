@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 
 #define D2KU_INDEX_MAX 65536u
 #define D2KU_MANIFEST_MAX 1048576u
@@ -118,6 +119,8 @@ struct d2ku_ctx {
     d2ku_rc (*sync_fd)(void *arg, int fd);
     /* Optional POSIX write adapter: partial writes/EINTR allowed; -1 sets errno. */
     ssize_t (*write_fd)(void *arg, int fd, const void *bytes, size_t len);
+    /* Optional POSIX fstat adapter: 0 on success; -1 sets errno. */
+    int (*stat_fd)(void *arg, int fd, struct stat *out);
     d2ku_rc (*rename_at)(void *arg, int from_dirfd, const char *from,
         int to_dirfd, const char *to);
     void *service_arg;

@@ -361,7 +361,7 @@ writes and EINTR), fsyncs its fd, closes, renames to the next slot, then fsyncs
 `update-state/`. All errors prevent success; only the exact temporary created
 by the current call is removed. No stale/foreign-temp sweep exists. Crash-left
 temporaries are ignored by readers. The previous slot is untouched by publication.
-Optional caller-owned `write_fd`, `sync_fd`, `rename_at` callbacks exercise I/O
+Optional caller-owned `write_fd`, `stat_fd`, `sync_fd`, `rename_at` callbacks exercise I/O
 faults; absent callbacks use real POSIX calls. sync_fd applies to files and dirs.
 
 **An error after rename has an ambiguous durability outcome.** The new generation

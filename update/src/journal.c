@@ -191,10 +191,12 @@ static d2ku_rc syncfd(d2ku_ctx *c, int fd)
     int rc; do { rc = fsync(fd); } while (rc < 0 && errno == EINTR);
     return rc == 0 ? D2KU_OK : D2KU_IO;
 }
-static int owned(int fd, int dir)
+static int statfd(d2ku_ctx *c, int fd, struct stat *out)
+{ return c->stat_fd ? c->stat_fd(c->io_arg, fd, out) : fstat(fd, out); }
+static int owned(const struct stat *s, int dir)
 {
-    struct stat s; return fstat(fd, &s) == 0 && (dir ? S_ISDIR(s.st_mode) : S_ISREG(s.st_mode)) &&
-        s.st_uid == geteuid() && (s.st_mode & 077) == 0 && (dir || s.st_nlink == 1);
+    return (dir ? S_ISDIR(s->st_mode) : S_ISREG(s->st_mode)) &&
+        s->st_uid == geteuid() && (s->st_mode & 077) == 0 && (dir || s->st_nlink == 1);
 }
 static d2ku_rc directory(d2ku_ctx *c, int create, int *out)
 {
@@ -206,17 +208,22 @@ static d2ku_rc directory(d2ku_ctx *c, int create, int *out)
     }
     int fd = openat(c->root_dirfd, "update-state", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return errno == ENOENT ? D2KU_ABSENT : D2KU_IO;
-    if (!owned(fd, 1)) { close(fd); return D2KU_IO; }
+    struct stat st;
+    if (statfd(c, fd, &st) < 0) { close(fd); return D2KU_IO; }
+    if (!owned(&st, 1)) { close(fd); return D2KU_IO; }
     /* Re-sync parent on every create path, including retry after mkdir/fsync failure. */
     if (create && (syncfd(c, c->root_dirfd) != D2KU_OK || (made && syncfd(c, fd) != D2KU_OK))) {
         close(fd); return D2KU_IO;
     }
     *out = fd; return D2KU_OK;
 }
-static d2ku_rc lockat(int dir, const char *name, int *out)
+static d2ku_rc lockat(d2ku_ctx *c, int dir, const char *name, int *out)
 {
     int fd = openat(dir, name, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0 || !owned(fd, 0)) { if (fd >= 0) close(fd); return D2KU_IO; }
+    if (fd < 0) return D2KU_IO;
+    struct stat st;
+    if (statfd(c, fd, &st) < 0) { close(fd); return D2KU_IO; }
+    if (!owned(&st, 0)) { close(fd); return D2KU_IO; }
     if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
         int busy = errno == EWOULDBLOCK || errno == EAGAIN; close(fd);
         return busy ? D2KU_BUSY : D2KU_IO;
@@ -227,13 +234,14 @@ static void filename(kind k, unsigned slot, char name[32])
 {
     (void)snprintf(name, 32, "%s.%u", k == JOURNAL ? "journal" : "persistent", slot);
 }
-static d2ku_rc readslot(int dir, kind k, unsigned slot, buffer *b, void *out)
+static d2ku_rc readslot(d2ku_ctx *c, int dir, kind k, unsigned slot, buffer *b, void *out)
 {
     char name[32]; filename(k, slot, name);
     int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) return errno == ENOENT ? D2KU_ABSENT : D2KU_IO;
     struct stat s;
-    if (!owned(fd, 0) || fstat(fd, &s) < 0 || s.st_size < 0 || (uint64_t)s.st_size > RECORD_MAX) {
+    if (statfd(c, fd, &s) < 0) { close(fd); return D2KU_IO; }
+    if (!owned(&s, 0) || s.st_size < 0 || (uint64_t)s.st_size > RECORD_MAX) {
         close(fd); return D2KU_RECOVERY;
     }
     memset(b, 0, sizeof *b);
@@ -248,10 +256,10 @@ static d2ku_rc readslot(int dir, kind k, unsigned slot, buffer *b, void *out)
 }
 typedef union { d2ku_journal j; d2ku_persistent_state p; } record_union;
 static uint64_t sequence(kind k, const record_union *r) { return k == JOURNAL ? r->j.sequence : r->p.sequence; }
-static d2ku_rc loadat(int dir, kind k, record_union *out, buffer *raw)
+static d2ku_rc loadat(d2ku_ctx *c, int dir, kind k, record_union *out, buffer *raw)
 {
     record_union a, b; buffer ba, bb;
-    d2ku_rc ra = readslot(dir, k, 0, &ba, &a), rb = readslot(dir, k, 1, &bb, &b);
+    d2ku_rc ra = readslot(c, dir, k, 0, &ba, &a), rb = readslot(c, dir, k, 1, &bb, &b);
     if (ra == D2KU_IO || rb == D2KU_IO) return D2KU_IO;
     if (ra != D2KU_OK && rb != D2KU_OK)
         return ra == D2KU_ABSENT && rb == D2KU_ABSENT ? D2KU_ABSENT : D2KU_RECOVERY;
@@ -262,7 +270,7 @@ static d2ku_rc loadat(int dir, kind k, record_union *out, buffer *raw)
 static d2ku_rc load(d2ku_ctx *c, kind k, record_union *r)
 {
     int d; d2ku_rc rc = directory(c, 0, &d); if (rc != D2KU_OK) return rc;
-    buffer raw; rc = loadat(d, k, r, &raw); close(d); return rc;
+    buffer raw; rc = loadat(c, d, k, r, &raw); close(d); return rc;
 }
 static int trust_progress(const d2ku_persistent_state *old, const d2ku_persistent_state *s)
 {
@@ -298,10 +306,10 @@ static d2ku_rc store(d2ku_ctx *c, kind k, const void *value, uint64_t seq)
     buffer bytes; d2ku_rc rc = encode(k, value, &bytes); if (rc != D2KU_OK) return rc;
     int dir, lock = -1, fd = -1; char temp[64] = {0}, target[32]; int own_temp = 0;
     rc = directory(c, 1, &dir); if (rc != D2KU_OK) return rc;
-    rc = lockat(dir, k == JOURNAL ? "journal.lock" : "persistent.lock", &lock);
+    rc = lockat(c, dir, k == JOURNAL ? "journal.lock" : "persistent.lock", &lock);
     if (rc != D2KU_OK) { close(dir); return rc; }
     record_union old; buffer raw;
-    rc = loadat(dir, k, &old, &raw);
+    rc = loadat(c, dir, k, &old, &raw);
     if (rc == D2KU_OK) {
         uint64_t previous = sequence(k, &old);
         if (seq == previous) {
@@ -358,6 +366,6 @@ d2ku_rc d2ku_maintenance_lock(d2ku_ctx *c, int *out)
 {
     if (!out) return D2KU_INVALID;
     int d; d2ku_rc rc = directory(c, 1, &d); if (rc != D2KU_OK) return rc;
-    rc = lockat(d, "maintenance.lock", out); close(d); return rc;
+    rc = lockat(c, d, "maintenance.lock", out); close(d); return rc;
 }
 void d2ku_maintenance_unlock(int fd) { if (fd >= 0) close(fd); }
