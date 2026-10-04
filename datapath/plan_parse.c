@@ -99,6 +99,10 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             break;
         case REC_PROTO:
             if (ln != 2) { fail(err, errlen, "proto не 2 байта"); return -1; }
+            if (b[off + 1] == D2K_PLAN_PROTO_HTTP &&
+                (rd16(b + 6) < 11 || b[off] != 6)) {
+                fail(err, errlen, "протокол http требует TCP и minexec=11"); return -1;
+            }
             break;
         case REC_PAYLOAD:
             if (ln < 2) { fail(err, errlen, "приманка без номера"); return -1; }
@@ -534,6 +538,10 @@ uint8_t d2k_plan_guards(const d2k_plan *p) {
 
 uint8_t d2k_plan_transport(const d2k_plan *p) {
     return p ? p->transport : 0;
+}
+
+uint8_t d2k_plan_proto(const d2k_plan *p) {
+    return p ? p->proto : 0;
 }
 
 int d2k_plan_stream_input(const d2k_plan *p) {

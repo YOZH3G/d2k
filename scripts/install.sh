@@ -86,7 +86,6 @@ fetch "scripts/select-panel-ip.sh" "$TMP/select-panel-ip.sh"
 fetch "builds/d2kpanel-linux-$ARCH" "$TMP/d2kpanel"
 fetch "builds/d2kc-linux-$ARCH" "$TMP/d2kc"
 fetch "builds/d2kd-linux-$ARCH" "$TMP/d2kd"
-fetch "builds/d2khttp-linux-$ARCH" "$TMP/d2khttp"
 fetch "builds/d2ktg-linux-$ARCH" "$TMP/d2ktg"
 fetch "files/S99d2k"            "$TMP/S99d2k"
 fetch "files/config"            "$TMP/config"
@@ -113,7 +112,7 @@ for face in onest jbmono; do
     fetch "internal/web/assets/fonts/OFL-$face.txt" "$TMP/panel/OFL-$face.txt"
 done
 
-chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kd" "$TMP/d2ktg" "$TMP/d2khttp" \
+chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kd" "$TMP/d2ktg" \
          "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/d2k-ppe-deoffload.sh" "$TMP/d2k-log-maintenance.sh" "$TMP/001-d2k.sh" \
          "$TMP/d2k-tg-firewall.sh" "$TMP/d2k-tg-watchdog.sh" \
          "$TMP/d2k-instagram-dns.sh" "$TMP/d2k-instagram-dns-scheduler.sh"
@@ -125,9 +124,6 @@ case "$PANEL_VERSION" in
     *) die "скачанный d2kpanel устарел: в нём нет управления Telegram-туннелем" ;;
 esac
 "$TMP/d2kd" --help  >/dev/null 2>&1 || die "скачанный d2kd не запускается на этой системе"
-rc_http=0
-"$TMP/d2khttp" --help >/dev/null 2>&1 || rc_http=$?
-[ "$rc_http" = 2 ] || die "скачанный d2khttp не запускается на этой системе (код $rc_http)"
 TG_VERSION=$("$TMP/d2ktg" --version 2>/dev/null) || die "скачанный d2ktg не запускается на этой системе"
 case "$TG_VERSION" in
     *features=per-install-enrollment*) ;;
@@ -181,7 +177,10 @@ install_data_atomic() {
 install_atomic "$TMP/d2kpanel" "$SBIN/d2kpanel"
 install_atomic "$TMP/d2kc"   "$SBIN/d2kc"
 install_atomic "$TMP/d2kd"   "$SBIN/d2kd"
-install_atomic "$TMP/d2khttp" "$SBIN/d2khttp"
+# Прокси открытого HTTP (d2khttp) больше не нужен: вставку провайдера в
+# HTTP узнаёт d2kd (задача 51). Прежняя версия уже остановлена выше вместе с
+# его правилами; бинарник убираем.
+rm -f "$SBIN/d2khttp"
 install_atomic "$TMP/d2ktg"  "$SBIN/d2ktg"
 install_atomic "$TMP/S99d2k" "$INIT"
 install_data_atomic "$TMP/panel/index.html" "$DIR/panel/index.html"

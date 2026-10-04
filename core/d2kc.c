@@ -28,6 +28,12 @@
 #include <unistd.h>
 
 #include "d2k_sched.h"
+#include "d2k_httpsprobe.h"
+#include "d2k_httpsearch.h"
+#include "d2k_plantlv.h"
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include "d2k_link.h"
 
 /* Переходник к перенесённому измерителю (detect/bridge.c). Объявлен здесь, а
  * не в заголовке ядра: ядро о detect/ не знает и знать не должно — связь
@@ -128,6 +134,239 @@ static void sched_say(void *ctx, const char *line) {
     fflush(stdout);
 }
 
+/* --- открытый HTTP: вставка провайдера → HTTPS имени (задача 51) -------- */
+
+/* Поиск обхода самого HTTP (шаг 4): имена, у которых HTTPS нет. */
+static d2k_httpsearch *g_hs;
+static d2k_hs_runner *g_hr;
+static int g_link_fd = -1;
+static uint32_t g_probe_mark;
+static const char *g_http_plans;
+
+static void http_search_portal(const char *host, uint8_t family, const uint8_t *addr,
+                               d2k_https_state st, int64_t now) {
+    /* Только класс 3 — портал проходит как есть, HTTPS у имени нет. */
+    if (!g_hs || !family || st == D2K_HTTPS_UNKNOWN || st == D2K_HTTPS_PROBING ||
+        d2k_https_upgrade(st)) { return; }
+    d2k_httpsearch_portal(g_hs, host, family, addr, now);
+}
+
+static int hs_open_port(void *ctx, uint8_t family, int *fd_out, uint16_t *sport_be) {
+    (void)ctx;
+    int fd = socket(family == 6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { return -1; }
+#ifdef SO_MARK
+    /* Метка зондов: через очередь, к потоку достаётся только пробный план
+       его порта, нового обнаружения он не рождает. */
+    if (g_probe_mark &&
+        setsockopt(fd, SOL_SOCKET, SO_MARK, &g_probe_mark, sizeof g_probe_mark) != 0) {
+        close(fd);
+        return -1;
+    }
+#endif
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof ss);
+    socklen_t sl;
+    if (family == 6) {
+        ((struct sockaddr_in6 *)&ss)->sin6_family = AF_INET6;
+        sl = sizeof(struct sockaddr_in6);
+    } else {
+        ((struct sockaddr_in *)&ss)->sin_family = AF_INET;
+        sl = sizeof(struct sockaddr_in);
+    }
+    if (bind(fd, (struct sockaddr *)&ss, sl) != 0 ||
+        getsockname(fd, (struct sockaddr *)&ss, &sl) != 0) {
+        close(fd);
+        return -1;
+    }
+    *sport_be = family == 6 ? ((struct sockaddr_in6 *)&ss)->sin6_port
+                            : ((struct sockaddr_in *)&ss)->sin_port;
+    *fd_out = fd;
+    return 0;
+}
+
+static void hs_close_port(void *ctx, int fd) { (void)ctx; close(fd); }
+
+static int hs_hex(const char *text, char *hex, size_t cap) {
+    char err[200];
+    if (d2k_plan_text_to_hex(text, hex, cap, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: план HTTP не собрался: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int hs_set_probe(void *ctx, const char *host, uint8_t family, uint16_t sport_be,
+                        const char *text, const uint8_t trial[16]) {
+    (void)ctx;
+    static char hex[8192];
+    char err[200];
+    if (hs_hex(text, hex, sizeof hex) != 0) { return -1; }
+    if (d2k_link_set_name_probe_trial(g_link_fd, host, 6, hex, D2K_LINK_SHAPE_HTTP, sport_be,
+                                      family, trial, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int hs_del_probe(void *ctx, const char *host, uint8_t family, uint16_t sport_be) {
+    (void)ctx;
+    char err[200];
+    if (d2k_link_del_name_probe_family(g_link_fd, host, 6, D2K_LINK_SHAPE_HTTP, sport_be,
+                                       family, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int hs_set_plan(void *ctx, const char *host, uint8_t family, const char *text) {
+    (void)ctx;
+    static char hex[8192];
+    char err[200];
+    if (hs_hex(text, hex, sizeof hex) != 0) { return -1; }
+    if (d2k_link_set_name_family(g_link_fd, host, 6, hex, D2K_LINK_SHAPE_HTTP, 0, family,
+                                 err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int hs_del_plan(void *ctx, const char *host, uint8_t family) {
+    (void)ctx;
+    char err[200];
+    if (d2k_link_del_name_family(g_link_fd, host, 6, D2K_LINK_SHAPE_HTTP, family,
+                                 err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static int hs_start(void *ctx, const d2k_hs_job *job) {
+    (void)ctx;
+    return d2k_hs_runner_start(g_hr, job);
+}
+
+static void hs_say(void *ctx, const char *line);
+static void hs_changed(void *ctx) {
+    (void)ctx;
+    char err[300];
+    if (g_hs && g_http_plans &&
+        d2k_httpsearch_save(g_hs, g_http_plans, (int64_t)time(NULL), err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: планы HTTP не сохранены: %s\n", err);
+    }
+}
+
+/* Датапат узнал вставку провайдера. Проверить HTTPS имени на том же адресе;
+   подтверждённое, но забытое датапатом — повторить. */
+static void http_portal(d2k_httpsprobe *hp, int fd, const d2k_ev *ev, int64_t now) {
+    char line[512];
+    uint32_t ttl = 0;
+    int rc = d2k_httpsprobe_portal(hp, ev->name, ev->family, ev->high_ip, ev->code == 1,
+                                   now, &ttl);
+    if (rc == 0) {
+        http_search_portal(ev->name, ev->family, ev->high_ip,
+                           d2k_httpsprobe_state(hp, ev->name, now), now);
+    }
+    if (rc == 1) {
+        snprintf(line, sizeof line, "HTTP %.255s: провайдер подменяет ответ порталом блокировки — "
+                 "проверяю HTTPS имени", ev->name);
+        sched_say(NULL, line);
+    } else if (rc == 2) {
+        char err[200];
+        if (d2k_link_set_https(fd, ev->name, ttl, err, sizeof err) != 0) {
+            fprintf(stderr, "d2kc: %s\n", err);
+        }
+    }
+}
+
+static void http_push(int fd, const char *host, uint32_t ttl) {
+    char err[200];
+    if (d2k_link_set_https(fd, host, ttl, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
+    }
+}
+
+static void http_save(d2k_httpsprobe *hp, const char *path, int64_t now) {
+    char err[300];
+    if (path && d2k_httpsprobe_save(hp, path, now, (int64_t)time(NULL), err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: кэш HTTPS не сохранён: %s\n", err);
+    }
+}
+
+static void http_probe_done(d2k_httpsprobe *hp, int fd, int64_t now, const char *cache_path) {
+    d2k_httpsprobe_result r[8];
+    size_t n, total = 0;
+    while ((n = d2k_httpsprobe_done(hp, now, r, sizeof r / sizeof r[0])) > 0) {
+        total += n;
+        for (size_t i = 0; i < n; i++) {
+            char line[1200];
+            int up = d2k_https_upgrade(r[i].state);
+            snprintf(line, sizeof line, "HTTP %.255s: %s (%.255s) — %s", r[i].host,
+                     r[i].state == D2K_HTTPS_SERVED ? "TLS к 443 прошёл, имя в листе сертификата" :
+                     r[i].state == D2K_HTTPS_TLS_BLOCKED ? "443 принимает, TLS срезан на линии" :
+                     r[i].state == D2K_HTTPS_CLOSED ? "HTTPS у источника нет (443 закрыт)" :
+                     r[i].state == D2K_HTTPS_OTHER_NAME ? "на 443 сертификат другого имени" :
+                                                          "HTTPS не решён",
+                     r[i].why,
+                     up ? "вставку провайдера датапат заменит на 307 → https"
+                        : "вставка провайдера идёт клиенту как есть: перевод на https "
+                          "был бы тупиком");
+            sched_say(NULL, line);
+            if (up) { http_push(fd, r[i].host, r[i].ttl_s); }
+            else { http_search_portal(r[i].host, r[i].family, r[i].addr, r[i].state, now); }
+        }
+    }
+    if (total) { http_save(hp, cache_path, now); }
+    static uint64_t lost_told;
+    uint64_t lost = d2k_httpsprobe_lost(hp);
+    if (lost != lost_told) {
+        fprintf(stderr, "d2kc: ответов зонда HTTPS потеряно %llu (имена перепроверятся)\n",
+                (unsigned long long)lost);
+        lost_told = lost;
+    }
+}
+
+static void hs_say(void *ctx, const char *line) { (void)ctx; sched_say(NULL, line); }
+
+/* ПОРЧА ПРИМАНКИ, ИЗМЕРЕННАЯ НА ЭТОЙ ЛИНИИ: признаки порчи, на которой
+   держатся подтверждённые TLS-планы коробок каталога (успехи > 0), —
+   самые успешные первыми. Каждая — вопрос к HTTP-коробке той же линии
+   вместо заготовки; tcpts/ipidzero HTTP-исполнитель не повторит, они
+   отбрасываются (d2k_httpsearch_measured_poison). */
+typedef struct { int succ; char spec[64]; } poison_seen;
+static int poison_cmp(const void *a, const void *b) {
+    return ((const poison_seen *)b)->succ - ((const poison_seen *)a)->succ;
+}
+static void hs_measured_poisons(d2k_httpsearch *hs, const d2k_catalog *cat) {
+    poison_seen v[64];
+    size_t n = 0;
+    for (size_t b = 0; b < cat->n_boxes; b++) {
+        const d2k_cat_box *box = &cat->boxes[b];
+        for (size_t k = 0; k < box->n_plans && n < 64; k++) {
+            const d2k_cat_plan *pl = &box->plans[k];
+            if (!pl->text || pl->successes <= 0 || !pl->enabled ||
+                !strstr(pl->text, "\nproto tcp tls\n")) { continue; }
+            char specs[8][64];
+            size_t m = d2k_hs_plan_poisons(pl->text, specs, 8);
+            for (size_t i = 0; i < m && n < 64; i++) {
+                snprintf(v[n].spec, sizeof v[n].spec, "%.63s", specs[i]);
+                v[n].succ = pl->successes;
+                n++;
+            }
+        }
+    }
+    qsort(v, n, sizeof v[0], poison_cmp);
+    size_t taken = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (d2k_httpsearch_measured_poison(hs, v[i].spec) == 0) { taken++; }
+    }
+    if (taken) { printf("d2kc: HTTP: измеренной порчи приманки с этой линии — %zu\n", taken); }
+}
+
 static void usage(void) {
     fprintf(stderr,
         "использование: d2kc --control <сокет> [--catalog <файл>] [--mark 0x2e] [--measure-mark 0x2f]\n"
@@ -135,6 +374,7 @@ static void usage(void) {
         "  --catalog  где держать знание (умолчание /opt/d2k/catalog.json)\n"
         "  --live     куда писать вид для панели (умолчание — рядом с каталогом)\n"
         "  --log      куда писать журнал (умолчание — стандартный вывод)\n"
+        "  --https-cache  кэш HTTPS имён для вставки провайдера (умолчание — рядом с каталогом)\n"
         "  --mark     метка verifier-зондов; они идут через NFQUEUE (умолчание 0x2d)\n"
         "  --measure-mark метка измерений; обычно обходит собственную NFQUEUE (по умолчанию --mark)\n");
 }
@@ -144,6 +384,7 @@ int main(int argc, char **argv) {
     const char *catpath = "/opt/d2k/catalog.json";
     const char *livepath = NULL;
     const char *logpath = NULL;
+    const char *https_path = NULL;
     uint32_t mark = 0x2d;
     uint32_t measure_mark = 0;
     int have_measure_mark = 0;
@@ -154,6 +395,7 @@ int main(int argc, char **argv) {
         else if (strcmp(f, "--catalog") == 0 && i + 1 < argc) { catpath = argv[++i]; }
         else if (strcmp(f, "--live") == 0 && i + 1 < argc) { livepath = argv[++i]; }
         else if (strcmp(f, "--log") == 0 && i + 1 < argc) { logpath = argv[++i]; }
+        else if (strcmp(f, "--https-cache") == 0 && i + 1 < argc) { https_path = argv[++i]; }
         else if (strcmp(f, "--mark") == 0 && i + 1 < argc) {
             mark = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(f, "--measure-mark") == 0 && i + 1 < argc) {
@@ -240,6 +482,73 @@ int main(int argc, char **argv) {
 
     d2k_sched_set_say(s, sched_say, NULL);
 
+    /* Зонд HTTPS — с меткой зондов контроллера: через очередь, с уже
+       подтверждённым планом имени, без нового обнаружения. */
+    d2k_httpsprobe *hp = d2k_httpsprobe_new(mark, NULL);
+    if (!hp) {
+        fprintf(stderr, "d2kc: зонд HTTPS не завёлся — вставка провайдера в HTTP "
+                        "будет идти клиенту как есть\n");
+    }
+    /* Кэш HTTPS переживает перезапуск (ревью I2): иначе первый заход после
+       каждого перезапуска снова видел бы портал. Рядом с каталогом. */
+    char https_buf[CATPATH_MAX + 32];
+    if (!https_path) {
+        const char *slash = strrchr(catpath, '/');
+        size_t dirlen = slash ? (size_t)(slash - catpath + 1) : 0;
+        if (dirlen < sizeof https_buf - 20) {
+            memcpy(https_buf, catpath, dirlen);
+            snprintf(https_buf + dirlen, sizeof https_buf - dirlen, "https-cache.txt");
+            https_path = https_buf;
+        }
+    }
+    /* Поиск обхода HTTP и его подтверждённые планы — рядом с каталогом. */
+    g_link_fd = fd;
+    g_probe_mark = mark;
+    static char plans_buf[CATPATH_MAX + 32];
+    {
+        const char *slash = strrchr(catpath, '/');
+        size_t dirlen = slash ? (size_t)(slash - catpath + 1) : 0;
+        if (dirlen < sizeof plans_buf - 20) {
+            memcpy(plans_buf, catpath, dirlen);
+            snprintf(plans_buf + dirlen, sizeof plans_buf - dirlen, "http-plans.txt");
+            g_http_plans = plans_buf;
+        }
+    }
+    g_hr = d2k_hs_runner_new();
+    if (g_hr) {
+        d2k_hs_ops ops = {hs_open_port, hs_close_port, hs_set_probe, hs_del_probe, hs_set_plan,
+                          hs_del_plan, hs_start, hs_say, hs_changed, NULL};
+        g_hs = d2k_httpsearch_new(&ops);
+        if (g_hs) { hs_measured_poisons(g_hs, &cat); }
+    }
+    if (!g_hs) {
+        fprintf(stderr, "d2kc: поиск обхода HTTP не завёлся — вставка в HTTP без HTTPS "
+                        "останется как есть\n");
+    } else if (g_http_plans) {
+        size_t nl = 0;
+        char herr[300];
+        if (d2k_httpsearch_load(g_hs, g_http_plans, &nl, herr, sizeof herr) != 0) {
+            fprintf(stderr, "d2kc: планы HTTP не прочитаны: %s\n", herr);
+        } else if (nl) {
+            printf("d2kc: планы HTTP %s: имён %zu поставлено датапату\n", g_http_plans, nl);
+        }
+    }
+    if (hp && https_path) {
+        static d2k_httpsprobe_result push[D2K_HTTPSPROBE_NAMES];
+        size_t np = 0, nl = 0;
+        char herr[300];
+        if (d2k_httpsprobe_load(hp, https_path, now_ms(), (int64_t)time(NULL), push,
+                                D2K_HTTPSPROBE_NAMES, &np, &nl, herr, sizeof herr) != 0) {
+            fprintf(stderr, "d2kc: кэш HTTPS не прочитан, начинаю с пустого: %s\n", herr);
+        } else {
+            for (size_t i = 0; i < np; i++) { http_push(fd, push[i].host, push[i].ttl_s); }
+            if (nl) {
+                printf("d2kc: кэш HTTPS %s: имён %zu, к датапату с 307 — %zu\n",
+                       https_path, nl, np);
+            }
+        }
+    }
+
     /* ИЗМЕРИТЕЛЬ TCP — ПЕРЕНЕСЁННЫЙ «ПОИСК ПО ДОМЕНУ», а не прежнее дерево.
      *
      * Прежнее (core/verdict.c) отвечало только на вопрос «какого класса
@@ -303,9 +612,11 @@ int main(int argc, char **argv) {
     int link_lost = 0;
 
     while (!stop_asked) {
-        struct pollfd pfd[2];
+        struct pollfd pfd[4];
         pfd[0].fd = fd;                       pfd[0].events = POLLIN; pfd[0].revents = 0;
         pfd[1].fd = d2k_sched_wake_fd(s);     pfd[1].events = POLLIN; pfd[1].revents = 0;
+        pfd[2].fd = d2k_httpsprobe_wake_fd(hp); pfd[2].events = POLLIN; pfd[2].revents = 0;
+        pfd[3].fd = d2k_hs_runner_wake_fd(g_hr); pfd[3].events = POLLIN; pfd[3].revents = 0;
 
         int64_t t = now_ms();
         int wait = (int)(TICK_MS - (t - last_tick));
@@ -315,7 +626,7 @@ int main(int argc, char **argv) {
                порция обязана идти сразу за чтением событий. */
             wait = 0;
         }
-        int pr = poll(pfd, 2, wait);
+        int pr = poll(pfd, 4, wait);
         if (pr < 0 && errno != EINTR) {
             fprintf(stderr, "d2kc: poll: %s\n", strerror(errno));
             break;
@@ -338,6 +649,19 @@ int main(int argc, char **argv) {
                     case D2K_EV_EXCHANGE: seen_exchange++; break;
                     case D2K_EV_APPLIED:  seen_applied++; break;
                     case D2K_EV_REFUSED:  seen_refused++; break;
+                    case D2K_EV_HTTP_PORTAL:
+                        if (hp) { http_portal(hp, fd, &ev, now_ms()); }
+                        break;
+                    default: break;
+                    }
+                    /* Поиск HTTP: подтверждение своей пробы и исполнение
+                       своего плана (сверка по trial ID и Plan ID). */
+                    if (g_hs && ev.kind == D2K_EV_ACK && ev.code == D2K_CMD_SET_NAME_PROBE) {
+                        d2k_httpsearch_ack(g_hs, ev.trial_id, ((ev.num >> 8) & 0xffu) == 1u, now_ms());
+                    } else if (g_hs && ev.kind == D2K_EV_APPLIED) {
+                        d2k_httpsearch_applied(g_hs, ev.plan_id);
+                    }
+                    switch (ev.kind) {
                     case D2K_EV_PROTO:
                         /* ВЕРСИЯ ПРОВОДА. Чужая — работать нельзя: смешанная пара
                            не падает и не ругается, она молча не даёт
@@ -367,6 +691,21 @@ int main(int argc, char **argv) {
                    пачка наблюдений теряется перед сохранением каталога. */
                 if (drained < 256 || d2k_link_peer_closed(fd) != 1) { break; }
             }
+        }
+        if (hp && pr > 0 && (pfd[2].revents & POLLIN)) {
+            http_probe_done(hp, fd, now_ms(), https_path);
+        }
+        if (g_hs && pr > 0 && (pfd[3].revents & POLLIN)) {
+            d2k_hs_result hr;
+            if (d2k_hs_runner_done(g_hr, &hr)) { d2k_httpsearch_result(g_hs, &hr, now_ms()); }
+        }
+        if (g_hs) { d2k_httpsearch_tick(g_hs, now_ms()); }
+        /* Таблица датапата вытесняет давно не нужные записи (LRU): свои
+           HTTP-планы ставятся заново раз в 30 мин (ревью M-5). */
+        static int64_t last_http_push;
+        if (g_hs && now_ms() - last_http_push >= 30ll * 60 * 1000) {
+            if (last_http_push) { d2k_httpsearch_push_all(g_hs); }
+            last_http_push = now_ms();
         }
         /* PID живого контроллера ещё не означает, что он связан с датапатом:
            закрытый AF_UNIX peer даёт POLLHUP один раз. Не выходя здесь,
@@ -444,6 +783,10 @@ int main(int argc, char **argv) {
        «останавливаюсь» не видно ровно тогда, когда его и ищут. */
     fflush(stdout);
     d2k_detect_stop_all();
+    d2k_httpsprobe_free(hp);
+    /* Сперва дождаться зонда (он держит сокет), потом снять свою пробу. */
+    d2k_hs_runner_free(g_hr);
+    d2k_httpsearch_free(g_hs);
     d2k_sched_free(s);
     if (cat.revision != dirty) {
         if (save_atomic(&cat, catpath, err, sizeof err) != 0) {

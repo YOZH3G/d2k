@@ -185,6 +185,12 @@ void         d2k_plantab_clear_probes(d2k_plantab *t);
  * одном протоколе к другому отношения не имеет. */
 #define D2K_PLAN_SHAPE_VOICE  5
 #define D2K_PLAN_SHAPE_ECH_TCP 6
+/* ОТКРЫТЫЙ HTTP (задача 51, шаг 4): вход — запрос GET/HEAD, имя — Host.
+ * Запись этой формы держит ТОЛЬКО план протокола http (minexec 11) и только
+ * по имени; TLS-поиск её не видит, а HTTP-поиск видит только её
+ * (d2k_plantab_find_http): ни дедушкина запись, ни адрес, ни семейство
+ * имён HTTP-запросу не достаются. */
+#define D2K_PLAN_SHAPE_HTTP 7
 
 /* Learned areas never consume/evict exact bindings. Set owns p on all paths,
  * like set_name_family. Exceptions are exact and context-specific. */
@@ -308,6 +314,11 @@ const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
 const d2k_plan *d2k_plantab_find_sport(d2k_plantab *t, const uint8_t *name,
                                        size_t len, uint32_t addr_be, uint64_t now_ns,
                                        uint8_t seen_shape, uint16_t sport_be);
+
+/* План для запроса HTTP: запись имени формы HTTP — пробная своего порта
+ * (sport_be != 0), иначе постоянная. Больше ничего. */
+const d2k_plan *d2k_plantab_find_http(d2k_plantab *t, const uint8_t *name, size_t len,
+                                      uint8_t family, uint16_t sport_be, uint64_t now_ns);
 
 /* Сколько раз запись нашлась по цели, но НЕ ПОДОШЛА по форме приветствия.
  * Отдельно от «плана нет»: тот счёт растёт и на каждом не-приветствии, и по

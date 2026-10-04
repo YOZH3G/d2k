@@ -250,29 +250,24 @@ fw_up
 fw_installed || fail "запуск после частичного отказа не восстановлен"
 fw_down
 
-echo "== HTTP helper совместно с IPv6 =="
+echo "== открытый HTTP без прокси: миграция с d2khttp (задача 51) =="
 MODE=apply
-HTTP_UPGRADE=1
-HTTPUPBIN=/bin/true
-HU_PID=/tmp/d2k-test-http.pid
-echo "$$" > "$HU_PID"
-ip() {
-    [ "$1" = "-4" ] && [ "$2" = "route" ] &&
-        echo "192.168.1.0/24 dev br0 proto kernel scope link src 192.168.1.1"
-}
+# Правила прежней версии: nat-перехват порта 80 и метка его upstream.
+iptables -t nat -N D2K_HTTP
+iptables -t nat -A D2K_HTTP -p tcp --dport 80 -j REDIRECT --to-ports 18080
+iptables -t nat -I PREROUTING -j D2K_HTTP
+iptables -t mangle -N D2K_HTTP_MARK
+iptables -t mangle -A D2K_HTTP_MARK -m mark --mark 0x30 -j CONNMARK --save-mark
+iptables -t mangle -I OUTPUT -j D2K_HTTP_MARK
 fw_up
-fw_installed || fail "HTTP+IPv6 правила не распознаны"
-iptables -t nat -C PREROUTING -j D2K_HTTP || fail "нет HTTP redirect"
-iptables -t nat -C D2K_HTTP -d 192.168.1.0/24 -j RETURN || fail "HTTP захватывает LAN"
-iptables -t mangle -C OUTPUT -j D2K_HTTP_MARK || fail "нет метки upstream HTTP"
-iptables -t mangle -C D2K_IN -m connmark --mark "$HTTPUP_MARK" -j RETURN || fail "HTTP upstream попадает в NFQUEUE"
-if ip6tables -t nat -S | grep -q D2K_HTTP; then fail "IPv4 HTTP redirect попал в IPv6"; fi
-fw_up
-fw_installed || fail "повторный HTTP+IPv6 запуск сломал правила"
+fw_installed || fail "правила без d2khttp не распознаны"
+if iptables -t nat -S | grep -q D2K_HTTP; then fail "прежний nat-перехват HTTP пережил запуск"; fi
+if iptables -t mangle -S | grep -q D2K_HTTP_MARK; then fail "прежняя метка upstream HTTP пережила запуск"; fi
+if iptables -t mangle -S D2K_IN | grep -q 18080; then fail "исключение порта прокси осталось"; fi
 fw_down
 if iptables -t nat -S | grep -q D2K_HTTP; then fail "HTTP redirect остался после остановки"; fi
-if iptables -t mangle -S | grep -q D2K; then fail "HTTP метка осталась после остановки"; fi
-ip6tables -t mangle -C INPUT -p ipv6-icmp -j ACCEPT || fail "HTTP удалил чужое IPv6 правило"
+if iptables -t mangle -S | grep -q D2K; then fail "метка осталась после остановки"; fi
+ip6tables -t mangle -C INPUT -p ipv6-icmp -j ACCEPT || fail "миграция удалила чужое IPv6 правило"
 
 echo "== удаление без init-скрипта =="
 fw_up

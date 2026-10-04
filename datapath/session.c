@@ -18,6 +18,7 @@
 #include "d2k_quic.h" /* core/ — разбор QUIC линкуется исходниками, см. Makefile */
 #include "d2k_nat.h"
 #include "d2k_session.h"
+#include "d2k_http80.h"
 #include "d2k_time.h"
 #include "d2k_tls.h"
 #include "d2k_capture.h"
@@ -1739,7 +1740,23 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         s->pay_late++;
     }
 
-    if (!fl->saw_hello && fwd && fl->fwd_pkts <= D2K_HELLO_WINDOW) {
+    /* ЗАПРОС HTTP — ВХОД ПЛАНА ОБХОДА HTTP (задача 51, шаг 4). Только
+       первая нагрузка клиента ровно с начала потока (SYN видели), один раз
+       на поток. TLS-признаков (saw_hello) не взводит: подозрения, обмены и
+       приветствия TLS к такому потоку отношения не имеют. */
+    int http_hello = 0;
+    size_t http_off = 0, http_len = 0;
+    /* Порт 80 (ревью M-1): Host без порта означает 80, и запрос на другой
+       порт — не наш вход. */
+    if (!fl->saw_hello && fwd && !fl->http_checked && fl->saw_syn &&
+        t[2] == 0 && t[3] == 80 &&
+        in_seq == fl->syn_seq + 1u && payload_len >= 5 &&
+        (pkt[payload_off] == 'G' || pkt[payload_off] == 'H')) {
+        fl->http_checked = 1;
+        http_hello = d2k_http_hello(pkt + payload_off, payload_len, &http_off, &http_len);
+    }
+
+    if (!fl->saw_hello && fwd && fl->fwd_pkts <= D2K_HELLO_WINDOW && !http_hello) {
         d2k_tls_parse(pkt + payload_off, payload_len, &tls);
         if (!tls.is_client_hello) {
             s->pay_not_hello++;
@@ -1929,6 +1946,13 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         if (!use) {
             use = s->plan;
         }
+    } else if (http_hello) {
+        /* Только запись имени формы HTTP (пробная — своего порта). Ни
+           дедушкина запись, ни адрес, ни общий план сюда не доходят. */
+        uint16_t sport_be;
+        memcpy(&sport_be, t + 0, 2);
+        use = d2k_plantab_find_http(s->plans, pkt + payload_off + http_off, http_len,
+                                    ip.family, controller_probe ? sport_be : 0, now_ns);
     }
 
     if (!plan_fits_transport(use, 6)) {
@@ -1964,7 +1988,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         }
         return 0;
     }
-    if (!tls.is_client_hello) {
+    if (!tls.is_client_hello && !http_hello) {
         /* Не приветствие — не наш случай. План первой версии описывает именно
            начало TLS-соединения. */
         out->skipped = "не ClientHello";
@@ -1988,6 +2012,13 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     in.sni_off = tls.sni_off;
     in.sni_len = tls.sni_len;
     in.segment_cap = tcp_segment_cap;
+    if (http_hello) {
+        in.is_http = 1;
+        in.have_sni = 1;
+        in.is_tls13 = 0;
+        in.sni_off = http_off;
+        in.sni_len = http_len;
+    }
 
     d2k_actions acts;
     memset(&acts, 0, sizeof acts);
@@ -1995,7 +2026,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         /* Неприменим — пропускаем как есть. Отказ исполнителя это результат, а
            не сбой: якорь может быть невычислим для конкретного пакета. */
         out->skipped = "план неприменим к этому пакету";
-        refuse(s, now_ns, &key, out->skipped);
+        if (!http_hello) { refuse(s, now_ns, &key, out->skipped); }
         d2k_actions_free(&acts);
         return 0;
     }
@@ -2017,7 +2048,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        мимо NAT (см. flow_tracked). */
     if (flow_tracked(fl, &c, 6, 0) != 0) {
         out->skipped = "поток не ведётся conntrack — посылки уйдут мимо NAT";
-        refuse(s, now_ns, &key, out->skipped);
+        if (!http_hello) { refuse(s, now_ns, &key, out->skipped); }
         d2k_actions_free(&acts);
         return 0;
     }
@@ -2034,7 +2065,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
            описывает, — то есть план, который не исполнялся. Честный исход —
            отказ целиком. */
         out->skipped = "план описывает больше посылок, чем вмещает буфер результата";
-        refuse(s, now_ns, &key, out->skipped);
+        if (!http_hello) { refuse(s, now_ns, &key, out->skipped); }
         d2k_actions_free(&acts);
         return 0;
     }
@@ -2068,7 +2099,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                 fl->damaged = 1;
             }
             out->skipped = "буфер отправки кончился";
-            refuse(s, now_ns, &key, out->skipped);
+            if (!http_hello) { refuse(s, now_ns, &key, out->skipped); }
             d2k_actions_free(&acts);
             return 0;
         }
@@ -2089,7 +2120,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         out->n_out = 0;
         out->verdict = D2K_VERDICT_ACCEPT;
         out->skipped = "удержание оригинала не поддержано";
-        refuse(s, now_ns, &key, out->skipped);
+        if (!http_hello) { refuse(s, now_ns, &key, out->skipped); }
         d2k_actions_free(&acts);
         return 0;
     }

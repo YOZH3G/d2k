@@ -43,7 +43,6 @@ DIR=/opt/d2k
 # ограничено локальной loopback-привязкой и командами из фиксированного списка.
 BIN=/opt/sbin/d2kc
 PANELBIN=/opt/sbin/d2kpanel
-HTTPUPBIN=/opt/sbin/d2khttp
 PANEL_ASSETS=$DIR/panel
 DPBIN=/opt/sbin/d2kd
 CONF=$DIR/config
@@ -53,6 +52,8 @@ LOG=$DIR/log
 DP_PID=$RUN/d2kd.pid
 CT_PID=$RUN/d2k.pid
 PN_PID=$RUN/d2k-panel.pid
+# Прежний прокси открытого HTTP (d2khttp, до задачи 51): его pid-файл и
+# правила снимаются при остановке и запуске — миграция со старой версии.
 HU_PID=$RUN/d2k-http.pid
 HL_PID=$RUN/d2k-heal.pid
 HEAL=$DIR/d2k-fw-heal.sh
@@ -76,8 +77,6 @@ CHAIN_IN=D2K_IN
 # Значения по умолчанию; конфигурация их перекрывает.
 QUEUE_NUM=2000
 PANEL_LISTEN=127.0.0.1:8090
-HTTP_UPGRADE=1
-HTTPUP_PORT=18080
 STATE_DIR=$DIR/state
 MARK=0x2d
 # Controller probes must traverse NFQUEUE for exact trial Plans, while raw
@@ -87,8 +86,9 @@ PROBE_MARK=0x2e
 # Контроллерские измерения обходят собственный NFQUEUE. Точные проверки
 # кандидата используют PROBE_MARK и специально идут через datapath.
 MEASURE_MARK=0x2f
-# Transparent HTTP relay gets its own mark: its reply packets must not be
-# confused with controller measurement replies that the datapath must inspect.
+# Метка прежнего прокси открытого HTTP: только чтобы снять его правила при
+# обновлении. Открытый HTTP теперь идёт ядром; вставку провайдера в первые
+# пакеты HTTP-потока узнаёт и заменяет d2kd (задача 51).
 HTTPUP_MARK=0x30
 # Наблюдаем весь TCP/UDP трафик, а не только привычный HTTPS-порт. Протокол
 # определяется разбором первых пакетов в d2kd; ограничение портом 443 теряло
@@ -151,7 +151,33 @@ D2K_PPE_CONFIG=$CONF
 # shellcheck disable=SC1090
 [ -r "$PPE_LIB" ] && . "$PPE_LIB"
 
-httpup_enabled() { [ "$MODE" = "apply" ] && [ "$HTTP_UPGRADE" = "1" ]; }
+# Остаток прежней версии: живой d2khttp или его nat-перехват порта 80.
+# Процесс узнаётся по имени, а не по одному pid: старый pid-файл мог
+# пережить перезагрузку, и его номер уже у чужого процесса (ревью M3).
+legacy_http_pid() {
+    [ -f "$HU_PID" ] || return 1
+    lpid=$(cat "$HU_PID" 2>/dev/null)
+    case "$lpid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(cat "$PROC_DIR/$lpid/comm" 2>/dev/null)" = d2khttp ] || return 1
+    echo "$lpid"
+}
+legacy_http_present() {
+    legacy_http_pid >/dev/null && return 0
+    iptables -t nat -C PREROUTING -j D2K_HTTP 2>/dev/null && return 0
+    return 1
+}
+legacy_http_stop() {
+    if lpid=$(legacy_http_pid); then
+        kill "$lpid" 2>/dev/null
+        i=0
+        while [ -d "$PROC_DIR/$lpid" ] && kill -0 "$lpid" 2>/dev/null && [ $i -lt 30 ]; do
+            i=$((i + 1))
+            sleep 0.1 2>/dev/null || sleep 1
+        done
+        kill -0 "$lpid" 2>/dev/null && kill -9 "$lpid" 2>/dev/null
+    fi
+    rm -f "$HU_PID"
+}
 
 say() { echo "$NAME: $*"; }
 die() { echo "$NAME: $*" >&2; exit 1; }
@@ -212,7 +238,7 @@ fw_family_up() (
     fw_tool=$1
     loopback=127.0.0.0/8
     [ "$fw_tool" != ip6tables ] || loopback=::1/128
-    local local_routes httpup_mark_num mark_num probe_mark_num measure_mark_num late_from
+    local late_from
     late_from=$(late_rst_from) || return 1
 
     # Код 3 — таблица mangle этого семейства непригодна вовсе (нет утилиты,
@@ -252,32 +278,6 @@ fw_family_up() (
     # порождает из них новое обнаружение.
     "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN || return 1
     "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN || return 1
-    if [ "$fw_tool" = iptables ] && httpup_enabled; then
-        case "$HTTPUP_PORT" in ''|*[!0-9]*) return 1 ;; esac
-        [ "$HTTPUP_PORT" -gt 0 ] && [ "$HTTPUP_PORT" -le 65535 ] && \
-            [ "$HTTPUP_PORT" -ne 80 ] || return 1
-        httpup_mark_num=$((HTTPUP_MARK))
-        mark_num=$((MARK))
-        probe_mark_num=$((PROBE_MARK))
-        measure_mark_num=$((MEASURE_MARK))
-        [ "$httpup_mark_num" -gt 0 ] && \
-            [ "$httpup_mark_num" -ne "$mark_num" ] && \
-            [ "$httpup_mark_num" -ne "$probe_mark_num" ] && \
-            [ "$httpup_mark_num" -ne "$measure_mark_num" ] || return 1
-        "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$HTTPUP_MARK" -j RETURN || return 1
-        # HTTP-upstream sockets carry their own mark. Persist it on conntrack,
-        # so only their replies bypass input NFQUEUE—not controller probes.
-        "$fw_tool" -t mangle -N D2K_HTTP_MARK 2>/dev/null || return 1
-        "$fw_tool" -t mangle -A D2K_HTTP_MARK -m mark --mark "$HTTPUP_MARK" \
-            -j CONNMARK --save-mark || return 1
-        "$fw_tool" -t mangle -I OUTPUT -j D2K_HTTP_MARK || return 1
-        "$fw_tool" -t mangle -A "$CHAIN_IN" -m connmark --mark "$HTTPUP_MARK" \
-            -j RETURN || return 1
-        # REDIRECTed client requests become local INPUT packets on this port.
-        "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp --dport "$HTTPUP_PORT" \
-            -j RETURN || return 1
-    fi
-
     # Never queue DNS (UDP/TCP 53) or encrypted DNS (DoT/DoQ, 853). These
     # packets are required for ordinary connectivity and are not useful
     # strategy inputs. Place exclusions before the broad TCP/UDP NFQUEUE rules.
@@ -374,30 +374,6 @@ fw_family_up() (
     # непроверенное на живой линии нельзя.
     [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -A POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE || say "не поставить MASQUERADE для своих посылок — QUIC за роутером не пойдёт"
-
-    # Only redirect HTTP after the listener is alive. It rewrites a response
-    # only when an ordinary GET/HEAD receives an explicit cross-host portal
-    # redirect; normal public HTTP and unrelated redirects are relayed intact.
-    # Connected LAN/router destinations bypass the NAT rule below.
-    if [ "$fw_tool" = iptables ] && httpup_enabled; then
-        [ -x "$HTTPUPBIN" ] && running "$HU_PID" || return 1
-        "$fw_tool" -t nat -N D2K_HTTP 2>/dev/null || return 1
-        fw_return_local "$fw_tool" nat D2K_HTTP || return 1
-        # Skip directly-connected router/LAN subnets, but do not blanket-skip
-        # RFC1918: some ISPs return a private sinkhole address for blocked DNS
-        # names, and HTTP to that address must still reach this portal detector.
-        command -v ip >/dev/null 2>&1 || return 1
-        local_routes=$(ip -4 route show table main scope link 2>/dev/null |
-            awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ { print $1 }')
-        [ -n "$local_routes" ] || return 1
-        for net in 0.0.0.0/8 127.0.0.0/8 169.254.0.0/16 \
-                   224.0.0.0/4 240.0.0.0/4 $local_routes; do
-            "$fw_tool" -t nat -A D2K_HTTP -d "$net" -j RETURN || return 1
-        done
-        "$fw_tool" -t nat -A D2K_HTTP -p tcp --dport 80 \
-            -j REDIRECT --to-ports "$HTTPUP_PORT" || return 1
-        "$fw_tool" -t nat -I PREROUTING -j D2K_HTTP || return 1
-    fi
 
     "$fw_tool" -t mangle -I POSTROUTING -j "$CHAIN_OUT" || return 1
     "$fw_tool" -t mangle -I FORWARD     -j "$CHAIN_IN"  || return 1
@@ -603,17 +579,6 @@ fw_family_installed() (
     "$fw_tool" -t mangle -C INPUT -j "$CHAIN_IN" 2>/dev/null || return 1
     "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN 2>/dev/null || return 1
     "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN 2>/dev/null || return 1
-    if [ "$fw_tool" = iptables ] && httpup_enabled; then
-        "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$HTTPUP_MARK" \
-            -j RETURN 2>/dev/null || return 1
-        "$fw_tool" -t mangle -C OUTPUT -j D2K_HTTP_MARK 2>/dev/null || return 1
-        "$fw_tool" -t mangle -C D2K_HTTP_MARK -m mark --mark "$HTTPUP_MARK" \
-            -j CONNMARK --save-mark 2>/dev/null || return 1
-        "$fw_tool" -t mangle -C "$CHAIN_IN" -m connmark --mark "$HTTPUP_MARK" \
-            -j RETURN 2>/dev/null || return 1
-        "$fw_tool" -t mangle -C "$CHAIN_IN" -p tcp --dport "$HTTPUP_PORT" \
-            -j RETURN 2>/dev/null || return 1
-    fi
     for proto in tcp udp; do
         "$fw_tool" -t mangle -C "$CHAIN_OUT" -p "$proto" -m multiport --dports "$DNS_PORTS" \
             -j RETURN 2>/dev/null || return 1
@@ -648,12 +613,6 @@ fw_family_installed() (
         --queue-bypass 2>/dev/null || return 1
     [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE 2>/dev/null || return 1
-    if [ "$fw_tool" = iptables ] && httpup_enabled; then
-        running "$HU_PID" || return 1
-        "$fw_tool" -t nat -C PREROUTING -j D2K_HTTP 2>/dev/null || return 1
-        "$fw_tool" -t nat -C D2K_HTTP -p tcp --dport 80 \
-            -j REDIRECT --to-ports "$HTTPUP_PORT" 2>/dev/null || return 1
-    fi
     return 0
 )
 
@@ -761,7 +720,7 @@ start_engine() {
 
     if running "$DP_PID"; then
         if running "$CT_PID" && fw_installed && \
-            { ! httpup_enabled || running "$HU_PID"; } && \
+            ! legacy_http_present && \
             { [ ! -x "$HEAL" ] || running "$HL_PID"; }; then
             say "движок уже запущен полностью"
             return 0
@@ -801,15 +760,6 @@ start_engine() {
     if [ -z "$bound" ] || [ "$bound" = "0" ]; then
         engine_stop
         die "очередь $QUEUE_NUM не привязалась — правила не ставлю"
-    fi
-
-    if httpup_enabled; then
-        [ -x "$HTTPUPBIN" ] || { engine_stop; die "нет $HTTPUPBIN для обычного HTTP-входа"; }
-        start-stop-daemon -S -b -m -p "$HU_PID" -x "$HTTPUPBIN" -- \
-            --port "$HTTPUP_PORT" --mark "$HTTPUP_MARK" || {
-                engine_stop; die "HTTP-upgrade listener не запустился"
-            }
-        if ! running "$HU_PID"; then engine_stop; die "HTTP-upgrade listener завершился сразу"; fi
     fi
 
     load_modules
@@ -986,7 +936,7 @@ engine_stop() {
     # и успеть восстановить их, пока служба останавливается.
     stop_pidfile "$HL_PID"
     fw_down
-    stop_pidfile "$HU_PID"
+    legacy_http_stop
     fastnat_restore
     stop_pidfile "$CT_PID"
     stop_pidfile "$DP_PID"
@@ -1018,8 +968,6 @@ status() {
                        || echo "  Telegram tunnel: не работает (enabled=${TG_ENABLED:-0})"
     running "$DNS_SCHED_PID" && echo "  Instagram DNS: суточное обновление запланировано (pid $(cat $DNS_SCHED_PID))" \
                               || echo "  Instagram DNS: планировщик не работает"
-    running "$HU_PID" && echo "  HTTP→HTTPS: listener работает" \
-                      || echo "  HTTP→HTTPS: listener не работает"
     running "$HL_PID" && echo "  сторож правил: работает (pid $(cat $HL_PID))" \
                       || echo "  сторож правил: не работает"
     fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
@@ -1043,11 +991,7 @@ status() {
 # Руками она тоже годится.
 reapply() {
     running "$DP_PID" || die "датапат не работает — ставить правила не для кого"
-    if httpup_enabled && ! running "$HU_PID"; then
-        [ -x "$HTTPUPBIN" ] || die "нет $HTTPUPBIN для HTTP→HTTPS"
-        start-stop-daemon -S -b -m -p "$HU_PID" -x "$HTTPUPBIN" -- \
-            --port "$HTTPUP_PORT" --mark "$HTTPUP_MARK" || die "HTTP-upgrade listener не запустился"
-    fi
+    legacy_http_stop
     load_modules
     fw_up || { fw_down; die "не поставить полный набор правил"; }
     say "правила поставлены заново"

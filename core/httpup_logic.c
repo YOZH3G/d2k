@@ -181,14 +181,10 @@ static int redirect_location_host(const char *value, size_t len, char *host, siz
     return 1;
 }
 
-int d2k_httpup_portal_response(const char *request, size_t request_len,
-                               const char *upstream, size_t upstream_len,
-                               char *response, size_t response_cap) {
-    http_request req;
-    if (!response || response_cap == 0) { return 0; }
-    response[0] = '\0';
-    if (!parse_request(request, request_len, &req) || !upstream || upstream_len < 16) { return 0; }
-
+/* 1 when the response head is a cross-host 30x to a host with a portal label. */
+static int portal_answer(const char *req_host, const char *upstream, size_t upstream_len,
+                         char *location_host, size_t location_cap) {
+    if (!upstream || upstream_len < 16) { return 0; }
     const char *end = upstream + upstream_len;
     const char *line_end = find_crlf(upstream, end);
     if (!line_end || (size_t)(line_end - upstream) < 13 ||
@@ -198,7 +194,6 @@ int d2k_httpup_portal_response(const char *request, size_t request_len,
         (upstream[11] != '1' && upstream[11] != '2' && upstream[11] != '3' &&
          upstream[11] != '7' && upstream[11] != '8')) { return 0; }
 
-    char location_host[256];
     int location_seen = 0;
     const char *p = line_end + 2;
     while ((line_end = find_crlf(p, end)) != NULL && line_end != p) {
@@ -210,11 +205,62 @@ int d2k_httpup_portal_response(const char *request, size_t request_len,
             const char *ve = line_end;
             while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t')) { ve--; }
             if (!redirect_location_host(v, (size_t)(ve - v), location_host,
-                                        sizeof location_host)) { return 0; }
+                                        location_cap)) { return 0; }
         }
         p = line_end + 2;
     }
-    if (!location_seen || !line_end || line_end != p ||
-        host_equal(req.host, location_host) || !portal_marker(location_host)) { return 0; }
+    return location_seen && line_end && line_end == p &&
+           !host_equal(req_host, location_host) && portal_marker(location_host);
+}
+
+int d2k_httpup_portal_response(const char *request, size_t request_len,
+                               const char *upstream, size_t upstream_len,
+                               char *response, size_t response_cap) {
+    http_request req;
+    char location_host[256];
+    if (!response || response_cap == 0) { return 0; }
+    response[0] = '\0';
+    if (!parse_request(request, request_len, &req) ||
+        !portal_answer(req.host, upstream, upstream_len, location_host,
+                       sizeof location_host)) { return 0; }
     return build_redirect(&req, "provider-portal", response, response_cap);
+}
+
+int d2k_httpup_request_target(const char *request, size_t request_len,
+                              char *host, size_t host_cap,
+                              char *target, size_t target_cap) {
+    http_request req;
+    if (!host || !target || host_cap == 0 || target_cap == 0) { return 0; }
+    host[0] = target[0] = '\0';
+    if (!parse_request(request, request_len, &req) ||
+        strlen(req.host) >= host_cap || req.target_len >= target_cap) { return 0; }
+    memcpy(host, req.host, strlen(req.host) + 1);
+    memcpy(target, req.target, req.target_len + 1);
+    return 1;
+}
+
+int d2k_httpup_portal_location(const char *host, const char *response, size_t response_len,
+                               char *portal, size_t portal_cap) {
+    char location_host[256];
+    if (!host || !portal || portal_cap == 0) { return 0; }
+    portal[0] = '\0';
+    if (!portal_answer(host, response, response_len, location_host, sizeof location_host) ||
+        strlen(location_host) >= portal_cap) { return 0; }
+    memcpy(portal, location_host, strlen(location_host) + 1);
+    return 1;
+}
+
+size_t d2k_httpup_redirect_https(const char *host, const char *target,
+                                 char *response, size_t response_cap) {
+    http_request req;
+    if (!response || response_cap == 0) { return 0; }
+    response[0] = '\0';
+    if (!host || !target || strlen(host) >= sizeof req.host ||
+        strlen(target) >= sizeof req.target || target[0] != '/') { return 0; }
+    memset(&req, 0, sizeof req);
+    memcpy(req.host, host, strlen(host) + 1);
+    req.target_len = strlen(target);
+    memcpy(req.target, target, req.target_len + 1);
+    if (!build_redirect(&req, "provider-portal", response, response_cap)) { return 0; }
+    return strlen(response);
 }

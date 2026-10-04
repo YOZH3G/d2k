@@ -13,7 +13,6 @@ builds/*
 !builds/d2kc-linux-*
 !builds/d2kpanel-linux-*
 !builds/d2ktg-linux-*
-!builds/d2khttp-linux-*
 /build/
 /telegram/build/
 /panel/d2kpanel

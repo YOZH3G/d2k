@@ -128,6 +128,16 @@ int d2k_nl_packet(const d2k_nl_msg *m, d2k_nl_pkt *out) {
                 out->have_mark = 1;
             }
             break;
+        case D2K_NFQA_TIMESTAMP:
+            if (vlen >= 16) {
+                uint64_t sec = (uint64_t)n32(val) << 32 | n32(val + 4);
+                uint64_t usec = (uint64_t)n32(val + 8) << 32 | n32(val + 12);
+                if (sec && usec < 1000000u && sec < 18000000000ull) {
+                    out->tstamp_ns = sec * 1000000000ull + usec * 1000u;
+                    out->have_tstamp = 1;
+                }
+            }
+            break;
         case D2K_NFQA_IFINDEX_OUTDEV:
             if (vlen >= 4) {
                 out->outdev = n32(val);
@@ -216,6 +226,24 @@ size_t d2k_nl_verdict(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
     wn32(vh + 0, verdict);
     wn32(vh + 4, pkt_id);
     pos = put_attr(o, cap, pos, D2K_NFQA_VERDICT_HDR, vh, sizeof vh);
+    if (pos == 0) {
+        return 0;
+    }
+    wh32(o, (uint32_t)pos);
+    return pos;
+}
+
+size_t d2k_nl_verdict_payload(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
+                              uint32_t pkt_id, uint32_t verdict,
+                              const uint8_t *payload, size_t len) {
+    if (!payload || len == 0 || len > 0xffffu - D2K_NLA_HDRLEN) {
+        return 0;
+    }
+    size_t pos = d2k_nl_verdict(o, cap, queue, seq, pkt_id, verdict);
+    if (pos == 0) {
+        return 0;
+    }
+    pos = put_attr(o, cap, pos, D2K_NFQA_PAYLOAD, payload, len);
     if (pos == 0) {
         return 0;
     }

@@ -300,6 +300,15 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     if (!in->payload || in->payload_len == 0) {
         return -1;
     }
+    /* HTTP-план — только запросу HTTP, прочий план — только не ему (шаг 4
+       задачи 51): якоря «sni_*» у них считаются от разного. */
+    if ((p->proto == D2K_PLAN_PROTO_HTTP) != (in->is_http != 0)) {
+        return -1;
+    }
+    if (in->is_http && (p->input_tls || p->input_len || p->oob_enabled || p->ipfrag ||
+                        p->udplen || p->qsplit)) {
+        return -1;
+    }
     if (p->input_tls) {
         /* SNI-relative actions are reusable, but a first TCP fragment is
          * not the full input on which raw.c performs its three-part send.

@@ -37,7 +37,11 @@
 /* Version 10 adds REC_QSPLIT: the client's Initial is re-sealed with the
  * ClientHello split into two CRYPTO frames, tail first, same length and
  * packet number (core d2k_quic_initial_split_crypto, task 40). */
-#define D2K_EXEC_VERSION 10
+/* 11: протокол http (задача 51, шаг 4) — вход плана — запрос HTTP, якоря
+ * «sni_*» считаются от имени в Host. Старый исполнитель такой план не
+ * принимает и потому не применит его к TLS. */
+#define D2K_EXEC_VERSION 11
+#define D2K_PLAN_PROTO_HTTP 4
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_WIRE_TCP_TEMPLATE 2
 #define D2K_SCHEMA_MAX   1
@@ -157,6 +161,9 @@ typedef struct {
        уходил повтор клиента без плана. Без фальшивок гонки нет — флаг ничего
        не меняет. */
     int      own_after_fakes;
+    /* Вход — запрос HTTP (sni_off/sni_len — имя в Host). План протокола
+       http исполняется только на таком входе, иной план — только на ином. */
+    int      is_http;
 } d2k_pkt;
 
 /* Состояние потока определяется в d2k_track.h. Здесь только опережающее
@@ -256,6 +263,8 @@ uint8_t d2k_plan_guards(const d2k_plan *p);
  *
  * Ноль — «не объявлен» (старый файл), и это НЕ «не тот» (§2.4). */
 uint8_t d2k_plan_transport(const d2k_plan *p);
+/* Протокол плана (запись proto): 1 tls, 2 quic, 3 voice, 4 http, 0 — не сказан. */
+uint8_t d2k_plan_proto(const d2k_plan *p);
 
 /* Идентификатор плана — те же D2K_PLAN_ID_LEN байт, что пришли записью
  * REC_ID. Нужен контроллеру, чтобы отличить применение СВОЕГО кандидата от

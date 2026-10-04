@@ -17,6 +17,7 @@
  * заголовок переносим и объявляет пределы способа отправки. */
 #include "d2k_raw.h"
 #include "d2k_session.h"
+#include "d2k_http80.h"
 
 /* Control v4: family(1), low/high address(16+16), ports(2+2), protocol(1).
  * IPv4 occupies the first four address bytes with zero tails. Fields are
@@ -50,6 +51,9 @@ typedef struct {
      * вытеснение считает минуты, не наносекунды. */
     uint64_t     now_ns;
     uint8_t      area_id[D2K_TRIAL_ID_LEN];
+    /* Имена с подтверждённым HTTPS (D2K_CMD_SET_HTTPS). NULL — команда
+       отвергается. */
+    d2k_http80  *http80;
 } d2k_ctlsrv;
 
 /* Может ли способ отправки исполнить план ЧЕСТНО — не «примерно».

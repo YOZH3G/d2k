@@ -329,6 +329,8 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             else if (strcmp(f[2], "quic") == 0) { p->proto = 2; }
             /* Голос Дискорда: первый пакет потока — запрос IP Discovery. */
             else if (strcmp(f[2], "voice") == 0) { p->proto = 3; }
+            /* Открытый HTTP (задача 51, шаг 4): вход — запрос, имя — Host. */
+            else if (strcmp(f[2], "http") == 0) { p->proto = 4; }
             else { say(err, errcap, "строка %zu: неизвестный протокол \"%s\"", lineno, f[2]); goto bad; }
         } else if (strcmp(f[0], "payload") == 0) {
             if (nf < 2 || nf > 3) { say(err, errcap, "строка %zu: payload ждёт номер и байты", lineno); goto bad; }

@@ -53,6 +53,7 @@
 #define D2K_NFQA_PACKET_HDR   1
 #define D2K_NFQA_VERDICT_HDR  2
 #define D2K_NFQA_MARK         3
+#define D2K_NFQA_TIMESTAMP    4
 #define D2K_NFQA_IFINDEX_OUTDEV 6
 #define D2K_NFQA_PAYLOAD     10
 #define D2K_NFQA_CAP_LEN     13
@@ -127,6 +128,11 @@ typedef struct {
        OUTPUT и FORWARD. Нужен шлюзу маршрута (d2k_routemark_gate). */
     uint32_t outdev;
     int have_outdev;
+    /* Метка времени приёма пакета ядром (NFQA_TIMESTAMP, стенные часы, нс).
+       Есть, когда ядро ставит skb->tstamp (кто-то включил SO_TIMESTAMP).
+       Без задержки самой очереди и d2kd (задача 51, ревью M1). */
+    uint64_t tstamp_ns;
+    int have_tstamp;
     /* Ядро отдало меньше, чем было на проводе: copy_range обрезал. Работать с
      * таким пакетом нельзя — мы рассуждали бы о куске, считая его целым. */
     int truncated;
@@ -149,6 +155,13 @@ int d2k_nl_errno(const d2k_nl_msg *m, int32_t *err);
 
 size_t d2k_nl_verdict(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
                       uint32_t pkt_id, uint32_t verdict);
+
+/* Вердикт с заменой пакета (NFQA_PAYLOAD): ядро выпускает вместо пришедшего
+ * пакета эти байты (задача 51 — 307 вместо вставки провайдера). Пустая
+ * замена — ошибка сборки, а не «без замены». */
+size_t d2k_nl_verdict_payload(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
+                              uint32_t pkt_id, uint32_t verdict,
+                              const uint8_t *payload, size_t len);
 
 size_t d2k_nl_cfg_cmd(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
                       uint8_t cmd, uint16_t pf);

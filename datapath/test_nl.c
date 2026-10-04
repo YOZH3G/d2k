@@ -108,6 +108,27 @@ int main(void) {
               "вердикт слепился в буфер, куда не влезает");
     }
 
+    /* --- вердикт с заменой пакета (задача 51) -------------------------- */
+    {
+        uint8_t o[128];
+        const uint8_t pay[5] = {0x45, 1, 2, 3, 4};
+        size_t n = d2k_nl_verdict_payload(o, sizeof o, 1, 7, 0x11223344u, D2K_NF_ACCEPT,
+                                          pay, sizeof pay);
+        CHECK(n == 32 + 12, "длина вердикта с заменой не 44 байта");
+        if (little_endian()) {
+            CHECK(o[0] == 44 && o[1] == 0, "nlmsg_len вердикта с заменой не тот");
+        }
+        /* Атрибут NFQA_PAYLOAD: длина 4+5, тип 10, хвост выравнивания нулевой. */
+        CHECK(n >= 44 && o[32] == 9 && o[33] == 0 && o[34] == D2K_NFQA_PAYLOAD && o[35] == 0,
+              "атрибут замены не NFQA_PAYLOAD");
+        CHECK(n >= 44 && memcmp(o + 36, pay, sizeof pay) == 0 && o[41] == 0 && o[42] == 0 &&
+              o[43] == 0, "байты замены или выравнивание не те");
+        CHECK(d2k_nl_verdict_payload(o, 43, 1, 7, 1, D2K_NF_ACCEPT, pay, sizeof pay) == 0,
+              "вердикт с заменой слепился в буфер, куда не влезает");
+        CHECK(d2k_nl_verdict_payload(o, sizeof o, 1, 7, 1, D2K_NF_ACCEPT, NULL, 0) == 0,
+              "вердикт с пустой заменой собрался");
+    }
+
     /* --- команда настройки ------------------------------------------------ */
     {
         uint8_t o[64];
@@ -182,6 +203,13 @@ int main(void) {
         wn32(odev, 7);
         pos = put(buf, pos, D2K_NFQA_IFINDEX_OUTDEV, odev, sizeof odev, 1);
 
+        /* Метка времени ядра (задача 51, ревью M1): sec и usec, be64. */
+        uint8_t ts[16];
+        memset(ts, 0, sizeof ts);
+        wn32(ts + 4, 1700000000u);
+        wn32(ts + 12, 123456u);
+        pos = put(buf, pos, D2K_NFQA_TIMESTAMP, ts, sizeof ts, 1);
+
         uint8_t pay[40];
         for (size_t i = 0; i < sizeof pay; i++) {
             pay[i] = (uint8_t)i;
@@ -204,6 +232,8 @@ int main(void) {
         CHECK(p.hook == 3, "hook потерян");
         CHECK(p.have_mark && p.mark == 0x1234, "метка потеряна");
         CHECK(p.have_outdev && p.outdev == 7, "выходной интерфейс потерян");
+        CHECK(p.have_tstamp && p.tstamp_ns == 1700000000ull * 1000000000ull + 123456000ull,
+              "метка времени ядра потеряна");
         CHECK(p.have_payload && p.payload_len == 40, "нагрузка потеряна");
         CHECK(p.payload && p.payload[0] == 0 && p.payload[39] == 39,
               "содержимое нагрузки не то");

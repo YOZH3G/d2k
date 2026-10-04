@@ -398,6 +398,22 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
                                           probe_port, b[2u + b[0]]);
         ack(cx, type, 1, D2K_ACK_OK);
         return;
+    case D2K_CMD_SET_HTTPS: {
+        if (len < 1 || len != 1u + b[0] + 4u || !cx->http80) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        uint32_t ttl = (uint32_t)b[1u + b[0]] << 24 | (uint32_t)b[2u + b[0]] << 16 |
+                       (uint32_t)b[3u + b[0]] << 8 | b[4u + b[0]];
+        if (ttl > D2K_HTTPS_TTL_MAX_S) { ttl = D2K_HTTPS_TTL_MAX_S; }
+        uint64_t expires = ttl ? cx->now_ns + (uint64_t)ttl * 1000000000ull : 0;
+        if (d2k_http80_set_https(cx->http80, (const char *)b + 1, b[0], expires) != 0) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        ack(cx, type, 1, D2K_ACK_OK);
+        return;
+    }
     case D2K_CMD_DEL_ADDR: {
         if (len != 18 || !canonical_address(b[0], b + 1) || !addr_shape_valid(b[17])) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);

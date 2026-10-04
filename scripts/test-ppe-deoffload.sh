@@ -290,7 +290,7 @@ printf '%s\n' "$FOREIGN" >> "$RULES/v4.mangle.FORWARD"
 (
     # shellcheck disable=SC1090,SC1091
     . "$TMP/init"
-    DIR=$TMP/d2k; RUN=$DIR/run; HTTP_UPGRADE=0; FW_LOCK=$TMP/fw.lock
+    DIR=$TMP/d2k; RUN=$DIR/run; FW_LOCK=$TMP/fw.lock
     PPE_LIB=$LIB
     # shellcheck disable=SC1090
     . "$PPE_LIB"
@@ -313,7 +313,7 @@ done
 (
     # shellcheck disable=SC1090,SC1091
     . "$TMP/init"
-    DIR=$TMP/d2k; RUN=$DIR/run; HTTP_UPGRADE=0; FW_LOCK=$TMP/fw.lock
+    DIR=$TMP/d2k; RUN=$DIR/run; FW_LOCK=$TMP/fw.lock
     PPE_LIB=$LIB
     # shellcheck disable=SC1090
     . "$PPE_LIB"
@@ -332,7 +332,7 @@ targets 1 1
 (
     # shellcheck disable=SC1090,SC1091
     . "$TMP/init"
-    DIR=$TMP/d2k; RUN=$DIR/run; HTTP_UPGRADE=0; FW_LOCK=$TMP/fw.lock
+    DIR=$TMP/d2k; RUN=$DIR/run; FW_LOCK=$TMP/fw.lock
     PPE_LIB=$LIB
     # shellcheck disable=SC1090
     . "$PPE_LIB"
