@@ -2695,9 +2695,22 @@ int main(int argc, char **argv) {
         settle(s); spin(s, 100);
         CHECK(tcp_calls == 1, "domain search repeated");
         CHECK(!said("спрашиваю коробку о свойствах"), "second property search after original");
-        CHECK(!said("запасного перебора"), "second fallback search after original");
-        CHECK(mode == 0 || mode == 4 ? ver_calls == 0 : ver_calls == 1,
-              "original split solution lost or extra candidates tested");
+        if (mode == 0) {
+            /* ПОЛЕ 04.10, rutracker.org на чистом каталоге: замер владеет
+               поиском, блок доказан («решает содержимое»), а выразимого
+               планом приёма нет (взят только «oob»). Решение координатора:
+               внутренние гипотезы оригинала — запасной список — идут явно,
+               и первый его кандидат испытывается. */
+            CHECK(said("выразимого планом приёма нет"),
+                  "owned OPAQUE without a plan: fallback not named");
+            CHECK(said("запасного перебора"), "owned OPAQUE without a plan: fallback list not used");
+            CHECK(said("поставил план 1 из") && ver_calls >= 1,
+                  "owned OPAQUE without a plan: first fallback candidate not tried");
+        } else {
+            CHECK(!said("запасного перебора"), "second fallback search after original");
+            CHECK(mode == 4 ? ver_calls == 0 : ver_calls == 1,
+                  "original split solution lost or extra candidates tested");
+        }
         if (mode == 1) {
             CHECK(mark_calls > 0 && last_mark == 0x2d,
                   "сокет verifier-зонда не получил метку контроллера");
@@ -11441,10 +11454,15 @@ measured_test:
                 CHECK(used == 2,
                       "t37: найденный замером приём — второй и последний опыт; запасной список не перебирается");
             } else if (mode == 1) {
-                CHECK(said("не дало новых кандидатов"),
-                      "t37: промах замера, владеющего поиском, не назван");
-                CHECK(used == 1,
-                      "t37: замер, владеющий поиском, ничего не нашёл — запасной список не перебирается");
+                /* Владеющий поиском замер ничего выразимого не нашёл: после
+                   плана коробки — явный запасной список (решение
+                   координатора 04.10), а не отдых. */
+                const char *box_at = strstr(saidbuf, "готовых планов узнанной коробки");
+                const char *fallback_at = strstr(saidbuf, "запасного перебора");
+                CHECK(said("выразимого планом приёма нет"),
+                      "t37: переход владеющего поиском замера к запасному списку не назван");
+                CHECK(box_at && fallback_at && box_at < fallback_at && used > 1,
+                      "t37: после плана коробки запасной список не испытан");
             } else if (mode == 2) {
                 const char *measured_at = strstr(saidbuf,
                     "проверяю кандидаты из уже выполненного прямого замера");
@@ -11462,7 +11480,9 @@ measured_test:
                       "t37: приём, не помещающийся в предел отправки, поставлен кандидатом");
                 CHECK(!said("отвергнуты исполнителем"),
                       "t37: неподходящий приём дошёл до исполнителя и кончился местным отказом");
-                CHECK(used == 1, "t37: после плана коробки поставлен непомещающийся приём");
+                /* Плана из приёма не вышло — дальше явный запасной список. */
+                CHECK(said("запасного перебора") && used > 1,
+                      "t37: без выразимого плана запасной список не испытан");
             } else {
                 const char *box_at = strstr(saidbuf, "готовых планов узнанной коробки");
                 const char *ask_at = strstr(saidbuf, "готовые планы не помогли; вердикт: решает содержимое — "

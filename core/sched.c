@@ -731,6 +731,10 @@ typedef struct {
     /* Номер следующего плеча ЗАПАСНОГО ПЕРЕБОРА (третий источник кандидатов,
        после готовых планов и синтеза). */
     int        search_owned;
+    /* Замер владеет поиском, блок доказан, а выразимого планом приёма нет:
+       запасной список взят ЯВНО (решение координатора 04.10, поле
+       rutracker.org/discord.com), а не через устаревший search_owned. */
+    int        owned_fallback;
     size_t     fb_next;
     /* Хэши уже испытанных текстов планов — чтобы перебор не предлагал то, что
        синтез уже дал. Одинаковый текст это один и тот же план, сколько бы
@@ -3248,7 +3252,7 @@ static int next_rx_volume_plan(d2k_sched *s, task *t, d2k_shape sh,
 }
 
 static size_t refill_from_fallback(d2k_sched *s, task *t) {
-    if (t->search_owned || t->transport == 17) { return 0; }
+    if ((t->search_owned && !t->owned_fallback) || t->transport == 17) { return 0; }
     size_t cap = sizeof t->plans / sizeof t->plans[0];
     size_t added = 0;
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
@@ -4340,6 +4344,22 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
                 "split payload_start +%d\norder forward\npace %u\n",
                 r->split_pos, (unsigned)r->split_gap_us);
             if (n > 0 && (size_t)n < sizeof t->plans[0]) { t->n_plans = 1; }
+        }
+        /* ЗАМЕР ВЛАДЕЕТ ПОИСКОМ, НО ПОСТАВИТЬ НЕЧЕГО. Поле 04.10, чистый
+           каталог: rutracker.org и discord.com — «решает содержимое», взят
+           только «oob» (URG языком плана не выражается), после него ни одна
+           выразимая отрава не прошла; итог был «кандидатов 0» и отдых.
+           Рабочий план этих целей (680fbe00) 02.10 вырос из запасного
+           списка: его кандидат снял ранний TLS-блок, identity оборвался, и
+           остаточная RX-лестница нашла fake-first план. Внутренние гипотезы
+           оригинала — часть переносимого поведения (AGENTS.md), поэтому
+           здесь запасной список берётся ЯВНО, по этому условию, а не через
+           устаревший флаг владения (его закрыл 423507f, задача 37). */
+        if (t->n_plans == 0 && t->transport == 6 && v == D2K_V_OPAQUE) {
+            say(s, "по %s замер владеет поиском, блок доказан, а выразимого планом приёма нет — "
+                   "беру внутренние гипотезы оригинала (запасной список)", t->name);
+            t->owned_fallback = 1;
+            (void)refill_from_fallback(s, t);
         }
         return;
     }
@@ -6527,6 +6547,7 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     memset(t->tried, 0, sizeof t->tried);
     t->n_tried = 0;
     t->fb_next = 0;
+    t->owned_fallback = 0;
     t->rx_volume_next_variant = 0;
     t->exec_refused = t->exec_probed = 0;
     /* Состояние фазы своих планов, RX-начала и ECH — тоже прошлого поиска
@@ -8391,6 +8412,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        запасной список, которого донор после вердикта не
                        перебирает. */
                     t->search_owned = r.owns_search;
+                    t->owned_fallback = 0;
                     t->cached_measure_valid = 1;
                     t->n_known = known;
                     t->n_plans = known;
