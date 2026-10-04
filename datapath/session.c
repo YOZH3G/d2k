@@ -148,6 +148,9 @@ struct d2k_session {
      * разные строки, и наличие одной ничего не говорит о другой. */
     int      rev_seen[4];
     int      udp_reverse_hook;
+    /* Счётчики потока у ядра по кортежу (d2k_ctq.h); NULL — не спрашивать. */
+    d2k_ct_query_fn ct_query;
+    void *ct_query_ctx;
 
     int      shape_armed[4];
     uint8_t  shape_name[4][256];
@@ -720,6 +723,9 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
            Ответ по нему тоже наблюдаем: иначе обратный трафик выглядел бы
            полным молчанием. Это не проверка протокола или успеха обхода. */
         if (fl->saw_hello || fl->saw_initial) {
+            if (fl->rev_after_hello == 0 && now_ns >= fl->hello_ns) {
+                fl->quic_rtt_ns = now_ns - fl->hello_ns;
+            }
             fl->rev_after_hello++;
             fl->last_rev_after_hello_ns = now_ns;
             if (fl->stun_txid_valid) {
@@ -792,6 +798,12 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        недостижима по построению (0009, U3-R2). */
     if (fl->damaged) {
         out->skipped = "поток испорчен предыдущей отменой";
+        return;
+    }
+    if (fl->quic_deny) {
+        out->verdict = D2K_VERDICT_DROP;
+        out->quic_deny = 1;
+        out->skipped = "QUIC для имени не пропускается: обхода по QUIC нет, клиент уйдёт на TCP";
         return;
     }
     /* Приветствие уже разбирали — второй раз незачем. КРОМЕ случая, когда
@@ -1057,6 +1069,20 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        write-only, а контроллер не получал бы о нём ни слова. */
     if (fl->plan_done && !fl->udp_replan) {
         out->skipped = "план уже применён к этому потоку";
+        return;
+    }
+    if (d2k_plan_quic_deny(use)) {
+        /* Задача 50, раунд 2: обхода по QUIC нет — поток не складывается,
+           клиент уходит на TCP. Зонд контроллера не трогаем: им имя и
+           перепроверяется. APPLIED нет — это не исполнение обхода. */
+        if (fl->controller_probe) {
+            out->skipped = "зонд контроллера: QUIC для имени снят только у клиентов";
+            return;
+        }
+        fl->quic_deny = 1;
+        out->verdict = D2K_VERDICT_DROP;
+        out->quic_deny = 1;
+        out->skipped = "QUIC для имени не пропускается: обхода по QUIC нет, клиент уйдёт на TCP";
         return;
     }
 
@@ -1642,8 +1668,32 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     }
 
     if (rst || fin) {
-        if (fin && !rst && fwd && fl->saw_hello && fl->plan_done &&
-            (fl->rev_types & (uint8_t)(1u << (23 - 20)))) {
+        /* ОТВЕТ ШЁЛ ДАЛЬШЕ РУКОПОЖАТИЯ — условие, при котором закрытие
+           клиента вообще может говорить об обрыве ответа. Два свидетельства:
+           пакет, начатый записью 0x17, или подтверждение клиента, ушедшее за
+           байты ответа, которые видела очередь, при увиденном ServerHello.
+           Второе нужно потому, что очередь видит только начало ответа
+           (connbytes 0:8): у TLS 1.3 там ServerHello-полёт и чистые ACK, а
+           первая запись 0x17 приходит позже (поле 03.10.2026, rua.gr — пакет
+           №10). Без него глухой обрыв Cloudflare не виден ничем.
+           Только подтверждение КЛИЕНТА: в пакете сервера оно считает байты
+           клиента и об ответе ничего не говорит. */
+        const int ack_beyond = fwd && ack && fl->hello_ack_valid && fl->rev_server_hello &&
+            (int32_t)(rd32(t + 8) - fl->hello_ack) > 0 &&
+            rd32(t + 8) - fl->hello_ack > fl->rev_payload_after_hello;
+        const int response_went_on =
+            (fl->rev_types & (uint8_t)(1u << (23 - 20))) || ack_beyond;
+        /* FIN клиента после ответа: поток держим до FIN/RST сервера или до
+           молчания и смотрим, не повторится ли FIN с тем же концом. Повтор
+           значит, что подтверждения с той стороны не пришло — сервер не
+           слышен вовсе. Обычное закрытие, длинная загрузка и long-poll
+           получают ACK (и FIN сервера) и повтора не дают. Раньше это
+           касалось только потоков под планом; поток без плана забывался на
+           первом FIN, и глухой обрыв без RST не давал ни одной улики
+           (задача 50). Подозрение — лишь повод для узкого RX-замера;
+           повторяемость по независимым потокам требует контроллер. */
+        if (fin && !rst && fwd && fl->saw_hello &&
+            (fl->plan_done || !fl->controller_probe) && response_went_on) {
             uint32_t fin_seq = rd32(t + 4) + (uint32_t)(total - ihl - doff);
             if (fl->pending_fin && fl->pending_fin_seq == fin_seq) {
                 d2k_jrn_detail det;
@@ -1651,9 +1701,12 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                 det.server_hello = fl->rev_server_hello;
                 suspect(s, now_ns, &key, fl, D2K_SUSPECT_FIN_RETRY, &det);
             }
+            if (!fl->pending_fin || fl->pending_fin_seq != fin_seq) {
+                fl->pending_fin_ns = now_ns; /* окно повтора — от первого FIN */
+            }
             fl->pending_fin = 1; fl->pending_fin_seq = fin_seq;
             d2k_capture_forget(&s->capture, &key);
-            out->skipped = "клиент закрывает поток под планом; ждём подтверждение или повтор FIN";
+            out->skipped = "клиент закрывает поток после ответа; ждём подтверждение или повтор FIN";
             return 0; /* retain bounded flow metadata, never hold/drop the FIN */
         }
         if (rst && !fwd && fl->saw_hello && rev_before == 0) {
@@ -1670,6 +1723,14 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST, &det);
         } else if (rst && fl->saw_hello && rev_before > 0 &&
                    (fl->rev_types & (uint8_t)(1u << (23 - 20)))) {
+            /* Только пакет 0x17, БЕЗ свидетельства подтверждением (задача 50,
+               раунд 2 — решение по полю 04.10). У RST нет второй половины
+               сигнала FIN — повтора в тишину: он посылается один раз и не
+               отвечается ни при обрыве, ни при обычном закрытии простаивающего
+               соединения. В захвате 04.10 обычные RST клиентов к CloudFront
+               легли на 21,5 и 24,8 КБ — внутри разброса самого обрыва
+               (19,9–24,5 КБ). Safari на обрыве ушёл не в TCP, а в QUIC, curl
+               закрывает FIN-ом; выигрыш не доказан, ложные — измерены. */
             /* Поздний RST после TLS app-data сам по себе НЕ диагноз: сбросить
                мог сервер или клиент (например, браузер, прекративший ждать
                оборванный ответ). Это лишь дешёвый сигнал, после которого
@@ -2207,6 +2268,10 @@ void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed) {
     if (s) { s->udp_reverse_hook = installed != 0; }
 }
 
+void d2k_session_set_ct_query(d2k_session *s, d2k_ct_query_fn fn, void *ctx) {
+    if (s) { s->ct_query = fn; s->ct_query_ctx = ctx; }
+}
+
 int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
                                uint64_t now_ns, d2k_key *key_out) {
     d2k_packet_view ip;
@@ -2525,6 +2590,30 @@ static uint64_t silence_deadline(const d2k_flow *f) {
     return d;
 }
 
+/* ОКНО ПОВТОРА FIN — сколько держать запись после FIN клиента.
+ *
+ * Сигнал один: повтор того же FIN, то есть ретрансмиссия по таймеру. Таймер
+ * задаёт RFC 6298: первый RTO по измеренному R — SRTT + 4·RTTVAR = R + 2R =
+ * 3R (§2.2), не меньше секунды (§2.4); без измерения — секунда (§2.1). Окно
+ * — первый повтор и ещё один после удвоения (§5.5): RTO + 2·RTO = 3·RTO, чтобы
+ * один потерянный повтор не стоил сигнала. Linux и macOS шлют повтор раньше
+ * (пол RTO 200 мс; в поле 03.10 macOS — через 0,44 с), значит окно с запасом.
+ * Повтор, пришедший позже (RTO, раздутый очередью), теряется — это пропуск
+ * сигнала, а не ложное срабатывание. После окна запись не говорит ничего и
+ * только занимает место в таблице, которая выше трёх четвертей отказывает
+ * новым потокам. */
+static uint64_t fin_retry_window(const d2k_flow *f) {
+    uint64_t rto = 3 * f->rtt_ns;
+    if (rto < NS_PER_S) { rto = NS_PER_S; }
+    return 3 * rto;
+}
+
+static int fin_window_over(void *ctx, const d2k_flow *f) {
+    const uint64_t now_ns = *(const uint64_t *)ctx;
+    return f->pending_fin && now_ns >= f->pending_fin_ns &&
+           now_ns - f->pending_fin_ns >= fin_retry_window(f);
+}
+
 struct sweep_ctx {
     d2k_session *s;
     uint64_t     now_ns;
@@ -2588,7 +2677,8 @@ static void sweep_udp_one(void *ctx, d2k_flow *f) {
     struct sweep_ctx *c = ctx;
     /* saw_initial — тот же поток, только имя из Initial не прочиталось
        (см. d2k_track.h). Молчание по нему — наблюдение не хуже прочих. */
-    if ((!f->saw_hello && !f->saw_initial) || f->silence_told || f->suspected) {
+    if ((!f->saw_hello && !f->saw_initial) || f->silence_told || f->suspected ||
+        f->quic_deny) {
         return;
     }
     /* Один ответ не закрывает наблюдение навсегда: цензор может пропустить
@@ -2615,6 +2705,83 @@ static void sweep_udp_one(void *ctx, d2k_flow *f) {
     suspect(c->s, c->now_ns, &f->key, f, D2K_SUSPECT_SILENT, NULL);
 }
 
+/* QUIC ЗАМОЛЧАЛ ПОСЛЕ РУКОПОЖАТИЯ (задача 50, раунд 2; поле 04.10, rua.gr в
+ * Safari и curl --http3-only).
+ *
+ * Рукопожатие прошло, сервер прислал ещё сколько-то пакетов — и замолчал
+ * насовсем (на ppp0 пусто), а клиент шлёт повторы по PTO. Очередь видит у UDP
+ * первые 8 пакетов каждой стороны, поэтому смотрим счётчики conntrack:
+ *   - кандидат: поток с Initial (с именем или без), ответ в очереди был,
+ *     подозрения ещё нет, не зонд контроллера;
+ *   - обратный счётчик ушёл ЗА то, что видела очередь (rev_pkts): сервер
+ *     прошёл дальше рукопожатия, иначе это молчание рукопожатия, у которого
+ *     свой детектор (sweep_udp_one);
+ *   - обратный счётчик стоит не меньше PTO (RFC 9002 §6.2: первый PTO = 3R,
+ *     пол секунда как у окна повтора FIN — шаг обхода тоже секунда);
+ *   - за это время клиент послал не меньше ТРЁХ пакетов. Без ответа законно
+ *     остаются два: последний ACK на последние данные сервера (ACK без
+ *     запроса подтверждения ответа не требует) и CONNECTION_CLOSE (RFC 9000
+ *     §10.2: на него не отвечают). Третий — повтор в тишину: живой сервер на
+ *     пакет, требующий подтверждения, ответил бы за RTT + max_ack_delay.
+ * Это подозрение, не диагноз: контроллер обязан воспроизвести остановку
+ * своим запросом HTTP/3, прежде чем что-то подбирать. */
+static int quic_watch(const d2k_flow *f) {
+    return f->key.proto == 17 && (f->saw_hello || f->saw_initial) &&
+           f->rev_after_hello > 0 && !f->suspected && !f->controller_probe &&
+           !f->quic_deny &&
+           !f->voice_ssrc_valid && !f->stun_txid_valid;
+}
+
+/* Прямой кортеж потока, как его ведёт conntrack: клиент → сервер. Для
+   транзита очередь стоит до SNAT, и адрес клиента в нём локальный — ровно
+   такой же, как в прямом кортеже записи. */
+static void flow_tuple(const d2k_flow *f, d2k_ct_tuple *t) {
+    memset(t, 0, sizeof *t);
+    int v6 = f->key.family == 6;
+    t->family = v6 ? 6 : 4;
+    t->proto = 17;
+    const uint8_t *lo = v6 ? f->key.low_ip6 : (const uint8_t *)&f->key.low_ip;
+    const uint8_t *hi = v6 ? f->key.high_ip6 : (const uint8_t *)&f->key.high_ip;
+    size_t al = v6 ? 16 : 4;
+    int cl = f->init_low;
+    memcpy(t->src, cl ? lo : hi, al);
+    memcpy(t->dst, cl ? hi : lo, al);
+    memcpy(t->sport_be, cl ? (const void *)&f->key.low_port : (const void *)&f->key.high_port, 2);
+    memcpy(t->dport_be, cl ? (const void *)&f->key.high_port : (const void *)&f->key.low_port, 2);
+}
+
+struct ct_ctx {
+    d2k_session *s;
+    uint64_t now_ns;
+    size_t told;
+};
+
+/* Один запрос ядру на наблюдаемый поток (раунд 3: не чтение всей таблицы).
+   Нет ответа — не знаем, и подозрения нет. */
+static void ct_flow(void *ctx, d2k_flow *f) {
+    struct ct_ctx *c = ctx;
+    if (!quic_watch(f)) { return; }
+    d2k_ct_tuple t;
+    flow_tuple(f, &t);
+    uint64_t orig = 0, reply = 0;
+    if (c->s->ct_query(c->s->ct_query_ctx, &t, &orig, &reply) != 0) { return; }
+    if (!f->ct_known || reply != f->ct_reply) {
+        f->ct_known = 1;
+        f->ct_reply = reply;
+        f->ct_reply_ns = c->now_ns;
+        f->ct_orig_mark = orig;
+        return;
+    }
+    if (reply <= f->rev_pkts || orig < f->ct_orig_mark || orig - f->ct_orig_mark < 3) {
+        return;
+    }
+    uint64_t pto = 3 * f->quic_rtt_ns;
+    if (pto < NS_PER_S) { pto = NS_PER_S; }
+    if (c->now_ns < f->ct_reply_ns || c->now_ns - f->ct_reply_ns < pto) { return; }
+    c->told++;
+    suspect(c->s, c->now_ns, &f->key, f, D2K_SUSPECT_QUIC_STALL, NULL);
+}
+
 size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns) {
     if (!s) {
         return 0;
@@ -2622,6 +2789,14 @@ size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns) {
     struct sweep_ctx c = { s, now_ns, 0 };
     d2k_track_walk(s->flows, sweep_one, &c);
     d2k_track_walk(s->uflows, sweep_udp_one, &c);
+    /* Счётчики — только наблюдаемых потоков, по одному запросу ядру на
+       поток (ctnetlink по кортежу, ~10 мкс на роутере). Нет наблюдаемых —
+       ни одного запроса. */
+    if (s->ct_query) {
+        struct ct_ctx cc = { s, now_ns, 0 };
+        d2k_track_walk(s->uflows, ct_flow, &cc);
+        c.told += cc.told;
+    }
     return c.told;
 }
 
@@ -2641,7 +2816,10 @@ size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns) {
        объявить молчанием всякий забытый UDP-поток с приветствием значило бы
        обойти условие про повтор через заднюю дверь. NULL как on_expire —
        штатный случай самого d2k_track_expire. */
-    size_t freed = d2k_track_expire(s->flows, now_ns, idle_ns, on_flow_expire, s);
+    /* Записи после FIN клиента — по своему окну (fin_retry_window), не по
+       молчанию: ответ у них был, и on_flow_expire им сказать нечего. */
+    size_t freed = d2k_track_remove_if(s->flows, fin_window_over, &now_ns);
+    freed += d2k_track_expire(s->flows, now_ns, idle_ns, on_flow_expire, s);
     freed += d2k_track_expire(s->uflows, now_ns, idle_ns, NULL, NULL);
     return freed;
 }

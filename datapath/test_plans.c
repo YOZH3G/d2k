@@ -37,6 +37,19 @@ static d2k_plan *mkplan(void) {
     return p;
 }
 
+/* quicdeny (задача 50): UDP, исполнитель 11, одна запись QDENY. */
+static const uint8_t deny_tlv[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 11, 0, 0, 0, 2,
+    0x00, 0x02, 0x00, 0x02, 17, 2,
+    0x01, 0x10, 0x00, 0x01, 0x01,
+};
+static d2k_plan *mkdeny(void) {
+    d2k_plan *p = NULL;
+    char err[128];
+    if (d2k_plan_load(deny_tlv, sizeof deny_tlv, &p, err, sizeof err) != 0) return NULL;
+    return p;
+}
+
 static uint32_t addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     uint8_t v[4] = {a, b, c, d};
     uint32_t r;
@@ -215,6 +228,20 @@ int main(void) {
         CHECK(d2k_plantab_count(t) == 2 &&
               d2k_plantab_find_family(t, name, 12, 0, 4, D2K_PLAN_SHAPE_MODERN, 123, 6) == v6,
               "controller disconnect must remove trials but preserve confirmed families");
+        /* Раунд 4 (M3): запрет QUIC — не знание каталога. Контроллер ушёл —
+           снимается вместе с опытами, иначе осиротевший запрет жил бы до
+           перезапуска d2kd. Подтверждённое не трогается. */
+        {
+            const uint8_t dn[] = "deny.example";
+            d2k_plan *dp = mkdeny();
+            CHECK(dp != NULL, "quicdeny fixture");
+            CHECK(d2k_plantab_set_name_family(t, dn, 12, 2, dp, D2K_PLAN_SHAPE_QUIC, 0, 4) == 0,
+                  "quicdeny setup");
+            d2k_plantab_clear_probes(t);
+            CHECK(d2k_plantab_find_family(t, dn, 12, 0, 3, D2K_PLAN_SHAPE_QUIC, 0, 4) == NULL,
+                  "quicdeny пережил уход контроллера");
+            CHECK(d2k_plantab_count(t) == 2, "уход контроллера задел подтверждённое");
+        }
         trial = mkplan();
         CHECK(d2k_plantab_set_name_family(t, name, 12, 3, trial, D2K_PLAN_SHAPE_MODERN, 123, 6) == 0,
               "new controller trial setup");

@@ -312,7 +312,9 @@ fw_family_up() (
         --tcp-flags RST RST -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
     # FIN без ответа тоже может повторяться после оборванного тела. Очередь
     # получает только закрывающие пакеты, не всю нагрузку. Первый FIN не
-    # вызывает замер; повтор допускает только RX-пару под применённым планом.
+    # вызывает замер; повтор того же FIN без ответа (с планом и без) допускает
+    # только узкую RX-пару, без плана — после второго такого потока за 30 с.
+    # FIN сервера здесь же отпускает запись потока при обычном закрытии.
     "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
         --tcp-flags FIN FIN -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1

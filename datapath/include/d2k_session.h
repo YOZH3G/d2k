@@ -21,6 +21,7 @@
 #include "d2k_plans.h"
 #include "d2k_track.h"
 #include "d2k_wire.h"
+#include "d2k_ctq.h"
 
 /* Что делать с пакетом, который нам дали. */
 typedef enum {
@@ -95,6 +96,10 @@ typedef struct {
     uint8_t  first_payload;
     uint8_t  udp_hold_wait;
     uint8_t  udp_hold_ready;
+    /* Датаграмма снята quicdeny (задача 50, раунд 2): QUIC для имени не
+       пропускается. Удержанная пачка снимается целиком, хвосты не
+       переотправляются. */
+    uint8_t  quic_deny;
     /* Task 47: the first packet of a flow whose client carries a routing mark
        (d2k_session_set_route_mark) — the caller logs it once per flow. */
     uint8_t  routed_first;
@@ -168,6 +173,12 @@ uint64_t d2k_session_routed_flows(const d2k_session *s);
    установлено. Нужен для распознавания полной тишины на заблокированном QUIC,
    где обратный пакет физически не может прийти. По умолчанию выключено. */
 void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed);
+/* Счётчики пакетов потока у conntrack по прямому кортежу: 0 — orig/reply
+   заполнены, иначе «не знаем». Обязана не ждать (d2k_ctq.h). d2kd ставит
+   ctnetlink; NULL — детектор «QUIC замолчал» выключен. */
+typedef int (*d2k_ct_query_fn)(void *ctx, const d2k_ct_tuple *t,
+                               uint64_t *orig_pkts, uint64_t *reply_pkts);
+void d2k_session_set_ct_query(d2k_session *s, d2k_ct_query_fn fn, void *ctx);
 
 /* Начать/завершить внешнее удержание split QUIC. Begin вызывается до обработки
  * первой кандидатной датаграммы; payload никогда не склеивается здесь. */

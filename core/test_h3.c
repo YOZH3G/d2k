@@ -37,6 +37,25 @@ int main(void) {
     CHECK(buf[hdr + 6] == 11, "длина имени не та");
     CHECK(memcmp(buf + hdr + 7, "example.com", 11) == 0, "имя в запросе не то");
 
+    /* Путь, отличный от "/": поле :path одно — литерал. Индексное «:path /»
+       рядом с ним давало ДВА :path, и сервер (Cloudflare, Google) честно
+       отвечал 400 целиком — а правило этапа данных засчитывало полный 400 как
+       прошедшее плечо (поле 04.10, задача 50, раунд 2). */
+    n = d2k_h3_request("example.com", "/big.css", buf, sizeof buf);
+    CHECK(n > 0, "запрос с путём не собрался");
+    {
+        int indexed_root = 0, literal_path = 0;
+        for (size_t i = hdr + 2; i < n; i++) {
+            if (buf[i] == 0xc1) indexed_root++;
+            if (buf[i] == 0x51 && i + 1 < n && buf[i + 1] == 8 &&
+                i + 2 + 8 <= n && memcmp(buf + i + 2, "/big.css", 8) == 0) literal_path++;
+        }
+        CHECK(buf[hdr + 2] == 0xd1 && buf[hdr + 3] == 0xd7,
+              "запрос с путём потерял :method/:scheme");
+        CHECK(indexed_root == 0, "запрос с путём несёт второй :path (индексный \"/\")");
+        CHECK(literal_path == 1, "запрос с путём не несёт свой :path литералом");
+    }
+
     /* Ответ индексным полем статической таблицы: 25 это :status 200. */
     {
         uint8_t rsp[] = { 0x01, 0x03, 0x00, 0x00, 0xd9 };

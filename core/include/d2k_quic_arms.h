@@ -16,6 +16,9 @@ typedef struct {
        пуст. benign: blob — безобидная датаграмма вопроса «остаточное
        разрешение» (D2K_QUIC_BENIGN), а не приманка перебора. */
     int split, benign;
+    /* Задача 50, раунд 3: засчитывать только ответ целиком (поиск по обрыву
+       после рукопожатия — сравнение с прямым запросом на том же пути). */
+    int need_complete;
 } d2k_quic_arm_question;
 
 /* БЕЗОБИДНАЯ ДАТАГРАММА ВОПРОСА «ОСТАТОЧНОЕ РАЗРЕШЕНИЕ» (задача 40).
@@ -93,6 +96,8 @@ typedef struct {
     /* Финальное ревью core, I1: разрез CRYPTO клиенту неприменим (ClientHello
        шире датаграммы) — вопрос о нём не задаётся, он не может стать планом. */
     int no_split;
+    /* Задача 50, раунд 3: этап данных засчитывает только ответ целиком. */
+    int need_complete;
 } d2k_quic_arm_context;
 
 /* Runtime transport for one original askArms question. It receives the SNI

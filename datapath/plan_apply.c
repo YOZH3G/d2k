@@ -305,6 +305,12 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     if ((p->proto == D2K_PLAN_PROTO_HTTP) != (in->is_http != 0)) {
         return -1;
     }
+    if (p->qdeny) {
+        /* Не воздействие: оригинал снимается, посылок нет (сессия решает
+           это раньше; здесь — чтобы исполнитель не выдумал иного). */
+        out->fate = D2K_ORIG_DROP;
+        return 0;
+    }
     if (in->is_http && (p->input_tls || p->input_len || p->oob_enabled || p->ipfrag ||
                         p->udplen || p->qsplit)) {
         return -1;

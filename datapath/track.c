@@ -306,6 +306,23 @@ size_t d2k_track_expire(d2k_table *t, uint64_t now_ns, uint64_t idle_ns,
     return freed;
 }
 
+size_t d2k_track_remove_if(d2k_table *t, int (*gone)(void *ctx, const d2k_flow *f),
+                           void *ctx) {
+    if (!t || !gone) {
+        return 0;
+    }
+    size_t freed = 0;
+    /* Как в d2k_track_expire: remove_at двигает записи назад, ячейку после
+       удаления надо перепроверить. */
+    for (size_t s = 0; s < t->cap; s++) {
+        while (t->state[s] == SLOT_USED && gone(ctx, &t->slots[s])) {
+            remove_at(t, s);
+            freed++;
+        }
+    }
+    return freed;
+}
+
 size_t d2k_track_count(const d2k_table *t) {
     return t ? t->used : 0;
 }

@@ -37,9 +37,12 @@
 /* Version 10 adds REC_QSPLIT: the client's Initial is re-sealed with the
  * ClientHello split into two CRYPTO frames, tail first, same length and
  * packet number (core d2k_quic_initial_split_crypto, task 40). */
-/* 11: протокол http (задача 51, шаг 4) — вход плана — запрос HTTP, якоря
- * «sni_*» считаются от имени в Host. Старый исполнитель такой план не
- * принимает и потому не применит его к TLS. */
+/* 11 (сборка 04.10, обе ветки вместе — ни одна не выходила отдельно):
+ * протокол http (задача 51, шаг 4) — вход плана — запрос HTTP, якоря
+ * «sni_*» считаются от имени в Host; и REC_QDENY (задача 50, раунд 2) — QUIC
+ * для имени не пропускается (датаграммы клиента снимаются, посылок нет),
+ * чтобы клиент ушёл на TCP; это не обход QUIC. Старый исполнитель такие
+ * планы не принимает. */
 #define D2K_EXEC_VERSION 11
 #define D2K_PLAN_PROTO_HTTP 4
 #define D2K_WIRE_DETECT_TCP 1
@@ -252,6 +255,8 @@ size_t d2k_plan_max_emit(const d2k_plan *p);
  * действует не на один пакет, а на соединение, и потому не является
  * действием. */
 uint8_t d2k_plan_guards(const d2k_plan *p);
+/* 1 — план «QUIC для имени не пропускается» (REC_QDENY). */
+int d2k_plan_quic_deny(const d2k_plan *p);
 
 /* ТРАНСПОРТ, ДЛЯ КОТОРОГО ПЛАН ОБЪЯВЛЕН: 6 TCP, 17 UDP, 0 — не объявлен.
  *

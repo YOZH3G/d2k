@@ -13,8 +13,11 @@
  * зовёт его на UDP-ветке пакетного пути и правильно распоряжается
  * результатом). ClientHello внутри несёт имя example.com.
  */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include "d2k_session.h"
 #include "d2k_journal.h"
@@ -1579,7 +1582,228 @@ static int frag_nat6(const char *path, uint8_t proto, const uint8_t *src,
     return 0;
 }
 
+/* --- QUIC ЗАМОЛЧАЛ ПОСЛЕ РУКОПОЖАТИЯ (задача 50, раунд 2) ---------------
+ *
+ * Поле 04.10: Safari и curl --http3-only на rua.gr. Рукопожатие проходит,
+ * сервер присылает ещё несколько пакетов данных и замолкает НАСОВСЕМ (на ppp0
+ * пусто), клиент повторяет короткие пакеты по PTO (1, 2, 3, 4, 6, 10… с).
+ * Очередь видит лишь первые 8 пакетов каждой стороны; остальное видно только
+ * по счётчикам conntrack: прямой растёт, обратный стоит. Раунд 3: счётчики
+ * спрашиваются у ядра по кортежу (ctnetlink, d2k_ctq.h), только для
+ * наблюдаемых потоков; здесь запрос подменён. */
+static struct { uint16_t cport; uint64_t orig, reply; int acct; } fake_ct;
+static unsigned ct_queries;
+static void ct_write(uint16_t cport, uint64_t orig, uint64_t reply, int acct) {
+    fake_ct.cport = cport; fake_ct.orig = orig; fake_ct.reply = reply; fake_ct.acct = acct;
+}
+static int fake_ct_query(void *ctx, const d2k_ct_tuple *t, uint64_t *orig, uint64_t *reply) {
+    (void)ctx;
+    ct_queries++;
+    static const uint8_t cli[4] = {192, 168, 1, 67}, srv[4] = {1, 2, 3, 4};
+    uint16_t sp = (uint16_t)(t->sport_be[0] << 8 | t->sport_be[1]);
+    uint16_t dp = (uint16_t)(t->dport_be[0] << 8 | t->dport_be[1]);
+    /* Прямой кортеж — клиент → сервер, как его ведёт conntrack. */
+    if (t->family != 4 || t->proto != 17 || memcmp(t->src, cli, 4) || memcmp(t->dst, srv, 4) ||
+        dp != 443 || sp != fake_ct.cport || !fake_ct.acct) return -1;
+    *orig = fake_ct.orig; *reply = fake_ct.reply;
+    return 0;
+}
+
+static uint8_t last_suspect_code(const d2k_session *s) {
+    const d2k_journal *j = d2k_session_journal(s);
+    uint8_t code = 0;
+    for (size_t i = 0; i < d2k_journal_count(j); i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e && e->kind == D2K_JRN_SUSPECT) code = e->code;
+    }
+    return code;
+}
+
+/* Поток с именем: Initial клиента, rev ответных пакетов в окне очереди. */
+static d2k_session *stall_flow(uint16_t cport, int rev) {
+    const uint64_t S = 1000000000ull;
+    d2k_session *s = d2k_session_new(64, 64);
+    if (!s) return NULL;
+    d2k_session_set_ct_query(s, fake_ct_query, NULL);
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    size_t n = build_udp_pkt(pkt, cport, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 1 * S, buf, sizeof buf, &r);
+    const uint8_t any[40] = {0x40};
+    for (int i = 0; i < rev; i++) {
+        n = build_udp_rev_pkt(pkt, cport, any, sizeof any);
+        d2k_session_packet(s, pkt, n, 1 * S + 50000000ull + (uint64_t)i, buf, sizeof buf, &r);
+    }
+    return s;
+}
+
+static void test_quic_post_handshake_stall(void) {
+    const uint64_t S = 1000000000ull;
+    /* Нечего смотреть — ядро не спрашивается вовсе. */
+    {
+        d2k_session *s0 = d2k_session_new(64, 64);
+        d2k_session_set_ct_query(s0, fake_ct_query, NULL);
+        ct_queries = 0;
+        d2k_session_sweep(s0, 5 * S);
+        uint8_t p0[1300], b0[4096];
+        d2k_result r0;
+        /* Initial без ответа сервера — тоже не кандидат (молчание
+           рукопожатия — забота SILENT). */
+        size_t n0 = build_udp_pkt(p0, 50399, 443, v1_initial, sizeof v1_initial);
+        d2k_session_packet(s0, p0, n0, 6 * S, b0, sizeof b0, &r0);
+        d2k_session_sweep(s0, 7 * S);
+        CHECK(ct_queries == 0, "conntrack спрошен, хотя наблюдать нечего");
+        d2k_session_free(s0);
+    }
+
+    /* Обрыв: сервер дал 14 пакетов (очередь видела 8), дальше молчит; клиент
+       шлёт повторы. */
+    d2k_session *s = stall_flow(50400, 8);
+    ct_write(50400, 12, 14, 1);
+    d2k_session_sweep(s, 2 * S);
+    ct_write(50400, 13, 14, 1);
+    d2k_session_sweep(s, 3 * S);
+    CHECK(d2k_session_suspects(s) == 0, "два пакета клиента в тишину уже объявлены обрывом");
+    ct_write(50400, 15, 14, 1);
+    d2k_session_sweep(s, 4 * S);
+    CHECK(last_suspect_code(s) == D2K_SUSPECT_QUIC_STALL,
+          "QUIC замолчал после рукопожатия, клиент повторяет — подозрения нет");
+    ct_write(50400, 25, 14, 1);
+    d2k_session_sweep(s, 9 * S);
+    CHECK(d2k_session_suspects(s) == 1, "один поток дал больше одного подозрения");
+    d2k_session_free(s);
+
+    /* Рабочий QUIC: обратный счётчик растёт — ни при каком числе пакетов клиента. */
+    s = stall_flow(50401, 8);
+    for (int i = 0; i < 10; i++) {
+        ct_write(50401, 20 + 50 * (uint64_t)i, 30 + 900 * (uint64_t)i, 1);
+        d2k_session_sweep(s, (uint64_t)(2 + i) * S);
+    }
+    CHECK(d2k_session_suspects(s) == 0, "рабочая загрузка по QUIC объявлена обрывом");
+    d2k_session_free(s);
+
+    /* Обычное окончание: последний ACK клиента и его CONNECTION_CLOSE остаются
+       без ответа законно — два пакета в тишину не обрыв. */
+    s = stall_flow(50402, 8);
+    ct_write(50402, 20, 40, 1);
+    d2k_session_sweep(s, 2 * S);
+    ct_write(50402, 22, 40, 1);
+    d2k_session_sweep(s, 30 * S);
+    CHECK(d2k_session_suspects(s) == 0, "ACK и CONNECTION_CLOSE клиента объявлены обрывом");
+    d2k_session_free(s);
+
+    /* Обратный счётчик не ушёл за окно очереди: это молчание рукопожатия,
+       у него свой детектор (SILENT), не этот. */
+    s = stall_flow(50403, 1);
+    ct_write(50403, 3, 1, 1);
+    d2k_session_sweep(s, 1 * S + 100000000ull);
+    ct_write(50403, 9, 1, 1);
+    d2k_session_sweep(s, 1 * S + 900000000ull);
+    CHECK(last_suspect_code(s) != D2K_SUSPECT_QUIC_STALL,
+          "молчание до конца рукопожатия выдано за обрыв после него");
+    d2k_session_free(s);
+
+    /* Счётчиков в таблице нет (accounting выключен) — сказать нечего. */
+    s = stall_flow(50404, 8);
+    ct_write(50404, 0, 0, 0);
+    d2k_session_sweep(s, 2 * S);
+    d2k_session_sweep(s, 6 * S);
+    CHECK(d2k_session_suspects(s) == 0, "строка без счётчиков дала подозрение");
+    d2k_session_free(s);
+
+    /* Тишина короче PTO: клиент шлёт три пакета за полсекунды — сервер ещё
+       мог не успеть ответить. */
+    s = stall_flow(50405, 8);
+    ct_write(50405, 12, 14, 1);
+    d2k_session_sweep(s, 2 * S);
+    ct_write(50405, 15, 14, 1);
+    d2k_session_sweep(s, 2 * S + 500000000ull);
+    CHECK(d2k_session_suspects(s) == 0, "тишина короче PTO объявлена обрывом");
+    d2k_session_free(s);
+
+    /* Один наблюдаемый поток — один запрос на обход, не чтение таблицы. */
+    s = stall_flow(50406, 8);
+    ct_write(50406, 12, 14, 1);
+    ct_queries = 0;
+    d2k_session_sweep(s, 2 * S);
+    CHECK(ct_queries == 1, "на обход ушло не по одному запросу на наблюдаемый поток");
+    d2k_session_free(s);
+}
+
+/* --- QUIC ДЛЯ ИМЕНИ НЕ ПРОПУСКАЕТСЯ (задача 50, раунд 2, требование 5c) ----
+ *
+ * Обрыв QUIC после рукопожатия воспроизведён своим запросом, обхода по QUIC
+ * нет: контроллер ставит на имя план «quicdeny». Каждая датаграмма клиента
+ * этого потока, которую видит очередь, снимается — рукопожатие не
+ * складывается, и браузер уходит на TCP (там свой поиск). Это НЕ обход QUIC
+ * (§4 спецификации): ни посылок, ни события APPLIED. Зонд контроллера не
+ * снимается — иначе перепроверить имя было бы нечем. Молчание потока, которое
+ * мы устроили сами, подозрением не становится. */
+static const uint8_t plan_deny[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 11, 0, 0, 0, 2,
+    0x00, 0x02, 0x00, 0x02, 17, 2,
+    0x01, 0x10, 0x00, 0x01, 0x01,
+};
+static const uint8_t plan_deny_tcp[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 11, 0, 0, 0, 2,
+    0x00, 0x02, 0x00, 0x02, 6, 1,
+    0x01, 0x10, 0x00, 0x01, 0x01,
+};
+static const uint8_t plan_deny_old[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 10, 0, 0, 0, 2,
+    0x00, 0x02, 0x00, 0x02, 17, 2,
+    0x01, 0x10, 0x00, 0x01, 0x01,
+};
+
+static void test_quic_deny(void) {
+    const uint64_t S = 1000000000ull;
+    char err[160];
+    d2k_plan *p = NULL;
+    CHECK(d2k_plan_load(plan_deny, sizeof plan_deny, &p, err, sizeof err) == 0,
+          "план quicdeny не разобрался");
+    CHECK(p && d2k_plan_quic_deny(p), "план quicdeny не опознан");
+    d2k_plan *bad = NULL;
+    CHECK(d2k_plan_load(plan_deny_tcp, sizeof plan_deny_tcp, &bad, err, sizeof err) != 0,
+          "quicdeny принят для TCP");
+    CHECK(d2k_plan_load(plan_deny_old, sizeof plan_deny_old, &bad, err, sizeof err) != 0,
+          "quicdeny принят без minexec=11");
+    if (!p) return;
+
+    d2k_session *s = d2k_session_new(64, 64);
+    CHECK(d2k_plantab_set_name_family(d2k_session_plans(s), (const uint8_t *)"example.com", 11,
+                                      1, p, D2K_PLAN_SHAPE_QUIC, 0, 4) == 0,
+          "quicdeny не встал на имя");
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    /* Обратная сторона видна — молчание иначе не рассматривалось бы вовсе. */
+    const uint8_t any[4] = {1, 2, 3, 4};
+    size_t n = build_udp_rev_pkt(pkt, 50500, any, sizeof any);
+    d2k_session_packet(s, pkt, n, 1 * S, buf, sizeof buf, &r);
+
+    n = build_udp_pkt(pkt, 50501, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 2 * S, buf, sizeof buf, &r);
+    CHECK(r.verdict == D2K_VERDICT_DROP && r.n_out == 0,
+          "Initial имени без обхода по QUIC не снят (или ушли посылки)");
+    CHECK(r.quic_deny == 1, "снятие quicdeny не помечено для удержанной пачки");
+    CHECK(count_journal_kind(s, D2K_JRN_PLAN_APPLIED) == 0,
+          "снятие QUIC выдано контроллеру за применение плана");
+    /* Повтор Initial по PTO — тоже снимается: иначе рукопожатие сложится
+       со второй попытки. */
+    d2k_session_packet(s, pkt, n, 3 * S, buf, sizeof buf, &r);
+    CHECK(r.verdict == D2K_VERDICT_DROP, "повтор Initial прошёл мимо quicdeny");
+    d2k_session_sweep(s, 10 * S);
+    CHECK(d2k_session_suspects(s) == 0, "молчание, устроенное quicdeny, стало подозрением");
+
+    /* Зонд контроллера того же имени не снимается. */
+    n = build_udp_pkt(pkt, 50502, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet_probe(s, pkt, n, 11 * S, buf, sizeof buf, &r);
+    CHECK(r.verdict != D2K_VERDICT_DROP, "quicdeny снял зонд контроллера");
+    d2k_session_free(s);
+}
+
 int main(void) {
+    test_quic_deny();
+    test_quic_post_handshake_stall();
     {
         d2k_session *s = d2k_session_new(32, 32);
         uint8_t pkt[1400], out[8192]; char err[128]; d2k_plan *p = NULL;

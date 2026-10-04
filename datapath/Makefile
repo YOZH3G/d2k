@@ -30,18 +30,18 @@ COREHDR  = $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_quicwire.h $(C
 QUIC_FIXTURE_OBJ = core_quichello.o core_hello.o core_tls13core.o core_x25519.o
 
 # Переносимый датапат: собирается и проверяется на любой машине.
-SRC     = http80.c addr.c plan_parse.c plan_apply.c tls.c capture.c hold.c udp_hold.c udp_release.c udp_path.c routemark.c wire.c wire_udp.c track.c session.c nat.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
+SRC     = http80.c addr.c plan_parse.c plan_apply.c tls.c capture.c hold.c udp_hold.c udp_release.c udp_path.c routemark.c wire.c wire_udp.c track.c session.c nat.c nl.c ctq.c sched.c journal.c plans.c ctl.c ctlsrv.c
 # Системный слой: только Linux. На маке не собирается намеренно — подделывать
 # сокеты ядра ради сборки значило бы проверять подделку. Проверяется целью
 # cross, которая линкует ПОЛНУЮ службу под обе целевые арки: полная сборка
 # доказывает больше, чем компиляция объектников.
 LINUXSRC = nfq.c raw.c routemark_nl.c
 DAEMON   = d2kd.c
-HDR     = include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h include/d2k_udp_path.h include/d2k_routemark.h include/d2k_capture.h include/d2k_plan.h include/d2k_nat.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h include/d2k_http80.h plan_internal.h $(COREHDR)
+HDR     = include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h include/d2k_udp_path.h include/d2k_routemark.h include/d2k_capture.h include/d2k_plan.h include/d2k_nat.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_ctq.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h include/d2k_http80.h plan_internal.h $(COREHDR)
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_addr test_hold test_udp_hold test_udp_release test_udp_path test_routemark test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session test_http80 test_http_hello
+TESTS   = test_addr test_hold test_udp_hold test_udp_release test_udp_path test_routemark test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session test_ctq test_http80 test_http_hello
 
 .PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release test-udp-path test-routemark cross clean
 
@@ -101,8 +101,8 @@ udp_path.o: udp_path.c $(HDR)
 
 # Владение ID в обвязке d2kd (задача 46, ревью M4): сессия, удержание и
 # выпуск — настоящие модули, сокеты заменены записью вызовов.
-test_udp_path: test_udp_path.c udp_path.o udp_hold.o udp_release.o routemark.o nl.o session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_udp_path.c udp_path.o udp_hold.o udp_release.o routemark.o nl.o session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
+test_udp_path: test_udp_path.c udp_path.o udp_hold.o udp_release.o routemark.o session.o http80.o hold.o capture.o nat.o ctq.o nl.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_udp_path.c udp_path.o udp_hold.o udp_release.o routemark.o session.o http80.o hold.o capture.o nat.o ctq.o nl.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
 
 test-udp-path: test_udp_path
 	./test_udp_path
@@ -221,10 +221,10 @@ ctl.o: ctl.c $(HDR)
 # настоящим кадром вовсе — отказ «нет места» от отказа «план негоден»
 # различимы на уровне ЭТОГО разбора, и подделывать его нельзя (см. шапку
 # файла). Тот же список объектников, что у test_session/ctlprobe.
-test_ctl: test_ctl.c ctl.o ctlsrv.o http80.o session.o hold.o capture.o nat.o journal.o track.o tls.o wire.o \
+test_ctl: test_ctl.c ctl.o ctlsrv.o session.o http80.o hold.o capture.o nat.o ctq.o nl.o journal.o track.o tls.o wire.o \
           wire_udp.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o \
           core_crypto.o core_ipfrag.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_ctl.c ctl.o ctlsrv.o http80.o session.o hold.o capture.o nat.o journal.o \
+	$(CC) $(CFLAGS) -o $@ test_ctl.c ctl.o ctlsrv.o session.o http80.o hold.o capture.o nat.o ctq.o nl.o journal.o \
 	    track.o tls.o wire.o wire_udp.o plans.o plan_parse.o plan_apply.o \
 	    $(COREOBJ) $(LDFLAGS)
 
@@ -237,18 +237,18 @@ test_journal: test_journal.c journal.o track.o $(HDR)
 # wire_udp.o и core_quic.o/core_crypto.o добавлены задачей 4: session.c теперь
 # зовёт d2k_wire_build_udp и разбор QUIC на UDP-ветке пакетного пути, и без
 # них линковка падает неопределёнными ссылками.
-test_session: test_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(LDFLAGS)
+test_session: test_session.c session.o http80.o hold.o capture.o nat.o ctq.o nl.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_session.c session.o http80.o hold.o capture.o nat.o ctq.o nl.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(LDFLAGS)
 
 # test_quic_session.c (задача 4) — то же самое дерево модулей, что и
 # test_session, тем же списком объектников: обе проверяют d2k_session_packet
 # целиком, только на разных транспортах.
-test_quic_session: test_quic_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
+test_quic_session: test_quic_session.c session.o http80.o hold.o capture.o nat.o ctq.o nl.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_session.c session.o http80.o hold.o capture.o nat.o ctq.o nl.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
 
 # Keep the STUN datapath proof independently runnable while QUIC acceptance is deferred.
-test_stun_session: test_stun_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_stun_session.c session.o http80.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
+test_stun_session: test_stun_session.c session.o http80.o hold.o capture.o nat.o ctq.o nl.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_stun_session.c session.o http80.o hold.o capture.o nat.o ctq.o nl.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(QUIC_FIXTURE_OBJ) $(LDFLAGS)
 
 track.o: track.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -272,6 +272,18 @@ test_nat: test_nat.c nat.o $(HDR)
 
 test-nat: test_nat
 	./test_nat
+
+ctq.o: ctq.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test_ctq: test_ctq.c ctq.o nl.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_ctq.c ctq.o nl.o $(LDFLAGS)
+
+.PHONY: test-ctq
+test-ctq: test_ctq
+	./test_ctq
+
+check: test-ctq
 
 nl.o: nl.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<

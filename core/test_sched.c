@@ -486,6 +486,8 @@ static d2k_ver_result stub_quic_path_ver(int use_fd, const char *ip, uint16_t po
 
 /* Задача 39: путь, которым этап данных плеча спрашивает цель (вход в arm). */
 static char quic_last_path[512];
+static int quic_last_data_cut = -1;
+static int quic_arm_none = 0; /* OPAQUE без найденного плеча */
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
                           d2k_hello trigger, d2k_hello control, uint32_t mark,
                           d2k_quic_arm *arm) {
@@ -544,10 +546,15 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
     memset(&r, 0, sizeof r);
     r.verdict = quic_answer;
     quic_last_split_unfit = arm ? arm->split_unfit : -1;
+    quic_last_data_cut = arm ? arm->data_cut : -1;
+    int keep_data_cut = arm ? arm->data_cut : 0;
     memset(arm, 0, sizeof *arm);
     arm->kind = D2K_QA_NOT_FOUND;
-    if (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX || r.verdict == D2K_V_WHOLE)
+    if (!quic_arm_none &&
+        (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX || r.verdict == D2K_V_WHOLE))
         *arm = stub_arm(ip, port, sni, NULL, trigger, mark);
+    if (quic_arm_none) { arm->original = 1; }
+    arm->data_cut = keep_data_cut;
     r.qprops = quic_props_answer;
     snprintf(r.reason, sizeof r.reason, "подменённый вопросник QUIC");
     return r;
@@ -1465,6 +1472,28 @@ static size_t sent_set_name_shape(const char *name, uint8_t shape) {
         const uint8_t *body = p + 6;
         if (cmd == D2K_CMD_SET_NAME && n - 2 >= 3 + nl && body[0] == nl &&
             !memcmp(body + 1, name, nl) && body[1 + nl] == shape) { count++; }
+        off += 4 + n;
+    }
+    return count;
+}
+
+/* SET_NAME с планом quicdeny (запись 0x0110) для имени — задача 50, раунд 2. */
+static size_t sent_quic_deny(const char *name) {
+    static const uint8_t rec[] = {0x01, 0x10, 0x00, 0x01, 0x01};
+    size_t count = 0, nl = strlen(name);
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+                     (uint32_t)p[2] << 8 | p[3];
+        if (n < 2 || n > sent_len - off - 4) break;
+        uint16_t cmd = (uint16_t)((uint16_t)p[4] << 8 | p[5]);
+        const uint8_t *body = p + 6;
+        size_t len = n - 2;
+        if (cmd == D2K_CMD_SET_NAME && len >= 3 + nl && body[0] == nl &&
+            !memcmp(body + 1, name, nl)) {
+            for (size_t i = 1 + nl; i + sizeof rec <= len; i++)
+                if (!memcmp(body + i, rec, sizeof rec)) { count++; break; }
+        }
         off += 4 + n;
     }
     return count;
@@ -3333,6 +3362,255 @@ int main(int argc, char **argv) {
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c18);
+    }
+
+    /* ЗАДАЧА 50. Повтор FIN без ответа на потоке БЕЗ плана (глухой обрыв
+       ответа Cloudflare, rua.gr 03.10) — тот же низкоуверенный сигнал
+       позднего закрытия, что поздний RST: одиночный не меряется, второй по
+       независимому потоку в окне запускает ровно одну RX-volume-пару, а не
+       полный поиск. Поздний RST и повтор FIN подтверждают друг друга: оба —
+       оборванный ответ той же цели. */
+    {
+        d2k_catalog c50 = {0};
+        d2k_sched *s = d2k_sched_new(&c50, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для повтора FIN не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            vol_calls = tcp_calls = 0;
+            vol_answer = D2K_VOL_PASSED;
+            vol_rx_cut = 0;
+            settle(s);
+            const char *name = "silent-cut.test";
+            d2k_ev h = ev_hello(6, 41060, name);
+            d2k_sched_event(s, &h);
+            d2k_ev f = ev_suspect(6, 41060);
+            f.code = D2K_SUSPECT_FIN_RETRY;
+            f.planned = D2K_LINK_PLANNED_NO;
+            CHECK(d2k_sched_event(s, &f) == 0,
+                  "одиночный повтор FIN без плана сразу запустил замер");
+            settle(s);
+            CHECK(vol_calls == 0 && tcp_calls == 0,
+                  "одиночный повтор FIN без плана дошёл до сетевого измерения");
+            CHECK(said("жду второй независимый поток"),
+                  "ожидание второго позднего закрытия не отражено в журнале");
+            CHECK(d2k_sched_event(s, &f) == 0,
+                  "повтор FIN того же потока засчитан как независимый");
+            settle(s);
+            CHECK(vol_calls == 0, "повтор того же потока запустил замер");
+            d2k_ev h2 = ev_hello(6, 41061, name);
+            d2k_sched_event(s, &h2);
+            d2k_ev f2 = ev_suspect(6, 41061);
+            f2.code = D2K_SUSPECT_FIN_RETRY;
+            f2.planned = D2K_LINK_PLANNED_NO;
+            CHECK(d2k_sched_event(s, &f2) == 1,
+                  "второй повтор FIN по независимому потоку не запустил замер");
+            settle(s);
+            CHECK(vol_calls == 1 && tcp_calls == 0,
+                  "подтверждённый повтор FIN не прошёл ровно одну RX-volume-пару");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c50);
+
+        /* Смешанная пара: поздний RST, затем повтор FIN на другом потоке. */
+        c50 = (d2k_catalog){0};
+        s = d2k_sched_new(&c50, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик смешанной пары не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            vol_calls = tcp_calls = 0;
+            vol_answer = D2K_VOL_PASSED;
+            vol_rx_cut = 0;
+            /* Часы планировщика ставит первый тик; без него первое
+               подозрение помечено нулём и окно истекло бы на settle(). */
+            settle(s);
+            const char *name = "silent-cut-mixed.test";
+            d2k_ev h = ev_hello(6, 41062, name);
+            d2k_sched_event(s, &h);
+            d2k_ev r = ev_suspect(6, 41062);
+            r.code = D2K_SUSPECT_RST_AFTER_APP;
+            d2k_sched_event(s, &r);
+            settle(s);
+            d2k_ev h2 = ev_hello(6, 41063, name);
+            d2k_sched_event(s, &h2);
+            d2k_ev f2 = ev_suspect(6, 41063);
+            f2.code = D2K_SUSPECT_FIN_RETRY;
+            f2.planned = D2K_LINK_PLANNED_NO;
+            CHECK(d2k_sched_event(s, &f2) == 1,
+                  "поздний RST и повтор FIN на независимых потоках не подтвердили друг друга");
+            settle(s);
+            CHECK(vol_calls == 1 && tcp_calls == 0,
+                  "смешанная пара позднего закрытия не прошла ровно одну RX-volume-пару");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c50);
+    }
+
+    /* ЗАДАЧА 50, РАУНД 2. «QUIC замолчал после рукопожатия» (Safari на
+       rua.gr) — QUIC-поиск своего протокола, и вопросник обязан мерить
+       ответ своим запросом (arm.data_cut), а не только ответ на Initial.
+       Обычное подозрение QUIC (молчание рукопожатия) — без этого признака. */
+    {
+        d2k_catalog cq = {0};
+        d2k_sched *s = d2k_sched_new(&cq, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для обрыва QUIC не завёлся");
+        if (s) {
+            settle(s);
+            quic_calls = 0; quic_last_data_cut = -1;
+            quic_answer = D2K_V_CLEAR;
+            d2k_ev h = ev_hello(17, 41090, "quic-stall.test");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 41090);
+            su.code = D2K_SUSPECT_QUIC_STALL;
+            su.planned = D2K_LINK_PLANNED_NO;
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(quic_calls == 1 && quic_last_data_cut == 1,
+                  "обрыв QUIC после рукопожатия не дошёл до замера ответа своим запросом");
+            d2k_ev h2 = ev_hello(17, 41091, "quic-silent.test");
+            d2k_sched_event(s, &h2);
+            d2k_ev su2 = ev_suspect(17, 41091);
+            su2.code = D2K_SUSPECT_SILENT;
+            d2k_sched_event(s, &su2);
+            settle(s);
+            CHECK(quic_calls == 2 && quic_last_data_cut == 0,
+                  "молчание рукопожатия QUIC стало замером ответа");
+            CHECK(sent_quic_deny("quic-stall.test") == 0,
+                  "QUIC снят по невоспроизведённому обрыву");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cq);
+        quic_answer = D2K_V_OPAQUE;
+    }
+
+    /* ЗАДАЧА 50, РАУНД 2, требование 5c. Обрыв воспроизведён своим
+       запросом, обхода по QUIC нет — QUIC для имени не пропускается (план
+       quicdeny на провод, в каталог — нет: это не обход и не знание), чтобы
+       браузер ушёл на TCP. По сроку отдыха снимается — следующий обрыв
+       меряется заново. */
+    {
+        d2k_catalog cq = {0};
+        d2k_sched *s = d2k_sched_new(&cq, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для снятия QUIC не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            settle(s);
+            forget_sent();
+            quic_calls = 0; quic_answer = D2K_V_OPAQUE; quic_arm_none = 1;
+            d2k_ev h = ev_hello(17, 41095, "quic-deny.test");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 41095);
+            su.code = D2K_SUSPECT_QUIC_STALL;
+            su.planned = D2K_LINK_PLANNED_NO;
+            d2k_sched_event(s, &su);
+            for (int i = 0; i < 40 && !sent_quic_deny("quic-deny.test"); i++) settle(s);
+            CHECK(quic_calls == 1 && sent_quic_deny("quic-deny.test") == 1,
+                  "обхода по QUIC нет, а QUIC для имени по-прежнему пропускается");
+            CHECK(said("QUIC для имени не пропускаю"), "снятие QUIC не названо в журнале");
+            CHECK(bindings_of(&cq, "quic-deny.test", 17) == 0,
+                  "снятие QUIC записано в каталог как обход");
+            /* Раунд 3: по сроку — сначала своя перепроверка (только прямые
+               запросы, без плеч). Обрыв воспроизводится — снятие продлено, не
+               снято. */
+            quic_last_data_cut = -1;
+            skip_ahead(s, 11 * 60 * 1000);
+            for (int i = 0; i < 40 && sent_quic_deny("quic-deny.test") < 2; i++) settle(s);
+            CHECK(quic_calls == 2 && quic_last_data_cut == 2,
+                  "перед снятием запрета QUIC нет своей перепроверки только прямым запросом");
+            CHECK(sent_quic_deny("quic-deny.test") == 2 &&
+                  sent_del_name_key("quic-deny.test", 17, D2K_LINK_SHAPE_QUIC, 4) == 0,
+                  "обрыв воспроизведён перепроверкой, а запрет QUIC снят или не продлён");
+            /* Второй срок длиннее (30 мин). Ответ своим запросом пришёл — снять. */
+            quic_answer = D2K_V_CLEAR;
+            skip_ahead(s, 11 * 60 * 1000);
+            settle(s);
+            CHECK(quic_calls == 2, "продлённый запрет перепроверен раньше своего срока");
+            skip_ahead(s, 20 * 60 * 1000);
+            for (int i = 0; i < 40 &&
+                 !sent_del_name_key("quic-deny.test", 17, D2K_LINK_SHAPE_QUIC, 4); i++) settle(s);
+            CHECK(quic_calls == 3 &&
+                  sent_del_name_key("quic-deny.test", 17, D2K_LINK_SHAPE_QUIC, 4) >= 1,
+                  "ответ своим запросом пришёл целиком, а запрет QUIC не снят");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cq);
+        quic_arm_none = 0;
+        quic_answer = D2K_V_OPAQUE;
+    }
+
+    /* Раунд 3, I2: у имени подтверждённая QUIC-привязка, а обрыв после
+       рукопожатия воспроизведён своим запросом и обхода нет — привязка под
+       этим обрывом не работает: помечается на повторную проверку (каталог
+       цел), запрет QUIC действует, проход каталога её обратно не ставит. */
+    {
+        d2k_catalog cq = {0};
+        char pq[40];
+        own_box(&cq, "box-quic-deny", pq, 31, 5, "quic-bound.test", 17,
+                D2K_LINK_SHAPE_QUIC, 4, 1790000000, 0);
+        d2k_sched *s = d2k_sched_new(&cq, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для привязки под обрывом не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            settle(s);
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            size_t set_before = sent_set_name_shape("quic-bound.test", D2K_LINK_SHAPE_QUIC);
+            CHECK(set_before >= 1, "фикстура: подтверждённая QUIC-привязка не встала");
+            forget_sent();
+            quic_calls = 0; quic_answer = D2K_V_OPAQUE; quic_arm_none = 1;
+            d2k_ev h = ev_hello(17, 41097, "quic-bound.test");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 41097);
+            su.code = D2K_SUSPECT_QUIC_STALL;
+            su.planned = D2K_LINK_PLANNED_YES;
+            d2k_sched_event(s, &su);
+            for (int i = 0; i < 40 && !sent_quic_deny("quic-bound.test"); i++) settle(s);
+            CHECK(sent_quic_deny("quic-bound.test") == 1, "обрыв под привязкой не снял QUIC");
+            CHECK(cq.n_boxes == 1 && cq.boxes[0].n_binds == 1 &&
+                  cq.boxes[0].binds[0].recheck_since != 0,
+                  "QUIC-привязка под воспроизведённым обрывом не помечена на перепроверку");
+            CHECK(said("помечена на повторную проверку"), "пометка привязки не названа в журнале");
+            /* Проходы каталога после этого привязку не возвращают. */
+            for (int i = 0; i < 10; i++) settle(s);
+            d2k_sched_sync(s); sync_out(s);
+            CHECK(sent_set_name_shape("quic-bound.test", D2K_LINK_SHAPE_QUIC) ==
+                  sent_quic_deny("quic-bound.test"),
+                  "проход каталога вернул QUIC-привязку поверх запрета QUIC");
+            /* И даже привязка без пометки (например, подтверждённая заново
+               где-то ещё) поверх действующего запрета не ставится. */
+            cq.boxes[0].binds[0].recheck_since = 0;
+            d2k_sched_sync(s); sync_out(s);
+            CHECK(sent_set_name_shape("quic-bound.test", D2K_LINK_SHAPE_QUIC) ==
+                  sent_quic_deny("quic-bound.test"),
+                  "проход каталога поставил QUIC-привязку при действующем запрете QUIC");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cq);
+        quic_arm_none = 0;
+        quic_answer = D2K_V_OPAQUE;
+    }
+
+    /* Найденное плечо — обычный кандидат, QUIC не снимается. */
+    {
+        d2k_catalog cq = {0};
+        d2k_sched *s = d2k_sched_new(&cq, sv[0], 0x2d);
+        if (s) {
+            settle(s);
+            forget_sent();
+            quic_calls = 0; quic_answer = D2K_V_OPAQUE;
+            d2k_ev h = ev_hello(17, 41096, "quic-arm.test");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 41096);
+            su.code = D2K_SUSPECT_QUIC_STALL;
+            su.planned = D2K_LINK_PLANNED_NO;
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(quic_calls == 1 && sent_quic_deny("quic-arm.test") == 0,
+                  "QUIC снят при найденном плече");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cq);
     }
 
     /* «Блок доказан, кандидатов 0»: пустой поиск откладывается на cooldown,

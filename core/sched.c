@@ -759,6 +759,13 @@ typedef struct {
     int        search_started; /* classifier/voice measurement started, even at zero probes */
     int        cached_measure_valid; /* preserve measured candidates after box-plan reuse */
     uint8_t    trigger_code;   /* signal that admitted this measurement; cooldown key */
+    /* Задача 50, раунд 2: обрыв QUIC после рукопожатия воспроизведён своим
+       запросом (прогон с arm.data_cut вернул OPAQUE). Неудача такой задачи
+       снимает QUIC для имени (quic_deny_install). */
+    uint8_t    stall_cut;
+    /* Раунд 3: задача — перепроверка перед снятием запрета QUIC: прогон
+       только прямыми запросами, без плеч (arm.data_cut = 2). */
+    uint8_t    deny_recheck;
     uint8_t    trigger_planned;
     uint8_t    trigger_shape;
     d2k_flowkey trigger_flow;
@@ -1036,6 +1043,29 @@ typedef struct {
     int64_t seen_ms;
 } late_rst_pending;
 
+/* QUIC ДЛЯ ИМЕНИ НЕ ПРОПУСКАЕТСЯ (задача 50, раунд 2, требование 5c).
+   Обрыв QUIC после рукопожатия воспроизведён своим запросом, обхода по QUIC
+   поиск не нашёл: на имя ставится план quicdeny, и браузер уходит на TCP.
+   Это НЕ обход QUIC (§4) и НЕ знание: в каталог не пишется (§2.3 —
+   отрицательное не хранится), живёт сроком отдыха цели и снимается, чтобы
+   следующий обрыв был измерен заново. streak — сколько раз подряд имя
+   снималось: срок растёт так же, как у повторного CLEAR (10/30/60 мин). */
+#define SCHED_QUIC_DENY_SLOTS 16
+typedef struct {
+    char name[256];
+    uint8_t family, used, active;
+    /* Раунд 3: срок вышел, идёт своя перепроверка (только прямые запросы).
+       Запрет стоит, пока она не скажет. */
+    uint8_t rechecking;
+    unsigned streak;
+    int64_t until_ms;
+    /* Для перепроверки: адрес, порт, Initial клиента (вход прогона). */
+    char ip[64];
+    uint16_t port;
+    uint8_t trig[2048];
+    size_t trig_len;
+} quic_deny_slot;
+
 typedef struct {
     char name[256], plan_id[40];
     uint8_t kind, transport, shape, family;
@@ -1066,6 +1096,7 @@ struct d2k_sched {
     dead_address    dead_addrs[SCHED_COOLDOWN_SLOTS];
     late_rst_pending late_rst[SCHED_LATE_RST_SLOTS];
     size_t       late_rst_next;
+    quic_deny_slot quic_deny[SCHED_QUIC_DENY_SLOTS];
     struct { d2k_resource ref; int64_t expires_ms; } resources[8];
     size_t resource_next;
     struct { char name[256]; uint8_t bytes[2048]; size_t len;
@@ -1683,8 +1714,15 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     c->until_ms = s->now_ms + clear_backoff_ms(c->negative_streak);
 }
 
-/* Порог позднего RST: 1 — это второй RST по независимому потоку в окне,
-   замер можно начинать; 0 — первый (или повтор того же потока), ждём. */
+/* Какое позднее закрытие пришло — для журнала; порог у них общий. */
+static const char *late_close_what(uint8_t code) {
+    return code == D2K_SUSPECT_FIN_RETRY ? "повтор FIN без ответа после ответа сервера"
+                                         : "поздний RST после app-data";
+}
+
+/* Порог позднего закрытия (поздний RST после app-data или повтор FIN без
+   ответа на потоке без плана): 1 — второе такое по независимому потоку в
+   окне, замер можно начинать; 0 — первое (или повтор того же потока), ждём. */
 static int late_rst_confirmed(d2k_sched *s, const char *name, const d2k_ev *ev) {
     uint8_t family = ev->family ? ev->family : 4;
     late_rst_pending *p = NULL;
@@ -1696,8 +1734,9 @@ static int late_rst_confirmed(d2k_sched *s, const char *name, const d2k_ev *ev) 
     if (p && s->now_ms - p->seen_ms <= SCHED_LATE_RST_CONFIRM_MS) {
         if (ev_matches_flow(ev, &p->flow)) { return 0; }
         memset(p, 0, sizeof *p);
-        say(s, "по %s второй поздний RST на независимом потоке за %d с — подтверждаю подозрение",
-            name, SCHED_LATE_RST_CONFIRM_MS / 1000);
+        say(s, "по %s второе позднее закрытие (%s) на независимом потоке за %d с — "
+               "подтверждаю подозрение", name, late_close_what(ev->code),
+            SCHED_LATE_RST_CONFIRM_MS / 1000);
         return 1;
     }
     if (!p) {
@@ -1716,8 +1755,9 @@ static int late_rst_confirmed(d2k_sched *s, const char *name, const d2k_ev *ev) 
     p->flow.family = family;
     p->seen_ms = s->now_ms;
     p->used = 1;
-    say(s, "по %s одиночный поздний RST после app-data — жду второй независимый поток до %d с; "
-           "замер пока не запускаю", name, SCHED_LATE_RST_CONFIRM_MS / 1000);
+    say(s, "по %s одиночное позднее закрытие (%s) — жду второй независимый поток до %d с; "
+           "замер пока не запускаю", name, late_close_what(ev->code),
+        SCHED_LATE_RST_CONFIRM_MS / 1000);
     return 0;
 }
 
@@ -2325,6 +2365,11 @@ static void *worker_run(void *vp) {
         /* Task 39 round 1: the arm data stage asks the known large resource. */
         snprintf(t->arm.probe_path, sizeof t->arm.probe_path, "%s", t->measure_path);
         t->arm.split_unfit = a_split_unfit;
+        /* Задача 50, раунд 2: поиск начат обрывом ПОСЛЕ рукопожатия —
+           прямой вопрос обязан проверить ответ своим запросом HTTP/3, а не
+           только ответ на Initial (тот проходит и при обрыве). */
+        t->arm.data_cut = t->trigger_code != D2K_SUSPECT_QUIC_STALL ? 0 :
+                          t->deny_recheck ? 2 : 1;
         r = seed && d2k_sched_quic_seeded_hook
             ? d2k_sched_quic_seeded_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm, seed)
             : d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm);
@@ -2905,9 +2950,15 @@ static void prop_finish(d2k_sched *s, task *t) {
     s->sync_pending = 1;
 }
 
+static void quic_deny_install(d2k_sched *s, task *t, int64_t now_ms);
+
 static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     join_worker(t);
     contact_close(t);
+    if (t->transport == 17 && t->stall_cut) {
+        t->stall_cut = 0;
+        quic_deny_install(s, t, now_ms);
+    }
     /* И вопрос, и кандидат — каждый своим ключом (задача 20). Прежде порт
        вопроса проверялся первым и, оставшись в памяти после вопросов, уводил
        снятие на давно снятый вопрос, а стоящий кандидат оставался. */
@@ -2936,6 +2987,157 @@ static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     t->n_plans = 0;
     t->next_plan = 0;
     t->fb_queue = 0;
+}
+
+static quic_deny_slot *quic_deny_find(d2k_sched *s, const char *name, uint8_t family) {
+    for (size_t i = 0; i < SCHED_QUIC_DENY_SLOTS; i++) {
+        quic_deny_slot *q = &s->quic_deny[i];
+        if (q->used && q->family == family && !strcmp(q->name, name)) return q;
+    }
+    return NULL;
+}
+
+static void quic_deny_install(d2k_sched *s, task *t, int64_t now_ms) {
+    uint8_t family = t->family ? t->family : 4;
+    quic_deny_slot *q = quic_deny_find(s, t->name, family);
+    if (!q) {
+        quic_deny_slot *victim = NULL;
+        for (size_t i = 0; i < SCHED_QUIC_DENY_SLOTS; i++) {
+            quic_deny_slot *c = &s->quic_deny[i];
+            if (!c->used) { victim = c; break; }
+            if (!c->active && (!victim || victim->active || c->until_ms < victim->until_ms))
+                victim = c;
+        }
+        if (!victim) {
+            say(s, "по %s (QUIC) обхода по QUIC нет, но мест для снятия QUIC нет — "
+                   "оставляю как есть", t->name);
+            return;
+        }
+        q = victim;
+        memset(q, 0, sizeof *q);
+        snprintf(q->name, sizeof q->name, "%s", t->name);
+        q->family = family;
+        q->used = 1;
+    }
+    char text[256], hex[2 * D2K_PLAN_TLV_MAX + 1], err[160], plan_id[40];
+    uint8_t wire_id[D2K_PLAN_ID_LEN];
+    snprintf(text, sizeof text, "d2k-plan 1 11\nid 00000000000000000000000000000000\n"
+                                "proto udp quic\nquicdeny 1\norder forward\n");
+    plan_ident(text, plan_id, sizeof plan_id, wire_id);
+    err[0] = '\0';
+    if (stamp_plan_id(text, wire_id) != 0 ||
+        d2k_plan_text_to_hex(text, hex, sizeof hex, err, sizeof err) != 0 ||
+        d2k_link_set_name_family(s->link_fd, t->name, 17, hex, D2K_LINK_SHAPE_QUIC, 0,
+                                 family, err, sizeof err) != 0) {
+        say(s, "по %s (QUIC) снять QUIC не удалось: %s", t->name, err[0] ? err : "ошибка записи");
+        return;
+    }
+    if (q->streak < UINT8_MAX) q->streak++;
+    int64_t dur = clear_backoff_ms(q->streak);
+    q->until_ms = now_ms + dur;
+    q->active = 1;
+    q->rechecking = 0;
+    snprintf(q->ip, sizeof q->ip, "%s", t->ip);
+    q->port = t->port;
+    if (t->trig_len && t->trig_len <= sizeof q->trig) {
+        memcpy(q->trig, t->trig, t->trig_len);
+        q->trig_len = t->trig_len;
+    }
+    /* I2 (раунд 3): подтверждённая QUIC-привязка этого имени под
+       воспроизведённым обрывом не работает — повторная проверка (задача 21:
+       каталог цел, с провода снята — запрет встал на её место, проход
+       каталога её не вернёт). */
+    if (s->cat) {
+        size_t marked = 0;
+        for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+            d2k_cat_box *b = &s->cat->boxes[bi];
+            for (size_t j = 0; j < b->n_binds; j++) {
+                d2k_cat_binding *bd = &b->binds[j];
+                if (!bd->enabled || bd->recheck_since || strcmp(bd->kind, "name") ||
+                    strcmp(bd->target, t->name) || (bd->transport ? bd->transport : 6) != 17 ||
+                    (bd->family ? bd->family : 4) != family) continue;
+                bd->recheck_since = wall_s(s, now_ms);
+                bd->recheck_mono_ms = now_ms ? now_ms : 1;
+                b->updated = bd->recheck_since;
+                say(s, "по %s (QUIC) привязка %s не проходит обрыв после рукопожатия — "
+                       "помечена на повторную проверку (каталог сохранён)", t->name, bd->plan_id);
+                marked++;
+            }
+        }
+        if (marked) s->cat->revision++;
+    }
+    say(s, "по %s (QUIC) обрыв после рукопожатия воспроизведён своим запросом, обхода по QUIC "
+           "нет — QUIC для имени не пропускаю %lld мин: браузер уйдёт на TCP (это не обход QUIC, "
+           "в каталог не пишется)", t->name, (long long)(dur / 60000));
+}
+
+static int quic_deny_active(const d2k_sched *s, const char *name, uint8_t family) {
+    for (size_t i = 0; i < SCHED_QUIC_DENY_SLOTS; i++) {
+        const quic_deny_slot *q = &s->quic_deny[i];
+        if (q->used && q->active && q->family == family && !strcmp(q->name, name)) return 1;
+    }
+    return 0;
+}
+
+static int launch_or_queue(d2k_sched *s, task *t);
+static void task_done(task *t);
+static task *task_of(d2k_sched *s, const char *name, uint8_t transport, uint8_t family);
+static task *task_free_slot(d2k_sched *s);
+
+/* Перед снятием — своя перепроверка (раунд 3): задача по тем же адресу и
+   Initial, только прямые запросы. 1 — запущена или уже идёт. */
+static int quic_deny_recheck(d2k_sched *s, quic_deny_slot *q) {
+    task *t = task_of(s, q->name, 17, q->family);
+    if (t && t->state != T_RESTING) return 1;      /* поиск по имени уже идёт */
+    if (t) { task_done(t); }
+    if (!q->trig_len || !q->ip[0]) return 0;
+    t = task_free_slot(s);
+    if (!t) return 0;
+    task_reset(t);
+    snprintf(t->name, sizeof t->name, "%s", q->name);
+    t->transport = 17;
+    t->family = q->family;
+    snprintf(t->ip, sizeof t->ip, "%s", q->ip);
+    t->port = q->port;
+    memcpy(t->trig, q->trig, q->trig_len);
+    t->trig_len = q->trig_len;
+    t->trig_snapped = 1;
+    t->trigger_code = D2K_SUSPECT_QUIC_STALL;
+    t->trigger_planned = D2K_LINK_PLANNED_NO;
+    t->deny_recheck = 1;
+    t->fp.method = D2K_FP_METHOD;
+    say(s, "по %s (QUIC) срок запрета QUIC вышел — сначала проверяю своим запросом HTTP/3, "
+           "встаёт ли ответ по-прежнему", q->name);
+    if (!launch_or_queue(s, t) && t->state == T_FREE) return 0;
+    return 1;
+}
+
+static void quic_deny_tick(d2k_sched *s, int64_t now_ms) {
+    for (size_t i = 0; i < SCHED_QUIC_DENY_SLOTS; i++) {
+        quic_deny_slot *q = &s->quic_deny[i];
+        if (!q->used || !q->active || now_ms < q->until_ms) continue;
+        if (!q->rechecking) {
+            if (quic_deny_recheck(s, q)) { q->rechecking = 1; continue; }
+        } else {
+            /* Перепроверка ещё идёт — запрет стоит. Встала снова — её
+               task_fail уже продлил запрет (rechecking снят). */
+            task *t = task_of(s, q->name, 17, q->family);
+            if (t && t->deny_recheck && t->state != T_RESTING && t->state != T_FREE) continue;
+        }
+        char err[160];
+        err[0] = '\0';
+        q->active = 0;
+        q->rechecking = 0;
+        if (d2k_link_del_name_family(s->link_fd, q->name, 17, D2K_LINK_SHAPE_QUIC, q->family,
+                                     err, sizeof err) != 0) {
+            say(s, "по %s (QUIC) снятие запрета QUIC не ушло: %s", q->name, err);
+        }
+        /* Подтверждённая QUIC-привязка того же имени (если появилась) вернётся
+           проходом каталога. */
+        s->sync_pending = 1;
+        say(s, "по %s (QUIC) своя перепроверка обрыв не воспроизвела (или не состоялась) — "
+               "снимаю запрет QUIC; следующий обрыв измерю заново", q->name);
+    }
 }
 
 static void task_done(task *t) {
@@ -3801,6 +4003,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
     }
 
     if (t->transport == 17) {
+        if (t->arm.data_cut && r->verdict == D2K_V_OPAQUE) { t->stall_cut = 1; }
         /* У QUIC свой источник кандидатов — подобранное плечо. Разрезы и
            перекрытия, которые выводит d2k_compose, к датаграмме не
            применимы вовсе, и предлагать их значило бы тратить бюджет зондов
@@ -4688,6 +4891,10 @@ int d2k_sched_sync_step(d2k_sched *s) {
            ни этим проходом, ни после перезапуска. Каталог при этом цел. */
         if (bd->recheck_since) { s->sync_recheck++; continue; }
         if (newer_name_binding(s->cat, bd)) { continue; }
+        /* I2 (раунд 3): пока QUIC имени не пропускается, его QUIC-привязка на
+           провод не ставится — она перекрыла бы запрет. */
+        if ((bd->transport ? bd->transport : 6) == 17 && !strcmp(bd->kind, "name") &&
+            quic_deny_active(s, bd->target, bd->family ? bd->family : 4)) { continue; }
         /* Прежний voice_confirm присваивал UDP CLIENT уровень 3 на любую
            обратную датаграмму. У таких записей нет протокольного
            свидетельства, независимо от сохранённого level. Не стираем
@@ -5974,7 +6181,15 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         t->voice_silent = 1;
         return 0;
     }
-    if (ev->code == D2K_SUSPECT_RST_AFTER_APP && (!t || t->state == T_WATCHING) &&
+    /* Повтор FIN без ответа на потоке БЕЗ плана (задача 50: глухой обрыв
+       ответа без RST/FIN, поле 03.10) — такой же низкоуверенный сигнал
+       позднего закрытия, как поздний RST, и с той же повторяемостью: второй
+       по независимому потоку в окне. Повтор FIN под планом (05e24fa) по-
+       прежнему меряется сразу: его датапат шлёт только о потоке, к которому
+       применён собственный план. */
+    const int late_close_needs_repeat = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
+        (ev->code == D2K_SUSPECT_FIN_RETRY && ev->planned == D2K_LINK_PLANNED_NO);
+    if (late_close_needs_repeat && (!t || t->state == T_WATCHING) &&
         !late_rst_confirmed(s, name, ev)) {
         return 0;
     }
@@ -7494,6 +7709,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     uint8_t drain[64];
     while (read(s->wake[0], drain, sizeof drain) > 0) { }
 
+    quic_deny_tick(s, now_ms);
     if (s->sync_pending && !s->sync_active) {
         (void)d2k_sched_sync(s);
     }
