@@ -44,6 +44,16 @@ D2K_PPE_TAG=${D2K_PPE_TAG:-d2k-ppe}
 # подключения этого файла).
 D2K_PPE_TCP_PORTS=${D2K_PPE_TCP_PORTS:-${PORTS:-0:65535}}
 D2K_PPE_UDP_PORTS=${D2K_PPE_UDP_PORTS:-443,${VOICE_PORTS:-50000:50099,1400,3478:3481,5349,19294:19344}}
+# ОТКРЫТЫЙ HTTP, KEEP-ALIVE (поле 04.10.2026): коробка смотрит каждый запрос
+# соединения, а следующие запросы браузера идут далеко за 30-м пакетом, когда
+# поток уже в ускорителе и мимо netfilter. Поэтому для порта 80 — только
+# направление клиента (--dports) и широкий connskip: запросы и подтверждения
+# клиента идут процессором, ответ сервера (сама загрузка) остаётся в
+# ускорителе. Замер 05.09.2026 (docs/field/2026-09-05-stage0-datapath.md,
+# опыт 3): правило по --dports с connskip 1000000 — клиент→сервер виден на
+# 100 %, сервер→клиент 0,08 %, 230–305 Мбит/с, процессор до 4,5 %.
+D2K_PPE_HTTP_PORTS=${D2K_PPE_HTTP_PORTS:-80}
+D2K_PPE_HTTP_CONNSKIP=${D2K_PPE_HTTP_CONNSKIP:-1000000}
 D2K_PPE_PROC=${D2K_PPE_PROC:-/proc/net}
 D2K_PPE_CONFIG=${D2K_PPE_CONFIG:-/opt/d2k/config}
 D2K_PPE_BINDS=${D2K_PPE_BINDS:-/proc/driver/hw_nat/foe/binds}
@@ -90,6 +100,9 @@ _d2k_ppe_rules() {
         printf 'FORWARD|-p %s -m multiport --dports %s %s\n' "$_d2k_ppe_p" "$_d2k_ppe_ports" "$_d2k_ppe_tail"
         printf 'FORWARD|-p %s -m multiport --sports %s %s\n' "$_d2k_ppe_p" "$_d2k_ppe_ports" "$_d2k_ppe_tail"
     done
+    _d2k_ppe_tail="-m connskip --connskip $D2K_PPE_HTTP_CONNSKIP -m comment --comment $D2K_PPE_TAG -j $D2K_PPE_TARGET"
+    printf 'PREROUTING|-p tcp -m multiport --dports %s %s\n' "$D2K_PPE_HTTP_PORTS" "$_d2k_ppe_tail"
+    printf 'FORWARD|-p tcp -m multiport --dports %s %s\n' "$D2K_PPE_HTTP_PORTS" "$_d2k_ppe_tail"
 }
 
 # Свои правила семейства по метке: строки «цепочка|аргументы» как их печатает
@@ -184,6 +197,7 @@ d2k_ppe_status() {
             echo "  разгрузка PPE: не стоит ($_d2k_ppe_line)"
         fi
         echo "  ограничение: после $D2K_PPE_CONNSKIP пакетов поток снова в ускорителе — поздние RST/FIN такого потока d2k не видит"
+        echo "  открытый HTTP (порт $D2K_PPE_HTTP_PORTS): сторона клиента мимо ускорителя все $D2K_PPE_HTTP_CONNSKIP пакетов — следующие запросы соединения видны"
     fi
 
     # Основной оракул на MediaTek: поток в binds ушёл мимо netfilter.
