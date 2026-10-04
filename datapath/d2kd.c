@@ -838,6 +838,15 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
                ps.reverse, ps.after_hello, ps.late, ps.not_hello,
                ps.last_first_byte);
         printf("имя уехало во второй сегмент: %" PRIu64 "\n", ps.sni_next_seg);
+        if (ps.http_later || ps.http_unaligned || ps.http_open_end) {
+            /* Keep-alive (поле 04.10.2026): следующие запросы соединения
+               получают план, только начинаясь на известной границе с начала
+               сегмента; прочие идут как есть — их счёт здесь. */
+            printf("HTTP keep-alive: следующих запросов узнано %" PRIu64
+                   ", граница не на начале сегмента %" PRIu64
+                   ", конец запроса неизвестен %" PRIu64 "\n",
+                   ps.http_later, ps.http_unaligned, ps.http_open_end);
+        }
         printf("снимки TCP: полных=%" PRIu64 " отвергнутых=%" PRIu64
                " истекших=%" PRIu64 " отказов ёмкости=%" PRIu64 "\n",
                ps.capture_complete, ps.capture_rejected,

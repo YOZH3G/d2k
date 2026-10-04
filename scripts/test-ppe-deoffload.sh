@@ -112,6 +112,7 @@ export PORTS VOICE_PORTS
 
 UDP="443,$VOICE_PORTS"
 T="-m connskip --connskip 30 -m comment --comment d2k-ppe -j PPE"
+TH="-m connskip --connskip 1000000 -m comment --comment d2k-ppe -j PPE"
 
 # --- connskip против окон d2k ----------------------------------------------
 # connskip считает пакеты соединения в ОБЕ стороны, окна d2k — каждую сторону
@@ -146,8 +147,16 @@ for fam in v4 v6; do
         grep -qxF -- "-p udp -m multiport --sports $UDP $T" "$RULES/$fam.mangle.FORWARD"
     check "$fam: ответного --sports в PREROUTING нет (там обратный NAT ещё не отработал)" \
         [ "$(chain $fam PREROUTING | grep -c -- '--sports')" = 0 ]
-    check "$fam: ровно 2 своих в PREROUTING" [ "$(count_tag $fam PREROUTING)" = 2 ]
-    check "$fam: ровно 4 своих в FORWARD" [ "$(count_tag $fam FORWARD)" = 4 ]
+    # Keep-alive открытого HTTP (поле 04.10.2026): порт 80, только сторона
+    # клиента, широкий connskip — следующие запросы соединения видны.
+    check "$fam PREROUTING: HTTP-клиент по --dports 80, широкий connskip" \
+        grep -qxF -- "-p tcp -m multiport --dports 80 $TH" "$RULES/$fam.mangle.PREROUTING"
+    check "$fam FORWARD: HTTP-клиент по --dports 80, широкий connskip" \
+        grep -qxF -- "-p tcp -m multiport --dports 80 $TH" "$RULES/$fam.mangle.FORWARD"
+    check "$fam: ответ HTTP (--sports 80) с широким connskip не снят с ускорителя" \
+        sh -c "! grep -q -- '--sports 80 .*--connskip $D2K_PPE_HTTP_CONNSKIP' '$RULES/$fam.mangle.FORWARD'"
+    check "$fam: ровно 3 своих в PREROUTING" [ "$(count_tag $fam PREROUTING)" = 3 ]
+    check "$fam: ровно 5 своих в FORWARD" [ "$(count_tag $fam FORWARD)" = 5 ]
     check "$fam: POSTROUTING не тронут" [ ! -s "$RULES/$fam.mangle.POSTROUTING" ]
 done
 check "nat не тронут" sh -c "! grep -q -- '-t nat' '$CALLS'"
@@ -156,9 +165,9 @@ check "nat не тронут" sh -c "! grep -q -- '-t nat' '$CALLS'"
 d2k_ppe_ensure
 d2k_ppe_ensure
 check "повтор ensure не плодит дубликатов (v4)" \
-    [ "$(count_tag v4 PREROUTING)/$(count_tag v4 FORWARD)" = 2/4 ]
+    [ "$(count_tag v4 PREROUTING)/$(count_tag v4 FORWARD)" = 3/5 ]
 check "повтор ensure не плодит дубликатов (v6)" \
-    [ "$(count_tag v6 PREROUTING)/$(count_tag v6 FORWARD)" = 2/4 ]
+    [ "$(count_tag v6 PREROUTING)/$(count_tag v6 FORWARD)" = 3/5 ]
 
 # --- снятие только своего --------------------------------------------------
 Z2K="-p tcp -m multiport --dports 80,443,2053 -m connskip --connskip 30 -j PPE"
@@ -194,7 +203,7 @@ check "нет цели: статус говорит «недоступна»" gr
 reset_rules
 targets 1 0
 d2k_ppe_ensure
-check "нет v6-цели: v4 поставлен" [ "$(count_tag v4 FORWARD)" = 4 ]
+check "нет v6-цели: v4 поставлен" [ "$(count_tag v4 FORWARD)" = 5 ]
 check "нет v6-цели: в v6 ни одного -I" sh -c "! grep -q '^v6 .* -I ' '$CALLS'"
 
 # --- выключено владельцем --------------------------------------------------
@@ -307,8 +316,8 @@ for fam in v4 v6; do
     last_p=$(chain $fam FORWARD | grep -n -- '--comment d2k-ppe -j PPE$' | tail -1 | cut -d: -f1)
     check "$fam FORWARD: разгрузка (${last_p:-нет}) выше перехода в очередь (${first_q:-нет})" \
         [ "${last_p:-99}" -lt "${first_q:-0}" ]
-    check "$fam: после двух fw_up по-прежнему 4+2 своих" \
-        [ "$(count_tag $fam FORWARD)/$(count_tag $fam PREROUTING)" = 4/2 ]
+    check "$fam: после двух fw_up по-прежнему 5+3 своих" \
+        [ "$(count_tag $fam FORWARD)/$(count_tag $fam PREROUTING)" = 5/3 ]
 done
 (
     # shellcheck disable=SC1090,SC1091

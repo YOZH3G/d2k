@@ -104,6 +104,12 @@ CONNBYTES=0:8
 # очередь гнать нельзя вовсе — на MIPS он её захлёбывает.
 VOICE_PORTS=50000:50099,1400,3478:3481,5349,19294:19344
 VOICE_CONNBYTES=0:4
+# ОТКРЫТЫЙ HTTP, KEEP-ALIVE (поле 04.10.2026, www.fast-torrent.ru): коробка
+# смотрит КАЖДЫЙ запрос соединения, а второй запрос браузера лежит далеко за
+# окном CONNBYTES. После окна в очередь идут только сегменты клиента на этот
+# порт с флагом PSH — запросы, а не поток подтверждений; d2kd применяет к
+# запросу на известной границе план его имени и пропускает остальное.
+HTTP_KEEPALIVE_PORTS=80
 MODE=apply
 FLOWS=2048
 # Период сводки датапата в журнал. Ноль выключает; без сводки нечем понять,
@@ -340,6 +346,13 @@ fw_family_up() (
     "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
         --tcp-flags FIN FIN -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    # Следующие запросы соединения открытого HTTP (keep-alive): сегменты
+    # клиента с PSH за окном. Чистые подтверждения загрузки PSH не несут и в
+    # очередь не идут; запрос без PSH d2kd увидит как потерянную границу и
+    # дальше пропустит поток как есть.
+    "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$HTTP_KEEPALIVE_PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
+        --tcp-flags PSH PSH -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
     "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
@@ -634,6 +647,10 @@ fw_family_installed() (
     "$fw_tool" -t mangle -C "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
         --tcp-flags FIN FIN -j NFQUEUE --queue-num "$QUEUE_NUM" \
+        --queue-bypass 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$HTTP_KEEPALIVE_PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
+        --tcp-flags PSH PSH -j NFQUEUE --queue-num "$QUEUE_NUM" \
         --queue-bypass 2>/dev/null || return 1
     [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE 2>/dev/null || return 1

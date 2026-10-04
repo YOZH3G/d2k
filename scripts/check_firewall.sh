@@ -150,6 +150,20 @@ echo "$RULES" | grep -qE -- '-A D2K_OUT -p udp -m conntrack --ctdir ORIGINAL .*-
 echo "$RULES" | grep -qE -- '-A D2K_IN -p udp -m conntrack --ctdir REPLY .*--sports 50000:50099,1400,3478:3481,5349,19294:19344' \
     || fail "голосовое UDP-правило D2K_IN не ограничено conntrack-направлением REPLY"
 
+# Keep-alive открытого HTTP (поле 04.10.2026): за окном — только PSH клиента
+# на порт 80, не весь порт.
+echo "$RULES" | grep -qE -- '-A D2K_OUT -p tcp -m conntrack --ctdir ORIGINAL .*--dports 80 .*--connbytes 9[: ].*--tcp-flags (PSH PSH|0x08/0x08|PSH/PSH).*--queue-bypass' \
+    || fail "нет правила следующих запросов HTTP (PSH на 80 за окном)"
+echo "$RULES" | grep -E -- '-A D2K_OUT .*--dports 80 ' | grep -vqE -- 'PSH|0x08' \
+    && fail "порт 80 за окном в очереди целиком, а не только PSH"
+iptables -t mangle -D D2K_OUT -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports 80 \
+    -m connbytes --connbytes 9: --connbytes-dir original --connbytes-mode packets \
+    --tcp-flags PSH PSH -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass \
+    || fail "правило следующих запросов HTTP не снимается точным описанием"
+if fw_installed; then fail "потеря правила следующих запросов HTTP не обнаружена"; fi
+fw_up
+RULES=$(iptables -t mangle -S)
+
 MARK_LINE=$(echo "$RULES" | grep -E -- '-A D2K_OUT -m mark .* -j RETURN' || true)
 [ -n "$MARK_LINE" ] || fail "нет правила RETURN по метке в исходящей цепочке"
 echo "$MARK_LINE" | grep -q -- '-p ' && fail "правило RETURN по метке сузили протоколом -p — UDP перестанет исключаться"
@@ -159,8 +173,9 @@ echo "== fw_up повторно (идемпотентность) =="
 fw_up
 COUNT_OUT=$(iptables -t mangle -S D2K_OUT | wc -l)
 # -N, 2 loopback, broadcast + multicast, 2 marks, 2 DNS, TCP/UDP queue, late
-# RST/FIN, voice UDP. (The old 11 predates the voice and late-close rules.)
-[ "$COUNT_OUT" -eq 14 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 14 включая -N)"
+# RST/FIN, HTTP keep-alive PSH, voice UDP. (The old 11 predates the voice and
+# late-close rules.)
+[ "$COUNT_OUT" -eq 15 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 15 включая -N)"
 
 echo "== пустые цепочки с сохранёнными переходами — НЕ работающий firewall =="
 iptables -t mangle -F D2K_OUT
@@ -240,7 +255,7 @@ if fw_installed; then fail "потеря IPv6 ответов не обнаруж
 fw_up
 fw_installed || fail "IPv6 не восстановлен"
 COUNT6=$(ip6tables -t mangle -S D2K_OUT | wc -l)
-[ "$COUNT6" -eq 13 ] || fail "IPv6 дубли после восстановления (строк: $COUNT6, ждали 13: как IPv4, но одно multicast-исключение)"
+[ "$COUNT6" -eq 14 ] || fail "IPv6 дубли после восстановления (строк: $COUNT6, ждали 14: как IPv4, но одно multicast-исключение)"
 
 echo "== fw_down =="
 fw_down

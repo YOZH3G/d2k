@@ -424,6 +424,40 @@ static void test_https_table(void) {
     d2k_http80_free(h);
 }
 
+/* KEEP-ALIVE (поле 04.10.2026): первый запрос получил настоящий ответ, второй
+   запрос того же соединения — вставку. Узнавание и замена 307 — только для
+   первого ответа потока: на следующем запросе ни события, ни замены, ни
+   снятия пакетов, даже если имя с HTTPS. План имени покрывает такие запросы
+   сам (session.c); здесь — только «не сработать мимо». */
+static void test_keepalive_later(void) {
+    d2k_http80 *h = d2k_http80_new();
+    const uint64_t T = 7000 * MS;
+    CHECK(d2k_http80_set_https(h, "rutracker.org", 13, T + 3600 * 1000 * MS) == 0,
+          "имя с HTTPS не принято");
+    flow f = flow4(52000);
+    uint32_t req_end = CISN + 1 + (uint32_t)strlen(GET);
+    open_flow(h, &f, T, GET);
+    static const char OK200[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    size_t n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, req_end, OK200, b);
+    PKT(h, b, n, T + 99 * MS + 98 * MS, &r);
+    CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "настоящий ответ принят за вставку");
+    uint32_t s2 = SISN + 1 + (uint32_t)strlen(OK200);
+    n = pkt(&f, 1, F_ACK | F_PSH, req_end, s2, GET, b);
+    PKT(h, b, n, T + 300 * MS, &r);
+    CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "второй запрос соединения не прошёл как есть");
+    uint32_t req2_end = req_end + (uint32_t)strlen(GET);
+    n = pkt(&f, 0, F_ACK | F_PSH | F_FIN, s2, req2_end, INJECT, b);
+    PKT(h, b, n, T + 300 * MS + 500000ull, &r);
+    CHECK(!r.injection && r.action == D2K_HTTP80_PASS && r.len == 0,
+          "вставка на втором запросе соединения сработала узнаванием/заменой");
+    PKT(h, b, n, T + 300 * MS + 600000ull, &r);
+    CHECK(r.action == D2K_HTTP80_PASS, "копия вставки на втором запросе снята");
+    d2k_http80_stats st = d2k_http80_get_stats(h);
+    CHECK(st.requests == 1 && st.injections == 0 && st.answered == 0 && st.dropped == 0,
+          "счётчики после второго запроса не те");
+    d2k_http80_free(h);
+}
+
 int main(void) {
     test_field_injection(0);
     test_field_injection(1);
@@ -435,6 +469,7 @@ int main(void) {
     test_https_table();
     test_swap_failure();
     test_kernel_clock();
+    test_keepalive_later();
     if (fails) {
         printf("test_http80: провалов %d\n", fails);
         return 1;
