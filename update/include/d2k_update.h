@@ -2,6 +2,7 @@
 #define D2K_UPDATE_H
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #define D2KU_INDEX_MAX 65536u
 #define D2KU_MANIFEST_MAX 1048576u
@@ -22,7 +23,7 @@
 
 typedef enum { D2KU_OK, D2KU_INVALID, D2KU_UNTRUSTED, D2KU_EXPIRED,
     D2KU_REPLAY, D2KU_INCOMPATIBLE, D2KU_BUSY, D2KU_IO, D2KU_NETWORK,
-    D2KU_TIME, D2KU_HEALTH } d2ku_rc;
+    D2KU_TIME, D2KU_HEALTH, D2KU_ABSENT, D2KU_RECOVERY } d2ku_rc;
 typedef struct d2ku_ctx d2ku_ctx;
 typedef struct d2ku_manifest d2ku_manifest;
 typedef struct d2ku_index d2ku_index;
@@ -115,6 +116,10 @@ struct d2ku_ctx {
     /* Owned by caller; no hidden allocations or persistence in verification. */
     void *io_arg;
     d2ku_rc (*sync_fd)(void *arg, int fd);
+    /* Optional POSIX write adapter: partial writes/EINTR allowed; -1 sets errno. */
+    ssize_t (*write_fd)(void *arg, int fd, const void *bytes, size_t len);
+    d2ku_rc (*rename_at)(void *arg, int from_dirfd, const char *from,
+        int to_dirfd, const char *to);
     void *service_arg;
     d2ku_rc (*service)(void *arg, const char *fixed_action);
 };
@@ -172,4 +177,52 @@ d2ku_rc d2ku_verify_selected_manifest(d2ku_ctx *, const d2ku_index *chosen,
  * selected ABI's signed file list into ctx.staging_dirfd. No install/activation;
  * success means hash/size checks + file and directory fsync completed. */
 d2ku_rc d2ku_stage(d2ku_ctx *, const d2ku_manifest *, int archive_fd);
+/* Durable record schema 1. sequence is the storage generation, not a release
+ * publication sequence. First store is 1, then increment exactly once/event.
+ * Loading ABSENT/RECOVERY/IO leaves output unchanged. RECOVERY means existing
+ * generations have no valid record: do not start a new release. */
+typedef enum { D2KU_CHECKING = 1, D2KU_AVAILABLE, D2KU_DOWNLOADING,
+    D2KU_VERIFYING, D2KU_PREPARED, D2KU_STOPPING, D2KU_SWITCHING,
+    D2KU_STARTING, D2KU_VALIDATING, D2KU_COMMITTED, D2KU_ROLLING_BACK,
+    D2KU_ROLLED_BACK, D2KU_RECOVERY_FAILED } d2ku_phase;
+struct d2ku_journal {
+    uint32_t schema;
+    uint64_t sequence;
+    unsigned char checksum[32]; /* computed on store, supplied by load */
+    char transaction_id[D2KU_ID_MAX + 1]; size_t transaction_id_len;
+    d2ku_phase phase;
+    char old_release_id[D2KU_ID_MAX + 1]; size_t old_release_id_len;
+    char new_release_id[D2KU_ID_MAX + 1]; size_t new_release_id_len;
+    unsigned char old_manifest_sha256[32], new_manifest_sha256[32];
+    int snapshot_ready;
+    uint64_t active_services; /* caller's stable service bit mapping */
+    uint64_t progress_mono_ms;
+    int64_t progress_utc;
+    char progress_boot_id[D2KU_BOOT_ID_MAX + 1]; size_t progress_boot_id_len;
+};
+typedef struct {
+    uint32_t schema;
+    uint64_t sequence;
+    unsigned char checksum[32];
+    uint64_t accepted_sequence;
+    unsigned char accepted_index_sha256[32];
+    int has_accepted_index;
+    int64_t last_accepted_timestamp;
+    d2ku_key trust[D2KU_KEYS_MAX]; size_t trust_count;
+    d2ku_policy policy;
+} d2ku_persistent_state;
+d2ku_rc d2ku_journal_load(d2ku_ctx *, d2ku_journal *);
+d2ku_rc d2ku_journal_store(d2ku_ctx *, const d2ku_journal *);
+/* Independent trust/policy records: never copy/restore with runtime snapshots.
+ * Apply to live context/policy only after successful durable store; load before
+ * signature verification. Accepted sequence/time, trust and date floors cannot
+ * decrease. Equal generation retries must have exactly identical payload. */
+d2ku_rc d2ku_persistent_load(d2ku_ctx *, d2ku_persistent_state *);
+d2ku_rc d2ku_persistent_store(d2ku_ctx *, const d2ku_persistent_state *);
+/* Global maintenance lock shared by update and all service/config/hooks.
+ * Descriptor is CLOEXEC; keep it for the whole transaction, close to unlock.
+ * Stores also serialize on private record locks (safe while maintenance held).
+ * No unlink of lock files: kernel releases lock on exit/crash. */
+d2ku_rc d2ku_maintenance_lock(d2ku_ctx *, int *lock_fd);
+void d2ku_maintenance_unlock(int lock_fd);
 #endif

@@ -283,3 +283,106 @@ or the daemon's nightly check request. The daemon uses the saved date/minute for
 nightly checking independently of `enabled`; `auto_due` gates installation only.
 Opening the panel starts only a due check; it never calls install/stage, nor
 requests a package download.
+
+## Durable records and maintenance locking (schema 1)
+
+Journal and security/schedule state are **independent** records beneath the
+verified `/opt/d2k` root dirfd, in the updater-owned `update-state/` directory
+(mode 0700). Record/lock files are regular, single-link, updater-owned, mode
+0600; symlinks and group/world access are rejected. Paths are fixed C constants,
+not metadata or request strings. Runtime snapshots/rollback must exclude this
+whole directory. The directory's root parent is synchronized before stores.
+
+Two generations per type are `journal.0`, `journal.1` and `persistent.0`,
+`persistent.1`. Slot is storage sequence modulo two. The **storage sequence** is
+independent of the index's publication sequence. First store is sequence 1;
+subsequent stores increment exactly once for a phase or significant event.
+Status polls and download chunks do not write. Sequence overflow is refused.
+`load` validates both files and selects the greatest valid sequence. A torn or
+malformed newest generation falls back to the valid older one. Both absent is
+`D2KU_ABSENT` (bootstrap must decide initialization); any existing records with
+no valid generation give `D2KU_RECOVERY`. Read/access errors give `D2KU_IO` even
+if the other generation is valid. These failures leave caller output unchanged
+and never authorize launching a new release. Corrupt records are preserved.
+
+The format is binary, all unsigned integers big endian, with **no raw C struct
+bytes, padding, pointers, size_t or enum representation**. All strings are a
+u16 byte length followed by exactly that many bytes, without terminator. Header:
+
+| Offset | Length | Value |
+| --- | --- | --- |
+| 0 | 8 | ASCII `D2KJNL01` or `D2KPER01` |
+| 8 | 4 | schema u32, exactly 1 |
+| 12 | 4 | total record byte length u32, at most 4096 |
+| 16 | 8 | positive storage sequence u64 |
+| 24 | 32 | SHA-256 over entire record with these 32 bytes zeroed |
+| 56 | variable | exactly the payload below; no trailing bytes |
+
+Checksum binds type, schema, length, generation and payload. It detects damage,
+not malicious modifications by privileged writers; signed metadata acceptance
+remains the trust boundary. Schema/type, sequence/slot consistency, exact length,
+checksum, every scalar range and string grammar are validated before exposure.
+Unsupported/corrupt generations are never decoded by guessed struct layout.
+
+Journal payload, in order: transaction ID string; phase u32; old release ID
+string; new release ID string; old and new exact manifest SHA-256 (32 bytes
+each); snapshot-ready u8 boolean; active services u64 bitset; monotonic progress
+milliseconds u64; UTC progress seconds u64 (0..INT64_MAX); progress boot ID
+string. IDs use the release-ID grammar and 64-byte bound; boot ID is 1..64
+printable non-space ASCII bytes. Phases 1..13 are checking, available,
+downloading, verifying, prepared, stopping, switching, starting, validating,
+committed, rolling_back, rolled_back, recovery_failed. Switching through
+committed requires snapshot-ready=1. The caller defines a stable service bit
+mapping, binds operation/old/new identities to actual validated releases, and
+owns legal phase transitions. A checksum does not prove that a snapshot exists
+or that a service is healthy. Boot ID makes a saved monotonic heartbeat usable
+only in its original boot; task 6/7 must handle a different boot conservatively.
+
+Persistent payload, in order: accepted publication sequence u64; exact accepted
+index SHA-256 (32 bytes); has-accepted-index u8 boolean; trusted accepted-time
+floor u64 (0..INT64_MAX); trust-key count u8 (1..8); for each key public bytes
+(32), not-before u64 and not-after u64 (0..INT64_MAX, increasing, no duplicates);
+policy enabled u8; selected local YYYYMMDD u32; last-attempt local YYYYMMDD u32;
+selected local minute u16; has-quarantined-release u8; exact quarantined manifest
+SHA-256 (32 bytes). Dates are zero/unselected or valid Gregorian dates
+19700101..99991231. Selected minute is zero when unselected, otherwise 180..299.
+Accepted sequence is positive exactly when has-accepted-index=1. Trust keys are
+public, with no private material. Store refuses decreasing publication/time/date
+floors, changing digest at equal accepted publication, changing the selected
+minute for an existing date, removing existing keys or altering their intervals.
+Adding keys must already have been authorized by the signature verifier; these
+persistence APIs do not authenticate arbitrary input. Key retirement is outside
+v1. Runtime rollback or journal deletion never rewinds this state. Reload it
+before signature verification, and update live ctx/policy only after store OK.
+
+Stores serialize using private `journal.lock`/`persistent.lock` files. Each
+store creates a unique own temporary with O_EXCL, fully writes (handling short
+writes and EINTR), fsyncs its fd, closes, renames to the next slot, then fsyncs
+`update-state/`. All errors prevent success; only the exact temporary created
+by the current call is removed. No stale/foreign-temp sweep exists. Crash-left
+temporaries are ignored by readers. The previous slot is untouched by publication.
+Optional caller-owned `write_fd`, `sync_fd`, `rename_at` callbacks exercise I/O
+faults; absent callbacks use real POSIX calls. sync_fd applies to files and dirs.
+
+**An error after rename has an ambiguous durability outcome.** The new generation
+may be visible even after parent fsync fails, and may or may not survive a power
+loss. Store returns IO and the running caller must not report durable commit or
+activate new trust/policy on that result. A retry with identical generation and
+payload re-fsyncs the visible inode and directory; equal generation with changed
+payload is REPLAY. Recovery uses the validated generation it actually observes,
+including a possibly visible terminal phase; it cannot infer an old generation
+from an earlier API error. Task 6 must reconcile recorded release identities and
+phase with actual `current`/snapshot/services and durably journal any rollback
+before declaring it complete. A failed terminal store is not permission to
+ignore a visible terminal record or blindly launch/revert a release. True storage
+loss remains outside software recovery guarantees, as in design §6.
+
+`d2ku_maintenance_lock` opens `maintenance.lock` with CLOEXEC and takes nonblocking
+exclusive flock. Every service/config/watchdog/NDM entry must use this same lock;
+update holds its returned fd across the transaction and invokes internal service
+commands without reacquisition. BUSY leaves output unchanged. Close releases the
+lock; process exit/crash releases it through the kernel. Lock files are never
+unlinked (avoiding split-inode locks). Record locks are distinct, allowing durable
+writes while maintenance is held. These primitives do not stop/start services,
+switch `current`, copy snapshots, enforce heartbeat health or perform rollback;
+those responsibilities belong to the consuming transaction/recovery modules.

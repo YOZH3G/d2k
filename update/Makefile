@@ -12,7 +12,7 @@ $(BUILD)/test_manifest: tests/test_manifest.c src/manifest.c include/d2k_update.
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_manifest.c src/manifest.c $(LDFLAGS) $(LDLIBS) -o $@
 clean:
-	rm -f $(BUILD)/test_manifest $(BUILD)/test_transport $(BUILD)/test_package $(BUILD)/test_schedule
+	rm -f $(BUILD)/test_manifest $(BUILD)/test_transport $(BUILD)/test_package $(BUILD)/test_schedule $(BUILD)/test_journal
 
 .PHONY: check-schedule
 check-schedule: $(BUILD)/test_schedule
@@ -34,3 +34,11 @@ $(BUILD)/test_transport: tests/test_transport.c src/transport.c src/manifest.c i
 $(BUILD)/test_package: tests/test_package.c src/package.c include/d2k_update.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_package.c src/package.c $(LDFLAGS) $(LDLIBS) -o $@
+
+.PHONY: check-journal
+check: check-journal
+check-journal: $(BUILD)/test_journal
+	$(BUILD)/test_journal
+$(BUILD)/test_journal: tests/test_journal.c src/journal.c include/d2k_update.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_journal.c src/journal.c $(LDFLAGS) $(LDLIBS) -o $@
