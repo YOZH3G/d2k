@@ -324,12 +324,17 @@ remains the trust boundary. Schema/type, sequence/slot consistency, exact length
 checksum, every scalar range and string grammar are validated before exposure.
 Unsupported/corrupt generations are never decoded by guessed struct layout.
 
-Journal payload, in order: transaction ID string; phase u32; old release ID
+Journal payload, in order: transaction ID string; phase u32; original failure
+reason u32; recovery failure reason u32; old release ID
 string; new release ID string; old and new exact manifest SHA-256 (32 bytes
 each); snapshot-ready u8 boolean; active services u64 bitset; monotonic progress
 milliseconds u64; UTC progress seconds u64 (0..INT64_MAX); progress boot ID
 string. IDs use the release-ID grammar and 64-byte bound; boot ID is 1..64
-printable non-space ASCII bytes. Phases 1..13 are checking, available,
+printable non-space ASCII bytes. Both reasons are explicit d2ku_rc values
+0..12 (OK through RECOVERY); zero means no failure. The first transaction
+cause survives a successful rollback; recovery_reason records failure of
+recovery independently. These two fields were added before the first release
+of schema 1: no deployed record migration is implied. Phases 1..13 are checking, available,
 downloading, verifying, prepared, stopping, switching, starting, validating,
 committed, rolling_back, rolled_back, recovery_failed. Switching through
 committed requires snapshot-ready=1. The caller defines a stable service bit
@@ -386,3 +391,116 @@ unlinked (avoiding split-inode locks). Record locks are distinct, allowing durab
 writes while maintenance is held. These primitives do not stop/start services,
 switch `current`, copy snapshots, enforce heartbeat health or perform rollback;
 those responsibilities belong to the consuming transaction/recovery modules.
+
+
+## Transaction and stable boot protocol v1
+
+`d2ku_install` accepts an internal authenticated request: original verified
+manifest, fresh durably accepted index, selected ID/hash, archive descriptor,
+operation ID, and expected current ID/hash. These are C-side bindings; HTTP
+must not create a manifest structure. Manual installation still applies the
+trusted clock gate. Automatic installation additionally checks durable policy
+and consumes its date under the maintenance lock immediately before preparing
+the stop; the daemon must not consume that date a second time.
+
+Preparation verifies/stages the exact archive, hashes the ABI file set again,
+runs each of d2kd/d2kc/d2kpanel/d2ktg/d2k-update with `--release-id` and
+`--self-check`, and requires updater `--boot-protocol` to print exactly `1\n`.
+Each offline process has a five-second deadline and receives no live config
+path. `releases/.stage-<operation>` is published by rename only after all files
+and its private `.d2ku-receipt` are synced. Reuse of an existing ID requires
+matching receipt and freshly matching signed file hashes, modes and sizes.
+Stable `boot/` is outside every release. Receipt format is
+`D2KR1 <wire> <state> <updater-version> <manifest-sha256-hex>\n`.
+Bootstrap uses `d2ku_release_receipt` only after verifying its old inventory.
+
+The transaction rechecks expected current, receipt, state compatibility and
+actual filesystem space under the shared maintenance lock. Required callbacks
+`transaction.capture` and `transaction.services` cannot default to success.
+Capture returns the exact enabled bitset (1 datapath, 2 core, 4 panel, 8 TG).
+Services receives fixed action `stop`, `start` or `remove-rules`, explicit
+release ID and preserved bitset. Stop must reap every persistent writer,
+flush state and remove only D2K rules; start must start only that bitset from
+the single supplied release. Callbacks must not reacquire maintenance.
+`ctx.maintenance_lock_fd` is valid only during these locked callbacks.
+
+The adapter supplies 1..16 personal top-level snapshot entries and marks each
+configuration or state. No slash, link, special file, duplicate, reserved
+update-state/update/releases/boot/current/run/log(s)/staging/snapshots entry is
+accepted. Configuration is copied before stopping under the lock. State is
+inventoried anew and copied only after stop succeeds, including files first
+created during shutdown. `snapshots/<operation>` is private root-owned storage,
+separate from trust/policy; inventory records absent entries and a SHA-256 seal
+binds names, types, modes and all bytes. Only full copy + seal + fsync makes
+snapshot_ready durable. Recovery validates the whole seal before changing any
+live entry. Copy+rename from the retained snapshot is restartable; interrupted
+restore never consumes the source. An incomplete snapshot is ignored and the
+old live state remains authoritative. Successful late rollback uses a new
+snapshot of current compatible state and never reuses the old pre-install data.
+
+`current` changes via a temporary relative symlink, rename and parent fsync.
+The old worker continues running from its original inode through switching.
+Candidate updater startup is checked separately before observation: execute
+`releases/<ID>/d2k-update --boot-probe 3 --root-fd 4`, cwd its release directory.
+FD3 is a nonblocking anonymous pipe; FD4 is a read-only root directory handle.
+Task9 must initialize the real daemon/config/state readers, with schedulers,
+transactions and mutations disabled; no public IPC socket is claimed. It must
+emit `D2KU1 READY\n` only after initialization, then `D2KU1 PULSE\n` at least
+once a second. It must exit when the pipe closes. No child processes may outlive
+this probe. Linux additionally binds probe death to its parent with PDEATHSIG.
+Missing readiness after 10 seconds, malformed records, exit, or 10 seconds
+without heartbeat fail the candidate. The candidate remains alive through
+COMMITTED publication; the transaction kills/reaps the probe afterwards.
+
+Only after READY does continuous runtime observation begin. Every enabled
+service is checked every second by `d2ku_health`; commit requires
+health_complete after 120000 monotonic milliseconds, with the same process
+identities. Restarts cannot extend the observation forever: failure to complete
+within that observation window rolls back. External availability is separate.
+The successful rollback also verifies the old runtime; no retry loop starts
+once RECOVERY_FAILED is recorded. Failure to durably record quarantine likewise
+fails recovery closed. Reason codes persist in the journal without secrets.
+
+A failed terminal store may be visible. The running transaction reloads its
+actual generation and writes explicit ROLLING_BACK before reverting. Recovery
+of a visible terminal record reconciles the recorded ID/hash against actual
+current/receipt; mismatch becomes RECOVERY_FAILED, never an assumed old state.
+Normal startup after an already terminal transaction remains the boot service
+adapter's responsibility. Incomplete transactions stop both possible writers,
+restore only a ready verified snapshot, select old, restart the saved bitset,
+and durably record ROLLED_BACK. RECOVERY_FAILED removes own interception via
+the adapter and rejects subsequent automatic recovery attempts.
+
+### Stable executable and Task7 adapter
+
+Build `make -C update boot`: `d2k-update-boot` links transaction/journal/package/
+health/schedule and OpenSSL, **no libcurl** and no candidate shared library.
+Production installs it in stable bootstrap storage outside releases. Commands:
+
+- `d2k-update-boot --boot-protocol` prints `1`.
+- `d2k-update-boot --recover` reconciles before ordinary D2K startup.
+- `d2k-update-boot --supervise /opt/d2k/current/d2k-update --boot-worker 3`
+  supervises the daemon. The daemon uses inherited FD3 and `d2ku_boot_pulse`
+  from an independent one-second heartbeat thread so downloads cannot block it.
+  On exit or heartbeat loss, boot kills/reaps its owned worker group first,
+  then obtains maintenance and independently recovers. It does not respawn a
+  failed worker in a loop. Worker argv is trusted bootstrap CLI, never HTTP.
+- Test/standalone CLI may precede the command with `--root DIR --runtime DIR`;
+  defaults are `/opt/d2k` and `/tmp/d2k`. There is no HTTP root override.
+
+Boot recovery executes only verified regular root-owned, non-writable-by-others
+`boot/d2k-service-adapter`, a stable C adapter supplied by Task7. Exact argv:
+`d2k-service-adapter --maintenance-fd 4 ACTION RELEASE SERVICE_BITS`.
+FD4 is a duplicate of the parent's locked maintenance file description and
+survives exec. Task7 must verify it belongs to its expected maintenance inode
+and use the held lock rather than acquiring another. Before spawning any
+long-lived runtime, close FD4 in that child or mark it CLOEXEC; a runtime must
+never retain the maintenance lock. The cwd is `boot/`.
+Fixed actions are `stop`, `start`, `remove-rules`, `health-state`,
+`health-rules`, `health-http`; health actions receive `- 0` and derive the
+actual configured enabled set from personal configuration. Exit 0 is success;
+any other status/timeout (30 seconds) is failure. This is not a shell-string
+interface. Missing adapter fails closed. Task7 must supply actual config/state,
+loopback panel and ALL datapath/TG NAT/ipset/filter rule checks; these are not
+claimed by callback fixtures. Boot uses Linux default executable/heartbeat
+observations against the restored release and volatile runtime directory.

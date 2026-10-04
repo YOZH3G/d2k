@@ -121,7 +121,25 @@ typedef struct {
     unsigned char public_key[32];
     int64_t not_before, not_after; /* inclusive start, exclusive end */
 } d2ku_key;
+#define D2KU_SNAPSHOT_PATHS_MAX 16u
+typedef struct {
+    char name[D2KU_ID_MAX + 1]; /* one personal top-level entry, no symlinks */
+    int configuration; /* 1 copied under lock before stop, 0 after stop */
+} d2ku_snapshot_path;
+typedef struct {
+    void *arg;
+    d2ku_rc (*capture)(void *, uint64_t *enabled);
+    d2ku_rc (*services)(void *, const char *action, const char *release, uint64_t enabled);
+    /* Optional test/platform seams; NULL uses production implementations. */
+    d2ku_rc (*offline)(void *, int release_fd, const char *release);
+    d2ku_rc (*updater_probe)(void *, const char *action, const char *release);
+    d2ku_rc (*wait_ms)(void *, unsigned ms);
+    d2ku_snapshot_path paths[D2KU_SNAPSHOT_PATHS_MAX];
+    size_t path_count;
+} d2ku_transaction_ops;
 struct d2ku_ctx {
+    d2ku_transaction_ops transaction;
+    int maintenance_lock_fd; /* internal, valid only during transaction callbacks */
     /* Local health adapters: callbacks are read-only and cannot infer success
      * from PID alone. Absent callbacks use Linux proc, dirfd-relative state,
      * loopback HTTP and read-only iptables-save. runtime_dirfd must be supplied
@@ -241,6 +259,7 @@ struct d2ku_journal {
     unsigned char checksum[32]; /* computed on store, supplied by load */
     char transaction_id[D2KU_ID_MAX + 1]; size_t transaction_id_len;
     d2ku_phase phase;
+    d2ku_rc failure_reason, recovery_reason; /* original cause and recovery failure */
     char old_release_id[D2KU_ID_MAX + 1]; size_t old_release_id_len;
     char new_release_id[D2KU_ID_MAX + 1]; size_t new_release_id_len;
     unsigned char old_manifest_sha256[32], new_manifest_sha256[32];
@@ -280,4 +299,30 @@ void d2ku_maintenance_unlock(int lock_fd);
  * process restart, boot/operation change or missed poll resets observation.
  * External availability is separate and never drives rollback. */
 d2ku_rc d2ku_health(d2ku_ctx *, const d2ku_journal *, d2ku_status *);
+/* Internal authenticated request, never deserialize these pointers from HTTP.
+ * index/manifest must have passed verification OK and durable acceptance.
+ * archive is rehashed by stage. Expected current binding is checked under lock.
+ * Rollback uses only transaction_id and selected/expected bindings; archive=-1. */
+struct d2ku_request {
+    char transaction_id[D2KU_ID_MAX + 1];
+    char expected_release_id[D2KU_ID_MAX + 1];
+    unsigned char expected_manifest_sha256[32];
+    char release_id[D2KU_ID_MAX + 1];
+    unsigned char manifest_sha256[32];
+    const d2ku_index *index;
+    const d2ku_manifest *manifest;
+    int archive_fd;
+    int automatic;
+};
+d2ku_rc d2ku_install(d2ku_ctx *, const d2ku_request *, d2ku_status *);
+d2ku_rc d2ku_rollback(d2ku_ctx *, const d2ku_request *, d2ku_status *);
+d2ku_rc d2ku_recover(d2ku_ctx *, d2ku_status *);
+/* Bootstrap receipt, used only after bootstrap verifies its inventory. */
+d2ku_rc d2ku_release_receipt(d2ku_ctx *, const char *id, const unsigned char hash[32]);
+/* Stable boot-v1 supervisor; owns child process group, kills/reaps before recover.
+ * argv is local trusted CLI data. Heartbeat pipe is inherited as descriptor 3. */
+d2ku_rc d2ku_supervise(d2ku_ctx *, const char *worker, char *const argv[], d2ku_status *);
+/* Worker calls pulse at least once/second from an independent thread, even
+ * during network I/O. fd must be inherited boot-v1 pipe, never persistent disk. */
+d2ku_rc d2ku_boot_pulse(int fd, int ready);
 #endif

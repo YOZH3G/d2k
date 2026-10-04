@@ -18,6 +18,7 @@ static d2ku_journal record(unsigned seq)
 {
     d2ku_journal j = {0};
     j.schema = 1; j.sequence = seq; j.phase = D2KU_PREPARED;
+    j.failure_reason = D2KU_HEALTH; j.recovery_reason = D2KU_IO;
     strcpy(j.transaction_id, "operation-1"); j.transaction_id_len = 11;
     strcpy(j.old_release_id, "old"); j.old_release_id_len = 3;
     strcpy(j.new_release_id, "new"); j.new_release_id_len = 3;
@@ -66,6 +67,7 @@ static void generations(void)
     assert(d2ku_journal_store(&c, &j) == D2KU_OK);
     assert(d2ku_journal_load(&c, &out) == D2KU_OK && out.sequence == 1);
     assert(out.active_services == 5 && out.transaction_id_len == 11);
+    assert(out.failure_reason == D2KU_HEALTH && out.recovery_reason == D2KU_IO);
     /* C-only tail/checksum bytes are excluded; equal logical retry is identical. */
     memset(j.checksum, 0xab, sizeof j.checksum);
     memset(j.transaction_id + 12, 0xcc, sizeof j.transaction_id - 12);

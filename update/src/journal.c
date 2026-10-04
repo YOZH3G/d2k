@@ -74,7 +74,9 @@ static d2ku_rc journal_valid(const d2ku_journal *j)
         !textvalid(j->new_release_id, j->new_release_id_len, D2KU_ID_MAX, 1) ||
         !textvalid(j->progress_boot_id, j->progress_boot_id_len, D2KU_BOOT_ID_MAX, 0) ||
         j->phase < D2KU_CHECKING || j->phase > D2KU_RECOVERY_FAILED ||
-        !boolean(j->snapshot_ready) || j->progress_utc < 0) return D2KU_INVALID;
+        !boolean(j->snapshot_ready) || j->progress_utc < 0 ||
+        j->failure_reason < D2KU_OK || j->failure_reason > D2KU_RECOVERY ||
+        j->recovery_reason < D2KU_OK || j->recovery_reason > D2KU_RECOVERY) return D2KU_INVALID;
     if (j->phase >= D2KU_SWITCHING && j->phase <= D2KU_COMMITTED && !j->snapshot_ready)
         return D2KU_INVALID;
     return D2KU_OK;
@@ -100,6 +102,7 @@ static d2ku_rc persistent_valid(const d2ku_persistent_state *s)
 static void encode_journal(buffer *b, const d2ku_journal *j)
 {
     putstr(b, j->transaction_id, j->transaction_id_len); number(b, j->phase, 4);
+    number(b, j->failure_reason, 4); number(b, j->recovery_reason, 4);
     putstr(b, j->old_release_id, j->old_release_id_len); putstr(b, j->new_release_id, j->new_release_id_len);
     bytes(b, j->old_manifest_sha256, 32); bytes(b, j->new_manifest_sha256, 32);
     number(b, (unsigned)j->snapshot_ready, 1); number(b, j->active_services, 8);
@@ -153,6 +156,8 @@ static d2ku_rc decode(kind k, buffer *b, unsigned slot, void *out)
         d2ku_journal j = {0}; j.schema = 1; j.sequence = seq; memcpy(j.checksum, saved, 32);
         j.transaction_id_len = getstr(b, j.transaction_id, D2KU_ID_MAX);
         j.phase = (d2ku_phase)getnum(b, 4);
+        j.failure_reason = (d2ku_rc)getnum(b, 4);
+        j.recovery_reason = (d2ku_rc)getnum(b, 4);
         j.old_release_id_len = getstr(b, j.old_release_id, D2KU_ID_MAX);
         j.new_release_id_len = getstr(b, j.new_release_id, D2KU_ID_MAX);
         getbytes(b, j.old_manifest_sha256, 32); getbytes(b, j.new_manifest_sha256, 32);

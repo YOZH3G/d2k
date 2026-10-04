@@ -12,7 +12,7 @@ $(BUILD)/test_manifest: tests/test_manifest.c src/manifest.c include/d2k_update.
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_manifest.c src/manifest.c $(LDFLAGS) $(LDLIBS) -o $@
 clean:
-	rm -f $(BUILD)/test_manifest $(BUILD)/test_transport $(BUILD)/test_package $(BUILD)/test_schedule $(BUILD)/test_journal $(BUILD)/test_health $(BUILD)/test_health_local $(BUILD)/test_health_fifo $(BUILD)/test_runtime_signal
+	rm -f $(BUILD)/test_manifest $(BUILD)/test_transport $(BUILD)/test_package $(BUILD)/test_schedule $(BUILD)/test_journal $(BUILD)/test_health $(BUILD)/test_health_local $(BUILD)/test_health_fifo $(BUILD)/test_runtime_signal $(BUILD)/test_transaction $(BUILD)/test_recovery $(BUILD)/d2k-update-boot
 
 .PHONY: check-schedule
 check-schedule: $(BUILD)/test_schedule
@@ -70,3 +70,21 @@ check-runtime-signal: $(BUILD)/test_runtime_signal
 $(BUILD)/test_runtime_signal: tests/test_runtime_signal_linux.c ../runtime/d2k_runtime.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) tests/test_runtime_signal_linux.c $(LDFLAGS) -o $@
+
+TRANSACTION_SRC = src/transaction.c src/recover.c src/journal.c src/package.c src/health.c src/schedule.c
+.PHONY: check-transaction check-recovery boot
+check: check-transaction check-recovery
+check-transaction: $(BUILD)/test_transaction
+	$(BUILD)/test_transaction
+check-recovery: $(BUILD)/test_recovery
+	$(BUILD)/test_recovery
+$(BUILD)/test_transaction: tests/test_transaction.c tests/transaction_fixture.h $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_transaction.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD)/test_recovery: tests/test_recovery.c tests/transaction_fixture.h $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_recovery.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
+boot: $(BUILD)/d2k-update-boot
+$(BUILD)/d2k-update-boot: src/boot_main.c $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/boot_main.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
