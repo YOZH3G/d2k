@@ -2026,7 +2026,9 @@ int main(void) {
                    SNI in the head is not sufficient to choose a shaped plan.
                    Own probes know their shape, while client traffic must wait
                    for the bounded owning assembly (never guess MODERN). */
-                for (int scenario = 0; scenario < 9; scenario++) {
+                /* Issue #2: scenario 9 has an ECH/GREASE hello but only a
+                   learned MODERN suffix, including segmented ClientHello. */
+                for (int scenario = 0; scenario < 10; scenario++) {
                     uint8_t late[2048];
                     memcpy(late, whole, whole_len);
                     size_t late_len = whole_len;
@@ -2044,7 +2046,7 @@ int main(void) {
                         wr16(late + q, (uint16_t)(((unsigned)late[q] << 8 | late[q + 1]) + sizeof versions));
                         wr16(late + 7, (uint16_t)(((unsigned)late[7] << 8 | late[8]) + sizeof versions));
                         wr16(late + 3, (uint16_t)(((unsigned)late[3] << 8 | late[4]) + sizeof versions));
-                        if (scenario == 4 || scenario == 8) {
+                        if (scenario == 4 || scenario >= 8) {
                             const uint8_t ech[] = {0xfe,0x0d,0,11, 0,0,1,0,1,7,0,0,0,1,42};
                             memcpy(late + late_len, ech, sizeof ech); late_len += sizeof ech;
                             wr16(late + q, (uint16_t)(((unsigned)late[q] << 8 | late[q + 1]) + sizeof ech));
