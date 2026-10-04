@@ -1319,6 +1319,41 @@ int main(void) {
         d2k_session_free(g);
     }
 
+    /* --- одно имя, две формы: клиент TLS 1.2 получает план своей формы ----
+     * Поле 04.10.2026, updates.discord.com: приложение шлёт приветствие
+     * TLS 1.2 одним сегментом, а привязка легла только формой TLS 1.3 —
+     * «отказов по форме приветствия» росло, обход не применялся. План формы
+     * 1.2 рядом с планом 1.3 того же имени достаётся именно ему.            */
+    {
+        const uint8_t *nm = (const uint8_t *)"hetzner.com";
+        for (int with_legacy = 0; with_legacy <= 1; with_legacy++) {
+            d2k_session *g = d2k_session_new(64, 64);
+            d2k_plan *modern = NULL, *legacy = NULL;
+            d2k_plan_load(plan_bytes, sizeof plan_bytes, &modern, err, sizeof err);
+            CHECK(modern && d2k_plantab_set_name_family(d2k_session_plans(g), nm, 11, 1,
+                      modern, D2K_PLAN_SHAPE_MODERN, 0, 4) == 0, "две формы: план TLS 1.3");
+            if (with_legacy) {
+                d2k_plan_load(plan_bytes, sizeof plan_bytes, &legacy, err, sizeof err);
+                CHECK(legacy && d2k_plantab_set_name_family(d2k_session_plans(g), nm, 11, 1,
+                          legacy, D2K_PLAN_SHAPE_LEGACY, 0, 4) == 0, "две формы: план TLS 1.2");
+            }
+            n = build_pkt(pkt, (uint16_t)(43010 + with_legacy), 0x18, hello, hlen);
+            d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+            if (with_legacy) {
+                CHECK(r.n_out == 2 && d2k_session_applied(g) == 1,
+                      "две формы: клиенту TLS 1.2 не применён план его формы");
+                CHECK(d2k_plantab_shape_misses(d2k_session_plans(g)) == 0,
+                      "две формы: приветствие TLS 1.2 посчитано отказом по форме");
+            } else {
+                CHECK(r.n_out == 0 && d2k_session_applied(g) == 0,
+                      "одна форма: клиенту TLS 1.2 применён план формы TLS 1.3");
+                CHECK(d2k_plantab_shape_misses(d2k_session_plans(g)) >= 1,
+                      "одна форма: отказ по форме не посчитан");
+            }
+            d2k_session_free(g);
+        }
+    }
+
     /* --- SYN-ACK обогнал SYN: направление всё равно верное -----------------
      * Два направления приходят из ДВУХ правил firewall, и порядок между ними
      * не гарантирован. Раньше такой поток получал направления наоборот, и

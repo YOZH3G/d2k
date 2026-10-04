@@ -1816,6 +1816,32 @@ static task *task_watching_slot(d2k_sched *s) {
  * Приветствия задачи: снятое, если есть; иначе профиль холодного старта.
  * -------------------------------------------------------------------- */
 
+/* ФОРМА КЛИЕНТА ИЗ ПОДОЗРЕНИЯ — ИЗМЕРЕНИЕ, А НЕ ДОГАДКА.
+ *
+ * Датапат кладёт в подозрение форму приветствия ТОГО потока, из-за которого
+ * оно возникло (trigger_shape). Снимок в общей ячейке — лишь последнее
+ * приветствие этого ИМЕНИ, а у имени бывают клиенты разных форм: браузер
+ * TLS 1.3 и программа обновления TLS 1.2. Поле 04.10.2026,
+ * updates.discord.com: приложение говорило 179 байтами TLS 1.2 (форма 2 в
+ * подозрении), а поиск шёл заготовкой TLS 1.3 — свой план формы 1.3, зонд
+ * TLS 1.3, привязка формы 1 — и датапат отказывал потокам приложения по
+ * форме. Байты, форма которых известна и расходится с формой клиента
+ * подозрения, входом этого опыта не берутся; неизвестная форма с любой
+ * стороны не противоречит. */
+static uint8_t tcp_hello_kind(const uint8_t *b, size_t n) {
+    return d2k_hello_ech_offer(b, n, NULL) == 1 ? (uint8_t)D2K_LINK_SHAPE_ECH_TCP
+                                                : (uint8_t)d2k_hello_shape(b, n);
+}
+
+static int hello_fits_client(const task *t, const uint8_t *b, size_t n) {
+    if (t->transport != 6) return 1;
+    uint8_t want = t->trigger_shape;
+    if (want != D2K_SHAPE_MODERN && want != D2K_SHAPE_LEGACY &&
+        want != D2K_LINK_SHAPE_ECH_TCP) return 1;
+    uint8_t got = tcp_hello_kind(b, n);
+    return got == D2K_SHAPE_UNKNOWN || got == want;
+}
+
 static int fill_hellos(d2k_sched *s, task *t) {
     if (t->transport == 17) {
         /* Донор quicprobe.buildInitial начинает замер собственным QUIC
@@ -1892,7 +1918,8 @@ static int fill_hellos(d2k_sched *s, task *t) {
         for (size_t k = 0; k < 8; k++) {
             if (s->ech_inputs[k].len && s->ech_inputs[k].family == t->family &&
                 s->ech_inputs[k].observed_ms + 600000 >= s->now_ms &&
-                !strcmp(s->ech_inputs[k].name, t->name)) {
+                !strcmp(s->ech_inputs[k].name, t->name) &&
+                hello_fits_client(t, s->ech_inputs[k].bytes, s->ech_inputs[k].len)) {
                 memcpy(t->trig, s->ech_inputs[k].bytes, s->ech_inputs[k].len);
                 t->trig_len = s->ech_inputs[k].len; t->trig_snapped = 1; break;
             }
@@ -1900,7 +1927,8 @@ static int fill_hellos(d2k_sched *s, task *t) {
     }
     if (t->trig_len == 0 && s->tcp_shape_len[t->family == 6] > 0 &&
         strcmp(s->tcp_shape_name[t->family == 6], t->name) == 0 &&
-        s->tcp_shape_len[t->family == 6] <= sizeof t->trig) {
+        s->tcp_shape_len[t->family == 6] <= sizeof t->trig &&
+        hello_fits_client(t, s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6])) {
         /* Снимок ЭТОЙ цели пришёл раньше подозрения. Берём его: это настоящие
            байты клиента, а профиль холодного старта — заведомо не они. */
         memcpy(t->trig, s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]);
@@ -1912,9 +1940,13 @@ static int fill_hellos(d2k_sched *s, task *t) {
            что шлёт настоящий клиент (§4), и вердикт на нём слабее; но
            альтернатива — не измерять вовсе, пока цель не откроют второй раз.
            Снимок закажем параллельно (arm_shape ниже) и со следующего раза
-           будем мерить уже им. MODERN, а не LEGACY: современный клиент —
-           то, чем ходит браузер сегодня, и мерить им ближе к правде. */
-        if (d2k_hello_from_profile(D2K_SHAPE_MODERN, t->name,
+           будем мерить уже им. Форма заготовки — форма клиента из
+           подозрения (hello_fits_client): по ней выбираются свои планы,
+           протокол зонда и форма привязки. Не сказана — MODERN: современный
+           клиент — то, чем ходит браузер сегодня, и мерить им ближе к правде. */
+        d2k_shape cold = t->transport == 6 && t->trigger_shape == D2K_SHAPE_LEGACY
+                             ? D2K_SHAPE_LEGACY : D2K_SHAPE_MODERN;
+        if (d2k_hello_from_profile(cold, t->name,
                                    t->trig, sizeof t->trig, &t->trig_len) != 0) {
             return -1;
         }
@@ -6530,6 +6562,10 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     t->trig_len = len;
     t->trig_snapped = 1;
     t->reasked = 1;
+    /* Перемер идёт байтами ЭТОГО снимка: клиент опыта теперь он, и его форма
+       — форма клиента (hello_fits_client), а не прежнего подозрения. */
+    if (t->transport == 6 && tcp_hello_kind(t->trig, t->trig_len) != D2K_SHAPE_UNKNOWN)
+        t->trigger_shape = tcp_hello_kind(t->trig, t->trig_len);
     t->ctrl_len = 0;   /* контроль соберётся из новых байт */
     t->researched = 0;
     t->family_fast = 0;
@@ -6725,7 +6761,8 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         }
         if (t->state == T_ASKING && t->transport == 6 &&
             strcmp(t->name, name) == 0) {
-            if (!t->trig_snapped && !t->reasked && ev->shape_len <= sizeof t->snap) {
+            if (!t->trig_snapped && !t->reasked && ev->shape_len <= sizeof t->snap &&
+                hello_fits_client(t, ev->shape, ev->shape_len)) {
                 /* The worker owns an immutable cold-start profile copy. Ask
                    it to stop at its next bounded probe boundary; T_ASKING's
                    completion path restarts with the task-owned snapshot
@@ -8236,10 +8273,14 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                руках. Коробка вправе смотреть на содержимое и длину, а не
                только на версию (§6), поэтому повод для повтора один: мерили
                НЕ байтами клиента, а они уже есть. */
+            /* Снимок ДРУГОГО клиента этого имени (форма расходится с формой
+               клиента подозрения) повтором не берётся: мерили бы снова не
+               того клиента (hello_fits_client). */
             if (snap_restart ||
                 (t->transport == 6 && !t->reasked && s->tcp_shape_len[t->family == 6] > 0 &&
                 strcmp(s->tcp_shape_name[t->family == 6], t->name) == 0 &&
                 s->tcp_shape_len[t->family == 6] <= sizeof t->trig &&
+                hello_fits_client(t, s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]) &&
                 (!t->trig_snapped ||
                  (!t->ech_grease &&
                   d2k_hello_ech_offer(s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6], NULL) == 1
