@@ -234,6 +234,25 @@ fw_return_local() {
     done
 }
 
+# ICMP «ВРЕМЯ ЖИЗНИ ИСТЕКЛО» (IPv4 11/0, ICMPv6 3/0) — к клиенту (FORWARD) и
+# к роутеру (INPUT). Фальшивка плана с пониженным TTL умирает на узле по пути,
+# узел отвечает time-exceeded, а NAT отдаёт его клиенту по кортежу его же
+# потока. Поле 04.10.2026 (KN-1811, icmp-rua.pcap): Safari по такому ICMP
+# закрывал UDP-сокет QUIC, страница не открывалась. d2kd снимает ТОЛЬКО ответ
+# на собственную фальшивку (цитата — ровно её кортеж, длина, ID/номер),
+# остальное (traceroute, чужие потоки) — ACCEPT. PMTU (frag needed, packet
+# too big) и прочие ICMP в очередь не попадают вовсе. --queue-bypass: без
+# d2kd ICMP идёт как без d2k. $1 — утилита, $2 — -A или -C.
+fw_icmp_te_rule() {
+    if [ "$1" = iptables ]; then
+        "$1" -t mangle "$2" "$CHAIN_IN" -p icmp --icmp-type 11/0 \
+            -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+    else
+        "$1" -t mangle "$2" "$CHAIN_IN" -p ipv6-icmp --icmpv6-type 3/0 \
+            -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+    fi
+}
+
 fw_family_up() (
     fw_tool=$1
     loopback=127.0.0.0/8
@@ -351,6 +370,8 @@ fw_family_up() (
         -m connbytes --connbytes "$VOICE_CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+
+    fw_icmp_te_rule "$fw_tool" -A || return 1
 
     # СВОИ ПОСЫЛКИ ПО UDP — ЧЕРЕЗ MASQUERADE, и это не симметрия ради
     # симметрии, а разница между TCP и QUIC, замеренная на живом роутере
@@ -597,6 +618,7 @@ fw_family_installed() (
             --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
             --queue-bypass 2>/dev/null || return 1
     done
+    fw_icmp_te_rule "$fw_tool" -C 2>/dev/null || return 1
     "$fw_tool" -t mangle -C "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
         --tcp-flags RST RST -j NFQUEUE --queue-num "$QUEUE_NUM" \

@@ -46,6 +46,7 @@
 #include "d2k_routemark.h"
 #include "d2k_packet.h"
 #include "d2k_http80.h"
+#include "d2k_icmpguard.h"
 
 #define RECV_BUF   65536
 #define MAX_PKT     1600
@@ -196,7 +197,46 @@ static struct {
     uint64_t udp_marked_kept;  /* потоков UDP с меткой клиента: хвосты не переизданы */
     uint64_t busy_lines;       /* строк «сокет полон» в журнале (первые 16) */
     uint64_t routes_watch;     /* уведомлений о правилах/маршрутах */
+    uint64_t icmp_seen;        /* ICMP time-exceeded из очереди */
 } st;
+
+/* ICMP time-exceeded на собственные фальшивки с пониженным TTL (поле
+   04.10.2026, d2k_icmpguard.h): клиент не должен получать ошибку на пакет,
+   которого не посылал. Static: ~20 КиБ кольца не место на стеке. */
+static d2k_icmpguard icmpg;
+
+/* ICMP из очереди: 1 — разобран здесь (вердикт выдан или некому), 0 — не
+   ICMP, дальше обычным путём. Снимается только ответ на нашу же фальшивку;
+   всё прочее — ACCEPT без изменений. */
+static int icmp_step(d2k_nfq *q, const d2k_nl_pkt *np, uint64_t t) {
+    if (!np->have_payload || np->payload_len < 1) { return 0; }
+    uint8_t family = np->payload[0] >> 4;
+    if (!((family == 4 && np->payload_len >= 20 && np->payload[9] == 1) ||
+          (family == 6 && np->payload_len >= 40 && np->payload[6] == 58))) {
+        return 0;
+    }
+    st.icmp_seen++;
+    /* Только входящее: FORWARD к клиенту, INPUT к роутеру. */
+    int inbound = np->hook == D2K_HOOK_FORWARD || np->hook == D2K_HOOK_INPUT;
+    uint32_t v = inbound && d2k_icmpguard_check(&icmpg, np->payload, np->payload_len, t)
+        ? D2K_NF_DROP : D2K_NF_ACCEPT;
+    if (v == D2K_NF_DROP && d2k_icmpguard_dropped(&icmpg) == 1) {
+        char from[64] = "?";
+        (void)inet_ntop(family == 6 ? AF_INET6 : AF_INET,
+                        np->payload + (family == 6 ? 8 : 12), from, sizeof from);
+        fprintf(stderr, "d2kd: ICMP time-exceeded от %s на собственную фальшивку с "
+                        "пониженным TTL снят, клиенту не передан (дальше только "
+                        "счётчик в сводке)\n", from);
+    }
+    char err[200];
+    if (d2k_nfq_verdict(q, np->id, v, err, sizeof err) != 0) {
+        st.verdict_fail++;
+        fprintf(stderr, "d2kd: %s\n", err);
+        return 1;
+    }
+    if (v == D2K_NF_DROP) { st.dropped++; } else { st.accepted++; }
+    return 1;
+}
 
 /* Отказ сырой посылки плана — строка журнала. Полный сокет (EAGAIN/ENOBUFS,
    финальное ревью M-3) под забитым аплинком повторяется на каждом плане:
@@ -741,6 +781,11 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
     printf("пакетов %" PRIu64 ", байт %" PRIu64
            ", пропущено %" PRIu64 ", снято %" PRIu64 "\n",
            st.seen, st.bytes, st.accepted, st.dropped);
+    if (st.icmp_seen || d2k_icmpguard_noted(&icmpg)) {
+        printf("ICMP time-exceeded: получено %" PRIu64 ", снято на свои фальшивки %" PRIu64
+               "; фальшивок с пониженным TTL запомнено %" PRIu64 "\n",
+               st.icmp_seen, d2k_icmpguard_dropped(&icmpg), d2k_icmpguard_noted(&icmpg));
+    }
     /* Счёт применений берётся у сессии, а не свой. Своя переменная считала
        применения по числу выпущенных пакетов, и план из одной защиты — без
        единой посылки — показывался как «применён 0», хотя журнал той же
@@ -1379,6 +1424,11 @@ int main(int argc, char **argv) {
 
                     st.seen++;
                     st.bytes += np.payload_len;
+                    /* ICMP идёт в очередь только как time-exceeded (S99d2k,
+                       D2K_IN) и к сессии отношения не имеет. */
+                    if (icmp_step(q, &np, t)) {
+                        continue;
+                    }
                     /* Зонды контроллера (метка зондов) — не трафик человека:
                        их вставку не заменяем и о ней не сообщаем, иначе
                        собственный замер HTTP (шаг 4) мерил бы нашу же
@@ -1672,6 +1722,20 @@ int main(int argc, char **argv) {
                             if(d2k_session_exec_failed(sess,t,&res.key,res.plan_id,
                                  D2K_REFUSE_SEND,res.execution_id,0,0)) verdict=D2K_NF_ACCEPT;
                             break;
+                        }
+                    }
+
+                    /* ФАЛЬШИВКИ С ПОНИЖЕННЫМ TTL — В ПАМЯТЬ ДО ОТПРАВКИ:
+                       ICMP узла, где она умрёт, может прийти раньше, чем
+                       закончится этот проход. Мерило — TTL исходного пакета
+                       потока: посылка ниже него сервера не достигнет. */
+                    if (mode == MODE_APPLY && raw && res.applied && res.n_out &&
+                        np.have_payload && np.payload_len >= 20) {
+                        uint8_t orig_ttl = (np.payload[0] >> 4) == 6
+                            ? np.payload[7] : np.payload[8];
+                        for (size_t k = 0; k < res.n_out; k++) {
+                            (void)d2k_icmpguard_note(&icmpg, obuf + res.out[k].off,
+                                                     res.out[k].len, orig_ttl, t);
                         }
                     }
 

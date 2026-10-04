@@ -112,6 +112,36 @@ S99_SNIPPET='fw_down' s99 STUB_V6_MANGLE_BROKEN=1
 if S99_SNIPPET='fw_installed' s99 STUB_V6_MANGLE_BROKEN=1; then fail "fw_installed true after fw_down"; fi
 ok "without ip6tables mangle the service runs IPv4-only and says so"
 
+# --- ICMP time-exceeded на свои фальшивки (поле 04.10.2026, icmp-rua.pcap) --
+# В очередь — только TTL-истечение в пути (11/0, ICMPv6 3/0), только в
+# ответной цепочке, с --queue-bypass; потеря правила видна сторожу; fw_down
+# снимает его вместе с цепочкой.
+rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
+S99_SNIPPET='fw_up && fw_installed' s99 || fail "fw_up with the ICMP rule failed"
+rules iptables mangle | grep -qx -- '-A D2K_IN -p icmp --icmp-type 11/0 -j NFQUEUE --queue-num 2000 --queue-bypass' \
+    || fail "IPv4 time-exceeded is not queued in D2K_IN"
+rules ip6tables mangle | grep -qx -- '-A D2K_IN -p ipv6-icmp --icmpv6-type 3/0 -j NFQUEUE --queue-num 2000 --queue-bypass' \
+    || fail "ICMPv6 time-exceeded is not queued in D2K_IN"
+[ "$(rules iptables mangle | grep -c icmp)" -eq 1 ] || fail "IPv4: more than the one time-exceeded ICMP rule"
+[ "$(rules ip6tables mangle | grep -c icmp)" -eq 1 ] || fail "IPv6: more than the one time-exceeded ICMP rule"
+! rules iptables mangle | grep -- '-A D2K_OUT' | grep -q icmp || fail "ICMP rule leaked into D2K_OUT"
+for tool in iptables ip6tables; do
+    if [ "$tool" = iptables ]; then
+        FW_STATE="$TMP/fw" "$TMP/bin/$tool" -t mangle -D D2K_IN -p icmp --icmp-type 11/0 \
+            -j NFQUEUE --queue-num 2000 --queue-bypass
+    else
+        FW_STATE="$TMP/fw" "$TMP/bin/$tool" -t mangle -D D2K_IN -p ipv6-icmp --icmpv6-type 3/0 \
+            -j NFQUEUE --queue-num 2000 --queue-bypass
+    fi
+    if S99_SNIPPET='fw_installed' s99; then fail "$tool: a lost ICMP rule went unnoticed"; fi
+    S99_SNIPPET='fw_up' s99 || fail "$tool: fw_up did not restore the ICMP rule"
+    S99_SNIPPET='fw_installed' s99 || fail "$tool: restored rules not recognised"
+done
+S99_SNIPPET='fw_down' s99
+! rules iptables mangle | grep -q icmp || fail "fw_down left the IPv4 ICMP rule"
+! rules ip6tables mangle | grep -q icmp || fail "fw_down left the IPv6 ICMP rule"
+ok "time-exceeded ICMP is queued with bypass in both families and removed on stop"
+
 # A working ip6tables whose rule fails half-way is still a real error: both
 # families roll back, as before.
 rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"

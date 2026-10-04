@@ -77,7 +77,18 @@ for proto in tcp udp; do
 done
 ip6tables -t mangle -C D2K_OUT -m mark --mark "$MARK" -j RETURN || fail "нет IPv6 raw bypass"
 ip6tables -t mangle -C D2K_OUT -m mark --mark "$MEASURE_MARK" -j RETURN || fail "нет IPv6 measurement bypass"
-ip6tables -t mangle -S | grep 'NFQUEUE' | grep -vE -- '-p (tcp|udp) ' && fail "IPv6 очередь захватывает не TCP/UDP"
+# Кроме TCP/UDP в очередь идёт ровно одно: ICMP time-exceeded в пути на свои
+# фальшивки (поле 04.10.2026) — и только в ответной цепочке.
+ip6tables -t mangle -S | grep 'NFQUEUE' | grep -vE -- '-p (tcp|udp) ' \
+    | grep -vxE -- '-A D2K_IN -p ipv6-icmp -m icmp6 --icmpv6-type 3/0 -j NFQUEUE --queue-num [0-9]+ --queue-bypass' \
+    && fail "IPv6 очередь захватывает не TCP/UDP"
+iptables -t mangle -S | grep 'NFQUEUE' | grep -vE -- '-p (tcp|udp) ' \
+    | grep -vxE -- '-A D2K_IN -p icmp -m icmp --icmp-type 11/0 -j NFQUEUE --queue-num [0-9]+ --queue-bypass' \
+    && fail "IPv4 очередь захватывает не TCP/UDP"
+iptables -t mangle -C D2K_IN -p icmp --icmp-type 11/0 -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass \
+    || fail "нет IPv4 time-exceeded в D2K_IN"
+ip6tables -t mangle -C D2K_IN -p ipv6-icmp --icmpv6-type 3/0 -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass \
+    || fail "нет ICMPv6 time-exceeded в D2K_IN"
 if ip6tables -t nat -S | grep -q MASQUERADE; then fail "IPv4 MASQUERADE скопирован в IPv6"; fi
 RULES=$(iptables -t mangle -S)
 echo "$RULES"
@@ -209,6 +220,13 @@ fw_up
 # Сам отказ полевой: 12.09.2026 на роутере автора NDM сбросил правила внутри
 # цепочек, оставив зацепки; служба рапортовала «правила: стоят» прежней
 # проверкой, и обход был мёртв полтора часа.
+iptables -t mangle -D D2K_IN -p icmp --icmp-type 11/0 -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+if fw_installed; then fail "потеря IPv4 time-exceeded не обнаружена"; fi
+fw_up
+ip6tables -t mangle -D D2K_IN -p ipv6-icmp --icmpv6-type 3/0 -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+if fw_installed; then fail "потеря ICMPv6 time-exceeded не обнаружена"; fi
+fw_up
+
 echo "== восстановление после внешнего сброса =="
 iptables -t mangle -F D2K_OUT
 iptables -t mangle -F D2K_IN
