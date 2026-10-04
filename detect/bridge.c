@@ -109,6 +109,44 @@ int d2k_arm_from_poison(const d2k_poison *p, d2k_arm *a, char *why, size_t whyca
     return 0;
 }
 
+/* НАХОДКА, КОТОРУЮ НЕЛЬЗЯ ПОСТАВИТЬ, ДЛЯ ПЛАНА — НЕ НАХОДКА.
+ *
+ * Поле 04.10, чистый каталог: rutracker.org и discord.com. Перебор отрав
+ * дошёл до «oob» (срочный байт), коробка его взяла — и перебор на этом
+ * кончился. Языком плана URG не выражается (d2k_arm_from_poison), поиск
+ * принадлежит замеру, и итог — «кандидатов 0», цель отдыхает, хотя
+ * следующие гипотезы того же списка, которые датапат исполняет, так и не
+ * были заданы. Фильтр находок дерева (d2k_opts.accept) ровно для этого:
+ * невыразимое — «как будто не сработало», перебор идёт дальше. Это не
+ * подмена похожим: следующий кандидат — тоже измеренный ответ коробки.
+ * Взятое, но невыразимое, не теряется — оно названо в причине, а первое
+ * из него ещё и доказывает «решает содержимое», если дальше не взяло
+ * ничего (см. sched_tcp). */
+typedef struct {
+    char first[64];     /* d2k_poison.name */
+    char why[120];      /* почему не выражается первое */
+    char others[96];    /* остальные взятые невыразимые — только имена */
+} unplannable;
+
+static int plannable_hit(const d2k_poison *p, void *ctx)
+{
+    unplannable *u = ctx;
+    d2k_arm a;
+    char why[120];
+    size_t n;
+    if (d2k_arm_from_poison(p, &a, why, sizeof why) == 0) { return 1; }
+    if (!u->first[0]) {
+        snprintf(u->first, sizeof u->first, "%s", p->name);
+        snprintf(u->why, sizeof u->why, "%s", why);
+        return 0;
+    }
+    n = strlen(u->others);
+    if (n + 1 < sizeof u->others) {
+        snprintf(u->others + n, sizeof u->others - n, "%s«%s»", n ? ", " : "", p->name);
+    }
+    return 0;
+}
+
 static d2k_verdict map_verdict(d2k_verdict_t v)
 {
     switch (v) {
@@ -249,6 +287,10 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
     int seeded_whole = opt.seed_whole;
     opt.on_obs = progress_seen;
     opt.on_obs_ctx = &seeded_whole;
+    unplannable refused;
+    memset(&refused, 0, sizeof refused);
+    opt.accept = plannable_hit;
+    opt.accept_ctx = &refused;
     d2k_classify_run(addr, &tr, &opt, &res);
 
     if (res.stopped) {
@@ -265,8 +307,23 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
     out.verdict = map_verdict(res.verdict);
     out.split_gap_us = (uint32_t)opt.write_gap_ms * 1000u;
     snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);
-    out.split_pos = res.split_pos;
-    out.probes = res.probes;
+    if (refused.first[0]) {
+        size_t n;
+        if (!res.has_hit) {
+            /* Ни одной выразимой находки после невыразимой: взятая отрава
+             * всё равно доказала, что решает содержимое, — тот же вердикт и
+             * та же строка, что прежде давала она сама; молчание контроля
+             * этого не отменяет. */
+            out.verdict = D2K_V_OPAQUE;
+            snprintf(out.reason, sizeof(out.reason),
+                     "поток пересобирается, но буфер травится: коробка глотает «%s», "
+                     "сервер выбрасывает", refused.first);
+        }
+        n = strlen(out.reason);
+        snprintf(out.reason + n, sizeof(out.reason) - n,
+                 "; приём «%s» сработал, но планом не задаётся: %s%s%s", refused.first,
+                 refused.why, refused.others[0] ? "; также " : "", refused.others);
+    }
     /* СЫРОЙ СЛОЙ НЕ ПОДНЯЛСЯ — ПОИСКА НЕ БЫЛО. Самопроверка не прошла ни
      * разу: отравление не проверено вовсе, и «решает содержимое» без плеча
      * — не итог поиска, а своя поломка (D2K_SPEC §9 п.9: локальная ошибка не

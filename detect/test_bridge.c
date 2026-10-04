@@ -19,6 +19,7 @@ int d2k_detect_sched_tcp_ack(const char *, uint16_t, uint32_t,
                              const volatile sig_atomic_t *, int *);
 
 static d2k_opts seen;
+static const char *const *sweep_pass;
 static d2k_result answer;
 static int failures;
 static char seen_name[D2K_TRIGGER_NAME_MAX];
@@ -85,6 +86,32 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     snprintf(seen_name, sizeof seen_name, "%s", tr->name);
     seen = *opt;
     *res = answer;
+    /* ПЕРЕБОР ОТРАВ НАСТОЯЩЕГО СПИСКА (поле 04.10, rutracker.org/discord.com).
+       Коробка «глотает» гипотезы из sweep_pass; дерево идёт по d2k_poisons()
+       в его порядке и, как classify.c, отдаёт первую единогласную находку,
+       которую принял фильтр opt->accept. */
+    if (sweep_pass) {
+        int n, i, k;
+        const d2k_poison *l = d2k_poisons(&n);
+        res->has_hit = 0;
+        /* Худший исход дерева без находки: контроль молчит, без поручительства. */
+        res->verdict = D2K_DV_INCONCLUSIVE;
+        snprintf(res->reason, sizeof res->reason,
+                 "контроль не ответил и отравить не удалось: базы нет");
+        for (i = 0; i < n && !res->has_hit; i++) {
+            for (k = 0; sweep_pass[k]; k++) {
+                if (strcmp(sweep_pass[k], l[i].name)) continue;
+                if (opt->accept && !opt->accept(&l[i], opt->accept_ctx)) break;
+                res->has_hit = 1;
+                res->hit = l[i];
+                res->verdict = D2K_DV_POISONABLE;
+                snprintf(res->reason, sizeof res->reason,
+                         "поток пересобирается, но буфер травится: коробка глотает «%s», "
+                         "сервер выбрасывает", l[i].name);
+                break;
+            }
+        }
+    }
     /* Базовый вопрос (задача 32): остановка взводится ровно наблюдением
        "whole" — до него дерево не бросается, после — бросается. */
     if (opt->on_obs) {
@@ -361,6 +388,41 @@ int main(void)
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
     p.oob = 0; p.md5 = 1;
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
+    {
+        /* ПОЛЕ 04.10, ЧИСТЫЙ КАТАЛОГ: rutracker.org и discord.com. Перебор
+           отрав дошёл до «oob» (срочный байт) — коробку он берёт, но языком
+           плана не выражается, — и на этом кончился: кандидатов 0, цель
+           отдыхает. Находка, которую поставить нельзя, для плана — не находка:
+           перебор обязан продолжиться к следующей гипотезе, которую датапат
+           исполнит, а о невыразимой — сказать в причине. */
+        static const char *const box_takes[] = {"oob", "ttl-8", NULL};
+        static const char *const only_oob[] = {"syndata", "oob", NULL};
+        uint8_t h[300], c[] = {0x16, 0x03, 0x01};
+        d2k_hello tr = {h, 0}, ctl = {c, sizeof c};
+        tr.len = build_hello(h, "rutracker.org");
+        memset(&answer, 0, sizeof answer);
+        sweep_pass = box_takes;
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        CHECK(seen.accept != NULL);
+        CHECK(r.verdict == D2K_V_OPAQUE && r.have_arm && r.owns_search);
+        CHECK(r.arm.ttl == 8 && r.arm.repeats == 1 && strcmp(r.arm_name, "ttl-8") == 0);
+        CHECK(strstr(r.reason, "«oob»") != NULL && strstr(r.reason, "URG") != NULL);
+        /* Выразимого нет вовсе: плана нет, но взятая отрава всё равно
+           доказала «решает содержимое» — вердикт тот же, что и до правки,
+           даже если без неё дерево не нашло бы базы (контроль молчал). */
+        sweep_pass = only_oob;
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        CHECK(r.verdict == D2K_V_OPAQUE && !r.have_arm && r.owns_search);
+        CHECK(strstr(r.reason, "буфер травится") != NULL);
+        CHECK(strstr(r.reason, "«syndata»") != NULL && strstr(r.reason, "«oob»") != NULL);
+        CHECK(strstr(r.reason, "SYN") != NULL);
+        /* Фильтр пропускает всё, что план выражает. */
+        memset(&p, 0, sizeof p);
+        p.badsum = 1; p.repeats = 7;
+        CHECK(seen.accept(&p, seen.accept_ctx) == 1);
+        sweep_pass = NULL;
+        memset(&answer, 0, sizeof answer);
+    }
     {
         /* Задача 54: вопрос перепроверки мёртвого адреса. */
         int probes = -1, rc;
