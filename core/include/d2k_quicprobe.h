@@ -521,10 +521,16 @@ static inline int d2k_qstall_step(d2k_qstall *st, int64_t now_ms, uint64_t rx_by
  * стороны, а сервер всё ещё шлёт (датаграмма от него моложе RTO), бюджет
  * прошёл — обход большого ресурса засчитывается, не дожидаясь конца ответа. */
 #define D2K_QUIC_BOX_BUDGET_PKTS 25u
+static inline int d2k_quic_budget_ok_n(uint64_t tx_pkts, uint64_t rx_pkts, int status,
+                                       int64_t now_ms, int64_t last_rx_ms, int64_t rto_ms,
+                                       unsigned budget_pk) {
+    if (!budget_pk) budget_pk = D2K_QUIC_BOX_BUDGET_PKTS;
+    return status > 0 && tx_pkts + rx_pkts >= 2u * (uint64_t)budget_pk &&
+           now_ms - last_rx_ms < rto_ms;
+}
 static inline int d2k_quic_budget_ok(uint64_t tx_pkts, uint64_t rx_pkts, int status,
                                      int64_t now_ms, int64_t last_rx_ms, int64_t rto_ms) {
-    return status > 0 && tx_pkts + rx_pkts >= 2u * D2K_QUIC_BOX_BUDGET_PKTS &&
-           now_ms - last_rx_ms < rto_ms;
+    return d2k_quic_budget_ok_n(tx_pkts, rx_pkts, status, now_ms, last_rx_ms, rto_ms, 0);
 }
 
 static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge3(int handshake, int status,
@@ -616,6 +622,15 @@ typedef struct {
        CLEAR; воспроизвёл — плечи меряются этапом данных. Сохраняется
        d2k_quic_run так же, как probe_path. */
     int               data_cut;
+    /* ВХОД: бюджет коробки в пакетах для воспроизведения обрыва своим
+       запросом (data_cut): запросы на новых потоках до 2 × budget_pk
+       датаграмм или тишины сервера. 0 — D2K_QUIC_BOX_BUDGET_PKTS.
+       Сохраняется d2k_quic_run так же, как probe_path. */
+    unsigned          budget_pk;
+    /* ВЫХОД: обрыв после рукопожатия воспроизведён своим запросом в этом
+       прогоне (а не, скажем, рукопожатие заблокировано при data_cut на
+       входе). Только он ведёт к снятию QUIC (stall_cut планировщика). */
+    int               data_cut_seen;
 } d2k_quic_arm;
 
 /* One original run: arm search happens before properties with the SAME pool.

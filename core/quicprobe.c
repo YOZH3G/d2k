@@ -1689,14 +1689,28 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
         snprintf(d.reason, sizeof d.reason, "фильтр прошёл, рукопожатия нет: %.120s", err);
         return d;
     }
+    d2k_quic_data_stage(c, sni, path, q->need_complete, q->budget_pk, step, &d);
+    d2k_qc_close(c);
+    return d;
+}
+d2k_quic_arm_data_wire_fn d2k_quic_arm_data_hook=quic_arm_data;
+
+/* Этап данных на уже установленном соединении c: управляющий поток HTTP/3,
+ * запрос к sni по path и чтение ответа до вердикта. Соединение не
+ * закрывает. Выделено из quic_arm_data ради стенда на петле (задача 50,
+ * поле 04.10: воспроизведение по бюджету коробки). */
+void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_complete,
+                         unsigned budget_pk, uint32_t step, d2k_quic_arm_data *out) {
+    d2k_quic_arm_data d = *out;
+    char err[200];
+    err[0] = '\0';
     uint8_t buf[4096];
     uint64_t sid = 0;
     size_t cn = d2k_h3_control(buf, sizeof buf);
     if (cn == 0 || d2k_qc_stream_send(c, 2, buf, cn, 0, err, sizeof err) != 0) {
         d.verdict = D2K_QAD_NOT_RUN;
         snprintf(d.reason, sizeof d.reason, "управляющий поток не ушёл: %.120s", err);
-        d2k_qc_close(c);
-        return d;
+        { *out = d; return; }
     }
     /* Та же пауза до вопроса, что у проверки плана (verify.c): сервер обязан
        увидеть SETTINGS раньше запроса. */
@@ -1704,8 +1718,7 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
     size_t rn = d2k_h3_request(sni, path, buf, sizeof buf);
     if (rn == 0 || d2k_qc_stream_send(c, 0, buf, rn, 1, err, sizeof err) != 0) {
         snprintf(d.reason, sizeof d.reason, "запрос не ушёл: %.120s", err);
-        d2k_qc_close(c);
-        return d;
+        { *out = d; return; }
     }
     uint64_t bytes = 0, last = 0;
     int complete = 0, closed = 0, status = 0;
@@ -1719,8 +1732,7 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
     if (!head) {
         d.verdict = D2K_QAD_NOT_RUN;
         snprintf(d.reason, sizeof d.reason, "не хватило памяти под заголовки ответа HTTP/3");
-        d2k_qc_close(c);
-        return d;
+        { *out = d; return; }
     }
     int64_t start = qp_now_ms(), progress_at = start;
     /* Раунд 3 (задача 50): «встал» решает молчание транспорта, проверенное
@@ -1730,25 +1742,56 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
        больше: обрыву нужно RTO тишины и два PING без ответа. */
     d2k_qstall st;
     d2k_qstall_init(&st, d2k_qc_rtt_ms(c), start, d2k_qc_rx_wire_bytes(c));
-    int stalled = 0, budget = 0;
-    uint64_t tx0 = 0, rx0 = 0;
+    int stalled = 0, budget = 0, req_failed = 0;
+    uint64_t tx0 = 0, rx0 = 0, pk = 0, done_bytes = 0;
     d2k_qc_dgrams(c, &tx0, &rx0);
     int64_t limit = (int64_t)(4u * step);
     if (limit < 4 * st.rto_ms) limit = 4 * st.rto_ms;
     (void)progress_at;
-    while (!(complete && status) &&
-           (q->need_complete || bytes < D2K_QUIC_ARM_DATA_BYTES || !status)) {
+    /* ВОСПРОИЗВЕДЕНИЕ ПО БЮДЖЕТУ КОРОБКИ (поле 04.10, rua.gr в Safari).
+       Коробка рвёт поток после бюджета пакетов, а ответ на один запрос
+       короткой страницы кончается внутри бюджета — «пришёл целиком» ничего
+       не говорил об обрыве. Как у подтверждений (задача 55, verify.c
+       budget_quic): полный ответ — следующий запрос тем же путём на новом
+       двунаправленном потоке той же связи, пока связь не перенесёт
+       2 × бюджет датаграмм (сервер отвечает — не заблокировано) или сервер
+       не замолчит (PING без ответа — обрыв воспроизведён). Срок ожидания
+       отсчитывается от каждого запроса заново. */
+    int repeat = budget_pk > 0;
+    unsigned need = 2u * (budget_pk ? budget_pk : D2K_QUIC_BOX_BUDGET_PKTS);
+    unsigned requests = 1;
+    uint64_t req_sid = 0;
+    int64_t req_at = start;
+    while (repeat || (!(complete && status) &&
+                      (need_complete || bytes < D2K_QUIC_ARM_DATA_BYTES || !status))) {
         int64_t now = qp_now_ms();
-        if (now - start >= limit) break;
+        if (now - req_at >= limit) break;
         int act = d2k_qstall_step(&st, now, d2k_qc_rx_wire_bytes(c));
         if (act == D2K_QSTALL_STALLED) { stalled = 1; break; }
         {
             uint64_t tx = 0, rx = 0;
             d2k_qc_dgrams(c, &tx, &rx);
-            if (d2k_quic_budget_ok(tx - tx0, rx - rx0, status, now, st.last_rx_ms, st.rto_ms)) {
+            pk = (tx - tx0) + (rx - rx0);
+            if (d2k_quic_budget_ok_n(tx - tx0, rx - rx0, status, now, st.last_rx_ms, st.rto_ms,
+                                     budget_pk)) {
                 budget = 1;
                 break;
             }
+        }
+        if (repeat && complete && status) {
+            /* Ответ целиком внутри бюджета — следующий запрос. */
+            done_bytes += bytes;
+            req_sid += 4;
+            rn = d2k_h3_request(sni, path, buf, sizeof buf);
+            if (rn == 0 || d2k_qc_stream_send(c, req_sid, buf, rn, 1, err, sizeof err) != 0) {
+                req_failed = 1;
+                break;
+            }
+            requests++;
+            req_at = now;
+            bytes = last = 0;
+            complete = 0;
+            continue;
         }
         if (act == D2K_QSTALL_PROBE) { (void)d2k_qc_ping(c, err, sizeof err); }
         long n = d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 200, err, sizeof err);
@@ -1770,13 +1813,43 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
     }
     free(head);
     d2k_qc_app_progress(c, &bytes, &complete);
-    d.app_bytes = bytes;
+    d.app_bytes = done_bytes + bytes;
+    d.requests = requests;
+    d.need = repeat ? need : 0;
+    {
+        uint64_t tx = 0, rx = 0;
+        d2k_qc_dgrams(c, &tx, &rx);
+        d.packets = pk = (tx - tx0) + (rx - rx0);
+    }
     /* Раунд 4 (M-n1): ошибка соединения — не молчание. CONNECTION_CLOSE
        сервера доказывает, что он жив; разбор и сокет — наша сторона. Обрыв —
-       только тишина, доказанная PING (d2k_qstall). */
-    d.verdict = d2k_quic_arm_data_judge3(1, status, bytes, complete, stalled,
-                                         q->need_complete, head_full, budget);
-    if (d.verdict == D2K_QAD_NOT_RUN && head_full && status <= 0) {
+       только тишина, доказанная PING (d2k_qstall). При воспроизведении по
+       бюджету полный ответ сам по себе успехом не считается: успех — только
+       бюджет, пройденный при живом сервере. */
+    d.verdict = d2k_quic_arm_data_judge3(1, status, bytes, repeat ? 0 : complete, stalled,
+                                         repeat ? 1 : need_complete, head_full, budget);
+    if (repeat && req_failed) {
+        d.verdict = D2K_QAD_NOT_RUN;
+        snprintf(d.reason, sizeof d.reason,
+                 "%u-й запрос HTTP/3 не ушёл (связь перенесла %llu датаграмм из нужных %u): %.80s"
+                 " — не измерено", requests + 1, (unsigned long long)pk, need, err);
+    } else if (repeat && d.verdict == D2K_QAD_PASS) {
+        snprintf(d.reason, sizeof d.reason,
+                 "HTTP %d, %u запрос(ов) на новых потоках: %llu из %u датаграмм (2×%u), "
+                 "сервер ответил на каждый",
+                 status, requests, (unsigned long long)pk, need, need / 2);
+    } else if (repeat && d.verdict == D2K_QAD_CUT && status > 0 && status != 451) {
+        snprintf(d.reason, sizeof d.reason,
+                 "HTTP %d, встал %u-й запрос: %llu из %u датаграмм (2×%u), %llu байт",
+                 status, requests, (unsigned long long)pk, need, need / 2,
+                 (unsigned long long)(done_bytes + bytes));
+    } else if (repeat && d.verdict == D2K_QAD_NOT_RUN && !head_full) {
+        snprintf(d.reason, sizeof d.reason,
+                 "сервер %s, но %u-й запрос за %lld мс не довёл связь до %u датаграмм (%llu, HTTP %d)"
+                 " — не обрыв, не измерено%s%.60s", closed ? "закрыл связь" : "жив (отвечает на PING)",
+                 requests, (long long)limit, need, (unsigned long long)pk, status,
+                 closed ? ": " : "", closed ? err : "");
+    } else if (d.verdict == D2K_QAD_NOT_RUN && head_full && status <= 0) {
         snprintf(d.reason, sizeof d.reason,
                  "заголовки ответа HTTP/3 длиннее %d байт — наш предел, не обрыв линии",
                  D2K_VERIFY_HEADER_LIMIT);
@@ -1784,7 +1857,7 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
         snprintf(d.reason, sizeof d.reason,
                  "сервер жив (отвечает на PING), но ответ за %lld мс не %s (HTTP %d, %llu байт) — "
                  "не обрыв, не измерено", (long long)limit,
-                 q->need_complete ? "пришёл целиком" : "донёс порог", status,
+                 need_complete ? "пришёл целиком" : "донёс порог", status,
                  (unsigned long long)bytes);
     } else if (d.verdict == D2K_QAD_PASS) {
         snprintf(d.reason, sizeof d.reason, "рукопожатие, HTTP %d и %llu байт данных%s",
@@ -1803,10 +1876,9 @@ static d2k_quic_arm_data quic_arm_data(const d2k_quic_arm_question *q, const cha
         snprintf(d.reason + rl, sizeof d.reason - rl,
                  "; сервер молчит: два PING без ответа (RTO %lld мс)", (long long)st.rto_ms);
     }
-    d2k_qc_close(c);
-    return d;
+    *out = d;
 }
-d2k_quic_arm_data_wire_fn d2k_quic_arm_data_hook=quic_arm_data;
+
 
 static d2k_tally quic_ask(const char *addr, uint16_t port,
                            const uint8_t *prefix, size_t prefix_len,
@@ -2308,9 +2380,11 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
     memset(&r, 0, sizeof r);
     char arm_path[sizeof ((d2k_quic_arm *)0)->probe_path] = "";
     int arm_split_unfit = 0, data_cut = 0;
+    unsigned arm_budget = 0;
     if(arm) {
         arm_split_unfit = arm->split_unfit != 0;
-        data_cut = arm->data_cut != 0;
+        data_cut = arm->data_cut;
+        arm_budget = arm->budget_pk;
         /* Input only when the caller filled it: a terminated, public resource
            path (d2k_resource_path_ok). Anything else -- including an
            uninitialised arm -- means "/". */
@@ -2321,6 +2395,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
         memcpy(arm->probe_path,arm_path,sizeof arm_path);
         arm->split_unfit = arm_split_unfit;
         arm->data_cut = data_cut;
+        arm->budget_pk = arm_budget;
     }
 
     /* ОДИН guard на весь класс "структурно непригодный вход" — было разведено
@@ -2609,6 +2684,10 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                     dq.addr = pool[0];
                     dq.label = "прямой запрос HTTP/3";
                     dq.need_complete = 1;
+                    /* Поле 04.10: короткий ответ кончается внутри бюджета
+                       коробки — запросы повторяются на новых потоках до
+                       2 × бюджет датаграмм или тишины сервера. */
+                    dq.budget_pk = arm_budget ? arm_budget : D2K_QUIC_BOX_BUDGET_PKTS;
                     d2k_quic_arm_data dd = d2k_quic_arm_data_hook(&dq, sni,
                         arm_path[0] ? arm_path : NULL, port, dyn_wait, mark);
                     r.probes += 1;
@@ -2632,8 +2711,8 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                                        "измерен: %.120s", base.pass, D2K_QUIC_REPEATS, dd2.reason);
                     } else if (dd.verdict == D2K_QAD_PASS) {
                         r.verdict = D2K_V_CLEAR;
-                        reason_set(&r, "Initial проходит (%d/%d), ответ на свой запрос HTTP/3 "
-                                       "приходит (%.120s) — обрыв после рукопожатия не воспроизвёлся",
+                        reason_set(&r, "Initial проходит (%d/%d), свои запросы HTTP/3 прошли бюджет "
+                                       "коробки (%.150s) — обрыв после рукопожатия не воспроизвёлся",
                                    base.pass, D2K_QUIC_REPEATS, dd.reason);
                     } else if (dd.verdict != D2K_QAD_CUT) {
                         r.verdict = D2K_V_INCONCLUSIVE;
@@ -2657,6 +2736,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                             .path=arm_path[0]?arm_path:NULL,
                             .no_split=arm_split_unfit,
                             .need_complete=1};
+                        arm->data_cut_seen = 1;
                         if (data_cut == 2) {
                             /* Перепроверка перед снятием запрета QUIC: нужен
                                только ответ «встаёт ли ещё»; плечи — не здесь. */
@@ -2667,6 +2747,8 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                             *arm = d2k_quic_strategy_measure(&context, port, trigger, control,
                                                              dyn_wait, mark);
                             arm->data_cut = 1;
+                            arm->data_cut_seen = 1;
+                            arm->budget_pk = arm_budget;
                             next_addr = context.next;
                             r.probes += arm->probes;
                             if (!context.marked) all_marked = 0;
@@ -2677,9 +2759,14 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                         }
                     }
                 } else if (all_marked) {
+                    /* Проверено ТОЛЬКО рукопожатие: ответ на свой запрос
+                       HTTP/3 не спрашивался (подозрение не о данных или нет
+                       arm). Строка называет, что именно прошло, — прежде
+                       тут стояла TCP-фраза «триггер проходит как есть». */
                     r.verdict = D2K_V_CLEAR;
-                    reason_set(&r, "триггер проходит как есть, метка подтверждена (%d/%d) — "
-                                   "обходить нечего",
+                    reason_set(&r, "наш Initial получает ответ (%d/%d, метка подтверждена) — "
+                                   "рукопожатие QUIC не режется; ответ на свой запрос HTTP/3 "
+                                   "не проверялся",
                                base.pass, D2K_QUIC_REPEATS);
                 } else {
                     r.verdict = D2K_V_INCONCLUSIVE;

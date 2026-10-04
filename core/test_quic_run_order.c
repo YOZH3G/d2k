@@ -111,6 +111,7 @@ static d2k_quic_arm_data data_pass(const d2k_quic_arm_question *q,const char *sn
 /* Задача 50, раунд 2: прямой этап данных — без воздействия. Обрыв после
    рукопожатия: сам по себе ответ встаёт, плечо с воздействием проходит. */
 static int direct_data_calls, direct_cut, direct_seq[4], arm_need_complete = -1;
+static unsigned direct_budget, arm_budget_seen;
 static d2k_quic_arm_data data_cut(const d2k_quic_arm_question *q,const char *sni,
     const char *path,uint16_t port,uint32_t wait,uint32_t mark) {
     (void)path;(void)port;(void)wait;(void)mark;(void)sni;
@@ -121,11 +122,13 @@ static d2k_quic_arm_data data_cut(const d2k_quic_arm_question *q,const char *sni
         int v = direct_data_calls < 4 && direct_seq[direct_data_calls] ?
                 direct_seq[direct_data_calls] : (direct_cut ? 1 : 2);
         CHECK(q->need_complete == 1);
+        direct_budget = q->budget_pk;
         direct_data_calls++;
         d.verdict=v==1?D2K_QAD_CUT:D2K_QAD_PASS;
         d.app_bytes=v==1?1169:D2K_QUIC_ARM_DATA_BYTES;
     } else {
         arm_need_complete = q->need_complete;
+        arm_budget_seen = q->budget_pk;
         data_calls++;
         d.verdict=D2K_QAD_PASS; d.app_bytes=D2K_QUIC_ARM_DATA_BYTES;
     }
@@ -207,6 +210,9 @@ static void post_handshake_stall(void) {
     d2k_vres r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
     CHECK(r.verdict==D2K_V_CLEAR && direct_data_calls==0 && data_calls==0);
+    /* Строка называет, что прошло: только рукопожатие (не TCP-фраза). */
+    CHECK(strstr(r.reason,"Initial")!=NULL && strstr(r.reason,"не проверялся")!=NULL &&
+          strstr(r.reason,"триггер проходит как есть")==NULL);
     /* Признак есть, ответ своим запросом встаёт: обрыв воспроизведён, плечи
        меряются этапом данных, найденное плечо — кандидат. */
     memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
@@ -219,6 +225,24 @@ static void post_handshake_stall(void) {
     CHECK(arm.original && arm.kind!=D2K_QA_NOT_FOUND && arm.kind!=D2K_QA_FLAKY);
     CHECK(strstr(r.reason,"после рукопожатия")!=NULL);
     CHECK(arm.data_cut==1);
+    /* Поле 04.10: свой запрос мерится бюджетом коробки (по умолчанию 25),
+       плечи — прежним правилом одного ответа. Воспроизведение — выход. */
+    CHECK(direct_budget==D2K_QUIC_BOX_BUDGET_PKTS && arm_budget_seen==0);
+    CHECK(arm.data_cut_seen==1);
+    /* Бюджет коробки из замера доходит до своего запроса и переживает прогон. */
+    memset(&arm,0,sizeof arm); arm.data_cut=1; arm.budget_pk=17;
+    calls=0; data_calls=direct_data_calls=0; direct_budget=0;
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(r.verdict==D2K_V_OPAQUE && direct_budget==17 && arm.budget_pk==17);
+    /* Перепроверка перед снятием запрета QUIC (data_cut 2): только прямые
+       запросы, плечи не меряются. Прежде вход сводился к 0/1, и ветка
+       «2» была мёртвой — перепроверка мерила плечи. */
+    memset(&arm,0,sizeof arm); arm.data_cut=2; calls=0; data_calls=direct_data_calls=0;
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(r.verdict==D2K_V_OPAQUE && direct_data_calls==2 && data_calls==0);
+    CHECK(arm.data_cut==2 && arm.data_cut_seen==1);
     /* Признак есть, но ответ приходит целиком: не воспроизвелось — CLEAR,
        плечи не меряются. */
     memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
@@ -227,6 +251,7 @@ static void post_handshake_stall(void) {
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
     CHECK(r.verdict==D2K_V_CLEAR && direct_data_calls==1 && data_calls==0);
     CHECK(strstr(r.reason,"не воспроизв")!=NULL);
+    CHECK(arm.data_cut_seen==0);
     /* Первый встал, второй прошёл целиком — не воспроизводится: плечи не
        меряются, ни плана, ни снятия QUIC. */
     memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;

@@ -833,6 +833,18 @@ test-quicconn-fc: test_quicconn_fc
 check: test-quicconn-fc
 TESTS += test_quicconn_fc
 
+# Поле 04.10 (rua.gr): воспроизведение обрыва своим запросом мерится бюджетом
+# коробки. Включает quicconn.c ради связи с ключами без живого сервера.
+REPRO_OBJS = props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o h3.o compose.o link.o
+test_quic_repro_budget: test_quic_repro_budget.c quicconn.c $(REPRO_OBJS) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_repro_budget.c $(REPRO_OBJS) $(TEST_LDFLAGS)
+
+.PHONY: test-quic-repro-budget
+test-quic-repro-budget: test_quic_repro_budget
+	./test_quic_repro_budget
+check: test-quic-repro-budget
+TESTS += test_quic_repro_budget
+
 .PHONY: test-quicconn6
 TESTS += test_quicconn_rtx
 TESTS += test_quicconn6 test_volume test_volume_context test_httpup_logic

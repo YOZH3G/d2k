@@ -2554,8 +2554,21 @@ static void *worker_run(void *vp) {
         /* Задача 50, раунд 2: поиск начат обрывом ПОСЛЕ рукопожатия —
            прямой вопрос обязан проверить ответ своим запросом HTTP/3, а не
            только ответ на Initial (тот проходит и при обрыве). */
-        t->arm.data_cut = t->trigger_code != D2K_SUSPECT_QUIC_STALL ? 0 :
+        /* Поле 04.10 13:37 (rua.gr, Safari): датапат назвал обрыв после
+           рукопожатия «молчанием» (подозрение 3): сервер прислал 8 пакетов —
+           все в окне очереди, — и счётчик conntrack не ушёл за них, так что
+           детектор QUIC_STALL молчал, а молчание UDP сработало на повторах
+           клиента после ответа. Без признака вопросник проверял только
+           Initial (3/3) и закрывал поиск словами «проходит как есть», пока
+           Safari стоял. Молчание QUIC при прошедшем Initial поэтому тоже
+           проверяется своим запросом: этап данных задаётся, только если наш
+           Initial ответ получил (иначе вопрос о рукопожатии и решается). */
+        t->arm.data_cut = t->trigger_code != D2K_SUSPECT_QUIC_STALL &&
+                          t->trigger_code != D2K_SUSPECT_SILENT ? 0 :
                           t->deny_recheck ? 2 : 1;
+        /* Бюджет коробки (задача 55, task_budget): свой запрос повторяется
+           на новых потоках до 2 × бюджет датаграмм или тишины сервера. */
+        t->arm.budget_pk = a_budget;
         r = seed && d2k_sched_quic_seeded_hook
             ? d2k_sched_quic_seeded_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm, seed)
             : d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->measure_mark, &t->arm);
@@ -2670,7 +2683,8 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     a->s = s; a->t = t;
     a->trig_len = t->trig_len; a->ctrl_len = t->ctrl_len;
     a->split_unfit = quic_split_unfit(s, t);
-    a->budget = job == JOB_VERIFY ? task_budget(s, t) : 0;
+    a->budget = job == JOB_VERIFY || (job == JOB_CLASSIFY && t->transport == 17)
+                ? task_budget(s, t) : 0;
     memcpy(a->trig, t->trig, t->trig_len);
     memcpy(a->ctrl, t->ctrl, t->ctrl_len);
     /* Сокет вопроса забирается ЗДЕСЬ, в главном потоке, и поле задачи
@@ -4317,7 +4331,10 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
     }
 
     if (t->transport == 17) {
-        if (t->arm.data_cut && r->verdict == D2K_V_OPAQUE) { t->stall_cut = 1; }
+        /* Снятие QUIC — только по обрыву, воспроизведённому своим запросом
+           в этом прогоне, а не по любому OPAQUE при признаке на входе
+           (молчание рукопожатия с признаком — вопрос о рукопожатии). */
+        if (t->arm.data_cut_seen && r->verdict == D2K_V_OPAQUE) { t->stall_cut = 1; }
         /* У QUIC свой источник кандидатов — подобранное плечо. Разрезы и
            перекрытия, которые выводит d2k_compose, к датаграмме не
            применимы вовсе, и предлагать их значило бы тратить бюджет зондов

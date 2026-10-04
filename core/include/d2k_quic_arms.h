@@ -1,6 +1,7 @@
 #ifndef D2K_QUIC_ARMS_H
 #define D2K_QUIC_ARMS_H
 #include "d2k_quicprobe.h"
+#include "d2k_quicconn.h"
 
 /* One question of the original askArms. Fragments use explicit donor shapes,
  * never the old midpoint substitute. frag: 0 normal, 1 pos8, 2 reverse pos8,
@@ -19,6 +20,11 @@ typedef struct {
     /* Задача 50, раунд 3: засчитывать только ответ целиком (поиск по обрыву
        после рукопожатия — сравнение с прямым запросом на том же пути). */
     int need_complete;
+    /* Поле 04.10 (rua.gr): бюджет коробки в пакетах для воспроизведения
+       обрыва своим запросом. 0 — один запрос, как прежде (плечи). Больше
+       нуля — запросы на новых потоках той же связи, пока она не перенесёт
+       2 × budget_pk датаграмм или сервер не замолчит (PING). */
+    unsigned budget_pk;
 } d2k_quic_arm_question;
 
 /* БЕЗОБИДНАЯ ДАТАГРАММА ВОПРОСА «ОСТАТОЧНОЕ РАЗРЕШЕНИЕ» (задача 40).
@@ -57,6 +63,12 @@ typedef struct {
     uint16_t local_port;  /* местный порт соединения — свежая четвёрка */
     char note[256];      /* приветствие и путь этапа (в трассу шага) */
     char reason[256];
+    /* Воспроизведение по бюджету (budget_pk вопроса > 0): сколько запросов
+       ушло на новых потоках, сколько датаграмм перенесла связь в обе
+       стороны после первого запроса и сколько было нужно (2 × бюджет). */
+    unsigned requests;
+    uint64_t packets;
+    unsigned need;
 } d2k_quic_arm_data;
 
 /* d2k_quic_arm_data_judge — d2k_quicprobe.h (одно правило с verify.c). */
@@ -70,6 +82,12 @@ typedef d2k_quic_arm_data (*d2k_quic_arm_data_fn)(const d2k_quic_arm_question *,
 typedef d2k_quic_arm_data (*d2k_quic_arm_data_wire_fn)(const d2k_quic_arm_question *,
     const char *sni, const char *path, uint16_t port, uint32_t wait_ms, uint32_t mark);
 extern d2k_quic_arm_data_wire_fn d2k_quic_arm_data_hook;
+
+/* Этап данных на уже установленной связи c (quicprobe.c): управляющий поток
+ * HTTP/3, запрос и чтение ответа до вердикта в *out (note и local_port —
+ * вызывающего). Связь не закрывает. step — измеренный срок ожидания. */
+void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_complete,
+                         unsigned budget_pk, uint32_t step, d2k_quic_arm_data *out);
 
 typedef struct {
     const char (*pool)[D2K_QUIC_ADDR_LEN];

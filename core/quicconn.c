@@ -258,6 +258,16 @@ static size_t seal_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
     size_t pn_len = d2k_qw_pn_len(L->next_pn, -1);
     size_t hlen;
     if (lvl == D2K_QW_LEVEL_APP) {
+        /* RFC 9001 §5.4.2: образец защиты заголовка берётся через 4 байта
+           после начала номера — номер и тело вместе не короче 4 байт. Пакет
+           из одного PING (тело 1 байт, номер 1 байт) иначе не запечатывался
+           и молча не уходил: «PING без ответа» было просто тишиной (поле
+           04.10). Добивка — PADDING (нули) внутри пакета. */
+        if (pn_len + blen < 4) {
+            size_t add = 4 - (pn_len + blen);
+            memset(body + blen, 0, add);
+            blen += add;
+        }
         size_t o = 0;
         pkt[o++] = 0x40;                       /* короткий заголовок, фикс. бит */
         memcpy(pkt + o, c->dcid, c->dcid_len); o += c->dcid_len;

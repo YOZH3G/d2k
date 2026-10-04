@@ -510,7 +510,10 @@ static d2k_ver_result stub_quic_path_ver(int use_fd, const char *ip, uint16_t po
 /* Задача 39: путь, которым этап данных плеча спрашивает цель (вход в arm). */
 static char quic_last_path[512];
 static int quic_last_data_cut = -1;
+static unsigned quic_last_budget;
 static int quic_arm_none = 0; /* OPAQUE без найденного плеча */
+/* OPAQUE от рукопожатия, а не от своего запроса: data_cut_seen не ставится. */
+static int quic_opaque_handshake = 0;
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
                           d2k_hello trigger, d2k_hello control, uint32_t mark,
                           d2k_quic_arm *arm) {
@@ -570,6 +573,7 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
     r.verdict = quic_answer;
     quic_last_split_unfit = arm ? arm->split_unfit : -1;
     quic_last_data_cut = arm ? arm->data_cut : -1;
+    quic_last_budget = arm ? arm->budget_pk : 0;
     int keep_data_cut = arm ? arm->data_cut : 0;
     memset(arm, 0, sizeof *arm);
     arm->kind = D2K_QA_NOT_FOUND;
@@ -578,6 +582,8 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
         *arm = stub_arm(ip, port, sni, NULL, trigger, mark);
     if (quic_arm_none) { arm->original = 1; }
     arm->data_cut = keep_data_cut;
+    /* Как настоящий прогон: обрыв своим запросом воспроизведён — выход. */
+    arm->data_cut_seen = keep_data_cut && r.verdict == D2K_V_OPAQUE && !quic_opaque_handshake;
     r.qprops = quic_props_answer;
     snprintf(r.reason, sizeof r.reason, "подменённый вопросник QUIC");
     return r;
@@ -3819,20 +3825,54 @@ int main(int argc, char **argv) {
             settle(s);
             CHECK(quic_calls == 1 && quic_last_data_cut == 1,
                   "обрыв QUIC после рукопожатия не дошёл до замера ответа своим запросом");
+            CHECK(quic_last_budget == D2K_BUDGET_FIELD_PACKETS,
+                  "свой запрос не получил бюджет коробки (по умолчанию поле 04.10, 25)");
+            /* Поле 04.10 13:37, rua.gr в Safari: обрыв после рукопожатия
+               пришёл подозрением 3 (молчание) — сервер уложился в окно
+               очереди. Прежде вопросник проверял только Initial и говорил
+               «проходит как есть». Теперь молчание QUIC тоже доходит до
+               своего запроса — он задаётся, лишь если Initial прошёл. */
             d2k_ev h2 = ev_hello(17, 41091, "quic-silent.test");
             d2k_sched_event(s, &h2);
             d2k_ev su2 = ev_suspect(17, 41091);
             su2.code = D2K_SUSPECT_SILENT;
             d2k_sched_event(s, &su2);
             settle(s);
-            CHECK(quic_calls == 2 && quic_last_data_cut == 0,
-                  "молчание рукопожатия QUIC стало замером ответа");
+            CHECK(quic_calls == 2 && quic_last_data_cut == 1,
+                  "молчание QUIC при прошедшем Initial не проверено своим запросом");
             CHECK(sent_quic_deny("quic-stall.test") == 0,
                   "QUIC снят по невоспроизведённому обрыву");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cq);
         quic_answer = D2K_V_OPAQUE;
+    }
+
+    /* Молчание QUIC с признаком на входе, а OPAQUE — от рукопожатия (свой
+       запрос не задавался): это не воспроизведённый обрыв после
+       рукопожатия, и QUIC для имени не снимается. */
+    {
+        d2k_catalog cq = {0};
+        d2k_sched *s = d2k_sched_new(&cq, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для молчания рукопожатия QUIC не завёлся");
+        if (s) {
+            settle(s);
+            forget_sent();
+            quic_calls = 0; quic_answer = D2K_V_OPAQUE; quic_arm_none = 1;
+            quic_opaque_handshake = 1;
+            d2k_ev h = ev_hello(17, 41097, "quic-hs.test");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 41097);
+            su.code = D2K_SUSPECT_SILENT;
+            su.planned = D2K_LINK_PLANNED_NO;
+            d2k_sched_event(s, &su);
+            for (int i = 0; i < 20; i++) settle(s);
+            CHECK(quic_calls == 1 && sent_quic_deny("quic-hs.test") == 0,
+                  "блок рукопожатия QUIC снял QUIC как обрыв после рукопожатия");
+            quic_opaque_handshake = 0; quic_arm_none = 0;
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cq);
     }
 
     /* ЗАДАЧА 50, РАУНД 2, требование 5c. Обрыв воспроизведён своим
