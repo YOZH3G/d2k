@@ -56,6 +56,8 @@ stop
   const controller = calls.find(x => x.includes('--catalog'));
   const panel = calls.find(x => x.includes('--assets'));
   assert(controller.includes(`--live ${tmp}/runtime/live.json`), 'controller must explicitly write runtime live snapshot');
+  assert(controller.includes(`--health-file ${tmp}/runtime/d2kc.health`), 'controller heartbeat must use configured private runtime');
+  assert(panel.includes(`--health-file ${tmp}/runtime/d2kpanel.health`), 'panel heartbeat must use configured private runtime');
   assert(panel.includes(`--live ${tmp}/runtime/live.json`), 'panel must read same runtime live snapshot');
   assert(controller.includes(`--catalog ${tmp}/d2k/state/catalog.json`), 'persistent catalog location must stay unchanged');
   assert.equal(fs.statSync(path.join(tmp, 'runtime')).mode & 0o777, 0o700, 'runtime directory must be private');

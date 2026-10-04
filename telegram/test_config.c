@@ -49,7 +49,16 @@ static void test_per_install_enrollment_needs_no_shared_secret(void) {
     assert(tg_config_read(path,&cfg)!=0);unlink(path);
 }
 
+static void test_managed_resource_root(void) {
+    char path[]="/tmp/d2k-managed-config-XXXXXX";int fd=mkstemp(path);assert(fd>=0);close(fd);
+    assert(!setenv("D2K_TG_CA_BUNDLE","/tmp/release/files/tg-roots.pem",1));
+    tg_config cfg;assert(!tg_config_read(path,&cfg));assert(!strcmp(cfg.ca_bundle,"/tmp/release/files/tg-roots.pem"));
+    FILE *f=fopen(path,"w");assert(f);fputs("TG_CA_BUNDLE=/tmp/personal-ca.pem\n",f);fclose(f);
+    assert(!tg_config_read(path,&cfg));assert(!strcmp(cfg.ca_bundle,"/tmp/personal-ca.pem"));
+    unsetenv("D2K_TG_CA_BUNDLE");unlink(path);
+}
 int main(void) {
+    test_managed_resource_root();
     test_config_values_and_url();test_url_rejects_unsafe_or_unsupported_inputs();
     test_per_install_enrollment_needs_no_shared_secret();
     test_duplicate_and_incomplete_keys_rejected();puts("config tests: ok");return 0;

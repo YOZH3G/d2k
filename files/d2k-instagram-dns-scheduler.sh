@@ -12,7 +12,7 @@ set -u
 export PATH="${D2K_STUB_PATH:+$D2K_STUB_PATH:}/opt/sbin:/opt/bin:/sbin:/usr/sbin:/bin:/usr/bin"
 
 DIR=${D2K_DIR:-/opt/d2k}
-HELPER=${D2K_INSTAGRAM_HELPER:-$DIR/d2k-instagram-dns.sh}
+HELPER=${D2K_INSTAGRAM_HELPER:-${D2K_RELEASE_ROOT:-$DIR}/d2k-instagram-dns.sh}
 # First line: local date of the last success; second: its epoch time.
 STATE=${D2K_INSTAGRAM_SCHED_STATE:-$DIR/state/instagram-dns-last-success}
 # "epoch date failures" of the last attempt (volatile: a reboot starts afresh).
@@ -98,6 +98,16 @@ write_attempt() {
 }
 
 tick() {
+    if [ -L "$DIR/current" ] || [ -f "$DIR/update-state/bootstrap.pending" ]; then
+        if [ "${D2K_MANAGED_INTERNAL:-}" != 1 ]; then
+            "$DIR/boot/d2k-service-adapter" --root "$DIR" service dns-tick &
+            child_pid=$!
+            wait "$child_pid"
+            child_pid=
+            return
+        fi
+        "$DIR/boot/d2k-service-adapter" --root "$DIR" --validate-maintenance-fd 4 || return 1
+    fi
     today=$(date +%Y-%m-%d)
     hhmm=$(date +%H%M)
     at=$(run_at)

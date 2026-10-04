@@ -38,12 +38,28 @@ if [ -z "${TZ:-}" ] && [ -r /etc/TZ ]; then
 fi
 
 NAME=d2k
-DIR=/opt/d2k
+DIR=${D2K_DIR:-/opt/d2k}
+# Managed entry resolves one release while holding the common C-owned lock.
+if [ -L "$DIR/current" ] || [ -f "$DIR/update-state/bootstrap.pending" ]; then
+    if [ "${1:-}" = --managed ]; then
+        "$DIR/boot/d2k-service-adapter" --root "$DIR" --validate-maintenance-fd 4 || exit 1
+        shift
+        D2K_SERVICE_BITS=${2:-0}
+        [ -n "${D2K_RELEASE_ROOT:-}" ] || exit 1
+        export D2K_DIR D2K_RELEASE_ROOT D2K_MANAGED_INTERNAL
+    else
+        if [ "${1:-}" = start ]; then
+            exec "$DIR/boot/d2k-service-adapter" --root "$DIR" service boot-start
+        fi
+        exec "$DIR/boot/d2k-service-adapter" --root "$DIR" service "$@"
+    fi
+fi
+RELEASE=${D2K_RELEASE_ROOT:-$DIR}
 # Контроллер и панель — независимые процессы на C. Управление панелью
 # ограничено локальной loopback-привязкой и командами из фиксированного списка.
 BIN=/opt/sbin/d2kc
 PANELBIN=/opt/sbin/d2kpanel
-PANEL_ASSETS=$DIR/panel
+PANEL_ASSETS=$RELEASE/panel
 DPBIN=/opt/sbin/d2kd
 CONF=$DIR/config
 RUN=$DIR/run
@@ -56,9 +72,9 @@ PN_PID=$RUN/d2k-panel.pid
 # правила снимаются при остановке и запуске — миграция со старой версии.
 HU_PID=$RUN/d2k-http.pid
 HL_PID=$RUN/d2k-heal.pid
-HEAL=$DIR/d2k-fw-heal.sh
+HEAL=$RELEASE/d2k-fw-heal.sh
 LM_PID=$RUN/d2k-log-maintenance.pid
-LOG_MAINTENANCE=$DIR/d2k-log-maintenance.sh
+LOG_MAINTENANCE=$RELEASE/d2k-log-maintenance.sh
 SOCK=$RUN/d2kd.sock
 
 # Собственные цепочки, по одной на направление. Не одна на оба: правило,
@@ -129,13 +145,23 @@ TG_ENABLED=${TG_ENABLED:-0}
 TG_PORT=${TG_PORT:-1443}
 TGBIN=/opt/sbin/d2ktg
 TG_PID=$RUN/d2ktg.pid
-TG_STATUS=$STATE_DIR/telegram.status
-TG_FIREWALL=$DIR/d2k-tg-firewall.sh
-TG_WATCHDOG=$DIR/d2k-tg-watchdog.sh
+TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
+TG_FIREWALL=$RELEASE/d2k-tg-firewall.sh
+TG_WATCHDOG=$RELEASE/d2k-tg-watchdog.sh
 TG_WD_PID=$RUN/d2k-tg-watchdog.pid
-DNS_SCHEDULER=$DIR/d2k-instagram-dns-scheduler.sh
+DNS_SCHEDULER=$RELEASE/d2k-instagram-dns-scheduler.sh
 DNS_SCHED_PID=$RUN/d2k-instagram-dns-scheduler.pid
 TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
+if [ -n "${D2K_RELEASE_ROOT:-}" ]; then
+    BIN=$RELEASE/d2kc; DPBIN=$RELEASE/d2kd; PANELBIN=$RELEASE/d2kpanel; TGBIN=$RELEASE/d2ktg
+    HEAL=$RELEASE/d2k-fw-heal.sh; LOG_MAINTENANCE=$RELEASE/d2k-log-maintenance.sh
+    D2K_INSTAGRAM_HELPER=$RELEASE/d2k-instagram-dns.sh
+    export D2K_INSTAGRAM_HELPER
+    D2K_FAKE_DIR=$RELEASE/files/fake
+    D2K_TG_CA_BUNDLE=$RELEASE/files/tg-roots.pem
+    D2K_META_RANGES=$RELEASE/files/meta-ranges.txt
+    export D2K_FAKE_DIR D2K_TG_CA_BUNDLE D2K_META_RANGES
+fi
 unset TG_RELAY_SECRET TG_RELAY_URL TG_IDENTITY TG_CA_BUNDLE
 FW_LOCK=${FW_LOCK:-/tmp/d2k-fw-operation.lock}
 # Метка «IPv6 не обслуживается»: ip6tables mangle на этой прошивке нет
@@ -149,7 +175,7 @@ PROC_DIR=/proc
 # Правила и их уборка — в d2k-ppe-deoffload.sh, здесь только вызовы. Нет
 # файла — нет разгрузки, остальная служба работает как прежде.
 # D2K_PPE_DEOFFLOAD=0 в конфигурации выключает её.
-PPE_LIB=$DIR/d2k-ppe-deoffload.sh
+PPE_LIB=$RELEASE/d2k-ppe-deoffload.sh
 # shellcheck disable=SC2034  # читает d2k-ppe-deoffload.sh
 D2K_PPE_DPLOG=$LOG/d2kd.log
 # shellcheck disable=SC2034
@@ -703,10 +729,16 @@ prepare_runtime() {
     fi
 }
 
+spawn_daemon() (
+    unset D2K_MANAGED_INTERNAL
+    exec 3>&- 4>&- 5>&-
+    exec start-stop-daemon "$@"
+)
+
 start_log_maintenance() {
     mkdir -p "$RUN" "$LOG" || return 1
     if [ -x "$LOG_MAINTENANCE" ] && ! running "$LM_PID"; then
-        start-stop-daemon -S -b -m -p "$LM_PID" -x "$LOG_MAINTENANCE" -- run \
+        spawn_daemon -S -b -m -p "$LM_PID" -x "$LOG_MAINTENANCE" -- run \
             || say "ротация журналов не запустилась"
     fi
 }
@@ -767,11 +799,11 @@ start_engine() {
             return 0
         fi
         say "обнаружен частичный запуск — восстанавливаю весь движок"
-        engine_stop
+        engine_stop || return 1
     else
         # Контроллер может пережить упавший datapath и продолжать писать
         # ложное live-состояние. Перед чистым запуском убираем весь остаток.
-        engine_stop
+        engine_stop || return 1
     fi
 
     # Файл сокета переживает SIGKILL и мешает следующему запуску.
@@ -782,11 +814,11 @@ start_engine() {
     [ "$PROBE_MARK" != "$MARK" ] || die "PROBE_MARK должен отличаться от MARK"
     [ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$PROBE_MARK" ] || die "MEASURE_MARK должен отличаться от MARK и PROBE_MARK"
 
-    start-stop-daemon -S -b -m -p "$DP_PID" -x "$DPBIN" -- \
+    spawn_daemon -S -b -m -p "$DP_PID" -x "$DPBIN" -- \
         --queue "$QUEUE_NUM" --mode "$dpmode" --mark "$MARK" \
         --probe-mark "$PROBE_MARK" --udp-reverse-hook \
         --flows "$FLOWS" --control "$SOCK" --stats "${STATS_SEC:-60}" \
-        --log "$LOG/d2kd.log" || die "датапат не запустился"
+        --health-file "$RUNTIME_DIR/d2kd.health" --log "$LOG/d2kd.log" || die "датапат не запустился"
 
     # Ждём привязки очереди, а не спим наугад: правила, поставленные до
     # привязки, отправляют пакеты в никуда.
@@ -813,10 +845,10 @@ start_engine() {
     # Журнал задаётся ключом, а не перенаправлением: start-stop-daemon -b
     # потоки потомка не наследует, и вывод уходил бы в никуда — проверено на
     # роутере, файл оставался нулевым при исправно работающем движке.
-    start-stop-daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
+    spawn_daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
         --control "$SOCK" --catalog "$DIR/state/catalog.json" --live "$LIVE" --mark "$PROBE_MARK" \
         --measure-mark "$MEASURE_MARK" \
-        --log "$LOG/d2kc.log" || { engine_stop; die "контроллер не запустился"; }
+        --health-file "$RUNTIME_DIR/d2kc.health" --log "$LOG/d2kc.log" || { engine_stop; die "контроллер не запустился"; }
     if ! running "$CT_PID"; then
         engine_stop
         die "контроллер завершился сразу после запуска"
@@ -831,7 +863,7 @@ start_engine() {
     # вызовом планировщика раз в минуту); событийный хук NDM реагирует
     # быстрее, а этот ловит сбросы, на которые хук не сработал.
     if [ -x "$HEAL" ]; then
-        start-stop-daemon -S -b -m -p "$HL_PID" -x /bin/sh -- -c \
+        spawn_daemon -S -b -m -p "$HL_PID" -x /bin/sh -- -c \
             "$WATCHLOOP" \
             || say "сторож правил не запустился — правила придётся возвращать вручную"
     fi
@@ -845,28 +877,38 @@ start_panel() {
     if [ -x "$PANELBIN" ]; then
         prepare_runtime
         start_log_maintenance
-        start-stop-daemon -S -b -m -p "$PN_PID" -x "$PANELBIN" -- serve \
+        spawn_daemon -S -b -m -p "$PN_PID" -x "$PANELBIN" -- serve \
             --config "$CONF" --live "$LIVE" --assets "$PANEL_ASSETS" \
             --listen "$PANEL_LISTEN" --state-dir "$STATE_DIR" --mode "$MODE" \
             --queue "$QUEUE_NUM" --service /opt/etc/init.d/S99d2k \
             --engine-pid "$DP_PID" --controller-pid "$CT_PID" \
-            --log "$LOG/panel.log" \
-            || say "панель не запустилась — обход это не затрагивает"
+            --health-file "$RUNTIME_DIR/d2kpanel.health" --log "$LOG/panel.log" \
+            || { say "панель не запустилась — обход это не затрагивает"; return 1; }
     fi
 }
 
 start() {
+    if [ -n "${D2K_MANAGED_INTERNAL:-}" ]; then
+        [ $((D2K_SERVICE_BITS & 3)) = 0 ] || start_engine || return $?
+        [ $((D2K_SERVICE_BITS & 8)) = 0 ] || telegram_start || return $?
+        [ $((D2K_SERVICE_BITS & 4)) = 0 ] || start_panel || return $?
+        if [ "$D2K_SERVICE_BITS" != 0 ] && [ -x "$DNS_SCHEDULER" ] && ! running "$DNS_SCHED_PID"; then
+            spawn_daemon -S -b -m -p "$DNS_SCHED_PID" -x "$DNS_SCHEDULER" -- run || return 1
+        fi
+        return 0
+    fi
     start_engine || return $?
     telegram_start || say "Telegram tunnel не поднят; D2K продолжает работу независимо"
     start_panel
     if [ -x "$DNS_SCHEDULER" ] && ! running "$DNS_SCHED_PID"; then
-        start-stop-daemon -S -b -m -p "$DNS_SCHED_PID" -x "$DNS_SCHEDULER" -- run \
+        spawn_daemon -S -b -m -p "$DNS_SCHED_PID" -x "$DNS_SCHEDULER" -- run \
             || say "планировщик Instagram DNS не запустился — повторы вручную"
     fi
 }
 
 stop_pidfile() {
     p=$1
+    forced=0
     if running "$p"; then
         start-stop-daemon -K -q -p "$p" 2>/dev/null
         i=0
@@ -874,7 +916,18 @@ stop_pidfile() {
             i=$((i + 1))
             sleep 0.1 2>/dev/null || sleep 1
         done
-        running "$p" && start-stop-daemon -K -q -s KILL -p "$p" 2>/dev/null
+        if running "$p"; then
+            forced=1
+            start-stop-daemon -K -q -s KILL -p "$p" 2>/dev/null
+        fi
+    fi
+    if [ -n "${D2K_MANAGED_INTERNAL:-}" ]; then
+        i=0
+        while running "$p" && [ "$i" -lt 30 ]; do i=$((i+1)); sleep 0.1; done
+        running "$p" && return 1
+        # SIGKILL proves termination, not a successful persistent-state flush.
+        # Abort the update; recovery can retry stop against the now-dead PID.
+        [ "$forced" = 0 ] || { rm -f "$p"; return 1; }
     fi
     rm -f "$p"
 }
@@ -896,14 +949,15 @@ telegram_start() {
         return 1
     }
     mkdir -p "$RUN" "$LOG" "$(dirname "$TG_STATUS")" || return 1
+    prepare_runtime
     start_log_maintenance
     if running "$TG_PID"; then
         [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" heal || true
         return 0
     fi
-    stop_pidfile "$TG_PID"
-    start-stop-daemon -S -b -m -p "$TG_PID" -x "$TGBIN" -- \
-        --config "$CONF" --log "$LOG/telegram.log" || { write_telegram_status error; return 1; }
+    stop_pidfile "$TG_PID" || return 1
+    spawn_daemon -S -b -m -p "$TG_PID" -x "$TGBIN" -- \
+        --config "$CONF" --health-file "$RUNTIME_DIR/d2ktg.health" --log "$LOG/telegram.log" || { write_telegram_status error; return 1; }
     i=0
     while [ $i -lt 20 ]; do
         running "$TG_PID" && break
@@ -917,25 +971,25 @@ telegram_start() {
     if [ -x "$TG_FIREWALL" ]; then
         "$TG_FIREWALL" start || { stop_pidfile "$TG_PID"; write_telegram_status error; return 1; }
     else
-        stop_pidfile "$TG_PID"; write_telegram_status error; say "нет правил Telegram firewall $TG_FIREWALL"; return 1
+        stop_pidfile "$TG_PID" || return 1; write_telegram_status error; say "нет правил Telegram firewall $TG_FIREWALL"; return 1
     fi
     if [ -x "$TG_WATCHDOG" ] && ! running "$TG_WD_PID"; then
-        start-stop-daemon -S -b -m -p "$TG_WD_PID" -x "$TG_WATCHDOG" \
+        spawn_daemon -S -b -m -p "$TG_WD_PID" -x "$TG_WATCHDOG" \
             || say "Telegram health watchdog не запустился"
     fi
     say "Telegram TCP tunnel запущен на :$TG_PORT"
 }
 
 telegram_stop() {
-    stop_pidfile "$TG_WD_PID"
-    stop_pidfile "$TG_PID"
+    stop_pidfile "$TG_WD_PID" || return 1
+    stop_pidfile "$TG_PID" || return 1
     [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" stop || true
     write_telegram_status stopped
     say "Telegram tunnel остановлен"
 }
 
 telegram_restart() {
-    stop_pidfile "$TG_PID"
+    stop_pidfile "$TG_PID" || return 1
     [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" stop || true
     [ "${TG_ENABLED:-0}" = 1 ] || { write_telegram_status stopped; return 0; }
     telegram_start
@@ -975,25 +1029,44 @@ telegram_disable() {
 engine_stop() {
     # Сторож гасится ДО снятия правил: иначе он может заметить снятые правила
     # и успеть восстановить их, пока служба останавливается.
-    stop_pidfile "$HL_PID"
+    stop_pidfile "$HL_PID" || return 1
     fw_down
     legacy_http_stop
     fastnat_restore
-    stop_pidfile "$CT_PID"
-    stop_pidfile "$DP_PID"
+    stop_pidfile "$CT_PID" || return 1
+    stop_pidfile "$DP_PID" || return 1
     rst_rules_down dead
     rm -f "$SOCK"
     say "движок остановлен"
 }
 
+managed_rules_removed() {
+    [ -n "${D2K_MANAGED_INTERNAL:-}" ] || return 0
+    for tool in iptables ip6tables; do
+        for tab in mangle nat filter; do
+            [ "$tool:$tab" != ip6tables:nat ] || continue
+            if rules=$("$tool" -t "$tab" -S 2>/dev/null); then
+                if printf '%s\n' "$rules" | grep -Eq -- '(^-N D2K(_OUT|_IN|_HTTP|_HTTP_MARK)?$)|(-j D2K(_OUT|_IN|_HTTP|_HTTP_MARK)?( |$))|--match-set d2k_tg_dc6? dst|--comment "?d2k-ppe"?( |$)|--comment "?d2k-rst:'; then
+                    return 1
+                fi
+            else
+                [ "$tool:$tab:${managed_v4only:-0}" = ip6tables:mangle:1 ] || return 1
+            fi
+        done
+    done
+    ! iptables -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" -j MASQUERADE 2>/dev/null
+}
+
 stop() {
-    stop_pidfile "$DNS_SCHED_PID"
-    telegram_stop
-    engine_stop
-    stop_pidfile "$PN_PID"
-    stop_pidfile "$LM_PID"
+    managed_v4only=0; [ ! -f "$FW_V4ONLY" ] || managed_v4only=1
+    stop_pidfile "$DNS_SCHED_PID" || return 1
+    telegram_stop || return 1
+    engine_stop || return 1
+    stop_pidfile "$PN_PID" || return 1
+    stop_pidfile "$LM_PID" || return 1
     rst_rules_down all
     rm -f "$LIVE"
+    managed_rules_removed || return 1
     say "служба остановлена"
 }
 
@@ -1040,14 +1113,31 @@ reapply() {
 
 case "$1" in
     start)   start ;;
+    health-rules)
+        [ $((D2K_SERVICE_BITS & 3)) = 0 ] || { fw_installed && d2k_ppe_check; } || exit 1
+        [ $((D2K_SERVICE_BITS & 8)) = 0 ] || "$TG_FIREWALL" check || exit 1
+        ;;
+    remove-rules) managed_v4only=0; [ ! -f "$FW_V4ONLY" ] || managed_v4only=1
+                  fw_down; "$TG_FIREWALL" stop; rst_rules_down all; managed_rules_removed ;;
+    heal) if running "$DP_PID"; then fw_installed || reapply; ppe_ensure; fi
+          telegram_reapply ;;
+    dns-tick) "$DNS_SCHEDULER" tick ;;
+    dns-refresh) "$RELEASE/d2k-instagram-dns.sh" refresh ;;
+    dns-remove) "$RELEASE/d2k-instagram-dns.sh" remove ;;
+    log-tick) "$LOG_MAINTENANCE" tick ;;
+    tg-tick) "$TG_WATCHDOG" tick ;;
+    tg-heal) telegram_reapply ;;
+    tg-stop-rules) "$TG_FIREWALL" stop ;;
+    uninstall) stop || exit 1; "$RELEASE/d2k-instagram-dns.sh" remove || exit 1
+               "$DIR/boot/uninstall.sh" ;;
+
     stop)    stop ;;
-    restart) stop; start ;;
+    restart) stop && start ;;
     engine-start) start_engine ;;
     engine-stop) engine_stop ;;
     engine-restart)
         [ "$MODE" != "off" ] || die "MODE=off — перезапуск невозможен"
-        engine_stop
-        start_engine
+        engine_stop && start_engine
         ;;
     telegram-enable) telegram_enable ;;
     telegram-disable) telegram_disable ;;
@@ -1056,6 +1146,7 @@ case "$1" in
     status)  status ;;
     reapply) reapply ;;
     ppe-ensure) ppe_ensure ;;
+    ppe-remove) d2k_ppe_remove ;;
     ppe-status)
         command -v d2k_ppe_status >/dev/null 2>&1 || die "нет $PPE_LIB"
         d2k_ppe_status "$2"

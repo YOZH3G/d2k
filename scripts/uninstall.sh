@@ -9,9 +9,19 @@
 # умолчанию. Чтобы оставить изученное состояние, задайте D2K_KEEP_STATE=1.
 set -eu
 
-DIR=/opt/d2k
-SBIN=/opt/sbin
-INIT=/opt/etc/init.d/S99d2k
+DIR=${D2K_DIR:-/opt/d2k}
+PREFIX=${DIR%/*}
+SBIN=$PREFIX/sbin
+INIT=$PREFIX/etc/init.d/S99d2k
+if [ -L "$DIR/current" ] || [ -d "$DIR/boot" ] || [ -d "$DIR/update-state" ]; then
+    if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
+        "$DIR/boot/d2k-service-adapter" --root "$DIR" --validate-maintenance-fd 4 || exit 1
+        # Stop and DNS cleanup have already completed under this held lock.
+        INIT=${D2K_RELEASE_ROOT}/S99d2k
+    else
+        exec "$DIR/boot/d2k-service-adapter" --root "$DIR" service uninstall
+    fi
+fi
 KEEP=${D2K_KEEP_STATE:-0}
 
 say() { echo "d2k: $*"; }
@@ -43,7 +53,7 @@ fi
 
 if [ -x "$INIT" ]; then
     say "останавливаю"
-    "$INIT" stop || say "остановка вернула ошибку — продолжаю удаление"
+    if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then "$INIT" --managed stop 0 || exit 1; else "$INIT" stop; fi || say "остановка вернула ошибку — продолжаю удаление"
 fi
 
 # Defense in depth when init has already been removed: stop only the owned
@@ -147,8 +157,8 @@ say "правила сняты"
 
 # Хук NDM снимается ПЕРВЫМ: оставленный, он будет звать сторожа, которого уже
 # нет, на каждое изменение netfilter — мусор в журнале на ровном месте.
-rm -f /opt/etc/ndm/netfilter.d/001-d2k.sh
-rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2ktg" "$SBIN/d2khttp"
+rm -f "$PREFIX/etc/ndm/netfilter.d/001-d2k.sh"
+rm -f "$PREFIX/etc/init.d/S99d2k" "$PREFIX/etc/init.d/S98d2k-update" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2ktg" "$SBIN/d2khttp"
 # Remove only d2kc snapshots explicitly named as D2K pre-install/work backups.
 # These were created during router development and are not user configuration.
 rm -f "$SBIN"/d2kc.before-d2k-* "$SBIN"/d2kc.pre-goal-* "$SBIN"/d2kc.pre-sched-*
@@ -186,7 +196,8 @@ cleanup_runtime() (
         case "$relative" in */*) relative=${relative#*/} ;; *) relative= ;; esac
     done
     [ -d "$runtime" ] || return 0
-    rm -f "$runtime/live.json"
+    rm -f "$runtime/live.json" "$runtime/d2kd.health" "$runtime/d2kc.health" \
+        "$runtime/d2kpanel.health" "$runtime/d2ktg.health"
     # SIGKILL/power loss can leave an abandoned retained tail.
     for stage in "$runtime"/log-tail.??????; do
         [ -f "$stage" ] || [ -L "$stage" ] || continue
@@ -206,12 +217,25 @@ fi
 cleanup_runtime /tmp/d2k
 [ -z "$custom_runtime" ] || cleanup_runtime "$custom_runtime"
 
+if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
+    # Keep maintenance.lock inode: existing waiters must never acquire a second
+    # lock for the same root. Remove code only after all owned writers stopped.
+    rm -rf "$DIR/releases" "$DIR/current" "$DIR/boot" "$DIR/update" "$DIR/snapshots"
+fi
 if [ "$KEEP" = "1" ]; then
     say "сохраняю конфигурацию и каталог изученных коробок в $DIR"
     say "чтобы удалить всё: D2K_KEEP_STATE=0 sh $0"
     rm -f "$DIR/config.new"
 else
-    rm -rf "$DIR"
+    if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
+        for owned in "$DIR"/* "$DIR"/.[!.]* "$DIR"/..?*; do
+            [ "$owned" = "$DIR/update-state" ] || rm -rf "$owned"
+        done
+        # Lock/tombstone survives concurrent waiters; a clean reinstall is an
+        # explicit bootstrap operation after all lifecycle clients have exited.
+    else
+        rm -rf "$DIR"
+    fi
     say "удалено всё, включая каталог коробок"
 fi
 

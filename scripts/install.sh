@@ -21,6 +21,17 @@ BASE=${D2K_BASE:-https://raw.githubusercontent.com/$REPO/$REF}
 DIR=/opt/d2k
 SBIN=/opt/sbin
 INIT=/opt/etc/init.d/S99d2k
+# Explicit local bootstrap bundle is staged and verified by the operator/release
+# tooling. No unsigned remote bootstrap is downloaded by this compatibility script.
+if [ -n "${D2K_BOOTSTRAP_BUNDLE:-}" ]; then
+    exec "$D2K_BOOTSTRAP_BUNDLE/d2k-update-boot" --root "$DIR" --bootstrap "$D2K_BOOTSTRAP_BUNDLE"
+fi
+# A managed root may only use the stable update entry; never replace individual
+# files using this historical flat installer, even if current is damaged.
+if [ -L "$DIR/current" ] || [ -d "$DIR/boot" ] || [ -d "$DIR/update-state" ]; then
+    [ -x "$DIR/boot/d2k-service-adapter" ] || { echo 'd2k: managed recovery required' >&2; exit 1; }
+    exec "$DIR/boot/d2k-service-adapter" service install
+fi
 TMP=
 
 say()  { echo "d2k: $*"; }

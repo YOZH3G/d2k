@@ -575,3 +575,95 @@ snapshot/restore reserve is charged; current free space already reflects the
 allocated release. `transaction.available_bytes` is an optional platform/test
 seam; absent callback reads real root fstatvfs. Archive bytes are already present
 in the authenticated request's archive descriptor before transaction staging.
+
+## Flat bootstrap and service integration (Task 7)
+
+`d2ku_bootstrap(ctx,status)` is installer-only. `bootstrap_prefix_fd` is a verified
+`/opt` directory and `bootstrap_bundle_fd` is an explicitly verified local bundle;
+it is not an HTTP parameter or unsigned download mechanism. Standalone command:
+`d2k-update-boot [--root DIR] --bootstrap BUNDLE`. The bundle contains executable
+`d2k-update-boot`, `d2k-service-adapter`, `S98d2k-update`, `S99d2k`, `001-d2k.sh`,
+`uninstall.sh` and the seven installed `d2k-*.sh` helpers. Release tooling must
+stage executable modes before handing this directory to bootstrap. Bundle
+publication/trust distribution remains the release/bootstrap packaging task.
+
+Inventory checks all four flat binaries using bounded offline self-checks,
+requires wire13 and one common embedded release identity, and rejects missing,
+linked, foreign-owned or writable-by-other files before service stop. This v1
+migration intentionally rejects older unknown binaries without the wire13
+self-check contract. A private `update/legacy-flat/` retains the original binaries,
+init/NDM scripts, helpers, assets and configuration. Bootstrap copies verified
+inputs to private `boot/input/`; both trees have SHA256 inventory seals. The
+synthetic `legacy-<first16 inventory hash>` receipt identifies this saved local
+inventory, not a signed remotely published release. It is available for immediate
+transaction recovery; publishing/signing it or offering it as a late rollback
+candidate is not implied.
+
+`update-state/bootstrap.pending` is the durable forward-completion record:
+`D2KB1 ID OLD_SEAL INPUT_SEAL SERVICE_BITS CHECKSUM\n`. Seals/checksum are 64 lower
+hex bytes; checksum is SHA256 of the exact preceding bytes excluding the space
+before CHECKSUM. The whole record is canonical, private, bounded, type checked
+and verified before use. The independent C executable and S98 recovery hook are
+synced before this record and before replacing any entry. Init/NDM/helper guards
+are replaced before stop/switch; outside operations wait on maintenance. Services
+stop with the saved mask, personal snapshot entries are retained under
+`update/legacy-personal/` after writers stop, current and launchers are published,
+and only the saved service mask starts. Live personal files are never rewritten
+by migration. Completion renames pending to `bootstrap.done` and syncs the parent.
+Recovery resumes from the sealed saved trees; it never recopies overwritten flat
+entry points as the original inventory. A failure before pending leaves the flat
+installation authoritative. Neither uncertain fsync nor a failed start is success.
+
+Stable `/opt/sbin/d2k*` launchers resolve current once through the C adapter.
+Binary aliases accept offline metadata/self-check and bounded read-only TG probe
+commands. Direct daemon launches are refused: managed writers must enter through
+service commands so a process cannot start after releasing maintenance and evade
+an in-progress state snapshot. Init starts explicit release binaries internally.
+`boot/d2k-service-adapter service ACTION` serializes supported lifecycle actions;
+Task9's `d2k-update service ACTION` must forward to this stable entry, including
+configuration changes. The legacy installer detects managed markers before any
+fetch/module action and routes to `service install`. `install`/`check` currently
+return explicit daemon-unavailable (exit3); Task9 must connect those fixed entries
+to the authenticated daemon/IPC, with no implicit unsigned installation fallback.
+S98 runs recovery synchronously and starts the independent supervisor in the
+background only when the selected release supplies `d2k-update`. Task9's worker
+must implement `--boot-worker 3`, independent heartbeat and FD5 protocol already
+specified above. Normal D2K stop does not stop that supervisor.
+
+Internal contract remains `--maintenance-fd 4 ACTION RELEASE SERVICE_BITS`.
+The adapter validates ownership/type/inode against maintenance.lock, verifies a
+separately opened description cannot acquire it, and on Linux requires FD4's own
+FLOCK/WRITE fdinfo record. It never reacquires FD4. Service callbacks run with a
+30-second deadline in acknowledged FD5 transient process groups; runtime children
+close FDs3/4/5 before start-stop-daemon and never inherit internal authority.
+Shell init/helper scripts remain fixed validated platform adapters; new lifecycle
+orchestration is C. All external NDM, firewall/PPE, Telegram, DNS and log helper
+mutations route to the shared maintenance entry. Scheduler loops lock individual
+operations, so an idle long-lived helper does not own maintenance indefinitely.
+
+`d2ku_service_configure` supplies wire13, real queue/listen address, numeric IPv4/
+IPv6 HTTP target, state paths and transaction callbacks. Boot creates/verifies
+the actual configured private volatile directory and opens health_runtime_dirfd.
+Task9 must do the same using the returned runtime path. Core's existing catalog
+is `state/catalog.json`; panel's STATE_DIR, TG_IDENTITY and TG_STATUS are derived
+from configuration. Personal top-level paths are inventoried without following
+links. Writable paths outside the root or beneath reserved updater/release/resource
+entries are INCOMPATIBLE before stop; external read-only system CA remains allowed.
+A shared-secret TG installation does not require an enrollment identity file;
+its actual status file is still checked. Secrets are never printed or journaled.
+
+Health-rules checks exact own datapath mangle/NFQUEUE/bypass/MASQUERADE contracts,
+configured PPE rules, every TG IPv4/IPv6 prefix and both NAT/filter hooks using
+read-only queries. Missing expectation fails rather than repairing during health.
+A managed stop confirms all owned interception rules are gone and waits for every
+recorded state writer to terminate; a failed query/removal is not successful stop.
+Legacy IPv4-only mangle handling is retained. Runtime binaries/assets/voice blobs/
+TG default CA and helper binaries are pinned to one resolved release root.
+
+Managed uninstall runs stop and DNS removal inside the same lock and preserves
+live personal state with D2K_KEEP_STATE=1. Full removal retains update-state's
+maintenance inode so concurrent waiters cannot lock a replacement inode. Code,
+owned hooks and heartbeats are removed; the retained coordination directory is
+an explicit reinstall/recovery prerequisite, not an ordinary flat installation.
+Task9 integration must additionally quiesce its daemon before removing managed
+code; this task does not invent a running daemon to claim that end-to-end case.

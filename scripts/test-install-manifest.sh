@@ -18,7 +18,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # shellcheck disable=SC2016  # literal $DIR as written in the scripts
 refs=$(grep -oh '\$DIR/[A-Za-z0-9._/-]*' "$ROOT/files/S99d2k" "$ROOT"/files/*.sh | sort -u |
-    grep -vE '^\$DIR/(config|log|run|state|panel)(/|$)')
+    grep -vE '^\$DIR/(config|log|run|state|panel|boot|current|update-state)(/|$)')
 [ -n "$refs" ] || fail "no runtime file references found (layout changed?)"
 for ref in $refs; do
     name=${ref#\$DIR/}
@@ -53,3 +53,10 @@ for name in $(sed -n 's/^install_atomic "\$TMP\/[^"]*" "\$DIR\/\([^"]*\.sh\)"$/\
 done
 echo "PASS: uninstall.sh removes every installed helper"
 echo "install manifest: all checks passed"
+
+# Bootstrap owns stable files independently of ordinary runtime releases.
+for name in d2k-update-boot d2k-service-adapter S98d2k-update S99d2k 001-d2k.sh uninstall.sh; do
+    grep -qF "\"$name\"" "$ROOT/update/src/bootstrap.c" || fail "bootstrap inventory misses $name"
+done
+[ -f "$ROOT/files/S98d2k-update" ] || fail "missing early recovery hook"
+echo "PASS: stable bootstrap inventory and early hook"

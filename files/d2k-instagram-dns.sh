@@ -9,6 +9,16 @@ set -eu
 trap 'exit 143' TERM INT HUP
 export PATH="${D2K_STUB_PATH:+$D2K_STUB_PATH:}/opt/sbin:/opt/bin:/sbin:/usr/sbin:/bin:/usr/bin"
 DIR=${D2K_DIR:-/opt/d2k}
+if [ -L "$DIR/current" ] || [ -f "$DIR/update-state/bootstrap.pending" ]; then
+    if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
+        "$DIR/boot/d2k-service-adapter" --root "$DIR" --validate-maintenance-fd 4 || exit 1
+    else
+        case "${1:-}" in refresh) action=dns-refresh;; remove) action=dns-remove;; *) exit 2;; esac
+        exec "$DIR/boot/d2k-service-adapter" --root "$DIR" service "$action"
+    fi
+fi
+TGBIN=${D2K_RELEASE_ROOT:+$D2K_RELEASE_ROOT/d2ktg}
+TGBIN=${TGBIN:-d2ktg}
 META_RANGES=${D2K_META_RANGES:-$DIR/files/meta-ranges.txt}
 MANIFEST=${D2K_INSTAGRAM_MANIFEST:-$DIR/state/instagram-ip-hosts.tsv}
 LOG=${D2K_INSTAGRAM_LOG:-$DIR/log/instagram-dns.log}
@@ -59,7 +69,7 @@ edge_verified() {
     probe_attempt=1
     probe_attempts=${D2K_IP_PROBE_ATTEMPTS:-2}
     while [ "$probe_attempt" -le "$probe_attempts" ]; do
-        d2ktg --check-instagram-ip "$1" "$2" "$ca_bundle" </dev/null >>"$LOG" 2>&1 && return 0
+        "$TGBIN" --check-instagram-ip "$1" "$2" "$ca_bundle" </dev/null >>"$LOG" 2>&1 && return 0
         if [ "$probe_attempt" -lt "$probe_attempts" ]; then
             log "повтор TLS-пробы $probe_attempt/$probe_attempts: $1 $2"
             sleep "${D2K_IP_PROBE_RETRY_DELAY:-1}"
@@ -175,7 +185,7 @@ remove_owned() {
 refresh() {
     if ! command -v ndmc >/dev/null 2>&1; then log 'ndmc отсутствует — пропускаю (не Keenetic)'; return 0; fi
     [ -s "$META_RANGES" ] || { log "нет списка диапазонов Meta: $META_RANGES"; return 1; }
-    command -v d2ktg >/dev/null 2>&1 || { log 'нет C-инструмента проверки адресов d2ktg'; return 1; }
+    command -v "$TGBIN" >/dev/null 2>&1 || { log 'нет C-инструмента проверки адресов d2ktg'; return 1; }
     ca_bundle=${D2K_IP_CA_BUNDLE:-/opt/etc/ssl/certs/ca-certificates.crt}
     [ -r "$ca_bundle" ] || ca_bundle=/etc/ssl/certs/ca-certificates.crt
     [ -r "$ca_bundle" ] || { log 'нет системных доверенных CA; установите ca-bundle'; return 1; }

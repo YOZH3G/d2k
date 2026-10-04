@@ -203,7 +203,17 @@ static void reset(void) {
     g_alive = -1;   /* по умолчанию сказать нечего */
 }
 
+static void test_managed_resource_root(void) {
+    char dir[]="/tmp/d2k-managed-voice.XXXXXX";CHECK(mkdtemp(dir)!=NULL,"managed resource fixture");
+    char path[128];snprintf(path,sizeof path,"%s/stun.bin",dir);FILE *f=fopen(path,"wb");
+    const char bytes[]="voice resource bytes";if(!f){CHECK(0,"managed resource file");return;}
+    fwrite(bytes,1,sizeof bytes-1,f);fclose(f);setenv("D2K_FAKE_DIR",dir,1);
+    unsigned char out[128];size_t n=0;
+    CHECK(!d2k_voice_blob_hook(NULL,"stun.bin",out,sizeof out,&n)&&n==sizeof bytes-1&&!memcmp(out,bytes,n),"default voice blob must use resolved managed release");
+    unsetenv("D2K_FAKE_DIR");unlink(path);rmdir(dir);
+}
 int main(void) {
+    test_managed_resource_root();
     d2k_voice_ask_hook = stub_ask;
     d2k_voice_resolve_hook = stub_resolve;
     d2k_voice_blob_hook = stub_blob;

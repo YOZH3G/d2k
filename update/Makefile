@@ -86,9 +86,28 @@ $(BUILD)/test_recovery: tests/test_recovery.c tests/transaction_fixture.h $(TRAN
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_recovery.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
 boot: $(BUILD)/d2k-update-boot
-$(BUILD)/d2k-update-boot: src/boot_main.c $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
+$(BUILD)/d2k-update-boot: src/boot_main.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
 	mkdir -p $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) src/boot_main.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/boot_main.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/test_offline_ownership: tests/test_offline_ownership.c tests/transaction_fixture.h $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_offline_ownership.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
+
+.PHONY: check-bootstrap service-adapter
+check-bootstrap: $(BUILD)/test_service_adapter
+service-adapter: $(BUILD)/d2k-service-adapter
+$(BUILD)/test_service_adapter: tests/test_service_adapter.c src/service_adapter.c $(TRANSACTION_SRC) include/d2k_update.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_service_adapter.c src/service_adapter.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD)/d2k-service-adapter: src/service_main.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) include/d2k_update.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/service_main.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
+check: check-bootstrap
+check-bootstrap: $(BUILD)/test_bootstrap $(BUILD)/d2k-service-adapter $(BUILD)/d2k-update-boot
+	$(BUILD)/test_service_adapter
+	$(BUILD)/test_bootstrap
+	python3 tests/test_managed.py $(BUILD)/d2k-service-adapter
+	python3 tests/test_bootstrap_cli.py $(BUILD)/d2k-update-boot $(BUILD)/d2k-service-adapter
+$(BUILD)/test_bootstrap: tests/test_bootstrap.c src/bootstrap.c $(TRANSACTION_SRC) include/d2k_update.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_bootstrap.c src/bootstrap.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@

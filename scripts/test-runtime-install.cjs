@@ -54,7 +54,7 @@ exit 1
   fs.mkdirSync(path.join(tmp, 'opt/etc/ndm/netfilter.d'), { recursive: true });
   const runtime = path.join(tmp, 'runtime');
   for (const name of ['install', 'uninstall']) {
-    const script = fs.readFileSync(path.join(root, `scripts/${name}.sh`), 'utf8')
+    const script = fs.readFileSync(name === 'install' && process.env.D2K_INSTALL_FIXTURE_SOURCE ? process.env.D2K_INSTALL_FIXTURE_SOURCE : path.join(root, `scripts/${name}.sh`), 'utf8')
       .replaceAll('/opt', path.join(tmp, 'opt'))
       .replaceAll('/proc', path.join(tmp, 'proc'))
       .replaceAll('/tmp/d2k', runtime);
@@ -142,6 +142,7 @@ exit 1
   // Init may already be missing: uninstall still stops its owned helper.
   fs.unlinkSync(path.join(tmp, 'opt/etc/init.d/S99d2k'));
   fs.mkdirSync(runtime); fs.writeFileSync(path.join(runtime, 'live.json'), '{}');
+  for (const binary of ['d2kd','d2kc','d2kpanel','d2ktg']) fs.writeFileSync(path.join(runtime, `${binary}.health`), 'stale');
   fs.writeFileSync(path.join(runtime, 'log-tail.ABCDEF'), 'stale');
   fs.writeFileSync(path.join(runtime, 'unrelated'), 'keep');
   const customRuntime = path.join(tmp, 'custom-runtime');
@@ -177,6 +178,7 @@ exit 1
   assert(!fs.existsSync(ppe), 'uninstall must remove the PPE de-offload helper');
   assert(fs.readFileSync(path.join(tmp, 'calls'), 'utf8').includes('ppe-remove'), 'uninstall must remove own PPE rules even without init');
   assert(!fs.existsSync(path.join(runtime, 'live.json')), 'uninstall must remove volatile live snapshot');
+  for (const binary of ['d2kd','d2kc','d2kpanel','d2ktg']) assert(!fs.existsSync(path.join(runtime, `${binary}.health`)), 'uninstall must remove owned heartbeat');
   assert(!fs.existsSync(path.join(runtime, 'log-tail.ABCDEF')), 'uninstall must remove owned abandoned stage');
   assert.equal(fs.readFileSync(path.join(runtime, 'unrelated'), 'utf8'), 'keep');
   assert(!fs.existsSync(path.join(customRuntime, 'live.json')), 'missing-init uninstall must remove configured custom snapshot');
@@ -200,7 +202,16 @@ exit 1
   fs.writeFileSync(path.join(envRuntime, 'live.json'), '{}');
   run('uninstall', { D2K_RUNTIME_DIR: envRuntime });
   assert(!fs.existsSync(envRuntime), 'explicit valid environment runtime must be cleaned and removed when empty');
-  console.log('local installer/helper and keep-state uninstall: PASS');
+  // The supported installer must route a managed root before downloads, module
+  // changes or flat per-file replacement. An absent task-9 daemon stays explicit.
+  fs.mkdirSync(path.join(tmp, 'opt/d2k/boot'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'opt/d2k/boot/d2k-service-adapter'), '#!/bin/sh\nprintf "%s\\n" "$*" > "$CALLS.managed"\nexit 3\n', { mode: 0o755 });
+  const configBefore = fs.readFileSync(config);
+  const managedResult = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
+  assert.equal(managedResult.status, 3, 'managed install must expose unavailable updater instead of replacing flat files');
+  assert.equal(fs.readFileSync(`${env.CALLS}.managed`, 'utf8').trim(), 'service install');
+  assert.deepEqual(fs.readFileSync(config), configBefore, 'managed routing preserves personal configuration');
+  console.log('local installer/helper, managed routing and keep-state uninstall: PASS');
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

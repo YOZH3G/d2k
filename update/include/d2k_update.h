@@ -139,8 +139,25 @@ typedef struct {
     d2ku_snapshot_path paths[D2KU_SNAPSHOT_PATHS_MAX];
     size_t path_count;
 } d2ku_transaction_ops;
+typedef struct {
+    d2ku_ctx *ctx;
+    char root[1024], runtime[1024], state[1024], identity[1024];
+    char panel_host[128];
+    uint64_t enabled;
+    int identity_required;
+} d2ku_service_config;
+d2ku_rc d2ku_service_lock_valid(d2ku_ctx *, int);
+d2ku_rc d2ku_service_configure(d2ku_ctx *, const char *, d2ku_service_config *);
+d2ku_rc d2ku_service_capture(void *, uint64_t *);
+d2ku_rc d2ku_service_call(void *, const char *, const char *, uint64_t);
+d2ku_rc d2ku_service_dispatch(d2ku_service_config *, const char *, const char *, uint64_t);
+d2ku_rc d2ku_service_health_state(void *);
+d2ku_rc d2ku_service_health_rules(void *);
+d2ku_rc d2ku_service_health_http(void *);
+d2ku_rc d2ku_bootstrap(d2ku_ctx *, d2ku_status *);
 struct d2ku_ctx {
     d2ku_transaction_ops transaction;
+    int bootstrap_prefix_fd, bootstrap_bundle_fd; /* explicit installer-only directory handles */
     int maintenance_lock_fd; /* internal, valid only during transaction callbacks */
     int boot_control_fd; /* task9: inherited FD5; <=2 means standalone */
     /* Local health adapters: callbacks are read-only and cannot infer success

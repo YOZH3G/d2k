@@ -329,6 +329,7 @@ static int voice_resolve(const char *hostport, uint32_t *ip, uint16_t *port) {
 
 static int voice_blob_load(const char *dir, const char *file,
                            uint8_t *out, size_t cap, size_t *len) {
+    if (!dir || !*dir) { dir = getenv("D2K_FAKE_DIR"); }
     if (!dir || !*dir) { dir = "/opt/d2k/files/fake"; }
     if (!file || !out || !len) { return -1; }
     char path[512];

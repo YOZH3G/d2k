@@ -70,6 +70,8 @@ int tg_config_read(const char *path,tg_config *out) {
     if(copy_value(out->identity_path,sizeof(out->identity_path),"/opt/d2k/state/tg.identity")||
        copy_value(out->ca_bundle,sizeof(out->ca_bundle),"/opt/d2k/files/tg-roots.pem")||
        copy_value(out->status_path,sizeof(out->status_path),"/opt/d2k/state/telegram.status"))return -1;
+    const char *managed_ca=getenv("D2K_TG_CA_BUNDLE");
+    if(managed_ca&&*managed_ca&&copy_value(out->ca_bundle,sizeof(out->ca_bundle),managed_ca))return -1;
     f=fopen(path,"r");if(!f)return -1;
     while(fgets(line,sizeof(line),f)) {
         if(!strchr(line,'\n')&&!feof(f))goto done;

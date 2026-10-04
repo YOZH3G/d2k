@@ -64,6 +64,13 @@ rotate_one() {
 }
 
 tick() {
+    if [ -L "$DIR/current" ] || [ -f "$DIR/update-state/bootstrap.pending" ]; then
+        if [ "${D2K_MANAGED_INTERNAL:-}" != 1 ]; then
+            "$DIR/boot/d2k-service-adapter" --root "$DIR" service log-tick
+            return $?
+        fi
+        "$DIR/boot/d2k-service-adapter" --root "$DIR" --validate-maintenance-fd 4 || return 1
+    fi
     prepare_runtime || return 1
     # Enumerate exact owned names: never rotate unrelated or custom logs.
     for name in d2kd.log d2kc.log panel.log telegram.log d2khttp.log \
