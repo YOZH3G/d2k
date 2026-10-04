@@ -254,8 +254,12 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
             f->touched = now;
             return;
         }
-        if (!f) { return; }
+        if (!f) {
+            if (plen > 0) { h->st.untracked++; }
+            return;
+        }
         f->touched = now;
+        if (plen > 0 && f->state != ST_OPEN && f->state != ST_SYN) { h->st.later++; }
         if (f->state == ST_OPEN && plen > 0) {
             /* Первая нагрузка клиента — запрос целиком в одном пакете, ровно
                с начала потока. Кусок запроса не разобрать: решать не по чему. */
@@ -269,6 +273,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
                 h->st.requests++;
             } else {
                 f->state = ST_DONE;
+                h->st.unparsed++;
             }
         }
         return;

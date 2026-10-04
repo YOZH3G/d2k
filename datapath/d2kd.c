@@ -762,10 +762,16 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
            rss_kb);
     if (http80) {
         d2k_http80_stats hst = d2k_http80_get_stats(http80);
-        if (hst.requests || hst.injections) {
+        if (hst.requests || hst.injections || hst.untracked || hst.unparsed || hst.later) {
+            /* Хвост — нагрузка клиента, где вставку не узнать: без него
+               портал в браузере при «запросов +0» не отличить от «запроса
+               к :80 не было» (поле 04.10.2026). */
             printf("HTTP: запросов %" PRIu64 ", вставок провайдера %" PRIu64
-                   ", потоков вытеснено %" PRIu64 "\n",
-                   hst.requests, hst.injections, hst.evicted);
+                   ", потоков вытеснено %" PRIu64 "; не разобрать, пакетов клиента: "
+                   "поток без SYN %" PRIu64 ", не целый запрос %" PRIu64
+                   ", после первой нагрузки потока %" PRIu64 "\n",
+                   hst.requests, hst.injections, hst.evicted,
+                   hst.untracked, hst.unparsed, hst.later);
         }
     }
     d2k_hold_stats hs;
