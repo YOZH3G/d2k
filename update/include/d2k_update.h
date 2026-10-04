@@ -16,6 +16,9 @@
 #define D2KU_HOSTS_MAX 8u
 #define D2KU_HOST_MAX 253u
 #define D2KU_CA_PATH_MAX 1024u
+#define D2KU_BOOT_ID_MAX 64u
+#define D2KU_TIMEZONE_MAX 128u
+#define D2KU_CHECK_TTL_MS UINT64_C(900000)
 
 typedef enum { D2KU_OK, D2KU_INVALID, D2KU_UNTRUSTED, D2KU_EXPIRED,
     D2KU_REPLAY, D2KU_INCOMPATIBLE, D2KU_BUSY, D2KU_IO, D2KU_NETWORK,
@@ -29,12 +32,67 @@ typedef struct d2ku_policy d2ku_policy;
 typedef struct d2ku_clock d2ku_clock;
 typedef struct d2ku_request d2ku_request;
 
+typedef struct {
+    int64_t utc_seconds;
+    uint64_t mono_ms;
+    int32_t local_date; /* Gregorian YYYYMMDD in router timezone */
+    unsigned local_minute; /* 0..1439 */
+    char boot_id[D2KU_BOOT_ID_MAX + 1];
+    char timezone[D2KU_TIMEZONE_MAX + 1]; /* router POSIX TZ / zone identifier */
+    int synchronized; /* exactly 1: platform explicitly confirmed sync */
+} d2ku_clock_sample;
+
 struct d2ku_clock {
     void *arg;
     /* wall returns TIME unless UTC is trustworthy; monotonic is nanoseconds. */
     d2ku_rc (*wall)(void *arg, int64_t *utc_seconds);
     d2ku_rc (*monotonic)(void *arg, uint64_t *nanoseconds);
+    /* Coherent snapshot from same platform clock as wall/monotonic. The daemon
+     * owns the adapter: capture UTC/monotonic/boot, derive local calendar using
+     * router TZ, report explicit sync (unknown != synchronized). No guessing.
+     * wall MUST apply the same trust/floor checks as d2ku_read_clock. */
+    d2ku_rc (*snapshot)(void *arg, d2ku_clock_sample *);
+    int64_t build_timestamp, last_accepted_timestamp; /* trusted UTC floors */
 };
+struct d2ku_policy {
+    int enabled;
+    int32_t selected_date, last_attempt_date; /* durable date high-water marks */
+    unsigned selected_minute; /* 180..299, saved once per selected_date */
+    int has_quarantined_release;
+    unsigned char quarantined_release_sha256[32]; /* exact manifest hash */
+};
+struct d2ku_status {
+    int has_check, check_in_flight;
+    uint64_t checked_mono_ms;
+    char checked_boot_id[D2KU_BOOT_ID_MAX + 1];
+    char observed_boot_id[D2KU_BOOT_ID_MAX + 1];
+    d2ku_rc check_result;
+    int has_success;
+    int64_t last_success_utc; /* retained on later failed checks */
+};
+
+/* No I/O/persistence. read_clock rejects unknown sync, invalid calendar/boot/TZ
+ * and wall below either UTC floor. Output unchanged on failure. Manual install
+ * must use this gate too; force check never bypasses signature time checks. */
+d2ku_rc d2ku_read_clock(const d2ku_clock *, d2ku_clock_sample *);
+/* Caller supplies an unbiased random offset 0..119. Save returned choice
+ * durably before relying on it. Existing date keeps its minute; older rejected. */
+d2ku_rc d2ku_select_minute(d2ku_policy *, int32_t date, unsigned random_offset);
+/* Schedule only. Automatic install needs BOTH auto_due and release_allowed.
+ * Recheck immediately before switch after download; begun switch/validation/
+ * rollback is completed regardless of window end. No manual date consumption. */
+int d2ku_auto_due(const d2ku_policy *, const d2ku_clock *);
+int d2ku_auto_release_allowed(const d2ku_policy *, const unsigned char hash[32]);
+/* Caller serializes attempts and durably fsyncs resulting policy BEFORE starting
+ * auto install. Failure to persist means do not install. Not for manual use. */
+d2ku_rc d2ku_mark_auto_attempt(d2ku_policy *, const d2ku_clock *);
+/* Observe boot before check_due. Cache is volatile; every boot requires a check.
+ * The daemon sets check_in_flight under its lock: even force requests join an
+ * existing operation. Metadata/display and previous failure reason are daemon
+ * state; record caches result without overwriting last success on errors. */
+void d2ku_cache_observe(d2ku_status *, const d2ku_clock_sample *);
+d2ku_rc d2ku_cache_record(d2ku_status *, const d2ku_clock_sample *, d2ku_rc);
+int d2ku_check_due(const d2ku_status *, uint64_t mono_ms, int force);
 typedef struct {
     unsigned char public_key[32];
     int64_t not_before, not_after; /* inclusive start, exclusive end */

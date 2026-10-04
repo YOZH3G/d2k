@@ -206,3 +206,80 @@ function never installs a release, writes active/config/state, executes scripts,
 or emits a durable prepared transaction. The transaction layer owns durable
 creation/removal of the staging container (including its parent fsync) and the
 prepared journal transition after staging returns OK.
+
+## Clock, schedule, cache and quarantine policy
+
+`schedule.c` performs policy only, with no file, network or service operations.
+The daemon supplies `clock.snapshot` through a platform adapter using the same
+clock as `clock.wall` and `clock.monotonic`. A snapshot owns its bounded boot ID
+and router timezone, UTC seconds, monotonic milliseconds, local Gregorian date
+(`YYYYMMDD`) and minute of day. The adapter derives the local fields from that
+captured UTC in the router's current timezone, including its POSIX `TZ` setting;
+it must not use the development host timezone or invent a default timezone.
+Boot ID is an opaque stable identifier for this boot; missing identity fails
+closed. Milliseconds in policy are distinct from the legacy monotonic callback's
+nanoseconds. The daemon's real adapter is separately verified during field
+preflight; fake clock unit tests are not evidence of platform synchronization.
+
+`synchronized == 1` means the platform positively confirmed clock synchronization;
+unknown or unsynchronized status is not trusted. `d2ku_read_clock` also requires
+valid calendar/boot/timezone fields and UTC at or after BOTH `build_timestamp`
+and the durable `last_accepted_timestamp`. No year threshold substitutes for
+confirmed synchronization. `clock.wall`, used by signature verification, must
+enforce the same gate. `D2KU_TIME` blocks automatic AND manual installation and
+signature freshness checks. Failed reads leave the output unchanged. Observing
+or caching an error requires only a valid boot ID, and does not bypass this gate.
+The daemon advances the accepted UTC floor durably as a high-water mark; reboot
+and release rollback never reduce it. It supplies the installed build timestamp
+from trusted build metadata, not a value supplied by a panel request.
+
+The daemon supplies an unbiased random integer 0..119 to `d2ku_select_minute`.
+The selected minute is `180 + offset`, representing `[03:00, 05:00)`. The selected
+date/minute must be durably saved before use, and repeated selection on that date
+keeps the saved minute. Dates below either saved selection or last auto-attempt
+date are rejected with TIME. This durable high-water rule conservatively delays
+installation after a backward date/timezone change until the date advances.
+
+`d2ku_auto_due` is ONLY the schedule predicate: enabled, saved selection for the
+current local date, current minute at/after that selection and before 05:00,
+and date strictly greater than the durable last auto-attempt date. Boot after
+the selected minute may catch up before 05:00; repeated hours, clock rollback
+and reboot do not reset the date guard. A skipped minute due to DST permits the
+same catch-up within the window; a skipped whole window never permits daytime
+installation. Automatic installation additionally requires
+`d2ku_auto_release_allowed` for the exact chosen manifest SHA-256, successfully
+verified compatible metadata, and the transaction layer's other preconditions.
+
+After downloading/staging, the caller rechecks the schedule and quarantine
+immediately before beginning installation. `d2ku_mark_auto_attempt` updates the
+in-memory date only if the schedule is still due (BUSY otherwise, TIME for
+untrusted time). Caller locking must serialize this claim, and the journal/daemon
+must durably fsync the new date BEFORE beginning the automatic transaction.
+Persistence failure means no installation. A download finishing at/after 05:00
+does not consume an installation attempt: the prepared release waits for the
+next window. Already begun switch, validation or rollback runs to completion
+after 05:00. Manual installation does not call this auto-attempt marker.
+
+The quarantined release hash is durable local policy, outside release rollback.
+Automatic installation of that exact manifest hash is forbidden on later nights;
+a different hash is not quarantined by this record. Manual retry is a distinct,
+explicit daemon action showing the stored failure reason; it bypasses only the
+automatic quarantine guard, never clock/signature/compatibility checks.
+
+The check cache is volatile and shared by all device clients. The daemon calls
+`d2ku_cache_observe` before `d2ku_check_due`; changed/unknown boot identity or a
+backward monotonic reading requires a new check, even when numeric milliseconds
+match the old boot. The TTL is exactly 900000 ms: age 899 seconds is cached,
+900 seconds is due. `d2ku_cache_record` stores the latest check result, including
+errors, with that same TTL; errors retain the timestamp of the last successful
+check. The daemon retains its authenticated metadata separately and must not
+present stale metadata as a fresh successful result after failure.
+
+Force requests bypass a cached result, but `check_in_flight` takes precedence:
+callers join the current operation. The daemon sets/clears this flag and checks
+the predicate under its operation lock; policy alone provides no synchronization.
+Disabling automatic installation never disables `d2ku_check_due`, manual actions,
+or the daemon's nightly check request. The daemon uses the saved date/minute for
+nightly checking independently of `enabled`; `auto_due` gates installation only.
+Opening the panel starts only a due check; it never calls install/stage, nor
+requests a package download.
