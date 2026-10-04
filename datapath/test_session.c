@@ -11,6 +11,7 @@
 #include "d2k_session.h"
 #include "d2k_hold.h"
 #include "d2k_tls.h"
+#include "d2k_ctq.h"
 
 static int fails;
 static size_t hold_released;
@@ -1030,7 +1031,340 @@ static void test_routed_flag_reset_on_new_syn(void) {
     d2k_session_free(g);
 }
 
+/* ЗАДАЧА 56. TCP ВСТАЛ НА БЮДЖЕТЕ КОРОБКИ, КЛИЕНТ НЕ ЗАКРЫВАЕТ (поле 04.10,
+ * Safari, пустой каталог). mailsuite.com (AWS 54.77.225.34): 20 пакетов
+ * данных вниз, 26 с данными в обе стороны, затем 42 с тишины; www.romfea.gr
+ * (Cloudflare): 25 с данными в обе стороны, 41 с тишины. Safari держит
+ * соединение открытым: ни RST, ни FIN — ни один из детекторов позднего
+ * закрытия не срабатывает, d2kc молчал.
+ *
+ * Очередь видит первые ~8 пакетов каждой стороны; дальше — счётчики
+ * conntrack по кортежу (тот же ctnetlink, что у QUIC). Подменяем запрос. */
+static struct { uint16_t cport; d2k_ct_info info; int answer; } tcp_ct;
+static unsigned tcp_ct_queries;
+static int fake_tcp_ct(void *ctx, const d2k_ct_tuple *t, d2k_ct_info *out) {
+    (void)ctx;
+    tcp_ct_queries++;
+    static const uint8_t cli[4] = {192, 168, 1, 67}, srv[4] = {1, 2, 3, 4};
+    uint16_t sp = (uint16_t)(t->sport_be[0] << 8 | t->sport_be[1]);
+    uint16_t dp = (uint16_t)(t->dport_be[0] << 8 | t->dport_be[1]);
+    /* Прямой кортеж — клиент → сервер, TCP. */
+    if (t->family != 4 || t->proto != 6 || memcmp(t->src, cli, 4) || memcmp(t->dst, srv, 4) ||
+        dp != 443 || sp != tcp_ct.cport || !tcp_ct.answer) return -1;
+    *out = tcp_ct.info;
+    return 0;
+}
+static void tcp_ct_set(uint16_t cport, uint64_t orig, uint64_t reply, int established) {
+    tcp_ct.cport = cport;
+    tcp_ct.answer = 1;
+    tcp_ct.info.orig_pkts = orig;
+    tcp_ct.info.reply_pkts = reply;
+    tcp_ct.info.tcp_state_known = 1;
+    tcp_ct.info.tcp_state = established ? D2K_CT_TCP_ESTABLISHED : 5 /* CLOSE_WAIT */;
+}
+
+/* Окно очереди одного потока: SYN, SYN-ACK через rtt, приветствие, затем
+   fwd_data-1 пакетов данных клиента и fwd_acks чистых ACK, rev_data пакетов
+   данных сервера и rev_acks чистых ACK сервера (кроме SYN-ACK). Номера
+   последовательности честные: повтор номера приветствия — другая улика. */
+static d2k_session *tcp_window(uint16_t port, uint64_t t0, uint64_t rtt,
+                               int fwd_data, int fwd_acks, int rev_data, int rev_acks) {
+    d2k_session *s = d2k_session_new(64, 64);
+    if (!s) return NULL;
+    d2k_session_set_ct_query(s, fake_tcp_ct, NULL);
+    uint8_t hello[512], pkt[2048], buf[8192], junk[1440];
+    memset(junk, 0x5a, sizeof junk);
+    junk[0] = 0x17; junk[1] = 0x03; junk[2] = 0x03;   /* запись app-data */
+    size_t hlen = build_hello(hello);
+    d2k_result r;
+    uint32_t cseq = 1000, sseq = 5000;
+    uint64_t t = t0;
+    size_t n = cut_seq(pkt, build_pkt(pkt, port, 0x02, NULL, 0), cseq - 1, 0);
+    d2k_session_packet(s, pkt, n, t, buf, sizeof buf, &r);
+    t += rtt;
+    n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x12, NULL, 0), sseq - 1, cseq);
+    d2k_session_packet(s, pkt, n, t, buf, sizeof buf, &r);
+    n = cut_seq(pkt, build_pkt(pkt, port, 0x18, hello, hlen), cseq, sseq);
+    d2k_session_packet(s, pkt, n, t + 1000, buf, sizeof buf, &r);
+    cseq += (uint32_t)hlen;
+    for (int i = 0; i < rev_data; i++) {
+        size_t len = i == 0 ? 1440 : 900;
+        n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x18, junk, len), sseq, cseq);
+        d2k_session_packet(s, pkt, n, t + 2000 + (uint64_t)i, buf, sizeof buf, &r);
+        sseq += (uint32_t)len;
+    }
+    for (int i = 0; i < rev_acks; i++) {
+        n = cut_seq(pkt, build_rev_pkt(pkt, port, 0x10, NULL, 0), sseq, cseq);
+        d2k_session_packet(s, pkt, n, t + 3000 + (uint64_t)i, buf, sizeof buf, &r);
+    }
+    for (int i = 1; i < fwd_data; i++) {
+        n = cut_seq(pkt, build_pkt(pkt, port, 0x18, junk, 64), cseq, sseq);
+        d2k_session_packet(s, pkt, n, t + 4000 + (uint64_t)i, buf, sizeof buf, &r);
+        cseq += 64;
+    }
+    for (int i = 0; i < fwd_acks; i++) {
+        n = cut_seq(pkt, build_pkt(pkt, port, 0x10, NULL, 0), cseq, sseq);
+        d2k_session_packet(s, pkt, n, t + 5000 + (uint64_t)i, buf, sizeof buf, &r);
+    }
+    return s;
+}
+
+static void test_tcp_stall(void) {
+    const uint64_t S = 1000000000ull, MS = 1000000ull;
+
+    /* Ничего не наблюдается — ядро не спрашивается вовсе. */
+    {
+        d2k_session *s = d2k_session_new(64, 64);
+        d2k_session_set_ct_query(s, fake_tcp_ct, NULL);
+        tcp_ct_queries = 0;
+        d2k_session_sweep(s, 5 * S);
+        /* Поток без ответа сервера после приветствия — не этот детектор. */
+        uint8_t hello[512], pkt[1024], buf[8192];
+        size_t hlen = build_hello(hello);
+        d2k_result r;
+        size_t n = cut_seq(pkt, build_pkt(pkt, 47900, 0x02, NULL, 0), 999, 0);
+        d2k_session_packet(s, pkt, n, 6 * S, buf, sizeof buf, &r);
+        n = cut_seq(pkt, build_rev_pkt(pkt, 47900, 0x12, NULL, 0), 4999, 1000);
+        d2k_session_packet(s, pkt, n, 6 * S + 80 * MS, buf, sizeof buf, &r);
+        n = cut_seq(pkt, build_pkt(pkt, 47900, 0x18, hello, hlen), 1000, 5000);
+        d2k_session_packet(s, pkt, n, 6 * S + 81 * MS, buf, sizeof buf, &r);
+        d2k_session_sweep(s, 7 * S);
+        CHECK(tcp_ct_queries == 0, "TCP: conntrack спрошен, хотя сервер ещё не отвечал данными");
+        d2k_session_free(s);
+    }
+
+    /* mailsuite.com, поле 04.10 (s2-mailsuite.pcap): RTT 81 мс; очередь
+       видела клиента S . 1536 1536 . . . 64 (3 с данными) и сервера
+       S. . . 1440 1440 1440 1099 . (4 с данными); conntrack к тишине:
+       прямой 19, обратный 25. Оценка: 3 + 4 + (25 - 8) = 24 при бюджете 25.
+       Клиент 39 с молчит — подозрения нет (обрыв от простоя не отличить);
+       на 40-й секунде Safari шлёт пять записей по 35 байт за 2 с, ни одна
+       не подтверждена — третья даёт подозрение. */
+    {
+        tcp_ct_queries = 0;
+        d2k_session *s = tcp_window(47901, 1 * S, 81 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47901, 19, 25, 1);
+        d2k_session_sweep(s, 2 * S);
+        d2k_session_sweep(s, 3 * S);
+        CHECK(d2k_session_suspects(s) == 0, "mailsuite: секунда тишины уже объявлена обрывом");
+        for (uint64_t k = 4; k <= 40; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 0,
+              "mailsuite: тишина при молчащем клиенте объявлена обрывом");
+        tcp_ct_set(47901, 21, 25, 1);
+        d2k_session_sweep(s, 41 * S);
+        CHECK(d2k_session_suspects(s) == 0, "mailsuite: два пакета клиента в тишину уже обрыв");
+        tcp_ct_set(47901, 22, 25, 1);
+        d2k_session_sweep(s, 42 * S);
+        const d2k_jrn_entry *e = last_suspect(s);
+        CHECK(e && e->code == D2K_SUSPECT_TCP_STALL,
+              "mailsuite: поток встал на бюджете, клиент не закрывает — подозрения нет");
+        CHECK(e && e->num == 24, "mailsuite: в подозрении не та оценка пакетов с данными (ждали 24)");
+        CHECK(e && e->d_planned == D2K_PLANNED_NO, "mailsuite: поток без плана объявлен плановым");
+        tcp_ct_set(47901, 30, 25, 1);
+        d2k_session_sweep(s, 50 * S);
+        d2k_session_sweep(s, 60 * S);
+        CHECK(d2k_session_suspects(s) == 1, "mailsuite: один поток дал больше одного подозрения");
+        d2k_session_free(s);
+    }
+
+    /* mailsuite.com повторно, замер 04.10 11:13 на роутере: Safari сразу
+       продолжает слать по вставшему соединению (прямой 17 → 20 → 21 за 3 с,
+       обратный стоит на 25) — подозрение через RTO. */
+    {
+        d2k_session *s = tcp_window(47915, 1 * S, 81 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47915, 17, 25, 1);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47915, 20, 25, 1);
+        d2k_session_sweep(s, 3 * S);
+        CHECK(d2k_session_suspects(s) == 0, "mailsuite-2: тишина короче RTO объявлена обрывом");
+        tcp_ct_set(47915, 21, 25, 1);
+        d2k_session_sweep(s, 4 * S + 100 * MS);
+        CHECK(last_suspect(s) && last_suspect(s)->code == D2K_SUSPECT_TCP_STALL,
+              "mailsuite-2: клиент говорит в тишину на бюджете — подозрения нет");
+        d2k_session_free(s);
+    }
+
+    /* Ложные полосы (замер 04.10: 15 из 21): keep-alive после полного ответа
+       на 22–28 пакетах. Клиент подтвердил последние данные (один пакет) и
+       молчит; потом шлёт PING HTTP/2 — сервер отвечает. Подозрения нет. */
+    {
+        d2k_session *s = tcp_window(47916, 1 * S, 50 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47916, 14, 22, 1);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47916, 15, 22, 1);
+        for (uint64_t k = 3; k <= 16; k++) d2k_session_sweep(s, k * S);
+        tcp_ct_set(47916, 16, 23, 1);
+        for (uint64_t k = 17; k <= 31; k++) d2k_session_sweep(s, k * S);
+        tcp_ct_set(47916, 17, 24, 1);
+        for (uint64_t k = 32; k <= 60; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 0,
+              "keep-alive на бюджете с отвечающим сервером объявлен обрывом");
+        d2k_session_free(s);
+    }
+
+    /* www.romfea.gr, поле 04.10 (s2-romfea.pcap): RTT 62 мс; клиент
+       S . hello . . . 80 348 (3), сервер S. . . 1440 1440 993 544 31 (5);
+       обратный 25 к тишине, клиент ещё шлёт ACK (прямой растёт). 3+5+17 = 25. */
+    {
+        d2k_session *s = tcp_window(47902, 1 * S, 62 * MS, 3, 5, 5, 2);
+        tcp_ct_set(47902, 19, 25, 1);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47902, 22, 25, 1);
+        d2k_session_sweep(s, 3 * S);
+        tcp_ct_set(47902, 24, 25, 1);
+        d2k_session_sweep(s, 4 * S + 100 * MS);
+        const d2k_jrn_entry *e = last_suspect(s);
+        CHECK(e && e->code == D2K_SUSPECT_TCP_STALL && e->num == 25,
+              "romfea: поток встал на 25 пакетах — подозрения нет");
+        d2k_session_free(s);
+    }
+
+    /* Простаивающее keep-alive после ПОЛНОГО ответа, число пакетов вне
+       полосы: ни сразу, ни через минуту. Выше полосы поток больше не
+       спрашивается — в неё уже не вернуться. */
+    {
+        d2k_session *s = tcp_window(47903, 1 * S, 50 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47903, 30, 60, 1);
+        tcp_ct_queries = 0;
+        for (uint64_t k = 2; k <= 60; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 0, "keep-alive после полного ответа (60 пакетов) объявлен обрывом");
+        CHECK(tcp_ct_queries == 1, "поток выше полосы продолжают спрашивать каждую секунду");
+        d2k_session_free(s);
+        /* Маленький полный ответ ниже полосы. */
+        s = tcp_window(47904, 1 * S, 50 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47904, 12, 12, 1);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47904, 20, 12, 1);   /* даже если клиент говорит в тишину */
+        for (uint64_t k = 3; k <= 60; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 0, "keep-alive после маленького ответа (12 пакетов) объявлен обрывом");
+        d2k_session_free(s);
+    }
+
+    /* Медленный сервер, который продолжает: пауза на бюджете короче RTO,
+       затем ответ идёт дальше — подозрения нет. С измеренным RTT 1 с RTO —
+       3 с, и пауза 2,5 с тоже не обрыв. */
+    {
+        d2k_session *s = tcp_window(47905, 1 * S, 50 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47905, 19, 25, 1);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47905, 23, 25, 1);   /* клиент шлёт, сервер думает */
+        d2k_session_sweep(s, 3 * S + 500 * MS);
+        tcp_ct_set(47905, 30, 70, 1);
+        d2k_session_sweep(s, 4 * S);
+        for (uint64_t k = 5; k <= 20; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 0, "медленный сервер, продолживший ответ, объявлен обрывом");
+        d2k_session_free(s);
+
+        s = tcp_window(47906, 1 * S, 1 * S, 3, 4, 4, 3);
+        tcp_ct_set(47906, 19, 25, 1);
+        d2k_session_sweep(s, 3 * S);
+        tcp_ct_set(47906, 23, 25, 1);
+        d2k_session_sweep(s, 4 * S);
+        d2k_session_sweep(s, 5 * S + 500 * MS);
+        CHECK(d2k_session_suspects(s) == 0, "пауза 2,5 с при RTT 1 с (RTO 3 с) объявлена обрывом");
+        tcp_ct_set(47906, 40, 90, 1);
+        d2k_session_sweep(s, 6 * S);
+        CHECK(d2k_session_suspects(s) == 0, "медленный сервер с RTT 1 с объявлен обрывом");
+        d2k_session_free(s);
+
+        /* Медленный первый байт: тишина ниже полосы, потом полный ответ. */
+        s = tcp_window(47907, 1 * S, 50 * MS, 3, 4, 2, 3);
+        tcp_ct_set(47907, 8, 9, 1);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47907, 12, 9, 1);
+        for (uint64_t k = 3; k <= 10; k++) d2k_session_sweep(s, k * S);
+        tcp_ct_set(47907, 40, 120, 1);
+        for (uint64_t k = 11; k <= 20; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 0, "медленный первый байт объявлен обрывом");
+        d2k_session_free(s);
+    }
+
+    /* Соединение уже не установлено (клиент закрыл: CLOSE_WAIT и дальше) —
+       это дело детекторов закрытия, не этого. Нет ответа ядра — не знаем. */
+    {
+        d2k_session *s = tcp_window(47908, 1 * S, 50 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47908, 19, 25, 0);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47908, 25, 25, 0);
+        for (uint64_t k = 3; k <= 10; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 0, "закрывающееся соединение объявлено обрывом");
+        d2k_session_free(s);
+        s = tcp_window(47909, 1 * S, 50 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47909, 19, 25, 1);
+        tcp_ct.answer = 0;
+        for (uint64_t k = 2; k <= 10; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 0, "без ответа ядра поток объявлен обрывом");
+        tcp_ct.info.tcp_state_known = 0;
+        tcp_ct.info.orig_pkts = 30;
+        tcp_ct.answer = 1;
+        for (uint64_t k = 11; k <= 20; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 0, "без состояния TCP поток объявлен обрывом");
+        d2k_session_free(s);
+    }
+
+    /* ИЗМЕРЕННЫЙ БЮДЖЕТ (контроллер передаёт бюджеты коробок): поток на 24
+       пакетах при единственном бюджете 16 не в полосе; при 16 и 25 — в ней;
+       поток на 17 при бюджете 16 — в полосе. */
+    {
+        const uint16_t b16[] = {16}, b16_25[] = {16, 25};
+        d2k_session *s = tcp_window(47910, 1 * S, 50 * MS, 3, 4, 4, 3);
+        d2k_session_set_stall_budgets(s, b16, 1);
+        tcp_ct_set(47910, 19, 25, 1);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47910, 22, 25, 1);
+        for (uint64_t k = 3; k <= 6; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 0, "24 пакета при бюджете коробки 16 объявлены обрывом");
+        d2k_session_free(s);
+        s = tcp_window(47911, 1 * S, 50 * MS, 3, 4, 4, 3);
+        d2k_session_set_stall_budgets(s, b16_25, 2);
+        tcp_ct_set(47911, 19, 25, 1);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47911, 22, 25, 1);
+        for (uint64_t k = 3; k <= 6; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 1, "24 пакета при бюджетах 16 и 25 не стали подозрением");
+        d2k_session_free(s);
+        s = tcp_window(47912, 1 * S, 50 * MS, 3, 4, 4, 3);
+        d2k_session_set_stall_budgets(s, b16, 1);
+        tcp_ct_set(47912, 12, 18, 1);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47912, 15, 18, 1);
+        for (uint64_t k = 3; k <= 6; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 1, "17 пакетов при бюджете 16 не стали подозрением");
+        d2k_session_free(s);
+        /* Пустой список — снова поле 04.10 (25). */
+        s = tcp_window(47913, 1 * S, 50 * MS, 3, 4, 4, 3);
+        d2k_session_set_stall_budgets(s, b16, 1);
+        d2k_session_set_stall_budgets(s, NULL, 0);
+        tcp_ct_set(47913, 19, 25, 1);
+        d2k_session_sweep(s, 2 * S);
+        tcp_ct_set(47913, 22, 25, 1);
+        for (uint64_t k = 3; k <= 6; k++) d2k_session_sweep(s, k * S);
+        CHECK(d2k_session_suspects(s) == 1, "сброс бюджетов не вернул полевой бюджет 25");
+        d2k_session_free(s);
+    }
+
+    /* Цикл очереди не ждёт: запрос — один на наблюдаемый поток за обход,
+       а поток после FIN клиента (ждёт повтора FIN) не наблюдается. */
+    {
+        d2k_session *s = tcp_window(47914, 1 * S, 50 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47914, 19, 21, 1);
+        tcp_ct_queries = 0;
+        d2k_session_sweep(s, 2 * S);
+        d2k_session_sweep(s, 3 * S);
+        CHECK(tcp_ct_queries == 2, "наблюдаемый поток спрошен не по разу за обход");
+        uint8_t pkt[256], buf[4096];
+        d2k_result r;
+        size_t n = cut_seq(pkt, build_pkt(pkt, 47914, 0x11, NULL, 0), 3000, 5000 + 30000);
+        d2k_session_packet(s, pkt, n, 3 * S + 1, buf, sizeof buf, &r);
+        tcp_ct_queries = 0;
+        d2k_session_sweep(s, 4 * S);
+        CHECK(tcp_ct_queries == 0, "поток после FIN клиента всё ещё спрашивается");
+        d2k_session_free(s);
+    }
+}
+
 int main(void) {
+    test_tcp_stall();
     test_route_mark_does_not_leak();
     test_routed_flag_reset_on_new_syn();
     test_tcp_plan_skips_conntrack_read();

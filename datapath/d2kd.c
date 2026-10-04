@@ -382,17 +382,18 @@ static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n)
  * сокетов); здесь только сами сокеты. Посылка, которой положено ждать
  * отложенных посылок плана, встаёт в их очередь без ключа: это байты клиента,
  * и уйти они обязаны при любом исходе плана. */
-/* Счётчики потока у ядра по кортежу (детектор «QUIC замолчал», задача 50,
-   раунд 3): один неблокирующий запрос ctnetlink на наблюдаемый поток. */
+/* Счётчики потока у ядра по кортежу (детекторы «QUIC замолчал», задача 50,
+   раунд 3, и «TCP встал на бюджете», задача 56): один неблокирующий запрос
+   ctnetlink на наблюдаемый поток. */
 typedef struct { int fd; uint32_t seq; int up; int told_off; int told_acct; } ct_link;
-static int ct_query(void *ctx, const d2k_ct_tuple *t, uint64_t *o, uint64_t *r) {
+static int ct_query(void *ctx, const d2k_ct_tuple *t, d2k_ct_info *out) {
     ct_link *c = ctx;
     if (++c->seq == 0) { c->seq = 1; }
-    int rc = d2k_ct_query_fd(c->fd, c->seq, t, o, r);
+    int rc = d2k_ct_query_info_fd(c->fd, c->seq, t, out);
     if (rc == 2 && !c->told_acct) {
         c->told_acct = 1;
         fprintf(stderr, "d2kd: в записях conntrack нет счётчиков (nf_conntrack_acct выключен) — "
-                        "детектор тишины QUIC ничего не видит\n");
+                        "детекторы тишины QUIC и TCP ничего не видят\n");
     }
     return rc;
 }
@@ -410,14 +411,14 @@ static void ct_probe(d2k_session *sess, int startup) {
         ctl_ct.up = 1;
         d2k_session_set_ct_query(sess, ct_query, &ctl_ct);
         if (ctl_ct.told_off) {
-            fprintf(stderr, "d2kd: ctnetlink появился — детектор тишины QUIC включён\n");
+            fprintf(stderr, "d2kd: ctnetlink появился — детекторы тишины QUIC и TCP включены\n");
         }
         return;
     }
     d2k_session_set_ct_query(sess, NULL, NULL);
     if (!ctl_ct.told_off) {
         ctl_ct.told_off = 1;
-        fprintf(stderr, "d2kd: детектор тишины QUIC выключен: нет ctnetlink\n");
+        fprintf(stderr, "d2kd: детекторы тишины QUIC и TCP выключены: нет ctnetlink\n");
     }
 }
 

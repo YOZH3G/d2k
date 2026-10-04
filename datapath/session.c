@@ -151,6 +151,10 @@ struct d2k_session {
     /* Счётчики потока у ядра по кортежу (d2k_ctq.h); NULL — не спрашивать. */
     d2k_ct_query_fn ct_query;
     void *ct_query_ctx;
+    /* Бюджеты потока коробок (задача 56, D2K_CMD_SET_STALL_BUDGETS); по
+       умолчанию — один полевой D2K_TCP_STALL_FIELD_BUDGET. */
+    uint16_t stall_budget[D2K_STALL_BUDGETS_MAX];
+    size_t   n_stall_budget;
 
     int      shape_armed[4];
     uint8_t  shape_name[4][256];
@@ -189,6 +193,8 @@ d2k_session *d2k_session_new(size_t capacity, size_t journal) {
        «серверная сторона»: молча и для ВСЕХ прежних вызывающих, которые про
        крючок ничего не знают. Умолчание обязано значить «не сказали». */
     s->hook = D2K_HOOK_UNKNOWN;
+    s->stall_budget[0] = D2K_TCP_STALL_FIELD_BUDGET;
+    s->n_stall_budget = 1;
     s->flows = d2k_track_new(capacity);
     /* Тот же capacity, что у TCP-таблицы: это не новое число, а
        унаследованное — оператор уже выбрал бюджет числа потоков одним
@@ -315,8 +321,9 @@ static d2k_table *table_of(d2k_session *s, const d2k_key *k) {
    Слово «подозрение» выбрано вместо «блокировки» намеренно: §2.4 запрещает
    превращать наблюдение в диагноз, а §2.3 — сохранять отрицательный результат
    вообще. Отсюда ничего не пишется на диск. */
-static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
-                    d2k_flow *fl, uint8_t code, const d2k_jrn_detail *det) {
+static void suspect_num(d2k_session *s, uint64_t at_ns, const d2k_key *k,
+                        d2k_flow *fl, uint8_t code, const d2k_jrn_detail *det,
+                        uint32_t num) {
     if (fl->controller_probe || fl->suspected) {
         return;
     }
@@ -330,7 +337,12 @@ static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     if (det) { d = *det; } else { memset(&d, 0, sizeof d); }
     d.planned = fl->plan_done ? D2K_PLANNED_YES : D2K_PLANNED_NO;
     d.client_shape = fl->client_shape;
-    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_SUSPECT, code, 0, &d, NULL, 0, NULL);
+    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_SUSPECT, code, num, &d, NULL, 0, NULL);
+}
+
+static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
+                    d2k_flow *fl, uint8_t code, const d2k_jrn_detail *det) {
+    suspect_num(s, at_ns, k, fl, code, det, 0);
 }
 
 /* Зовётся при забвении потока по молчанию. Приветствие ушло, ответа с той
@@ -1514,10 +1526,15 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        бы никогда: счётчик к моменту проверки уже единица. */
     const uint32_t rev_before = fl->rev_after_hello;
 
+    /* Пакеты с данными — для оценки бюджета потока (задача 56). */
+    const int has_payload = total > ihl + doff;
     if (fwd) {
         fl->fwd_pkts++;
         fl->fwd_bytes += total;
+        if (has_payload) { fl->fwd_data_pkts++; }
     } else {
+        fl->rev_pkts_conn++;
+        if (has_payload) { fl->rev_data_pkts++; }
         if (!fl->rev_profiled) {
             /* Первый пакет с той стороны задаёт ориентир. Обычно это SYN-ACK,
                то есть заведомо настоящий сервер: подделка приходит позже, в
@@ -2739,7 +2756,7 @@ static void flow_tuple(const d2k_flow *f, d2k_ct_tuple *t) {
     memset(t, 0, sizeof *t);
     int v6 = f->key.family == 6;
     t->family = v6 ? 6 : 4;
-    t->proto = 17;
+    t->proto = f->key.proto == 6 ? 6 : 17;
     const uint8_t *lo = v6 ? f->key.low_ip6 : (const uint8_t *)&f->key.low_ip;
     const uint8_t *hi = v6 ? f->key.high_ip6 : (const uint8_t *)&f->key.high_ip;
     size_t al = v6 ? 16 : 4;
@@ -2763,8 +2780,10 @@ static void ct_flow(void *ctx, d2k_flow *f) {
     if (!quic_watch(f)) { return; }
     d2k_ct_tuple t;
     flow_tuple(f, &t);
-    uint64_t orig = 0, reply = 0;
-    if (c->s->ct_query(c->s->ct_query_ctx, &t, &orig, &reply) != 0) { return; }
+    d2k_ct_info ci;
+    memset(&ci, 0, sizeof ci);
+    if (c->s->ct_query(c->s->ct_query_ctx, &t, &ci) != 0) { return; }
+    uint64_t orig = ci.orig_pkts, reply = ci.reply_pkts;
     if (!f->ct_known || reply != f->ct_reply) {
         f->ct_known = 1;
         f->ct_reply = reply;
@@ -2782,6 +2801,136 @@ static void ct_flow(void *ctx, d2k_flow *f) {
     suspect(c->s, c->now_ns, &f->key, f, D2K_SUSPECT_QUIC_STALL, NULL);
 }
 
+/* TCP ВСТАЛ НА БЮДЖЕТЕ КОРОБКИ (задача 56; поле 04.10, Safari: mailsuite.com
+ * на AWS и www.romfea.gr на Cloudflare). Коробка режет поток после ~25
+ * пакетов с данными обеих сторон (task-55-facts §1.2), сервер замолкает
+ * насовсем — без RST и FIN. curl через 40 с закрывает FIN-ом, и это ловит
+ * повтор FIN (задача 50); Safari держит соединение открытым, и до сих пор не
+ * говорилось ничего. Очередь видит лишь первые пакеты каждой стороны, дальше —
+ * счётчики conntrack по кортежу (ctnetlink, как у QUIC).
+ *
+ * Кандидат: поток с именем из приветствия, сервер прислал данные после
+ * приветствия, клиент не закрывал (нет ждущего FIN), не зонд, подозрения не
+ * было, запись жива (молодой поток: запись истекает через 120 с после
+ * последнего пакета в очереди). Подозрение, когда ВСЁ сразу:
+ *   - обратный счётчик ушёл за то, что видела очередь (сервер шёл дальше
+ *     окна — иначе это молчание рукопожатия, у него SILENT);
+ *   - обратный счётчик стоит не меньше RTO: 3 RTT рукопожатия (RFC 6298
+ *     §2.2), не меньше 2 с. Сервер с данными в полёте за это время повторил
+ *     бы их; медленный сервер, ответивший раньше, — не обрыв;
+ *   - ядро говорит, что соединение ESTABLISHED (закрытие — дело детекторов
+ *     закрытия); не сказало — не знаем, подозрения нет;
+ *   - за это время клиент послал не меньше ТРЁХ пакетов, и ни один не получил
+ *     ответа (как у QUIC: два без ответа законны, третий — в тишину). Пока
+ *     клиент молчит, обрыв от простоя не отличить ничем — подозрение ждёт
+ *     его следующего слова;
+ *   - пакетов с данными обеих сторон к началу тишины — в полосе бюджета
+ *     коробки (D2K_TCP_STALL_SLACK вокруг любого из бюджетов, по умолчанию
+ *     полевые 25). ЭТО и отличает обрыв от keep-alive после полного ответа:
+ *     простаивает соединение на любом числе пакетов, обрыв — на бюджете.
+ * Оценка пакетов с данными: точные числа из окна очереди (обе стороны) плюс
+ * пакеты сервера за окном по conntrack. Пакеты клиента за окном почти все —
+ * чистые ACK и не считаются; чистые ACK сервера за окном считаются данными.
+ * Ошибки противоположны и малы: mailsuite 24 против 26 на проводе, romfea 25
+ * против 25. Поток выше полосы больше не спрашивается: число пакетов только
+ * растёт. Это подозрение, не диагноз: контроллер требует второй поток имени и
+ * RX-пару identity/gzip, прежде чем что-то подбирать. */
+static int tcp_watch(const d2k_flow *f) {
+    return f->key.proto == 6 && f->saw_hello && f->had_sni &&
+           f->rev_payload_after_hello > 0 && !f->suspected && !f->controller_probe &&
+           !f->pending_fin && !f->tcp_watch_off && !f->routed;
+}
+
+static int tcp_in_band(const d2k_session *s, uint64_t est) {
+    for (size_t i = 0; i < s->n_stall_budget; i++) {
+        uint64_t b = s->stall_budget[i];
+        if (est + D2K_TCP_STALL_SLACK >= b && est <= b + D2K_TCP_STALL_SLACK) { return 1; }
+    }
+    return 0;
+}
+
+static uint64_t tcp_band_top(const d2k_session *s) {
+    uint64_t top = 0;
+    for (size_t i = 0; i < s->n_stall_budget; i++) {
+        if (s->stall_budget[i] > top) { top = s->stall_budget[i]; }
+    }
+    return top + D2K_TCP_STALL_SLACK;
+}
+
+static void ct_tcp_flow(void *ctx, d2k_flow *f) {
+    struct ct_ctx *c = ctx;
+    if (!tcp_watch(f)) { return; }
+    d2k_ct_tuple t;
+    flow_tuple(f, &t);
+    d2k_ct_info ci;
+    memset(&ci, 0, sizeof ci);
+    if (c->s->ct_query(c->s->ct_query_ctx, &t, &ci) != 0) { return; }
+    if (!ci.tcp_state_known) { return; }
+    if (ci.tcp_state != D2K_CT_TCP_ESTABLISHED) {
+        /* SYN_SENT/SYN_RECV (0..2) сюда не доходят: у потока уже есть данные
+           сервера. Всё дальше ESTABLISHED — закрытие. */
+        f->tcp_watch_off = 1;
+        return;
+    }
+    const uint64_t reply = ci.reply_pkts;
+    const uint64_t unseen = reply > f->rev_pkts_conn ? reply - f->rev_pkts_conn : 0;
+    const uint64_t est = (uint64_t)f->fwd_data_pkts + f->rev_data_pkts + unseen;
+    if (est > tcp_band_top(c->s)) {
+        f->tcp_watch_off = 1;
+        return;
+    }
+    if (!f->ct_known || reply != f->ct_reply) {
+        f->ct_known = 1;
+        f->ct_reply = reply;
+        f->ct_reply_ns = c->now_ns;
+        f->ct_orig_mark = ci.orig_pkts;
+        return;
+    }
+    if (unseen == 0) { return; }
+    /* Клиент говорит в тишину: с тех пор как обратный счётчик встал, от
+       клиента ушло не меньше трёх пакетов, и ни на один не пришло ничего.
+       Без ответа законно остаются два — ACK последних данных и обновление
+       окна; живой сервер на данные клиента (новый запрос, PING HTTP/2)
+       ответил бы хотя бы ACK. Замер 04.10 на роутере (отчёт задачи 56):
+       без этого условия полоса дала 21 подозрение за 9 минут, из них у 15
+       сервер потом говорил (keep-alive после полного ответа на 22–28
+       пакетах); с ним — 4, и у всех четырёх сервер молчал до конца. */
+    if (ci.orig_pkts < f->ct_orig_mark || ci.orig_pkts - f->ct_orig_mark < 3) { return; }
+    uint64_t rto = 3 * f->rtt_ns;
+    if (rto < 2 * NS_PER_S) { rto = 2 * NS_PER_S; }
+    if (c->now_ns < f->ct_reply_ns || c->now_ns - f->ct_reply_ns < rto) { return; }
+    if (!tcp_in_band(c->s, est)) { return; }
+    c->told++;
+    d2k_jrn_detail det;
+    memset(&det, 0, sizeof det);
+    det.server_hello = f->rev_server_hello;
+    suspect_num(c->s, c->now_ns, &f->key, f, D2K_SUSPECT_TCP_STALL, &det,
+                est > UINT16_MAX ? UINT16_MAX : (uint32_t)est);
+}
+
+int d2k_session_set_stall_budgets(d2k_session *s, const uint16_t *b, size_t n) {
+    if (!s || n > D2K_STALL_BUDGETS_MAX || (n && !b)) { return -1; }
+    for (size_t i = 0; i < n; i++) {
+        if (b[i] == 0) { return -1; }
+    }
+    if (n == 0) {
+        s->stall_budget[0] = D2K_TCP_STALL_FIELD_BUDGET;
+        s->n_stall_budget = 1;
+        return 0;
+    }
+    memcpy(s->stall_budget, b, n * sizeof *b);
+    s->n_stall_budget = n;
+    return 0;
+}
+
+size_t d2k_session_stall_budgets(const d2k_session *s, uint16_t *out, size_t cap) {
+    if (!s) { return 0; }
+    for (size_t i = 0; out && i < s->n_stall_budget && i < cap; i++) {
+        out[i] = s->stall_budget[i];
+    }
+    return s->n_stall_budget;
+}
+
 size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns) {
     if (!s) {
         return 0;
@@ -2795,6 +2944,7 @@ size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns) {
     if (s->ct_query) {
         struct ct_ctx cc = { s, now_ns, 0 };
         d2k_track_walk(s->uflows, ct_flow, &cc);
+        d2k_track_walk(s->flows, ct_tcp_flow, &cc);
         c.told += cc.told;
     }
     return c.told;

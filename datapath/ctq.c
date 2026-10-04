@@ -95,8 +95,31 @@ static int counter(const uint8_t *p, size_t n, uint64_t *out) {
     return -1;
 }
 
-int d2k_ct_counters_parse(const uint8_t *buf, size_t len, uint32_t seq,
-                          uint64_t *orig_pkts, uint64_t *reply_pkts) {
+/* Состояние TCP из вложенного CTA_PROTOINFO (enum tcp_conntrack + 1): 0 — нет. */
+static unsigned tcp_state(const uint8_t *p, size_t n) {
+    size_t off = 0;
+    while (off + D2K_NLA_HDRLEN <= n) {
+        uint16_t alen = rd16h(p + off), type = rd16h(p + off + 2) & D2K_NLA_TYPE_MASK;
+        if (alen < D2K_NLA_HDRLEN || alen > n - off) return 0;
+        const uint8_t *v = p + off + D2K_NLA_HDRLEN;
+        size_t vl = alen - D2K_NLA_HDRLEN;
+        if (type == D2K_CTA_PROTOINFO_TCP) {
+            size_t o2 = 0;
+            while (o2 + D2K_NLA_HDRLEN <= vl) {
+                uint16_t l2 = rd16h(v + o2), t2 = rd16h(v + o2 + 2) & D2K_NLA_TYPE_MASK;
+                if (l2 < D2K_NLA_HDRLEN || l2 > vl - o2) return 0;
+                if (t2 == D2K_CTA_PROTOINFO_TCP_STATE && l2 >= D2K_NLA_HDRLEN + 1)
+                    return v[o2 + D2K_NLA_HDRLEN] + 1u;
+                o2 += align4(l2);
+            }
+            return 0;
+        }
+        off += align4(alen);
+    }
+    return 0;
+}
+
+int d2k_ct_info_parse(const uint8_t *buf, size_t len, uint32_t seq, d2k_ct_info *out) {
     d2k_nl_iter it;
     d2k_nl_msg m;
     d2k_nl_iter_init(&it, buf, len);
@@ -110,6 +133,7 @@ int d2k_ct_counters_parse(const uint8_t *buf, size_t len, uint32_t seq,
         size_t n = m.body_len - D2K_NFGENMSG_LEN, off = 0;
         int have_o = 0, have_r = 0;
         uint64_t o = 0, r = 0;
+        unsigned st = 0;
         while (off + D2K_NLA_HDRLEN <= n) {
             uint16_t alen = rd16h(p + off), type = rd16h(p + off + 2) & D2K_NLA_TYPE_MASK;
             if (alen < D2K_NLA_HDRLEN || alen > n - off) return -1;
@@ -117,18 +141,32 @@ int d2k_ct_counters_parse(const uint8_t *buf, size_t len, uint32_t seq,
             size_t vl = alen - D2K_NLA_HDRLEN;
             if (type == D2K_CTA_COUNTERS_ORIG) have_o = counter(v, vl, &o) == 0;
             if (type == D2K_CTA_COUNTERS_REPLY) have_r = counter(v, vl, &r) == 0;
+            if (type == D2K_CTA_PROTOINFO) st = tcp_state(v, vl);
             off += align4(alen);
         }
         if (!have_o || !have_r) return 2;
-        if (orig_pkts) *orig_pkts = o;
-        if (reply_pkts) *reply_pkts = r;
+        if (out) {
+            out->orig_pkts = o; out->reply_pkts = r;
+            out->tcp_state_known = st != 0;
+            out->tcp_state = st ? (uint8_t)(st - 1u) : 0;
+        }
         return 0;
     }
     return -1;
 }
 
-int d2k_ct_query_fd(int fd, uint32_t seq, const d2k_ct_tuple *t,
-                    uint64_t *orig_pkts, uint64_t *reply_pkts) {
+int d2k_ct_counters_parse(const uint8_t *buf, size_t len, uint32_t seq,
+                          uint64_t *orig_pkts, uint64_t *reply_pkts) {
+    d2k_ct_info i;
+    int rc = d2k_ct_info_parse(buf, len, seq, &i);
+    if (rc == 0) {
+        if (orig_pkts) *orig_pkts = i.orig_pkts;
+        if (reply_pkts) *reply_pkts = i.reply_pkts;
+    }
+    return rc;
+}
+
+int d2k_ct_query_info_fd(int fd, uint32_t seq, const d2k_ct_tuple *t, d2k_ct_info *out) {
     if (fd < 0 || !t) return -1;
     uint8_t req[128];
     size_t n = d2k_ct_get_req(req, sizeof req, seq, t);
@@ -141,8 +179,19 @@ int d2k_ct_query_fd(int fd, uint32_t seq, const d2k_ct_tuple *t,
     for (int i = 0; i < 8; i++) {
         ssize_t got = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
         if (got <= 0) break;
-        int r = d2k_ct_counters_parse(buf, (size_t)got, seq, orig_pkts, reply_pkts);
+        int r = d2k_ct_info_parse(buf, (size_t)got, seq, out);
         if (r == 0 || r == 1 || r == 2) { rc = r; break; }
+    }
+    return rc;
+}
+
+int d2k_ct_query_fd(int fd, uint32_t seq, const d2k_ct_tuple *t,
+                    uint64_t *orig_pkts, uint64_t *reply_pkts) {
+    d2k_ct_info i;
+    int rc = d2k_ct_query_info_fd(fd, seq, t, &i);
+    if (rc == 0) {
+        if (orig_pkts) *orig_pkts = i.orig_pkts;
+        if (reply_pkts) *reply_pkts = i.reply_pkts;
     }
     return rc;
 }

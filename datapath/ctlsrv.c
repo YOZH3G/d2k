@@ -414,6 +414,22 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         ack(cx, type, 1, D2K_ACK_OK);
         return;
     }
+    case D2K_CMD_SET_STALL_BUDGETS: {
+        uint16_t bud[D2K_STALL_BUDGETS_MAX];
+        if (len < 1 || b[0] > D2K_STALL_BUDGETS_MAX || len != 1u + 2u * b[0]) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        for (size_t i = 0; i < b[0]; i++) {
+            bud[i] = (uint16_t)(b[1 + 2 * i] << 8 | b[2 + 2 * i]);
+        }
+        if (d2k_session_set_stall_budgets(cx->sess, bud, b[0]) != 0) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        ack(cx, type, 1, D2K_ACK_OK);
+        return;
+    }
     case D2K_CMD_DEL_ADDR: {
         if (len != 18 || !canonical_address(b[0], b + 1) || !addr_shape_valid(b[17])) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
@@ -502,6 +518,12 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
                вход от старой службы. */
             body[n++] = e->d_planned;
             body[n++] = e->d_client_shape;
+            /* Девятым и десятым (v12) — число при записи, u16 BE: у «TCP
+               встал на бюджете» это оценка пакетов с данными обеих сторон к
+               началу тишины, по ней контроллер сверяет полосу с бюджетом
+               коробки цели. У остальных подозрений ноль. */
+            body[n++] = (uint8_t)((e->num > 0xffffu ? 0xffffu : e->num) >> 8);
+            body[n++] = (uint8_t)(e->num > 0xffffu ? 0xffffu : e->num);
             break;
         case D2K_JRN_PLAN_APPLIED:
             /* Prepared, not yet sent. Never expose this as positive proof. */

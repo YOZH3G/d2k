@@ -173,12 +173,19 @@ uint64_t d2k_session_routed_flows(const d2k_session *s);
    установлено. Нужен для распознавания полной тишины на заблокированном QUIC,
    где обратный пакет физически не может прийти. По умолчанию выключено. */
 void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed);
-/* Счётчики пакетов потока у conntrack по прямому кортежу: 0 — orig/reply
-   заполнены, иначе «не знаем». Обязана не ждать (d2k_ctq.h). d2kd ставит
-   ctnetlink; NULL — детектор «QUIC замолчал» выключен. */
-typedef int (*d2k_ct_query_fn)(void *ctx, const d2k_ct_tuple *t,
-                               uint64_t *orig_pkts, uint64_t *reply_pkts);
+/* Счётчики пакетов потока у conntrack по прямому кортежу и состояние TCP:
+   0 — out заполнен, иначе «не знаем». Обязана не ждать (d2k_ctq.h). d2kd
+   ставит ctnetlink; NULL — детекторы «QUIC замолчал» и «TCP встал на
+   бюджете» выключены. */
+typedef int (*d2k_ct_query_fn)(void *ctx, const d2k_ct_tuple *t, d2k_ct_info *out);
 void d2k_session_set_ct_query(d2k_session *s, d2k_ct_query_fn fn, void *ctx);
+/* Бюджеты потока коробок для детектора «TCP встал на бюджете» (задача 56):
+   n значений, не больше D2K_STALL_BUDGETS_MAX; n == 0 возвращает полевой
+   D2K_TCP_STALL_FIELD_BUDGET. Нули и лишнее отбрасываются: 0 — успех,
+   -1 — список негоден (ничего не поменялось). */
+int d2k_session_set_stall_budgets(d2k_session *s, const uint16_t *b, size_t n);
+/* Действующие бюджеты: сколько их, первые cap — в out. */
+size_t d2k_session_stall_budgets(const d2k_session *s, uint16_t *out, size_t cap);
 
 /* Начать/завершить внешнее удержание split QUIC. Begin вызывается до обработки
  * первой кандидатной датаграммы; payload никогда не склеивается здесь. */
