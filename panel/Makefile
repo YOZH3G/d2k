@@ -1,6 +1,8 @@
 CC ?= cc
 ZIG ?= /opt/homebrew/bin/zig
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L
+RELEASE_ID ?= dev
+CFLAGS += -DD2K_RELEASE_ID='"$(RELEASE_ID)"'
 VERSION ?= dev
 COMMIT ?=
 BUILT ?=
@@ -10,7 +12,7 @@ DIRTY ?= 0
 
 all: d2kpanel
 
-d2kpanel: main.c server.h server.c
+d2kpanel: main.c server.h server.c ../runtime/d2k_runtime.h
 	$(CC) $(CFLAGS) -o $@ main.c server.c
 
 TARGET ?= aarch64-linux-musl
@@ -19,10 +21,10 @@ ARCH ?= arm64
 BUILDDIR ?= ../builds
 .PHONY: release
 d2kpanel-linux-arm64: release
-release: main.c server.h server.c
+release: main.c server.h server.c ../runtime/d2k_runtime.h
 	mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) -static -Wl,-S -Os -std=c11 -Wall -Wextra -Werror \
-		-D_POSIX_C_SOURCE=200809L -DD2K_PANEL_VERSION='"$(VERSION)"' \
+		-D_POSIX_C_SOURCE=200809L -DD2K_RELEASE_ID='"$(RELEASE_ID)"' -DD2K_PANEL_VERSION='"$(VERSION)"' \
 		-DD2K_PANEL_COMMIT='"$(COMMIT)"' -DD2K_PANEL_BUILT='"$(BUILT)"' \
 		-DD2K_PANEL_DIRTY=$(DIRTY) -o $(BUILDDIR)/d2kpanel-linux-$(ARCH) main.c server.c
 

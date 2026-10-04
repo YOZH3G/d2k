@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 /* ctlsrv.c — смысл команд и событий управляющего сокета.
  *
  * Переносимо: ни NFQUEUE, ни сырых сокетов. Смысл протокола обязан
@@ -8,6 +9,7 @@
 #include <string.h>
 
 #include "d2k_ctlsrv.h"
+#include "../runtime/d2k_runtime.h"
 
 /* Кладёт ключ потока в тело события ПОЛЯМИ, а не наложением структуры на
  * буфер: memcpy(тело, &ключ, sizeof ключ) отправил бы на провод и три байта
@@ -124,7 +126,7 @@ void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen) {
        ругается: она молча не даёт подтверждений, и полдня измерений уходит в
        никуда. Событие лосси, как и все прочие, — не дошло, значит контроллер
        версии не увидел и обязан считать это несовпадением. */
-    uint8_t body[D2K_KEY_WIRE_LEN + 6];
+    uint8_t body[D2K_KEY_WIRE_LEN + 7 + sizeof(D2K_RELEASE_ID) - 1];
     memset(body, 0, sizeof body);
     body[0] = 4;
     body[D2K_KEY_WIRE_LEN]     = (uint8_t)(D2K_CTL_PROTO_VERSION >> 8);
@@ -133,6 +135,8 @@ void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen) {
     body[D2K_KEY_WIRE_LEN + 3] = (uint8_t)(send_maxlen >> 16);
     body[D2K_KEY_WIRE_LEN + 4] = (uint8_t)(send_maxlen >> 8);
     body[D2K_KEY_WIRE_LEN + 5] = (uint8_t)send_maxlen;
+    body[D2K_KEY_WIRE_LEN + 6] = (uint8_t)(sizeof(D2K_RELEASE_ID) - 1);
+    memcpy(body + D2K_KEY_WIRE_LEN + 7, D2K_RELEASE_ID, sizeof(D2K_RELEASE_ID) - 1);
     d2k_ctl_event(ctl, D2K_EV_PROTO, body, sizeof body);
 }
 

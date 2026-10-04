@@ -68,7 +68,8 @@
  * с данными u16 BE хвостом SUSPECT и команда D2K_CMD_SET_STALL_BUDGETS.
  * Старый контроллер принял бы код 8 за обычное подозрение и пустил бы полный
  * поиск вместо узкого RX-замера с повторяемостью. */
-#define D2K_CTL_PROTO_VERSION 12
+/* v13: mandatory release ID after send limit: u8 length + 1..64 bytes. */
+#define D2K_CTL_PROTO_VERSION 13
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */

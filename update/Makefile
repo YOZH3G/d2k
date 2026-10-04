@@ -12,7 +12,7 @@ $(BUILD)/test_manifest: tests/test_manifest.c src/manifest.c include/d2k_update.
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_manifest.c src/manifest.c $(LDFLAGS) $(LDLIBS) -o $@
 clean:
-	rm -f $(BUILD)/test_manifest $(BUILD)/test_transport $(BUILD)/test_package $(BUILD)/test_schedule $(BUILD)/test_journal
+	rm -f $(BUILD)/test_manifest $(BUILD)/test_transport $(BUILD)/test_package $(BUILD)/test_schedule $(BUILD)/test_journal $(BUILD)/test_health $(BUILD)/test_health_local
 
 .PHONY: check-schedule
 check-schedule: $(BUILD)/test_schedule
@@ -42,3 +42,15 @@ check-journal: $(BUILD)/test_journal
 $(BUILD)/test_journal: tests/test_journal.c src/journal.c include/d2k_update.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_journal.c src/journal.c $(LDFLAGS) $(LDLIBS) -o $@
+
+.PHONY: check-health
+check: check-health
+check-health: $(BUILD)/test_health $(BUILD)/test_health_local
+	$(BUILD)/test_health
+	$(BUILD)/test_health_local
+$(BUILD)/test_health: tests/test_health.c src/health.c include/d2k_update.h ../runtime/d2k_runtime.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_health.c src/health.c $(LDFLAGS) -o $@
+$(BUILD)/test_health_local: tests/test_health_local.c src/health.c include/d2k_update.h ../runtime/d2k_runtime.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_health_local.c src/health.c $(LDFLAGS) -o $@

@@ -98,6 +98,7 @@ int d2k_link_del_bypass_family(int, const char *, uint8_t transport,
  * файла) — НАБЛЮДЕНИЕ, а не порог успеха. Проверено на настоящем ctlprobe (см.
  * test_link.c: hello + два reply — 22, потом 23 — на одном потоке). */
 typedef struct {
+    char release_id[65]; /* validated release greeting; empty for legacy */
     uint16_t kind;          /* D2K_EV_* */
     uint8_t  family;
     uint8_t  low_ip[16], high_ip[16];

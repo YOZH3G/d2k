@@ -1,7 +1,8 @@
 CC ?= cc
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Werror -pedantic
-CPPFLAGS += -Iinclude
+RELEASE_ID ?= dev
+CPPFLAGS += -Iinclude -DD2K_RELEASE_ID='"$(RELEASE_ID)"'
 BUILD_DIR ?= build
 OPENSSL_CFLAGS ?= $(shell pkg-config --cflags openssl 2>/dev/null)
 OPENSSL_LIBS ?= $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
@@ -37,9 +38,9 @@ test-config: $(BUILD_DIR)/test-config
 
 d2ktg: $(BUILD_DIR)/d2ktg
 
-$(BUILD_DIR)/d2ktg: src/main.c src/config.c src/tls.c src/ws.c src/ws_pump.c src/identity.c src/register.c src/enroll.c src/net.c src/wire.c src/tunnel.c src/listener.c src/streams.c src/queue.c src/session.c
+$(BUILD_DIR)/d2ktg: ../runtime/d2k_runtime.h src/main.c src/config.c src/tls.c src/ws.c src/ws_pump.c src/identity.c src/register.c src/enroll.c src/net.c src/wire.c src/tunnel.c src/listener.c src/streams.c src/queue.c src/session.c
 	mkdir -p $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -o $@ $^ $(OPENSSL_LIBS)
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -pthread -o $@ $(filter %.c,$^) $(OPENSSL_LIBS)
 
 $(BUILD_DIR)/test-wire: test_wire.c src/wire.c include/tg_wire.h
 	mkdir -p $(BUILD_DIR)

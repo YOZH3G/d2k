@@ -63,7 +63,29 @@ struct d2ku_policy {
     int has_quarantined_release;
     unsigned char quarantined_release_sha256[32]; /* exact manifest hash */
 };
+#define D2KU_SERVICE_DATAPATH UINT64_C(1)
+#define D2KU_SERVICE_CORE UINT64_C(2)
+#define D2KU_SERVICE_PANEL UINT64_C(4)
+#define D2KU_SERVICE_TELEGRAM UINT64_C(8)
+#define D2KU_VALIDATION_MS UINT64_C(120000)
+#define D2KU_HEARTBEAT_MS UINT64_C(10000)
+typedef struct {
+    pid_t pid;
+    uint64_t start_ticks, heartbeat_mono_ms;
+    char release_id[D2KU_ID_MAX + 1], peer_release_id[D2KU_ID_MAX + 1];
+    char boot_id[D2KU_BOOT_ID_MAX + 1];
+    uint64_t wire;
+    int executable_matches, peer_connected, ready, external_available;
+} d2ku_health_observation;
 struct d2ku_status {
+    int health_observing, installation_healthy, health_complete, external_available;
+    uint64_t health_since_ms, health_last_ms;
+    char health_transaction[D2KU_ID_MAX + 1], health_boot[D2KU_BOOT_ID_MAX + 1];
+    char health_release[D2KU_ID_MAX + 1];
+    unsigned char health_manifest_sha256[32];
+    uint64_t health_services;
+    pid_t health_pid[4];
+    uint64_t health_start_ticks[4];
     int has_check, check_in_flight;
     uint64_t checked_mono_ms;
     char checked_boot_id[D2KU_BOOT_ID_MAX + 1];
@@ -100,6 +122,31 @@ typedef struct {
     int64_t not_before, not_after; /* inclusive start, exclusive end */
 } d2ku_key;
 struct d2ku_ctx {
+    /* Local health adapters: callbacks are read-only and cannot infer success
+     * from PID alone. Absent callbacks use Linux proc, dirfd-relative state,
+     * loopback HTTP and read-only iptables-save. runtime_dirfd must be supplied
+     * for default health records (volatile /tmp/d2k). root holds releases/ID.
+     * Fixed release binaries: d2kd,d2kc,d2kpanel,d2ktg. */
+    void *health_arg;
+    d2ku_rc (*health_observe)(void *, unsigned, const d2ku_journal *, d2ku_health_observation *);
+    d2ku_rc (*health_state)(void *);
+    d2ku_rc (*health_http)(void *);
+    /* Probes ALL enabled own rules. Mandatory for Telegram-enabled health:
+     * task6/7 service adapter owns real NAT/ipset/filter checks; absent fails
+     * closed. Generic datapath default checks configured mangle expectations. */
+    d2ku_rc (*health_rules)(void *);
+    int health_runtime_dirfd;
+    uint16_t health_panel_port; /* zero: 8090 */
+    uint16_t health_queue; /* exact expected NFQUEUE number; zero is valid */
+    int health_ipv6_rules;
+    /* Full expected own-rule lines from the service adapter's configured
+     * iptables-save representation; missing expectations fail closed.
+     * IPv6 requirements have family=6, IPv4=4. No request-provided commands. */
+    char health_rule_lines[32][512];
+    unsigned char health_rule_family[32];
+    size_t health_rule_count;
+    char health_state_paths[8][D2KU_PATH_MAX + 1];
+    size_t health_state_count; /* required when core/Telegram enabled */
     int root_dirfd; /* production: verified /opt/d2k dirfd */
     d2ku_clock clock;
     /* Bootstrap-owned HTTPS policy, never supplied by HTTP requests. */
@@ -228,4 +275,9 @@ d2ku_rc d2ku_persistent_store(d2ku_ctx *, const d2ku_persistent_state *);
  * No unlink of lock files: kernel releases lock on exit/crash. */
 d2ku_rc d2ku_maintenance_lock(d2ku_ctx *, int *lock_fd);
 void d2ku_maintenance_unlock(int lock_fd);
+/* Poll at <=10s intervals under transaction lock. OK is instantaneous local
+ * health only; durable commit requires status.health_complete. A failed probe,
+ * process restart, boot/operation change or missed poll resets observation.
+ * External availability is separate and never drives rollback. */
+d2ku_rc d2ku_health(d2ku_ctx *, const d2ku_journal *, d2ku_status *);
 #endif

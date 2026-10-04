@@ -64,6 +64,7 @@ file "$ROOT/build/telegram/openssl-link-smoke-$ARCH"
 # shellcheck disable=SC2086
 "$ZIG" cc -target "$TARGET" $TARGET_FLAGS -static -O2 -std=c11 \
     -Wall -Wextra -Werror -pedantic -Wl,-S \
+    -DD2K_RELEASE_ID="\"${RELEASE_ID:-dev}\"" \
     -I"$ROOT/telegram/include" -I"$PREFIX/include" \
     -o "$OUT/d2ktg-linux-$ARCH" "$ROOT"/telegram/src/*.c \
     -L"$LIBDIR" -lssl -lcrypto -ldl -pthread

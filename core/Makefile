@@ -22,6 +22,8 @@ CC      ?= cc
 # datapath/include/d2k_plan.h (коды записей TLV — приватное зеркало этого
 # контракта у compose.c, см. её шапку, а не отсюда).
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../datapath/include
+RELEASE_ID ?= dev
+CFLAGS += -DD2K_RELEASE_ID='"$(RELEASE_ID)"'
 LDFLAGS ?=
 # Стенд в тестах поднимает петлю-мишень в отдельном потоке; самому оракулу
 # потоки не нужны, поэтому pthread — только у тестовой линковки.
@@ -36,6 +38,8 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
           include/d2k_quicprobe.h include/d2k_quic_arms.h include/d2k_ipfrag.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
           include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
           include/d2k_verify.h include/d2k_arm.h include/d2k_stun.h include/d2k_net4.h include/d2k_voice.h ../datapath/include/d2k_plan.h ../datapath/include/d2k_ctl.h ../datapath/include/d2k_ctlsrv.h
+HDR += ../runtime/d2k_runtime.h
+
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
 # test_crypto и test_quic стенда не используют вовсе: криптография и разбор

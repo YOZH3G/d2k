@@ -16,6 +16,8 @@
  */
 #define _POSIX_C_SOURCE 200809L
 
+#include "../runtime/d2k_runtime.h"
+#include "d2k_crypto.h"
 #include <errno.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -982,7 +984,18 @@ static uint8_t refuse_of_errno(int e) {
     return (e == EMSGSIZE) ? D2K_REFUSE_TOO_LONG : D2K_REFUSE_SEND;
 }
 
+static int offline_self_check(void) {
+    static const uint8_t want[32] = {0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+        0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad};
+    uint8_t got[32]; d2k_sha256((const uint8_t *)"abc", 3, got);
+    return D2K_CTL_PROTO_VERSION == D2K_RUNTIME_WIRE && memcmp(got, want, 32) == 0 ? 0 : -1;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) { printf("d2kd release=%s wire=%u\n", D2K_RELEASE_ID, D2K_RUNTIME_WIRE); return 0; }
+    int offline = d2k_runtime_offline(argc, argv, "d2kd", offline_self_check);
+    if (offline >= 0) return offline;
+    const char *health_path = "/tmp/d2k/d2kd.health";
     uint32_t queue = 0;
     int have_queue = 0;
     const char *plan_path = NULL;
@@ -1004,7 +1017,8 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
 #define NEEDV() do { if (!v) { fprintf(stderr, "%s требует значения\n", a); return 2; } i++; } while (0)
-        if (strcmp(a, "--queue") == 0)            { NEEDV(); if (arg_u32(v, &queue)) goto badval; have_queue = 1; }
+        if (strcmp(a, "--health-file") == 0) { NEEDV(); health_path = v; }
+        else if (strcmp(a, "--queue") == 0)            { NEEDV(); if (arg_u32(v, &queue)) goto badval; have_queue = 1; }
         else if (strcmp(a, "--plan") == 0)        { NEEDV(); plan_path = v; }
         else if (strcmp(a, "--log") == 0)         { NEEDV(); log_path = v; }
         else if (strcmp(a, "--control") == 0)     { NEEDV(); ctl_path = v; }
@@ -1296,6 +1310,7 @@ int main(int argc, char **argv) {
     uint64_t next_ctl_stats = start + NS_PER_S;
 
     while (!stop_flag) {
+        (void)d2k_runtime_heartbeat(health_path, NULL, ctl && d2k_ctl_peer_fd(ctl) >= 0, 1, 1);
         uint64_t t = now_ns();
         /* Часы для вытеснения в таблице планов (d2k_plantab_set_name/set_addr,
            см. d2k_plans.h) — точность в сотни миллисекунд достаточна: там

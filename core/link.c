@@ -387,6 +387,16 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         }
         break;
     case D2K_EV_PROTO:
+        if (rlen > 6) {
+            unsigned len = rest[6];
+            if (!len || len > 64 || rlen != 7u + len) { return -1; }
+            for (unsigned i = 0; i < len; i++) {
+                unsigned char c = rest[7+i];
+                int alnum = (c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9');
+                if (!alnum && !(i && (c=='.'||c=='_'||c=='-'))) { return -1; }
+            }
+            memcpy(out->release_id, rest+7, len);
+        }
         /* ВЕРСИЯ ПРОВОДА. Короче двух байт — версия не объявлена, и это не
            повод считать, что всё в порядке: контроллер обязан отказаться
            работать так же, как при чужой версии. */

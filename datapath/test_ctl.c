@@ -20,6 +20,7 @@
 #include <sys/un.h>
 
 #include "d2k_ctl.h"
+#include "../runtime/d2k_runtime.h"
 #include "d2k_ctlsrv.h"
 #include "d2k_http80.h"
 #include "d2k_plan.h"
@@ -306,13 +307,15 @@ static void check_proto_greeting(void) {
     d2k_ctl_flush(c);
 
     uint16_t type = 0;
-    uint8_t ev[64];
+    uint8_t ev[160];
     ssize_t n = read_event(cli, &type, ev, sizeof ev);
     CHECK(n > 0, "версия протокола не приехала вовсе");
     CHECK(type == D2K_EV_PROTO, "первым событием пришла не версия протокола");
-    CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 6),
+    CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 7 + strlen(D2K_RELEASE_ID)),
           "тело версии не «ключ + два байта версии + четыре байта предела»");
-    if (n == (ssize_t)(D2K_KEY_WIRE_LEN + 6)) {
+    if (n >= (ssize_t)(D2K_KEY_WIRE_LEN + 7)) {
+        CHECK(ev[D2K_KEY_WIRE_LEN + 6] == strlen(D2K_RELEASE_ID), "release length mismatch");
+        CHECK(memcmp(ev + D2K_KEY_WIRE_LEN + 7, D2K_RELEASE_ID, strlen(D2K_RELEASE_ID)) == 0, "release ID mismatch");
         unsigned v = (unsigned)ev[D2K_KEY_WIRE_LEN] << 8 | ev[D2K_KEY_WIRE_LEN + 1];
         CHECK(v == (unsigned)D2K_CTL_PROTO_VERSION,
               "объявлена не та версия протокола, что собрана");

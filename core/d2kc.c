@@ -18,6 +18,8 @@
  * знания разом, а падение питания на роутере — обычное дело.
  */
 #define _POSIX_C_SOURCE 200809L
+#include "../runtime/d2k_runtime.h"
+#include "d2k_crypto.h"
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
@@ -379,7 +381,18 @@ static void usage(void) {
         "  --measure-mark метка измерений; обычно обходит собственную NFQUEUE (по умолчанию --mark)\n");
 }
 
+static int offline_self_check(void) {
+    static const uint8_t want[32] = {0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+        0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad};
+    uint8_t got[32]; d2k_sha256((const uint8_t *)"abc", 3, got);
+    return D2K_CTL_PROTO_VERSION == D2K_RUNTIME_WIRE && memcmp(got, want, 32) == 0 ? 0 : -1;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) { printf("d2kc release=%s wire=%u\n", D2K_RELEASE_ID, D2K_RUNTIME_WIRE); return 0; }
+    int offline = d2k_runtime_offline(argc, argv, "d2kc", offline_self_check);
+    if (offline >= 0) return offline;
+    const char *health_path = "/tmp/d2k/d2kc.health";
     const char *sock = NULL;
     const char *catpath = "/opt/d2k/catalog.json";
     const char *livepath = NULL;
@@ -391,7 +404,8 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         const char *f = argv[i];
-        if (strcmp(f, "--control") == 0 && i + 1 < argc) { sock = argv[++i]; }
+        if (strcmp(f, "--health-file") == 0 && i + 1 < argc) { health_path = argv[++i]; }
+        else if (strcmp(f, "--control") == 0 && i + 1 < argc) { sock = argv[++i]; }
         else if (strcmp(f, "--catalog") == 0 && i + 1 < argc) { catpath = argv[++i]; }
         else if (strcmp(f, "--live") == 0 && i + 1 < argc) { livepath = argv[++i]; }
         else if (strcmp(f, "--log") == 0 && i + 1 < argc) { logpath = argv[++i]; }
@@ -461,7 +475,7 @@ int main(int argc, char **argv) {
         d2k_catalog_free(&cat);
         return 1;
     }
-    if (greeting.kind != D2K_EV_PROTO || greeting.num != D2K_CTL_PROTO_VERSION) {
+    if (greeting.kind != D2K_EV_PROTO || greeting.num != D2K_CTL_PROTO_VERSION || strcmp(greeting.release_id, D2K_RELEASE_ID)) {
         fprintf(stderr, "d2kc: несовместимое приветствие датапата, нужна версия %u\n",
                 (unsigned)D2K_CTL_PROTO_VERSION);
         d2k_link_close(fd);
@@ -612,6 +626,7 @@ int main(int argc, char **argv) {
     int link_lost = 0;
 
     while (!stop_asked) {
+        (void)d2k_runtime_heartbeat(health_path, greeting.release_id, 1, 1, 1);
         struct pollfd pfd[4];
         pfd[0].fd = fd;                       pfd[0].events = POLLIN; pfd[0].revents = 0;
         pfd[1].fd = d2k_sched_wake_fd(s);     pfd[1].events = POLLIN; pfd[1].revents = 0;

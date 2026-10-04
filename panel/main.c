@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "../runtime/d2k_runtime.h"
 #include "server.h"
 
 #include <arpa/inet.h>
@@ -35,6 +36,7 @@
 #define UNKNOWN_KEY_MAX 128
 #define CONFIG_LINE_MAX 2048
 
+static const char *health_path = "/tmp/d2k/d2kpanel.health";
 static volatile sig_atomic_t stop_requested;
 
 static void on_signal(int sig) {
@@ -312,6 +314,7 @@ static int serve(const char *listen_addr, const char *live_path, const char *ass
     fflush(stdout);
 
     while (!stop_requested) {
+        (void)d2k_runtime_heartbeat(health_path, NULL, 0, 1, 1);
         d2k_panel_control_tick();
         struct pollfd ready = { .fd = listener, .events = POLLIN };
         int pr = poll(&ready, 1, 1000);
@@ -337,14 +340,24 @@ static int serve(const char *listen_addr, const char *live_path, const char *ass
     return 0;
 }
 
+static int offline_self_check(void) {
+    char host[128], port[16];
+    if (split_listen("127.0.0.1:8090", host, sizeof host, port, sizeof port) != 0 ||
+        strcmp(host, "127.0.0.1") || strcmp(port, "8090")) return -1;
+    if (split_listen("[::1]:8090", host, sizeof host, port, sizeof port) != 0 || strcmp(host, "::1")) return -1;
+    return split_listen("127.0.0.1:65536", host, sizeof host, port, sizeof port) == -1 ? 0 : -1;
+}
+
 int main(int argc, char **argv) {
+    int offline = d2k_runtime_offline(argc, argv, "d2kpanel", offline_self_check);
+    if (offline >= 0) return offline;
     if (d2k_panel_ignore_sigpipe() != 0) {
         say("не удалось настроить обработку разрыва HTTP-клиента: %s", strerror(errno));
         return 1;
     }
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        printf("d2kpanel %s commit %s features=%s\n", D2K_PANEL_VERSION,
-               D2K_PANEL_COMMIT, D2K_PANEL_FEATURES);
+        printf("d2kpanel %s commit %s features=%s release=%s\n", D2K_PANEL_VERSION,
+               D2K_PANEL_COMMIT, D2K_PANEL_FEATURES, D2K_RELEASE_ID);
         return 0;
     }
     if (argc < 2 || strcmp(argv[1], "serve") != 0) {
@@ -390,6 +403,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--engine-pid") == 0 && i + 1 < argc) { engine_pid_path = argv[++i]; }
         else if (strcmp(argv[i], "--controller-pid") == 0 && i + 1 < argc) { controller_pid_path = argv[++i]; }
         else if (strcmp(argv[i], "--telegram-pid") == 0 && i + 1 < argc) { telegram_pid_path = argv[++i]; }
+        else if (strcmp(argv[i], "--health-file") == 0 && i + 1 < argc) { health_path = argv[++i]; }
         else if (strcmp(argv[i], "--telegram-status") == 0 && i + 1 < argc) { telegram_status_path = argv[++i]; }
         else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) { log_path = argv[++i]; }
         else { usage(stderr); return 2; }

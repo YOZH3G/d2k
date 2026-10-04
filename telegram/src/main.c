@@ -2,6 +2,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 #define _POSIX_C_SOURCE 200809L
+#include "../../runtime/d2k_runtime.h"
 #include "tg_config.h"
 #include "tg_identity.h"
 #include "tg_net.h"
@@ -9,6 +10,7 @@
 #include "tg_enroll.h"
 #include "tg_session.h"
 #include "tg_tunnel.h"
+#include "tg_wire.h"
 #include "tg_tls.h"
 #include "tg_ws.h"
 
@@ -18,6 +20,8 @@
 #include <netinet/in.h>
 #include <openssl/rand.h>
 #include <signal.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +32,18 @@
 #define TG_BUILD "d2k-tg-0.3"
 #define TG_DEFAULT_WINDOW (2u*1024u*1024u)
 
+static const char *health_path = "/tmp/d2k/d2ktg.health";
+static atomic_int health_running, external_available;
+typedef struct { int listener; } health_local;
+static void *health_thread(void *arg) {
+    const health_local *local=arg;
+    while(atomic_load(&health_running)) {
+        int ready=d2k_runtime_listener_ready(local->listener);
+        (void)d2k_runtime_heartbeat(health_path,NULL,0,ready,atomic_load(&external_available));
+        struct timespec delay={.tv_nsec=100000000L};(void)nanosleep(&delay,NULL);
+    }
+    return NULL;
+}
 static volatile sig_atomic_t stop_requested;
 
 static void on_signal(int signo) { (void)signo;stop_requested=1; }
@@ -104,7 +120,7 @@ static double random_unit(void) {
 }
 
 static int run_daemon(const char *config_path) {
-    tg_config cfg;tg_relay_url url;tg_identity identity={0};SSL_CTX *ctx=NULL;int listener=-1,rc=1;
+    tg_config cfg;tg_relay_url url;tg_identity identity={0};SSL_CTX *ctx=NULL;int listener=-1,rc=1;pthread_t observer;int observer_started=0;health_local local={0};
     if(tg_config_read(config_path,&cfg)!=0){log_msg("cannot read configuration");return 1;}
     if(!cfg.enabled||!cfg.relay_url[0]||(!cfg.relay_secret[0]&&!cfg.enroll_port)){
         (void)write_status(cfg.status_path,"not_configured\n");tg_config_clean(&cfg);return 0;
@@ -116,8 +132,12 @@ static int run_daemon(const char *config_path) {
     struct sigaction sa;memset(&sa,0,sizeof(sa));sa.sa_handler=on_signal;sigemptyset(&sa.sa_mask);
     (void)sigaction(SIGINT,&sa,NULL);(void)sigaction(SIGTERM,&sa,NULL);(void)signal(SIGPIPE,SIG_IGN);
 
+    local.listener=listener;atomic_store(&health_running,1);
+    if(pthread_create(&observer,NULL,health_thread,&local)!=0){log_msg("cannot start local health observer");goto done;}
+    observer_started=1;
     unsigned failures=0,fast_deaths=0;int healthy=0,identity_registered=0;
     while(!stop_requested) {
+        atomic_store(&external_available,0);
         (void)write_status(cfg.status_path,"connecting\n");
         if(!identity_registered) {
             int registered=ensure_registered(&cfg,&url,&identity);
@@ -144,10 +164,11 @@ static int run_daemon(const char *config_path) {
             if(tg_reconnect_needs_reregister(fast_deaths)){int rer=ensure_registered(&cfg,&url,&identity);fast_deaths=0;identity_registered=rer==0;if(rer!=0)log_msg("identity re-registration after repeated fast failures failed");}
             interruptible_wait(tg_reconnect_delay_ms(failures,session.retry_after,healthy,random_unit()));continue;
         } else if(session.window)window=session.window;
+        atomic_store(&external_available,1);
         (void)write_status(cfg.status_path,"connected\n");log_msg(protocol_v2?"relay session authenticated (mux v2)":"relay session authenticated (mux v1)");
         tg_tunnel_config tunnel={.relay_ssl=ssl,.listener_fd=listener,.listen_port=cfg.listen_port,
             .protocol_v2=protocol_v2,.window=window,.stop=&stop_requested};
-        int tunnel_rc=tg_tunnel_run(&tunnel);close_ws(&ssl,&relay_fd);
+        int tunnel_rc=tg_tunnel_run(&tunnel);atomic_store(&external_available,0);close_ws(&ssl,&relay_fd);
         time_t lifetime=time(NULL)-began;
         if(lifetime>=60){healthy=1;failures=0;fast_deaths=0;}
         else {healthy=0;failures++;fast_deaths++;}
@@ -160,6 +181,7 @@ static int run_daemon(const char *config_path) {
     }
     (void)write_status(cfg.status_path,"stopped\n");rc=0;
 done:
+    atomic_store(&health_running,0);if(observer_started)(void)pthread_join(observer,NULL);
     if(listener>=0)close(listener);
     if(ctx)SSL_CTX_free(ctx);
     tg_identity_cleanup(&identity);tg_config_clean(&cfg);return rc;
@@ -223,14 +245,24 @@ static int check_instagram_ip(const char *host,const char *ip,const char *ca) {
     SSL_free(ssl);SSL_CTX_free(ctx);if(fd>=0)close(fd);alarm(0);return rc;
 }
 
+static int offline_self_check(void) {
+    uint8_t encoded[8], payload[2]={0x12,0x34}; tg_frame frame;
+    size_t n=tg_mux_encode(encoded,sizeof encoded,7,1,payload,sizeof payload);
+    if(n!=5||tg_mux_decode(encoded,n,&frame)!=0||frame.stream_id!=7||frame.type!=1||frame.payload_len!=2||memcmp(frame.payload,payload,2))return -1;
+    return OPENSSL_init_ssl(0,NULL)==1?0:-1;
+}
+
 int main(int argc,char **argv) {
+    int offline = d2k_runtime_offline(argc, argv, "d2ktg", offline_self_check);
+    if (offline >= 0) return offline;
     const char *config="/opt/d2k/config",*log_path=NULL;
-    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3");return 0;}
+    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3 release=" D2K_RELEASE_ID);return 0;}
     if(argc==5&&strcmp(argv[1],"--check-instagram-ip")==0)return check_instagram_ip(argv[2],argv[3],argv[4]);
     if(argc==2&&strcmp(argv[1],"--help")==0){puts("d2ktg [--config FILE]");return 0;}
     if(argc==3&&strcmp(argv[1],"--check-config")==0)return check_config(argv[2]);
     for(int i=1;i<argc;i++) {
-        if(strcmp(argv[i],"--config")==0&&i+1<argc)config=argv[++i];
+        if(strcmp(argv[i],"--health-file")==0&&i+1<argc)health_path=argv[++i];
+        else if(strcmp(argv[i],"--config")==0&&i+1<argc)config=argv[++i];
         else if(strcmp(argv[i],"--log")==0&&i+1<argc)log_path=argv[++i];
         else {fprintf(stderr,"usage: d2ktg [--config FILE] [--log FILE]\n");return 2;}
     }
