@@ -729,6 +729,8 @@ static int handle_signal_key(jctx *j, const char *key, void *ctx, int depth, cha
         return jparse_i32(j, &out->volume, "signal.volume", err, errcap);
     if (strcmp(key, "seen") == 0)
         return jparse_i32(j, &out->seen, "signal.seen", err, errcap);
+    if (strcmp(key, "packets") == 0)
+        return jparse_i32(j, &out->packets, "signal.packets", err, errcap);
     return jskip_value(j, depth + 1, err, errcap);
 }
 static int parse_signal(jctx *j, d2k_cat_signal *out, int depth, char *err, size_t errcap) {
@@ -862,6 +864,8 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
                                    "binding.ech_origin", err, errcap);
     if (strcmp(key, "recheck_since") == 0)
         return jparse_rfc3339(j, &out->recheck_since, "binding.recheck_since", err, errcap);
+    if (strcmp(key, "budget") == 0)
+        return jparse_u8(j, &out->budget, "binding.budget", err, errcap);
     return jskip_value(j, depth + 1, err, errcap);
 }
 static int parse_binding(jctx *j, d2k_cat_binding *out, int depth, char *err, size_t errcap) {
@@ -1201,7 +1205,11 @@ static void write_signal_elem(FILE *f, const void *e, int depth) {
     wr_indent(f, depth + 1); fprintf(f, "\"tos\": %u,\n", (unsigned)s->tos);
     wr_indent(f, depth + 1); fprintf(f, "\"ipid\": %u,\n", (unsigned)s->ipid);
     wr_indent(f, depth + 1); fprintf(f, "\"volume\": %d,\n", s->volume);
-    wr_indent(f, depth + 1); fprintf(f, "\"seen\": %d\n", s->seen);
+    wr_indent(f, depth + 1); fprintf(f, "\"seen\": %d", s->seen);
+    if (s->packets) { /* только посчитанный бюджет (задача 55) */
+        fputs(",\n", f); wr_indent(f, depth + 1); fprintf(f, "\"packets\": %d", s->packets);
+    }
+    fputc('\n', f);
     wr_indent(f, depth); fputc('}', f);
 }
 
@@ -1269,6 +1277,11 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
         format_rfc3339(bd->recheck_since, recheck_s, sizeof recheck_s);
         fputs(",\n", f); wr_indent(f, depth + 1);
         fprintf(f, "\"recheck_since\": \"%s\"", recheck_s);
+    }
+    if (bd->budget) {
+        /* Только проверенная: отсутствие ключа — «не проверено» (задача 55). */
+        fputs(",\n", f); wr_indent(f, depth + 1);
+        fprintf(f, "\"budget\": %u", (unsigned)bd->budget);
     }
     fputc('\n', f);
     wr_indent(f, depth); fputc('}', f);

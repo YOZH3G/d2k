@@ -116,9 +116,65 @@ typedef struct {
        D2K_VERIFY_HEADER_LIMIT, нет памяти), а не поведением линии. Такой
        неуспех не улика против плана и не записывается ему как провал. */
     int      local_limit;
+    /* Сервер объявил конец keep-alive: Connection: close, HTTP/1.0 без
+       keep-alive или тело до закрытия соединения. Повторить запрос на этом
+       потоке нельзя (проверка бюджета ниже — «не применимо»). */
+    int      conn_close;
+    /* ПРОВЕРКА БЮДЖЕТА ПОТОКА (задача 55, D2K_BUDGET_*). После первого
+       ответа приложения зонд продолжает ТОТ ЖЕ поток повторами того же
+       запроса, пока поток не перенесёт budget_need пакетов с данными (обе
+       стороны вместе) при ответе сервера на каждый запрос. */
+    int      budget;
+    unsigned budget_need;     /* 2 × бюджет коробки, пакетов с данными */
+    unsigned budget_packets;  /* сколько пакетов с данными поток перенёс к итогу */
+    unsigned budget_requests; /* запросов на потоке, включая первый */
+    char     budget_note[160];
+    int      budget_uncountable; /* «не применимо»: пакеты потока не считаются (старое ядро) */
+    /* TCP: пакеты с данными обеих сторон на момент конца обращения
+       (TCP_INFO data_segs_in + data_segs_out), 0 — не считается. Им объёмный
+       замер записывает бюджет коробки там, где видит обрыв identity. */
+    unsigned data_packets;
     d2k_resource resources[D2K_RESOURCE_COUNT];
     size_t n_resources; /* hints only, from a complete anonymous HTML response */
 } d2k_ver_result;
+
+/* БЮДЖЕТ ПОТОКА — ДЕЙСТВИЕ КОРОБКИ (a), поле 04.10.2026 (задача 55,
+ * task-55-facts.md §1.2): на именах под её правилом поток переносит ~25
+ * пакетов с данными (обе стороны вместе, TCP и QUIC), после чего сервер
+ * для клиента замолкает; от времени и байтов (5,9–29,6 КБ) не зависит.
+ * Ответ 403/404/401 или короткий 200 до этого порога не доходит, и план,
+ * снимающий только распознавание имени при рукопожатии, «подтверждался» им.
+ *
+ * Итоги проверки (d2k_ver_result.budget):
+ *   NOT_CHECKED — проверку не просили (бюджет потока 0) или уровень ниже
+ *                 приложения;
+ *   PASSED      — поток перенёс не меньше 2 × бюджет пакетов с данными, и
+ *                 сервер ответил на каждый запрос;
+ *   CUT         — сервер замолчал посреди повторов: кандидат не подтверждён;
+ *   NOT_APPLICABLE — сервер закрыл keep-alive (Connection: close, конец
+ *                 потока, сброс) раньше порога, или пакеты не считаются:
+ *                 подтверждение прежнее, привязка «бюджет не проверен». */
+#define D2K_BUDGET_NOT_CHECKED    0
+#define D2K_BUDGET_PASSED         1
+#define D2K_BUDGET_CUT            2
+#define D2K_BUDGET_NOT_APPLICABLE 3
+/* Бюджет до первого замера коробки: 25 пакетов с данными в 18 из 18
+   оборванных потоков поля 04.10.2026 (task-55-facts.md §1.2). Не константа
+   обхода: замер коробки (обрыв identity) заменяет его своим числом. */
+#define D2K_BUDGET_FIELD_PACKETS 25
+
+/* Бюджет для зондов ЭТОГО потока исполнения: 0 — без проверки (умолчание;
+ * базовые и объёмные замеры её не делают). Зовёт рабочий поток испытания
+ * кандидата перед зондом и снимает после. */
+void d2k_verify_budget_set(unsigned budget_packets);
+unsigned d2k_verify_budget_get(void);
+
+/* Пакеты TCP с данными обеих сторон на сокете: TCP_INFO data_segs_in +
+ * data_segs_out (Linux ≥ 4.6; роутеры — 4.9). Меньше нуля — не считается
+ * (другая ОС, старое ядро). Подменяемо для тестов. */
+typedef long (*d2k_verify_packets_fn)(int fd);
+long d2k_verify_tcp_data_packets(int fd);
+extern d2k_verify_packets_fn d2k_verify_packets_hook;
 
 /* Same verifier and protocol, with a public stylesheet witness instead of /.
  * NULL preserves /. No arbitrary URI, credentials, query strings or redirects

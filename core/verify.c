@@ -32,6 +32,8 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <stdarg.h>
+#include <netinet/in.h>
 
 #include "d2k_compose_internal.h" /* d2k_props_contact — общее обращение к цели */
 #include "d2k_h3.h"
@@ -446,7 +448,7 @@ static int read_status_buf(uint8_t *buf, size_t capacity,
                           char *location, size_t location_cap,
                           d2k_resource *resources, size_t *n_resources,
                           d2k_http_reply_result *http_reply, int *local_limit,
-                          char *err, size_t errcap);
+                          int *conn_close, char *err, size_t errcap);
 static int read_status_buf(uint8_t *buf, size_t capacity,
                           read_fn rd, void *sess, int wait_ms,
                           int *cloudflare_challenge, uint64_t *body_bytes,
@@ -456,9 +458,10 @@ static int read_status_buf(uint8_t *buf, size_t capacity,
                           char *location, size_t location_cap,
                           d2k_resource *resources, size_t *n_resources,
                           d2k_http_reply_result *http_reply, int *local_limit,
-                          char *err, size_t errcap) {
+                          int *conn_close, char *err, size_t errcap) {
     size_t used = 0;
     if (local_limit) { *local_limit = 0; }
+    if (conn_close) { *conn_close = 0; }
     if (err && errcap) { err[0] = '\0'; }
     *http_reply = (d2k_http_reply_result){D2K_HTTP_NEUTRAL, ""};
     if (n_resources) *n_resources = 0;
@@ -518,6 +521,7 @@ static int read_status_buf(uint8_t *buf, size_t capacity,
                 int encoding_seen = 0;
                 int location_seen = 0;
                 int html = 0;
+                int conn_token_close = 0, conn_token_keep = 0;
                 uint64_t length = 0;
                 size_t pos = (size_t)(eol - buf) + 2;
                 while (pos < hdr_len) {
@@ -567,6 +571,19 @@ static int read_status_buf(uint8_t *buf, size_t capacity,
                             else if (span_eq_ascii_ci(line + v, end - v, "gzip")) { encoding = 1; }
                             else if (span_eq_ascii_ci(line + v, end - v, "identity")) { encoding = 0; }
                             else { encoding = 2; }
+                        } else if (span_eq_ascii_ci(line, kn, "connection")) {
+                            /* Список токенов через запятую (RFC 9110 §7.6.1). */
+                            size_t a = v;
+                            while (a < ln) {
+                                while (a < ln && (line[a] == ' ' || line[a] == '\t' || line[a] == ',')) a++;
+                                size_t b = a;
+                                while (b < ln && line[b] != ',') b++;
+                                size_t e = b;
+                                while (e > a && (line[e - 1] == ' ' || line[e - 1] == '\t')) e--;
+                                if (span_eq_ascii_ci(line + a, e - a, "close")) conn_token_close = 1;
+                                if (span_eq_ascii_ci(line + a, e - a, "keep-alive")) conn_token_keep = 1;
+                                a = b;
+                            }
                         } else if (span_eq_ascii_ci(line, kn, "location") && location && location_cap) {
                             int duplicate = location_seen++;
                             if (duplicate) framing_valid = 0;
@@ -621,6 +638,12 @@ static int read_status_buf(uint8_t *buf, size_t capacity,
                     *body_framing_valid = framing_valid && !(has_length && chunked);
                 }
                 if (body_encoding) { *body_encoding = encoding; }
+                /* Конец keep-alive: явный close, HTTP/1.0 без keep-alive или
+                   тело до закрытия соединения (нет ни длины, ни chunked). */
+                if (conn_close) {
+                    *conn_close = conn_token_close || (buf[7] == '0' && !conn_token_keep) ||
+                        (!has_length && !chunked && code != 204 && code != 304);
+                }
                 *http_reply = d2k_http_reply_classify(code, location, encoding,
                     bs.prefix, bs.prefix_len, got + (complete ? 0 : 1));
                 if (complete && bs.scan && resources && n_resources) {
@@ -676,7 +699,7 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
                           char *location, size_t location_cap,
                           d2k_resource *resources, size_t *n_resources,
                           d2k_http_reply_result *http_reply, int *local_limit,
-                          char *err, size_t errcap) {
+                          int *conn_close, char *err, size_t errcap) {
     /* Буфер на куче: заголовки Meta ~8,4 КБ не влезали в прежние 8 КБ на
        стеке (задача 44). Тело читается теми же 8192 байтами с начала. */
     size_t capacity = D2K_VERIFY_HEADER_LIMIT + 1;
@@ -692,7 +715,7 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
         cloudflare_challenge, body_bytes, body_expected, body_complete,
         body_has_length, body_chunked, body_framing_valid, body_encoding,
         location, location_cap, resources, n_resources, http_reply,
-        local_limit, err, errcap);
+        local_limit, conn_close, err, errcap);
     free(buf);
     return code_out;
 }
@@ -774,11 +797,186 @@ static int https_redirect_response(int code, const char *location) {
     return 1;
 }
 
+/* --- проверка бюджета потока (задача 55, d2k_verify.h) ------------------ */
+
+/* Бюджет зондов этого потока исполнения. Поточная переменная, а не параметр:
+   подписи зондов — крючки планировщика и тестов, а бюджет нужен ровно одному
+   звонящему — испытанию кандидата (worker_run, JOB_VERIFY). */
+static __thread unsigned g_verify_budget;
+void d2k_verify_budget_set(unsigned budget_packets) { g_verify_budget = budget_packets; }
+unsigned d2k_verify_budget_get(void) { return g_verify_budget; }
+
+/* Почему TCP_INFO, а не счёт в зонде: зонд видит записи TLS и байты, а
+   коробка считает ПАКЕТЫ (поле 04.10: от байтов порог не зависит). Сегменты
+   с данными знает только ядро: data_segs_in/out (Linux 4.6+, роутеры на 4.9)
+   — ровно «пакеты с данными обеих сторон» из замера, с повторами и без
+   чистых ACK. Раскладка struct tcp_info — своя копия начала uapi
+   <linux/tcp.h> (смещения 152/156), а не заголовок библиотеки: у musl и
+   glibc разных лет поля названы и доступны по-разному. Ответ короче 160
+   байт — старое ядро, считать нечем. */
+long d2k_verify_tcp_data_packets(int fd) {
+#ifdef __linux__
+    uint8_t info[256];
+    socklen_t len = sizeof info;
+    memset(info, 0, sizeof info);
+    if (fd < 0 || getsockopt(fd, IPPROTO_TCP, 11 /* TCP_INFO */, info, &len) != 0 || len < 160)
+        return -1;
+    uint32_t in = 0, out = 0;
+    memcpy(&in, info + 152, 4);
+    memcpy(&out, info + 156, 4);
+    return (long)in + (long)out;
+#else
+    (void)fd;
+    return -1;
+#endif
+}
+d2k_verify_packets_fn d2k_verify_packets_hook = d2k_verify_tcp_data_packets;
+
+/* Счёт пакетов и «сервер закрыл поток» — подменяемы ради теста без сокетов. */
+typedef struct {
+    long (*packets)(void *ctx);   /* пакеты с данными обеих сторон, <0 — не считается */
+    int  (*peer_spoke)(void *ctx); /* после неудачи чтения: 1 — сервер закрыл/сбросил, 0 — молчит */
+    void *ctx;
+} budget_io;
+
+static void budget_say(d2k_ver_result *r, int outcome, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+static void budget_say(d2k_ver_result *r, int outcome, const char *fmt, ...) {
+    va_list ap;
+    r->budget = outcome;
+    va_start(ap, fmt);
+    vsnprintf(r->budget_note, sizeof r->budget_note, fmt, ap);
+    va_end(ap);
+}
+
+/* Чтение с запоминанием законного конца потока (close_notify): после него
+   сокет может ещё не показать FIN, а молчанием коробки это не является. */
+/* Заодно помнит, чем кончилось последнее чтение: отказ (n < 0) и сколько
+   байт ответа пришло. Молчание коробки — это отказ чтения по истечении
+   срока; битый ответ, тревога TLS, наш предел приходят раньше срока или без
+   отказа чтения и обрывом не считаются (ревью M-2). */
+typedef struct { read_fn rd; void *sess; int eof, failed; uint64_t bytes; } eof_reader;
+static long read_eof(void *ctx, uint8_t *buf, size_t cap, int wait_ms, char *err, size_t errcap) {
+    eof_reader *e = ctx;
+    long n = e->rd(e->sess, buf, cap, wait_ms, err, errcap);
+    if (n == 0) e->eof = 1;
+    e->failed = n < 0;
+    if (n > 0) e->bytes += (uint64_t)n;
+    return n;
+}
+
+/* Тот же запрос на том же потоке, пока поток не перенесёт 2 × бюджет пакетов
+   с данными. Каждый ответ обязан прийти целиком: «сервер ответил на каждый
+   запрос». Молчание (тайм-аут без закрытия) — обрыв коробкой; закрытие или
+   сброс сервером раньше порога — «не применимо». Повтор без роста счётчика
+   пакетов — тоже «не применимо»: счёт сломан, а не коробка пропустила. */
+static void budget_tcp(read_fn rd, write_fn wr, void *sess, const budget_io *io,
+                       const char *req, size_t req_len, int deadline_ms,
+                       unsigned budget, int conn_close, d2k_ver_result *r) {
+    unsigned need = budget * 2;
+    r->budget_need = need;
+    r->budget_requests = 1;
+    long last = -1;
+    char err[160];
+    for (;;) {
+        long pk = io->packets(io->ctx);
+        if (pk < 0) {
+            r->budget_uncountable = 1;
+            budget_say(r, D2K_BUDGET_NOT_APPLICABLE,
+                       "пакеты потока не считаются (нет TCP_INFO data_segs) — бюджет не проверен");
+            return;
+        }
+        r->budget_packets = (unsigned)pk;
+        if ((unsigned long)pk >= need) {
+            budget_say(r, D2K_BUDGET_PASSED, "поток перенёс %ld пакетов с данными из нужных %u "
+                       "за %u запросов, сервер ответил на каждый", pk, need, r->budget_requests);
+            return;
+        }
+        if (conn_close) {
+            budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "сервер закрывает keep-alive после %u-го "
+                       "ответа, на %ld пакетах из %u — бюджет не проверен", r->budget_requests, pk, need);
+            return;
+        }
+        if (last >= 0 && pk <= last) {
+            budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "счётчик пакетов не растёт (%ld) — бюджет не проверен", pk);
+            return;
+        }
+        last = pk;
+        eof_reader er = { rd, sess, 0, 0, 0 };
+        err[0] = '\0';
+        int64_t asked = verify_now_ms();
+        int wrote = wr(sess, (const uint8_t *)req, req_len, err, sizeof err);
+        r->budget_requests++;
+        int code = 0, complete = 0, cc = 0, ll = 0, chal = 0, a = 0, b = 0, c = 0, enc = 0;
+        uint64_t got = 0, expected = 0;
+        d2k_http_reply_result hr;
+        if (wrote == 0) {
+            code = read_status_rd(read_eof, &er, deadline_ms, &chal, &got, &expected, &complete,
+                                  &a, &b, &c, &enc, NULL, 0, NULL, NULL, &hr, &ll, &cc,
+                                  err, sizeof err);
+        }
+        if (wrote != 0 || !code || !complete) {
+            long now = io->packets(io->ctx);
+            if (now >= 0) r->budget_packets = (unsigned)now;
+            /* Срок ожидания прошёл целиком (с допуском на ход часов). */
+            int silent = er.failed && verify_now_ms() - asked >= (int64_t)deadline_ms - 20;
+            if (wrote != 0 || er.eof || io->peer_spoke(io->ctx)) {
+                budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "сервер закрыл поток на %u-м запросе, "
+                           "%u пакетов из %u — бюджет не проверен: %.60s",
+                           r->budget_requests, r->budget_packets, need, err);
+            } else if (ll || !silent) {
+                budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "повтор %u не измерен (%s): %.60s — "
+                           "бюджет не проверен", r->budget_requests,
+                           ll ? "наш предел" : "ответ битый или отказ TLS, не молчание", err);
+            } else {
+                budget_say(r, D2K_BUDGET_CUT, "сервер замолчал посреди повторов: %u-й запрос, "
+                           "поток перенёс %u пакетов с данными из нужных %u: %.60s",
+                           r->budget_requests, r->budget_packets, need, err);
+            }
+            return;
+        }
+        conn_close = cc;
+    }
+}
+
+/* Сервер что-то сделал с потоком (FIN/RST): сокет читаем без ожидания. Тишина
+   коробки — сокет не читаем. Вызывается после неудачного чтения. */
+static int fd_peer_spoke(void *ctx) {
+    int fd = *(int *)ctx;
+    struct pollfd p;
+    p.fd = fd; p.events = POLLIN; p.revents = 0;
+    return poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR));
+}
+static long fd_packets(void *ctx) { return d2k_verify_packets_hook(*(int *)ctx); }
+
+static void request_page_budget(read_fn rd, write_fn wr, void *sess,
+                                const char *host, int encoding,
+                                const char *initial_path,
+                                int deadline_ms, int tls12,
+                                const budget_io *io, unsigned budget,
+                                d2k_ver_result *r, char *err, size_t errcap);
+/* Без проверки бюджета — прежнее чтение одного ответа (тесты разбора). */
+static void request_complete_page(read_fn rd, write_fn wr, void *sess,
+                                  const char *host, int encoding,
+                                  const char *initial_path,
+                                  int deadline_ms, int tls12,
+                                  d2k_ver_result *r, char *err, size_t errcap)
+    __attribute__((unused));
 static void request_complete_page(read_fn rd, write_fn wr, void *sess,
                                   const char *host, int encoding,
                                   const char *initial_path,
                                   int deadline_ms, int tls12,
                                   d2k_ver_result *r, char *err, size_t errcap) {
+    request_page_budget(rd, wr, sess, host, encoding, initial_path, deadline_ms, tls12,
+                        NULL, 0, r, err, errcap);
+}
+
+static void request_page_budget(read_fn rd, write_fn wr, void *sess,
+                                const char *host, int encoding,
+                                const char *initial_path,
+                                int deadline_ms, int tls12,
+                                const budget_io *io, unsigned budget,
+                                d2k_ver_result *r, char *err, size_t errcap) {
     char path[1024] = "/";
     if (initial_path) snprintf(path, sizeof path, "%s", initial_path);
     const char *accept_encoding = encoding == 1 ? "gzip" :
@@ -805,7 +1003,7 @@ static void request_complete_page(read_fn rd, write_fn wr, void *sess,
                                   &r->body_has_length, &r->body_chunked,
                                   &r->body_framing_valid, &r->body_encoding, r->location,
                                   sizeof r->location, r->resources, &r->n_resources,
-                                  &http_reply, &r->local_limit, err, errcap);
+                                  &http_reply, &r->local_limit, &r->conn_close, err, errcap);
         r->status = code;
         r->http_outcome = http_reply.outcome;
         snprintf(r->http_evidence, sizeof r->http_evidence, "%s", http_reply.evidence);
@@ -836,6 +1034,8 @@ static void request_complete_page(read_fn rd, write_fn wr, void *sess,
                 snprintf(r->reason, sizeof r->reason,
                          "HTTP %d, HTTPS redirect получен полностью (%llu байт); цель перехода не проверялась",
                          code, (unsigned long long)r->body_bytes);
+                if (io && budget)
+                    budget_tcp(rd, wr, sess, io, req, (size_t)n, deadline_ms, budget, r->conn_close, r);
                 return;
             }
             r->level = D2K_VER_HANDSHAKE;
@@ -848,6 +1048,8 @@ static void request_complete_page(read_fn rd, write_fn wr, void *sess,
             snprintf(r->reason, sizeof r->reason,
                      "HTTP %d, тело загружено полностью (%llu байт)%s", code,
                      (unsigned long long)r->body_bytes, tls12 ? " по TLS 1.2" : "");
+            if (io && budget)
+                budget_tcp(rd, wr, sess, io, req, (size_t)n, deadline_ms, budget, r->conn_close, r);
         } else if (code) {
             snprintf(r->reason, sizeof r->reason,
                      "HTTP %d, тело оборвалось (%llu/%llu байт): %.80s", code,
@@ -937,8 +1139,11 @@ static d2k_ver_result verify_probe13_internal(int use_fd, const char *ip, uint16
     r.ech_accepted = d2k_tls_ech_accepted(t);
     snprintf(r.reason, sizeof r.reason, "рукопожатие завершено, приложение молчит");
 
-    request_complete_page(read13, write13, t, host, encoding, path,
-                          deadline_ms, 0, &r, err, sizeof err);
+    budget_io io = { fd_packets, fd_peer_spoke, &r.fd };
+    request_page_budget(read13, write13, t, host, encoding, path,
+                        deadline_ms, 0, &io, g_verify_budget, &r, err, sizeof err);
+    long dp = d2k_verify_packets_hook(r.fd);
+    r.data_packets = dp > 0 ? (unsigned)dp : 0;
     /* Сессию освобождаем, сокет — нет: d2k_tls_free владения им не берёт
        (d2k_tls13.h), а закрыть его здесь значило бы послать FIN и потерять
        ячейку потока в датапате раньше, чем вызывающий свяжет с ней событие. */
@@ -1102,8 +1307,11 @@ static d2k_ver_result verify_probe12_internal(int use_fd, const char *ip, uint16
     r.name_ok = d2k_tls12_peer_name(t);
     snprintf(r.reason, sizeof r.reason, "рукопожатие 1.2 завершено, приложение молчит");
 
-    request_complete_page(read12, write12, t, host, encoding, path,
-                          deadline_ms, 1, &r, err, sizeof err);
+    budget_io io = { fd_packets, fd_peer_spoke, &r.fd };
+    request_page_budget(read12, write12, t, host, encoding, path,
+                        deadline_ms, 1, &io, g_verify_budget, &r, err, sizeof err);
+    long dp = d2k_verify_packets_hook(r.fd);
+    r.data_packets = dp > 0 ? (unsigned)dp : 0;
     d2k_tls12_free(t);
     return r;
 }
@@ -1226,6 +1434,129 @@ static long quic_recv_chunk(void *ctx, uint8_t *buf, size_t cap, char *err,
     uint64_t sid = 0;
     return d2k_qc_stream_recv(((quic_recv_ctx *)ctx)->c, &sid, buf, cap, 200,
                               err, errcap);
+}
+
+/* БЮДЖЕТ ПО QUIC: тот же порог по датаграммам обеих сторон (поле 04.10:
+   25 у QUIC так же, как у TCP). Повтор — НОВЫЙ двунаправленный поток той же
+   связи (номер +4) с тем же запросом; незаконченный ответ сперва дочитывается.
+   Молчание дольше deadline_ms — обрыв; закрытие связи сервером — «не
+   применимо». Ввод-вывод подменяем ради теста без сокетов. */
+typedef struct {
+    int  (*request)(void *ctx, uint64_t sid, char *err, size_t errcap);
+    h3_recv_fn recv;
+    void (*progress)(void *ctx, uint64_t *bytes, int *complete);
+    long (*packets)(void *ctx);
+    void *ctx;
+} quic_budget_io;
+
+static void budget_quic(const quic_budget_io *io, int deadline_ms, unsigned budget,
+                        d2k_ver_result *r) {
+    unsigned need = budget * 2;
+    r->budget_need = need;
+    r->budget_requests = 1;
+    uint64_t sid = 0;
+    long asked_at = -1;
+    char err[160];
+    err[0] = '\0';
+    int wait = deadline_ms > 0 ? deadline_ms : 5000;
+    for (;;) {
+        long pk = io->packets(io->ctx);
+        if (pk < 0) {
+            r->budget_uncountable = 1;
+            budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "датаграммы связи не считаются — бюджет не проверен");
+            return;
+        }
+        r->budget_packets = (unsigned)pk;
+        if ((unsigned long)pk >= need) {
+            budget_say(r, D2K_BUDGET_PASSED, "связь перенесла %ld датаграмм из нужных %u за %u "
+                       "запросов HTTP/3, сервер ответил на каждый", pk, need, r->budget_requests);
+            return;
+        }
+        uint64_t bytes = 0;
+        int complete = 0;
+        io->progress(io->ctx, &bytes, &complete);
+        if (complete) {
+            if (asked_at >= 0 && pk <= asked_at) {
+                budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "счётчик датаграмм не растёт (%ld) — бюджет не проверен", pk);
+                return;
+            }
+            asked_at = pk;
+            sid += 4;
+            r->budget_requests++;
+            if (io->request(io->ctx, sid, err, sizeof err) != 0) {
+                budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "запрос HTTP/3 %u не ушёл: %.60s — бюджет не проверен",
+                           r->budget_requests, err);
+                return;
+            }
+            uint8_t hdr[4096];
+            size_t got = 0;
+            int status = 0, closed = 0;
+            (void)h3_read_headers(io->recv, io->ctx, hdr, sizeof hdr, verify_now_ms() + wait,
+                                  &got, &status, &closed, err, sizeof err);
+            long now = io->packets(io->ctx);
+            if (now >= 0) r->budget_packets = (unsigned)now;
+            if (closed) {
+                budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "сервер закрыл связь на %u-м запросе, %u "
+                           "датаграмм из %u — бюджет не проверен: %.60s", r->budget_requests,
+                           r->budget_packets, need, err);
+                return;
+            }
+            if (!status && got) {
+                /* Байты пришли, а кадр HEADERS не разобран — не молчание. */
+                budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "ответ HTTP/3 на %u-й запрос не разобран "
+                           "(%zu байт) — бюджет не проверен", r->budget_requests, got);
+                return;
+            }
+            if (!status) {
+                budget_say(r, D2K_BUDGET_CUT, "сервер замолчал посреди повторов: %u-й запрос HTTP/3, "
+                           "связь перенесла %u датаграмм из нужных %u", r->budget_requests,
+                           r->budget_packets, need);
+                return;
+            }
+            continue;
+        }
+        /* Ответ ещё идёт — это и есть «сервер отвечает»; ждём следующих байт. */
+        int64_t until = verify_now_ms() + wait;
+        int moved = 0;
+        while (!moved && verify_now_ms() < until) {
+            uint8_t sink[4096];
+            long n = io->recv(io->ctx, sink, sizeof sink, err, sizeof err);
+            if (n < 0) {
+                long now = io->packets(io->ctx);
+                if (now >= 0) r->budget_packets = (unsigned)now;
+                budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "сервер закрыл связь посреди ответа, %u "
+                           "датаграмм из %u — бюджет не проверен: %.60s", r->budget_packets, need, err);
+                return;
+            }
+            if (n > 0 || io->packets(io->ctx) != pk) moved = 1;
+        }
+        if (!moved) {
+            budget_say(r, D2K_BUDGET_CUT, "сервер замолчал посреди ответа на %u-й запрос HTTP/3, "
+                       "связь перенесла %ld датаграмм из нужных %u", r->budget_requests, pk, need);
+            return;
+        }
+    }
+}
+
+typedef struct { d2k_qc *c; const char *host, *path; } quic_budget_ctx;
+static int qb_request(void *ctx, uint64_t sid, char *err, size_t errcap) {
+    quic_budget_ctx *q = ctx;
+    uint8_t req[512];
+    size_t rn = d2k_h3_request(q->host, q->path, req, sizeof req);
+    if (!rn) { snprintf(err, errcap, "запрос HTTP/3 не собрался"); return -1; }
+    return d2k_qc_stream_send(q->c, sid, req, rn, 1, err, errcap);
+}
+static long qb_recv(void *ctx, uint8_t *buf, size_t cap, char *err, size_t errcap) {
+    uint64_t sid = 0;
+    return d2k_qc_stream_recv(((quic_budget_ctx *)ctx)->c, &sid, buf, cap, 200, err, errcap);
+}
+static void qb_progress(void *ctx, uint64_t *bytes, int *complete) {
+    d2k_qc_app_progress(((quic_budget_ctx *)ctx)->c, bytes, complete);
+}
+static long qb_packets(void *ctx) {
+    uint64_t tx = 0, rx = 0;
+    d2k_qc_datagrams(((quic_budget_ctx *)ctx)->c, &tx, &rx);
+    return (long)(tx + rx);
 }
 
 /* use_fd — УЖЕ ЗАНЯТЫЙ сокет UDP (d2k_props_bind_udp), под чей местный порт
@@ -1371,6 +1702,11 @@ d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_
             snprintf(r.reason, sizeof r.reason,
                      "заголовки HTTP/3 получены, статус %d, данных %llu байт%s", r.status,
                      (unsigned long long)bytes, complete ? ", ответ целиком" : "");
+            if (g_verify_budget) {
+                quic_budget_ctx qc = { c, host, path };
+                quic_budget_io qio = { qb_request, qb_recv, qb_progress, qb_packets, &qc };
+                budget_quic(&qio, deadline_ms, g_verify_budget, &r);
+            }
         } else {
             snprintf(r.reason, sizeof r.reason,
                      "заголовки HTTP/3 получены (статус %d), поток оборван на %llu байт "

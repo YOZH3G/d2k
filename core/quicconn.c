@@ -167,7 +167,8 @@ struct d2k_qc {
     uint64_t rx_want_high;   /* наибольший конец данных потока ответа */
     uint64_t rx_other;       /* байты прочих потоков (счёт сверху) */
     int      credit_due;     /* 1 — MAX_STREAM_DATA, 2 — MAX_DATA */
-    /* Датаграммы обоих направлений — для «потока хватило на бюджет». */
+    /* Датаграммы связи в обе стороны (задачи 50, 55): коробка считает бюджет
+       потока пакетами, и проверки «хватило на бюджет» считают так же. */
     uint64_t tx_dgrams, rx_dgrams;
 
     uint8_t  local_addr[16];
@@ -912,6 +913,7 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
             say(err, errcap, "датаграмма не ушла: %s", strerror(errno));
             d2k_qc_close(c); return -1;
         }
+        c->tx_dgrams++;
     }
 
     c->sent0_ms = now_ms();
@@ -1143,6 +1145,10 @@ void d2k_qc_app_progress(const d2k_qc *c, uint64_t *bytes, int *complete) {
 
 int d2k_qc_peer_name(const d2k_qc *c) { return c ? c->peer_name : -1; }
 uint64_t d2k_qc_rx_wire_bytes(const d2k_qc *c) { return c ? c->rx_wire_bytes : 0; }
+void d2k_qc_datagrams(const d2k_qc *c, uint64_t *tx, uint64_t *rx) {
+    if (tx) { *tx = c ? c->tx_dgrams : 0; }
+    if (rx) { *rx = c ? c->rx_dgrams : 0; }
+}
 int d2k_qc_handshake_done(const d2k_qc *c) { return c ? c->handshake_done : 0; }
 int64_t d2k_qc_rtt_ms(const d2k_qc *c) { return c ? c->rtt_ms : 0; }
 void d2k_qc_dgrams(const d2k_qc *c, uint64_t *tx, uint64_t *rx) {
