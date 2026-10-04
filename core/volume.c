@@ -76,8 +76,28 @@ int d2k_volume_rx_evidence(const d2k_ver_result *a,
                    ? a->body_bytes - b->body_bytes : b->body_bytes - a->body_bytes;
     if (delta > (uint64_t)D2K_VOLUME_SLACK * 1024) { return 0; }
     if (gzip->status < 200 || gzip->status >= 300 || !gzip->body_framing_valid ||
-        !gzip->body_complete ||
         gzip->body_encoding != 1 || gzip->body_bytes == 0) { return 0; }
+    /* ДВЕ ПРИМЕТЫ ОДНОГО И ТОГО ЖЕ: ОБРЫВ ПО БАЙТАМ И ОБРЫВ ПО ПАКЕТАМ.
+       Байтовая — identity рвётся, а gzip той же страницы, меньший по
+       объёму, доходит. Пакетная (поле 04.10, task-55-facts §1.2: Cloudflare
+       режет поток после ~25 пакетов с данными обеих сторон, 25–27 в 18/18
+       потоках, при 5,9–29,6 КБ): gzip, которому самому нужно больше
+       бюджета, рвётся тоже, но на ТОМ ЖЕ числе пакетов. rua.gr 04.10:
+       identity 22229/22280, gzip 20817 не дошёл — прежнее правило читало
+       это как «блока нет». Пакеты считает ядро (TCP_INFO data_segs); не
+       посчитаны все три — остаётся только байтовое правило. */
+    int packet_budget = 0;
+    if (!gzip->body_complete) {
+        unsigned pa = a->data_packets, pb = b->data_packets, pg = gzip->data_packets;
+        unsigned lo = pa, hi = pa;
+        if (!pa || !pb || !pg) { return 0; }
+        if (pb < lo) lo = pb;
+        if (pb > hi) hi = pb;
+        if (pg < lo) lo = pg;
+        if (pg > hi) hi = pg;
+        if (hi - lo > D2K_VOLUME_PACKET_SLACK) { return 0; }
+        packet_budget = 1;
+    }
 
     out->rx_cut = 1;
     uint64_t midpoint = (a->body_bytes < b->body_bytes ? a->body_bytes : b->body_bytes)
@@ -88,14 +108,20 @@ int d2k_volume_rx_evidence(const d2k_ver_result *a,
     if (a->body_has_length && a->body_expected <= (uint64_t)INT_MAX * 1024) {
         out->rx_expected_kb = (int)(a->body_expected / 1024);
     }
-    out->rx_compressed_complete = 1;
+    out->rx_compressed_complete = !packet_budget;
     /* Бюджет потока коробки (задача 55): пакеты с данными обеих сторон, на
        которых identity оборвался. Из двух посчитанных — меньший: коробка
-       режет не позже него. Не посчитан ни один — 0, бюджета не выдумываем. */
+       режет не позже него. Не посчитан ни один — 0, бюджета не выдумываем.
+       При пакетной примете в счёт идёт и обрыв gzip. */
     unsigned pa = a->data_packets, pb = b->data_packets;
     unsigned pk = pa && pb ? (pa < pb ? pa : pb) : (pa ? pa : pb);
+    if (packet_budget && gzip->data_packets < pk) { pk = gzip->data_packets; }
     out->rx_cut_packets = pk > INT_MAX ? INT_MAX : (int)pk;
-    if (out->rx_expected_kb > 0) {
+    if (packet_budget) {
+        snprintf(out->reason, sizeof out->reason,
+                 "identity (около %d КБ) и gzip оборвались на одном бюджете: ~%u пакетов "
+                 "с данными на поток", out->rx_at_kb, pk);
+    } else if (out->rx_expected_kb > 0) {
         snprintf(out->reason, sizeof out->reason,
                  "identity-тело повторно оборвалось около %d/%d КБ; gzip завершился",
                  out->rx_at_kb, out->rx_expected_kb);
@@ -319,9 +345,12 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     d2k_ver_result gz = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
                                                    hello_wire, tls12, 1, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
-             "identity %llu/%llu; gzip HTTP %d, тело %llu, complete=%d, encoding=%d",
+             "identity %llu/%llu (пакетов %u/%u); gzip HTTP %d, тело %llu, complete=%d, "
+             "encoding=%d, пакетов %u",
              (unsigned long long)a.body_bytes, (unsigned long long)b.body_bytes,
-             gz.status, (unsigned long long)gz.body_bytes, gz.body_complete, gz.body_encoding);
+             a.data_packets, b.data_packets,
+             gz.status, (unsigned long long)gz.body_bytes, gz.body_complete, gz.body_encoding,
+             gz.data_packets);
     (void)d2k_volume_rx_evidence(&a, &b, &gz, res);
     d2k_verify_close(&a);
     d2k_verify_close(&b);

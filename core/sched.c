@@ -2004,7 +2004,11 @@ static int worker_volume_cut(d2k_sched *s, task *t) {
     pthread_mutex_lock(&s->mu);
     memset(&t->res, 0, sizeof t->res);
     t->res.verdict = D2K_V_INCONCLUSIVE;
-    if (t->vol.rx_cut) {
+    if (t->vol.rx_cut && !t->vol.rx_compressed_complete) {
+        /* Пакетный бюджет (поле 04.10, rua.gr): gzip оборван тоже, на том же
+           числе пакетов — причину пишет сама проба. */
+        snprintf(t->res.reason, sizeof t->res.reason, "%s", t->vol.reason);
+    } else if (t->vol.rx_cut) {
         if (t->vol.rx_expected_kb > 0) {
             snprintf(t->res.reason, sizeof t->res.reason,
                      "identity-тело дважды оборвалось около %d/%d КБ, gzip завершился",
@@ -8193,9 +8197,15 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     moved++;
                     continue;
                 }
-                say(s, "по %s подтверждён повторяемый обрыв входящего ответа около %d КБ "
-                       "при полном gzip-контроле — теперь ищу коробку и её планы",
-                    t->name, t->vol.rx_at_kb);
+                if (t->vol.rx_compressed_complete) {
+                    say(s, "по %s подтверждён повторяемый обрыв входящего ответа около %d КБ "
+                           "при полном gzip-контроле — теперь ищу коробку и её планы",
+                        t->name, t->vol.rx_at_kb);
+                } else {
+                    say(s, "по %s подтверждён пакетный бюджет потока: identity и gzip "
+                           "оборвались около %d пакетов с данными — теперь ищу коробку и её планы",
+                        t->name, t->vol.rx_cut_packets);
+                }
             }
             /* QUIC snapshots can arrive while the original Run is in flight.
                Keep that Run's copied input immutable, then discard its result

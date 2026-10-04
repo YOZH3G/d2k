@@ -202,6 +202,7 @@ static int resource_fixture;
 static int resource_volume_calls, resource_verify_calls;
 
 static int vol_rx_packets; /* задача 55: пакеты на обрыве identity */
+static int vol_rx_packet_only; /* gzip оборван на том же бюджете пакетов */
 static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
                                int plain, int tls12, size_t hello_wire,
                                uint32_t mark) {
@@ -223,7 +224,7 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     r.rx_at_kb = vol_rx_at_kb;
     r.rx_cut_packets = vol_rx_cut ? vol_rx_packets : 0;
     r.rx_expected_kb = 96;
-    r.rx_compressed_complete = vol_rx_cut;
+    r.rx_compressed_complete = vol_rx_cut && !vol_rx_packet_only;
     if (resource_fixture) {
         r.n_resources = 1;
         strcpy(r.resources[0].host, "assets.example");
@@ -3395,6 +3396,39 @@ int main(int argc, char **argv) {
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c18);
+    }
+
+    /* ПОЛЕ 04.10, rua.gr: два поздних закрытия подтвердили подозрение,
+       RX-пара: identity 22229/22280 и gzip 20817 оборваны на одном бюджете
+       пакетов (~25). Это примета коробки — дальше обычный поиск планов
+       (RX-лестница fake-first), а не «не подтвердилось» и отдых. */
+    {
+        d2k_catalog cr = {0};
+        d2k_sched *s = d2k_sched_new(&cr, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = ver_calls = 0;
+        vol_answer = D2K_VOL_PASSED;
+        vol_rx_cut = 1; vol_rx_packet_only = 1; vol_rx_packets = 25; vol_rx_at_kb = 21;
+        const char *name = "rua.packet.example";
+        for (uint16_t port = 41060; port <= 41061; port++) {
+            d2k_ev hh = ev_hello(6, port, name);
+            d2k_sched_event(s, &hh);
+            d2k_ev rr = ev_suspect(6, port);
+            rr.code = D2K_SUSPECT_RST_AFTER_APP;
+            d2k_sched_event(s, &rr);
+        }
+        settle(s); spin(s, 200);
+        CHECK(vol_calls >= 1, "rua.gr: RX-пара позднего закрытия не началась");
+        CHECK(!said("позднее закрытие не подтвердилось"),
+              "rua.gr: пакетный бюджет identity+gzip прочитан как «не подтвердилось»");
+        CHECK(said("подтверждён пакетный бюджет потока"),
+              "rua.gr: пакетная примета коробки не названа");
+        CHECK(said("fake-SNI") && said("поставил план 1 из"),
+              "rua.gr: после пакетной приметы не начат поиск fake-first кандидатов");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&cr);
+        vol_rx_cut = 0; vol_rx_packet_only = 0; vol_rx_packets = 0; vol_rx_at_kb = 24;
     }
 
     /* ЗАДАЧА 50. Повтор FIN без ответа на потоке БЕЗ плана (глухой обрыв
