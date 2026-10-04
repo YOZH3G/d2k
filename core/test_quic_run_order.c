@@ -286,7 +286,7 @@ int main(void) {
     CHECK(arm.len==D2K_QUIC_BENIGN_LEN && arm.copies==1 && strategy_calls==1 && data_calls==1);
     CHECK(fragment_calls==0 && first_prefix==0);
     CHECK(r.qprops.junk_ahead==D2K_PROP_YES && r.qtrace[0].sent==0);
-    /* Оба «нет»: обход не найден, приманки не перебираются. */
+    /* Оба «нет», фрагменты проходят: план из ответа фрагментации. */
     memset(&arm,0,sizeof arm);
     calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='N';
     r=d2k_quic_run("127.0.0.1",443,"target.example",

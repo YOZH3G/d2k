@@ -5,8 +5,10 @@
  *      четвёрке, затем наш Initial; да → план «одна безобидная датаграмма
  *      перед Initial», перебора нет;
  *   2. разрез ClientHello на кадры CRYPTO; да → план разреза.
- * Оба «нет» → «обход по QUIC не найден» без перебора. Перебор приманок
- * (askArms) — только когда ответ не получен (неизмеримо). Вопрос
+ * Оба «нет» и фрагменты не прошли → перебор приманок askArms без уже
+ * заданных вопросов (поле 04.10, rutracker.org: «нет» на оба вопроса не
+ * значит, что приманки бесполезны). Перебор приманок (askArms) — и когда
+ * ответ не получен (неизмеримо). Вопрос
  * повторяется один раз, пока исход не решающий (правило задачи 35).
  */
 #include <stdio.h>
@@ -23,6 +25,8 @@ static const char *ans_clear, *ans_split;
 static int i_clear, i_split, ladder_calls, ladder_pass, marked_ok;
 /* Круг 1: форма фрагментации, которая проходит (0 — фрагменты не доживают). */
 static int frag_ok_shape;
+/* Поле 02.10 rutracker.org: из приманок прошла только fake_default_quic ×11. */
+static int fake_ok_blob = -1, fake_ok_copies;
 static d2k_quic_arm_question seen[64];
 
 static char next_answer(const d2k_quic_arm_question *q) {
@@ -44,8 +48,12 @@ static d2k_tally probe(const d2k_quic_arm_question *q, void *u, int *sent) {
     if (!a) {
         ladder_calls++;
         *sent = 3;
+        size_t fl = 0;
+        const uint8_t *fb = fake_ok_blob >= 0 ?
+            d2k_quic_original_blob((size_t)fake_ok_blob, &fl, NULL) : NULL;
         if ((ladder_pass && !q->control && !q->frag) ||
-            (frag_ok_shape && (q->control || q->frag == frag_ok_shape))) t.pass = 3;
+            (frag_ok_shape && (q->control || q->frag == frag_ok_shape)) ||
+            (fb && q->blob == fb && q->copies == fake_ok_copies && !q->ttl && !q->frag)) t.pass = 3;
         else t.fail = 3;
         return t;
     }
@@ -97,15 +105,39 @@ int main(void) {
     CHECK(calls == 2 && r.probes == 6 && data_calls == 1 && ladder_calls == 0);
     CHECK(seen[1].split == 1 && !seen[1].blob_len);
 
-    /* 3. Оба «нет»: приманки не перебираются, но вопросы IP-фрагментации —
-          это вопросы замера, не перебор (круг 1): контроль выживания задан,
-          фрагменты не доживают — обход не найден. */
+    /* 3. Оба «нет», фрагменты не доживают — это ПОЛЕ 04.10, rutracker.org
+          (06:02:30: 0/3, 0/3, 0/3 — «плечо не нашлось за 9 опытов», браузер
+          ушёл на TCP). Эти ответы не говорят о приманках ничего: на том же
+          имени 02.10 21:39 fake_default_quic ×11 прошла 3/3, её план
+          389a3920 — 4/4 полных ответа (task-55-facts §2). Дальше —
+          перебор askArms, но уже заданные вопросы (0x00…0 ×1 и выживание
+          фрагментов) он не повторяет. */
+    fake_ok_blob = 3; fake_ok_copies = 11;
     r = run("N", "N", 0, 1);
-    CHECK(r.kind == D2K_QA_NOT_FOUND && !r.incomplete && r.strategy == D2K_QS_NONE);
-    CHECK(calls == 3 && r.probes == 9 && ladder_calls == 1 && data_calls == 0);
+    CHECK(r.strategy == D2K_QS_LADDER && r.kind == D2K_QA_COPIES && !r.incomplete);
+    CHECK(r.copies == 11 && !r.ttl && !strcmp(r.blob_name, "fake_default_quic"));
+    CHECK(r.clearance == D2K_PROP_NO && r.split_crypto == D2K_PROP_NO);
+    CHECK(r.frag_survives == D2K_PROP_NO && !r.frag_kind);
+    /* 3 вопроса стратегии; приманки ×1 без 0x00…0 (4), копии quic5 ×6/×11 и
+       fake_default_quic ×6/×11 (4), TTL 3/5/8/12 (4); фрагменты — один раз. */
+    CHECK(calls == 3 + 12 && ladder_calls == 1 + 12 && r.n_trace == 15);
+    {
+        int controls = 0, benign = 0;
+        for (int i = 0; i < calls && i < 64; i++) {
+            controls += seen[i].control;
+            benign += seen[i].blob_len == 16 && seen[i].copies == 1 && !seen[i].ttl;
+        }
+        CHECK(controls == 1 && benign == 1);
+    }
+    CHECK(strstr(r.reason, "fake_default_quic") != NULL);
+    fake_ok_blob = -1; fake_ok_copies = 0;
+
+    /* 3в. То же, и приманки не взяли ничего: обход по QUIC не найден, теперь
+          — после перебора, а не вместо него. */
+    r = run("N", "N", 0, 1);
+    CHECK(r.kind == D2K_QA_NOT_FOUND && !r.incomplete && r.strategy == D2K_QS_LADDER);
+    CHECK(calls == 3 + 12 && ladder_calls == 1 + 12 && data_calls == 0);
     CHECK(seen[2].control && r.frag_survives == D2K_PROP_NO);
-    CHECK(strstr(r.reason, "не найден") != NULL);
-    for (int i = 0; i < calls && i < 64; i++) CHECK(!(seen[i].blob_len && !seen[i].benign));
 
     /* 3а. Финальное ревью core, I1: клиенту разрез CRYPTO неприменим
           (ClientHello шире датаграммы). Вопрос о разрезе не задаётся даже
@@ -121,6 +153,7 @@ int main(void) {
         CHECK(i_split == 0 && !r.split_asked && r.split_crypto == D2K_PROP_UNKNOWN);
         for (int i = 0; i < calls && i < 64; i++) CHECK(!seen[i].split);
         CHECK(r.kind == D2K_QA_NOT_FOUND && seen[1].control && strstr(r.reason, "неприменим"));
+        CHECK(r.strategy == D2K_QS_LADDER && calls == 2 + 12);
     }
 
     /* 3б. Оба «нет», фрагменты доживают и форма 3 проходит — план из ответа. */
@@ -133,7 +166,7 @@ int main(void) {
 
     /* 4. Фильтр прошёл, а поток оборван — это решающее «нет», не повтор. */
     r = run("C", "C", 0, 1);
-    CHECK(r.kind == D2K_QA_NOT_FOUND && calls == 3 && data_calls == 2 && ladder_calls == 1);
+    CHECK(r.kind == D2K_QA_NOT_FOUND && calls == 3 + 12 && data_calls == 2 && ladder_calls == 1 + 12);
     CHECK(r.clearance == D2K_PROP_NO && r.split_crypto == D2K_PROP_NO);
 
     /* 5. Неустойчивый ответ — один повтор; решающий второй ответ принимается. */

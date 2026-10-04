@@ -147,8 +147,10 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
     for(size_t i=0;i<4;i++) if(ask(c,&r,decoy,1,ttls[i],0,0,&measured)) {
         chosen=decoy; r.ttl=ttls[i]; break;
     }
-    /* 4. Survival on control precedes every fragmentation arm. */
-    ask_frag(c,&r);
+    /* 4. Survival on control precedes every fragmentation arm. Уже заданные
+       стратегией (оба её ответа «нет») вопросы фрагментации не повторяются:
+       их исход тот же, и он уже в трассе. */
+    if(!(c && c->frag_answered)) ask_frag(c,&r);
     if(chosen>=0) {
         const char *name="";
         const uint8_t *blob=d2k_quic_original_blob((size_t)chosen,&r.len,&name);
@@ -227,42 +229,45 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
             snprintf(r.reason,sizeof r.reason,
                      "разрез ClientHello на два кадра CRYPTO проходит (остаточное разрешение: %s)",
                      prop_word(r.clearance));
-        } else if(r.clearance==D2K_PROP_NO && (r.split_crypto==D2K_PROP_NO || no_split)) {
-            /* Перебор приманок не нужен, но IP-фрагментация — отдельные
-               вопросы замера (круг 1): задаются, и при ответе «да» план
-               собирается из него. */
-            r.incomplete=0;
-            ask_frag(c,&r);
-            if(r.frag_kind) {
-                r.kind=D2K_QA_FRAG; r.strategy=D2K_QS_FRAG;
-                snprintf(r.reason,sizeof r.reason,
-                         "разрешение не прошло, разрез CRYPTO %s; IP-фрагментация формы %d прошла "
-                         "(приманки не перебирались)",
-                         no_split ? "клиенту неприменим (ClientHello шире датаграммы)" : "не прошёл",
-                         r.frag_kind);
-            } else {
-                const char *fw = r.frag_survives==D2K_PROP_NO ? "фрагменты не доживают" :
-                                 r.frag_survives==D2K_PROP_YES ? "ни одна форма" : "не измерена";
-                if(no_split)
-                    snprintf(r.reason,sizeof r.reason,
-                             "обход по QUIC не найден: разрешение и фрагменты (%s) не прошли, "
-                             "разрез CRYPTO клиенту неприменим; браузер уйдёт на TCP", fw);
-                else
-                    snprintf(r.reason,sizeof r.reason,
-                             "обход по QUIC не найден: разрешение, разрез CRYPTO и фрагменты (%s) "
-                             "не прошли; приманки не перебираются, браузер уйдёт на TCP", fw);
-            }
         } else {
-            /* Неизмеримо: запасной путь — перебор приманок оригинала. */
+            /* Оба «нет» — вопросы IP-фрагментации задаются (круг 1); форма,
+               что прошла, и есть план. Не прошла ни одна — перебор приманок
+               askArms. Прежде (задача 40) он здесь не запускался: «нет» на
+               безобидную датаграмму и на разрез читалось как «приманки
+               бесполезны». Поле это опровергло: rutracker.org 04.10 — 0/3,
+               0/3, фрагменты 0/3, «обход по QUIC не найден», а на том же
+               имени 02.10 fake_default_quic ×11 прошла 3/3, и её план
+               389a3920 отдаёт ответы целиком 4/4 (task-55-facts §2). Ответы
+               стратегии говорят о безобидной датаграмме и о разрезе, не о
+               фальшивом Initial. */
+            int both_no=r.clearance==D2K_PROP_NO && (r.split_crypto==D2K_PROP_NO || no_split);
+            if(both_no) {
+                r.incomplete=0;
+                ask_frag(c,&r);
+                if(r.frag_kind) {
+                    r.kind=D2K_QA_FRAG; r.strategy=D2K_QS_FRAG;
+                    snprintf(r.reason,sizeof r.reason,
+                             "разрешение не прошло, разрез CRYPTO %s; IP-фрагментация формы %d прошла "
+                             "(приманки не перебирались)",
+                             no_split ? "клиенту неприменим (ClientHello шире датаграммы)" : "не прошёл",
+                             r.frag_kind);
+                    if(c && !c->marked) r.kind=D2K_QA_FLAKY;
+                    return r;
+                }
+            }
+            /* Запасной путь — перебор приманок оригинала: и при неизмеримом
+               ответе, и после двух «нет». */
             int strategy_incomplete=r.incomplete;
             d2k_quic_arm_context local=*c;
             local.benign_answered=r.clearance_asked;
+            local.frag_answered=both_no;
             d2k_quic_arm l=d2k_quic_original_arms(&local);
             c->next=local.next; c->marked=local.marked;
             size_t head=r.n_trace;
             int probes=r.probes;
             int8_t cl=r.clearance, sp=r.split_crypto;
             int8_t cla=r.clearance_asked, spa=r.split_asked;
+            int8_t fs=r.frag_survives;
             d2k_quic_arm_step steps[D2K_QUIC_ARM_STEPS];
             memcpy(steps,r.trace,head*sizeof steps[0]);
             r=l;
@@ -274,13 +279,22 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
             r.probes+=probes;
             r.clearance=cl; r.split_crypto=sp;
             r.clearance_asked=cla; r.split_asked=spa;
+            if(both_no) r.frag_survives=fs;
             r.strategy=D2K_QS_LADDER;
             r.incomplete=r.incomplete||strategy_incomplete||take<l.n_trace;
             /* Причина перебора — его собственная строка, урезанная так,
                чтобы вместе с заголовком влезть в r.reason. */
-            snprintf(r.reason,sizeof r.reason,
-                     "ответа нет (разрешение: %s, разрез CRYPTO: %s) — запасной перебор: %.90s",
-                     prop_word(cl),prop_word(sp),l.reason);
+            if(both_no) {
+                const char *fw = fs==D2K_PROP_NO ? "фрагм. не доживают" :
+                                 fs==D2K_PROP_YES ? "фрагм. не прошли" : "фрагм. не измерены";
+                snprintf(r.reason,sizeof r.reason,
+                         "разрешение: нет, разрез CRYPTO: %s, %s — перебор приманок: %.90s",
+                         no_split ? "неприменим" : "нет", fw, l.reason);
+            } else {
+                snprintf(r.reason,sizeof r.reason,
+                         "ответа нет (разрешение: %s, разрез CRYPTO: %s) — запасной перебор: %.90s",
+                         prop_word(cl),prop_word(sp),l.reason);
+            }
             return r;
         }
     }
