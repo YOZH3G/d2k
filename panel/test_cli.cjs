@@ -38,7 +38,11 @@ async function main() {
   const configPath = path.join(temp, 'config');
   const servicePath = path.join(temp, 'slow-service');
   fs.writeFileSync(servicePath, '#!/bin/sh\nsleep 1\nexit 7\n', { mode: 0o700 });
-  fs.writeFileSync(configPath,
+  // The shipped config comes first: every key the installer writes must be
+  // known to the panel (field 04.10: D2K_PPE_DEOFFLOAD showed up as
+  // «Непонятные ключи — эта сборка их не читает» for every user).
+  const shipped = fs.readFileSync(path.join(__dirname, '../files/config'), 'utf8');
+  fs.writeFileSync(configPath, shipped +
     `MODE=apply\nPANEL_LISTEN=0.0.0.0:${port}\nSTATE_DIR=${stateDir}\nQUEUE_NUM=4321\nFUTURE_OPTION=preserve-me\n`);
   const child = spawn(exe, [
     'serve', '--config', configPath,
