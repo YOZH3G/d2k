@@ -59,6 +59,52 @@ static uint32_t addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 
 int main(void) {
     {
+        /* Issue #2: a new ECH/GREASE member inherits the learned TLS 1.3
+           suffix, while dedicated ECH families and exceptions keep priority. */
+        const uint8_t root[] = "discord.media", child[] = "new.discord.media";
+        const uint8_t narrow[] = "region.discord.media", leaf[] = "new.region.discord.media";
+        for (uint8_t family = 4; family <= 6; family += 2) {
+            d2k_plantab *t = d2k_plantab_new(8);
+            d2k_plan *modern = mkplan(), *ech = mkplan(), *specific = mkplan();
+            CHECK(t && modern && ech && specific, "suffix ECH fixture");
+            CHECK(!d2k_plantab_set_suffix_family(t, root, sizeof root-1, 1,
+                  modern, D2K_PLAN_SHAPE_MODERN, family), "learned TLS13 suffix");
+            CHECK(d2k_plantab_find_family(t, child, sizeof child-1, 0, 2,
+                  D2K_PLAN_SHAPE_ECH_TCP, 0, family) == modern,
+                  "new ECH/GREASE member inherits TLS13 suffix on first lookup");
+            CHECK(!d2k_plantab_has_ech_target(t, child, sizeof child-1, NULL, family, 0),
+                  "TLS13 fallback does not claim dedicated ECH evidence");
+            CHECK(!d2k_plantab_find_family(t, child, sizeof child-1, 0, 2,
+                  D2K_PLAN_SHAPE_LEGACY, 0, family), "TLS13 suffix never leaks to TLS12");
+            CHECK(!d2k_plantab_set_suffix_family(t, narrow, sizeof narrow-1, 2,
+                  specific, D2K_PLAN_SHAPE_MODERN, family), "narrow TLS13 suffix");
+            CHECK(d2k_plantab_find_family(t, leaf, sizeof leaf-1, 0, 3,
+                  D2K_PLAN_SHAPE_ECH_TCP, 0, family) == specific,
+                  "ECH fallback preserves longest suffix");
+            CHECK(!d2k_plantab_set_suffix_family(t, root, sizeof root-1, 3,
+                  ech, D2K_PLAN_SHAPE_ECH_TCP, family), "dedicated ECH suffix");
+            CHECK(d2k_plantab_find_family(t, leaf, sizeof leaf-1, 0, 4,
+                  D2K_PLAN_SHAPE_ECH_TCP, 0, family) == ech,
+                  "dedicated ECH suffix precedes even narrower TLS13 fallback");
+            CHECK(d2k_plantab_find_family(t, child, sizeof child-1, 0, 4,
+                  D2K_PLAN_SHAPE_MODERN, 0, family) == modern,
+                  "ECH suffix does not replace ordinary TLS13 family");
+            CHECK(d2k_plantab_del_suffix_family(t, root, sizeof root-1, 6,
+                  D2K_PLAN_SHAPE_ECH_TCP, family) == 1, "remove dedicated ECH suffix");
+            CHECK(!d2k_plantab_set_bypass_family(t, child, sizeof child-1, 6,
+                  D2K_PLAN_SHAPE_ECH_TCP, family), "ECH-specific exception");
+            CHECK(!d2k_plantab_find_family(t, child, sizeof child-1, 0, 5,
+                  D2K_PLAN_SHAPE_ECH_TCP, 0, family), "ECH bypass blocks TLS13 fallback");
+            CHECK(d2k_plantab_del_bypass_family(t, child, sizeof child-1, 6,
+                  D2K_PLAN_SHAPE_ECH_TCP, family) == 1, "remove ECH exception");
+            CHECK(!d2k_plantab_set_bypass_family(t, child, sizeof child-1, 6,
+                  D2K_PLAN_SHAPE_MODERN, family), "TLS13 family exception");
+            CHECK(!d2k_plantab_find_family(t, child, sizeof child-1, 0, 6,
+                  D2K_PLAN_SHAPE_ECH_TCP, 0, family), "TLS13 bypass also blocks inherited fallback");
+            d2k_plantab_free(t);
+        }
+    }
+    {
         d2k_plantab *t = d2k_plantab_new(1);
         char name[64];
         for (size_t i = 0; i < D2K_PLAN_SUFFIX_MAX; i++) {

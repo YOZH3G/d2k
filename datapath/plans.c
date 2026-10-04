@@ -1082,6 +1082,14 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
         }
         if (!e) {
             const area_entry *area = area_match(t, name, len, seen_shape, family);
+            /* ECH offers (including GREASE) retain the ordinary TLS 1.3
+               suffix fallback, just like exact-name/address lookup. A
+               dedicated ECH family wins; neither family's exception may
+               be bypassed by inheriting the ordinary family instead. */
+            if (!area && seen_shape == D2K_PLAN_SHAPE_ECH_TCP) {
+                if (area_bypassed(t, name, len, D2K_PLAN_SHAPE_MODERN, family)) return NULL;
+                area = area_match(t, name, len, D2K_PLAN_SHAPE_MODERN, family);
+            }
             if (area) return area->plan;
             /* Имя знаем, а формы такой у него нет — это отдельный факт, см.
                счётчик ниже. */
