@@ -40,12 +40,34 @@ done
 for t in ipset openssl; do
     command -v "$t" >/dev/null 2>&1 || die "нет $t — нужен для Telegram/Instagram; поставьте зависимости из README"
 done
+# Модули netfilter прошивка часто держит файлами, но не загружает: в /proc
+# видны только загруженные (Keenetic; Netis N6 04.10 — xt_connbytes ожил от
+# modprobe). Установщик загружает их сам тем же способом, что S99d2k при
+# старте, и только потом проверяет.
+MODULES_DIR=${D2K_MODULES_DIR:-/lib/modules}
+load_kmod() {
+    modprobe "$1" 2>/dev/null && return 0
+    kver=$(uname -r 2>/dev/null)
+    ko=
+    for d in "$MODULES_DIR/$kver" "$MODULES_DIR"; do
+        [ -f "$d/$1.ko" ] && { ko="$d/$1.ko"; break; }
+    done
+    [ -n "$ko" ] || ko=$(find "$MODULES_DIR" -name "$1.ko" -type f 2>/dev/null | head -1)
+    if [ -n "$ko" ]; then insmod "$ko" 2>/dev/null || true; fi
+    # Всегда 0: под set -e неудача последней команды в «a || load_kmod»
+    # оборвала бы установщик без объяснения; итог проверяется строкой ниже.
+    return 0
+}
+NF_HINT="модуль не найден в прошивке; на Keenetic установите компонент «Модули ядра подсистемы Netfilter»"
+[ -e /proc/net/netfilter/nfnetlink_queue ] || { load_kmod nfnetlink; load_kmod nfnetlink_queue; }
 [ -e /proc/net/netfilter/nfnetlink_queue ] || \
-    die "ядро без nfnetlink_queue — d2k работать не сможет"
+    die "ядро без nfnetlink_queue — $NF_HINT"
+grep -qw NFQUEUE /proc/net/ip_tables_targets 2>/dev/null || load_kmod xt_NFQUEUE
 grep -qw NFQUEUE /proc/net/ip_tables_targets 2>/dev/null || \
-    die "в iptables нет цели NFQUEUE"
+    die "в iptables нет цели NFQUEUE — $NF_HINT"
+grep -qw connbytes /proc/net/ip_tables_matches 2>/dev/null || load_kmod xt_connbytes
 grep -qw connbytes /proc/net/ip_tables_matches 2>/dev/null || \
-    die "в iptables нет совпадения connbytes"
+    die "в iptables нет совпадения connbytes — $NF_HINT"
 
 # --- загрузка во временное место -----------------------------------------
 #

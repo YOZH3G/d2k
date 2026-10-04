@@ -103,8 +103,32 @@ exit 1
   assert.notEqual(stale.status, 0, 'installer must reject a d2ktg without the Meta host list check');
   assert.match(stale.stdout + stale.stderr, /d2ktg устарел/);
   fs.writeFileSync(tgFixture, tgCurrent);
+  // Netis N6 (MT7621, field 04.10): xt_connbytes ships as a module file but is
+  // not loaded, and /proc/net/ip_tables_matches lists only loaded matches. The
+  // installer loads it itself — modprobe first, then insmod of the firmware file.
+  const matches = path.join(tmp, 'proc/net/ip_tables_matches');
+  const loadStubs = ['modprobe', 'insmod', 'uname'].map((n) => path.join(tmp, 'bin', n));
+  fs.writeFileSync(loadStubs[0], `#!/bin/sh\n[ "$1" = xt_connbytes ] && [ "\${MODPROBE_OK:-0}" = 1 ] && { echo connbytes >> '${matches}'; exit 0; }\nexit 1\n`, { mode: 0o755 });
+  fs.writeFileSync(loadStubs[1], `#!/bin/sh\ncase "$1" in */xt_connbytes.ko) echo connbytes >> '${matches}'; exit 0 ;; esac\nexit 1\n`, { mode: 0o755 });
+  fs.writeFileSync(loadStubs[2], '#!/bin/sh\n[ "$1" = -r ] && { echo 9.9-test; exit 0; }\nexec /usr/bin/uname "$@"\n', { mode: 0o755 });
+  fs.writeFileSync(matches, '');
+  run('install', { MODPROBE_OK: '1' });
+  assert.match(fs.readFileSync(matches, 'utf8'), /connbytes/, 'installer must modprobe an unloaded xt_connbytes');
+  const modsDir = path.join(tmp, 'mods');
+  fs.mkdirSync(path.join(modsDir, '9.9-test'), { recursive: true });
+  fs.writeFileSync(path.join(modsDir, '9.9-test/xt_connbytes.ko'), '');
+  fs.writeFileSync(matches, '');
+  run('install', { D2K_MODULES_DIR: modsDir });
+  assert.match(fs.readFileSync(matches, 'utf8'), /connbytes/, 'installer must insmod xt_connbytes from the firmware tree when modprobe fails');
+  fs.rmSync(path.join(modsDir, '9.9-test/xt_connbytes.ko'));
+  fs.writeFileSync(matches, '');
+  const noModule = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env: { ...env, D2K_MODULES_DIR: modsDir }, encoding: 'utf8', timeout: 10000 });
+  assert.notEqual(noModule.status, 0, 'installer must stop when xt_connbytes is absent from the firmware');
+  assert.match(noModule.stdout + noModule.stderr, /Модули ядра подсистемы Netfilter/, 'the refusal must name what to install');
+  for (const stub of loadStubs) fs.unlinkSync(stub);
+  fs.writeFileSync(matches, 'connbytes\n');
   run('install');
-  const installed = path.join(tmp, 'opt/d2k/d2k-log-maintenance.sh');
+  const installed =path.join(tmp, 'opt/d2k/d2k-log-maintenance.sh');
   assert.deepEqual(fs.readFileSync(installed), fs.readFileSync(path.join(root, 'files/d2k-log-maintenance.sh')), 'installer must fetch and install helper');
   assert(fs.statSync(installed).mode & 0o111, 'installed helper must be executable');
   const ppe = path.join(tmp, 'opt/d2k/d2k-ppe-deoffload.sh');
