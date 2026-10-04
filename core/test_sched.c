@@ -12089,12 +12089,18 @@ own_first_test:
             saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
             base_calls = tcp_calls = ver_calls = 0;
+            drain(); forget_sent();
             d2k_ev h = ev_hello(6, 42131, "modern.mix-target.own"); d2k_sched_event(s, &h);
             d2k_ev su = ev_suspect(6, 42131); d2k_sched_event(s, &su);
             settle(s);
-            CHECK(base_calls == 0 && tcp_calls == 1 && ver_calls == 0 &&
-                  !said("пробую свои подтверждённые"),
-                  "own-first: TLS 1.3-цели предложены планы другой формы/транспорта/семейства "
+            /* План формы 1.2 — гипотеза для клиента 1.3 (поле 04.10, решение
+               координатора): предлагается, но один — QUIC, другое семейство,
+               помеченный к перепроверке и выключенный не предлагаются. */
+            CHECK(base_calls == 1 && tcp_calls == 1 &&
+                  said("пробую свои подтверждённые планы до полного замера: 1") &&
+                  sent_first_split_index(21) == 0 && sent_first_split_index(23) < 0 &&
+                  sent_first_split_index(24) < 0 && sent_first_split_index(25) < 0,
+                  "own-first: TLS 1.3-цели предложены планы другого транспорта/семейства "
                   "или помеченные к перепроверке");
             /* Тот же каталог, клиент TLS 1.2: берётся только план формы 1.2. */
             saidbuf[0] = '\0';
@@ -12160,11 +12166,11 @@ own_first_test:
             settle(s);
             d2k_ev ap = ev_applied(6, 42171); d2k_sched_event(s, &ap);
             spin(s, 40);
-            CHECK(!said("пробую свои подтверждённые планы") && base_calls == 0,
-                  "shape f1: клиенту TLS 1.2 предложен свой план формы TLS 1.3");
-            CHECK(tcp_calls >= 1 &&
-                  d2k_hello_shape(tcp_last_trig, tcp_last_wire) == D2K_SHAPE_LEGACY,
-                  "shape f1: замер клиента TLS 1.2 шёл приветствием другой формы");
+            /* С 04.10 (решение координатора) план формы 1.3 предлагается
+               клиенту 1.2 гипотезой — но испытывается зондом TLS 1.2 и
+               привязывается формой 1.2 (см. g1). */
+            CHECK(ver_calls >= 1 && ver_last_shape == (uint8_t)D2K_SHAPE_LEGACY,
+                  "shape f1: клиенту TLS 1.2 план испытан зондом другой формы");
             CHECK(binding_shape(&c, "updates.app.own", 6, D2K_SHAPE_MODERN) == NULL,
                   "shape f1: клиенту TLS 1.2 записана привязка формы TLS 1.3");
             if (fails) fprintf(stderr, "%s\n", saidbuf);
@@ -12186,6 +12192,7 @@ own_first_test:
             saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
             base_calls = tcp_calls = ver_calls = 0; ver_last_shape = 0;
+            drain(); forget_sent();
             ver_answer_port = 42172;
             d2k_ev h = ev_hello(6, 42172, "updates.app2.own"); d2k_sched_event(s, &h);
             d2k_ev su = ev_suspect(6, 42172); su.client_shape = D2K_SHAPE_LEGACY;
@@ -12198,8 +12205,9 @@ own_first_test:
             settle(s);
             d2k_ev ap = ev_applied(6, 42172); d2k_sched_event(s, &ap);
             spin(s, 40);
-            CHECK(base_calls == 1 && said("пробую свои подтверждённые планы до полного замера: 1"),
-                  "shape f2: клиенту TLS 1.2 не предложен свой план формы TLS 1.2");
+            CHECK(base_calls == 1 && said("пробую свои подтверждённые планы до полного замера: 2") &&
+                  sent_first_split_index(43) == 0,
+                  "shape f2: клиенту TLS 1.2 свой план формы TLS 1.2 предложен не первым");
             CHECK(ver_calls >= 1 && ver_last_shape == (uint8_t)D2K_SHAPE_LEGACY,
                   "shape f2: свой план испытан не зондом TLS 1.2");
             const d2k_cat_binding *lg = binding_shape(&c, "updates.app2.own", 6, D2K_SHAPE_LEGACY);
@@ -12260,6 +12268,87 @@ own_first_test:
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
             d2k_sched_rx_ver_hook = saved_rx;
+        }
+        /* (g) ПОЛЕ 04.10.2026, 11:39: апдейтер Discord уже мерится своей
+           формой TLS 1.2, но фейк-первый plan-680fbe00, рабочий на этой
+           коробке для discord.com и rutracker, привязан только формой 1.3 —
+           own_first_plans его не предлагал, поиск кончился «выведенные планы
+           исчерпаны». Решение координатора: свои планы ДРУГОЙ формы TCP-TLS
+           (1.3 <-> 1.2) — гипотезы ПОСЛЕ планов своей формы; проверяются
+           зондом формы клиента и проверкой бюджета, привязка — формой
+           клиента. TCP<->QUIC, ECH и HTTP не пересекаются. */
+        {
+            /* (g1) На коробке только план формы 1.3 — клиенту 1.2 он
+               испытывается зондом TLS 1.2 и привязывается формой 1.2. */
+            d2k_catalog c = {0};
+            char pm[40], pq[40];
+            own_box(&c, "box-cross-modern", pm, 51, 3, "rutracker.cross.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            own_box(&c, "box-cross-quic", pq, 52, 9, "quic.cross.own", 17, D2K_LINK_SHAPE_QUIC, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1; ver_fail_first = 0;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = 0; ver_last_shape = 0;
+            drain(); forget_sent();
+            ver_answer_port = 42181;
+            d2k_ev h = ev_hello(6, 42181, "updates.cross.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42181); su.client_shape = D2K_SHAPE_LEGACY;
+            d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 42181); d2k_sched_event(s, &ap);
+            spin(s, 40);
+            CHECK(base_calls == 1 && said("пробую свои подтверждённые планы до полного замера: 1"),
+                  "shape g1: план формы 1.3 не предложен клиенту 1.2 гипотезой");
+            CHECK(tcp_calls == 0 && ver_calls >= 1 && ver_last_shape == (uint8_t)D2K_SHAPE_LEGACY,
+                  "shape g1: гипотеза другой формы испытана не зондом TLS 1.2");
+            const d2k_cat_binding *lg = binding_shape(&c, "updates.cross.own", 6, D2K_SHAPE_LEGACY);
+            CHECK(lg != NULL && !strcmp(lg->plan_id, pm) && lg->level >= 3,
+                  "shape g1: подтверждённая гипотеза привязана не формой клиента 1.2");
+            CHECK(binding_shape(&c, "updates.cross.own", 6, D2K_SHAPE_MODERN) == NULL,
+                  "shape g1: клиенту 1.2 записана привязка формы 1.3");
+            CHECK(said_count("поставил план") == 1,
+                  "shape g1: TCP-клиенту предложен план QUIC");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+        {
+            /* (g2) Планы своей формы — первыми, даже при большем числе
+               успехов у плана другой формы; гипотеза другой формы — после. */
+            d2k_catalog c = {0};
+            char pm[40], pl[40];
+            own_box(&c, "box-order-modern", pm, 53, 9, "modern.order.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000900, 0);
+            own_box(&c, "box-order-legacy", pl, 54, 1, "legacy.order.own", 6, D2K_SHAPE_LEGACY, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_INCONCLUSIVE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1; ver_fail_first = 1;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = 0; ver_last_shape = 0;
+            drain(); forget_sent();
+            ver_answer_port = 42182;
+            d2k_ev h = ev_hello(6, 42182, "updates.order.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42182); su.client_shape = D2K_SHAPE_LEGACY;
+            d2k_sched_event(s, &su);
+            for (int i = 0; i < 40 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 200);
+                d2k_ev ap = ev_applied(6, 42182); d2k_sched_event(s, &ap);
+            }
+            spin(s, 40);
+            CHECK(said("пробую свои подтверждённые планы до полного замера: 2"),
+                  "shape g2: в своих планах нет обеих форм");
+            CHECK(sent_first_split_index(54) == 0 && sent_first_split_index(53) == 1,
+                  "shape g2: гипотеза другой формы испытана раньше плана своей формы");
+            const d2k_cat_binding *lg = binding_shape(&c, "updates.order.own", 6, D2K_SHAPE_LEGACY);
+            CHECK(lg != NULL && !strcmp(lg->plan_id, pm) && ver_last_shape == (uint8_t)D2K_SHAPE_LEGACY,
+                  "shape g2: гипотеза другой формы не подтверждена формой клиента");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_fail_first = 0;
         }
 
         /* (e) База донора не показала блокировки рукопожатия — своих планов

@@ -3843,6 +3843,17 @@ static int bound_plan_here(const d2k_sched *s, const task *t, uint8_t shape,
     return 0;
 }
 
+/* ПОРЯДОК СВОИХ ПЛАНОВ: план, под которым шёл поток подозрения; затем планы
+   формы клиента; затем гипотезы другой формы TLS по TCP. Внутри группы —
+   число успехов, затем свежесть подтверждения. */
+static int own_rank_before(int lead_a, int tier_a, const d2k_cat_plan *a, int64_t fresh_a,
+                           int lead_b, int tier_b, const d2k_cat_plan *b, int64_t fresh_b) {
+    if (lead_a != lead_b) return lead_a > lead_b;
+    if (tier_a != tier_b) return tier_a < tier_b;
+    if (a->successes != b->successes) return a->successes > b->successes;
+    return fresh_a > fresh_b;
+}
+
 static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
     if (!s->cat || (t->transport != 6 && t->transport != 17) || t->by_addr || t->ech_offer)
         return 0;
@@ -3856,7 +3867,19 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
     const d2k_cat_box *owner[SCHED_MAX_PLANS];
     int64_t fresh[SCHED_MAX_PLANS];
     int first[SCHED_MAX_PLANS];
+    int tiers[SCHED_MAX_PLANS];
     size_t n = 0;
+    /* ГИПОТЕЗЫ ДРУГОЙ ФОРМЫ TLS (поле 04.10.2026, апдейтер Discord TLS 1.2):
+       фейк-первый план, рабочий на этой коробке для discord.com и rutracker,
+       был привязан только формой 1.3, и клиенту 1.2 его не предлагали —
+       поиск кончился «выведенные планы исчерпаны». Подтверждение другой
+       формы — не доказательство для этой (U5), но гипотеза: испытывается
+       ПОСЛЕ планов своей формы, зондом формы клиента (TLS 1.2 —
+       d2k_verify_probe12_on) с проверкой бюджета, и привязка ложится формой
+       клиента (record_shape). Только TLS 1.3 <-> TLS 1.2 по TCP: QUIC, ECH и
+       HTTP не пересекаются. */
+    uint8_t cross = quic ? 0 : want == D2K_SHAPE_LEGACY ? (uint8_t)D2K_SHAPE_MODERN :
+                    want == D2K_SHAPE_MODERN ? (uint8_t)D2K_SHAPE_LEGACY : 0;
     /* Подозрение с потока ПОД планом: этот план не исключается вслепую, а
        испытывается ПЕРВЫМ с проверкой бюджета (задача 55, §2.3). Прошёл —
        подозрение было ложным; оборвался — дальше по порядку. */
@@ -3879,7 +3902,7 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
             const d2k_cat_plan *p = &b->plans[i];
             if (!p->enabled || !p->text || strcmp(p->proto, quic ? "quic" : "tls") ||
                 strlen(p->text) >= sizeof t->plans[0]) continue;
-            int found = 0;
+            int found = 0, tier = 1;
             int64_t newest = 0;
             for (size_t j = 0; j < b->n_binds; j++) {
                 const d2k_cat_binding *bd = &b->binds[j];
@@ -3887,11 +3910,13 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
                     bd->recheck_since || strcmp(bd->kind, "name") ||
                     (bd->transport ? bd->transport : 6) != t->transport ||
                     (bd->family ? bd->family : 4) != t->family ||
-                    bd->shape != want || bd->ech_origin[0] ||
+                    (bd->shape != want && (!cross || bd->shape != cross)) || bd->ech_origin[0] ||
                     /* У QUIC подтверждение — только собственным зондом (H3):
                        «UDP + CLIENT» — любой обратный пакет, не доказательство. */
                     (quic && bd->verified_by != D2K_VERBY_PROBE)) continue;
-                if (!found || bd->confirmed > newest) newest = bd->confirmed;
+                int bt = bd->shape == want ? 0 : 1;
+                if (!found || bt < tier) { tier = bt; newest = bd->confirmed; }
+                else if (bt == tier && bd->confirmed > newest) newest = bd->confirmed;
                 found = 1;
             }
             if (!found) continue;
@@ -3910,30 +3935,27 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
             /* Тот же текст в другой коробке — тот же план: остаётся лучший. */
             size_t dup = n;
             for (size_t k = 0; k < n; k++) if (!strcmp(pick[k]->text, p->text)) dup = k;
-            int better_than_dup = dup < n && (lead > first[dup] ||
-                (lead == first[dup] && (p->successes > pick[dup]->successes ||
-                (p->successes == pick[dup]->successes && newest > fresh[dup]))));
+            int better_than_dup = dup < n &&
+                own_rank_before(lead, tier, p, newest, first[dup], tiers[dup], pick[dup], fresh[dup]);
             if (dup < n && !better_than_dup) continue;
             if (dup < n) {
                 for (size_t k = dup; k + 1 < n; k++) {
                     pick[k] = pick[k + 1]; owner[k] = owner[k + 1]; fresh[k] = fresh[k + 1];
-                    first[k] = first[k + 1];
+                    first[k] = first[k + 1]; tiers[k] = tiers[k + 1];
                 }
                 n--;
             }
             size_t at = n;
-            while (at > 0 && (lead > first[at - 1] ||
-                              (lead == first[at - 1] &&
-                               (p->successes > pick[at - 1]->successes ||
-                                (p->successes == pick[at - 1]->successes && newest > fresh[at - 1])))))
+            while (at > 0 && own_rank_before(lead, tier, p, newest, first[at - 1], tiers[at - 1],
+                                             pick[at - 1], fresh[at - 1]))
                 at--;
             if (at >= SCHED_MAX_PLANS) continue;
             if (n == SCHED_MAX_PLANS) n--;
             for (size_t k = n; k > at; k--) {
                 pick[k] = pick[k - 1]; owner[k] = owner[k - 1]; fresh[k] = fresh[k - 1];
-                first[k] = first[k - 1];
+                first[k] = first[k - 1]; tiers[k] = tiers[k - 1];
             }
-            pick[at] = p; owner[at] = b; fresh[at] = newest; first[at] = lead;
+            pick[at] = p; owner[at] = b; fresh[at] = newest; first[at] = lead; tiers[at] = tier;
             n++;
         }
     }
