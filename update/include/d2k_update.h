@@ -13,6 +13,9 @@
 #define D2KU_NOTES_MAX 16384u
 #define D2KU_VERSION_MAX 64u
 #define D2KU_ABI_MAX 8u
+#define D2KU_HOSTS_MAX 8u
+#define D2KU_HOST_MAX 253u
+#define D2KU_CA_PATH_MAX 1024u
 
 typedef enum { D2KU_OK, D2KU_INVALID, D2KU_UNTRUSTED, D2KU_EXPIRED,
     D2KU_REPLAY, D2KU_INCOMPATIBLE, D2KU_BUSY, D2KU_IO, D2KU_NETWORK,
@@ -39,6 +42,11 @@ typedef struct {
 struct d2ku_ctx {
     int root_dirfd; /* production: verified /opt/d2k dirfd */
     d2ku_clock clock;
+    /* Bootstrap-owned HTTPS policy, never supplied by HTTP requests. */
+    char transport_hosts[D2KU_HOSTS_MAX][D2KU_HOST_MAX + 1];
+    size_t transport_host_count;
+    char ca_bundle[D2KU_CA_PATH_MAX + 1]; /* installed system trust bundle */
+    int staging_dirfd; /* caller-created private empty directory, not active */
     char abi[D2KU_ABI_MAX + 1];
     uint64_t updater_version, wire_version, state_version;
     d2ku_key trust[D2KU_KEYS_MAX];
@@ -95,4 +103,15 @@ d2ku_rc d2ku_verify_index(d2ku_ctx *, const void *, size_t,
     const unsigned char sig[64], d2ku_index *);
 d2ku_rc d2ku_verify_manifest(d2ku_ctx *, const void *, size_t,
     const unsigned char sig[64], d2ku_manifest *);
+/* out_fd must be a private empty regular file at offset zero. Failure removes
+ * partial download bytes. Only HTTPS to bootstrap hosts, including redirects. */
+d2ku_rc d2ku_fetch(d2ku_ctx *, const char *url, int out_fd, uint64_t max_bytes);
+/* chosen must be a fresh successfully verified index selected for this operation.
+ * Bind exact bytes and release ID before exposing even incompatible metadata. */
+d2ku_rc d2ku_verify_selected_manifest(d2ku_ctx *, const d2ku_index *chosen,
+    const void *, size_t, const unsigned char sig[64], d2ku_manifest *);
+/* Caller MUST have obtained manifest with verification result OK. Extract only
+ * selected ABI's signed file list into ctx.staging_dirfd. No install/activation;
+ * success means hash/size checks + file and directory fsync completed. */
+d2ku_rc d2ku_stage(d2ku_ctx *, const d2ku_manifest *, int archive_fd);
 #endif

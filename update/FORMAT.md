@@ -154,3 +154,55 @@ the publication number or restores old trust. Reboot loads this durable context
 before checking signatures. Disk I/O and service callbacks in `d2ku_ctx` are
 caller-owned seams for later isolated transaction tests; verification performs
 no file, network or service action.
+
+## HTTPS and staging API
+
+Bootstrap supplies `ctx.transport_hosts` (1..8 exact DNS hostnames) and
+`ctx.ca_bundle` (an installed, readable system CA bundle). Neither is HTTP input.
+`d2ku_fetch` requires a caller-owned private empty regular file, one link, a
+writable non-append descriptor at offset zero. It permits only HTTPS, checks the
+hostname and chain, disables environment proxies and content decompression,
+limits streamed bytes to the caller's metadata/package bound, uses a 15-second
+connect timeout and a 30-second low-speed timeout, and follows at most five
+redirects after checking each resolved HTTPS host against bootstrap policy.
+Credentials and fragments are rejected. A failed transfer truncates its own
+partial output; an invalid pre-existing destination is left untouched. Missing
+or unusable CA trust fails UNTRUSTED, with no insecure fallback. HTTP success is
+exactly 200; redirect/error bodies never become the output artifact.
+
+After fetching manifest bytes and their detached signature, the caller passes
+the operation's fresh successfully verified chosen index into
+`d2ku_verify_selected_manifest`. This checks the exact original-byte SHA-256,
+signature and release ID before exposing metadata. A different signed release
+cannot replace the selected one. INCOMPATIBLE remains authenticated display-only
+metadata; installation requires OK. This helper neither refreshes latest nor
+accepts/persists an index.
+
+`d2ku_stage` consumes only a manifest previously verified with result OK by the
+trusted C caller. C structs are an internal API, never an HTTP input. It repeats
+schema/range/compatibility checks and selects exactly `ctx.abi`'s flat file range.
+The caller opens a new private directory in `ctx.staging_dirfd`, owned by the
+updater UID (root in production) with no group/world access. The function rejects
+any existing directory entry, including symlinks, without deleting it. The
+release tooling's independent runtime-owned allowlist excludes personal data;
+staging enforces the signed package's exact file list.
+
+Only POSIX ustar (`ustar\0`, version `00`) is accepted: regular files and distinct
+implied parent directories, octal fields, correct unsigned checksum, exact file
+sizes and modes, no link/device/extension headers, zero payload padding, at least
+two zero end blocks and only zero archive padding. Prefix/name joins are checked
+against the same relative-path grammar. Each signed file occurs exactly once;
+only directories implied by those files may occur. Ownership from tar is ignored;
+files belong to the updater UID. Directory modes are 0700/0755, output directories
+0755 beneath the private staging container; file modes are exactly 0644/0755.
+
+The exact regular archive size and SHA-256 are checked before writing, each
+file's SHA-256 while streaming, and the archive hash/size again before success.
+Creation uses dirfd-relative openat/mkdirat, O_NOFOLLOW and O_EXCL. File bytes
+are bounded by signed sizes. All files are fsynced after their final modes;
+implied directories are fsynced bottom-up, then the staging directory is fsynced.
+On error only this attempt's created filenames/directories are removed. The
+function never installs a release, writes active/config/state, executes scripts,
+or emits a durable prepared transaction. The transaction layer owns durable
+creation/removal of the staging container (including its parent fsync) and the
+prepared journal transition after staging returns OK.
