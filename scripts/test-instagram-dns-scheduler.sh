@@ -135,4 +135,29 @@ HELPER_FAIL_ALL=0 FAKE_DAY=2026-10-07 FAKE_HHMM=0100 FAKE_EPOCH=$((base + 2880 *
 [ "$(awk '{print $3}' "$TMP/attempt")" = 0 ] || fail 'success after failures did not reset the backoff'
 echo "PASS: persistent failure backs off ($day1 calls on day 1, $day2 on day 2)"
 
+# Управляемая остановка даёт писателю состояния ограниченное время на TERM и
+# считает принудительный SIGKILL отказом транзакции (files/S99d2k stop_pidfile).
+# Планировщик, спящий между тиками, обязан выйти сразу, а не через RUN_EVERY:
+# shell откладывает trap, пока ждёт foreground-команду.
+rm -f "$TMP/calls" "$TMP/attempt"; printf 'v2 0\n' > "$TMP/d2k/state/offset"
+printf '2026-10-07\n1791300000\n' > "$TMP/d2k/state/success"
+env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$TMP/d2k" FAKE_DAY=2026-10-07 FAKE_HHMM=1200 \
+    D2K_INSTAGRAM_HELPER="$TMP/helper" D2K_INSTAGRAM_SCHED_STATE="$TMP/d2k/state/success" \
+    D2K_INSTAGRAM_SCHED_ATTEMPT="$TMP/attempt" D2K_INSTAGRAM_SCHED_OFFSET="$TMP/d2k/state/offset" \
+    D2K_INSTAGRAM_SCHED_LOG="$TMP/scheduler.log" HELPER_CALLS="$TMP/calls" \
+    D2K_SCHEDULER_INTERVAL=20 "${TEST_SH:-sh}" "$SCHEDULER" run &
+sched=$!
+sleep 1
+kill -0 "$sched" 2>/dev/null || fail 'scheduler loop exited on its own'
+kill -TERM "$sched"
+i=0
+while kill -0 "$sched" 2>/dev/null && [ "$i" -lt 20 ]; do i=$((i + 1)); sleep 0.1; done
+if kill -0 "$sched" 2>/dev/null; then
+    kill -KILL "$sched" 2>/dev/null || true
+    fail 'sleeping scheduler ignored TERM for 2 s: a managed stop would have to SIGKILL it'
+fi
+wait "$sched" 2>/dev/null || fail 'scheduler did not exit cleanly on TERM'
+[ "$(calls)" = 0 ] || fail 'idle scheduler ran the helper'
+echo 'PASS: sleeping scheduler stops promptly on TERM'
+
 echo 'Instagram DNS scheduler: all checks passed'

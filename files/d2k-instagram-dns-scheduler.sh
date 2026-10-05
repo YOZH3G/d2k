@@ -159,7 +159,13 @@ case "${1:-run}" in
     run)
         while :; do
             tick
-            sleep "$RUN_EVERY"
+            # Пауза — фоновым sleep и wait: trap на TERM срабатывает сразу, а
+            # не после foreground-команды. Иначе управляемая остановка ждёт до
+            # RUN_EVERY, добивает SIGKILL и считает транзакцию сорванной.
+            sleep "$RUN_EVERY" &
+            child_pid=$!
+            wait "$child_pid" || true
+            child_pid=
         done
         ;;
     *) echo "usage: $0 {run|tick}" >&2; exit 2 ;;
