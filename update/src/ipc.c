@@ -267,6 +267,13 @@ int d2ku_ipc_receive_lock(int fd, d2ku_command *c, int *lock_fd) {
   int received = -1,
       bad = got != 1 || !!(msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC));
   size_t count = 0;
+  /* musl's CMSG_NXTHDR compares signed with unsigned inside the macro; under
+     -Werror that breaks the cross build on a line with none of our code (same
+     point suppression as core/quicprobe.c). */
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#endif
   for (struct cmsghdr *ch = CMSG_FIRSTHDR(&msg); ch;
        ch = CMSG_NXTHDR(&msg, ch)) {
     if (ch->cmsg_level != SOL_SOCKET || ch->cmsg_type != SCM_RIGHTS ||
@@ -284,6 +291,9 @@ int d2ku_ipc_receive_lock(int fd, d2ku_command *c, int *lock_fd) {
         close(fds[i]);
     }
   }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
   if (count > 1)
     bad = 1;
   uint64_t end = now() + 1000;
