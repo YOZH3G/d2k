@@ -114,6 +114,15 @@ int main(int argc, char **argv) {
     memset(f.r.expected_manifest_sha256, 2, 32);
     strcpy(f.r.release_id, "A");
     memset(f.r.manifest_sha256, 1, 32);
+    /* A release laid down by the flat-install bootstrap has no updater of its
+     * own (boot/d2k-update-first served it and is retired after the first
+     * signed update). Rolling back to it is refused before anything stops. */
+    assert(!unlinkat(f.c.root_dirfd, "releases/A/d2k-update", 0));
+    stops = f.stops;
+    assert(d2ku_rollback(&f.c, &f.r, &s) == D2KU_INCOMPATIBLE);
+    assert(f.stops == stops);
+    current(&f, "releases/B");
+    put(f.c.root_dirfd, "releases/A/d2k-update", "updater");
     assert(d2ku_rollback(&f.c, &f.r, &s) == D2KU_OK);
     current(&f, "releases/A");
     check_file(f.c.root_dirfd, "state/knowledge", "new knowledge");

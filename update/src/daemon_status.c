@@ -110,7 +110,8 @@ d2ku_rc d2ku_daemon_json_status(d2ku_daemon *d, const d2ku_status *view,
   add(&o, ",\"legacy_restored\":%s,\"evidence\":", journal && j.phase == D2KU_ROLLED_BACK && j.old_kind == D2KU_SOURCE_LEGACY_LOCAL && source_rc == D2KU_OK && source == D2KU_SOURCE_LEGACY_LOCAL ? "true" : "false");
   quoted(&o, source_rc == D2KU_OK && source == D2KU_SOURCE_LEGACY_LOCAL ? "Owner-authorized local inventory; legacy Telegram listener/status is not a main-loop heartbeat or application success" : "");
   add(&o, "},\"previous\":");
-  if (journal && j.phase == D2KU_COMMITTED && j.old_kind == D2KU_SOURCE_RUNTIME) {
+  if (journal && j.phase == D2KU_COMMITTED && j.old_kind == D2KU_SOURCE_RUNTIME &&
+      d2ku_tx_has_updater(d->ctx, j.old_release_id) == D2KU_OK) {
     add(&o, "{\"release_id\":");
     quoted(&o, j.old_release_id);
     add(&o, ",\"manifest_sha256\":");

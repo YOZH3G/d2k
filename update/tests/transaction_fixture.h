@@ -230,6 +230,8 @@ static void setup(fixture *f) {
     put(f->c.root_dirfd, "state/knowledge", "original");
     put(f->c.root_dirfd, "config", "personal");
     put(f->c.root_dirfd, "service", "A");
+    /* A signed release carries its own updater; rollback needs it. */
+    put(f->c.root_dirfd, "releases/A/d2k-update", "updater");
     unsigned char h[32];
     memset(h, 1, 32);
     assert(d2ku_release_receipt(&f->c, "A", h) == D2KU_OK);

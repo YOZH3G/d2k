@@ -209,6 +209,20 @@ d2ku_rc d2ku_tx_receipt(d2ku_ctx *c, const char *id, unsigned char hash[32]) {
     return D2KU_INCOMPATIBLE;
   return D2KU_OK;
 }
+/* A release laid down by the flat-install bootstrap has no updater of its
+ * own: boot/d2k-update-first served it and is retired after the first signed
+ * update. Such a release can be kept but not returned to: validation probes
+ * the target's own updater. */
+d2ku_rc d2ku_tx_has_updater(d2ku_ctx *c, const char *id) {
+    int d = release_dir(c, id);
+    if (d < 0)
+        return D2KU_INCOMPATIBLE;
+    struct stat st;
+    int ok = !fstatat(d, "d2k-update", &st, AT_SYMLINK_NOFOLLOW) &&
+             S_ISREG(st.st_mode);
+    close(d);
+    return ok ? D2KU_OK : D2KU_INCOMPATIBLE;
+}
 d2ku_rc d2ku_tx_source_kind(d2ku_ctx *c, const char *id, d2ku_source_kind *kind) {
   unsigned char hash[32];
   d2ku_rc rc = d2ku_legacy_source(c, id, hash);
@@ -1462,6 +1476,9 @@ static d2ku_rc execute(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s,
             rc = D2KU_INCOMPATIBLE;
             goto out;
         }
+        rc = d2ku_tx_has_updater(c, r->release_id);
+        if (rc != D2KU_OK)
+            goto out;
     }
     if (r->automatic) {
       rc = d2ku_auto_reservation_valid(c, r);
