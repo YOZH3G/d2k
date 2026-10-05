@@ -8,6 +8,9 @@ OUT=${OUT:-"$ROOT/builds"}
 TEST_OUT=${TEST_OUT:-"$OUT/tests"}
 : "${RELEASE_ID:?common release identity required}"
 : "${SOURCE_DATE_EPOCH:?build epoch required}"
+ADAPTER_ROOT=$(mktemp -d)
+chmod 755 "$ADAPTER_ROOT"
+trap 'rmdir "$ADAPTER_ROOT" 2>/dev/null || true' EXIT
 for arch in $ARCHES; do
     case "$arch" in
         arm64) cpu=aarch64 ;;
@@ -30,7 +33,13 @@ for arch in $ARCHES; do
         fi
         case "$component" in
             d2k-update-boot) [ "$(timeout 20 "qemu-$cpu" "$bin" --boot-protocol)" = 1 ] ;;
-            d2k-service-adapter) rc=0; timeout 20 "qemu-$cpu" "$bin" >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] ;;
+            d2k-service-adapter)
+                # The adapter refuses a missing or foreign root (exit 1) before
+                # it reads the action, and /opt/d2k does not exist here: give
+                # it an owned empty root so the usage exit proves startup.
+                rc=0; timeout 20 "qemu-$cpu" "$bin" --root "$ADAPTER_ROOT" >/dev/null 2>&1 || rc=$?
+                [ "$rc" = 2 ] || { echo "$bin: expected usage exit 2, got $rc" >&2; exit 1; }
+                ;;
             *) [ "$(timeout 20 "qemu-$cpu" "$bin" --release-id)" = "$RELEASE_ID" ] ;;
         esac
         case "$component" in
