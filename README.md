@@ -200,4 +200,8 @@ ZIG_MIPS64EL=/path/to/zig-0.14.1 sh scripts/build-router-tests.sh
 sh scripts/check-router-builds.sh
 ```
 
+### Автообновление (не опубликовано)
+
+Подписанные ночные обновления (обновлятор `d2k-update`, загрузчик с восстановлением `S98d2k-update`, проверка нового выпуска 120 с, откат и карантин) собраны и проверены только в лаборатории; подписанный stable-выпуск не публиковался, и публичный установщик их не ставит. Сборка выпуска теперь требует `RELEASE_ID`, `SOURCE_DATE_EPOCH` и проверенных зависимостей `DEPS_PROVENANCE` (`scripts/build-update-deps.sh`), упаковка — `scripts/package-update.py`, подпись — `scripts/sign-update.sh`. Сквозная Linux-лаборатория — `sh scripts/lab-update.sh` (Docker). Что проверено и что нет: [отчёт 05.10.2026](docs/field/2026-10-05-auto-update-local.md), формат — [update/FORMAT.md](update/FORMAT.md), требования — [docs/auto-update-design.md](docs/auto-update-design.md).
+
 Донор: [z2k](https://github.com/necronicle/z2k). Лицензия: MIT.
