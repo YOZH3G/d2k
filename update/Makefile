@@ -165,6 +165,7 @@ check: check-feed check-lifecycle check-auto
 .PHONY: check-supervised
 check-supervised: daemon boot service-adapter
 	python3 tests/test_supervised.py $(BUILD)/d2k-update $(BUILD)/d2k-update-boot $(BUILD)/d2k-service-adapter
+	python3 tests/test_supervise_reap_linux.py $(BUILD)/d2k-update-boot
 
 check-ipc: check-daemon-replay
 .PHONY: check-daemon-replay

@@ -178,9 +178,12 @@ int main(int argc, char **argv) {
         d2ku_status s = {0};
         assert(d2ku_supervise(&f.c, argv[0], args, &s) == D2KU_HEALTH);
         if (killer > 0) {
+            /* Супервизор — subreaper и собирает всех завершившихся потомков,
+             * в том числе этого соседа: его уже могли reap-нуть за нас. */
             int w;
-            assert(waitpid(killer, &w, 0) == killer && WIFEXITED(w) &&
-                   !WEXITSTATUS(w));
+            pid_t got = waitpid(killer, &w, 0);
+            assert(got == killer ? WIFEXITED(w) && !WEXITSTATUS(w)
+                                 : errno == ECHILD);
         }
         pid_t ids[3] = {0};
         assert(pids(f.c.root_dirfd, ids));

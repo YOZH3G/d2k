@@ -274,6 +274,22 @@ static d2ku_rc supervise_worker(d2ku_ctx *c, const char *worker,
             bad = 1;
             break;
         }
+        /* Супервизор — subreaper: демоны служб, запущенные транзакцией через
+         * start-stop-daemon -b, усыновляются им. Не собранный потомок остаётся
+         * зомби, S99d2k считает его живым, и управляемая остановка срывается. */
+        for (;;) {
+            int stray_status;
+            pid_t stray = waitpid(-1, &stray_status, WNOHANG);
+            if (stray <= 0)
+                break;
+            if (stray == pid) {
+                status = stray_status;
+                reaped = 1;
+                break;
+            }
+        }
+        if (reaped)
+            break;
         struct pollfd pollfds[2] = {{fds[0], POLLIN, 0},
                                     {control[0], POLLIN, 0}};
         int n = poll(pollfds, 2, 100);
