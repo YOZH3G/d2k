@@ -77,3 +77,6 @@ detect/*
 /builds/provenance-*.json
 /builds/gates-*.json
 /update-release/
+
+# Python bytecode from release tooling; a release checkout must stay clean.
+__pycache__/
