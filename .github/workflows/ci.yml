@@ -180,5 +180,8 @@ jobs:
   update-release:
     name: Nine C runtime ABIs, authenticated packaging, offline publisher
     uses: ./.github/workflows/release.yml
+    # The called workflow declares its publish job with contents: write, and
+    # GitHub refuses to start a caller that grants less. That job runs only on
+    # workflow_dispatch/schedule on main, never from CI.
     permissions:
-      contents: read
+      contents: write
