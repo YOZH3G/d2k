@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 async function main() {
-  let visibility, calls = 0, aborted = 0;
+  let visibility, calls = 0, aborted = 0, updateCalls = 0;
   const intervals = [], timers = new Map(); let next = 0;
   const stub = () => ({
     get ownerDocument() { return document; },
@@ -20,11 +20,12 @@ async function main() {
     addEventListener(name, fn) { if (name === 'visibilitychange') visibility = fn; },
   };
   const window = {
-    document, AbortController,
+    document, AbortController, crypto:require("node:crypto").webcrypto,
     setTimeout(fn, ms) { timers.set(++next, { fn, ms }); return next; },
     clearTimeout(id) { timers.delete(id); },
     setInterval(fn, ms) { intervals.push({ fn, ms }); },
     fetch(url, options) {
+      if (url.startsWith("/api/update")) { updateCalls++; return Promise.resolve({ ok:true, status:200, json:async()=>({state:"unchecked"}) }); }
       calls++;
       return new Promise((resolve, reject) => {
         options.signal.addEventListener('abort', () => { aborted++; reject(new Error('aborted')); });
@@ -33,6 +34,7 @@ async function main() {
   };
   vm.runInNewContext(fs.readFileSync('../internal/web/assets/panel.js', 'utf8'), { window, AbortController, Date, JSON, Math, Object, String, Number, Array, Error, Promise });
   assert.equal(calls, 1, 'the panel polls immediately on load');
+  assert.equal(updateCalls, 1, 'opening the panel checks updates once');
   const poll = intervals.find(i => i.ms === 2000);
   assert.ok(poll, 'the panel polls on an interval');
   for (let i = 0; i < 12; i++) poll.fn();

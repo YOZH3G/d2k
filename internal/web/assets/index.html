@@ -41,6 +41,7 @@
       <a href="#families" data-nav="families"><span>Семейства</span><b id="nav-families"></b></a>
       <a href="#boxes" data-nav="boxes"><span>Коробки</span><b id="nav-boxes"></b></a>
       <a href="#telegram" data-nav="telegram"><span>Telegram-туннель</span><b id="nav-telegram"></b></a>
+      <a href="#updates" data-nav="updates"><span>Обновления</span><b id="nav-updates"></b></a>
       <a href="#diagnostics" data-nav="diagnostics"><span>Диагностика</span><b id="nav-diagnostics"></b></a>
     </nav>
 
@@ -83,6 +84,43 @@
           <p>Отдельная служба со своим состоянием. Обходы D2K через неё не идут.</p>
         </header>
         <div class="tunnel" id="telegram-body"></div>
+      </section>
+
+      <section class="sheet sheet-updates" id="updates" aria-labelledby="updates-title">
+        <header class="sheet-head">
+          <h2 id="updates-title">Обновления</h2>
+          <p>Новые выпуски D2K. Настройки, регистрация Telegram и найденные обходы сохраняются.</p>
+        </header>
+        <div id="updates-body">
+          <p class="update-installed">Установленный выпуск <span id="update-current" class="mono">—</span></p>
+          <div class="update-status" aria-live="polite" aria-atomic="true">
+            <h3 id="update-state">Обновления ещё не проверялись</h3>
+            <p id="update-reason" hidden></p>
+          </div>
+          <p class="update-meta" id="update-checked">Проверка при открытии панели · кеш 15 минут</p>
+          <div class="update-release" id="update-release" hidden>
+            <p class="update-version" id="update-version"></p>
+            <details class="update-notes" id="update-notes">
+              <summary>Что изменилось</summary>
+              <div class="update-notes-content"><p id="update-notes-text"></p></div>
+            </details>
+          </div>
+          <div class="update-transfer">
+            <progress id="update-progress" max="100" value="0" aria-label="Загрузка выпуска" hidden></progress>
+            <p class="update-meta" id="update-progress-text" hidden></p>
+          </div>
+          <div class="update-actions">
+            <button type="button" class="btn" id="update-install" data-variant="primary" hidden>Установить сейчас</button>
+            <button type="button" class="btn" id="update-check" data-variant="primary">Проверить обновления</button>
+          </div>
+          <p class="update-meta" id="update-warning" hidden></p>
+          <p class="update-action" id="update-action" role="status" aria-live="polite" hidden></p>
+          <div class="update-night">
+            <label for="update-auto"><input type="checkbox" id="update-auto" disabled> Устанавливать автоматически ночью</label>
+            <p id="update-schedule">03:00–05:00 по времени роутера</p>
+          </div>
+          <p class="update-meta update-result" id="update-result" hidden></p>
+        </div>
       </section>
 
       <section class="sheet" id="diagnostics" aria-labelledby="diagnostics-title">

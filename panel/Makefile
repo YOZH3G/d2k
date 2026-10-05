@@ -42,6 +42,7 @@ san: test_server_san test_update_san
 test-js:
 	node test_ui.cjs
 	node test_poll.cjs
+	node test_updates.cjs
 
 test-cli: d2kpanel
 	node test_cli.cjs
