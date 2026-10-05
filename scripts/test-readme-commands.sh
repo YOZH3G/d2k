@@ -34,10 +34,10 @@ for n in 1 2; do
     [ -s "$RUN_MARKER" ]
     [ ! -e "$(cat "$CURL_TARGET")" ]
     if [ "$n" = 1 ]; then
-        [ "$(cat "$RUN_MARKER")" = executed:feat/telegram-tunnel ]
-        [ "$(cat "$CURL_URL")" = https://raw.githubusercontent.com/necronicle/d2k/feat/telegram-tunnel/scripts/install.sh ]
+        [ "$(cat "$RUN_MARKER")" = executed:main ]
+        [ "$(cat "$CURL_URL")" = https://raw.githubusercontent.com/necronicle/d2k/main/scripts/install.sh ]
     else
-        [ "$(cat "$CURL_URL")" = https://raw.githubusercontent.com/necronicle/d2k/feat/telegram-tunnel/scripts/uninstall.sh ]
+        [ "$(cat "$CURL_URL")" = https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh ]
     fi
 done
 echo 'README install/uninstall: execution, failed-download safety and cleanup passed'

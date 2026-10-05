@@ -8,10 +8,11 @@
 # Что здесь НЕ делается и почему:
 #   * ничего не берётся у z2k при неудаче загрузки — подмена артефактов
 #     чужого продукта своими это не запасной путь, а сюрприз;
-#   * фонового обновления нет: механизм не проверен, а непроверенное
-#     автообновление хуже отсутствующего;
-#   * подписи пока нет — это задача версии для общего пользования, и
-#     обещать её здесь нельзя.
+#   * автообновление ставится только из ПОДПИСАННОГО выпуска: после плоской
+#     установки скрипт берёт из канала stable загрузочный комплект своей
+#     арки, проверяет подпись закреплённым ниже ключом и переводит установку
+#     под d2k-update. Нет выпуска или подпись не сошлась — остаётся рабочая
+#     плоская установка без автообновления, и это говорится словами.
 set -eu
 
 REPO=${D2K_REPO:-necronicle/d2k}
@@ -341,5 +342,65 @@ if [ -n "$PANEL_LISTEN" ]; then
 else
     say "панель отключена (PANEL_LISTEN пуст в $DIR/config)"
 fi
+# --- автообновление ------------------------------------------------------
+#
+# Канал stable публикует .github/workflows/release.yml: release-тег
+# d2k-channel-stable с подписанным stable.json и выпуски с загрузочным
+# комплектом на каждую арку. Ключ закреплён здесь, а не берётся из сети:
+# установщик приходит по HTTPS из того же репозитория, что и ключ.
+UPDATE_FEED=${D2K_UPDATE_FEED:-https://github.com/$REPO/releases/download}
+UPDATE_KEY='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAqZkq/DsxeFJ1MCEEyFa7yzm80XiWf+cHPR1JsybbMPQ=
+-----END PUBLIC KEY-----'
+update_fetch() {
+    curl -fsSL --proto '=https' --max-time 300 -o "$2" "$UPDATE_FEED/$1"
+}
+update_verified() {
+    # $1 — документ, $2 — его подпись Ed25519 (64 байта).
+    [ "$(wc -c < "$2" | tr -d ' ')" = 64 ] || return 1
+    openssl pkeyutl -verify -pubin -inkey "$TMP/update-key.pem" -rawin \
+        -in "$1" -sigfile "$2" >/dev/null 2>&1
+}
+enable_autoupdate() {
+    printf '%s\n' "$UPDATE_KEY" > "$TMP/update-key.pem" || return 1
+    if ! update_fetch d2k-channel-stable/stable.json "$TMP/stable.json" ||
+       ! update_fetch d2k-channel-stable/stable.json.sig "$TMP/stable.json.sig"; then
+        say "автообновление: подписанного выпуска ещё нет — работает плоская установка без автообновления"
+        return 0
+    fi
+    update_verified "$TMP/stable.json" "$TMP/stable.json.sig" || {
+        say "автообновление: подпись канала не сошлась — автообновление не включено"; return 1; }
+    rid=$(sed -n 's/.*"release_id":"\([A-Za-z0-9][A-Za-z0-9._-]*\)".*/\1/p' "$TMP/stable.json")
+    [ -n "$rid" ] || { say "автообновление: в канале нет выпуска"; return 1; }
+    if ! { update_fetch "$rid/bootstrap-$ARCH.json" "$TMP/bootstrap.json" &&
+           update_fetch "$rid/bootstrap-$ARCH.json.sig" "$TMP/bootstrap.json.sig"; }; then
+        say "автообновление: в выпуске $rid нет комплекта для $ARCH"; return 1
+    fi
+    update_verified "$TMP/bootstrap.json" "$TMP/bootstrap.json.sig" || {
+        say "автообновление: подпись комплекта $rid не сошлась"; return 1; }
+    if ! { grep -q "\"abi\":\"$ARCH\"" "$TMP/bootstrap.json" &&
+           grep -q "\"artifact\":\"d2k-bootstrap-$ARCH.tar\"" "$TMP/bootstrap.json"; }; then
+        say "автообновление: комплект $rid не для $ARCH"; return 1
+    fi
+    update_fetch "$rid/d2k-bootstrap-$ARCH.tar" "$TMP/bootstrap.tar" || {
+        say "автообновление: не скачать комплект $rid"; return 1; }
+    # Подписан описатель, а в нём — хеш архива: архив принимается только
+    # с ровно этим хешем.
+    sum=$(openssl dgst -sha256 -r "$TMP/bootstrap.tar" | cut -d' ' -f1)
+    case "$sum" in ''|*[!0-9a-f]*) return 1 ;; esac
+    grep -q "\"sha256\":\"$sum\",\"size\":" "$TMP/bootstrap.json" || {
+        say "автообновление: архив комплекта не совпал с подписанным описателем"; return 1; }
+    mkdir "$TMP/bootstrap" && tar -xf "$TMP/bootstrap.tar" -C "$TMP/bootstrap" || return 1
+    say "автообновление: перевожу установку под d2k-update (выпуск $rid)"
+    "$TMP/bootstrap/d2k-update-boot" --root "$DIR" --bootstrap "$TMP/bootstrap" || {
+        say "автообновление: перевод не выполнен — плоская установка продолжает работать"; return 1; }
+    say "автообновление включено: новые выпуски ставятся ночью 03:00–05:00, вручную — кнопкой в панели"
+}
+if [ -n "${D2K_LOCAL:-}" ] || [ "${D2K_AUTOUPDATE:-1}" = 0 ]; then
+    say "автообновление не включается (локальная установка или D2K_AUTOUPDATE=0)"
+else
+    enable_autoupdate || true
+fi
+
 say "готово"
 say "режим по умолчанию — активный обход (MODE=apply). Для наблюдения задайте MODE=observe."

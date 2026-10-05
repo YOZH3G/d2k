@@ -7,15 +7,15 @@ D2K наблюдает трафик на Keenetic, измеряет подозр
 Выполняйте **в SSH-терминале Entware на роутере от root**, не на компьютере и не в командной строке KeeneticOS. Архитектуру установщик определяет автоматически по Entware и `uname` — см. [совместимость](#архитектуры) и [подготовку](#перед-первой-установкой).
 
 ```sh
-(f=$(mktemp) && curl -fsSL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/necronicle/d2k/feat/telegram-tunnel/scripts/install.sh -o "$f" && D2K_REF=feat/telegram-tunnel sh "$f"; r=$?; rm -f "$f"; exit "$r")
+(f=$(mktemp) && curl -fsSL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/necronicle/d2k/main/scripts/install.sh -o "$f" && D2K_REF=main sh "$f"; r=$?; rm -f "$f"; exit "$r")
 ```
 
-Сейчас устанавливается ветка **`feat/telegram-tunnel`**, не `main`: это публичная тестовая сборка, не стабильный релиз. Скрипт запускается только после полной успешной загрузки. Перед выполнением можно [посмотреть его код](scripts/install.sh).
+Устанавливается ветка **`main`**. Если опубликован подписанный выпуск, установщик сразу включает автообновление: новые выпуски ставятся ночью 03:00–05:00 по времени роутера или кнопкой в панели, с проверкой и откатом при сбое. Скрипт запускается только после полной успешной загрузки. Перед выполнением можно [посмотреть его код](scripts/install.sh).
 
 ## Полное удаление — одна команда
 
 ```sh
-(f=$(mktemp) && curl -fsSL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/necronicle/d2k/feat/telegram-tunnel/scripts/uninstall.sh -o "$f" && sh "$f"; r=$?; rm -f "$f"; exit "$r")
+(f=$(mktemp) && curl -fsSL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh -o "$f" && sh "$f"; r=$?; rm -f "$f"; exit "$r")
 ```
 
 Удаляются службы, панель, правила D2K, его Instagram DNS-записи, конфигурация, найденные обходы и ключ Telegram. **Изученное состояние будет потеряно.** Чужие правила и DNS-записи не удаляются. [Код удаления](scripts/uninstall.sh).
@@ -87,7 +87,7 @@ D2K наблюдает трафик на Keenetic, измеряет подозр
 Измерения не захватывают DNS на портах 53/853 и локальный resolver IPC.
 Направления NFQUEUE ограничены conntrack, восстановление правил
 сериализовано; исправления объединены с IPv6, Telegram и управлением панели
-в `feat/telegram-tunnel`. Установка обновляет весь комплект из этой ветки.
+в `main`. Установка обновляет весь комплект из этой ветки.
 
 Добавлен C-helper для HTTP-редиректов на явную страницу блокировки провайдера:
 он переводил такой запрос на HTTPS исходного сайта, не меняя обычные
@@ -200,8 +200,8 @@ ZIG_MIPS64EL=/path/to/zig-0.14.1 sh scripts/build-router-tests.sh
 sh scripts/check-router-builds.sh
 ```
 
-### Автообновление (не опубликовано)
+### Выпуск и автообновление
 
-Подписанные ночные обновления (обновлятор `d2k-update`, загрузчик с восстановлением `S98d2k-update`, проверка нового выпуска 120 с, откат и карантин) собраны и проверены только в лаборатории; подписанный stable-выпуск не публиковался, и публичный установщик их не ставит. Сборка выпуска теперь требует `RELEASE_ID`, `SOURCE_DATE_EPOCH` и проверенных зависимостей `DEPS_PROVENANCE` (`scripts/build-update-deps.sh`), упаковка — `scripts/package-update.py`, подпись — `scripts/sign-update.sh`. Сквозная Linux-лаборатория — `sh scripts/lab-update.sh` (Docker). Что проверено и что нет: [отчёт 05.10.2026](docs/field/2026-10-05-auto-update-local.md), формат — [update/FORMAT.md](update/FORMAT.md), требования — [docs/auto-update-design.md](docs/auto-update-design.md).
+Выпуск — GitHub Actions → **Signed D2K release** → *Run workflow* на `main`: сначала с `dry_run` (сборка девяти арок, проверки под QEMU, упаковка, подпись тестовым ключом, без публикации), затем без него. Настоящий запуск подписывает выпуск ключом из окружения `d2k-signing`, публикует его отдельным релизом и переставляет канал `d2k-channel-stable`; ежедневный запуск в 03:17 UTC переподписывает канал (срок его подписи 7 суток). Роутеры на автообновлении проверяют канал и ставят выпуск ночью 03:00–05:00 по своим часам: остановка, переключение, 120 с проверки, при сбое откат и карантин выпуска. Закрытый ключ подписи в репозиторий не попадает; открытый закреплён в `scripts/install.sh` и в переменных репозитория. Сквозная Linux-лаборатория — `sh scripts/lab-update.sh` (Docker); что проверено и что нет — [отчёт 05.10.2026](docs/field/2026-10-05-auto-update-local.md), формат — [update/FORMAT.md](update/FORMAT.md), требования — [docs/auto-update-design.md](docs/auto-update-design.md).
 
 Донор: [z2k](https://github.com/necronicle/z2k). Лицензия: MIT.
