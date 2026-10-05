@@ -14,6 +14,7 @@ int main(void) {
   d2ku_status status;
   assert(d2ku_dispatch(&f.c, &f.r, &status) == D2KU_OK && status.busy);
   assert(d2ku_install(&f.c, &f.r, &status) == D2KU_OK);
+  assert(d2ku_rollback(&f.c, &f.r, &status) == D2KU_INVALID);
   d2ku_daemon_destroy(&d);
   assert(d2ku_daemon_init(&d, &f.c) == D2KU_OK);
   assert(d2ku_dispatch(&f.c, &f.r, &status) == D2KU_OK && !status.busy &&
@@ -25,6 +26,20 @@ int main(void) {
   assert(d2ku_daemon_init(&d, &f.c) == D2KU_OK);
   assert(d2ku_dispatch(&f.c, &f.r, &status) == D2KU_OK && !status.busy &&
          status.phase == D2KU_COMMITTED);
+  d2ku_request collision = {.command = D2KU_CMD_CHECK, .force = 1};
+  strcpy(collision.transaction_id, f.r.transaction_id);
+  assert(d2ku_dispatch(&f.c, &collision, &status) == D2KU_BUSY);
+  collision.command = D2KU_CMD_SETTINGS; collision.force = 0;
+  assert(d2ku_dispatch(&f.c, &collision, &status) == D2KU_BUSY);
+  d.selected = 1; d.index = f.i; *d.manifest = f.m;
+  d2ku_request later = f.r;
+  strcpy(later.transaction_id, "later-download-failure");
+  assert(d2ku_dispatch(&f.c, &later, &status) == D2KU_OK && status.busy);
+  d2ku_daemon_work(&d);
+  assert(d.status.last_result != D2KU_OK && !d.status.busy);
+  d2ku_daemon_destroy(&d);
+  assert(d2ku_daemon_init(&d, &f.c) == D2KU_OK);
+  assert(d2ku_dispatch(&f.c, &f.r, &status) == D2KU_OK && !status.busy && status.phase == D2KU_COMMITTED);
   f.r.command = D2KU_CMD_ROLLBACK;
   assert(d2ku_dispatch(&f.c, &f.r, &status) == D2KU_BUSY);
   f.r.command = D2KU_CMD_INSTALL;

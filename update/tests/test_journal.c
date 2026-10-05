@@ -17,7 +17,7 @@
 static d2ku_journal record(unsigned seq)
 {
     d2ku_journal j = {0};
-    j.schema = 1; j.sequence = seq; j.phase = D2KU_PREPARED;
+    j.schema = 1; j.command = D2KU_CMD_INSTALL; j.sequence = seq; j.phase = D2KU_PREPARED;
     j.failure_reason = D2KU_HEALTH; j.recovery_reason = D2KU_IO;
     strcpy(j.transaction_id, "operation-1"); j.transaction_id_len = 11;
     strcpy(j.old_release_id, "old"); j.old_release_id_len = 3;
@@ -66,7 +66,7 @@ static void generations(void)
     assert(!memcmp(&out, &sentinel, sizeof out));
     assert(d2ku_journal_store(&c, &j) == D2KU_OK);
     assert(d2ku_journal_load(&c, &out) == D2KU_OK && out.sequence == 1);
-    assert(out.active_services == 5 && out.transaction_id_len == 11);
+    assert(out.active_services == 5 && out.transaction_id_len == 11 && out.command == D2KU_CMD_INSTALL);
     assert(out.failure_reason == D2KU_HEALTH && out.recovery_reason == D2KU_IO);
     /* C-only tail/checksum bytes are excluded; equal logical retry is identical. */
     memset(j.checksum, 0xab, sizeof j.checksum);
@@ -95,6 +95,8 @@ static void invalid_records(void)
     j = record(1); strcpy(j.transaction_id, "../evil"); j.transaction_id_len = 7;
     assert(d2ku_journal_store(&c, &j) == D2KU_INVALID);
     j = record(1); j.old_release_id_len = 4;
+    assert(d2ku_journal_store(&c, &j) == D2KU_INVALID);
+    j = record(1); j.command = D2KU_CMD_CHECK;
     assert(d2ku_journal_store(&c, &j) == D2KU_INVALID);
     j = record(1); j.phase = D2KU_SWITCHING;
     assert(d2ku_journal_store(&c, &j) == D2KU_INVALID);
@@ -175,7 +177,7 @@ static void separate_state(void)
     s.trust_count = 1; memset(s.trust[0].public_key, 8, 32);
     s.trust[0].not_before = 100; s.trust[0].not_after = 900;
     s.policy.enabled = 1; s.policy.selected_date = 20261004; s.policy.selected_minute = 234;
-    s.policy.last_attempt_date = 20261004; s.policy.has_quarantined_release = 1;
+    s.policy.last_attempt_date = 20261004; s.policy.has_quarantined_release = 1; s.policy.quarantine_reason = D2KU_HEALTH;
     memset(s.policy.quarantined_release_sha256, 9, 32);
     assert(d2ku_persistent_store(&c, &s) == D2KU_OK);
     d2ku_journal j = record(1); assert(d2ku_journal_store(&c, &j) == D2KU_OK);
@@ -183,7 +185,7 @@ static void separate_state(void)
     int d = openat(c.root_dirfd, "update-state", O_RDONLY | O_DIRECTORY);
     unlinkat(d, "journal.0", 0); unlinkat(d, "journal.1", 0); close(d);
     assert(d2ku_persistent_load(&c, &out) == D2KU_OK);
-    assert(out.accepted_sequence == 50 && out.trust_count == 1 && out.policy.selected_minute == 234);
+    assert(out.accepted_sequence == 50 && out.trust_count == 1 && out.policy.selected_minute == 234 && out.policy.quarantine_reason == D2KU_HEALTH);
     s.sequence = 2; assert(d2ku_persistent_store(&c, &s) == D2KU_OK);
     damage(&c, "persistent.0", 1);
     assert(d2ku_persistent_load(&c, &out) == D2KU_OK && out.sequence == 1);
@@ -194,7 +196,7 @@ static void separate_state(void)
 
 static void wire_validation(void)
 {
-    for (unsigned variant = 0; variant < 7; variant++) {
+    for (unsigned variant = 0; variant < 8; variant++) {
         char path[64]; d2ku_ctx c = context(path); d2ku_journal j = record(1), out;
         assert(d2ku_journal_store(&c, &j) == D2KU_OK);
         int d = openat(c.root_dirfd, "update-state", O_RDONLY | O_DIRECTORY);
@@ -208,6 +210,7 @@ static void wire_validation(void)
         if (variant == 3) raw[23] = 2; /* wrong sequence for slot */
         if (variant == 4) { raw[len++] = 0; raw[15] = (unsigned char)len; } /* trailing byte */
         if (variant == 5) raw[71] = 255; /* invalid phase (body + tx + phase) */
+        if (variant == 7) raw[len-1] = D2KU_CMD_CHECK; /* nontransaction command */
         if (variant == 6) raw[80] = '/'; /* malformed new release ID */
         memset(raw + 24, 0, 32); unsigned char hash[32]; unsigned n;
         assert(EVP_Digest(raw, (size_t)len, hash, &n, EVP_sha256(), NULL) == 1 && n == 32);

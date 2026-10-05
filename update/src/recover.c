@@ -2,6 +2,7 @@
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
 #include "lifecycle.h"
+#include "startup.h"
 #include "transaction_internal.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -388,20 +389,11 @@ d2ku_rc d2ku_supervise(d2ku_ctx *c, const char *worker, char *const argv[],
     return D2KU_INVALID;
   if (c->supervisor_lock_fd > 2)
     return supervise_worker(c, worker, argv, s);
-  int fd = openat(c->root_dirfd, "update-state/supervisor.lock",
-                  O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
-  struct stat st;
-  if (fd < 0)
-    return D2KU_IO;
-  if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
-      (st.st_mode & 077) || st.st_nlink != 1) {
-    close(fd);
-    return D2KU_INVALID;
-  }
-  if (flock(fd, LOCK_EX | LOCK_NB)) {
-    close(fd);
-    return D2KU_BUSY;
-  }
+  int fd = -1, guard = -1;
+  d2ku_rc claimed = d2ku_startup_claim(c, "supervisor.lock", &guard, &fd);
+  if (claimed != D2KU_OK)
+    return claimed;
+  d2ku_maintenance_unlock(guard);
   c->supervisor_lock_fd = fd;
   d2ku_rc r = supervise_worker(c, worker, argv, s);
   c->supervisor_lock_fd = -1;

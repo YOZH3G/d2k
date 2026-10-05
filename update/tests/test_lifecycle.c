@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
 #include "../src/lifecycle.h"
+#include "../src/startup.h"
 #include <assert.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -23,6 +24,17 @@ int main(void) {
   d2ku_lifecycle l;
   assert(d2ku_lifecycle_load(&c, &l) == D2KU_ABSENT);
   assert(d2ku_lifecycle_intent(&c, "op", getpid()) != D2KU_OK);
+  const char *names[] = {"daemon.lock", "supervisor.lock"};
+  for (size_t i = 0; i < 2; i++) {
+    int guard = -1, owner = -1;
+    assert(d2ku_startup_claim(&c, names[i], &guard, &owner) == D2KU_OK);
+    d2ku_maintenance_unlock(guard);
+    assert(d2ku_maintenance_lock(&c, &c.maintenance_lock_fd) == D2KU_OK);
+    assert(d2ku_lifecycle_quiesce(&c, root) == D2KU_BUSY);
+    assert(d2ku_lifecycle_load(&c, &l) == D2KU_ABSENT);
+    close(owner);
+    close(c.maintenance_lock_fd); c.maintenance_lock_fd = -1;
+  }
   assert(d2ku_maintenance_lock(&c, &c.maintenance_lock_fd) == D2KU_OK);
   assert(d2ku_lifecycle_quiesce(&c, root) == D2KU_OK);
   assert(d2ku_lifecycle_load(&c, &l) == D2KU_OK && l.stopped);

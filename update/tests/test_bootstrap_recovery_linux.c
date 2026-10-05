@@ -154,7 +154,7 @@ int main(int argc, char **argv) {
   /* Use the actual bootstrap result, so the pre-fix synthetic ID reaches
    * health. */
   d2ku_journal j = {
-      .schema = 1, .sequence = 1, .phase = D2KU_STOPPING, .active_services = 4};
+      .schema = 1, .command = D2KU_CMD_INSTALL, .sequence = 1, .phase = D2KU_STOPPING, .active_services = 4};
   strcpy(j.transaction_id, "first-update");
   j.transaction_id_len = strlen(j.transaction_id);
   strcpy(j.old_release_id, current + 9);

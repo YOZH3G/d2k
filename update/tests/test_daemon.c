@@ -74,6 +74,19 @@ int main(void) {
   assert(d2ku_dispatch(&c, &r, &s) == D2KU_OK && !s.busy);
   r.force = 0;
   assert(d2ku_dispatch(&c, &r, &s) == D2KU_BUSY);
+  for (unsigned which = 0; which < 2; which++) {
+    d2ku_clock_sample snapshot; sample(NULL, &snapshot);
+    d2ku_rc failed = which ? D2KU_NETWORK : D2KU_TIME;
+    assert(d2ku_cache_record(&d.status, &snapshot, failed) == D2KU_OK);
+    d.status.last_result = failed;
+    d2ku_request settings = {.command = D2KU_CMD_SETTINGS, .enabled = (int)which};
+    assert(d2ku_dispatch(&c, &settings, &s) == D2KU_OK);
+    d2ku_daemon_work(&d);
+    assert(d.status.last_result == D2KU_OK);
+    assert(d2ku_daemon_json(&d, json, sizeof json) == D2KU_OK);
+    assert(strstr(json, "\"state\":\"error\""));
+    assert(strstr(json, which ? "network transfer failed" : "trusted synchronized time unavailable"));
+  }
   d2ku_daemon_destroy(&d);
   close(c.root_dirfd);
   char cmd[200];

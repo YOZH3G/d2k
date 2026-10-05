@@ -2,6 +2,7 @@
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
 #include "lifecycle.h"
+#include "startup.h"
 #include "transaction_internal.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -41,7 +42,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   d2ku_ctx c = {0};
-  c.maintenance_lock_fd = -1;
+  c.maintenance_lock_fd = c.supervisor_lock_fd = -1;
   c.root_dirfd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   c.health_runtime_dirfd = -1;
   c.bootstrap_prefix_fd = c.bootstrap_bundle_fd = -1;
@@ -56,6 +57,20 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "installation is quiescing; explicit uninstall/resume required\n");
     return 1;
+  }
+  if (!strcmp(argv[at], "--daemon") || !strcmp(argv[at], "--supervise"))
+    d2ku_startup_barrier("supervisor");
+  if (!strcmp(argv[at], "--daemon") || !strcmp(argv[at], "--supervise")) {
+    int guard = -1;
+    d2ku_rc claimed = d2ku_startup_claim(&c, "supervisor.lock", &guard,
+                                         &c.supervisor_lock_fd);
+    if (claimed != D2KU_OK) {
+      fprintf(stderr, "updater unavailable: supervisor startup result=%d\n",
+              claimed);
+      close(c.root_dirfd);
+      return 1;
+    }
+    d2ku_maintenance_unlock(guard);
   }
   c.supervisor_quiesce = d2ku_lifecycle_ack;
   c.updater_version = 1;
@@ -107,15 +122,6 @@ int main(int argc, char **argv) {
     r = d2ku_recover(&c, &s);
     if (r != D2KU_OK)
       goto done;
-    int supervisor = openat(c.root_dirfd, "update-state/supervisor.lock",
-                            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (supervisor < 0 || flock(supervisor, LOCK_EX | LOCK_NB)) {
-      if (supervisor >= 0)
-        close(supervisor);
-      r = D2KU_BUSY;
-      goto done;
-    }
-    c.supervisor_lock_fd = supervisor;
     do {
       int refresh_lock = -1;
       r = d2ku_maintenance_lock(&c, &refresh_lock);
@@ -156,14 +162,14 @@ int main(int argc, char **argv) {
                       "--boot-worker", "3",      NULL};
       r = d2ku_supervise(&c, worker, args, &s);
     } while (r == D2KU_HANDOFF_RC);
-    c.supervisor_lock_fd = -1;
-    close(supervisor);
     if (r == D2KU_QUIESCED_RC)
       r = D2KU_OK;
   } else
     r = at + 1 < argc ? d2ku_supervise(&c, argv[at + 1], &argv[at + 1], &s)
                       : D2KU_INVALID;
 done:
+  if (c.supervisor_lock_fd >= 0)
+    close(c.supervisor_lock_fd);
   if (c.bootstrap_prefix_fd >= 0)
     close(c.bootstrap_prefix_fd);
   if (c.bootstrap_bundle_fd >= 0)

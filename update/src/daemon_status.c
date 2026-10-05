@@ -82,14 +82,17 @@ d2ku_rc d2ku_daemon_json_status(d2ku_daemon *d, const d2ku_status *view,
   unsigned phase = s->phase;
   if (journal && !strcmp(j.transaction_id, s->operation_id))
     phase = j.phase;
-  const char *state = s->busy                     ? "working"
-                      : s->last_result != D2KU_OK ? "error"
-                      : s->available              ? "available"
-                      : fresh                     ? "current"
-                                                  : "unchecked";
-  if (s->available && !strcmp(current, d->index.release_id) &&
-      s->last_result == D2KU_OK && !s->busy && fresh)
-    state = "current";
+  d2ku_rc visible_error = s->last_result;
+  if (visible_error == D2KU_OK && s->has_check && s->check_result != D2KU_OK)
+    visible_error = s->check_result;
+  int current_verified = fresh && s->check_result == D2KU_OK && s->available &&
+                         !strcmp(current, d->index.release_id);
+  const char *state = s->busy                    ? "working"
+                      : visible_error != D2KU_OK ? "error"
+                      : current_verified         ? "current"
+                      : s->available && strcmp(current, d->index.release_id)
+                          ? "available"
+                          : "unchecked";
   add(&o, "{\"state\":");
   quoted(&o, state);
   add(&o, ",\"operation_id\":");
@@ -134,7 +137,46 @@ d2ku_rc d2ku_daemon_json_status(d2ku_daemon *d, const d2ku_status *view,
       d->persistent.policy.selected_minute);
   quoted(&o, d->timezone);
   add(&o, "},\"last_error\":");
-  quoted(&o, error_text(s->last_result));
+  quoted(&o, error_text(visible_error));
+  const d2ku_policy *policy = &d->persistent.policy;
+  int quarantined = policy->has_quarantined_release;
+  int applies =
+      quarantined && s->available &&
+      !memcmp(policy->quarantined_release_sha256, d->index.manifest_sha256, 32);
+  add(&o,
+      ",\"quarantine\":{\"active\":%s,\"applies_to_available\":%s,\"manifest_"
+      "sha256\":",
+      quarantined ? "true" : "false", applies ? "true" : "false");
+  if (quarantined)
+    hash(&o, policy->quarantined_release_sha256);
+  else
+    quoted(&o, "");
+  add(&o, ",\"reason\":");
+  quoted(&o, quarantined ? error_text(policy->quarantine_reason) : "");
+  add(&o, "},\"last_installation\":");
+  const d2ku_installation_outcome *last = &d->last_installation;
+  if (!last->present)
+    add(&o, "null");
+  else {
+    add(&o, "{\"operation_id\":");
+    quoted(&o, last->operation_id);
+    add(&o, ",\"release_id\":");
+    quoted(&o, last->release_id);
+    add(&o, ",\"result\":%d,\"phase\":%u,\"completed_utc\":", last->result,
+        last->phase);
+    if (last->completed_utc)
+      add(&o, "%lld", (long long)last->completed_utc);
+    else
+      add(&o, "null");
+    add(&o, ",\"reason\":");
+    quoted(&o, error_text(last->result));
+    add(&o, "}");
+  }
+  add(&o, ",\"completed_utc\":");
+  if (last->present && last->completed_utc)
+    add(&o, "%lld", (long long)last->completed_utc);
+  else
+    add(&o, "null");
   add(&o, "}");
   pthread_mutex_unlock(&d->mutex);
   return o.bad ? D2KU_INVALID : D2KU_OK;

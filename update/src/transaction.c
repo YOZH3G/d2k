@@ -1093,6 +1093,8 @@ static d2ku_rc quarantine(d2ku_ctx *c, const d2ku_journal *j) {
         return rc;
     p.sequence++;
     p.policy.has_quarantined_release = 1;
+    p.policy.quarantine_reason =
+        j->failure_reason == D2KU_OK ? D2KU_RECOVERY : j->failure_reason;
     memcpy(p.policy.quarantined_release_sha256, j->new_manifest_sha256, 32);
     return d2ku_persistent_store(c, &p);
 }
@@ -1172,27 +1174,28 @@ d2ku_rc d2ku_tx_recover_locked(d2ku_ctx *c, d2ku_status *s) {
 static int terminal(d2ku_phase p) {
     return p == D2KU_COMMITTED || p == D2KU_ROLLED_BACK;
 }
-static d2ku_rc duplicate(d2ku_ctx *c, const d2ku_request *r, int *found) {
-    d2ku_journal j;
-    *found = 0;
-    d2ku_rc rc = d2ku_journal_load(c, &j);
-    if (rc == D2KU_ABSENT)
-        return D2KU_OK;
-    if (rc != D2KU_OK)
-        return rc;
-    if (!strcmp(r->transaction_id, j.transaction_id)) {
-        *found = 1;
-        if (strcmp(r->release_id, j.new_release_id) ||
-            memcmp(r->manifest_sha256, j.new_manifest_sha256, 32))
-            return D2KU_INVALID;
-        return j.phase == D2KU_COMMITTED         ? D2KU_OK
-               : j.phase == D2KU_ROLLED_BACK     ? D2KU_HEALTH
-               : j.phase == D2KU_RECOVERY_FAILED ? D2KU_RECOVERY
-                                                 : D2KU_BUSY;
-    }
-    return terminal(j.phase)                 ? D2KU_OK
+static d2ku_rc duplicate(d2ku_ctx *c, const d2ku_request *r,
+                         d2ku_command_op command, int *found) {
+  d2ku_journal j;
+  *found = 0;
+  d2ku_rc rc = d2ku_journal_load(c, &j);
+  if (rc == D2KU_ABSENT)
+    return D2KU_OK;
+  if (rc != D2KU_OK)
+    return rc;
+  if (!strcmp(r->transaction_id, j.transaction_id)) {
+    *found = 1;
+    if (j.command != command || strcmp(r->release_id, j.new_release_id) ||
+        memcmp(r->manifest_sha256, j.new_manifest_sha256, 32))
+      return D2KU_INVALID;
+    return j.phase == D2KU_COMMITTED         ? D2KU_OK
+           : j.phase == D2KU_ROLLED_BACK     ? D2KU_HEALTH
            : j.phase == D2KU_RECOVERY_FAILED ? D2KU_RECOVERY
                                              : D2KU_BUSY;
+  }
+  return terminal(j.phase)                 ? D2KU_OK
+         : j.phase == D2KU_RECOVERY_FAILED ? D2KU_RECOVERY
+                                           : D2KU_BUSY;
 }
 static d2ku_rc bind_current(d2ku_ctx *c, const d2ku_request *r) {
     char id[D2KU_ID_MAX + 1];
@@ -1400,7 +1403,8 @@ static d2ku_rc execute(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s,
     c->maintenance_lock_fd = lock;
     if (c->refresh && (rc = c->refresh(c->refresh_arg)) != D2KU_OK)
       goto out;
-    rc = duplicate(c, r, &found);
+    rc = duplicate(c, r, rollback ? D2KU_CMD_ROLLBACK : D2KU_CMD_INSTALL,
+                   &found);
     if (rc != D2KU_OK || found)
         goto out;
     rc = request_valid(c, r, rollback);
@@ -1435,6 +1439,7 @@ static d2ku_rc execute(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s,
     }
     d2ku_journal j = {0};
     j.schema = 1;
+    j.command = rollback ? D2KU_CMD_ROLLBACK : D2KU_CMD_INSTALL;
     strcpy(j.transaction_id, r->transaction_id);
     j.transaction_id_len = strlen(r->transaction_id);
     strcpy(j.old_release_id, r->expected_release_id);
@@ -1528,7 +1533,7 @@ d2ku_rc d2ku_install(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s) {
     if (!c || !r || !s)
         return D2KU_INVALID;
     int found = 0;
-    d2ku_rc rc = duplicate(c, r, &found);
+    d2ku_rc rc = duplicate(c, r, D2KU_CMD_INSTALL, &found);
     if (rc != D2KU_OK || found)
         return rc;
     rc = request_valid(c, r, 0);

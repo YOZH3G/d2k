@@ -62,6 +62,7 @@ struct d2ku_policy {
     int32_t selected_date, last_attempt_date; /* durable date high-water marks */
     unsigned selected_minute; /* 180..299, saved once per selected_date */
     int has_quarantined_release;
+    d2ku_rc quarantine_reason;
     unsigned char quarantined_release_sha256[32]; /* exact manifest hash */
 };
 #define D2KU_SERVICE_DATAPATH UINT64_C(1)
@@ -297,6 +298,7 @@ struct d2ku_journal {
     unsigned char checksum[32]; /* computed on store, supplied by load */
     char transaction_id[D2KU_ID_MAX + 1]; size_t transaction_id_len;
     d2ku_phase phase;
+    d2ku_command_op command; /* canonical transaction request, persisted */
     d2ku_rc failure_reason, recovery_reason; /* original cause and recovery failure */
     char old_release_id[D2KU_ID_MAX + 1]; size_t old_release_id_len;
     char new_release_id[D2KU_ID_MAX + 1]; size_t new_release_id_len;

@@ -330,12 +330,15 @@ reason u32; recovery failure reason u32; old release ID
 string; new release ID string; old and new exact manifest SHA-256 (32 bytes
 each); snapshot-ready u8 boolean; active services u64 bitset; monotonic progress
 milliseconds u64; UTC progress seconds u64 (0..INT64_MAX); progress boot ID
-string. IDs use the release-ID grammar and 64-byte bound; boot ID is 1..64
+string; canonical request command u8, exactly 3 (install) or 4 (rollback).
+IDs use the release-ID grammar and 64-byte bound; boot ID is 1..64
 printable non-space ASCII bytes. Both reasons are explicit d2ku_rc values
 0..12 (OK through RECOVERY); zero means no failure. The first transaction
 cause survives a successful rollback; recovery_reason records failure of
 recovery independently. These two fields were added before the first release
-of schema 1: no deployed record migration is implied. Phases 1..13 are checking, available,
+of schema 1; the canonical command tail was also added before publication.
+No deployed record migration is implied. Missing/unknown commands fail closed;
+never infer install vs rollback from release IDs or terminal phase. Phases 1..13 are checking, available,
 downloading, verifying, prepared, stopping, switching, starting, validating,
 committed, rolling_back, rolled_back, recovery_failed. Switching through
 committed requires snapshot-ready=1. The caller defines a stable service bit
@@ -352,7 +355,9 @@ policy enabled u8; selected local YYYYMMDD u32; last-attempt local YYYYMMDD u32;
 selected local minute u16; has-quarantined-release u8; exact quarantined manifest
 SHA-256 (32 bytes); auto-reservation operation ID and release ID (each the
 existing length-prefixed bounded string encoding), then manifest SHA-256
-(32 bytes). Empty reservation IDs mean no active reservation; populated fields
+(32 bytes); quarantine reason u32 (d2ku_rc 1..12 while quarantine is active,
+exactly 0 otherwise). Hash and reason are stored in one atomic generation and
+survive journal rotation. Empty reservation IDs mean no active reservation; populated fields
 are bound to the last-attempt date. Dates are zero/unselected or valid Gregorian dates
 19700101..99991231. Selected minute is zero when unselected, otherwise 180..299.
 Accepted sequence is positive exactly when has-accepted-index=1. Trust keys are
@@ -777,9 +782,14 @@ work 202, conflicting selection/operation 409. Unavailable updater is a separate
 operation ID is preserved; different payload under the same retained ID conflicts.
 Without one, the daemon generates a random 128-bit ID. `daemon-result` (D2KD2,
 canonical bounded mode0600 atomic/fsynced text) retains the last accepted command
-and result across restart; `daemon-transaction` retains the request associated
-with the transaction journal across later checks. Matching retained terminal
-journal replay returns the existing operation, never repeats install. The bounded
+and result across restart. The journal itself retains the canonical transaction
+command and release/hash binding across later checks. Every mutating command
+checks a matching retained journal operation ID before routing: different command
+or payload conflicts, including check/settings reusing an install ID. Acceptance
+or pretransaction failure of another request never replaces the old journal
+binding. The first durable journal of the new transaction replaces it.
+`daemon-transaction` is no longer written or used as replay authority. Matching
+retained terminal journal replay returns the existing operation, never repeats install. The bounded
 retention contract covers the last operation and current journal generation;
 clients must poll status after reconnect rather than retry installation.
 
@@ -789,7 +799,45 @@ version/notes/hash/compatibility, cache `cached`/`fresh`/result/last-success UTC
 last result and safe error text, enabled/window/selected date/minute/timezone.
 Current/previous release IDs are authoritative installed generation identifiers;
 bootstrap inventories need not have a friendly signed version label. Notes are
-JSON-escaped. Secrets, URLs and configuration contents are not exposed.
+JSON-escaped. A successful settings action cannot erase a retained failed check:
+state/error still reflect the check failure, and "current" requires a fresh
+successful check matching the current release. Secrets, URLs and configuration
+contents are not exposed.
+
+Additional status fields:
+
+- `quarantine`: `{active, applies_to_available, manifest_sha256, reason}`. Inactive
+  hash/reason are empty strings. `applies_to_available` requires an authenticated
+  available candidate with exactly the durable quarantined manifest hash. Reason
+  is safe text mapped from the durable cause enum, never a previous unrelated
+  journal or raw log.
+- `last_installation`: null or `{operation_id, release_id, result, phase,
+  completed_utc, reason}` for the last completed install/rollback **request**,
+  including metadata/download failures. Result is d2ku_rc, phase is the matching
+  journal phase or 0 before a transaction. Check/settings never replace it.
+- `completed_utc`: identical alias of last_installation.completed_utc, or null
+  with no known outcome. It is an integer UTC timestamp only when the completion
+  clock was trusted; otherwise null. Check-success time, transaction start time,
+  and restart time are never substituted.
+
+One independent `update-state/installation-result` stores the outcome in bounded
+canonical D2KI1 text (at most 511 bytes, regular/single-link/owner mode0600):
+`D2KI1 COMMAND OPERATION RELEASE HASH RESULT PHASE UTC CHECKSUM\n`.
+HASH is 64 lowercase hex manifest bytes, COMMAND=3|4, RESULT=0..12, PHASE=0..13,
+UTC=0..INT64_MAX (0 means unknown), and CHECKSUM is SHA-256 of all bytes before
+its separating space. The atomic private `.new` is fully written and fsynced,
+renamed, then the parent directory fsynced before completion is exposed. Format,
+ranges, checksum and canonical encoding are validated on load; corrupt outcome
+fails closed. The record is bounded independently of metadata/release history.
+
+The daemon writes this outcome before its generic completion record or any new
+mutation. Outcome/storage failure blocks subsequent mutating requests so the
+unresolved installation cannot be overwritten by check/settings. Restart
+reconciles the retained request with a matching journal; an interrupted request
+with no durable completion timestamp gets null, even if COMMITTED/ROLLED_BACK
+establishes its terminal result. A successfully persisted matching outcome keeps
+its real timestamp if the crash occurred before the generic completion write.
+Readonly candidate probes reconcile only in memory and never write these files.
 
 CLI fixed forms: `status`, `check [--force]`, `install ID HASH`, `rollback ID HASH`,
 `settings on|off`; mutating commands accept trailing `--operation-id ID`.
@@ -840,3 +888,23 @@ are idle, retaining the original intent binding after confirming exclusive idle 
 this also handles remover
 loss after intent/worker exit. Removal preserves the independent coordination
 state and never silently restarts a quiesced installation.
+
+
+Startup ownership is fenced against removal by shared maintenance. Both daemon
+and supervisor acquire maintenance, reject any lifecycle marker (including an
+invalid one), then claim their validated lifetime ownership lock before releasing
+maintenance. Daemon retains maintenance through persistent initialization,
+runtime refresh and socket publication; lifetime daemon.lock remains held until
+worker/socket cleanup. Stable --daemon and --supervise retain supervisor.lock
+before configuration/runtime mutation or recovery/worker fork and across handoffs;
+they release startup maintenance before calling recovery, which takes its own
+maintenance lock. Candidate --boot-probe stays readonly and claims neither public
+ownership nor transaction maintenance.
+
+Thus a no-worker remover can inspect idle locks and fsync intent/stopped ACK while
+holding maintenance without a delayed startup entering between those steps. A
+starter paused before ownership sees the marker after resuming and cannot create
+its lock/socket or run a worker after code removal. If startup claimed first,
+remover refuses or follows authenticated quiescence of that owned process.
+`check-startup-fence` exercises all three actual CLI paths with private pipe
+barriers in `D2KU_TEST_STARTUP` builds; those hooks are absent from ordinary builds.

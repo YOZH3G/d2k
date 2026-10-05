@@ -71,7 +71,7 @@ $(BUILD)/test_runtime_signal: tests/test_runtime_signal_linux.c ../runtime/d2k_r
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) tests/test_runtime_signal_linux.c $(LDFLAGS) -o $@
 
-TRANSACTION_SRC = src/auto.c src/transaction.c src/recover.c src/journal.c src/package.c src/health.c src/schedule.c
+TRANSACTION_SRC = src/startup.c src/auto.c src/transaction.c src/recover.c src/journal.c src/package.c src/health.c src/schedule.c
 .PHONY: check-transaction check-recovery boot
 check: check-transaction check-recovery
 check-transaction: $(BUILD)/test_transaction
@@ -120,7 +120,7 @@ $(BUILD)/test_ipc: tests/test_ipc.c src/ipc.c include/d2k_update_ipc.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread tests/test_ipc.c src/ipc.c -o $@
 check: check-ipc
-DAEMON_SRC = src/daemon.c src/daemon_status.c src/feed.c
+DAEMON_SRC = src/outcome.c src/daemon.c src/daemon_status.c src/feed.c
 $(BUILD)/test_daemon: tests/test_daemon.c $(DAEMON_SRC) src/transport.c src/manifest.c $(TRANSACTION_SRC)
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) -pthread tests/test_daemon.c $(DAEMON_SRC) src/transport.c src/manifest.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) $(CURL_LIBS) -o $@
@@ -173,3 +173,21 @@ check-daemon-replay: $(BUILD)/test_daemon_replay
 $(BUILD)/test_daemon_replay: tests/test_daemon_replay.c tests/transaction_fixture.h $(DAEMON_SRC) src/transport.c src/manifest.c $(TRANSACTION_SRC) include/d2k_update.h src/daemon.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) -pthread tests/test_daemon_replay.c $(DAEMON_SRC) src/transport.c src/manifest.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) $(CURL_LIBS) -o $@
+
+check-ipc: check-daemon-outcome
+.PHONY: check-daemon-outcome
+check-daemon-outcome: $(BUILD)/test_daemon_outcome
+	$(BUILD)/test_daemon_outcome
+$(BUILD)/test_daemon_outcome: tests/test_daemon_outcome.c tests/transaction_fixture.h $(DAEMON_SRC) src/transport.c src/manifest.c $(TRANSACTION_SRC) include/d2k_update.h src/daemon.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) -pthread tests/test_daemon_outcome.c $(DAEMON_SRC) src/transport.c src/manifest.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) $(CURL_LIBS) -o $@
+
+# Linux-only private fixtures. Test pause hooks are absent from ordinary builds.
+.PHONY: check-startup-fence
+check-startup-fence:
+	$(MAKE) BUILD=$(BUILD)/startup-fixture CFLAGS='$(CFLAGS) -DD2KU_TEST_STARTUP' daemon boot service-adapter
+	python3 tests/test_startup_fence.py $(BUILD)/startup-fixture/d2k-update $(BUILD)/startup-fixture/d2k-update-boot $(BUILD)/startup-fixture/d2k-service-adapter serve
+	python3 tests/test_startup_fence.py $(BUILD)/startup-fixture/d2k-update $(BUILD)/startup-fixture/d2k-update-boot $(BUILD)/startup-fixture/d2k-service-adapter daemon
+	python3 tests/test_startup_fence.py $(BUILD)/startup-fixture/d2k-update $(BUILD)/startup-fixture/d2k-update-boot $(BUILD)/startup-fixture/d2k-service-adapter supervise
+
+$(BUILD)/d2k-update $(BUILD)/d2k-update-boot $(BUILD)/d2k-service-adapter: src/startup.h

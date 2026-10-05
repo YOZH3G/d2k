@@ -3,6 +3,7 @@
 #define _DARWIN_C_SOURCE
 #include "daemon.h"
 #include "lifecycle.h"
+#include "startup.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -69,38 +70,28 @@ static int root_path(int fd, char path[1024]) {
   return fcntl(fd, F_GETPATH, path);
 #endif
 }
-static int serve(d2ku_daemon *d, int pulse, int probe) {
+static int serve(d2ku_daemon *d, int pulse, int probe, int lock, int guard) {
   d2ku_ctx *c = d->ctx;
-  int socket_fd = -1, lock = -1;
+  int socket_fd = -1;
   char path[1200];
+  pthread_t beat, work;
+  int hasbeat = 0, haswork = 0;
   if (!probe) {
-    lock = openat(c->root_dirfd, "update-state/daemon.lock",
-                  O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
     struct stat st;
-    if (lock < 0 || fstat(lock, &st) || !S_ISREG(st.st_mode) ||
-        st.st_uid != geteuid() || (st.st_mode & 077) ||
-        flock(lock, LOCK_EX | LOCK_NB)) {
-      if (lock >= 0)
-        close(lock);
-      return 1;
-    }
     snprintf(path, sizeof path, "%s/update-state/updater.sock", d->root);
     struct sockaddr_un address = {.sun_family = AF_UNIX};
     if (strlen(path) >= sizeof address.sun_path) {
-      close(lock);
-      return 1;
+      goto failed;
     }
     strcpy(address.sun_path, path);
     if (lstat(path, &st) == 0 &&
         (!S_ISSOCK(st.st_mode) || st.st_uid != geteuid())) {
-      close(lock);
-      return 1;
+      goto failed;
     }
     unlink(path);
     socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (socket_fd < 0) {
-      close(lock);
-      return 1;
+      goto failed;
     }
     fcntl(socket_fd, F_SETFD, FD_CLOEXEC);
     fcntl(socket_fd, F_SETFL, O_NONBLOCK);
@@ -109,12 +100,11 @@ static int serve(d2ku_daemon *d, int pulse, int probe) {
     umask(old);
     if (r || chmod(path, 0600) || listen(socket_fd, 16)) {
       close(socket_fd);
-      close(lock);
-      return 1;
+      goto failed;
     }
   }
-  pthread_t beat, work;
-  int hasbeat = 0, haswork = 0;
+  d2ku_maintenance_unlock(guard);
+  guard = -1;
   if (pulse >= 0) {
     if (d2ku_boot_pulse(pulse, 1) != D2KU_OK)
       goto failed;
@@ -211,6 +201,7 @@ static int serve(d2ku_daemon *d, int pulse, int probe) {
     close(lock);
   return d->stop ? 76 : d->handoff ? 75 : 0;
 failed:
+  d2ku_maintenance_unlock(guard);
   interrupted = 1;
   if (haswork)
     pthread_join(work, NULL);
@@ -382,6 +373,8 @@ int main(int argc, char **argv) {
     close(c.root_dirfd);
     return 3;
   }
+  if (!probe)
+    d2ku_startup_barrier("daemon");
   d2ku_daemon config = {.ctx = &c};
   d2ku_rc rc = d2ku_daemon_config(&config, fixture);
   if (rc != D2KU_OK) {
@@ -394,9 +387,21 @@ int main(int argc, char **argv) {
     c.clock.build_timestamp = D2KU_BUILD_TIMESTAMP;
   char feed[2048];
   strcpy(feed, config.feed);
+  int startup_guard = -1, ownership = -1;
+  if (!probe) {
+    rc = d2ku_startup_claim(&c, "daemon.lock", &startup_guard, &ownership);
+    if (rc != D2KU_OK) {
+      fprintf(stderr, "updater unavailable: startup ownership result=%d\n", rc);
+      close(c.root_dirfd);
+      return 3;
+    }
+  }
   d2ku_daemon d;
   rc = d2ku_daemon_open(&d, &c, probe);
   if (rc != D2KU_OK) {
+    d2ku_maintenance_unlock(startup_guard);
+    if (ownership >= 0)
+      close(ownership);
     close(c.root_dirfd);
     return 1;
   }
@@ -414,18 +419,20 @@ int main(int argc, char **argv) {
     if (rc == D2KU_OK)
       rc = d2ku_platform_clock(&c.clock);
   } else {
-    int lock = -1;
-    rc = d2ku_maintenance_lock(&c, &lock);
-    if (rc == D2KU_OK) {
-      rc = d2ku_daemon_refresh(&d);
-      d2ku_maintenance_unlock(lock);
-    }
+    rc = d2ku_daemon_refresh(&d);
   }
   c.refresh = d2ku_daemon_refresh;
   c.refresh_arg = &d;
   c.progress = progress;
   c.progress_arg = &d;
-  int result = rc == D2KU_OK ? serve(&d, pulse, probe) : 1;
+  int result = 1;
+  if (rc == D2KU_OK)
+    result = serve(&d, pulse, probe, ownership, startup_guard);
+  else {
+    d2ku_maintenance_unlock(startup_guard);
+    if (ownership >= 0)
+      close(ownership);
+  }
   d2ku_daemon_destroy(&d);
   if (c.health_runtime_dirfd >= 0)
     close(c.health_runtime_dirfd);

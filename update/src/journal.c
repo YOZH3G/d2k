@@ -69,14 +69,18 @@ static int datevalid(int32_t date)
 static d2ku_rc journal_valid(const d2ku_journal *j)
 {
     if (j->schema != 1) return D2KU_INCOMPATIBLE;
-    if (!j->sequence || !textvalid(j->transaction_id, j->transaction_id_len, D2KU_ID_MAX, 1) ||
+    if (!j->sequence ||
+        !textvalid(j->transaction_id, j->transaction_id_len, D2KU_ID_MAX, 1) ||
         !textvalid(j->old_release_id, j->old_release_id_len, D2KU_ID_MAX, 1) ||
         !textvalid(j->new_release_id, j->new_release_id_len, D2KU_ID_MAX, 1) ||
-        !textvalid(j->progress_boot_id, j->progress_boot_id_len, D2KU_BOOT_ID_MAX, 0) ||
+        !textvalid(j->progress_boot_id, j->progress_boot_id_len,
+                   D2KU_BOOT_ID_MAX, 0) ||
         j->phase < D2KU_CHECKING || j->phase > D2KU_RECOVERY_FAILED ||
+        (j->command != D2KU_CMD_INSTALL && j->command != D2KU_CMD_ROLLBACK) ||
         !boolean(j->snapshot_ready) || j->progress_utc < 0 ||
         j->failure_reason < D2KU_OK || j->failure_reason > D2KU_RECOVERY ||
-        j->recovery_reason < D2KU_OK || j->recovery_reason > D2KU_RECOVERY) return D2KU_INVALID;
+        j->recovery_reason < D2KU_OK || j->recovery_reason > D2KU_RECOVERY)
+      return D2KU_INVALID;
     if (j->phase >= D2KU_SWITCHING && j->phase <= D2KU_COMMITTED && !j->snapshot_ready)
         return D2KU_INVALID;
     return D2KU_OK;
@@ -86,12 +90,19 @@ static d2ku_rc persistent_valid(const d2ku_persistent_state *s)
     if (s->schema != 1) return D2KU_INCOMPATIBLE;
     const d2ku_policy *p = &s->policy;
     if (!s->sequence || !boolean(s->has_accepted_index) ||
-        (s->has_accepted_index ? !s->accepted_sequence : s->accepted_sequence != 0) ||
-        s->last_accepted_timestamp < 0 || !s->trust_count || s->trust_count > D2KU_KEYS_MAX ||
-        !boolean(p->enabled) || !boolean(p->has_quarantined_release) ||
+        (s->has_accepted_index ? !s->accepted_sequence
+                               : s->accepted_sequence != 0) ||
+        s->last_accepted_timestamp < 0 || !s->trust_count ||
+        s->trust_count > D2KU_KEYS_MAX || !boolean(p->enabled) ||
+        !boolean(p->has_quarantined_release) ||
+        (p->has_quarantined_release ? p->quarantine_reason <= D2KU_OK ||
+                                          p->quarantine_reason > D2KU_RECOVERY
+                                    : p->quarantine_reason != D2KU_OK) ||
         !datevalid(p->selected_date) || !datevalid(p->last_attempt_date) ||
-        (p->selected_date ? (p->selected_minute < 180 || p->selected_minute > 299) : p->selected_minute != 0))
-        return D2KU_INVALID;
+        (p->selected_date
+             ? (p->selected_minute < 180 || p->selected_minute > 299)
+             : p->selected_minute != 0))
+      return D2KU_INVALID;
     if (s->auto_operation[0] &&
         (!textvalid(s->auto_operation, strnlen(s->auto_operation, 65), 64, 1) ||
          !textvalid(s->auto_release, strnlen(s->auto_release, 65), 64, 1) ||
@@ -115,6 +126,7 @@ static void encode_journal(buffer *b, const d2ku_journal *j)
     number(b, (unsigned)j->snapshot_ready, 1); number(b, j->active_services, 8);
     number(b, j->progress_mono_ms, 8); number(b, (uint64_t)j->progress_utc, 8);
     putstr(b, j->progress_boot_id, j->progress_boot_id_len);
+    number(b, j->command, 1);
 }
 static void encode_persistent(buffer *b, const d2ku_persistent_state *s)
 {
@@ -132,6 +144,7 @@ static void encode_persistent(buffer *b, const d2ku_persistent_state *s)
     putstr(b, s->auto_operation, strlen(s->auto_operation));
     putstr(b, s->auto_release, strlen(s->auto_release));
     bytes(b, s->auto_manifest_sha256, 32);
+    number(b, s->policy.quarantine_reason, 4);
 }
 static int digest(const void *p, size_t n, unsigned char sha[32])
 {
@@ -175,6 +188,7 @@ static d2ku_rc decode(kind k, buffer *b, unsigned slot, void *out)
         j.progress_mono_ms = getnum(b, 8); uint64_t utc = getnum(b, 8);
         if (utc > INT64_MAX) b->bad = 1; else j.progress_utc = (int64_t)utc;
         j.progress_boot_id_len = getstr(b, j.progress_boot_id, D2KU_BOOT_ID_MAX);
+        j.command = (d2ku_command_op)getnum(b, 1);
         if (b->bad || b->pos != b->n || journal_valid(&j) != D2KU_OK) return D2KU_RECOVERY;
         *(d2ku_journal *)out = j;
     } else {
@@ -198,6 +212,7 @@ static d2ku_rc decode(kind k, buffer *b, unsigned slot, void *out)
         getstr(b, s.auto_operation, D2KU_ID_MAX);
         getstr(b, s.auto_release, D2KU_ID_MAX);
         getbytes(b, s.auto_manifest_sha256, 32);
+        s.policy.quarantine_reason = (d2ku_rc)getnum(b, 4);
         if (b->bad || b->pos != b->n || persistent_valid(&s) != D2KU_OK) return D2KU_RECOVERY;
         *(d2ku_persistent_state *)out = s;
     }

@@ -160,6 +160,8 @@ d2ku_rc d2ku_daemon_open(d2ku_daemon *d, d2ku_ctx *c, int readonly) {
         d->status.last_result = D2KU_HEALTH;
     }
   }
+  if (r == D2KU_OK)
+    r = d2ku_outcome_reconcile(d, readonly);
   if (r != D2KU_OK)
     d2ku_daemon_destroy(d);
   return r;
@@ -190,6 +192,10 @@ d2ku_rc d2ku_dispatch(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s) {
   d2ku_rc rc = D2KU_OK;
   if (r->command == D2KU_CMD_STATUS)
     goto done;
+  if (d->outcome_blocked) {
+    rc = D2KU_BUSY;
+    goto done;
+  }
   if (r->transaction_id[0]) {
     if (!valid_id(r->transaction_id)) {
       rc = D2KU_INVALID;
@@ -203,17 +209,11 @@ d2ku_rc d2ku_dispatch(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s) {
         rc = D2KU_BUSY;
       goto done;
     }
-    if (r->command == D2KU_CMD_INSTALL || r->command == D2KU_CMD_ROLLBACK) {
+    {
       d2ku_journal j;
       if (d2ku_journal_load(c, &j) == D2KU_OK &&
           !strcmp(j.transaction_id, r->transaction_id)) {
-        d2ku_daemon prior = {.ctx = c};
-        d2ku_rc loaded = result_file(&prior, 0, "daemon-transaction");
-        if (loaded != D2KU_OK ||
-            strcmp(prior.status.operation_id, r->transaction_id) ||
-            prior.pending.command != r->command ||
-            prior.pending.force != r->force ||
-            prior.pending.enabled != r->enabled ||
+        if (j.command != r->command || r->force || r->enabled ||
             strcmp(j.new_release_id, r->release_id) ||
             memcmp(j.new_manifest_sha256, r->manifest_sha256, 32)) {
           rc = D2KU_BUSY;
@@ -285,10 +285,7 @@ d2ku_rc d2ku_dispatch(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s) {
   d->status.phase = r->command == D2KU_CMD_CHECK     ? D2KU_CHECKING
                     : r->command == D2KU_CMD_INSTALL ? D2KU_DOWNLOADING
                                                      : 0;
-  if (r->command == D2KU_CMD_INSTALL || r->command == D2KU_CMD_ROLLBACK)
-    rc = result_file(d, 1, "daemon-transaction");
-  if (rc == D2KU_OK)
-    rc = result_file(d, 1, "daemon-result");
+  rc = result_file(d, 1, "daemon-result");
   if (rc != D2KU_OK) {
     d->pending_work = 0;
     d->status.busy = 0;
@@ -404,16 +401,30 @@ void d2ku_daemon_work(d2ku_daemon *d) {
   if ((r.command == D2KU_CMD_INSTALL || r.command == D2KU_CMD_ROLLBACK) &&
       rc == D2KU_OK)
     d->handoff = 1;
+  int installation =
+      r.command == D2KU_CMD_INSTALL || r.command == D2KU_CMD_ROLLBACK;
+  if (installation) {
+    d2ku_persistent_state current;
+    if (d2ku_persistent_load(d->ctx, &current) == D2KU_OK)
+      d->persistent = current;
+    if (d2ku_outcome_complete(d, &r, rc) != D2KU_OK) {
+      d->outcome_blocked = 1;
+      d->status.last_result = D2KU_IO;
+    }
+  }
   d->status.busy = 0;
   d->status.check_in_flight = 0;
-  if (result_file(d, 1, "daemon-result") != D2KU_OK)
+  if (!d->outcome_blocked && result_file(d, 1, "daemon-result") != D2KU_OK) {
     d->status.last_result = D2KU_IO;
+    if (installation)
+      d->outcome_blocked = 1;
+  }
   pthread_mutex_unlock(&d->mutex);
   free(m);
 }
 void d2ku_daemon_tick(d2ku_daemon *d) {
   pthread_mutex_lock(&d->mutex);
-  int busy = d->status.busy || d->stop || d->handoff;
+  int busy = d->status.busy || d->stop || d->handoff || d->outcome_blocked;
   pthread_mutex_unlock(&d->mutex);
   if (busy)
     return;
