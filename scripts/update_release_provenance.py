@@ -144,8 +144,9 @@ def clean_source(root):
     root = Path(root).resolve()
     if git(root, 'rev-parse', '--show-toplevel') != str(root):
         raise ValueError('--root must be checkout root')
-    if git(root, 'status', '--porcelain', '--untracked-files=all'):
-        raise ValueError('dirty source checkout')
+    dirty = git(root, 'status', '--porcelain', '--untracked-files=all')
+    if dirty:
+        raise ValueError('dirty source checkout: ' + ' '.join(dirty.splitlines()[:10]))
     commit = git(root, 'rev-parse', 'HEAD')
     if not re.fullmatch('[0-9a-f]{40}', commit):
         raise ValueError('invalid commit')
