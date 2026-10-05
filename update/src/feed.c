@@ -120,7 +120,7 @@ d2ku_rc d2ku_feed_check(d2ku_daemon *d, d2ku_index *i, d2ku_manifest *m) {
   memcpy(c->trust, p.trust, sizeof c->trust);
   unsigned char *b = NULL, sig[64];
   size_t n = 0;
-  r = signed_bytes(d, "stable.json", D2KU_INDEX_MAX, &b, &n, sig);
+  r = signed_bytes(d, "d2k-channel-stable/stable.json", D2KU_INDEX_MAX, &b, &n, sig);
   if (r != D2KU_OK)
     return r;
   r = d2ku_verify_index(c, b, n, sig, i);

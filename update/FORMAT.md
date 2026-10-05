@@ -808,7 +808,7 @@ header bounds. Unknown/duplicate scalar keys, invalid values and non-HTTPS feed
 fail. No production key is invented by Task 9. Releases cannot replace this
 bootstrap trust input. Accepted publication/time floors and key transitions load
 from independent durable state before every verification, and become live only
-after persistent store succeeds. `/stable.json[.sig]` and
+after persistent store succeeds. `/d2k-channel-stable/stable.json[.sig]` and
 `/<release-id>/manifest.json[.sig]` are fetched with the existing strict HTTPS
 transport; detached signatures are exactly 64 raw bytes. Package artifact paths
 come only from the authenticated ABI entry. Rechecking install metadata may
@@ -986,3 +986,98 @@ its lock/socket or run a worker after code removal. If startup claimed first,
 remover refuses or follows authenticated quiescence of that owned process.
 `check-startup-fence` exercises all three actual CLI paths with private pipe
 barriers in `D2KU_TEST_STARTUP` builds; those hooks are absent from ordinary builds.
+
+## Release-host packaging and authenticated bootstrap (Task 8)
+
+These Python/OpenSSL tools run only from an operator's trusted checkout. They are
+not router runtime dependencies. `update/runtime-files.txt` is the exact owned
+inventory: 26 ordinary files per ABI (234 across nine) and 15 separate bootstrap
+inputs. Ordinary packages exclude boot, public/personal configuration, identity,
+knowledge, logs and updater state. Bootstrap includes real stable boot/adapter,
+first worker and externally provisioned public `update.conf`; it carries no
+private key. Runtime packages are sorted deterministic uncompressed POSIX ustar,
+uid/gid zero, empty user/group names, fixed UTC epoch and exact 0644/0755 modes.
+
+`package-update.py --root CLEAN_CHECKOUT --build-dir PRIVATE_BUILD --arch ABI
+--release ID --built-at EPOCH --out DIR` creates one ABI draft and archive.
+`--finalize` requires all nine ABI drafts with the same clean commit, release ID,
+build time/version/notes and verified build/gate receipts. The source must be a
+clean real git checkout; ignored build outputs are independently hash-bound by
+receipts. Packaging never bypasses this check through git archive. Both drafts
+and finalized metadata are immutable local outputs: reuse is refused.
+`--signing-keys-file FILE` accepts only public v1 transition records; runtime
+verification still requires the current trusted signer and overlap rules.
+`sign-update.sh DOCUMENT SIGNATURE` uses external `D2K_SIGNING_KEY` and raw
+Ed25519 signatures; it never creates a production key. `D2K_OPENSSL` selects an
+explicit release-host OpenSSL 3 executable (macOS uses installed Homebrew 3).
+
+`--bootstrap --public-config FILE` creates a separately typed signed-document
+input, `bootstrap-ABI.json`, and `d2k-bootstrap-ABI.tar`. The exact required fields
+are `format:"d2k-bootstrap-v1"`, `schema:1`, `bootstrap_id` (bounded ID), `commit`
+(40 lower hex), positive `built_at`, known `abi`, `boot_protocol:1`, relative
+`artifact`, positive exact `size`, `sha256`, `public_config_sha256`, and `files`.
+Each of exactly 15 file objects has only path/size/mode/sha256. JSON is bounded to
+1 MiB with no duplicate/unknown fields; public config is bounded to 16 KiB.
+Config has `D2KU-CONFIG-1`, exactly one feed/ca/abi/build, 1..8 exact hosts and
+1..8 public key+validity records. Feed is HTTPS, CA is an absolute externally
+provisioned public CA path, build is positive, and ABI matches the archive.
+
+The trusted-checkout operator command `--verify-bootstrap MANIFEST --signature
+SIG --archive TAR --public-key EXTERNALLY_TRUSTED_RAW32 --arch ABI --stage
+PRIVATE_EMPTY_DIR` authenticates the original complete bytes before JSON parsing,
+then checks archive size/hash, strict ustar, exact allowlist, every mode/file hash
+and config binding before creating files. It never executes any bundle member.
+The verifier/public key must come from an independent trusted source; running a
+downloaded bundle's own verifier does not authenticate that bundle. Transfer to
+production is manual and authenticated: verify source/transfer integrity, stage
+into a root-owned directory, then use the existing local bootstrap entrypoint.
+Local bootstrap trusts this already verified root-owned input directory. No
+remote installer one-liner or router Python/OpenSSL subprocess is introduced.
+
+## GitHub feed publication and recovery (Task 8)
+
+The default feed base is `https://github.com/necronicle/d2k/releases/download`.
+The fixed channel suffix is `d2k-channel-stable/stable.json[.sig]`; runtime
+metadata/artifacts use `<release-id>/manifest.json[.sig]` and
+`<release-id>/<artifact>`. `d2k-channel-stable` is reserved and cannot be a runtime
+ID. Fixture feeds mirror these paths. Runtime TLS/signature/redirect checks are
+unchanged. A missing/mismatched channel pair fails closed and cannot update the
+last accepted sequence/trust/current. A later coherent pair recovers normally.
+
+One workflow concurrency group serializes new releases and daily refresh, with
+cancel-in-progress false. The protected signing job requires externally configured
+`d2k-signing` protection, `D2K_SIGNING_ENVIRONMENT_READY=true`, provisioned private
+key secret and independent public-key/config variables. Declaring the environment
+in YAML is not protection: operators must configure it in GitHub before enabling
+production. Defaults/CI use ephemeral fixture keys and dry-run with no publication.
+Read-only build jobs have no production key. Daily refresh revalidates existing
+immutable runtime assets and publishes a higher sequence with seven-day expiry.
+
+An immutable release ID is never reused, including partial uploads. All nine
+runtime and separate bootstrap assets, then manifest/signature, become publicly
+available and are downloaded/hash-verified before channel mutation. GitHub asset
+bytes are replaced by deleting the exact mutable asset ID and uploading again;
+PATCH changes metadata only. Immutable assets/checkpoints are never clobbered.
+`--publish --dry-run` exercises the same state machine with fixture signing and
+zero GitHub calls. No publication command was executed during Task 8 development.
+
+Before replacing stable, publisher uploads ONE immutable recovery checkpoint:
+`D2KCP001` (8 bytes), big-endian u32 document length, exact signed index bytes,
+raw 64-byte signature. Document length is 1..65536; total is at most 65612.
+Filename is `checkpoint-SEQUENCE-DOCUMENT_SHA256.bin`, bound to authenticated
+payload after signature verification and before parsing. Listing is bounded to
+64 pages of 100 assets and 4096 checkpoints; exceeding either refuses allocation,
+never silently truncates and allocates a lower sequence. Incomplete starter assets,
+ambiguous names/metadata, or conflicting signed bytes at one sequence fail closed.
+No incomplete checkpoint proves a sequence; this implementation leaves ambiguous
+starters for operator investigation and does not delete foreign assets.
+
+Recovery chooses the highest authenticated checkpoint/stable sequence. An unexpired
+pending checkpoint can finish exactly its original pair after revalidating its
+referenced runtime. Expired checkpoints remain sequence provenance only: allocate
+a higher fresh sequence, never publish expired bytes or reset sequence to one.
+A race discovered before replacement refuses publication. Checkpoint is uploaded
+and read-verified first, stable signature is replaced/read-verified second, and
+stable JSON is replaced/read-verified last as the commit point. JSON/signature
+replacement is NOT atomic. Every temporary mismatch is rejected by the runtime;
+repeated publisher recovery can finish a coherent pending checkpoint.

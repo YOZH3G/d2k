@@ -176,3 +176,9 @@ jobs:
             echo "== $cc =="
             "$cc" -O2 -Wall -Wextra -Werror -c -o /tmp/nfqview-$cc.o nfqview.c
           done
+
+  update-release:
+    name: Nine C runtime ABIs, authenticated packaging, offline publisher
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: read

@@ -2,7 +2,7 @@
 """Private loopback HTTPS and ephemeral TEST signing key. No remote traffic."""
 import hashlib,http.server,json,os,pathlib,ssl,subprocess,sys,tempfile,threading,time
 with tempfile.TemporaryDirectory(prefix='d2ku-feed-') as tmp:
-    root=pathlib.Path(tmp);(root/'boot').mkdir();(root/'r2').mkdir()
+    root=pathlib.Path(tmp);(root/'boot').mkdir();(root/'r2').mkdir();(root/'d2k-channel-stable').mkdir()
     def openssl(*args):
         return subprocess.run([os.environ.get('OPENSSL', '/opt/homebrew/opt/openssl@3/bin/openssl' if pathlib.Path('/opt/homebrew/opt/openssl@3/bin/openssl').exists() else 'openssl'),*map(str,args)],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE).stdout
     key=root/'TEST-key.pem';cert=root/'TEST-cert.pem'
@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix='d2ku-feed-') as tmp:
         return data
     manifest['signing_keys']=[dict(public_key='02'+'00'*31,not_before=now-10,not_after=now+7000)]
     data=signed(root/'r2/manifest.json',manifest);(root/'r2/arm64.tar').write_bytes(b'data')
-    signed(root/'stable.json',dict(schema=1,channel='stable',sequence=2,issued_at=now-30,expires_at=now+3600,release_id='r2',manifest_sha256=hashlib.sha256(data).hexdigest()))
+    signed(root/'d2k-channel-stable/stable.json',dict(schema=1,channel='stable',sequence=2,issued_at=now-30,expires_at=now+3600,release_id='r2',manifest_sha256=hashlib.sha256(data).hexdigest()))
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self,*a,**kw):super().__init__(*a,directory=tmp,**kw)
         def log_message(self,*a):pass

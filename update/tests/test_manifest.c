@@ -99,6 +99,10 @@ int main(void) {
     assert(d2ku_verify_index(&ctx,changed,strlen(changed),sig,&out)==D2KU_UNTRUSTED);
     /* Even malformed unsigned bytes must fail at the cryptographic boundary. */
     assert(d2ku_verify_index(&ctx,"{",1,sig,&out)==D2KU_UNTRUSTED);
+    /* True lower sequence (not merely equal without durable hash). */
+    ctx.accepted_sequence = 3;
+    bad_index(&ctx,"\"sequence\":2","\"sequence\":2",D2KU_REPLAY);
+    ctx.accepted_sequence = 1;
     bad_index(&ctx,"\"sequence\":2","\"sequence\":1",D2KU_REPLAY);
     bad_index(&ctx,"\"sequence\":2","\"sequence\":18446744073709551616",D2KU_INVALID);
     bad_index(&ctx,"\"sequence\":2","\"sequence\":2.0",D2KU_INVALID);

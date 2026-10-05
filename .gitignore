@@ -70,3 +70,10 @@ detect/*
 /compile_commands.json
 /.serena/
 /.cache/clangd/
+
+# Local update release/operator outputs (keys must stay outside the checkout).
+/builds/update-*/
+/builds/tests/
+/builds/provenance-*.json
+/builds/gates-*.json
+/update-release/

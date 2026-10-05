@@ -20,11 +20,21 @@ JOBS=${JOBS:-4}
 command -v cmake >/dev/null
 [ "$(git -C "$SSL_SOURCE" rev-parse HEAD)" = "$OPENSSL_COMMIT" ] || { echo 'Pinned OpenSSL source missing/mismatched; run build-openssl-tg.sh first' >&2; exit 1; }
 # Source must not carry local modifications into the dependency provenance.
-[ -z "$(git -C "$SSL_SOURCE" status --porcelain --untracked-files=no)" ] || { echo 'OpenSSL source is dirty' >&2; exit 1; }
+[ -z "$(git -C "$SSL_SOURCE" status --porcelain --untracked-files=all)" ] || { echo 'OpenSSL source is dirty' >&2; exit 1; }
 SSL_LIB="$SSL_PREFIX/lib"
 [ -f "$SSL_LIB/libssl.a" ] || SSL_LIB="$SSL_PREFIX/lib64"
 [ -f "$SSL_LIB/libssl.a" ] && [ -f "$SSL_LIB/libcrypto.a" ] || { echo 'Static pinned OpenSSL missing; run build-openssl-tg.sh first' >&2; exit 1; }
-mkdir -p "$DEPS_DIR" "$PREFIX"
+mkdir -p "$DEPS_DIR" "$(dirname -- "$PREFIX")"
+# Do not overlay a foreign or previously compiled output. Each invocation owns
+# one fresh attempt; failed source/object trees are retained for diagnosis.
+[ ! -e "$PREFIX" ] && [ ! -L "$PREFIX" ] || { echo 'Output prefix already exists; choose a fresh owned prefix' >&2; exit 1; }
+LOCK="$PREFIX.d2ku-lock"
+mkdir "$LOCK" || { echo 'Output prefix is claimed by another build' >&2; exit 1; }
+trap 'rmdir "$LOCK"' EXIT HUP INT TERM
+ATTEMPT=$(mktemp -d "$DEPS_DIR/attempt-$ARCH.XXXXXXXX")
+FINAL_PREFIX=$PREFIX
+PREFIX="$ATTEMPT/prefix"
+mkdir "$PREFIX"
 ARCHIVE="$DEPS_DIR/curl-$CURL_VERSION.tar.xz"
 if [ ! -f "$ARCHIVE" ]; then
     curl --fail --show-error --silent --proto '=https' --proto-redir '=https' --location \
@@ -38,10 +48,10 @@ else
 fi
 [ "$actual" = "$CURL_SHA256" ] || { echo 'libcurl source checksum mismatch' >&2; exit 1; }
 # Re-extract verified bytes for each build, so stale local source edits cannot win.
-SOURCE="$DEPS_DIR/source-$ARCH"
+SOURCE="$ATTEMPT/source"
 mkdir -p "$SOURCE"
 tar -xJf "$ARCHIVE" --strip-components=1 -C "$SOURCE"
-TOOLS="$DEPS_DIR/tools-$ARCH"
+TOOLS="$ATTEMPT/tools"
 mkdir -p "$TOOLS"
 cat > "$TOOLS/cc" <<'WRAPPER'
 #!/bin/sh
@@ -57,7 +67,7 @@ cat > "$TOOLS/ranlib" <<'WRAPPER'
 exec "$D2KU_ZIG" ranlib "$@"
 WRAPPER
 chmod 0755 "$TOOLS/cc" "$TOOLS/ar" "$TOOLS/ranlib"
-OBJ="$DEPS_DIR/obj-$ARCH"
+OBJ="$ATTEMPT/obj"
 cmake -S "$SOURCE" -B "$OBJ" -G 'Unix Makefiles' \
     -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR="$ARCH" \
     -DCMAKE_C_COMPILER="$TOOLS/cc" -DCMAKE_AR="$TOOLS/ar" -DCMAKE_RANLIB="$TOOLS/ranlib" \
@@ -79,7 +89,7 @@ cmake -S "$SOURCE" -B "$OBJ" -G 'Unix Makefiles' \
     -DENABLE_THREADED_RESOLVER=ON -DENABLE_UNIX_SOCKETS=OFF
 cmake --build "$OBJ" --parallel "$JOBS"
 cmake --install "$OBJ"
-cat > "$DEPS_DIR/smoke.c" <<'SMOKE'
+cat > "$ATTEMPT/smoke.c" <<'SMOKE'
 #include <curl/curl.h>
 #include <stdio.h>
 #include <string.h>
@@ -93,9 +103,9 @@ int main(void) {
     curl_global_cleanup();return 0;
 }
 SMOKE
-"$TOOLS/cc" -static -Os -Wl,--gc-sections -I"$PREFIX/include" "$DEPS_DIR/smoke.c" \
-    "$PREFIX/lib/libcurl.a" "$SSL_LIB/libssl.a" "$SSL_LIB/libcrypto.a" -pthread -ldl -o "$DEPS_DIR/smoke-$ARCH"
-file "$DEPS_DIR/smoke-$ARCH"
+"$TOOLS/cc" -static -Os -Wl,--gc-sections -I"$PREFIX/include" "$ATTEMPT/smoke.c" \
+    "$PREFIX/lib/libcurl.a" "$SSL_LIB/libssl.a" "$SSL_LIB/libcrypto.a" -pthread -ldl -o "$ATTEMPT/smoke-$ARCH"
+file "$ATTEMPT/smoke-$ARCH"
 cat > "$PREFIX/PROVENANCE" <<PROVENANCE
 curl_version=$CURL_VERSION
 curl_commit=$CURL_COMMIT
@@ -105,4 +115,10 @@ openssl_commit=$OPENSSL_COMMIT
 arch=$ARCH
 target=$TARGET
 PROVENANCE
-wc -c "$PREFIX/lib/libcurl.a" "$SSL_LIB/libssl.a" "$SSL_LIB/libcrypto.a" "$DEPS_DIR/smoke-$ARCH"
+wc -c "$PREFIX/lib/libcurl.a" "$SSL_LIB/libssl.a" "$SSL_LIB/libcrypto.a" "$ATTEMPT/smoke-$ARCH"
+
+# Commit only this successful attempt's output; no foreign tree is removed.
+[ ! -e "$FINAL_PREFIX" ] && [ ! -L "$FINAL_PREFIX" ] || { echo 'Output appeared during build' >&2; exit 1; }
+printf '%s\n' "$ATTEMPT" > "$PREFIX/BUILD_ATTEMPT"
+cp "$ATTEMPT/smoke-$ARCH" "$PREFIX/curl-link-smoke"
+mv "$PREFIX" "$FINAL_PREFIX"

@@ -12,11 +12,18 @@ SRC_DIR=${OPENSSL_SRC_DIR:-"$ROOT/build/telegram/openssl-src"}
 PREFIX=${OPENSSL_PREFIX:-"$ROOT/build/telegram/openssl-$ARCH"}
 OBJ_DIR=${OPENSSL_OBJ_DIR:-"$ROOT/build/telegram/obj-$ARCH"}
 OUT=${OUT:-"$ROOT/builds"}
+TEST_OUT=${TEST_OUT:-"$ROOT/build/telegram"}
 
 command -v "$ZIG" >/dev/null 2>&1 || { echo "zig not found: $ZIG" >&2; exit 1; }
 command -v git >/dev/null 2>&1 || { echo "git is required to fetch pinned OpenSSL" >&2; exit 1; }
 mkdir -p "$(dirname -- "$SRC_DIR")" "$PREFIX"
-mkdir -p "$ROOT/build/telegram" "$OBJ_DIR" "$OUT"
+mkdir -p "$TEST_OUT" "$OUT"
+if [ "${D2K_REUSE_VALIDATED_DEPS:-0}" = 1 ]; then
+    : "${DEPS_PROVENANCE:?validated receipt required for dependency reuse}"
+    python3 "$ROOT/scripts/update_release_provenance.py" --root "$ROOT" --build-dir "$OUT" \
+        --abi "$ARCH" --dependencies "$DEPS_PROVENANCE" --deps-env >/dev/null
+else
+mkdir -p "$OBJ_DIR"
 
 if [ ! -d "$SRC_DIR/.git" ]; then
     git init "$SRC_DIR"
@@ -46,6 +53,8 @@ AR="$ZIG ar" RANLIB="$ZIG ranlib" \
     --prefix="$PREFIX" --openssldir=/opt/d2k/certs
 make -j "$JOBS" build_libs
 make install_sw
+[ -z "$(git -C "$SRC_DIR" status --porcelain --untracked-files=all)" ] || { echo "OpenSSL source dirty" >&2; exit 1; }
+fi
 
 SMOKE="$ROOT/telegram/test_openssl_link.c"
 LIBDIR="$PREFIX/lib"
@@ -54,9 +63,9 @@ LIBDIR="$PREFIX/lib"
 # shellcheck disable=SC2086
 "$ZIG" cc -target "$TARGET" $TARGET_FLAGS -static \
     -I"$PREFIX/include" -L"$LIBDIR" \
-    -o "$ROOT/build/telegram/openssl-link-smoke-$ARCH" "$SMOKE" \
+    -o "$TEST_OUT/openssl-link-smoke-$ARCH" "$SMOKE" \
     -lssl -lcrypto -ldl -pthread
-file "$ROOT/build/telegram/openssl-link-smoke-$ARCH"
+file "$TEST_OUT/openssl-link-smoke-$ARCH"
 
 # The router runtime is a single static C executable. Keep all implementation
 # sources in the compile command so the package cannot accidentally omit a
