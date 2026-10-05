@@ -215,6 +215,10 @@ d2ku_rc d2ku_service_configure(d2ku_ctx *c, const char *root,
   unsigned long queue = 2000;
   s->tg_port = 1443;
   s->legacy_log_fd = -1;
+  strcpy(s->legacy_mark, "0x2d");
+  strcpy(s->legacy_probe_mark, "0x2e");
+  strcpy(s->legacy_measure_mark, "0x2f");
+  strcpy(s->legacy_flows, "2048");
   int fd = openat(c->root_dirfd, "config",
                   O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
   if (!regular(fd)) {
@@ -253,20 +257,44 @@ d2ku_rc d2ku_service_configure(d2ku_ctx *c, const char *root,
     }
     char *dest = NULL;
     size_t cap = 0;
-    const char *keys[] = {"STATE_DIR", "D2K_RUNTIME_DIR", "TG_IDENTITY",
-                          "TG_STATUS", "TG_CA_BUNDLE",    "PANEL_LISTEN",
-                          "MODE",      "TG_ENABLED"};
-    char *fields[] = {s->state, s->runtime, s->identity, status,
-                      ca,       listen,     mode,        tg};
-    size_t caps[] = {sizeof s->state, sizeof s->runtime, sizeof s->identity,
-                     sizeof status,   sizeof ca,         sizeof listen,
-                     sizeof mode,     sizeof tg};
-    for (unsigned i = 0; i < 8; i++)
+    const char *keys[] = {"STATE_DIR",  "D2K_RUNTIME_DIR", "TG_IDENTITY",
+                          "TG_STATUS",  "TG_CA_BUNDLE",    "PANEL_LISTEN",
+                          "MODE",       "TG_ENABLED",      "MARK",
+                          "PROBE_MARK", "MEASURE_MARK",    "FLOWS"};
+    char *fields[] = {s->state,
+                      s->runtime,
+                      s->identity,
+                      status,
+                      ca,
+                      listen,
+                      mode,
+                      tg,
+                      s->legacy_mark,
+                      s->legacy_probe_mark,
+                      s->legacy_measure_mark,
+                      s->legacy_flows};
+    size_t caps[] = {sizeof s->state,
+                     sizeof s->runtime,
+                     sizeof s->identity,
+                     sizeof status,
+                     sizeof ca,
+                     sizeof listen,
+                     sizeof mode,
+                     sizeof tg,
+                     sizeof s->legacy_mark,
+                     sizeof s->legacy_probe_mark,
+                     sizeof s->legacy_measure_mark,
+                     sizeof s->legacy_flows};
+    for (unsigned i = 0; i < 12; i++)
       if (!strcmp(p, keys[i])) {
         dest = fields[i];
         cap = caps[i];
         break;
       }
+    if (!strcmp(p, "MODE"))
+      s->legacy_mode_configured = 1;
+    if (!strcmp(p, "STATE_DIR"))
+      s->legacy_state_configured = 1;
     if (!strcmp(p, "TG_RELAY_SECRET"))
       s->identity_required = !*eq;
     if (!strcmp(p, "TG_PORT")) {
@@ -301,6 +329,8 @@ d2ku_rc d2ku_service_configure(d2ku_ctx *c, const char *root,
   if (!status[0] && snprintf(status, sizeof status, "%s/telegram.status",
                              s->state) >= (int)sizeof status)
     return D2KU_INVALID;
+  strcpy(s->legacy_mode, mode);
+  strcpy(s->legacy_listen, listen);
   char *colon = strrchr(listen, ':');
   if (!colon)
     return D2KU_INVALID;

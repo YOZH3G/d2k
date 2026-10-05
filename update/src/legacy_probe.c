@@ -183,6 +183,137 @@ d2ku_rc d2ku_legacy_admit(d2ku_ctx *c, int saved, char abi[9]) {
   return d2ku_legacy_protocol(c, saved);
 }
 
+/* The known flat S99 profile is recoverable only when effective arguments
+ * match its config and retained resources. Defaults below are from the wire12
+ * executables, not from a newer CLI. Diagnostics --stats is deliberately reset
+ * to one second on recovery; it does not change traffic or personal resources.
+ */
+static int number(const char *p, unsigned long *v) {
+  if (!p || !*p || *p == '-' || *p == '+' || *p == ' ')
+    return 0;
+  char *end;
+  errno = 0;
+  *v = strtoul(p, &end, 0);
+  return !errno && !*end && *v <= UINT32_MAX;
+}
+int d2ku_legacy_argv(d2ku_service_config *s, unsigned role, size_t argc,
+                     const char *const *argv) {
+  if (role > 3 || !argc || argc > 64)
+    return 0;
+  char control[1200], catalog[1200], live[1200], config[1200], log[1200],
+      assets[1200], cache[1200], service[1200], dp[1200], core[1200], tg[1200],
+      status[1200], queue[24];
+  snprintf(control, sizeof control, "%s/run/d2kd.sock", s->root);
+  snprintf(catalog, sizeof catalog, "%s/state/catalog.json", s->root);
+  snprintf(live, sizeof live, "%s/live.json", s->runtime);
+  snprintf(config, sizeof config, "%s/config", s->root);
+  snprintf(log, sizeof log, "%s/log/%s.log", s->root,
+           role == 0   ? "d2kd"
+           : role == 1 ? "d2kc"
+           : role == 2 ? "panel"
+                       : "telegram");
+  snprintf(assets, sizeof assets, "%s/panel", s->root);
+  snprintf(cache, sizeof cache, "%s/state/https-cache.txt", s->root);
+  const char *slash = strrchr(s->root, '/');
+  if (!slash)
+    return 0;
+  snprintf(service, sizeof service, "%.*s/etc/init.d/S99d2k",
+           (int)(slash - s->root), s->root);
+  snprintf(dp, sizeof dp, "%s/run/d2kd.pid", s->root);
+  snprintf(core, sizeof core, "%s/run/d2k.pid", s->root);
+  snprintf(tg, sizeof tg, "%s/run/d2ktg.pid", s->root);
+  /* Historical panel CLI does not consume TG_STATUS from config. */
+  snprintf(status, sizeof status, "%s/state/telegram.status", s->root);
+  snprintf(queue, sizeof queue, "%u", s->ctx->health_queue);
+  /* roles bitmask; kind: text=0, uint32=1, flag=2, diagnostic uint32=3.
+   * NULL default means the historical daemon needs the explicit argument. */
+  struct option {
+    const char *key, *want, *def;
+    unsigned roles, kind;
+    int seen;
+  } opts[] = {
+      {"--control", control, NULL, 3, 0, 0},
+      {"--catalog", catalog, "/opt/d2k/catalog.json", 2, 0, 0},
+      {"--live", live, NULL, 6, 0, 0},
+      {"--config", config, "/opt/d2k/config", 12, 0, 0},
+      {"--log", log, NULL, 15, 0, 0},
+      {"--https-cache", cache, cache, 2, 0, 0},
+      {"--assets", assets, "/opt/d2k/panel", 4, 0, 0},
+      {"--state-dir", s->state,
+       s->legacy_state_configured ? s->state : "/opt/d2k/state", 4, 0, 0},
+      {"--listen", s->legacy_listen, s->legacy_listen, 4, 0, 0},
+      {"--service", service, "/opt/etc/init.d/S99d2k", 4, 0, 0},
+      {"--engine-pid", dp, "/opt/d2k/run/d2kd.pid", 4, 0, 0},
+      {"--controller-pid", core, "/opt/d2k/run/d2k.pid", 4, 0, 0},
+      {"--telegram-pid", tg, "/opt/d2k/run/d2ktg.pid", 4, 0, 0},
+      {"--telegram-status", status, "/opt/d2k/state/telegram.status", 4, 0, 0},
+      {"--queue", queue, role == 2 ? queue : "0", 5, 1, 0},
+      {"--mode",
+       role == 2                          ? s->legacy_mode
+       : !strcmp(s->legacy_mode, "apply") ? "apply"
+                                          : "observe",
+       role == 2 && s->legacy_mode_configured ? s->legacy_mode : "observe", 5,
+       0, 0},
+      {"--mark", role == 0 ? s->legacy_mark : s->legacy_probe_mark,
+       role == 0 ? "0" : "0x2d", 3, 1, 0},
+      {"--probe-mark", s->legacy_probe_mark, "0", 1, 1, 0},
+      {"--measure-mark", s->legacy_measure_mark, s->legacy_probe_mark, 2, 1, 0},
+      {"--flows", s->legacy_flows, "2048", 1, 1, 0},
+      {"--udp-reverse-hook", "1", "0", 1, 2, 0},
+      {"--queue-len", "1024", "1024", 1, 1, 0},
+      {"--copy-range", "1600", "1600", 1, 1, 0},
+      {"--sched-slots", "128", "128", 1, 1, 0},
+      {"--journal", "256", "256", 1, 1, 0},
+      {"--idle", "120", "120", 1, 1, 0},
+      {"--duration", "0", "0", 1, 1, 0},
+      {"--stats", "1", "10", 1, 3, 0}};
+  size_t first = 1;
+  if (role == 2) {
+    if (argc < 2 || strcmp(argv[1], "serve"))
+      return 0;
+    first = 2;
+  }
+  for (size_t i = first; i < argc; i++) {
+    size_t k;
+    for (k = 0; k < sizeof opts / sizeof *opts; k++)
+      if (!strcmp(argv[i], opts[k].key))
+        break;
+    if (k == sizeof opts / sizeof *opts || !(opts[k].roles & (1u << role)) ||
+        opts[k].seen)
+      return 0;
+    opts[k].seen = 1;
+    const char *value = "1";
+    if (opts[k].kind != 2) {
+      if (++i == argc || !*argv[i])
+        return 0;
+      value = argv[i];
+    }
+    opts[k].def = value;
+  }
+  for (size_t k = 0; k < sizeof opts / sizeof *opts; k++) {
+    struct option *o = &opts[k];
+    if (!(o->roles & (1u << role)))
+      continue;
+    /* Panel's implicit live path follows STATE_DIR, not the volatile dir. */
+    if (!o->def && role == 2 && !strcmp(o->key, "--live")) {
+      char implicit[1200];
+      snprintf(implicit, sizeof implicit, "%s/live.json", s->state);
+      if (strcmp(implicit, o->want))
+        return 0;
+      continue;
+    }
+    if (!o->def)
+      return 0;
+    if (o->kind) {
+      unsigned long a, b;
+      if (!number(o->def, &a) || !number(o->want, &b) ||
+          (o->kind != 3 && a != b))
+        return 0;
+    } else if (strcmp(o->def, o->want))
+      return 0;
+  }
+  return 1;
+}
 static int process_paths(d2ku_service_config *s, pid_t pid, unsigned role) {
   char path[80], data[8192];
   snprintf(path, sizeof path, "/proc/%ld/cmdline", (long)pid);
@@ -193,76 +324,14 @@ static int process_paths(d2ku_service_config *s, pid_t pid, unsigned role) {
   close(f);
   if (n <= 0 || n == (ssize_t)sizeof data || data[n - 1])
     return 0;
-  char control[1200], catalog[1200], live[1200], config[1200];
-  snprintf(control, sizeof control, "%s/run/d2kd.sock", s->root);
-  snprintf(catalog, sizeof catalog, "%s/state/catalog.json", s->root);
-  snprintf(live, sizeof live, "%s/live.json", s->runtime);
-  snprintf(config, sizeof config, "%s/config", s->root);
-  int seen_control = 0, seen_catalog = 0, seen_live = 0, seen_config = 0,
-      seen_log = 0;
-  for (char *p = data + strlen(data) + 1; p < data + n; p += strlen(p) + 1) {
-    const char *want = NULL;
-    if (!strcmp(p, "--control")) {
-      want = control;
-      seen_control = 1;
-    }
-    if (!strcmp(p, "--catalog")) {
-      want = catalog;
-      seen_catalog = 1;
-    }
-    if (!strcmp(p, "--live")) {
-      want = live;
-      seen_live = 1;
-    }
-    if (!strcmp(p, "--config")) {
-      want = config;
-      seen_config = 1;
-    }
-    if (!strcmp(p, "--plan") || !strcmp(p, "--duration") ||
-        !strcmp(p, "--health-file"))
+  const char *argv[64];
+  size_t argc = 0;
+  for (char *p = data; p < data + n; p += strlen(p) + 1) {
+    if (argc == 64)
       return 0;
-    if (want) {
-      p += strlen(p) + 1;
-      if (p >= data + n || strcmp(p, want))
-        return 0;
-    } else if (!strcmp(p, "--queue")) {
-      p += strlen(p) + 1;
-      if (p >= data + n)
-        return 0;
-      char *end;
-      unsigned long q = strtoul(p, &end, 10);
-      if (*end || q != s->ctx->health_queue)
-        return 0;
-    } else if (!strcmp(p, "--log")) {
-      seen_log = 1;
-      p += strlen(p) + 1;
-      if (p >= data + n)
-        return 0;
-      char expected[1200];
-      snprintf(expected, sizeof expected, "%s/log/%s.log", s->root,
-               role == 0   ? "d2kd"
-               : role == 1 ? "d2kc"
-               : role == 2 ? "d2kpanel"
-                           : "d2ktg");
-      if (strcmp(p, expected))
-        return 0;
-    } else if (!strcmp(p, "--https-cache")) {
-      p += strlen(p) + 1;
-      if (p >= data + n)
-        return 0;
-      char expected[1200];
-      snprintf(expected, sizeof expected, "%s/state/https-cache.json", s->root);
-      if (strcmp(p, expected))
-        return 0;
-    }
+    argv[argc++] = p;
   }
-  if (role < 2 && (!seen_control || !seen_log))
-    return 0;
-  if (role == 1 && (!seen_catalog || !seen_live))
-    return 0;
-  if (role == 3 && !seen_config)
-    return 0;
-  return 1;
+  return d2ku_legacy_argv(s, role, argc, argv);
 }
 /* Bind every live pidfile even if an enabled-intent file already exists. The
  * source inode must still be the flat executable, and its held bytes must equal

@@ -735,10 +735,32 @@ this same exact old receipt identity; no extra Task8 bootstrap entry is needed.
 The first new candidate must pass ordinary signed index/manifest/package,
 wire13/offline checks before STOPPING. New health never falls back to legacy.
 
+Admission parses the complete live argv (maximum8192 bytes/64 arguments) by
+role, including the panel `serve` verb. Unknown/cross-role/duplicate switches,
+missing values and unsupported effective settings/resources are refused before
+entry-point replacement. Explicit paths must match the retained profile; normal
+omitted historical defaults are resolved. S99 config marks/flows/mode/queue and
+panel listen/state are compared, with historical executable defaults used when
+the corresponding CLI/config option is absent. Core HTTPS cache is the default
+`state/https-cache.txt`; externally redirected caches/assets/state are refused.
+Panel uses `log/panel.log`, TG `log/telegram.log`. Historical panel's default
+Telegram status is `root/state/telegram.status`: unlike the TG daemon it does not
+read `TG_STATUS` from config. The TG daemon's configured personal status remains
+in the snapshot inventory. Datapath diagnostic stats interval is deliberately
+reset to one second during legacy recovery; unsupported traffic settings are
+not silently converted to current defaults.
+
 Before coherent snapshot, the adapter enumerates historical runtimes, old
 helper PID files, known NDM/init/helper invocations and descendants. Runtime
-executables bind the saved release or exact original bytes. Helpers are stopped
-before platform stop, rechecked afterwards, and an unknown writer fails closed.
+executables bind the saved release or exact original bytes. Helpers and their captured descendants must finish before fixing the stop-log
+offset and before platform stop; they are rechecked afterwards, and an unknown
+writer fails closed. A live controller's actual stdout/stderr FDs and start ticks
+must bind the held regular root-owned single-link log inode. The pathname and
+FD binding are checked again after helpers finish. Log prefix SHA256 and offset
+then pin prior bytes; replacement, missing pathname, shortening or prefix rewrite
+after stop refuse the snapshot. Prefix hashing streams16KiB at a time and has
+the same128MiB file ceiling as inventory; new diagnostics must be below64KiB.
+A core already absent has no pending flush; no fictitious log-FD proof is made.
 Forced kill, remaining/new writers, unreadable/overflowed stop diagnostics or
 controller catalog-save error prevents snapshot-ready/candidate start. Original
 root `files/` stays sealed because old voice code has hardcoded resource paths;

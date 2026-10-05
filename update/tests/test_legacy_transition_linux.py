@@ -24,11 +24,11 @@ with tempfile.TemporaryDirectory(prefix='legacy-first-') as temporary:
     processes=[]
     def start(name,args,pidfile):
         p=subprocess.Popen(['/opt/sbin/'+name,*args],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);processes.append(p);(root/'run'/pidfile).write_text(str(p.pid)+'\n');return p
-    dp=start('d2kd',['--queue','30000','--control',str(root/'run/d2kd.sock'),'--mode','observe','--stats','1','--log',str(root/'log/d2kd.log')],'d2kd.pid')
+    dp=start('d2kd',['--queue','30000','--control',str(root/'run/d2kd.sock'),'--mode','observe','--mark','0x2d','--probe-mark','0x2e','--udp-reverse-hook','--stats','1','--log',str(root/'log/d2kd.log')],'d2kd.pid')
     for _ in range(100):
         if (root/'run/d2kd.sock').exists():break
         assert dp.poll() is None;time.sleep(.05)
-    core=start('d2kc',['--control',str(root/'run/d2kd.sock'),'--catalog',str(root/'state/catalog.json'),'--live','/tmp/d2k/live.json','--log',str(root/'log/d2kc.log'),'--https-cache',str(root/'state/https-cache.json')],'d2k.pid')
+    core=start('d2kc',['--control',str(root/'run/d2kd.sock'),'--catalog',str(root/'state/catalog.json'),'--live','/tmp/d2k/live.json','--log',str(root/'log/d2kc.log'),'--mark','0x2e','--measure-mark','0x2f','--https-cache',str(root/'state/https-cache.txt')],'d2k.pid')
     for _ in range(100):
         if pathlib.Path('/tmp/d2k/live.json').exists():break
         assert core.poll() is None;time.sleep(.05)

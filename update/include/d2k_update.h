@@ -151,6 +151,9 @@ typedef struct {
     d2ku_ctx *ctx;
     char root[1024], runtime[1024], state[1024], identity[1024];
     char panel_host[128];
+    char legacy_mode[16], legacy_listen[256];
+    int legacy_mode_configured, legacy_state_configured;
+    char legacy_mark[32], legacy_probe_mark[32], legacy_measure_mark[32], legacy_flows[32];
     uint64_t enabled;
     int identity_required;
     char legacy_abi[9];
@@ -160,6 +163,7 @@ typedef struct {
     size_t legacy_writer_count;
     int legacy_log_fd;
     off_t legacy_log_offset;
+    unsigned char legacy_log_prefix[32];
 } d2ku_service_config;
 d2ku_rc d2ku_service_lock_valid(d2ku_ctx *, int);
 d2ku_rc d2ku_service_configure(d2ku_ctx *, const char *, d2ku_service_config *);

@@ -281,3 +281,167 @@ Final evidence summary:
 Raw logs stay in the ignored local `.superpowers/sdd/2026-10-04-auto-update/`
 workspace evidence directory. The owned report is committed explicitly; logs,
 fixture binaries, container/debug artifacts and all foreign dirt are excluded.
+
+## Independent legacy review fix round 1 — 2026-10-05
+
+Base `87c742e823fb7cf272cce482c7217d7ebf457a1e`, same branch and foreign
+working-tree dirt listed above. All three Important findings in
+`task-7-legacy-review.md` were reproduced and fixed. No router/host-rule/service
+changes, subagents, package additions, keys or external publication. Task8's
+15/26 file inventories, receipts/journal schemas and ABI dependencies are unchanged.
+
+### Changes and actual historical defaults
+
+1. Active panel/TG admission now uses actual historical S99 log names
+   `panel.log` and `telegram.log`. The Linux bootstrap fixture starts both real
+   historical ARM64 binaries, checks they remain alive across preparation, and
+   still checks disabled intent/personal files/tamper refusal. The fixture runs
+   only with `D2KU_LEGACY_LAB=1` in `--network none`; panel listens on loopback
+   127.0.0.1:18090 and receives no HTTP/API requests. TG listens on its historical
+   fixed port1443 and tries only closed loopback `wss://127.0.0.1:1/ws`, using
+   fixture-only credentials and system CA. There is no external relay/target.
+   These are admission checks, not an active TG application/120s proof.
+2. Live argv is bounded to8192 bytes/64 arguments and parsed completely by role.
+   Unknown/cross-role/duplicate options, missing values, bad numbers and divergent
+   effective resources/settings refuse before entry changes. All historical
+   panel resource switches are checked, including assets/state/service/pid/status.
+   Actual CLI defaults come from e10a017 `panel/main.c`, `core/d2kc.c`, datapath
+   and Telegram CLI, compared with current configured S99 profile. DP config
+   marks/flows, mode/queue and panel listen/state are retained; explicit default
+   DP tuning options are accepted, unsupported nondefault tuning refused.
+   `--stats` remains diagnostic-only and becomes1 on recovery as previously.
+   The known S99 profile explicitly passes marks/reverse-hook; the transition
+   fixture now does the same. The historical cache is `state/https-cache.txt`,
+   not the earlier synthetic fixture `.json` path. Controller defaults and
+   explicit optional default cache are tested.
+   Historical panel does NOT consume config `TG_STATUS`; its default remains
+   root/state/telegram.status, while the TG daemon's configured status is still
+   snapshotted. Missing panel MODE means observe unless config supplied MODE;
+   missing STATE_DIR means /opt/d2k/state unless config supplied STATE_DIR.
+   These distinctions have addressed RED→GREEN tests. Config is not rewritten.
+3. Before stop, diagnostics bind to actual live controller FD1 AND FD2, retained
+   executable/start ticks, and the held owner-safe regular single-link log inode.
+   Captured helper descendants must exit (bounded3s, no forced-success path)
+   before offset. FD/inode/path are rechecked after their exit, including a helper
+   that replaces the pathname during TERM. The pinned prefix is SHA256 streamed
+   in16KiB chunks, capped at the existing inventory128MiB/file limit. After stop,
+   missing/replaced/truncated/rewritten prior bytes, NUL/overflow/unreadable new
+   diagnostics or actual catalog/HTTPS-cache/HTTP-plan save-failure text fail
+   closed. Already absent core has no pending writer/flush to prove. Independent
+   external installed-adapter waiters remain excluded; captured descendants are
+   still stopped. The signed target and typed legacy120s health paths are unchanged.
+
+### RED evidence, retained unchanged
+
+All logs below are beside this report with prefix `task7-legacy-fix1-`.
+The real historical fixture command is:
+
+```
+python3 update/tests/test_legacy_linux.py build/update/d2k-update-boot \
+  build/update/d2k-service-adapter build/task7-legacy/builds
+```
+
+- `active-red3.log`, exit1: healthy active panel/TG bootstrap returned HEALTH10,
+  no current alias. After two log-name corrections `active-green.log`, exit0.
+  Earlier `active-red.log`/`active-red2.log` are fixture setup errors (duplicate
+  TG_ENABLED, then unsupported TG_PORT15443), not product evidence; retained.
+- With log fix, `paths-red.log`, exit1: real historical panel redirected
+  --state-dir to a private external directory, yet bootstrap succeeded. Final
+  fixture checks four live divergences (state-dir/assets/service/telegram-status)
+  rejected before current, without stopping that process. `paths-green2.log`
+  exit0. The misleadingly named `paths-green.log` is a compile failure from a
+  missing test-only fcntl include; `diagnostic-red.log` consequently has127
+  (test not built). Neither is claimed GREEN.
+- `diagnostic-red2.log`: production before/after with real held writer FDs and
+  inode: replaced-before, truncated, rewritten, replaced-after and helper each
+  abort134. Normal and exit-zero save-error pass. The C fixture uses an isolated
+  writer executable implementing the old exit-zero diagnostic behavior, not a
+  mock of quiesce; full real historical core stop is separately covered below.
+  `diagnostic-green.log` then passes7 cases; final nine-case
+  `diagnostic-final.log` exit0 adds helper replacement and oversized log.
+- `panel-default-red.log`, exit134, finds config TG_STATUS wrongly changing
+  panel default; addressed in `panel-default-green.log`, exit0.
+  `omitted-default-red.log`, exit134, then finds absent MODE wrongly inheriting
+  S99's apply default. The final per-role test covers both with real configured
+  presence flags. These are narrow final changes after broad covering below.
+
+### Covering gates and exact chronology
+
+Before the final panel TG_STATUS/MODE/STATE_DIR default refinement:
+
+```
+make -C update check-bootstrap check-transaction check-recovery check-legacy
+make -C update BUILD=../build/update-task7-fix1-san \
+  CFLAGS='-O1 -g -UNDEBUG -std=c11 -Wall -Wextra -Werror -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer' \
+  LDFLAGS='-fsanitize=address,undefined' check-bootstrap check-legacy
+```
+
+`covering.log` exit0:155 bootstrap crash barriers,67 missing-rule cases, real
+managed CLI, transaction,37 recovery crash/fsync barriers, offline ownership,
+legacy inventory. `san.log` HARNESS_EXIT0, ASan/UBSan bootstrap/managed/argv/
+inventory. This round did not repeat unrelated full core/detect/datapath suites.
+
+Fresh container `d2ku-legacy-fix1-final`, same previously recorded lab image:
+
+```
+docker run -d --init --name d2ku-legacy-fix1-final --network none \
+  --cap-add NET_ADMIN -e D2KU_LEGACY_LAB=1 d2k-update-lab:bookworm sleep infinity
+COPYFILE_DISABLE=1 tar -cf /tmp/d2ku-legacy-fix1-final.tar \
+  update runtime files scripts build/task7-legacy/builds
+docker cp /tmp/d2ku-legacy-fix1-final.tar d2ku-legacy-fix1-final:/tmp/source.tar
+```
+
+Inside that private container (no host mounts):
+
+```
+mkdir -p /work
+cd /work
+tar -xf /tmp/source.tar
+make -C update CFLAGS='-O2 -g -UNDEBUG -std=c11 -Wall -Wextra -Werror -Wpedantic -Wno-misleading-indentation -Wno-format-truncation' \
+  boot service-adapter ../build/update/test_legacy_transition \
+  ../build/update/legacy_candidate ../build/update/test_legacy_quiesce
+for scenario in replaced-before truncated rewritten replaced-after helper helper-replace oversized normal save-error; do
+  build/update/test_legacy_quiesce "$scenario" || exit
+done
+python3 update/tests/test_legacy_linux.py build/update/d2k-update-boot \
+  build/update/d2k-service-adapter build/task7-legacy/builds
+python3 update/tests/test_legacy_transition_linux.py build/update/d2k-update-boot \
+  build/update/d2k-service-adapter build/task7-legacy/builds \
+  build/update/test_legacy_transition build/update/legacy_candidate
+```
+
+`final-linux2.log` HARNESS_EXIT0: all9 diagnostics, actual active panel/TG
+admission, actual signed failed target→wire12 rollback with **full120s**,
+negative frozen DP/core/rules/wrong-target/new-health checks, helper-descendant
+stop preserving independent waiter, trailing external stop. `final-linux.log`
+HARNESS_EXIT1 contains only initial `mkdir /work: File exists` setup mistake,
+fixed to mkdir -p; retained, not product failure. Historical artifact provenance
+and field limitations are exactly those already recorded above.
+
+After the LAST product change (only panel effective-default refinement):
+
+```
+make -C update BUILD=../build/update-task7-fix1-san \
+  CFLAGS='-O1 -g -UNDEBUG -std=c11 -Wall -Wextra -Werror -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer' \
+  LDFLAGS='-fsanitize=address,undefined' ../build/update-task7-fix1-san/test_service_adapter
+build/update-task7-fix1-san/test_service_adapter
+```
+
+`final-argv-san.log` HARNESS_EXIT0. Updated sources copied by tar/cp into the
+same now-stopped private Linux container, then:
+
+```
+make -C update CFLAGS='-O2 -g -UNDEBUG -std=c11 -Wall -Wextra -Werror -Wpedantic -Wno-misleading-indentation -Wno-format-truncation' \
+  boot service-adapter ../build/update/test_service_adapter
+build/update/test_service_adapter
+python3 update/tests/test_legacy_linux.py build/update/d2k-update-boot \
+  build/update/d2k-service-adapter build/task7-legacy/builds
+```
+
+`final-active.log` HARNESS_EXIT0: final strict role/default parser and actual
+historical active panel/TG plus all four divergent live paths. The earlier full
+120s run is explicitly prior to this final parser-only refinement; it is not
+mislabelled a post-refinement rerun. Final `git diff --check` passes. No further
+runtime changes follow these tests. The next gate is the same independent
+reviewer's scoped re-review, then Task8 distribution; no MVP/field acceptance
+or new-runtime health fallback is claimed.

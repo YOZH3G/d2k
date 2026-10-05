@@ -5,6 +5,7 @@
 #include "legacy_runtime.h"
 #include <dirent.h>
 #include <errno.h>
+#include <openssl/evp.h>
 #include <signal.h>
 #include <sys/wait.h>
 static int index_of(d2ku_service_config *s, pid_t pid) {
@@ -182,45 +183,133 @@ static int stopping(const char *a) {
   return !strcmp(a, "stop") || !strcmp(a, "remove-rules") ||
          !strcmp(a, "uninstall");
 }
+/* Same per-file ceiling as the sealed legacy inventory; stream in 16 KiB. */
+#define LEGACY_LOG_MAX (128 * 1024 * 1024)
+static int log_identity(d2ku_service_config *s) {
+  struct stat held, named;
+  int dir = openat(s->ctx->root_dirfd, "log",
+                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  int ok =
+      dir >= 0 && !fstat(s->legacy_log_fd, &held) &&
+      !fstatat(dir, "d2kc.log", &named, AT_SYMLINK_NOFOLLOW) &&
+      S_ISREG(held.st_mode) && S_ISREG(named.st_mode) &&
+      held.st_uid == geteuid() && !(held.st_mode & 022) && held.st_nlink == 1 &&
+      held.st_dev == named.st_dev && held.st_ino == named.st_ino &&
+      held.st_size >= s->legacy_log_offset && held.st_size <= LEGACY_LOG_MAX;
+  if (dir >= 0)
+    close(dir);
+  return ok;
+}
+static int log_owner(d2ku_service_config *s, pid_t core) {
+  int index = index_of(s, core);
+  if (index < 0 || !alive(s, (size_t)index))
+    return 0;
+  struct stat held, actual;
+  if (fstat(s->legacy_log_fd, &held))
+    return 0;
+  /* Historical core redirects both stdout and stderr with freopen/dup2.
+   * A pathname alone does not prove where its final save diagnostic goes. */
+  for (unsigned fd = 1; fd <= 2; fd++) {
+    char path[80];
+    snprintf(path, sizeof path, "/proc/%ld/fd/%u", (long)core, fd);
+    if (stat(path, &actual) || actual.st_dev != held.st_dev ||
+        actual.st_ino != held.st_ino)
+      return 0;
+  }
+  return alive(s, (size_t)index);
+}
+static int log_prefix(d2ku_service_config *s, unsigned char hash[32]) {
+  if (s->legacy_log_offset < 0 || s->legacy_log_offset > LEGACY_LOG_MAX)
+    return 0;
+  EVP_MD_CTX *m = EVP_MD_CTX_new();
+  if (!m)
+    return 0;
+  int ok = EVP_DigestInit_ex(m, EVP_sha256(), NULL);
+  char b[16384];
+  off_t at = 0;
+  while (ok && at < s->legacy_log_offset) {
+    off_t remaining = s->legacy_log_offset - at;
+    size_t want = remaining < (off_t)sizeof b ? (size_t)remaining : sizeof b;
+    ssize_t n = pread(s->legacy_log_fd, b, want, at);
+    if (n <= 0) {
+      ok = 0;
+      break;
+    }
+    ok = EVP_DigestUpdate(m, b, (size_t)n);
+    at += n;
+  }
+  unsigned len = 0;
+  ok = ok && EVP_DigestFinal_ex(m, hash, &len) && len == 32;
+  EVP_MD_CTX_free(m);
+  return ok;
+}
+static d2ku_rc log_close(d2ku_service_config *s, d2ku_rc rc) {
+  if (s->legacy_log_fd >= 0)
+    close(s->legacy_log_fd);
+  s->legacy_log_fd = -1;
+  return rc;
+}
 d2ku_rc d2ku_legacy_before(d2ku_service_config *s, const char *action,
                            const char *id, uint64_t mask) {
+  (void)mask;
   if (!stopping(action))
     return D2KU_OK;
+  log_close(s, D2KU_OK);
+  s->legacy_log_offset = 0;
   d2ku_rc rc = collect(s, id, 1);
   if (rc != D2KU_OK)
     return rc;
-  /* Main runtimes flush through the platform stop. TERM old helper trees first
-   * so they cannot resurrect writers while that stop is in progress. */
-  for (size_t i = 0; i < s->legacy_writer_count; i++) {
-    int runtime = 0;
+  pid_t core = 0;
+  int runtime[128] = {0};
+  for (size_t i = 0; i < s->legacy_writer_count; i++)
     for (unsigned k = 0; k < 4; k++)
-      if (d2ku_legacy_process(s, id, k, s->legacy_writers[i], 1))
-        runtime = 1;
-    if (!runtime && alive(s, i) && kill(s->legacy_writers[i], SIGTERM) &&
-        errno != ESRCH)
-      return D2KU_IO;
-  }
-  int log = openat(s->ctx->root_dirfd, "log",
-                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (log >= 0) {
-    s->legacy_log_fd =
-        openat(log, "d2kc.log", O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
-    close(log);
-    if (s->legacy_log_fd >= 0) {
-      struct stat st;
-      if (fstat(s->legacy_log_fd, &st) || !S_ISREG(st.st_mode) ||
-          st.st_uid != geteuid() || (st.st_mode & 022) || st.st_nlink != 1) {
-        close(s->legacy_log_fd);
-        s->legacy_log_fd = -1;
-        return D2KU_INVALID;
+      if (d2ku_legacy_process(s, id, k, s->legacy_writers[i], 1)) {
+        runtime[i] = 1;
+        if (k == 1)
+          core = s->legacy_writers[i];
       }
-      s->legacy_log_offset = lseek(s->legacy_log_fd, 0, SEEK_END);
-      if (s->legacy_log_offset < 0)
-        return D2KU_IO;
+  if (core) {
+    int dir = openat(s->ctx->root_dirfd, "log",
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir >= 0) {
+      s->legacy_log_fd = openat(dir, "d2kc.log",
+                                O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+      close(dir);
     }
+    if (s->legacy_log_fd < 0 || !log_identity(s) || !log_owner(s, core))
+      return log_close(s, D2KU_HEALTH);
   }
-  if ((mask & D2KU_SERVICE_CORE) && s->legacy_log_fd < 0)
-    return D2KU_HEALTH;
+  /* Main runtimes flush through platform stop. Old log-maintenance shells can
+   * defer TERM while awaiting a child, so offset is fixed only after the entire
+   * captured non-runtime population has exited. Timeout is not a clean stop. */
+  for (size_t i = 0; i < s->legacy_writer_count; i++)
+    if (!runtime[i] && alive(s, i) && kill(s->legacy_writers[i], SIGTERM) &&
+        errno != ESRCH)
+      return log_close(s, D2KU_IO);
+  uint64_t start = d2k_runtime_mono_ms();
+  int running;
+  do {
+    running = 0;
+    for (size_t i = 0; i < s->legacy_writer_count; i++)
+      if (!runtime[i] && alive(s, i))
+        running = 1;
+    if (!running)
+      break;
+    struct timespec delay = {0, 20000000};
+    nanosleep(&delay, NULL);
+  } while (d2k_runtime_mono_ms() - start < 3000);
+  size_t captured = s->legacy_writer_count;
+  if (running || collect(s, id, 0) != D2KU_OK ||
+      captured != s->legacy_writer_count)
+    return log_close(s, D2KU_HEALTH);
+  if (core) {
+    if (!log_identity(s) || !log_owner(s, core))
+      return log_close(s, D2KU_HEALTH);
+    s->legacy_log_offset = lseek(s->legacy_log_fd, 0, SEEK_END);
+    if (s->legacy_log_offset < 0 || !log_prefix(s, s->legacy_log_prefix) ||
+        !log_identity(s) || !log_owner(s, core))
+      return log_close(s, D2KU_HEALTH);
+  }
   return D2KU_OK;
 }
 d2ku_rc d2ku_legacy_after(d2ku_service_config *s, const char *action,
@@ -249,17 +338,24 @@ d2ku_rc d2ku_legacy_after(d2ku_service_config *s, const char *action,
                    ? D2KU_HEALTH
                    : D2KU_OK;
   if (s->legacy_log_fd >= 0) {
+    unsigned char prefix[32];
+    if (!log_identity(s) || !log_prefix(s, prefix) ||
+        memcmp(prefix, s->legacy_log_prefix, sizeof prefix))
+      rc = D2KU_HEALTH;
     char b[65537];
     ssize_t n = read(s->legacy_log_fd, b, sizeof b - 1);
     if (n < 0 || n == (ssize_t)sizeof b - 1)
       rc = D2KU_HEALTH;
     else {
       b[n] = 0;
-      if (strstr(b, "каталог не сохран") || strstr(b, "не сохранить каталог"))
+      if (memchr(b, 0, (size_t)n) || strstr(b, "каталог не сохран") ||
+          strstr(b, "не сохранить каталог") ||
+          strstr(b, "кэш HTTPS не сохран") || strstr(b, "планы HTTP не сохран"))
         rc = D2KU_HEALTH;
     }
-    close(s->legacy_log_fd);
-    s->legacy_log_fd = -1;
+    if (!log_identity(s))
+      rc = D2KU_HEALTH;
+    log_close(s, D2KU_OK);
   }
   s->legacy_writer_count = 0;
   return rc;

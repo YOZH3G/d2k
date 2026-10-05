@@ -210,3 +210,8 @@ $(BUILD)/legacy_candidate: tests/legacy_candidate.c
 $(BUILD)/test_legacy_crash: tests/test_legacy_crash.c src/bootstrap.c src/service_adapter.c $(TRANSACTION_SRC)
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_legacy_crash.c src/bootstrap.c src/service_adapter.c $(TRANSACTION_SRC) $(LDLIBS) -o $@
+
+# /proc process identity fixture: only run in an isolated Linux container.
+$(BUILD)/test_legacy_quiesce: tests/test_legacy_quiesce.c src/service_adapter.c $(TRANSACTION_SRC) include/d2k_update.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_legacy_quiesce.c src/service_adapter.c $(TRANSACTION_SRC) $(LDLIBS) -o $@
