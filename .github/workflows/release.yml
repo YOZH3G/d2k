@@ -14,8 +14,11 @@ on:
 permissions:
   contents: read
 # Release and daily refresh share one publisher; never cancel between asset writes.
+# CI calls this workflow on every push; it must not share the publisher's
+# queue, or a push cancels a pending release (GitHub keeps one pending run
+# per group).
 concurrency:
-  group: d2k-stable-publisher
+  group: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && 'd2k-stable-publisher' || format('d2k-release-ci-{0}', github.ref) }}
   cancel-in-progress: false
 jobs:
   build:
