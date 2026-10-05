@@ -155,6 +155,9 @@ int main(int argc, char **argv) {
                       "does not install releases\n");
       return 3;
     }
+    r = d2ku_service_recovery_context(&c, sc.runtime);
+    if (r != D2KU_OK)
+      return 1;
     do {
       r = d2ku_maintenance_lock(&c, &c.maintenance_lock_fd);
       if (r == D2KU_BUSY) {
@@ -216,7 +219,8 @@ int main(int argc, char **argv) {
   /* Persist service intent before start/stop so a crash/reboot preserves an
    * administratively disabled service. Transaction start writes saved mask. */
   if (!strcmp(action, "start") || !strcmp(action, "engine-start") ||
-      !strcmp(action, "engine-stop") || !strcmp(action, "telegram-enable") ||
+      !strcmp(action, "engine-restart") || !strcmp(action, "engine-stop") ||
+      !strcmp(action, "telegram-enable") ||
       !strcmp(action, "telegram-disable")) {
     r = enabled(&c, mask);
     if (r != D2KU_OK)
@@ -229,6 +233,8 @@ int main(int argc, char **argv) {
 done:
   if (!internal)
     close(c.maintenance_lock_fd);
+  if (c.health_runtime_dirfd >= 0)
+    close(c.health_runtime_dirfd);
   close(c.root_dirfd);
   if (r != D2KU_OK)
     fprintf(stderr, "managed lifecycle result=%d\n", r);

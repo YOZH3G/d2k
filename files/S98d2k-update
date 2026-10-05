@@ -10,8 +10,9 @@ case "${1:-start}" in
         if [ -x "$ROOT/current/d2k-update" ]; then
             mkdir -p "$ROOT/run" || exit 1
             start-stop-daemon -S -b -m -p "$ROOT/run/d2k-update-boot.pid" -x "$BOOT" -- --root "$ROOT" --daemon || exit 1
+        else
+            echo 'd2k-update: daemon not installed; recovery remains available' >&2
         fi
-        echo 'd2k-update: daemon not installed; recovery remains available' >&2
         ;;
     stop) : ;; # normal D2K service stop must not kill recovery
     *) exit 2 ;;

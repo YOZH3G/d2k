@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix='d2ku-managed-') as temp:
             shutil.copy2(repo/'files'/name,root/'releases'/release/name); (root/'releases'/release/name).chmod(0o700)
     (root/'current').symlink_to('releases/old')
     (root/'update-state'/'enabled').write_text('15\n'); (root/'update-state'/'enabled').chmod(0o600)
-    (root/'config').write_text(f'PATH={root}/commands:/usr/bin:/bin\nMODE=apply\nTG_ENABLED=1\nSTATE_DIR={root}/state\nD2K_PPE_DEOFFLOAD=0\n')
+    (root/'config').write_text(f'PATH={root}/commands:/usr/bin:/bin\nMODE=apply\nTG_ENABLED=1\nSTATE_DIR={root}/state\nD2K_RUNTIME_DIR={root}/runtime\nD2K_PPE_DEOFFLOAD=0\n')
     (root/'config').chmod(0o600)
     for name in ['iptables','ip6tables','ipset']:
         (root/'commands'/name).write_text('''#!/bin/sh
@@ -76,6 +76,24 @@ printf '%s\\n' "$line" >> "$CALLS"
     (root/'releases'/'new'/'d2kc').chmod(0o700)
     unmanaged=subprocess.run([adapter,'--root',root,'--launch','d2kc','--control',str(root/'run/socket')],capture_output=True)
     assert unmanaged.returncode!=0 and not (root/'unmanaged-writer').exists(), 'direct daemon launch bypassed maintenance lifecycle'
+
+    # Re-enabling through restart must survive capture and the next boot start.
+    (root/'releases'/'new'/'S99d2k').write_text(f'#!/bin/sh\nprintf "%s %s\\n" "$2" "$3" >> "{root}/intent"\n')
+    for action, expected in [('engine-stop',12),('engine-restart',15),('boot-start',15)]:
+        result=subprocess.run([adapter,'--root',root,'service',action],capture_output=True,text=True,timeout=10)
+        assert result.returncode==0,(action,result.stderr)
+        assert (root/'update-state'/'enabled').read_text()==f'{expected}\n',action
+    assert (root/'intent').read_text().splitlines()==['engine-stop 12','engine-restart 15','start 15']
+
+    # S98 reports daemon absence only on the missing executable branch.
+    (root/'boot'/'d2k-update-boot').write_text('#!/bin/sh\nexit 0\n'); (root/'boot'/'d2k-update-boot').chmod(0o700)
+    (root/'commands'/'start-stop-daemon').write_text('#!/bin/sh\nexit 0\n'); (root/'commands'/'start-stop-daemon').chmod(0o700)
+    for present in [False,True]:
+        if present:
+            (root/'releases'/'new'/'d2k-update').write_text('#!/bin/sh\nexit 0\n'); (root/'releases'/'new'/'d2k-update').chmod(0o700)
+        result=subprocess.run(['sh',repo/'files'/'S98d2k-update','start'],env={**env,'D2K_DIR':str(root),'PATH':str(root/'commands')+':/usr/bin:/bin'},capture_output=True,text=True)
+        assert result.returncode==0
+        assert ('daemon not installed' in result.stderr)==(not present),(present,result.stderr)
 
     bad=subprocess.run([adapter,'--root',root,'--maintenance-fd','4','start','new','15'],capture_output=True)
     assert bad.returncode!=0

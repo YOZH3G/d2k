@@ -16,33 +16,6 @@
 /* Stable bootstrap executable. It links no transport/curl and executes only the
  * installed bootstrap-owned C adapter. Candidate archives cannot replace boot/.
  */
-static d2ku_rc mono(void *arg, uint64_t *n) {
-  (void)arg;
-  struct timespec t;
-  if (clock_gettime(CLOCK_MONOTONIC, &t))
-    return D2KU_TIME;
-  *n = (uint64_t)t.tv_sec * 1000000000 + (uint64_t)t.tv_nsec;
-  return D2KU_OK;
-}
-static d2ku_rc sample(void *arg, d2ku_clock_sample *s) {
-  (void)arg;
-  memset(s, 0, sizeof *s);
-  uint64_t n;
-  if (mono(NULL, &n) != D2KU_OK)
-    return D2KU_TIME;
-  s->mono_ms = n / 1000000;
-  int fd = open("/proc/sys/kernel/random/boot_id",
-                O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (fd < 0)
-    return D2KU_TIME;
-  ssize_t k = read(fd, s->boot_id, sizeof s->boot_id - 1);
-  close(fd);
-  if (k <= 0)
-    return D2KU_TIME;
-  s->boot_id[k] = 0;
-  s->boot_id[strcspn(s->boot_id, "\n")] = 0;
-  return D2KU_OK;
-}
 int main(int argc, char **argv) {
   const char *root = "/opt/d2k", *runtime = NULL;
   int at = 1;
@@ -79,8 +52,6 @@ int main(int argc, char **argv) {
   c.updater_version = 1;
   c.wire_version = 13;
   c.state_version = 1;
-  c.clock.monotonic = mono;
-  c.clock.snapshot = sample;
   d2ku_service_config config;
   d2ku_rc configured = d2ku_service_configure(&c, root, &config);
   if (configured != D2KU_OK) {
@@ -92,12 +63,7 @@ int main(int argc, char **argv) {
   }
   if (!runtime)
     runtime = config.runtime;
-  if (mkdir(runtime, 0700) && errno != EEXIST)
-    return 1;
-  c.health_runtime_dirfd =
-      open(runtime, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (c.health_runtime_dirfd < 0 || fstat(c.health_runtime_dirfd, &st) ||
-      st.st_uid != geteuid() || (st.st_mode & 077))
+  if (d2ku_service_recovery_context(&c, runtime) != D2KU_OK)
     return 1;
   char prefix[1024];
   if (strlen(root) >= sizeof prefix)

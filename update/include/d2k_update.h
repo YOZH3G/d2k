@@ -148,6 +148,9 @@ typedef struct {
 } d2ku_service_config;
 d2ku_rc d2ku_service_lock_valid(d2ku_ctx *, int);
 d2ku_rc d2ku_service_configure(d2ku_ctx *, const char *, d2ku_service_config *);
+/* Recovery-only clock and private CLOEXEC health directory; initialize the
+ * input health_runtime_dirfd to -1 and close the returned FD after use. */
+d2ku_rc d2ku_service_recovery_context(d2ku_ctx *, const char *runtime);
 d2ku_rc d2ku_service_capture(void *, uint64_t *);
 d2ku_rc d2ku_service_call(void *, const char *, const char *, uint64_t);
 d2ku_rc d2ku_service_dispatch(d2ku_service_config *, const char *, const char *, uint64_t);

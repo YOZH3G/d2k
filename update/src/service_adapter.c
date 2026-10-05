@@ -20,6 +20,53 @@
 #include <sys/prctl.h>
 #endif
 
+static d2ku_rc mono(void *arg, uint64_t *n) {
+  (void)arg;
+  struct timespec t;
+  if (clock_gettime(CLOCK_MONOTONIC, &t))
+    return D2KU_TIME;
+  *n = (uint64_t)t.tv_sec * 1000000000 + (uint64_t)t.tv_nsec;
+  return D2KU_OK;
+}
+static d2ku_rc sample(void *arg, d2ku_clock_sample *s) {
+  (void)arg;
+  memset(s, 0, sizeof *s);
+  uint64_t n;
+  if (mono(NULL, &n) != D2KU_OK)
+    return D2KU_TIME;
+  s->mono_ms = n / 1000000;
+  int fd = open("/proc/sys/kernel/random/boot_id",
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0)
+    return D2KU_TIME;
+  ssize_t k = read(fd, s->boot_id, sizeof s->boot_id - 1);
+  close(fd);
+  if (k <= 0)
+    return D2KU_TIME;
+  s->boot_id[k] = 0;
+  s->boot_id[strcspn(s->boot_id, "\n")] = 0;
+  return D2KU_OK;
+}
+/* Both stable boot and external service/NDM recovery require the same clock
+ * and private runtime directory. Caller owns the returned CLOEXEC directory. */
+d2ku_rc d2ku_service_recovery_context(d2ku_ctx *c, const char *runtime) {
+  if (!c || !runtime || !*runtime || c->health_runtime_dirfd >= 0)
+    return D2KU_INVALID;
+  if (mkdir(runtime, 0700) && errno != EEXIST)
+    return D2KU_IO;
+  int fd = open(runtime, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  struct stat st;
+  if (fd < 0)
+    return D2KU_IO;
+  if (fstat(fd, &st) || st.st_uid != geteuid() || (st.st_mode & 077)) {
+    close(fd);
+    return D2KU_INVALID;
+  }
+  c->health_runtime_dirfd = fd;
+  c->clock.monotonic = mono;
+  c->clock.snapshot = sample;
+  return D2KU_OK;
+}
 static int regular(int fd) {
   struct stat s;
   return fd >= 0 && !fstat(fd, &s) && S_ISREG(s.st_mode) &&

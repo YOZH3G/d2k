@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
+#include "../../runtime/d2k_runtime.h"
 #include "d2k_update.h"
 #include <dirent.h>
 #include <errno.h>
@@ -278,8 +279,7 @@ static d2ku_rc marker_read(int at, const char *name, char id[65], char seal[65],
   if (n <= 0 ||
       sscanf(b, "D2KB1 %64s %64s %64s %llu %64s %c", id, seal, input, &mask,
              sum, &extra) != 5 ||
-      strlen(id) != 23 || strncmp(id, "legacy-", 7) ||
-      strspn(id + 7, "0123456789abcdef") != 16 || strlen(seal) != 64 ||
+      !d2k_runtime_id_valid(id) || strlen(seal) != 64 ||
       strspn(seal, "0123456789abcdef") != 64 || strlen(input) != 64 ||
       strspn(input, "0123456789abcdef") != 64 || mask > 15)
     return D2KU_RECOVERY;
@@ -289,10 +289,8 @@ static d2ku_rc marker_read(int at, const char *name, char id[65], char seal[65],
   *bits = mask;
   return D2KU_OK;
 }
-static d2ku_rc old_runtime_check(d2ku_ctx *c, int saved) {
-  if (c->transaction.offline)
-    return c->transaction.offline(c->transaction.arg, saved, "legacy");
-  char release[65] = "";
+static d2ku_rc old_runtime_check(d2ku_ctx *c, int saved, char release[65]) {
+  release[0] = 0;
   for (unsigned i = 0; i < 4; i++) {
     int pipefd[2];
     if (pipe(pipefd))
@@ -355,14 +353,15 @@ static d2ku_rc old_runtime_check(d2ku_ctx *c, int saved) {
     char id[65];
     memcpy(id, start, len);
     id[len] = 0;
-    if (strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456"
-                   "789._-") != len)
+    if (!d2k_runtime_id_valid(id))
       return D2KU_INCOMPATIBLE;
     if (i && strcmp(release, id))
       return D2KU_INCOMPATIBLE;
     strcpy(release, id);
   }
-  return D2KU_OK;
+  return c->transaction.offline
+             ? c->transaction.offline(c->transaction.arg, saved, release)
+             : D2KU_OK;
 }
 /* No symlink traversal in the external prefix: callers open /opt once and all
  * target parents below it are checked independently. */
@@ -440,9 +439,13 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
       if (r != D2KU_OK)
         goto end;
     }
-    r = old_runtime_check(c, saved);
-    if (r != D2KU_OK)
+    r = old_runtime_check(c, saved, id);
+    if (r != D2KU_OK) {
+      if (r == D2KU_INCOMPATIBLE)
+        fprintf(stderr, "flat inventory requires a common wire13 runtime "
+                        "identity; historical wire12 migration is unavailable\n");
       goto end;
+    }
     for (unsigned i = 0; i < 7; i++) {
       r = copy_file(c, c->root_dirfd, helpers[i], saved, helpers[i]);
       if (r != D2KU_OK)
@@ -497,7 +500,9 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
     if (r != D2KU_OK)
       goto end;
     hex(hash, seal);
-    snprintf(id, sizeof id, "legacy-%.16s", seal);
+    /* Keep the verified runtime identity: recovery checks both this ID and
+     * the preserved executable inode; the receipt separately seals inventory.
+     */
     /* Early recovery hook is durable before pending/any destructive phase. */
     r = copy_file(c, input, "S98d2k-update", init, "S98d2k-update");
     if (r != D2KU_OK)

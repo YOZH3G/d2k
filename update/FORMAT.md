@@ -590,13 +590,20 @@ publication/trust distribution remains the release/bootstrap packaging task.
 Inventory checks all four flat binaries using bounded offline self-checks,
 requires wire13 and one common embedded release identity, and rejects missing,
 linked, foreign-owned or writable-by-other files before service stop. This v1
-migration intentionally rejects older unknown binaries without the wire13
-self-check contract. A private `update/legacy-flat/` retains the original binaries,
+migration supports the prepared flat `voice-4faa482` wire13 runtime bundle
+tracked in commit `d184d14`, and compatible installations with the same runtime
+self-check/heartbeat contract. It does **not** support the field-installed wire12
+pair documented in `docs/field/2026-10-04-discord-udp-late-cut.md`; that pair
+predates runtime identity/heartbeat. Such inventory fails closed before stop,
+with an explicit diagnostic. No preparatory replacement of the old flat install
+is part of this contract. A private `update/legacy-flat/` retains the original binaries,
 init/NDM scripts, helpers, assets and configuration. Bootstrap copies verified
 inputs to private `boot/input/`; both trees have SHA256 inventory seals. The
-synthetic `legacy-<first16 inventory hash>` receipt identifies this saved local
-inventory, not a signed remotely published release. It is available for immediate
-transaction recovery; publishing/signing it or offering it as a late rollback
+release directory and bootstrap marker retain the common verified embedded
+runtime ID. The private receipt separately seals the saved inventory hash; it is
+not a signed remotely published release. Immediate transaction recovery therefore
+uses the original ID and the preserved binary inode under the normal exact
+runtime health checks; publishing/signing it or offering it as a late rollback
 candidate is not implied.
 
 `update-state/bootstrap.pending` is the durable forward-completion record:
@@ -667,3 +674,17 @@ owned hooks and heartbeats are removed; the retained coordination directory is
 an explicit reinstall/recovery prerequisite, not an ordinary flat installation.
 Task9 integration must additionally quiesce its daemon before removing managed
 code; this task does not invent a running daemon to claim that end-to-end case.
+
+Both stable boot and external lifecycle/NDM recovery initialize their production
+monotonic clock, boot identity reader and checked private runtime directory via
+`d2ku_service_recovery_context`. The returned directory FD is CLOEXEC and must be
+closed by its caller. Configuration alone does not initialize these resources.
+Explicit `engine-restart` persists the enabled core/datapath bits before starting,
+so later capture and boot-start retain the administrator's intent.
+
+Historical wire12 migration needs a separately reviewed compatibility contract:
+a trusted complete inventory manifest (all runtime hashes/ABI and old init/helper
+contracts), sealed preservation and bootstrap-only old-runtime recovery/health.
+It cannot be implemented by treating absent wire13 metadata as success or by
+weakening signed candidate health. The available field report records only the
+controller/datapath hashes, not a complete verified installation manifest.

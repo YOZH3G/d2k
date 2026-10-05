@@ -34,7 +34,7 @@ static d2ku_rc capture(void *a, uint64_t *n) {
 static d2ku_rc services(void *a, const char *act, const char *id, uint64_t n) {
   (void)a;
   assert(n == 4);
-  assert(id && !strncmp(id, "legacy-", 7));
+  assert(id && !strcmp(id, "fixture"));
   assert(!strcmp(act, "start") || !strcmp(act, "stop"));
   return D2KU_OK;
 }
@@ -63,7 +63,7 @@ static void setup(d2ku_ctx *c, char root[64]) {
   for (unsigned i = 0; i < 4; i++) {
     char p[64];
     snprintf(p, sizeof p, "sbin/%s", bins[i]);
-    put(c->bootstrap_prefix_fd, p, "legacy runtime\n");
+    put(c->bootstrap_prefix_fd, p, "#!/bin/sh\nprintf 'fixture self-check=ok release=fixture wire=13\\n'\n");
   }
   put(c->bootstrap_prefix_fd, "etc/init.d/S99d2k", "legacy init\n");
   put(c->bootstrap_prefix_fd, "etc/ndm/netfilter.d/001-d2k.sh", "legacy ndm\n");
@@ -114,7 +114,7 @@ static void verify(d2ku_ctx *c) {
   ssize_t n = readlinkat(c->root_dirfd, "current", b, sizeof b - 1);
   assert(n > 0);
   b[n] = 0;
-  assert(!strncmp(b, "releases/legacy-", 16));
+  assert(!strcmp(b, "releases/fixture"));
 }
 static void clean(d2ku_ctx *c, const char *root) {
   close(c->bootstrap_prefix_fd);

@@ -36,6 +36,7 @@ for wire in [12,13]:
         else:
             assert result.returncode==0,(result.stdout,result.stderr)
             assert (root/'current').is_symlink() and (prefix/'etc'/'init.d'/'S98d2k-update').is_file()
+            assert (root/'current').readlink()==pathlib.Path('releases/fixture'), 'bootstrap lost embedded runtime identity'
             assert (root/'update-state'/'enabled').read_text()=='0\n'
             for name,data in before.items(): assert (root/name).read_bytes()==data,name
             retry=subprocess.run([boot,'--root',root,'--recover'],capture_output=True,text=True,timeout=10)
