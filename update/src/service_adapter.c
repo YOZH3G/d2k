@@ -637,6 +637,10 @@ d2ku_rc d2ku_service_health_state(void *arg) {
     if (!(bits & (i ? 8 : 2)))
       continue;
     int f = open_beneath(s->ctx->root_dirfd, s->ctx->health_state_paths[i]);
+    /* d2kc starts from an empty catalog when the file is absent and writes it
+     * only after learning something: absence is valid controller state. */
+    if (f < 0 && i == 0 && errno == ENOENT)
+      continue;
     int good = regular(f);
     if (f >= 0)
       close(f);

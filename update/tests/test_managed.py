@@ -48,9 +48,14 @@ printf '%s\\n' "$line" >> "$CALLS"
     for name in ['catalog.json','tg.identity','telegram.status']:
         (root/'state'/name).write_text('fixture\n')
     assert internal('health-state').returncode==0
-    for name in ['catalog.json','tg.identity','telegram.status']:
+    for name in ['tg.identity','telegram.status']:
         (root/'state'/name).unlink(); assert internal('health-state').returncode!=0,name
         (root/'state'/name).write_text('fixture\n')
+    # d2kc starts from an empty catalog when the file is absent and writes it
+    # only after learning something: absence is valid state, a non-file is not.
+    (root/'state'/'catalog.json').unlink(); assert internal('health-state').returncode==0
+    (root/'state'/'catalog.json').mkdir(); assert internal('health-state').returncode!=0
+    (root/'state'/'catalog.json').rmdir(); (root/'state'/'catalog.json').write_text('fixture\n')
     with (root/'config').open('a') as config: config.write('TG_RELAY_SECRET=fixture-only\n')
     (root/'state'/'tg.identity').unlink(); assert internal('health-state').returncode==0
     class HTTP(http.server.BaseHTTPRequestHandler):
