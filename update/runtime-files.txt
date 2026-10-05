@@ -21,10 +21,10 @@ runtime internal/web/assets/fonts/onest.woff2 panel/onest.woff2 0644
 runtime internal/web/assets/fonts/jbmono.woff2 panel/jbmono.woff2 0644
 runtime internal/web/assets/fonts/OFL-onest.txt panel/OFL-onest.txt 0644
 runtime internal/web/assets/fonts/OFL-jbmono.txt panel/OFL-jbmono.txt 0644
-runtime files/meta-ranges.txt meta-ranges.txt 0644
-runtime files/tg-roots.pem tg-roots.pem 0644
-runtime files/fake/stun.bin stun.bin 0644
-runtime files/fake/quic_initial_dbankcloud_ru.bin quic_initial_dbankcloud_ru.bin 0644
+runtime files/meta-ranges.txt files/meta-ranges.txt 0644
+runtime files/tg-roots.pem files/tg-roots.pem 0644
+runtime files/fake/stun.bin files/fake/stun.bin 0644
+runtime files/fake/quic_initial_dbankcloud_ru.bin files/fake/quic_initial_dbankcloud_ru.bin 0644
 bootstrap build:d2k-update-boot-linux-{abi} d2k-update-boot 0755
 bootstrap build:d2k-service-adapter-linux-{abi} d2k-service-adapter 0755
 bootstrap files/S98d2k-update S98d2k-update 0755
