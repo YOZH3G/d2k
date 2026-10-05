@@ -120,7 +120,12 @@ static int read_ack(int fd, uint16_t *cmd, int *ok, uint8_t *reason) {
     size_t body_len = frame_len - 2;
     got = 0;
     while (got < body_len) {
-        ssize_t n = read(fd, body + got, body_len - got);
+        /* body_len <= sizeof body уже проверено выше, но glibc-фортификация
+           GCC на Ubuntu этого не видит и под -Werror роняет сборку теста:
+           предел повторён рядом с вызовом. */
+        size_t want = body_len - got;
+        if (want > sizeof body - got) { return 0; }
+        ssize_t n = read(fd, body + got, want);
         if (n > 0) { got += (size_t)n; continue; }
         return 0;
     }
