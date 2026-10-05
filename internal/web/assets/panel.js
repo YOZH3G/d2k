@@ -418,6 +418,7 @@
     catch (e) { this.updateMessage("Браузер не может создать ID операции. Обновите браузер и повторите действие."); return Promise.resolve(); }
     /* Ровно один ID на действие. При потере ответа команда не отправляется повторно. */
     this.updateEpoch = (this.updateEpoch || 0) + 1;
+    this.updateActionError = null;
     this.updatePending = { action: action, operation_id: body.operation_id };
     this.updateMessage(action === "install" ? "Запрашиваем установку выбранного выпуска…" : action === "check" ? "Проверяем обновления…" : "Сохраняем ночное расписание…");
     this.renderUpdates(this.updateStatus);
@@ -425,11 +426,13 @@
       self.updateFailed = false;
       if (reply.data.state) self.updateStatus = reply.data;
       if (!reply.ok) {
+        self.updateActionError = { action: action, operation_id: body.operation_id };
         self.updateMessage(reply.code === 409 ? "Выбор или операция изменились. Проверьте состояние и повторите действие." : reply.code === 403 ? "Управление обновлениями отключено или запрос не разрешён." : "Обновлятор недоступен. Повторите проверку позже.");
         if (action === "check") self.updateFailed = true;
       } else self.updateMessage("");
     }).catch(function () {
       self.updateFailed = true;
+      self.updateActionError = { action: action, operation_id: body.operation_id };
       self.updateMessage(action === "install" ? "Ответ на установку потерян. Читаем состояние операции; установка повторно не отправляется." : "Связь с обновлятором потеряна. Повторите проверку после подключения.");
     }).finally(function () {
       self.updatePending = null;
@@ -452,7 +455,15 @@
       if (epoch !== (self.updateEpoch || 0)) return;
       if (reply.data.state) self.updateStatus = reply.data;
       self.updateFailed = !reply.ok;
-      if (reply.ok) self.updateMessage("");
+      if (reply.ok) {
+        var error = self.updateActionError, data = reply.data;
+        /* Успешный GET сам по себе не разрешает отказ или потерянный ответ.
+           Только результат своей операции либо следующее явное действие. */
+        var matched = error && ((data.operation_id === error.operation_id && data.busy === false) ||
+          (error.action === "install" && data.last_installation && data.last_installation.operation_id === error.operation_id));
+        if (matched) self.updateActionError = null;
+        if (!self.updateActionError) self.updateMessage("");
+      }
       self.renderUpdates(self.updateStatus);
     }).catch(function () { if (epoch === (self.updateEpoch || 0)) { self.updateFailed = true; self.renderUpdates(self.updateStatus); } })
       .finally(function () { self.updateInflight = false; });
@@ -489,7 +500,7 @@
     var busy = !!s.busy, pending = this.updatePending, failed = !!this.updateFailed;
     var same = available && available.release_id === current;
     var quarantine = s.quarantine || {};
-    var retry = !!quarantine.applies_to_available || phase === 12;
+    var retry = s.quarantine === undefined ? phase === 12 : quarantine.applies_to_available === true;
     var fresh = check.fresh === true && check.result === 0 && !failed;
     var compatible = available && available.compatible === true;
     var reason = updateError(s.last_error), tone = "", text = "Обновления ещё не проверялись";

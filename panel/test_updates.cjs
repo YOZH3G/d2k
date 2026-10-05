@@ -12,7 +12,77 @@ function fixture() {
   return {app:new App(document,window),nodes,requests,window,document};
 }
 function status(over={}) { return {state:'available',operation_id:'check-one',phase:2,busy:false,received_bytes:0,total_bytes:0,current:{release_id:'installed'},previous:null,available:{release_id:'shown',manifest_sha256:'a'.repeat(64),version:'1.2.3',notes:'<img src=x onerror=alert(1)>',compatible:true},check:{cached:true,fresh:true,result:0,last_success_utc:1791150000},last_result:0,last_error:'',settings:{enabled:true,window_start:180,window_end:300,timezone:'Europe/Volgograd',selected_date:20261006,selected_minute:203},...over}; }
+async function reviewRegressions() {
+  const failures = [];
+  async function run(name, test) {
+    try { await test(); console.log('review regression PASS: ' + name); }
+    catch (error) { failures.push(error); console.error('review regression FAIL: ' + name + '\n' + error.message); }
+  }
+  for (const [action, code, expected] of [
+    ['install', 403, 'Управление обновлениями отключено или запрос не разрешён.'],
+    ['settings', 409, 'Выбор или операция изменились. Проверьте состояние и повторите действие.']
+  ]) {
+    await run(action + code + ' survives unrelated successful polling', async () => {
+      const {app, nodes, window} = fixture();
+      app.initUpdates(); app.renderUpdates(status());
+      const posts = [];
+      window.fetch = async (url, options) => {
+        if (options.method === 'POST') {
+          const body = JSON.parse(options.body); posts.push({url, body});
+          if (url.endsWith('/check')) return {ok:true, status:202, json:async()=>status({operation_id:body.operation_id})};
+          return {ok:false, status:code, json:async()=>code === 403 ? {error:'control_forbidden'} : status({operation_id:'another-operation'})};
+        }
+        return {ok:true, status:200, json:async()=>status({
+          operation_id:'another-operation',
+          last_installation:{operation_id:'other-install', release_id:'other-release', result:0, phase:10, completed_utc:1791150100, reason:''}
+        })};
+      };
+      if (action === 'install') await nodes['update-install'].listeners.click();
+      else { nodes['update-auto'].checked=false; await nodes['update-auto'].listeners.change(); }
+      assert.equal(nodes['update-action'].textContent, expected, 'POST rejection must be explained');
+      await app.pollUpdates(); await app.pollUpdates();
+      assert.equal(nodes['update-action'].textContent, expected, 'unrelated successful GET must retain action error');
+      assert.equal(nodes['update-action'].hidden, false, 'refusal must remain visible');
+      assert.equal(nodes['update-version'].textContent, 'Выпуск 1.2.3');
+      assert.equal(posts.length, 1, 'polling must not resend rejected action');
+      await app.checkUpdates(true);
+      assert.equal(nodes['update-action'].hidden, true, 'next explicit accepted action replaces prior refusal');
+    });
+  }
+  for (const retained of [false, true]) {
+    await run('lost install resolves only matching ' + (retained ? 'retained outcome' : 'terminal status'), async () => {
+      const {app, nodes, window} = fixture();
+      app.initUpdates(); app.renderUpdates(status());
+      let operation, outcome = false, posts = 0;
+      window.fetch = async (url, options) => {
+        if (options.method === 'POST') { posts++; operation=JSON.parse(options.body).operation_id; throw Error('response lost'); }
+        const data = outcome ? retained ? status({operation_id:'later-check', last_installation:{operation_id:operation, release_id:'shown', result:0, phase:10, completed_utc:1791150100, reason:''}}) : status({operation_id:operation, busy:false, phase:10, state:'current', current:{release_id:'shown'}}) : status({operation_id:operation, busy:true, phase:3, received_bytes:25, total_bytes:100});
+        return {ok:true, status:200, json:async()=>data};
+      };
+      await nodes['update-install'].listeners.click();
+      assert.match(nodes['update-action'].textContent, /Ответ на установку потерян/, 'matching in-flight status is not an outcome');
+      assert.equal(nodes['update-action'].hidden, false);
+      outcome=true; await app.pollUpdates();
+      assert.equal(nodes['update-action'].hidden, true, 'matching completed outcome resolves lost response');
+      assert.equal(posts, 1, 'reconciliation must never retry install');
+    });
+  }
+  await run('explicit quarantine applicability overrides phase12 legacy fallback', async () => {
+    const {app, nodes} = fixture();
+    app.initUpdates();
+    app.renderUpdates(status({phase:12, quarantine:{active:true, applies_to_available:false, manifest_sha256:'b'.repeat(64), reason:'other release'}}));
+    assert.equal(nodes['update-install'].textContent, 'Установить сейчас');
+    assert.doesNotMatch(nodes['update-warning'].textContent, /Ручной повтор/);
+    app.renderUpdates(status({phase:12, quarantine:{active:true, applies_to_available:true, manifest_sha256:'a'.repeat(64), reason:'health failed'}}));
+    assert.match(nodes['update-install'].textContent, /Повторить/);
+    app.renderUpdates(status({phase:12}));
+    assert.match(nodes['update-install'].textContent, /Повторить/, 'legacy status without contract retains fallback');
+  });
+  if (failures.length) throw new AggregateError(failures, 'Task10 review regressions failed');
+}
+
 async function main(){
+ await reviewRegressions();
  const {app,nodes,requests,window,document}=fixture();
  assert.equal(typeof app.renderUpdates,'function','actual panel needs update section renderer');
  app.initUpdates();app.renderUpdates(status());
