@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 static d2ku_rc sample(void *p, d2ku_clock_sample *s) {
   (void)p;
@@ -35,6 +36,35 @@ int main(void) {
     close(owner);
     close(c.maintenance_lock_fd); c.maintenance_lock_fd = -1;
   }
+  /* Старт после загрузки: S99 boot-start держит maintenance те же секунды,
+   * что и супервизор/демон стартуют. Временно занятая блокировка — повод
+   * подождать, а не выйти навсегда с BUSY. */
+  pid_t holder = fork();
+  assert(holder >= 0);
+  if (!holder) {
+    int held = -1;
+    if (d2ku_maintenance_lock(&c, &held) != D2KU_OK)
+      _exit(1);
+    struct timespec hold = {1, 500000000};
+    nanosleep(&hold, NULL);
+    d2ku_maintenance_unlock(held);
+    _exit(0);
+  }
+  struct timespec settle = {0, 200000000};
+  nanosleep(&settle, NULL);
+  {
+    struct timespec before, after;
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    int guard = -1, owner = -1;
+    assert(d2ku_startup_claim(&c, "supervisor.lock", &guard, &owner) == D2KU_OK);
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    assert(after.tv_sec - before.tv_sec >= 1);
+    d2ku_maintenance_unlock(guard);
+    close(owner);
+  }
+  int holder_status;
+  assert(waitpid(holder, &holder_status, 0) == holder && WIFEXITED(holder_status) &&
+         WEXITSTATUS(holder_status) == 0);
   assert(d2ku_maintenance_lock(&c, &c.maintenance_lock_fd) == D2KU_OK);
   assert(d2ku_lifecycle_quiesce(&c, root) == D2KU_OK);
   assert(d2ku_lifecycle_load(&c, &l) == D2KU_OK && l.stopped);
