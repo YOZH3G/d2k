@@ -346,6 +346,7 @@ targets 1 1
     # shellcheck disable=SC1090
     . "$PPE_LIB"
     # shellcheck disable=SC2329  # зовёт ppe_up из S99d2k
+    # shellcheck disable=SC2317  # вызывается из подключённого S99d2k
     d2k_ppe_ensure() { return 1; }
     fw_up || exit 21
     fw_installed || exit 22

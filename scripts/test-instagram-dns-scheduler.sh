@@ -126,7 +126,7 @@ while [ "$minute" -lt 2880 ]; do
     [ "$minute" != 1430 ] || day1=$(calls)
     minute=$((minute + 10))
 done
-[ "$day1" -ge 2 ] && [ "$day1" -le 7 ] || fail "first failing day made $day1 calls (expected a few, backing off)"
+{ [ "$day1" -ge 2 ] && [ "$day1" -le 7 ]; } || fail "first failing day made $day1 calls (expected a few, backing off)"
 day2=$(( $(calls) - day1 ))
 [ "$day2" = 1 ] || fail "second failing day made $day2 calls (expected only the daily slot)"
 grep -q 'следующая попытка через' "$TMP/scheduler.log" || fail 'backoff is not logged'

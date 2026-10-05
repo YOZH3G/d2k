@@ -91,7 +91,7 @@ for fw_tool in iptables ip6tables; do
     printf '%s\n' "$rst_rules" | sed -n \
         's/^-A OUTPUT -p tcp \(-m tcp \)\{0,1\}--sport \([0-9][0-9]*\) --tcp-flags RST RST -m comment --comment "\{0,1\}d2k-rst:\([1-9][0-9]*\)"\{0,1\} -j DROP *$/\2 \3/p' |
     while read -r port owner; do
-        [ "$port" -ge 30000 ] && [ "$port" -le 54999 ] || continue
+        { [ "$port" -ge 30000 ] && [ "$port" -le 54999 ]; } || continue
         if kill -0 "$owner" 2>/dev/null; then
             case "$(cat "/proc/$owner/comm" 2>/dev/null)" in d2k*) ;; *) continue ;; esac
         fi
@@ -170,7 +170,7 @@ rm -rf "$DIR/run" "$DIR/log" "$DIR/panel"
 # Свои файлы в /tmp: отметки сторожа и планировщика, брошенные замки.
 rm -f /tmp/d2k-fw-heal.last /tmp/d2k-instagram-dns-last-attempt
 for lock in /tmp/d2k-fw-heal.lock /tmp/d2k-fw-operation.lock; do
-    [ -d "$lock" ] && [ ! -L "$lock" ] || continue
+    { [ -d "$lock" ] && [ ! -L "$lock" ]; } || continue
     rm -f "$lock/pid"
     rmdir "$lock" 2>/dev/null || true
 done
@@ -220,7 +220,7 @@ cleanup_runtime /tmp/d2k
 if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
     # Keep maintenance.lock inode: existing waiters must never acquire a second
     # lock for the same root. Remove code only after all owned writers stopped.
-    rm -rf "$DIR/releases" "$DIR/current" "$DIR/boot" "$DIR/update" "$DIR/snapshots"
+    rm -rf "${DIR:?}/releases" "${DIR:?}/current" "${DIR:?}/boot" "${DIR:?}/update" "${DIR:?}/snapshots"
 fi
 if [ "$KEEP" = "1" ]; then
     say "сохраняю конфигурацию и каталог изученных коробок в $DIR"

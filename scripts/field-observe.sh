@@ -255,7 +255,7 @@ CTL_SRC=""
 NOTSELF=""
 [ "$MARK" != 0 ] && NOTSELF="-m mark ! --mark $MARK"
 [ "$CTL_MARK" != "$MARK" ] || { say "D2K_CTL_MARK должен отличаться от D2K_MARK"; exit 2; }
-[ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$CTL_MARK" ] || {
+{ [ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$CTL_MARK" ]; } || {
     say "D2K_MEASURE_MARK должен отличаться от D2K_MARK и D2K_CTL_MARK"; exit 2;
 }
 NOTMEASURE="-m mark ! --mark $MEASURE_MARK"

@@ -262,15 +262,19 @@ sleep 300 >/dev/null 2>&1 & HU_OTHER=$!
 mkdir -p "$TMP/proc/$HU_OTHER"
 printf 'sshd\n' > "$TMP/proc/$HU_OTHER/comm"
 printf '%s\n' "$HU_OTHER" > "$TMP/run/d2k-http.pid"
+# shellcheck disable=SC2016  # раскрывает S99d2k, не этот скрипт
 if S99_SNIPPET='HU_PID=$RUN/d2k-http.pid; legacy_http_present' s99; then
     kill "$HU_OTHER"; fail "a reused pid of a foreign process counted as d2khttp"
 fi
+# shellcheck disable=SC2016  # раскрывает S99d2k, не этот скрипт
 S99_SNIPPET='HU_PID=$RUN/d2k-http.pid; legacy_http_stop' s99
 kill -0 "$HU_OTHER" 2>/dev/null || fail "legacy cleanup killed a foreign process by a stale pid"
 [ ! -e "$TMP/run/d2k-http.pid" ] || fail "stale d2khttp pid file kept"
 printf 'd2khttp\n' > "$TMP/proc/$HU_OTHER/comm"
 printf '%s\n' "$HU_OTHER" > "$TMP/run/d2k-http.pid"
+# shellcheck disable=SC2016  # раскрывает S99d2k, не этот скрипт
 S99_SNIPPET='HU_PID=$RUN/d2k-http.pid; legacy_http_present' s99 || fail "a live d2khttp not seen"
+# shellcheck disable=SC2016  # раскрывает S99d2k, не этот скрипт
 S99_SNIPPET='HU_PID=$RUN/d2k-http.pid; legacy_http_stop' s99
 i=0; while kill -0 "$HU_OTHER" 2>/dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
 if kill -0 "$HU_OTHER" 2>/dev/null; then kill "$HU_OTHER"; fail "a live d2khttp was not stopped"; fi

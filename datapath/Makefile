@@ -209,7 +209,12 @@ check: test-http-hello
 core_quichello.o: $(CORE_DIR)/quichello.c $(COREHDR) $(CORE_DIR)/include/d2k_quichello.h $(CORE_DIR)/include/d2k_hello.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-core_hello.o: $(CORE_DIR)/hello.c $(COREHDR) $(CORE_DIR)/include/d2k_hello.h
+# hello.c #include'ит сгенерированный core/hello_profiles.inc: на чистом
+# дереве (CI) его ещё нет, если ядро не собиралось раньше датапата.
+$(CORE_DIR)/hello_profiles.inc:
+	$(MAKE) -C $(CORE_DIR) hello_profiles.inc
+
+core_hello.o: $(CORE_DIR)/hello.c $(COREHDR) $(CORE_DIR)/include/d2k_hello.h $(CORE_DIR)/hello_profiles.inc
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 core_tls13core.o: $(CORE_DIR)/tls13core.c $(COREHDR) $(CORE_DIR)/include/d2k_tls13core.h

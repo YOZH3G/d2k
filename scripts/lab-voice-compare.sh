@@ -44,6 +44,7 @@ WORK=$(mktemp -d /tmp/d2kvc.XXXXXX)
 TOK="d2kvc$$"
 # Invoked by the EXIT/INT/TERM trap below.
 # shellcheck disable=SC2329
+# shellcheck disable=SC2317  # вызывается через trap
 cleanup() { rm -rf "$WORK"; $SSH "rm -f /tmp/$TOK.*" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 

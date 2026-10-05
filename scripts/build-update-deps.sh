@@ -23,11 +23,11 @@ command -v cmake >/dev/null
 [ -z "$(git -C "$SSL_SOURCE" status --porcelain --untracked-files=all)" ] || { echo 'OpenSSL source is dirty' >&2; exit 1; }
 SSL_LIB="$SSL_PREFIX/lib"
 [ -f "$SSL_LIB/libssl.a" ] || SSL_LIB="$SSL_PREFIX/lib64"
-[ -f "$SSL_LIB/libssl.a" ] && [ -f "$SSL_LIB/libcrypto.a" ] || { echo 'Static pinned OpenSSL missing; run build-openssl-tg.sh first' >&2; exit 1; }
+{ [ -f "$SSL_LIB/libssl.a" ] && [ -f "$SSL_LIB/libcrypto.a" ]; } || { echo 'Static pinned OpenSSL missing; run build-openssl-tg.sh first' >&2; exit 1; }
 mkdir -p "$DEPS_DIR" "$(dirname -- "$PREFIX")"
 # Do not overlay a foreign or previously compiled output. Each invocation owns
 # one fresh attempt; failed source/object trees are retained for diagnosis.
-[ ! -e "$PREFIX" ] && [ ! -L "$PREFIX" ] || { echo 'Output prefix already exists; choose a fresh owned prefix' >&2; exit 1; }
+{ [ ! -e "$PREFIX" ] && [ ! -L "$PREFIX" ]; } || { echo 'Output prefix already exists; choose a fresh owned prefix' >&2; exit 1; }
 LOCK="$PREFIX.d2ku-lock"
 mkdir "$LOCK" || { echo 'Output prefix is claimed by another build' >&2; exit 1; }
 trap 'rmdir "$LOCK"' EXIT HUP INT TERM
@@ -118,7 +118,7 @@ PROVENANCE
 wc -c "$PREFIX/lib/libcurl.a" "$SSL_LIB/libssl.a" "$SSL_LIB/libcrypto.a" "$ATTEMPT/smoke-$ARCH"
 
 # Commit only this successful attempt's output; no foreign tree is removed.
-[ ! -e "$FINAL_PREFIX" ] && [ ! -L "$FINAL_PREFIX" ] || { echo 'Output appeared during build' >&2; exit 1; }
+{ [ ! -e "$FINAL_PREFIX" ] && [ ! -L "$FINAL_PREFIX" ]; } || { echo 'Output appeared during build' >&2; exit 1; }
 printf '%s\n' "$ATTEMPT" > "$PREFIX/BUILD_ATTEMPT"
 cp "$ATTEMPT/smoke-$ARCH" "$PREFIX/curl-link-smoke"
 mv "$PREFIX" "$FINAL_PREFIX"
