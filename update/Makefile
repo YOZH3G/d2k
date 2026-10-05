@@ -224,3 +224,11 @@ check-main-socket: $(BUILD)/test_main_socket
 $(BUILD)/test_main_socket: tests/test_main_socket.c src/main.c src/lifecycle.c $(DAEMON_SRC) src/platform.c src/ipc.c src/service_adapter.c src/transport.c src/manifest.c $(TRANSACTION_SRC) include/d2k_update.h include/d2k_update_ipc.h src/daemon.h src/startup.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) -pthread tests/test_main_socket.c src/lifecycle.c $(DAEMON_SRC) src/platform.c src/ipc.c src/service_adapter.c src/transport.c src/manifest.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) $(CURL_LIBS) -o $@
+
+# ASan+UBSan: отдельный каталог сборки, assert включены (-UNDEBUG), полный
+# набор `check`. Ошибка санитайзера завершает тест ненулевым кодом.
+.PHONY: san
+SAN_BUILD ?= ../build/update-san
+SANFLAGS = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
+san:
+	$(MAKE) BUILD=$(SAN_BUILD) CFLAGS='$(CFLAGS) $(SANFLAGS)' check
