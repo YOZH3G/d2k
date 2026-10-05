@@ -110,7 +110,7 @@ alive_pins=0
 recheck_owned() {
     [ -s "$MANIFEST" ] || return 0
     while read -r host ip _extra; do
-        [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+        { [ -n "${host:-}" ] && [ -n "${ip:-}" ]; } || continue
         if ! managed_host "$host" || ! valid_ipv4 "$ip"; then continue; fi
         if record_exists "$host" "$ip"; then :; else
             [ "$?" = 1 ] && continue
@@ -137,7 +137,7 @@ $1 $2
 drop_dead_pins() {
     [ -n "$dead_pins" ] || return 0
     while read -r host ip; do
-        [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+        { [ -n "${host:-}" ] && [ -n "${ip:-}" ]; } || continue
         if record_exists "$host" "$ip"; then
             LD_LIBRARY_PATH='' ndmc -c "no ip host $host $ip" >/dev/null 2>&1 || { log "ошибка удаления недоступной записи $host $ip"; return 1; }
             ndm_touched
@@ -151,7 +151,7 @@ EOF_DEAD
     kept="$MANIFEST.alive.$$"
     : > "$kept"
     while read -r host ip _extra; do
-        [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+        { [ -n "${host:-}" ] && [ -n "${ip:-}" ]; } || continue
         is_dead_pin "$host" "$ip" && continue
         printf '%s %s\n' "$host" "$ip" >> "$kept"
     done < "$MANIFEST"
@@ -162,7 +162,7 @@ remove_owned() {
     [ -s "$MANIFEST" ] || { rm -f "$MANIFEST"; log 'нет D2K-owned DNS-записей Instagram/WhatsApp'; return 0; }
     command -v ndmc >/dev/null 2>&1 || { log 'ndmc отсутствует; manifest оставлен'; return 1; }
     while read -r host ip _extra; do
-        [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+        { [ -n "${host:-}" ] && [ -n "${ip:-}" ]; } || continue
         if ! managed_host "$host" || ! valid_ipv4 "$ip"; then
             log 'игнорирую некорректную строку manifest'
             continue
@@ -267,7 +267,7 @@ refresh() {
         answered=" $(printf '%s\n' "$parsed" | awk -v h="$host" '$1==h{print $2}' | tr '\n' ' ') "
         candidates=$({ printf '%b' "$filtered"; cat "$MANIFEST" 2>/dev/null || true; } |
             while read -r sibling ip _extra; do
-                [ -n "${sibling:-}" ] && [ -n "${ip:-}" ] || continue
+                { [ -n "${sibling:-}" ] && [ -n "${ip:-}" ]; } || continue
                 [ "$sibling" != "$host" ] || continue
                 if ! managed_host "$sibling" || ! valid_ipv4 "$ip"; then continue; fi
                 is_dead_pin "$sibling" "$ip" && continue
@@ -321,7 +321,7 @@ EOF_CANDIDATES
         # it can never cover the user's own later identical pin.
         ndm_config || { rm -f "$next"; log 'не удалось прочитать NDM перед обновлением'; return 1; }
         while read -r host ip _extra; do
-            [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+            { [ -n "${host:-}" ] && [ -n "${ip:-}" ]; } || continue
             if ! managed_host "$host" || ! valid_ipv4 "$ip"; then continue; fi
             if printf '%s\n' "$ndm_cfg" | awk -v h="$host" -v ip="$ip" '$1=="ip"&&$2=="host"&&$3==h&&$4==ip {f=1} END{exit !f}'; then
                 printf '%s %s\n' "$host" "$ip" >> "$next"
@@ -364,7 +364,7 @@ EOF_CANDIDATES
     if [ -f "$MANIFEST" ]; then
         stale_removed=0
         while read -r host ip _extra; do
-            [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+            { [ -n "${host:-}" ] && [ -n "${ip:-}" ]; } || continue
             if ! managed_host "$host"; then continue; fi
             if ! valid_ipv4 "$ip"; then continue; fi
             fresh=$(printf '%b' "$filtered" | awk -v h="$host" '$1==h{print $2}' | tr '\n' ' ')
@@ -388,7 +388,7 @@ EOF_CANDIDATES
             kept="$next.kept"
             : > "$kept"
             while read -r host ip _extra; do
-                [ -n "${host:-}" ] && [ -n "${ip:-}" ] || continue
+                { [ -n "${host:-}" ] && [ -n "${ip:-}" ]; } || continue
                 fresh=$(printf '%b' "$filtered" | awk -v h="$host" '$1==h{print $2}' | tr '\n' ' ')
                 if [ -n "$fresh" ]; then case " $fresh " in *" $ip "*) :;; *) continue;; esac; fi
                 printf '%s %s\n' "$host" "$ip" >> "$kept"
