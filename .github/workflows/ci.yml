@@ -13,10 +13,6 @@ on:
 permissions:
   contents: read
 
-env:
-  # Версия закреплена: иначе вердикт CI начинает зависеть от даты прогона.
-  GO_VERSION: "1.25.12"
-
 jobs:
   panel:
     name: C-панель — HTTP, CLI и безопасность
@@ -27,84 +23,6 @@ jobs:
         run: make -C panel test
       - name: ASan и UBSan HTTP-handler
         run: make -C panel san
-
-  go:
-    name: Go — формат, vet, тесты
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          # Зависимостей у d2k нет, go.sum отсутствует, и кеш модулей каждый
-          # раз жаловался на его отсутствие. Отсутствие зависимостей — свойство
-          # продукта (§2.1), а не недосмотр, поэтому кеш просто не нужен.
-          cache: false
-
-      - name: Формат
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "не отформатировано:"
-            echo "$unformatted"
-            exit 1
-          fi
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Собрать стенды датапата
-        # Тесты моста гоняют planlab и ctlprobe — тот же исполнитель и тот же
-        # разбор команд, что пойдут в прод. Без них тесты не пропустятся, а
-        # упадут: пропущенный тест выглядит как пройденный.
-        run: make -C datapath planlab ctlprobe
-
-      - name: Тесты с детектором гонок
-        # -race обязателен: локальный CI z2k однажды его не гонял, и релиз
-        # сгорел на гонке, которую тесты без него не видели.
-        #
-        # D2K_REQUIRE_LAB превращает пропуск тестов моста в провал: молчаливый
-        # пропуск здесь означал бы, что связка Go и C не проверяется вовсе.
-        run: D2K_REQUIRE_LAB=1 go test -race -count=1 ./...
-
-  build:
-    name: Сборка под все арки
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          # Зависимостей у d2k нет, go.sum отсутствует, и кеш модулей каждый
-          # раз жаловался на его отсутствие. Отсутствие зависимостей — свойство
-          # продукта (§2.1), а не недосмотр, поэтому кеш просто не нужен.
-          cache: false
-      # Здесь собирается только Go-часть (инструменты на Go). Статические
-      # C-бинарники роутера под девять арок собирает и проверяет под QEMU
-      # задание update-release ниже — тем же путём, что настоящий выпуск.
-      - name: Собрать девять арок (Go)
-        run: D2K_GO_ONLY=1 sh scripts/build.sh
-      - name: Проверить, что бинарники той арки, за какую себя выдают
-        run: |
-          set -eu
-          fail=0
-          for f in builds/d2k-linux-*; do
-            arch=${f##*-}
-            out=$(file -b "$f")
-            echo "$arch: $out"
-            case "$arch:$out" in
-              arm64:*aarch64*|arm:*ARM,*|amd64:*x86-64*|386:*Intel\ 80386*) ;;
-              mips:*MIPS*|mipsle:*MIPS*|mips64le:*MIPS*) ;;
-              ppc64:*PowerPC*|riscv64:*RISC-V*) ;;
-              *) echo "  НЕ СООТВЕТСТВУЕТ"; fail=1 ;;
-            esac
-          done
-          [ "$fail" -eq 0 ]
 
   shell:
     name: Скрипты

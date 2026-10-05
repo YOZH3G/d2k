@@ -1,11 +1,9 @@
-spike/nfqview/nfqview-linux-*
 *.tsv
 *.summary.json
 *.ct-*.txt
 docs/field/raw/
 spike/nfqview-c/nfqview-c-linux-*
 spike/bench/results/
-spike/nfqview-raw/nfqview-raw-linux-*
 # Публикуемые arm64 runtime-артефакты, которые скачивает scripts/install.sh.
 # Остальные сборки и временные файлы каталога остаются локальными.
 builds/*
