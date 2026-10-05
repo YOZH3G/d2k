@@ -3,6 +3,7 @@
 #define _DARWIN_C_SOURCE
 #include "../../runtime/d2k_runtime.h"
 #include "d2k_update.h"
+#include "transaction_internal.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -483,6 +484,25 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
       if (r != D2KU_OK)
         goto end;
     }
+    const char *first_files[] = {"d2k-update-first", "update.conf"};
+    struct stat first_stat;
+    int has_first = fstatat(c->bootstrap_bundle_fd, "d2k-update-first",
+                            &first_stat, AT_SYMLINK_NOFOLLOW) == 0;
+    int has_config = fstatat(c->bootstrap_bundle_fd, "update.conf", &first_stat,
+                             AT_SYMLINK_NOFOLLOW) == 0;
+    if (has_first != has_config) {
+      r = D2KU_INVALID;
+      goto end;
+    }
+    if (has_first)
+      for (unsigned k = 0; k < 2; k++) {
+        r = copy_file(c, c->bootstrap_bundle_fd, first_files[k], input,
+                      first_files[k]);
+        if (r == D2KU_OK)
+          r = copy_file(c, input, first_files[k], boot, first_files[k]);
+        if (r != D2KU_OK)
+          goto end;
+      }
     for (unsigned i = 0; i < 7; i++) {
       r = copy_file(c, c->bootstrap_bundle_fd, helpers[i], input, helpers[i]);
       if (r != D2KU_OK)
@@ -670,5 +690,105 @@ end: {
 }
   c->maintenance_lock_fd = -1;
   close(lock);
+  return r;
+}
+
+/* First-worker fallback is bound to the preserved bootstrap inventory, not to
+ * the absence of an updater binary in an arbitrary signed release. */
+static int equal_file(int a, int b, const char *name) {
+  int x = openat(a, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC),
+      y = openat(b, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  struct stat sx, sy;
+  int good = x >= 0 && y >= 0 && !fstat(x, &sx) && !fstat(y, &sy) &&
+             S_ISREG(sx.st_mode) && S_ISREG(sy.st_mode) &&
+             sx.st_uid == geteuid() && sy.st_uid == geteuid() &&
+             !(sx.st_mode & 022) && !(sy.st_mode & 022) &&
+             sx.st_size == sy.st_size;
+  char bx[4096], by[4096];
+  while (good) {
+    ssize_t nx = read(x, bx, sizeof bx), ny = read(y, by, sizeof by);
+    if (nx < 0 || ny != nx || memcmp(bx, by, nx > 0 ? (size_t)nx : 0)) {
+      good = 0;
+      break;
+    }
+    if (!nx)
+      break;
+  }
+  if (x >= 0)
+    close(x);
+  if (y >= 0)
+    close(y);
+  return good;
+}
+d2ku_rc d2ku_bootstrap_first(d2ku_ctx *c) {
+  int state = dir(c, c->root_dirfd, "update-state", 0);
+  if (state < 0)
+    return D2KU_ABSENT;
+  struct stat st;
+  if (!fstatat(state, "first-retired", &st, AT_SYMLINK_NOFOLLOW)) {
+    close(state);
+    return D2KU_INCOMPATIBLE;
+  }
+  char id[65], oldseal[65], inputseal[65], current[65], actual[65];
+  uint64_t bits;
+  d2ku_rc r =
+      marker_read(state, "bootstrap.done", id, oldseal, inputseal, &bits);
+  close(state);
+  if (r != D2KU_OK)
+    return r;
+  r = d2ku_tx_current(c, current);
+  if (r != D2KU_OK || strcmp(id, current))
+    return D2KU_INCOMPATIBLE;
+  d2ku_journal journal;
+  r = d2ku_journal_load(c, &journal);
+  if (r != D2KU_ABSENT && (r != D2KU_OK || journal.phase != D2KU_ROLLED_BACK ||
+                           strcmp(journal.old_release_id, id)))
+    return D2KU_INCOMPATIBLE;
+  unsigned char hash[32];
+  r = d2ku_tx_receipt(c, id, hash);
+  if (r != D2KU_OK)
+    return r;
+  hex(hash, actual);
+  if (strcmp(actual, oldseal))
+    return D2KU_RECOVERY;
+  int boot = dir(c, c->root_dirfd, "boot", 0),
+      input = boot >= 0 ? dir(c, boot, "input", 0) : -1;
+  if (input < 0) {
+    if (boot >= 0)
+      close(boot);
+    return D2KU_ABSENT;
+  }
+  r = digest(c, input, hash);
+  hex(hash, actual);
+  if (r == D2KU_OK && strcmp(actual, inputseal))
+    r = D2KU_RECOVERY;
+  if (r == D2KU_OK && (!equal_file(boot, input, "d2k-update-first") ||
+                       !equal_file(boot, input, "update.conf")))
+    r = D2KU_UNTRUSTED;
+  close(input);
+  close(boot);
+  return r;
+}
+d2ku_rc d2ku_bootstrap_retire_first(d2ku_ctx *c) {
+  int lock = -1;
+  d2ku_rc r = d2ku_maintenance_lock(c, &lock);
+  if (r != D2KU_OK)
+    return r;
+  d2ku_journal j;
+  r = d2ku_journal_load(c, &j);
+  if (r == D2KU_ABSENT) {
+    d2ku_maintenance_unlock(lock);
+    return D2KU_OK;
+  }
+  if (r == D2KU_OK && j.phase == D2KU_COMMITTED) {
+    int state = dir(c, c->root_dirfd, "update-state", 0);
+    if (state < 0)
+      r = D2KU_IO;
+    else {
+      r = atomic(c, state, "first-retired", "D2KF1\n", 6, 0600);
+      close(state);
+    }
+  }
+  d2ku_maintenance_unlock(lock);
   return r;
 }

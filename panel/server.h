@@ -15,6 +15,7 @@ typedef struct {
     const char *state_dir;
     const char *state_dir_note;
     const char *service_path;
+    const char *update_socket; /* local configuration only, never HTTP */
     const char *engine_pid_path;
     const char *controller_pid_path;
     const char *telegram_pid_path;

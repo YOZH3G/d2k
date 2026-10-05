@@ -106,7 +106,7 @@ d2ku_rc d2ku_cache_record(d2ku_status *status, const d2ku_clock_sample *sample,
     d2ku_rc result)
 {
     if (!status || !sample || !text_valid(sample->boot_id, sizeof(sample->boot_id)) ||
-        result < D2KU_OK || result > D2KU_HEALTH ||
+        result < D2KU_OK || result > D2KU_RECOVERY ||
         (result == D2KU_OK && (sample->synchronized != 1 || sample->utc_seconds < 0)))
         return D2KU_INVALID;
     d2ku_cache_observe(status, sample);

@@ -30,7 +30,7 @@
 #ifndef D2K_PANEL_DIRTY
 #define D2K_PANEL_DIRTY 0
 #endif
-#define D2K_PANEL_FEATURES "telegram-control"
+#define D2K_PANEL_FEATURES "telegram-control update-control"
 
 #define UNKNOWN_MAX 64
 #define UNKNOWN_KEY_MAX 128
@@ -308,6 +308,7 @@ static int serve(const char *listen_addr, const char *live_path, const char *ass
         /* The operator explicitly selected this panel bind address. Allow
          * same-origin controls there; server.c rejects cross-origin actions. */
         .control_enabled = 1,
+        .update_socket = "/opt/d2k/update-state/updater.sock",
         .listener_fd = listener,
     };
     printf("d2kpanel %s\nhttp://%s/\n", D2K_PANEL_VERSION, listen_addr);

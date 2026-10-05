@@ -201,7 +201,9 @@ d2ku_rc d2ku_service_configure(d2ku_ctx *c, const char *root,
   s->identity_required = 1;
   if (!path_ok(root) || !assign(s->root, sizeof s->root, root))
     return D2KU_INVALID;
-  snprintf(s->state, sizeof s->state, "%s/state", root);
+  if (snprintf(s->state, sizeof s->state, "%s/state", root) >=
+      (int)sizeof s->state)
+    return D2KU_INVALID;
   const char *runtime_env = getenv("D2K_RUNTIME_DIR");
   if (!assign(s->runtime, sizeof s->runtime,
               runtime_env && *runtime_env ? runtime_env : "/tmp/d2k"))
@@ -671,6 +673,11 @@ d2ku_rc d2ku_service_dispatch(d2ku_service_config *s, const char *action,
   if (mask > 15 || (mask & 3) == 1 || (mask & 3) == 2 ||
       d2ku_service_lock_valid(c, c->maintenance_lock_fd) != D2KU_OK)
     return D2KU_INVALID;
+  struct stat lifecycle;
+  if (!fstatat(c->root_dirfd, "update-state/lifecycle", &lifecycle,
+               AT_SYMLINK_NOFOLLOW) &&
+      strcmp(action, "uninstall") && strncmp(action, "health-", 7))
+    return D2KU_BUSY;
   if (!strcmp(action, "health-state"))
     return d2ku_service_health_state(s);
   if (!strcmp(action, "health-http"))

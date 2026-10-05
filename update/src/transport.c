@@ -45,6 +45,7 @@ done:
 }
 typedef struct {
     CURL *curl;
+    d2ku_ctx *ctx;
     int fd;
     uint64_t max, written;
     size_t headers;
@@ -142,6 +143,8 @@ static size_t body(char *data, size_t size, size_t count, void *arg) {
         off += (size_t)w;
     }
     d->written += n;
+    if (d->ctx && d->ctx->progress)
+      d->ctx->progress(d->ctx->progress_arg, d->written);
     return n;
 }
 d2ku_rc d2ku_fetch(d2ku_ctx *ctx, const char *url, int out_fd, uint64_t max_bytes) {
@@ -172,8 +175,12 @@ d2ku_rc d2ku_fetch(d2ku_ctx *ctx, const char *url, int out_fd, uint64_t max_byte
         goto done;
     }
     for (unsigned redirects = 0;; redirects++) {
-        download d = {.curl = c, .fd = out_fd, .max = max_bytes, .failure = D2KU_OK};
-        curl_easy_reset(c);
+      download d = {.ctx = ctx,
+                    .curl = c,
+                    .fd = out_fd,
+                    .max = max_bytes,
+                    .failure = D2KU_OK};
+      curl_easy_reset(c);
 #define SET(option, value)                                                                         \
     do {                                                                                           \
         if (curl_easy_setopt(c, option, value) != CURLE_OK)                                        \

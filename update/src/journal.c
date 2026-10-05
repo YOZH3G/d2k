@@ -92,6 +92,13 @@ static d2ku_rc persistent_valid(const d2ku_persistent_state *s)
         !datevalid(p->selected_date) || !datevalid(p->last_attempt_date) ||
         (p->selected_date ? (p->selected_minute < 180 || p->selected_minute > 299) : p->selected_minute != 0))
         return D2KU_INVALID;
+    if (s->auto_operation[0] &&
+        (!textvalid(s->auto_operation, strnlen(s->auto_operation, 65), 64, 1) ||
+         !textvalid(s->auto_release, strnlen(s->auto_release, 65), 64, 1) ||
+         !p->last_attempt_date))
+      return D2KU_INVALID;
+    if (!s->auto_operation[0] && s->auto_release[0])
+      return D2KU_INVALID;
     for (size_t i = 0; i < s->trust_count; i++) {
         if (s->trust[i].not_before < 0 || s->trust[i].not_after <= s->trust[i].not_before) return D2KU_INVALID;
         for (size_t k = 0; k < i; k++)
@@ -122,6 +129,9 @@ static void encode_persistent(buffer *b, const d2ku_persistent_state *s)
     number(b, (unsigned)p->enabled, 1); number(b, (uint32_t)p->selected_date, 4);
     number(b, (uint32_t)p->last_attempt_date, 4); number(b, p->selected_minute, 2);
     number(b, (unsigned)p->has_quarantined_release, 1); bytes(b, p->quarantined_release_sha256, 32);
+    putstr(b, s->auto_operation, strlen(s->auto_operation));
+    putstr(b, s->auto_release, strlen(s->auto_release));
+    bytes(b, s->auto_manifest_sha256, 32);
 }
 static int digest(const void *p, size_t n, unsigned char sha[32])
 {
@@ -185,6 +195,9 @@ static d2ku_rc decode(kind k, buffer *b, unsigned slot, void *out)
         s.policy.selected_minute = (unsigned)getnum(b, 2);
         s.policy.has_quarantined_release = (int)getnum(b, 1);
         getbytes(b, s.policy.quarantined_release_sha256, 32);
+        getstr(b, s.auto_operation, D2KU_ID_MAX);
+        getstr(b, s.auto_release, D2KU_ID_MAX);
+        getbytes(b, s.auto_manifest_sha256, 32);
         if (b->bad || b->pos != b->n || persistent_valid(&s) != D2KU_OK) return D2KU_RECOVERY;
         *(d2ku_persistent_state *)out = s;
     }
@@ -285,6 +298,12 @@ static int trust_progress(const d2ku_persistent_state *old, const d2ku_persisten
             (s->accepted_sequence == old->accepted_sequence && memcmp(s->accepted_index_sha256, old->accepted_index_sha256, 32)))) ||
         (old->policy.selected_date && old->policy.selected_date == s->policy.selected_date &&
             old->policy.selected_minute != s->policy.selected_minute)) return 0;
+    if (old->auto_operation[0] &&
+        old->policy.last_attempt_date == s->policy.last_attempt_date &&
+        (strcmp(old->auto_operation, s->auto_operation) ||
+         strcmp(old->auto_release, s->auto_release) ||
+         memcmp(old->auto_manifest_sha256, s->auto_manifest_sha256, 32)))
+      return 0;
     for (size_t i = 0; i < old->trust_count; i++) {
         int found = 0;
         for (size_t j = 0; j < s->trust_count; j++)

@@ -2,6 +2,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "server.h"
+#include "update.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -286,16 +287,17 @@ static int header_value(const char *req, const char *wanted,
     return 0;
 }
 
-static int same_origin(const char *req) {
-    const char *host = NULL, *origin = NULL;
-    size_t host_len = 0, origin_len = 0;
-    if (!header_value(req, "Host", &host, &host_len) ||
-        !header_value(req, "Origin", &origin, &origin_len) ||
-        origin_len < 7 || memcmp(origin, "http://", 7) != 0) { return 0; }
-    const char *authority = origin + 7;
-    size_t authority_len = origin_len - 7;
-    return host_len == authority_len &&
-           memcmp(host, authority, host_len) == 0;
+int d2k_panel_same_origin(const char *req) {
+  const char *host = NULL, *origin = NULL;
+  size_t host_len = 0, origin_len = 0;
+  if (!header_value(req, "Host", &host, &host_len) ||
+      !header_value(req, "Origin", &origin, &origin_len) || origin_len < 7 ||
+      memcmp(origin, "http://", 7) != 0) {
+    return 0;
+  }
+  const char *authority = origin + 7;
+  size_t authority_len = origin_len - 7;
+  return host_len == authority_len && memcmp(host, authority, host_len) == 0;
 }
 
 static int run_service_action(const d2k_panel_config *cfg, const char *action, int client) {
@@ -412,10 +414,11 @@ static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
         return response(fd, 404, "Not Found", "application/json; charset=utf-8",
                         body, sizeof body - 1);
     }
-    if (!cfg || !cfg->control_enabled || !same_origin(req)) {
-        static const char body[] = "{\"ok\":false,\"message\":\"Управление разрешено только с этой панели\"}";
-        return response(fd, 403, "Forbidden", "application/json; charset=utf-8",
-                        body, sizeof body - 1);
+    if (!cfg || !cfg->control_enabled || !d2k_panel_same_origin(req)) {
+      static const char body[] = "{\"ok\":false,\"message\":\"Управление "
+                                 "разрешено только с этой панели\"}";
+      return response(fd, 403, "Forbidden", "application/json; charset=utf-8",
+                      body, sizeof body - 1);
     }
     if ((strcmp(command, "engine-start") == 0 ||
          strcmp(command, "engine-restart") == 0) &&
@@ -782,6 +785,8 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     }
     char *query = strchr(path, '?');
     if (query) { *query = '\0'; }
+    if (!strcmp(path, "/api/update") || !strncmp(path, "/api/update/", 12))
+      return d2k_panel_update_handle(fd, cfg, req, path);
     if (strncmp(path, "/api/control/", sizeof "/api/control/" - 1) == 0) {
         if (strcmp(method, "POST") != 0) {
             return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8",

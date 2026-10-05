@@ -68,10 +68,12 @@ printf '%s\\n' "$line" >> "$CALLS"
         (root/'releases'/release/'S99d2k').write_text(f'#!/bin/sh\nprintf {release} > "{root}/selected"\n')
     waiter=subprocess.Popen([adapter,'--root',root,'service','heal'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     time.sleep(.2); assert waiter.poll() is None and not (root/'selected').exists()
+    with (root/'config').open('a') as config: config.write(f'D2K_RUNTIME_DIR={root}/runtime-after-wait\n')
     (root/'next').symlink_to('releases/new'); os.replace(root/'next',root/'current')
     fcntl.flock(4,fcntl.LOCK_UN); os.close(4)
     stdout,stderr=waiter.communicate(timeout=5); assert waiter.returncode==0,(stdout,stderr)
     assert (root/'selected').read_text()=='new'
+    assert (root/'runtime-after-wait').is_dir(), 'configuration must refresh after maintenance wait'
     (root/'releases'/'new'/'d2kc').write_text(f'#!/bin/sh\nprintf unsafe > "{root}/unmanaged-writer"\n')
     (root/'releases'/'new'/'d2kc').chmod(0o700)
     unmanaged=subprocess.run([adapter,'--root',root,'--launch','d2kc','--control',str(root/'run/socket')],capture_output=True)

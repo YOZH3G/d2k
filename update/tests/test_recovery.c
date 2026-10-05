@@ -1,4 +1,5 @@
 #include "transaction_fixture.h"
+#include "../src/lifecycle.h"
 static int terminal_cut, terminal_syncs;
 static d2ku_rc before_terminal_sync(void *arg, int fd) {
     fixture *f = arg;
@@ -73,6 +74,17 @@ static void relocated_snapshot(void) {
 }
 int main(int argc, char **argv) {
     if (argc > 1) {
+        if (!strcmp(argv[1], "--commit-handoff")) {
+            fixture f; setup(&f); int own=f.c.root_dirfd;
+            f.c.root_dirfd=open(argv[2],O_RDONLY|O_DIRECTORY);
+            d2ku_status s={0};
+            assert(d2ku_boot_pulse(3,1)==D2KU_OK);
+            assert(d2ku_install(&f.c,&f.r,&s)==D2KU_OK);
+            close(f.c.root_dirfd); f.c.root_dirfd=own; cleanup(&f);
+            return 75;
+        }
+        if (!strcmp(argv[1], "--unsolicited-handoff")) return 75;
+        if (!strcmp(argv[1], "--unsolicited-quiesce")) return 76;
         if (!strcmp(argv[1], "--pulse")) {
             assert(d2ku_boot_pulse(3, 0) == D2KU_OK);
             return 0;
@@ -95,6 +107,17 @@ int main(int argc, char **argv) {
         args[1] = "--hang";
         assert(d2ku_supervise(&f.c, argv[0], args, &s) == D2KU_HEALTH);
         cleanup(&f);
+    }
+    {
+        fixture f; setup(&f); d2ku_status s={0};
+        char *args[]={argv[0],"--commit-handoff",f.path,NULL};
+        assert(d2ku_supervise(&f.c,argv[0],args,&s)==D2KU_HANDOFF_RC);
+        current(&f,"releases/B");
+        args[1]="--unsolicited-handoff";
+        assert(d2ku_supervise(&f.c,argv[0],args,&s)==D2KU_HEALTH);
+        args[1]="--unsolicited-quiesce";
+        assert(d2ku_supervise(&f.c,argv[0],args,&s)==D2KU_HEALTH);
+        current(&f,"releases/B"); cleanup(&f);
     }
     terminal_durability();
     relocated_snapshot();

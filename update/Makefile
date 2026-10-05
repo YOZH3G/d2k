@@ -71,7 +71,7 @@ $(BUILD)/test_runtime_signal: tests/test_runtime_signal_linux.c ../runtime/d2k_r
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) tests/test_runtime_signal_linux.c $(LDFLAGS) -o $@
 
-TRANSACTION_SRC = src/transaction.c src/recover.c src/journal.c src/package.c src/health.c src/schedule.c
+TRANSACTION_SRC = src/auto.c src/transaction.c src/recover.c src/journal.c src/package.c src/health.c src/schedule.c
 .PHONY: check-transaction check-recovery boot
 check: check-transaction check-recovery
 check-transaction: $(BUILD)/test_transaction
@@ -86,9 +86,9 @@ $(BUILD)/test_recovery: tests/test_recovery.c tests/transaction_fixture.h $(TRAN
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_recovery.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
 boot: $(BUILD)/d2k-update-boot
-$(BUILD)/d2k-update-boot: src/boot_main.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
+$(BUILD)/d2k-update-boot: src/boot_main.c src/lifecycle.c src/ipc.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
 	mkdir -p $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) src/boot_main.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/boot_main.c src/lifecycle.c src/ipc.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/test_offline_ownership: tests/test_offline_ownership.c tests/transaction_fixture.h $(TRANSACTION_SRC) include/d2k_update.h src/transaction_internal.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_offline_ownership.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
@@ -99,9 +99,9 @@ service-adapter: $(BUILD)/d2k-service-adapter
 $(BUILD)/test_service_adapter: tests/test_service_adapter.c src/service_adapter.c $(TRANSACTION_SRC) include/d2k_update.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_service_adapter.c src/service_adapter.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
-$(BUILD)/d2k-service-adapter: src/service_main.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) include/d2k_update.h
+$(BUILD)/d2k-service-adapter: src/service_main.c src/lifecycle.c src/ipc.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) include/d2k_update.h
 	mkdir -p $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) src/service_main.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/service_main.c src/lifecycle.c src/ipc.c src/service_adapter.c src/bootstrap.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
 check: check-bootstrap
 check-bootstrap: $(BUILD)/test_bootstrap $(BUILD)/d2k-service-adapter $(BUILD)/d2k-update-boot
 	$(BUILD)/test_service_adapter
@@ -111,3 +111,65 @@ check-bootstrap: $(BUILD)/test_bootstrap $(BUILD)/d2k-service-adapter $(BUILD)/d
 $(BUILD)/test_bootstrap: tests/test_bootstrap.c src/bootstrap.c $(TRANSACTION_SRC) include/d2k_update.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_bootstrap.c src/bootstrap.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) -o $@
+
+.PHONY: check-ipc
+check-ipc: $(BUILD)/test_ipc $(BUILD)/test_daemon
+	$(BUILD)/test_ipc
+	$(BUILD)/test_daemon
+$(BUILD)/test_ipc: tests/test_ipc.c src/ipc.c include/d2k_update_ipc.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread tests/test_ipc.c src/ipc.c -o $@
+check: check-ipc
+DAEMON_SRC = src/daemon.c src/daemon_status.c src/feed.c
+$(BUILD)/test_daemon: tests/test_daemon.c $(DAEMON_SRC) src/transport.c src/manifest.c $(TRANSACTION_SRC)
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) -pthread tests/test_daemon.c $(DAEMON_SRC) src/transport.c src/manifest.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) $(CURL_LIBS) -o $@
+
+.PHONY: check-platform
+check-platform: $(BUILD)/test_platform
+	$(BUILD)/test_platform
+$(BUILD)/test_platform: tests/test_platform.c src/platform.c src/service_adapter.c $(TRANSACTION_SRC)
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread tests/test_platform.c src/platform.c src/service_adapter.c $(TRANSACTION_SRC) $(LDLIBS) -o $@
+check-ipc: check-platform
+.PHONY: check-feed
+check-feed: $(BUILD)/test_feed
+	python3 tests/run_feed.py $(BUILD)/test_feed
+$(BUILD)/test_feed: tests/test_feed.c $(DAEMON_SRC) src/platform.c src/service_adapter.c src/transport.c src/manifest.c $(TRANSACTION_SRC)
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) -pthread tests/test_feed.c $(DAEMON_SRC) src/platform.c src/service_adapter.c src/transport.c src/manifest.c $(TRANSACTION_SRC) $(LDLIBS) $(CURL_LIBS) -o $@
+.PHONY: daemon check-daemon-cli
+daemon: $(BUILD)/d2k-update
+$(BUILD)/d2k-update: src/main.c src/lifecycle.c $(DAEMON_SRC) src/platform.c src/ipc.c src/service_adapter.c src/transport.c src/manifest.c $(TRANSACTION_SRC)
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) -DD2K_RELEASE_ID='"$(or $(RELEASE_ID),dev)"' -pthread src/main.c src/lifecycle.c $(DAEMON_SRC) src/platform.c src/ipc.c src/service_adapter.c src/transport.c src/manifest.c $(TRANSACTION_SRC) $(LDLIBS) $(CURL_LIBS) -o $@
+check-daemon-cli: daemon
+	python3 tests/test_daemon_cli.py $(BUILD)/d2k-update
+check-ipc: check-daemon-cli
+.PHONY: check-lifecycle
+check-lifecycle: $(BUILD)/test_lifecycle
+	$(BUILD)/test_lifecycle
+$(BUILD)/test_lifecycle: tests/test_lifecycle.c src/lifecycle.c src/ipc.c src/service_adapter.c $(TRANSACTION_SRC)
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread tests/test_lifecycle.c src/lifecycle.c src/ipc.c src/service_adapter.c $(TRANSACTION_SRC) $(LDLIBS) -o $@
+
+.PHONY: check-auto
+check-auto: $(BUILD)/test_auto
+	$(BUILD)/test_auto
+$(BUILD)/test_auto: tests/test_auto.c $(TRANSACTION_SRC)
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_auto.c $(TRANSACTION_SRC) $(LDLIBS) -o $@
+
+$(BUILD)/test_daemon $(BUILD)/test_feed $(BUILD)/test_platform $(BUILD)/d2k-update: include/d2k_update.h include/d2k_update_ipc.h src/daemon.h
+check: check-feed check-lifecycle check-auto
+.PHONY: check-supervised
+check-supervised: daemon boot service-adapter
+	python3 tests/test_supervised.py $(BUILD)/d2k-update $(BUILD)/d2k-update-boot $(BUILD)/d2k-service-adapter
+
+check-ipc: check-daemon-replay
+.PHONY: check-daemon-replay
+check-daemon-replay: $(BUILD)/test_daemon_replay
+	$(BUILD)/test_daemon_replay
+$(BUILD)/test_daemon_replay: tests/test_daemon_replay.c tests/transaction_fixture.h $(DAEMON_SRC) src/transport.c src/manifest.c $(TRANSACTION_SRC) include/d2k_update.h src/daemon.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) -pthread tests/test_daemon_replay.c $(DAEMON_SRC) src/transport.c src/manifest.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) $(CURL_LIBS) -o $@

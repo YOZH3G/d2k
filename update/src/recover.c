@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
+#include "lifecycle.h"
 #include "transaction_internal.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -8,6 +9,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #ifdef __linux__
@@ -45,8 +47,12 @@ d2ku_rc d2ku_boot_pulse(int fd, int ready) {
         r = write(fd, b, n);
     } while (r < 0 && errno == EINTR);
     if (r < 0 && errno == EPIPE && !sigismember(&pending, SIGPIPE)) {
+      sigset_t after;
+      sigpending(&after);
+      if (sigismember(&after, SIGPIPE)) {
         int signal_number;
         (void)sigwait(&set, &signal_number);
+      }
     }
     sigprocmask(SIG_SETMASK, &old, NULL);
     return r == (ssize_t)n ? D2KU_OK : D2KU_IO;
@@ -182,18 +188,25 @@ static d2ku_rc control_frame(int fd, const unsigned char b[8], pid_t worker,
     group_frame(ack, "D2GA", pid);
     return send_frame(NULL, fd, ack);
 }
-d2ku_rc d2ku_supervise(d2ku_ctx *c, const char *worker, char *const argv[],
-                       d2ku_status *s) {
-    if (!c || !worker || !argv || !s)
-        return D2KU_INVALID; /* Reconcile previous attempt before allowing a new
-                                worker. */
-    d2ku_rc rc = d2ku_recover(c, s);
-    if (rc != D2KU_OK)
-        return rc;
+static d2ku_rc supervise_worker(d2ku_ctx *c, const char *worker,
+                                char *const argv[], d2ku_status *s) {
+  if (!c || !worker || !argv || !s)
+    return D2KU_INVALID; /* Reconcile previous attempt before allowing a new
+                            worker. */
+  d2ku_rc rc = d2ku_recover(c, s);
+  if (rc != D2KU_OK)
+    return rc;
 #ifdef __linux__
     if (prctl(PR_SET_CHILD_SUBREAPER, 1))
         return D2KU_IO;
 #endif
+    char initial_release[D2KU_ID_MAX + 1];
+    rc = d2ku_tx_current(c, initial_release);
+    if (rc != D2KU_OK)
+      return rc;
+    d2ku_journal before;
+    uint64_t initial_sequence =
+        d2ku_journal_load(c, &before) == D2KU_OK ? before.sequence : 0;
     int fds[2], control[2];
     if (pipe(fds))
         return D2KU_IO;
@@ -337,14 +350,61 @@ d2ku_rc d2ku_supervise(d2ku_ctx *c, const char *worker, char *const argv[],
     for (size_t k = 0; k < GROUPS_MAX; k++)
         if (groups[k] && d2ku_group_cleanup(groups[k]) != D2KU_OK)
             return D2KU_RECOVERY;
+    if (!bad && reaped && WIFEXITED(status) && WEXITSTATUS(status) == 76 &&
+        c->supervisor_quiesce && c->supervisor_quiesce(c, pid) == D2KU_OK)
+      return D2KU_QUIESCED_RC;
     d2ku_journal j;
     rc = d2ku_journal_load(c, &j);
+    int handoff = !bad && reaped && WIFEXITED(status) &&
+                  WEXITSTATUS(status) == 75 && rc == D2KU_OK &&
+                  j.phase == D2KU_COMMITTED && j.sequence > initial_sequence &&
+                  !strcmp(j.old_release_id, initial_release) &&
+                  strcmp(j.new_release_id, initial_release);
+    if (handoff) {
+      char current[D2KU_ID_MAX + 1];
+      unsigned char hash[32];
+      handoff = d2ku_tx_current(c, current) == D2KU_OK &&
+                !strcmp(current, j.new_release_id) &&
+                d2ku_tx_receipt(c, current, hash) == D2KU_OK &&
+                !memcmp(hash, j.new_manifest_sha256, 32);
+    }
     int incomplete = rc == D2KU_OK && j.phase != D2KU_COMMITTED &&
                      j.phase != D2KU_ROLLED_BACK;
     rc = d2ku_recover(c, s);
     if (rc != D2KU_OK)
         return rc;
+    if (handoff)
+      return D2KU_HANDOFF_RC;
     return bad || incomplete || !WIFEXITED(status) || WEXITSTATUS(status)
                ? D2KU_HEALTH
                : D2KU_OK;
+}
+
+/* Standalone supervisor CLI and stable daemon loop share the same ownership
+ * lock. The latter passes its held descriptor across successive workers. */
+d2ku_rc d2ku_supervise(d2ku_ctx *c, const char *worker, char *const argv[],
+                       d2ku_status *s) {
+  if (!c)
+    return D2KU_INVALID;
+  if (c->supervisor_lock_fd > 2)
+    return supervise_worker(c, worker, argv, s);
+  int fd = openat(c->root_dirfd, "update-state/supervisor.lock",
+                  O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+  struct stat st;
+  if (fd < 0)
+    return D2KU_IO;
+  if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+      (st.st_mode & 077) || st.st_nlink != 1) {
+    close(fd);
+    return D2KU_INVALID;
+  }
+  if (flock(fd, LOCK_EX | LOCK_NB)) {
+    close(fd);
+    return D2KU_BUSY;
+  }
+  c->supervisor_lock_fd = fd;
+  d2ku_rc r = supervise_worker(c, worker, argv, s);
+  c->supervisor_lock_fd = -1;
+  close(fd);
+  return r;
 }

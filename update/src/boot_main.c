@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
+#include "lifecycle.h"
 #include "transaction_internal.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -9,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -49,6 +51,13 @@ int main(int argc, char **argv) {
     fprintf(stderr, "invalid update root\n");
     return 1;
   }
+  d2ku_lifecycle lifecycle;
+  if (d2ku_lifecycle_load(&c, &lifecycle) != D2KU_ABSENT) {
+    fprintf(stderr,
+            "installation is quiescing; explicit uninstall/resume required\n");
+    return 1;
+  }
+  c.supervisor_quiesce = d2ku_lifecycle_ack;
   c.updater_version = 1;
   c.wire_version = 13;
   c.state_version = 1;
@@ -96,19 +105,61 @@ int main(int argc, char **argv) {
     r = D2KU_OK;
   else if (!strcmp(argv[at], "--daemon")) {
     r = d2ku_recover(&c, &s);
-    char id[D2KU_ID_MAX + 1], worker[1200];
-    if (r == D2KU_OK)
+    if (r != D2KU_OK)
+      goto done;
+    int supervisor = openat(c.root_dirfd, "update-state/supervisor.lock",
+                            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (supervisor < 0 || flock(supervisor, LOCK_EX | LOCK_NB)) {
+      if (supervisor >= 0)
+        close(supervisor);
+      r = D2KU_BUSY;
+      goto done;
+    }
+    c.supervisor_lock_fd = supervisor;
+    do {
+      int refresh_lock = -1;
+      r = d2ku_maintenance_lock(&c, &refresh_lock);
+      if (r != D2KU_OK)
+        break;
+      r = d2ku_service_configure(&c, root, &config);
+      if (r == D2KU_OK) {
+        if (c.health_runtime_dirfd >= 0)
+          close(c.health_runtime_dirfd);
+        c.health_runtime_dirfd = -1;
+        r = d2ku_service_recovery_context(&c,
+                                          runtime ? runtime : config.runtime);
+      }
+      d2ku_maintenance_unlock(refresh_lock);
+      if (r != D2KU_OK)
+        break;
+      char id[D2KU_ID_MAX + 1], worker[1200];
       r = d2ku_tx_current(&c, id);
-    if (r == D2KU_OK) {
+      if (r != D2KU_OK)
+        break;
       snprintf(worker, sizeof worker, "%s/releases/%s/d2k-update", root, id);
       if (access(worker, X_OK)) {
-        fprintf(stderr, "update daemon is unavailable\n");
-        r = D2KU_ABSENT;
+        r = d2ku_bootstrap_first(&c);
+        if (r != D2KU_OK) {
+          fprintf(stderr,
+                  "updater unavailable: selected release has no daemon and "
+                  "authenticated first-worker eligibility failed (result=%d)\n",
+                  r);
+          break;
+        }
+        snprintf(worker, sizeof worker, "%s/boot/d2k-update-first", root);
       } else {
-        char *args[] = {worker, "--boot-worker", "3", NULL};
-        r = d2ku_supervise(&c, worker, args, &s);
+        r = d2ku_bootstrap_retire_first(&c);
+        if (r != D2KU_OK)
+          break;
       }
-    }
+      char *args[] = {worker,          "--root", (char *)root,
+                      "--boot-worker", "3",      NULL};
+      r = d2ku_supervise(&c, worker, args, &s);
+    } while (r == D2KU_HANDOFF_RC);
+    c.supervisor_lock_fd = -1;
+    close(supervisor);
+    if (r == D2KU_QUIESCED_RC)
+      r = D2KU_OK;
   } else
     r = at + 1 < argc ? d2ku_supervise(&c, argv[at + 1], &argv[at + 1], &s)
                       : D2KU_INVALID;

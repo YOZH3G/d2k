@@ -84,6 +84,8 @@ static void setup(d2ku_ctx *c, char root[64]) {
   assert(!mkdirat(c->root_dirfd, "state", 0700));
   put(c->root_dirfd, "state/catalog.json", "learned state\n");
   put(c->root_dirfd, "state/tg.identity", "personal identity\n");
+  put(c->bootstrap_bundle_fd,"d2k-update-first","trusted first updater\n");
+  put(c->bootstrap_bundle_fd,"update.conf","public bootstrap trust\n");
   const char *bundle[] = {"d2k-update-boot", "d2k-service-adapter",
                           "S99d2k",          "S98d2k-update",
                           "001-d2k.sh",      "uninstall.sh"};
@@ -151,6 +153,9 @@ int main(void) {
   assert(d2ku_bootstrap(&c, &s) == D2KU_OK);
   unsigned count = barrier;
   verify(&c);
+  assert(d2ku_bootstrap_first(&c)==D2KU_OK);
+  put(c.root_dirfd,"boot/d2k-update-first","tampered");
+  assert(d2ku_bootstrap_first(&c)!=D2KU_OK);
   assert(d2ku_bootstrap(&c, &s) == D2KU_OK);
   int record = openat(c.root_dirfd, "update-state/bootstrap.done", O_RDWR);
   assert(record >= 0);

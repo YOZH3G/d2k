@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
+#include "lifecycle.h"
 #include "transaction_internal.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -148,13 +149,43 @@ int main(int argc, char **argv) {
         return 2;
       action = argv[at++];
     }
+    if (!strcmp(action, "check") || !strcmp(action, "install")) {
+      d2ku_command command = {.op = D2KU_CMD_CHECK, .force = 1};
+      if (!strcmp(action, "install")) {
+        if (at + 2 != argc) {
+          fprintf(stderr, "not installed: use d2k-update check, status, then "
+                          "service install RELEASE_ID MANIFEST_SHA256\n");
+          return 2;
+        }
+        char json[512];
+        snprintf(json, sizeof json,
+                 "{\"release_id\":\"%s\",\"manifest_sha256\":\"%s\"}", argv[at],
+                 argv[at + 1]);
+        if (d2ku_command_parse(D2KU_CMD_INSTALL, json, &command))
+          return 2;
+      } else if (at != argc)
+        return 2;
+      char socket_path[1200];
+      snprintf(socket_path, sizeof socket_path, "%s/update-state/updater.sock",
+               root);
+      int fd = d2ku_ipc_connect(socket_path);
+      if (fd < 0) {
+        fprintf(stderr, "update daemon unavailable; not installed\n");
+        return 3;
+      }
+      char *json = malloc(D2KU_IPC_MAX);
+      int code = 503;
+      int error =
+          json ? d2ku_ipc_exchange(fd, &command, &code, json, D2KU_IPC_MAX)
+               : -1;
+      close(fd);
+      if (!error)
+        puts(json);
+      free(json);
+      return error ? 3 : code == 200 || code == 202 ? 0 : code == 409 ? 4 : 1;
+    }
     if (at != argc)
       return 2;
-    if (!strcmp(action, "check") || !strcmp(action, "install")) {
-      fprintf(stderr, "update daemon/IPC is unavailable; this lifecycle entry "
-                      "does not install releases\n");
-      return 3;
-    }
     r = d2ku_service_recovery_context(&c, sc.runtime);
     if (r != D2KU_OK)
       return 1;
@@ -167,6 +198,27 @@ int main(int argc, char **argv) {
     } while (r == D2KU_BUSY);
     if (r != D2KU_OK)
       return 1;
+    r = d2ku_service_configure(&c, root, &sc);
+    if (r != D2KU_OK)
+      goto done;
+    configured_mask = sc.enabled;
+    if (c.health_runtime_dirfd >= 0)
+      close(c.health_runtime_dirfd);
+    c.health_runtime_dirfd = -1;
+    r = d2ku_service_recovery_context(&c, sc.runtime);
+    if (r != D2KU_OK)
+      goto done;
+    d2ku_lifecycle lifecycle;
+    d2ku_rc lr = d2ku_lifecycle_load(&c, &lifecycle);
+    if (strcmp(action, "uninstall") && lr != D2KU_ABSENT) {
+      r = D2KU_BUSY;
+      goto done;
+    }
+    if (!strcmp(action, "uninstall")) {
+      r = d2ku_lifecycle_quiesce(&c, root);
+      if (r != D2KU_OK)
+        goto done;
+    }
     d2ku_status status = {0};
     if (!fstatat(c.root_dirfd, "update-state/bootstrap.pending", &st,
                  AT_SYMLINK_NOFOLLOW)) {

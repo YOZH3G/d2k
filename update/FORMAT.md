@@ -250,15 +250,16 @@ installation. Automatic installation additionally requires
 `d2ku_auto_release_allowed` for the exact chosen manifest SHA-256, successfully
 verified compatible metadata, and the transaction layer's other preconditions.
 
-After downloading/staging, the caller rechecks the schedule and quarantine
-immediately before beginning installation. `d2ku_mark_auto_attempt` updates the
-in-memory date only if the schedule is still due (BUSY otherwise, TIME for
-untrusted time). Caller locking must serialize this claim, and the journal/daemon
-must durably fsync the new date BEFORE beginning the automatic transaction.
-Persistence failure means no installation. A download finishing at/after 05:00
-does not consume an installation attempt: the prepared release waits for the
-next window. Already begun switch, validation or rollback runs to completion
-after 05:00. Manual installation does not call this auto-attempt marker.
+Before starting automatic package download (including a failed download),
+`d2ku_auto_reserve` takes maintenance, checks trusted time/window/quarantine,
+and durably stores the local attempt date plus operation ID, selected release ID
+and manifest hash. A download failure or reboot does not refund the date.
+`d2ku_auto_reservation_valid` rechecks this exact binding and the current window
+under transaction maintenance before preparation/switch; an `automatic` flag
+alone never bypasses the date guard. A package finishing at/after 05:00 remains
+in the bounded prepared cache for a later window, which requires a new date's
+validated reservation. Already begun switch/validation/recovery runs to
+completion after 05:00. Manual installation never consumes the automatic date.
 
 The quarantined release hash is durable local policy, outside release rollback.
 Automatic installation of that exact manifest hash is forbidden on later nights;
@@ -349,7 +350,10 @@ floor u64 (0..INT64_MAX); trust-key count u8 (1..8); for each key public bytes
 (32), not-before u64 and not-after u64 (0..INT64_MAX, increasing, no duplicates);
 policy enabled u8; selected local YYYYMMDD u32; last-attempt local YYYYMMDD u32;
 selected local minute u16; has-quarantined-release u8; exact quarantined manifest
-SHA-256 (32 bytes). Dates are zero/unselected or valid Gregorian dates
+SHA-256 (32 bytes); auto-reservation operation ID and release ID (each the
+existing length-prefixed bounded string encoding), then manifest SHA-256
+(32 bytes). Empty reservation IDs mean no active reservation; populated fields
+are bound to the last-attempt date. Dates are zero/unselected or valid Gregorian dates
 19700101..99991231. Selected minute is zero when unselected, otherwise 180..299.
 Accepted sequence is positive exactly when has-accepted-index=1. Trust keys are
 public, with no private material. Store refuses decreasing publication/time/date
@@ -400,8 +404,8 @@ manifest, fresh durably accepted index, selected ID/hash, archive descriptor,
 operation ID, and expected current ID/hash. These are C-side bindings; HTTP
 must not create a manifest structure. Manual installation still applies the
 trusted clock gate. Automatic installation additionally checks durable policy
-and consumes its date under the maintenance lock immediately before preparing
-the stop; the daemon must not consume that date a second time.
+and validates its already durable predownload reservation under the maintenance
+lock before preparation. The transaction never consumes that date a second time.
 
 Preparation verifies/stages the exact archive, hashes the ABI file set again,
 runs each of d2kd/d2kc/d2kpanel/d2ktg/d2k-update with `--release-id` and
@@ -629,13 +633,16 @@ an in-progress state snapshot. Init starts explicit release binaries internally.
 `boot/d2k-service-adapter service ACTION` serializes supported lifecycle actions;
 Task9's `d2k-update service ACTION` must forward to this stable entry, including
 configuration changes. The legacy installer detects managed markers before any
-fetch/module action and routes to `service install`. `install`/`check` currently
-return explicit daemon-unavailable (exit3); Task9 must connect those fixed entries
-to the authenticated daemon/IPC, with no implicit unsigned installation fallback.
+fetch/module action and routes to `service install`. Bare install fails nonzero
+with explicit not-installed/selection guidance. `service check` forwards a force
+check; `service install ID HASH` forwards that exact selection to authenticated
+IPC before acquiring maintenance (the daemon owns transaction locking). Neither
+command substitutes latest or falls back to unsigned installation.
 S98 runs recovery synchronously and starts the independent supervisor in the
-background only when the selected release supplies `d2k-update`. Task9's worker
-must implement `--boot-worker 3`, independent heartbeat and FD5 protocol already
-specified above. Normal D2K stop does not stop that supervisor.
+background when current supplies `d2k-update` or a bootstrap first worker exists.
+Stable boot validates first-worker eligibility before executing it. The worker
+implements `--boot-worker 3`, independent heartbeat and FD5 protocol specified
+above. Normal D2K stop does not stop that supervisor.
 
 Internal contract remains `--maintenance-fd 4 ACTION RELEASE SERVICE_BITS`.
 The adapter validates ownership/type/inode against maintenance.lock, verifies a
@@ -672,8 +679,8 @@ live personal state with D2K_KEEP_STATE=1. Full removal retains update-state's
 maintenance inode so concurrent waiters cannot lock a replacement inode. Code,
 owned hooks and heartbeats are removed; the retained coordination directory is
 an explicit reinstall/recovery prerequisite, not an ordinary flat installation.
-Task9 integration must additionally quiesce its daemon before removing managed
-code; this task does not invent a running daemon to claim that end-to-end case.
+The lifecycle handshake below quiesces the real daemon and supervisor before
+removing managed code; its isolated Linux fixture executes that path.
 
 Both stable boot and external lifecycle/NDM recovery initialize their production
 monotonic clock, boot identity reader and checked private runtime directory via
@@ -688,3 +695,148 @@ contracts), sealed preservation and bootstrap-only old-runtime recovery/health.
 It cannot be implemented by treating absent wire13 metadata as success or by
 weakening signed candidate health. The available field report records only the
 controller/datapath hashes, not a complete verified installation manifest.
+
+
+## Daemon, feed configuration and asynchronous IPC (Task 9)
+
+The C daemon is `d2k-update serve`. Modules separate platform/configuration,
+signed feed/downloads, operation dispatch/scheduling, safe status serialization,
+IPC transport, automatic reservation, and lifecycle coordination. Stable boot
+continues to link no curl. Production root is `/opt/d2k`; explicit standalone
+`--root DIR` / `--fixture-config FILE` are fixture controls, never HTTP fields.
+Required production configuration absent/invalid means unavailable and fail-closed.
+
+Task 8 provisions bootstrap-owned `boot/update.conf`, a regular single-link file
+owned by the updater UID (root in production), not writable by group/other, at
+most 16 KiB. This is strict data, never shell-sourced:
+
+```
+D2KU-CONFIG-1
+feed=https://<allowed-host>/<channel-path>
+ca=/absolute/public-ca-bundle
+abi=<target-abi>
+build=<positive-UTC-build-timestamp>
+host=<allowed-host>
+key=<64-lowercase-hex-public-key> <not-before-UTC> <not-after-UTC>
+```
+
+Feed/CA/ABI/build are unique required keys; host/key may repeat within the public
+header bounds. Unknown/duplicate scalar keys, invalid values and non-HTTPS feed
+fail. No production key is invented by Task 9. Releases cannot replace this
+bootstrap trust input. Accepted publication/time floors and key transitions load
+from independent durable state before every verification, and become live only
+after persistent store succeeds. `/stable.json[.sig]` and
+`/<release-id>/manifest.json[.sig]` are fetched with the existing strict HTTPS
+transport; detached signatures are exactly 64 raw bytes. Package artifact paths
+come only from the authenticated ABI entry. Rechecking install metadata may
+return conflict/expiry/replay requiring a new displayed selection; it never
+substitutes a different ID/hash. Current selection occupies one bounded in-memory
+manifest/index slot and is pinned while work is in flight. Restart requires a
+fresh check to select an install, but never resets independent trust floors.
+
+The one durable `update-state/prepared-package` is a raw archive, not authority.
+Every reuse checks regular-file owner/mode/link count, signed exact size and full
+SHA-256 from freshly verified metadata. Its bounded `.new` is fsynced before
+rename and directory fsync; partial `.new` is never reused. A mismatch is removed
+and refetched only as part of an already accepted operation (automatic work must
+have a new valid reservation). Worker serialization prevents in-flight eviction.
+Metadata uses one fixed temporary, removed after each fetch. Force checks cannot
+accumulate history/download files.
+
+Linux trusted synchronization uses `adjtimex`, real monotonic clock and boot ID.
+Without an initially supplied TZ, the bounded POSIX string in `/etc/TZ` is loaded
+and refreshed for every calendar snapshot; initial explicit TZ remains
+controlling. Validation/setenv/tzset/localtime share one process mutex, including
+all scheduler/feed/transaction clock snapshots. Configured service runtime and
+health dirfd refresh per operation under maintenance and again before transaction
+stop. Configuration storage belongs to the long-lived daemon, never a returned
+stack address. Unsynchronized time blocks manual and automatic installation with
+safe `last_error`; metadata status reads never trigger work.
+
+Unix socket: `update-state/updater.sock`, mode 0600, owner/peer UID validated
+on both ends (root in production). Frame header is ASCII `D2UI`, u32 big-endian
+version 1, u32 big-endian payload length. Request is exactly 166 bytes:
+command/force/enabled/reserved u8; release ID in 65 NUL-padded bytes; raw manifest
+hash 32 bytes; optional operation ID in 65 NUL-padded bytes. Commands 1..6 are
+status/check/install/rollback/settings/quiesce. Reply payload starts with u32
+big-endian status code then safe UTF-8 JSON, at most 131072 total bytes. Reads,
+writes and frame sizes are bounded. HTTP JSON body is at most 16384 bytes,
+strict scalar object with duplicate/unknown/nested fields rejected.
+
+- `GET /api/update`: passive safe state only.
+- `POST /api/update/check`: `{"force":false}` (default false).
+- `POST /api/update/install` and `/rollback`: required `release_id` and
+  64-lowercase-hex `manifest_sha256`.
+- `POST /api/update/settings`: required Boolean `enabled`.
+- Mutating JSON may additionally contain bounded ASCII `operation_id`.
+
+Existing panel control/same-origin policy applies: missing/bad Origin or disabled
+control 403, wrong method 405, oversized body 413, invalid command 400, accepted
+work 202, conflicting selection/operation 409. Unavailable updater is a separate
+503 state. Multiple clients join one in-flight compatible operation. A supplied
+operation ID is preserved; different payload under the same retained ID conflicts.
+Without one, the daemon generates a random 128-bit ID. `daemon-result` (D2KD2,
+canonical bounded mode0600 atomic/fsynced text) retains the last accepted command
+and result across restart; `daemon-transaction` retains the request associated
+with the transaction journal across later checks. Matching retained terminal
+journal replay returns the existing operation, never repeats install. The bounded
+retention contract covers the last operation and current journal generation;
+clients must poll status after reconnect rather than retry installation.
+
+Status supplies operation ID/busy, numeric journal phase, actual download bytes,
+current/previous release IDs (previous includes rollback hash), available signed
+version/notes/hash/compatibility, cache `cached`/`fresh`/result/last-success UTC,
+last result and safe error text, enabled/window/selected date/minute/timezone.
+Current/previous release IDs are authoritative installed generation identifiers;
+bootstrap inventories need not have a friendly signed version label. Notes are
+JSON-escaped. Secrets, URLs and configuration contents are not exposed.
+
+CLI fixed forms: `status`, `check [--force]`, `install ID HASH`, `rollback ID HASH`,
+`settings on|off`; mutating commands accept trailing `--operation-id ID`.
+`service ACTION` forwards fixed validated argv to the stable adapter, and
+`service install ID HASH` requires explicit selection. The old managed installer
+therefore cannot claim installation success without a selected ID/hash. Task 12
+should document the structured CLI; Task 10 supplies the panel controls and stores
+one operation ID per user action, reconnecting by status rather than retryinstall.
+
+## First worker, postcommit handoff and uninstall ownership
+
+Authenticated bootstrap bundles may contain the pair `d2k-update-first` and
+`update.conf`. Both are sealed in bootstrap input and installed into immutable
+`boot/`; Task 8 supplies the real first daemon and production config. First-worker
+execution requires exact bootstrap.done inventory/current receipt identity,
+matching sealed first/config bytes, no signed committed generation, and no
+`first-retired` marker. A missing daemon in signed current never re-enables
+fallback, even if journal generations rotate. The first signed commit durably
+retires fallback. This supports wire13 bootstrap inventories; historical wire12
+is a separate typed legacy source and must not be called signed by this path.
+
+Old worker owns the transaction through commit and candidate probe. Exit75 is a
+handoff request only: supervisor must verify newer durable COMMITTED journal,
+old generation equals the worker's initial current, new generation differs, and
+current receipt matches journal ID/hash. It kills/reaps owned/registered groups
+before handing off. Stable boot retains `supervisor.lock` across worker changes,
+refreshes config/runtime and launches new current with independent heartbeat.
+No same-generation exit75 restart loop is accepted. Postcommit startup failure
+leaves an explicit stopped/unavailable state; it never late-restores old state.
+
+Managed uninstall holds maintenance and sends internal QUIESCE with exactly one
+SCM_RIGHTS descriptor for that same held lock description. Receiver rejects extra
+or stray descriptors, validates maintenance inode/description and closes all
+received descriptors on reject. Under dispatch mutex it refuses pending work,
+sets quiescing, and fsyncs D2KL1 intent bound to operation ID, worker PID and boot
+ID after confirming terminal/no transaction. Other lifecycle entrypoints refuse
+mutations while the marker exists. A worker's arbitrary exit76 cannot bypass
+normal recovery: stable supervisor authenticates intent/PID/boot and terminal
+journal, reaps groups, then fsyncs stopped ACK **without reacquiring maintenance**.
+The remover waits for stopped ACK and both daemon/supervisor lock release before
+removing code. Normal service stop preserves updater supervision.
+
+D2KL1 contains stopped bit, worker PID, boot ID, operation ID and SHA-256 checksum,
+strict bounded canonical text, fsynced atomic file. An interrupted remover leaves
+an explicit lifecycle marker: ordinary bootstrap/service startup fails closed.
+Explicit uninstall may resume under maintenance only after both ownership locks
+are idle, retaining the original intent binding after confirming exclusive idle ownership;
+this also handles remover
+loss after intent/worker exit. Removal preserves the independent coordination
+state and never silently restarts a quiesced installation.

@@ -6,8 +6,8 @@ case "${1:-start}" in
     start|restart)
         [ -x "$BOOT" ] || exit 0
         "$BOOT" --root "$ROOT" --recover || exit 1
-        # Task 9 supplies the supervised daemon. No substitute success daemon.
-        if [ -x "$ROOT/current/d2k-update" ]; then
+        # Stable boot validates signed current or the sealed first-worker anchor.
+        if [ -x "$ROOT/current/d2k-update" ] || [ -x "$ROOT/boot/d2k-update-first" ]; then
             mkdir -p "$ROOT/run" || exit 1
             start-stop-daemon -S -b -m -p "$ROOT/run/d2k-update-boot.pid" -x "$BOOT" -- --root "$ROOT" --daemon || exit 1
         else

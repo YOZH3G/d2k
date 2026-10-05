@@ -189,22 +189,22 @@ d2ku_rc d2ku_release_receipt(d2ku_ctx *c, const char *id,
     close(d);
     return r;
 }
-static d2ku_rc receipt(d2ku_ctx *c, const char *id, unsigned char hash[32]) {
-    int d = release_dir(c, id);
-    if (d < 0)
-        return D2KU_IO;
-    char b[256], h[65], tail;
-    d2ku_rc r = small_read(d, ".d2ku-receipt", b, sizeof b);
-    close(d);
-    if (r != D2KU_OK)
-        return r;
-    unsigned long long w, s, u;
-    if (sscanf(b, "D2KR1 %llu %llu %llu %64s %c", &w, &s, &u, h, &tail) != 4 ||
-        !unhex(h, hash))
-        return D2KU_RECOVERY;
-    if (w != c->wire_version || s != c->state_version || u > c->updater_version)
-        return D2KU_INCOMPATIBLE;
-    return D2KU_OK;
+d2ku_rc d2ku_tx_receipt(d2ku_ctx *c, const char *id, unsigned char hash[32]) {
+  int d = release_dir(c, id);
+  if (d < 0)
+    return D2KU_IO;
+  char b[256], h[65], tail;
+  d2ku_rc r = small_read(d, ".d2ku-receipt", b, sizeof b);
+  close(d);
+  if (r != D2KU_OK)
+    return r;
+  unsigned long long w, s, u;
+  if (sscanf(b, "D2KR1 %llu %llu %llu %64s %c", &w, &s, &u, h, &tail) != 4 ||
+      !unhex(h, hash))
+    return D2KU_RECOVERY;
+  if (w != c->wire_version || s != c->state_version || u > c->updater_version)
+    return D2KU_INCOMPATIBLE;
+  return D2KU_OK;
 }
 d2ku_rc d2ku_tx_current(d2ku_ctx *c, char id[D2KU_ID_MAX + 1]) {
     char p[128];
@@ -1115,9 +1115,9 @@ d2ku_rc d2ku_tx_recover_locked(d2ku_ctx *c, d2ku_status *s) {
         const unsigned char *hash = j.phase == D2KU_COMMITTED
                                         ? j.new_manifest_sha256
                                         : j.old_manifest_sha256;
-        if (strcmp(active, want) || receipt(c, want, h) != D2KU_OK ||
+        if (strcmp(active, want) || d2ku_tx_receipt(c, want, h) != D2KU_OK ||
             memcmp(h, hash, 32))
-            return failed(c, &j);
+          return failed(c, &j);
         /* Reconcile visible terminal record against current; boot service start
          * is separately adapter-owned. Never restore a stale snapshot after
          * commit. The visible generation may predate its directory fsync.
@@ -1125,9 +1125,9 @@ d2ku_rc d2ku_tx_recover_locked(d2ku_ctx *c, d2ku_status *s) {
          * recovery accepts it as durable; no new generation is invented. */
         return d2ku_journal_store(c, &j);
     }
-    if (receipt(c, j.old_release_id, h) != D2KU_OK ||
+    if (d2ku_tx_receipt(c, j.old_release_id, h) != D2KU_OK ||
         memcmp(h, j.old_manifest_sha256, 32))
-        return failed(c, &j);
+      return failed(c, &j);
     if (j.phase < D2KU_STOPPING) {
         if (strcmp(active, j.old_release_id))
             return failed(c, &j);
@@ -1202,7 +1202,7 @@ static d2ku_rc bind_current(d2ku_ctx *c, const d2ku_request *r) {
         return rc;
     if (strcmp(id, r->expected_release_id))
         return D2KU_BUSY;
-    rc = receipt(c, id, h);
+    rc = d2ku_tx_receipt(c, id, h);
     if (rc != D2KU_OK)
         return rc;
     return memcmp(h, r->expected_manifest_sha256, 32) ? D2KU_BUSY : D2KU_OK;
@@ -1336,11 +1336,11 @@ static d2ku_rc prepare(d2ku_ctx *c, const d2ku_request *r) {
     if (!fstatat(all, r->release_id, &st, AT_SYMLINK_NOFOLLOW)) {
         unsigned char h[32];
         close(all);
-        d2ku_rc rc =
-            receipt(c, r->release_id,
-                    h); /* Existing immutable ID may be reused only with same
-                         * receipt. Offline checks are repeated; package payload
-                         * never overwrites an existing release. */
+        d2ku_rc rc = d2ku_tx_receipt(
+            c, r->release_id,
+            h); /* Existing immutable ID may be reused only with same
+                 * receipt. Offline checks are repeated; package payload
+                 * never overwrites an existing release. */
         if (rc != D2KU_OK || memcmp(h, r->manifest_sha256, 32))
             return D2KU_INVALID;
         int d = release_dir(c, r->release_id);
@@ -1398,6 +1398,8 @@ static d2ku_rc execute(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s,
     if (rc != D2KU_OK)
         return rc;
     c->maintenance_lock_fd = lock;
+    if (c->refresh && (rc = c->refresh(c->refresh_arg)) != D2KU_OK)
+      goto out;
     rc = duplicate(c, r, &found);
     if (rc != D2KU_OK || found)
         goto out;
@@ -1420,29 +1422,16 @@ static d2ku_rc execute(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s,
             rc = D2KU_INVALID;
             goto out;
         }
-        rc = receipt(c, r->release_id, h);
+        rc = d2ku_tx_receipt(c, r->release_id, h);
         if (rc != D2KU_OK || memcmp(h, r->manifest_sha256, 32)) {
             rc = D2KU_INCOMPATIBLE;
             goto out;
         }
     }
     if (r->automatic) {
-        d2ku_persistent_state p;
-        rc = d2ku_persistent_load(c, &p);
-        if (rc != D2KU_OK)
-            goto out;
-        if (!d2ku_auto_due(&p.policy, &c->clock) ||
-            !d2ku_auto_release_allowed(&p.policy, r->manifest_sha256)) {
-            rc = D2KU_TIME;
-            goto out;
-        }
-        rc = d2ku_mark_auto_attempt(&p.policy, &c->clock);
-        if (rc != D2KU_OK)
-            goto out;
-        p.sequence++;
-        rc = d2ku_persistent_store(c, &p);
-        if (rc != D2KU_OK)
-            goto out;
+      rc = d2ku_auto_reservation_valid(c, r);
+      if (rc != D2KU_OK)
+        goto out;
     }
     d2ku_journal j = {0};
     j.schema = 1;

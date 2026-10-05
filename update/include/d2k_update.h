@@ -1,5 +1,6 @@
 #ifndef D2K_UPDATE_H
 #define D2K_UPDATE_H
+#include "d2k_update_ipc.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -78,6 +79,11 @@ typedef struct {
     int executable_matches, peer_connected, ready, external_available;
 } d2ku_health_observation;
 struct d2ku_status {
+    char operation_id[D2KU_ID_MAX + 1];
+    int busy, available, enabled;
+    unsigned phase;
+    d2ku_rc last_result;
+    uint64_t received_bytes, total_bytes;
     int health_observing, installation_healthy, health_complete, external_available;
     uint64_t health_since_ms, health_last_ms;
     char health_transaction[D2KU_ID_MAX + 1], health_boot[D2KU_BOOT_ID_MAX + 1];
@@ -158,7 +164,16 @@ d2ku_rc d2ku_service_health_state(void *);
 d2ku_rc d2ku_service_health_rules(void *);
 d2ku_rc d2ku_service_health_http(void *);
 d2ku_rc d2ku_bootstrap(d2ku_ctx *, d2ku_status *);
+d2ku_rc d2ku_bootstrap_first(d2ku_ctx *);
+d2ku_rc d2ku_bootstrap_retire_first(d2ku_ctx *);
 struct d2ku_ctx {
+    int supervisor_lock_fd; /* stable boot owns this across committed handoffs */
+    d2ku_rc (*supervisor_quiesce)(d2ku_ctx *, pid_t);
+    struct d2ku_daemon *daemon; /* caller-owned lifetime, not an IPC pointer */
+    void *refresh_arg;
+    d2ku_rc (*refresh)(void *); /* invoked under maintenance before stop */
+    void *progress_arg;
+    void (*progress)(void *, uint64_t);
     d2ku_transaction_ops transaction;
     int bootstrap_prefix_fd, bootstrap_bundle_fd; /* explicit installer-only directory handles */
     int maintenance_lock_fd; /* internal, valid only during transaction callbacks */
@@ -302,6 +317,8 @@ typedef struct {
     int64_t last_accepted_timestamp;
     d2ku_key trust[D2KU_KEYS_MAX]; size_t trust_count;
     d2ku_policy policy;
+    char auto_operation[D2KU_ID_MAX + 1], auto_release[D2KU_ID_MAX + 1];
+    unsigned char auto_manifest_sha256[32];
 } d2ku_persistent_state;
 d2ku_rc d2ku_journal_load(d2ku_ctx *, d2ku_journal *);
 d2ku_rc d2ku_journal_store(d2ku_ctx *, const d2ku_journal *);
@@ -327,6 +344,8 @@ d2ku_rc d2ku_health(d2ku_ctx *, const d2ku_journal *, d2ku_status *);
  * archive is rehashed by stage. Expected current binding is checked under lock.
  * Rollback uses only transaction_id and selected/expected bindings; archive=-1. */
 struct d2ku_request {
+    d2ku_command_op command;
+    int force, enabled;
     char transaction_id[D2KU_ID_MAX + 1];
     char expected_release_id[D2KU_ID_MAX + 1];
     unsigned char expected_manifest_sha256[32];
@@ -337,6 +356,9 @@ struct d2ku_request {
     int archive_fd;
     int automatic;
 };
+d2ku_rc d2ku_dispatch(d2ku_ctx *, const d2ku_request *, d2ku_status *);
+d2ku_rc d2ku_auto_reserve(d2ku_ctx *, const d2ku_request *);
+d2ku_rc d2ku_auto_reservation_valid(d2ku_ctx *, const d2ku_request *);
 d2ku_rc d2ku_install(d2ku_ctx *, const d2ku_request *, d2ku_status *);
 d2ku_rc d2ku_rollback(d2ku_ctx *, const d2ku_request *, d2ku_status *);
 d2ku_rc d2ku_recover(d2ku_ctx *, d2ku_status *);

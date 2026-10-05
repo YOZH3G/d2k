@@ -117,6 +117,7 @@ static void cache_and_quarantine(void)
     strcpy(s.boot_id, "boot-b"); s.mono_ms = 2001;
     d2ku_cache_observe(&st, &s);
     assert(d2ku_check_due(&st, 2001, 0) == 1);
+    assert(d2ku_cache_record(&st, &s, D2KU_RECOVERY) == D2KU_OK);
     assert(d2ku_cache_record(&st, &s, D2KU_TIME) == D2KU_OK);
     assert(d2ku_check_due(&st, 2002, 0) == 0);
     s.boot_id[0] = '\0';
