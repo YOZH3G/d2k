@@ -18,7 +18,8 @@ static inline int d2k_runtime_id_valid(const char *id) {
     size_t n=strnlen(id,65); if(!n||n>64)return 0;
     for(size_t i=0;i<n;i++) { unsigned char c=(unsigned char)id[i];
         if((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9'))continue;
-        if(i&&(c=='.'||c=='_'||c=='-'))continue;return 0;
+        if(i&&(c=='.'||c=='_'||c=='-'))continue;
+        return 0;
     }return 1;
 }
 static inline int d2k_runtime_offline(int argc,char **argv,const char *name,int (*self_check)(void)) {
@@ -38,7 +39,9 @@ static inline uint64_t d2k_runtime_start_ticks(const char *path) {
     char *ok=fgets(b,sizeof b,f);fclose(f);if(!ok)return 0;
     char *p=strrchr(b,')');if(!p)return 0;p++;
     for(unsigned field=3;field<=22;field++) { while(*p==' ')p++;char *end=p;while(*end&&*end!=' ')end++;
-        if(field==22)return strtoull(p,NULL,10);if(!*end)return 0;p=end;
+        if(field==22)return strtoull(p,NULL,10);
+        if(!*end)return 0;
+        p=end;
     }return 0;
 }
 /* Local installation readiness only: this does not establish relay/session
