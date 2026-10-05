@@ -215,3 +215,12 @@ $(BUILD)/test_legacy_crash: tests/test_legacy_crash.c src/bootstrap.c src/servic
 $(BUILD)/test_legacy_quiesce: tests/test_legacy_quiesce.c src/service_adapter.c $(TRANSACTION_SRC) include/d2k_update.h
 	mkdir -p $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_legacy_quiesce.c src/service_adapter.c $(TRANSACTION_SRC) $(LDLIBS) -o $@
+
+# Отказ bind/listen: настоящий main.c с подменой close/bind/listen и сторожем FD.
+.PHONY: check-main-socket
+check-ipc: check-main-socket
+check-main-socket: $(BUILD)/test_main_socket
+	$(BUILD)/test_main_socket
+$(BUILD)/test_main_socket: tests/test_main_socket.c src/main.c src/lifecycle.c $(DAEMON_SRC) src/platform.c src/ipc.c src/service_adapter.c src/transport.c src/manifest.c $(TRANSACTION_SRC) include/d2k_update.h include/d2k_update_ipc.h src/daemon.h src/startup.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CURL_CFLAGS) $(CFLAGS) -pthread tests/test_main_socket.c src/lifecycle.c $(DAEMON_SRC) src/platform.c src/ipc.c src/service_adapter.c src/transport.c src/manifest.c $(TRANSACTION_SRC) $(LDFLAGS) $(LDLIBS) $(CURL_LIBS) -o $@

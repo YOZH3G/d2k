@@ -98,10 +98,8 @@ static int serve(d2ku_daemon *d, int pulse, int probe, int lock, int guard) {
     mode_t old = umask(077);
     int r = bind(socket_fd, (struct sockaddr *)&address, sizeof address);
     umask(old);
-    if (r || chmod(path, 0600) || listen(socket_fd, 16)) {
-      close(socket_fd);
-      goto failed;
-    }
+    if (r || chmod(path, 0600) || listen(socket_fd, 16))
+      goto failed; /* сокет закрывает общий выход, ровно один раз */
   }
   d2ku_maintenance_unlock(guard);
   guard = -1;
