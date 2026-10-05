@@ -351,6 +351,7 @@ d2ku_rc d2ku_persistent_store(d2ku_ctx *, const d2ku_persistent_state *);
  * No unlink of lock files: kernel releases lock on exit/crash. */
 d2ku_rc d2ku_maintenance_lock(d2ku_ctx *, int *lock_fd);
 void d2ku_maintenance_unlock(int lock_fd);
+d2ku_rc d2ku_maintenance_wait(d2ku_ctx *, int *lock_fd); /* ждёт BUSY */
 /* Poll at <=10s intervals under transaction lock. OK is instantaneous local
  * health only; durable commit requires status.health_complete. A failed probe,
  * process restart, boot/operation change or missed poll resets observation.

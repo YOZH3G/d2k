@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define RECORD_MAX 4096u
@@ -412,3 +413,14 @@ d2ku_rc d2ku_maintenance_lock(d2ku_ctx *c, int *out)
     rc = lockat(c, d, "maintenance.lock", out); close(d); return rc;
 }
 void d2ku_maintenance_unlock(int fd) { if (fd >= 0) close(fd); }
+/* Занятое обслуживание (boot-start S99, NDM, ручной restart) — временное
+ * состояние: загрузка и восстановление ждут его, как адаптер и помощники. */
+d2ku_rc d2ku_maintenance_wait(d2ku_ctx *c, int *out)
+{
+    for (;;) {
+        d2ku_rc rc = d2ku_maintenance_lock(c, out);
+        if (rc != D2KU_BUSY) return rc;
+        struct timespec pause = {0, 100000000};
+        nanosleep(&pause, NULL);
+    }
+}

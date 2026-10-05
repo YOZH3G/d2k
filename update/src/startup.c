@@ -6,7 +6,6 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/file.h>
-#include <time.h>
 #include <unistd.h>
 
 /* Maintenance serializes the absent-marker check with lifetime ownership.
@@ -19,18 +18,9 @@ d2ku_rc d2ku_startup_claim(d2ku_ctx *ctx, const char *name, int *maintenance,
     return D2KU_INVALID;
   *maintenance = *ownership = -1;
   int guard = -1;
-  d2ku_rc rc;
-  /* Занятая другим обслуживанием (S99 boot-start сразу после S98, NDM,
-   * ручной restart) блокировка — временное состояние: ждём её, как делают
-   * адаптер и помощники, а не выходим навсегда с BUSY. BUSY ниже означает
-   * уже другое: маркер остановки или живого владельца того же имени. */
-  for (;;) {
-    rc = d2ku_maintenance_lock(ctx, &guard);
-    if (rc != D2KU_BUSY)
-      break;
-    struct timespec pause = {0, 100000000};
-    nanosleep(&pause, NULL);
-  }
+  /* Занятая другим обслуживанием блокировка — временное состояние: ждём
+   * её; BUSY ниже означает маркер остановки или живого владельца имени. */
+  d2ku_rc rc = d2ku_maintenance_wait(ctx, &guard);
   if (rc != D2KU_OK)
     return rc;
   struct stat st;

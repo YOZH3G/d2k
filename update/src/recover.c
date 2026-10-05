@@ -23,7 +23,7 @@ d2ku_rc d2ku_recover(d2ku_ctx *c, d2ku_status *s) {
     if (!c || !s)
         return D2KU_INVALID;
     int lock = -1;
-    d2ku_rc r = d2ku_maintenance_lock(c, &lock);
+    d2ku_rc r = d2ku_maintenance_wait(c, &lock);
     if (r != D2KU_OK)
         return r;
     c->maintenance_lock_fd = lock;

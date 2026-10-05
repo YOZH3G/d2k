@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
       goto done;
     do {
       int refresh_lock = -1;
-      r = d2ku_maintenance_lock(&c, &refresh_lock);
+      r = d2ku_maintenance_wait(&c, &refresh_lock);
       if (r != D2KU_OK)
         break;
       r = d2ku_service_configure(&c, root, &config);
