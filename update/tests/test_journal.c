@@ -210,7 +210,7 @@ static void wire_validation(void)
         if (variant == 3) raw[23] = 2; /* wrong sequence for slot */
         if (variant == 4) { raw[len++] = 0; raw[15] = (unsigned char)len; } /* trailing byte */
         if (variant == 5) raw[71] = 255; /* invalid phase (body + tx + phase) */
-        if (variant == 7) raw[len-1] = D2KU_CMD_CHECK; /* nontransaction command */
+        if (variant == 7) raw[len-2] = D2KU_CMD_CHECK; /* nontransaction command */
         if (variant == 6) raw[80] = '/'; /* malformed new release ID */
         memset(raw + 24, 0, 32); unsigned char hash[32]; unsigned n;
         assert(EVP_Digest(raw, (size_t)len, hash, &n, EVP_sha256(), NULL) == 1 && n == 32);

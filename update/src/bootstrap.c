@@ -3,6 +3,7 @@
 #define _DARWIN_C_SOURCE
 #include "../../runtime/d2k_runtime.h"
 #include "d2k_update.h"
+#include "legacy.h"
 #include "transaction_internal.h"
 #include <dirent.h>
 #include <errno.h>
@@ -124,6 +125,21 @@ static d2ku_rc copy_file(d2ku_ctx *c, int from, const char *src, int to,
     if ((r = writeall(out, b, (size_t)n)) != D2KU_OK)
       break;
   }
+  struct stat after;
+  if (r == D2KU_OK && (fstat(f, &after) || after.st_size != s.st_size ||
+#ifdef __APPLE__
+                       after.st_mtimespec.tv_sec != s.st_mtimespec.tv_sec ||
+                       after.st_mtimespec.tv_nsec != s.st_mtimespec.tv_nsec ||
+                       after.st_ctimespec.tv_sec != s.st_ctimespec.tv_sec ||
+                       after.st_ctimespec.tv_nsec != s.st_ctimespec.tv_nsec
+#else
+                       after.st_mtim.tv_sec != s.st_mtim.tv_sec ||
+                       after.st_mtim.tv_nsec != s.st_mtim.tv_nsec ||
+                       after.st_ctim.tv_sec != s.st_ctim.tv_sec ||
+                       after.st_ctim.tv_nsec != s.st_ctim.tv_nsec
+#endif
+                       ))
+    r = D2KU_RECOVERY;
   if (r == D2KU_OK && fchmod(out, s.st_mode & 0777))
     r = D2KU_IO;
   if (r == D2KU_OK)
@@ -135,6 +151,119 @@ static d2ku_rc copy_file(d2ku_ctx *c, int from, const char *src, int to,
   if (r == D2KU_OK)
     r = syncfd(c, to);
   return r;
+}
+static int positive_digits(const char **p) {
+  if (**p < '1' || **p > '9')
+    return 0;
+  do {
+    (*p)++;
+  } while (**p >= '0' && **p <= '9');
+  return 1;
+}
+static int temp_name(const char *name) {
+  const char *p = name;
+  if (!strncmp(p, ".bootstrap-", 11)) {
+    p += 11;
+    if (!positive_digits(&p) || *p++ != '-' || !positive_digits(&p))
+      return 0;
+  } else if (!strncmp(p, ".legacy-", 8)) {
+    p += 8;
+    if (!positive_digits(&p))
+      return 0;
+  } else
+    return 0;
+  return !*p;
+}
+/* Reserve the construction namespace before copying source resources. This
+ * makes cleanup incapable of silently deleting a legitimate admitted asset. */
+static d2ku_rc source_names(d2ku_ctx *c, int at, unsigned depth) {
+  if (depth > 12)
+    return D2KU_INVALID;
+  int f = dup(at);
+  if (f < 0)
+    return D2KU_IO;
+  DIR *d = fdopendir(f);
+  if (!d) {
+    close(f);
+    return D2KU_IO;
+  }
+  rewinddir(d);
+  struct dirent *e;
+  d2ku_rc rc = D2KU_OK;
+  unsigned count = 0;
+  while (rc == D2KU_OK && (e = readdir(d))) {
+    if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+      continue;
+    if (++count > 1024 || !strncmp(e->d_name, ".bootstrap-", 11) ||
+        !strncmp(e->d_name, ".legacy-", 8) ||
+        !strcmp(e->d_name, ".d2ku-legacy")) {
+      rc = D2KU_INCOMPATIBLE;
+      break;
+    }
+    struct stat st;
+    if (fstatat(at, e->d_name, &st, AT_SYMLINK_NOFOLLOW)) {
+      rc = D2KU_IO;
+      break;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      int sub = dir(c, at, e->d_name, 0);
+      rc = sub < 0 ? D2KU_INVALID : source_names(c, sub, depth + 1);
+      if (sub >= 0)
+        close(sub);
+    }
+  }
+  closedir(d);
+  return rc;
+}
+/* Private construction trees may contain an interrupted copy's temporary
+ * inode. Remove only our reserved names, with the same owner/link/type checks;
+ * never omit arbitrary published resources from the final seal. */
+static d2ku_rc clean_temps(d2ku_ctx *c, int at, unsigned depth) {
+  if (depth > 12)
+    return D2KU_INVALID;
+  int copied = dup(at);
+  if (copied < 0)
+    return D2KU_IO;
+  DIR *d = fdopendir(copied);
+  if (!d) {
+    close(copied);
+    return D2KU_IO;
+  }
+  rewinddir(d);
+  d2ku_rc rc = D2KU_OK;
+  struct dirent *e;
+  int changed = 0;
+  while (rc == D2KU_OK && (e = readdir(d))) {
+    if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+      continue;
+    struct stat st;
+    if (fstatat(at, e->d_name, &st, AT_SYMLINK_NOFOLLOW) ||
+        st.st_uid != geteuid() || (st.st_mode & 022)) {
+      rc = D2KU_INVALID;
+      break;
+    }
+    if (!strncmp(e->d_name, ".bootstrap-", 11) ||
+        !strncmp(e->d_name, ".legacy-", 8)) {
+      if (!temp_name(e->d_name) || !S_ISREG(st.st_mode) || st.st_nlink != 1) {
+        rc = D2KU_INVALID;
+        break;
+      }
+      if (unlinkat(at, e->d_name, 0)) {
+        rc = D2KU_IO;
+        break;
+      }
+      changed = 1;
+    } else if (S_ISDIR(st.st_mode)) {
+      int sub = dir(c, at, e->d_name, 0);
+      rc = sub < 0 ? D2KU_INVALID : clean_temps(c, sub, depth + 1);
+      if (sub >= 0)
+        close(sub);
+    }
+  }
+  closedir(d);
+  if (rc == D2KU_OK && changed)
+    rc = syncfd(c, at);
+  return rc;
 }
 static int cmp(const void *a, const void *b) {
   return strcmp(*(char *const *)a, *(char *const *)b);
@@ -251,9 +380,10 @@ static void hex(const unsigned char *p, char out[65]) {
   out[64] = 0;
 }
 static int marker_bytes(char out[384], const char *id, const char *seal,
-                        const char *input, uint64_t bits) {
-  int n = snprintf(out, 384, "D2KB1 %s %s %s %llu", id, seal, input,
-                   (unsigned long long)bits);
+                        const char *input, uint64_t bits,
+                        d2ku_source_kind kind) {
+  int n = snprintf(out, 384, "D2KB2 %u %s %s %s %llu", (unsigned)kind, id, seal,
+                   input, (unsigned long long)bits);
   unsigned char hash[32];
   unsigned len = 0;
   char h[65];
@@ -264,7 +394,8 @@ static int marker_bytes(char out[384], const char *id, const char *seal,
   return n + snprintf(out + n, 384 - (size_t)n, " %s\n", h);
 }
 static d2ku_rc marker_read(int at, const char *name, char id[65], char seal[65],
-                           char input[65], uint64_t *bits) {
+                           char input[65], uint64_t *bits,
+                           d2ku_source_kind *kind) {
   int fd = openat(at, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0)
     return errno == ENOENT ? D2KU_ABSENT : D2KU_IO;
@@ -277,17 +408,20 @@ static d2ku_rc marker_read(int at, const char *name, char id[65], char seal[65],
     n = read(fd, b, sizeof b - 1);
   close(fd);
   unsigned long long mask;
+  unsigned source;
   if (n <= 0 ||
-      sscanf(b, "D2KB1 %64s %64s %64s %llu %64s %c", id, seal, input, &mask,
-             sum, &extra) != 5 ||
-      !d2k_runtime_id_valid(id) || strlen(seal) != 64 ||
+      sscanf(b, "D2KB2 %u %64s %64s %64s %llu %64s %c", &source, id, seal,
+             input, &mask, sum, &extra) != 6 ||
+      source > 1 || !d2k_runtime_id_valid(id) || strlen(seal) != 64 ||
       strspn(seal, "0123456789abcdef") != 64 || strlen(input) != 64 ||
       strspn(input, "0123456789abcdef") != 64 || mask > 15)
     return D2KU_RECOVERY;
-  int want = marker_bytes(canonical, id, seal, input, mask);
+  int want =
+      marker_bytes(canonical, id, seal, input, mask, (d2ku_source_kind)source);
   if (want != n || memcmp(b, canonical, (size_t)n))
     return D2KU_RECOVERY;
   *bits = mask;
+  *kind = (d2ku_source_kind)source;
   return D2KU_OK;
 }
 static d2ku_rc old_runtime_check(d2ku_ctx *c, int saved, char release[65]) {
@@ -398,6 +532,8 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
   int up = -1, saved = -1, boot = -1, state = -1, rel = -1, releases = -1,
       sbin = -1, init = -1, ndm = -1, input = -1;
   uint64_t bits = 0;
+  d2ku_source_kind kind = D2KU_SOURCE_RUNTIME;
+  char legacy_abi[9] = "";
   char id[65], seal[65], inputseal[65], got[65], pending[384];
   unsigned char hash[32];
   state = dir(c, c->root_dirfd, "update-state", 0);
@@ -405,7 +541,7 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
     r = D2KU_IO;
     goto end;
   }
-  r = marker_read(state, "bootstrap.done", id, seal, inputseal, &bits);
+  r = marker_read(state, "bootstrap.done", id, seal, inputseal, &bits, &kind);
   if (r == D2KU_OK) {
     r = syncfd(c, state);
     goto end;
@@ -428,7 +564,8 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
     r = D2KU_IO;
     goto end;
   }
-  r = marker_read(state, "bootstrap.pending", id, seal, inputseal, &bits);
+  r = marker_read(state, "bootstrap.pending", id, seal, inputseal, &bits,
+                  &kind);
   if (r == D2KU_ABSENT) {
     /* Inventory validation completes before any service stop or entry
      * replacement. */
@@ -441,12 +578,15 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
         goto end;
     }
     r = old_runtime_check(c, saved, id);
-    if (r != D2KU_OK) {
-      if (r == D2KU_INCOMPATIBLE)
-        fprintf(stderr, "flat inventory requires a common wire13 runtime "
-                        "identity; historical wire12 migration is unavailable\n");
-      goto end;
+    if (r == D2KU_INCOMPATIBLE) {
+      r = d2ku_legacy_admit(c, saved, legacy_abi);
+      if (r == D2KU_OK)
+        r = d2ku_legacy_bind(c, saved);
+      if (r == D2KU_OK)
+        kind = D2KU_SOURCE_LEGACY_LOCAL;
     }
+    if (r != D2KU_OK)
+      goto end;
     for (unsigned i = 0; i < 7; i++) {
       r = copy_file(c, c->root_dirfd, helpers[i], saved, helpers[i]);
       if (r != D2KU_OK)
@@ -458,13 +598,19 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
     r = copy_file(c, ndm, "001-d2k.sh", saved, "flat-001-d2k.sh");
     if (r != D2KU_OK)
       goto end;
-    r = copy_file(c, c->root_dirfd, "config", saved, "flat-config");
+    r = kind == D2KU_SOURCE_RUNTIME
+            ? copy_file(c, c->root_dirfd, "config", saved, "flat-config")
+            : D2KU_OK;
     if (r != D2KU_OK)
       goto end;
     const char *dirs[] = {"panel", "files"};
     for (unsigned i = 0; i < 2; i++) {
       int a = dir(c, c->root_dirfd, dirs[i], 0), b = dir(c, saved, dirs[i], 1);
-      r = a < 0 || b < 0 ? D2KU_INVALID : tree(c, a, b, NULL, 0);
+      r = a < 0 || b < 0 ? D2KU_INVALID : D2KU_OK;
+      if (r == D2KU_OK && kind == D2KU_SOURCE_LEGACY_LOCAL)
+        r = source_names(c, a, 0);
+      if (r == D2KU_OK)
+        r = tree(c, a, b, NULL, 0);
       if (a >= 0)
         close(a);
       if (b >= 0)
@@ -516,10 +662,18 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
     r = copy_file(c, input, "uninstall.sh", boot, "uninstall.sh");
     if (r != D2KU_OK)
       goto end;
-    r = digest(c, saved, hash);
+    if (kind == D2KU_SOURCE_LEGACY_LOCAL) {
+      r = clean_temps(c, saved, 0);
+      if (r != D2KU_OK)
+        goto end;
+    }
+    r = kind == D2KU_SOURCE_LEGACY_LOCAL ? d2ku_legacy_hash(saved, hash)
+                                         : digest(c, saved, hash);
     if (r != D2KU_OK)
       goto end;
     hex(hash, seal);
+    if (kind == D2KU_SOURCE_LEGACY_LOCAL)
+      snprintf(id, sizeof id, "legacy-local-%.32s", seal);
     /* Keep the verified runtime identity: recovery checks both this ID and
      * the preserved executable inode; the receipt separately seals inventory.
      */
@@ -531,7 +685,7 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
     if (r != D2KU_OK)
       goto end;
     hex(hash, inputseal);
-    int n = marker_bytes(pending, id, seal, inputseal, bits);
+    int n = marker_bytes(pending, id, seal, inputseal, bits, kind);
     if (n < 0) {
       r = D2KU_IO;
       goto end;
@@ -555,7 +709,8 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
     r = D2KU_RECOVERY;
     goto end;
   }
-  r = digest(c, saved, hash);
+  r = kind == D2KU_SOURCE_LEGACY_LOCAL ? d2ku_legacy_hash(saved, hash)
+                                       : digest(c, saved, hash);
   if (r != D2KU_OK)
     goto end;
   hex(hash, got);
@@ -592,10 +747,25 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
     if (r != D2KU_OK)
       goto end;
   }
+  /* Legacy preparation never stops/restarts old runtimes or snapshots live
+   * personal data. The first authenticated transaction owns that boundary. */
+  if (kind == D2KU_SOURCE_LEGACY_LOCAL) {
+    r = clean_temps(c, rel, 0);
+    if (r == D2KU_OK)
+      r = d2ku_legacy_admit(c, saved, legacy_abi);
+    if (r == D2KU_OK)
+      r = d2ku_legacy_create(c, saved, rel, id, legacy_abi, hash);
+    if (r == D2KU_OK)
+      r = d2ku_legacy_source(c, id, hash);
+    if (r != D2KU_OK)
+      goto end;
+  }
   /* Receipt is idempotent only for this sealed local inventory. */
   char receipt[160];
   int n = snprintf(receipt, sizeof receipt, "D2KR1 13 1 1 %s\n", seal);
-  r = atomic(c, rel, ".d2ku-receipt", receipt, (size_t)n, 0600);
+  r = kind == D2KU_SOURCE_RUNTIME
+          ? atomic(c, rel, ".d2ku-receipt", receipt, (size_t)n, 0600)
+          : D2KU_OK;
   if (r != D2KU_OK)
     goto end;
   /* All externally writable helpers become fixed lifecycle entries. */
@@ -610,38 +780,41 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
     if (r != D2KU_OK)
       goto end;
   }
-  r = c->transaction.services(c->transaction.arg, "stop", id, bits);
-  if (r != D2KU_OK)
-    goto end;
-  /* No personal mutation occurs during migration. Retain a quiesced backup in
-   * addition to untouched live data, including files first written on stop. */
-  int personal = dir(c, up, "legacy-personal", 1);
-  if (personal < 0) {
-    r = D2KU_IO;
-    goto end;
-  }
-  for (size_t i = 0; i < c->transaction.path_count && r == D2KU_OK; i++) {
-    const char *name = c->transaction.paths[i].name;
-    struct stat st;
-    if (fstatat(c->root_dirfd, name, &st, AT_SYMLINK_NOFOLLOW)) {
-      if (errno == ENOENT)
-        continue;
+  if (kind == D2KU_SOURCE_RUNTIME) {
+    r = c->transaction.services(c->transaction.arg, "stop", id, bits);
+    if (r != D2KU_OK)
+      goto end;
+    /* No personal mutation occurs during migration. Retain a quiesced backup in
+     * addition to untouched live data, including files first written on stop.
+     */
+    int personal = dir(c, up, "legacy-personal", 1);
+    if (personal < 0) {
       r = D2KU_IO;
-      break;
+      goto end;
     }
-    if (S_ISDIR(st.st_mode)) {
-      int a = dir(c, c->root_dirfd, name, 0), b = dir(c, personal, name, 1);
-      r = a < 0 || b < 0 ? D2KU_INVALID : tree(c, a, b, NULL, 0);
-      if (a >= 0)
-        close(a);
-      if (b >= 0)
-        close(b);
-    } else
-      r = copy_file(c, c->root_dirfd, name, personal, name);
+    for (size_t i = 0; i < c->transaction.path_count && r == D2KU_OK; i++) {
+      const char *name = c->transaction.paths[i].name;
+      struct stat st;
+      if (fstatat(c->root_dirfd, name, &st, AT_SYMLINK_NOFOLLOW)) {
+        if (errno == ENOENT)
+          continue;
+        r = D2KU_IO;
+        break;
+      }
+      if (S_ISDIR(st.st_mode)) {
+        int a = dir(c, c->root_dirfd, name, 0), b = dir(c, personal, name, 1);
+        r = a < 0 || b < 0 ? D2KU_INVALID : tree(c, a, b, NULL, 0);
+        if (a >= 0)
+          close(a);
+        if (b >= 0)
+          close(b);
+      } else
+        r = copy_file(c, c->root_dirfd, name, personal, name);
+    }
+    close(personal);
+    if (r != D2KU_OK)
+      goto end;
   }
-  close(personal);
-  if (r != D2KU_OK)
-    goto end;
   char target[100];
   snprintf(target, sizeof target, "releases/%s", id);
   unlinkat(c->root_dirfd, ".bootstrap-current", 0);
@@ -674,7 +847,9 @@ d2ku_rc d2ku_bootstrap(d2ku_ctx *c, d2ku_status *status) {
   r = atomic(c, state, "enabled", mask, (size_t)n, 0600);
   if (r != D2KU_OK)
     goto end;
-  r = c->transaction.services(c->transaction.arg, "start", id, bits);
+  r = kind == D2KU_SOURCE_RUNTIME
+          ? c->transaction.services(c->transaction.arg, "start", id, bits)
+          : D2KU_OK;
   if (r != D2KU_OK)
     goto end;
   if (renameat(state, "bootstrap.pending", state, "bootstrap.done")) {
@@ -731,8 +906,9 @@ d2ku_rc d2ku_bootstrap_first(d2ku_ctx *c) {
   }
   char id[65], oldseal[65], inputseal[65], current[65], actual[65];
   uint64_t bits;
-  d2ku_rc r =
-      marker_read(state, "bootstrap.done", id, oldseal, inputseal, &bits);
+  d2ku_source_kind kind;
+  d2ku_rc r = marker_read(state, "bootstrap.done", id, oldseal, inputseal,
+                          &bits, &kind);
   close(state);
   if (r != D2KU_OK)
     return r;

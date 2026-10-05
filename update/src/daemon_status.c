@@ -103,8 +103,14 @@ d2ku_rc d2ku_daemon_json_status(d2ku_daemon *d, const d2ku_status *view,
       phase, s->busy ? "true" : "false", (unsigned long long)s->received_bytes,
       (unsigned long long)s->total_bytes);
   quoted(&o, current);
+  d2ku_source_kind source = D2KU_SOURCE_RUNTIME;
+  d2ku_rc source_rc = current[0] ? d2ku_tx_source_kind(d->ctx, current, &source) : D2KU_ABSENT;
+  add(&o, ",\"provenance\":");
+  quoted(&o, source_rc == D2KU_OK && source == D2KU_SOURCE_LEGACY_LOCAL ? "legacy-local-v1" : source_rc == D2KU_OK ? "runtime" : "unverified");
+  add(&o, ",\"legacy_restored\":%s,\"evidence\":", journal && j.phase == D2KU_ROLLED_BACK && j.old_kind == D2KU_SOURCE_LEGACY_LOCAL && source_rc == D2KU_OK && source == D2KU_SOURCE_LEGACY_LOCAL ? "true" : "false");
+  quoted(&o, source_rc == D2KU_OK && source == D2KU_SOURCE_LEGACY_LOCAL ? "Owner-authorized local inventory; legacy Telegram listener/status is not a main-loop heartbeat or application success" : "");
   add(&o, "},\"previous\":");
-  if (journal && j.phase == D2KU_COMMITTED) {
+  if (journal && j.phase == D2KU_COMMITTED && j.old_kind == D2KU_SOURCE_RUNTIME) {
     add(&o, "{\"release_id\":");
     quoted(&o, j.old_release_id);
     add(&o, ",\"manifest_sha256\":");

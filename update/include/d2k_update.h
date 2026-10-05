@@ -91,6 +91,7 @@ struct d2ku_status {
     char health_release[D2KU_ID_MAX + 1];
     unsigned char health_manifest_sha256[32];
     uint64_t health_services;
+    uint64_t legacy_live_token, legacy_live_seen_ms, legacy_dp_elapsed, legacy_dp_seen_ms;
     pid_t health_pid[4];
     uint64_t health_start_ticks[4];
     int has_check, check_in_flight;
@@ -152,6 +153,13 @@ typedef struct {
     char panel_host[128];
     uint64_t enabled;
     int identity_required;
+    char legacy_abi[9];
+    uint16_t tg_port;
+    pid_t legacy_writers[128];
+    uint64_t legacy_writer_ticks[128];
+    size_t legacy_writer_count;
+    int legacy_log_fd;
+    off_t legacy_log_offset;
 } d2ku_service_config;
 d2ku_rc d2ku_service_lock_valid(d2ku_ctx *, int);
 d2ku_rc d2ku_service_configure(d2ku_ctx *, const char *, d2ku_service_config *);
@@ -176,6 +184,7 @@ struct d2ku_ctx {
     void *progress_arg;
     void (*progress)(void *, uint64_t);
     d2ku_transaction_ops transaction;
+    d2ku_service_config *service_config; /* configured local lifecycle, not IPC */
     int bootstrap_prefix_fd, bootstrap_bundle_fd; /* explicit installer-only directory handles */
     int maintenance_lock_fd; /* internal, valid only during transaction callbacks */
     int boot_control_fd; /* task9: inherited FD5; <=2 means standalone */
@@ -292,6 +301,7 @@ typedef enum { D2KU_CHECKING = 1, D2KU_AVAILABLE, D2KU_DOWNLOADING,
     D2KU_VERIFYING, D2KU_PREPARED, D2KU_STOPPING, D2KU_SWITCHING,
     D2KU_STARTING, D2KU_VALIDATING, D2KU_COMMITTED, D2KU_ROLLING_BACK,
     D2KU_ROLLED_BACK, D2KU_RECOVERY_FAILED } d2ku_phase;
+typedef enum { D2KU_SOURCE_RUNTIME = 0, D2KU_SOURCE_LEGACY_LOCAL = 1 } d2ku_source_kind;
 struct d2ku_journal {
     uint32_t schema;
     uint64_t sequence;
@@ -299,6 +309,7 @@ struct d2ku_journal {
     char transaction_id[D2KU_ID_MAX + 1]; size_t transaction_id_len;
     d2ku_phase phase;
     d2ku_command_op command; /* canonical transaction request, persisted */
+    d2ku_source_kind old_kind; /* target is always ordinary authenticated runtime */
     d2ku_rc failure_reason, recovery_reason; /* original cause and recovery failure */
     char old_release_id[D2KU_ID_MAX + 1]; size_t old_release_id_len;
     char new_release_id[D2KU_ID_MAX + 1]; size_t new_release_id_len;

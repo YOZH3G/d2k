@@ -69,6 +69,8 @@ static int datevalid(int32_t date)
 static d2ku_rc journal_valid(const d2ku_journal *j)
 {
     if (j->schema != 1) return D2KU_INCOMPATIBLE;
+    if (j->old_kind != D2KU_SOURCE_RUNTIME && j->old_kind != D2KU_SOURCE_LEGACY_LOCAL) return D2KU_INVALID;
+    if (j->old_kind == D2KU_SOURCE_LEGACY_LOCAL && j->command != D2KU_CMD_INSTALL) return D2KU_INVALID;
     if (!j->sequence ||
         !textvalid(j->transaction_id, j->transaction_id_len, D2KU_ID_MAX, 1) ||
         !textvalid(j->old_release_id, j->old_release_id_len, D2KU_ID_MAX, 1) ||
@@ -127,6 +129,7 @@ static void encode_journal(buffer *b, const d2ku_journal *j)
     number(b, j->progress_mono_ms, 8); number(b, (uint64_t)j->progress_utc, 8);
     putstr(b, j->progress_boot_id, j->progress_boot_id_len);
     number(b, j->command, 1);
+    number(b, j->old_kind, 1);
 }
 static void encode_persistent(buffer *b, const d2ku_persistent_state *s)
 {
@@ -189,6 +192,7 @@ static d2ku_rc decode(kind k, buffer *b, unsigned slot, void *out)
         if (utc > INT64_MAX) b->bad = 1; else j.progress_utc = (int64_t)utc;
         j.progress_boot_id_len = getstr(b, j.progress_boot_id, D2KU_BOOT_ID_MAX);
         j.command = (d2ku_command_op)getnum(b, 1);
+        j.old_kind = (d2ku_source_kind)getnum(b, 1);
         if (b->bad || b->pos != b->n || journal_valid(&j) != D2KU_OK) return D2KU_RECOVERY;
         *(d2ku_journal *)out = j;
     } else {

@@ -2,6 +2,7 @@
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
 #include "transaction_internal.h"
+#include "legacy.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -190,6 +191,8 @@ d2ku_rc d2ku_release_receipt(d2ku_ctx *c, const char *id,
     return r;
 }
 d2ku_rc d2ku_tx_receipt(d2ku_ctx *c, const char *id, unsigned char hash[32]) {
+  d2ku_rc legacy = d2ku_legacy_source(c, id, hash);
+  if (legacy != D2KU_ABSENT) return legacy;
   int d = release_dir(c, id);
   if (d < 0)
     return D2KU_IO;
@@ -205,6 +208,15 @@ d2ku_rc d2ku_tx_receipt(d2ku_ctx *c, const char *id, unsigned char hash[32]) {
   if (w != c->wire_version || s != c->state_version || u > c->updater_version)
     return D2KU_INCOMPATIBLE;
   return D2KU_OK;
+}
+d2ku_rc d2ku_tx_source_kind(d2ku_ctx *c, const char *id, d2ku_source_kind *kind) {
+  unsigned char hash[32];
+  d2ku_rc rc = d2ku_legacy_source(c, id, hash);
+  if (rc == D2KU_OK) { *kind = D2KU_SOURCE_LEGACY_LOCAL; return D2KU_OK; }
+  if (rc != D2KU_ABSENT) return rc;
+  rc = d2ku_tx_receipt(c, id, hash);
+  if (rc == D2KU_OK) *kind = D2KU_SOURCE_RUNTIME;
+  return rc;
 }
 d2ku_rc d2ku_tx_current(d2ku_ctx *c, char id[D2KU_ID_MAX + 1]) {
     char p[128];
@@ -1059,7 +1071,8 @@ static d2ku_rc validate(d2ku_ctx *c, d2ku_journal *j, d2ku_status *s,
             r = D2KU_TIME;
             break;
         }
-        r = d2ku_health(c, j, s);
+        r = !updater && j->old_kind == D2KU_SOURCE_LEGACY_LOCAL
+                ? d2ku_legacy_health(c, j, s) : d2ku_health(c, j, s);
         if (r != D2KU_OK)
             break;
         if (s->health_complete && ready == D2KU_OK)
@@ -1111,6 +1124,10 @@ d2ku_rc d2ku_tx_recover_locked(d2ku_ctx *c, d2ku_status *s) {
     unsigned char h[32];
     if (d2ku_tx_current(c, active) != D2KU_OK)
         return failed(c, &j);
+    d2ku_source_kind actual_kind;
+    if (j.phase != D2KU_COMMITTED &&
+        (d2ku_tx_source_kind(c, j.old_release_id, &actual_kind) != D2KU_OK ||
+         actual_kind != j.old_kind)) return failed(c, &j);
     if (j.phase == D2KU_COMMITTED || j.phase == D2KU_ROLLED_BACK) {
         const char *want =
             j.phase == D2KU_COMMITTED ? j.new_release_id : j.old_release_id;
@@ -1339,6 +1356,8 @@ static d2ku_rc prepare(d2ku_ctx *c, const d2ku_request *r) {
     if (!fstatat(all, r->release_id, &st, AT_SYMLINK_NOFOLLOW)) {
         unsigned char h[32];
         close(all);
+        d2ku_source_kind existing_kind;
+        if (d2ku_tx_source_kind(c, r->release_id, &existing_kind) != D2KU_OK || existing_kind != D2KU_SOURCE_RUNTIME) return D2KU_INCOMPATIBLE;
         d2ku_rc rc = d2ku_tx_receipt(
             c, r->release_id,
             h); /* Existing immutable ID may be reused only with same
@@ -1421,6 +1440,7 @@ static d2ku_rc execute(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s,
         unsigned char h[32];
         rc = d2ku_journal_load(c, &prev);
         if (rc != D2KU_OK || prev.phase != D2KU_COMMITTED ||
+            prev.old_kind != D2KU_SOURCE_RUNTIME ||
             strcmp(prev.old_release_id, r->release_id) ||
             memcmp(prev.old_manifest_sha256, r->manifest_sha256, 32)) {
             rc = D2KU_INVALID;
@@ -1440,6 +1460,9 @@ static d2ku_rc execute(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s,
     d2ku_journal j = {0};
     j.schema = 1;
     j.command = rollback ? D2KU_CMD_ROLLBACK : D2KU_CMD_INSTALL;
+    rc = d2ku_tx_source_kind(c, r->expected_release_id, &j.old_kind);
+    if (rc != D2KU_OK) goto out;
+    if (rollback && j.old_kind != D2KU_SOURCE_RUNTIME) { rc = D2KU_INCOMPATIBLE; goto out; }
     strcpy(j.transaction_id, r->transaction_id);
     j.transaction_id_len = strlen(r->transaction_id);
     strcpy(j.old_release_id, r->expected_release_id);

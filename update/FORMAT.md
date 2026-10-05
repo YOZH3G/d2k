@@ -330,14 +330,17 @@ reason u32; recovery failure reason u32; old release ID
 string; new release ID string; old and new exact manifest SHA-256 (32 bytes
 each); snapshot-ready u8 boolean; active services u64 bitset; monotonic progress
 milliseconds u64; UTC progress seconds u64 (0..INT64_MAX); progress boot ID
-string; canonical request command u8, exactly 3 (install) or 4 (rollback).
+string; canonical request command u8, exactly 3 (install) or 4 (rollback);
+old source kind u8, exactly 0 (runtime) or 1 (legacy-local-v1). Kind1 permits
+install only. Target kind is always runtime; remote metadata cannot select legacy.
 IDs use the release-ID grammar and 64-byte bound; boot ID is 1..64
 printable non-space ASCII bytes. Both reasons are explicit d2ku_rc values
 0..12 (OK through RECOVERY); zero means no failure. The first transaction
 cause survives a successful rollback; recovery_reason records failure of
 recovery independently. These two fields were added before the first release
 of schema 1; the canonical command tail was also added before publication.
-No deployed record migration is implied. Missing/unknown commands fail closed;
+The old-kind tail is also a prepublication extension. No deployed record
+migration is implied. Missing/unknown command or source-kind tails fail closed;
 never infer install vs rollback from release IDs or terminal phase. Phases 1..13 are checking, available,
 downloading, verifying, prepared, stopping, switching, starting, validating,
 committed, rolling_back, rolled_back, recovery_failed. Switching through
@@ -596,32 +599,24 @@ it is not an HTTP parameter or unsigned download mechanism. Standalone command:
 stage executable modes before handing this directory to bootstrap. Bundle
 publication/trust distribution remains the release/bootstrap packaging task.
 
-Inventory checks all four flat binaries using bounded offline self-checks,
-requires wire13 and one common embedded release identity, and rejects missing,
-linked, foreign-owned or writable-by-other files before service stop. This v1
-migration supports the prepared flat `voice-4faa482` wire13 runtime bundle
-tracked in commit `d184d14`, and compatible installations with the same runtime
-self-check/heartbeat contract. It does **not** support the field-installed wire12
-pair documented in `docs/field/2026-10-04-discord-udp-late-cut.md`; that pair
-predates runtime identity/heartbeat. Such inventory fails closed before stop,
-with an explicit diagnostic. No preparatory replacement of the old flat install
-is part of this contract. A private `update/legacy-flat/` retains the original binaries,
-init/NDM scripts, helpers, assets and configuration. Bootstrap copies verified
-inputs to private `boot/input/`; both trees have SHA256 inventory seals. The
-release directory and bootstrap marker retain the common verified embedded
-runtime ID. The private receipt separately seals the saved inventory hash; it is
-not a signed remotely published release. Immediate transaction recovery therefore
-uses the original ID and the preserved binary inode under the normal exact
-runtime health checks; publishing/signing it or offering it as a late rollback
-candidate is not implied.
+Ordinary flat inventory checks all four binaries using bounded offline self-checks,
+requires wire13 and one common embedded release identity. The prepared
+`voice-4faa482` bundle retains that exact identity and ordinary health contract.
+Historical field wire12 instead uses the separate local-owner contract below.
+Neither old source is represented as a newly signed publisher release. Both
+paths reject missing, linked, foreign-owned or writable-by-other inventory
+before stop. `update/legacy-flat/` retains original binaries, init/NDM, helpers
+and assets; ordinary wire13 also saves flat config there. Legacy wire12 excludes
+personal config from its immutable code seal. `boot/input/` retains validated
+bootstrap inputs so interruption never depends on installer temporary files.
 
 `update-state/bootstrap.pending` is the durable forward-completion record:
-`D2KB1 ID OLD_SEAL INPUT_SEAL SERVICE_BITS CHECKSUM\n`. Seals/checksum are 64 lower
-hex bytes; checksum is SHA256 of the exact preceding bytes excluding the space
+`D2KB2 SOURCE_KIND ID OLD_SEAL INPUT_SEAL SERVICE_BITS CHECKSUM\n`. Seals/checksum are 64 lower
+hex bytes; SOURCE_KIND is canonical decimal0 or1; checksum is SHA256 of the exact preceding bytes excluding the space
 before CHECKSUM. The whole record is canonical, private, bounded, type checked
 and verified before use. The independent C executable and S98 recovery hook are
 synced before this record and before replacing any entry. Init/NDM/helper guards
-are replaced before stop/switch; outside operations wait on maintenance. Services
+are replaced before stop/switch; outside operations wait on maintenance. For ordinary wire13, services
 stop with the saved mask, personal snapshot entries are retained under
 `update/legacy-personal/` after writers stop, current and launchers are published,
 and only the saved service mask starts. Live personal files are never rewritten
@@ -694,12 +689,73 @@ closed by its caller. Configuration alone does not initialize these resources.
 Explicit `engine-restart` persists the enabled core/datapath bits before starting,
 so later capture and boot-start retain the administrator's intent.
 
-Historical wire12 migration needs a separately reviewed compatibility contract:
-a trusted complete inventory manifest (all runtime hashes/ABI and old init/helper
-contracts), sealed preservation and bootstrap-only old-runtime recovery/health.
-It cannot be implemented by treating absent wire13 metadata as success or by
-weakening signed candidate health. The available field report records only the
-controller/datapath hashes, not a complete verified installation manifest.
+Historical wire12 uses profile `flat-wire12-2026-10-04`, authenticated locally
+by the owner's existing code, not by an invented historical publisher manifest.
+The supported roles are static executable ELF of one supported ABI, bounded
+`d2kd --help`, `d2kc` missing-required-argument usage/exit2, panel `--version`
+with telegram-control and TG `--version` with per-install-enrollment. Probes
+have fixed argv, 5-second/16-KiB bounds and transient group ownership. An
+additional event-free private AF_UNIX controller probe must reject wire13 and
+accept wire12. Its catalog/live/cache/log paths live in a fresh mode0700 scratch
+directory, never live state; no target/event is supplied. Each greeting is
+bounded to4 seconds plus1 second TERM grace, then group kill/reap; the log cap
+is16KiB. Registration on FD5 precedes child execution. Live
+pidfiles bind actual `/proc/PID/exe` to the still-current flat inode and copied
+bytes even when enabled intent exists. Core control/catalog/live and runtime
+log/resource options must match the supported paths. External writable personal
+paths and dynamically loaded old dependencies are unsupported before stop.
+Root authorization does not prove original publisher provenance; a malicious
+root/bootstrap is outside this integrity model.
+
+The dedicated private receipt is exactly:
+`D2KV1 flat-wire12-2026-10-04 ID ABI OLD_HASH RELEASE_HASH RESOURCES_HASH CHECKSUM\n`.
+All hashes are lowercase SHA256 hex. Checksum covers preceding bytes excluding
+its separator. Canonical bounds and ABI are validated. Release `.d2ku-legacy`
+must equal `update-state/legacy-source` byte-for-byte; a simultaneous D2KR1 is
+invalid. Before old code executes, the adapter rehashes all saved code, resolved
+release code and original root `files/` resources. The tree digest sorts names,
+binds each NUL-terminated name, directory mode/type, regular mode/size/content
+and directory end markers, refuses links/special files/unsafe owners, and
+checks held-file identity and timestamps. Source resources using the reserved
+`.bootstrap-`, `.legacy-` prefixes or `.d2ku-legacy` name are refused before copy.
+On resume, only regular, single-link, owner-safe temporaries matching exact
+`.bootstrap-PID-COUNTER` or `.legacy-PID` decimal grammar are removed from
+bootstrap-private construction trees before sealing; all final resources remain
+in the complete seal. Bounds: depth12, 4096 entries,
+1024 entries per directory, 128MiB per file. Only root `.d2ku-legacy` is excluded.
+Legacy ID is `legacy-local-` plus first32 hex digits of full old inventory hash;
+full hash, not shortened name, is journal/receipt authority. D2KL1 remains the
+independent lifecycle intent format.
+
+Wire12 bootstrap performs **safe preparation only**: seals source and trusted
+stable inputs, installs guards/current aliases and persists disabled mask, but
+does not stop old runtimes, snapshot live personal data or install a new runtime.
+CLI explicitly reports preparation only. Task9's sealed first-worker pair uses
+this same exact old receipt identity; no extra Task8 bootstrap entry is needed.
+The first new candidate must pass ordinary signed index/manifest/package,
+wire13/offline checks before STOPPING. New health never falls back to legacy.
+
+Before coherent snapshot, the adapter enumerates historical runtimes, old
+helper PID files, known NDM/init/helper invocations and descendants. Runtime
+executables bind the saved release or exact original bytes. Helpers are stopped
+before platform stop, rechecked afterwards, and an unknown writer fails closed.
+Forced kill, remaining/new writers, unreadable/overflowed stop diagnostics or
+controller catalog-save error prevents snapshot-ready/candidate start. Original
+root `files/` stays sealed because old voice code has hardcoded resource paths;
+new signed code continues to use release-pinned resources.
+
+Immediate recovery selects old health only from validated journal kind1 and
+matching old receipt. Datapath greeting is verified wire12 with SO_PEERCRED
+before the old core connects, never via a second controller on a live pair.
+Bounded startup readiness precedes a real120-second observation: stable proc
+inode/start ticks/non-stopped state, owning NFQUEUE socket, progressing datapath
+main-loop stats and controller live publication, required state, panel HTTP and
+own enabled rules. Old TG requires its process-owned listener and known
+connecting/connected status; this is **not** a main-loop pulse or relay/application
+success. Status exposes `current.provenance=legacy-local-v1`, `legacy_restored`
+and that limitation; `installation_healthy` remains false for this weaker proof.
+Legacy is never a remote target or late rollback selection. Durable D2KI1 result,
+command replay, quarantine reason and startup ownership fences remain unchanged.
 
 
 ## Daemon, feed configuration and asynchronous IPC (Task 9)
@@ -856,8 +912,8 @@ execution requires exact bootstrap.done inventory/current receipt identity,
 matching sealed first/config bytes, no signed committed generation, and no
 `first-retired` marker. A missing daemon in signed current never re-enables
 fallback, even if journal generations rotate. The first signed commit durably
-retires fallback. This supports wire13 bootstrap inventories; historical wire12
-is a separate typed legacy source and must not be called signed by this path.
+retires fallback. Both ordinary wire13 and typed historical wire12 local
+inventories can anchor the first worker; neither becomes publisher-signed.
 
 Old worker owns the transaction through commit and candidate probe. Exit75 is a
 handoff request only: supervisor must verify newer durable COMMITTED journal,

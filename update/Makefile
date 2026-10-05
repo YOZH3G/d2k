@@ -71,7 +71,7 @@ $(BUILD)/test_runtime_signal: tests/test_runtime_signal_linux.c ../runtime/d2k_r
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) tests/test_runtime_signal_linux.c $(LDFLAGS) -o $@
 
-TRANSACTION_SRC = src/startup.c src/auto.c src/transaction.c src/recover.c src/journal.c src/package.c src/health.c src/schedule.c
+TRANSACTION_SRC = src/legacy_protocol.c src/legacy_quiesce.c src/legacy_health.c src/legacy_probe.c src/legacy_inventory.c src/startup.c src/auto.c src/transaction.c src/recover.c src/journal.c src/package.c src/health.c src/schedule.c
 .PHONY: check-transaction check-recovery boot
 check: check-transaction check-recovery
 check-transaction: $(BUILD)/test_transaction
@@ -191,3 +191,22 @@ check-startup-fence:
 	python3 tests/test_startup_fence.py $(BUILD)/startup-fixture/d2k-update $(BUILD)/startup-fixture/d2k-update-boot $(BUILD)/startup-fixture/d2k-service-adapter supervise
 
 $(BUILD)/d2k-update $(BUILD)/d2k-update-boot $(BUILD)/d2k-service-adapter: src/startup.h
+
+.PHONY: check-legacy
+check: check-legacy
+check-legacy: $(BUILD)/test_legacy
+	$(BUILD)/test_legacy
+$(BUILD)/test_legacy: tests/test_legacy.c src/legacy_inventory.c src/legacy.h src/journal.c include/d2k_update.h
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_legacy.c src/legacy_inventory.c src/journal.c $(LDLIBS) -o $@
+
+# Invoked only by the private Linux CAP_NET_ADMIN harness; never starts host services.
+$(BUILD)/test_legacy_transition: tests/test_legacy_transition.c src/service_adapter.c src/manifest.c src/transport.c $(TRANSACTION_SRC)
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_legacy_transition.c src/service_adapter.c src/manifest.c src/transport.c $(TRANSACTION_SRC) $(LDLIBS) $(CURL_LIBS) -o $@
+$(BUILD)/legacy_candidate: tests/legacy_candidate.c
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) tests/legacy_candidate.c -o $@
+$(BUILD)/test_legacy_crash: tests/test_legacy_crash.c src/bootstrap.c src/service_adapter.c $(TRANSACTION_SRC)
+	mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_legacy_crash.c src/bootstrap.c src/service_adapter.c $(TRANSACTION_SRC) $(LDLIBS) -o $@

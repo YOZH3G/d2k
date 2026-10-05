@@ -116,8 +116,14 @@ int main(int argc, char **argv) {
   }
   if (!strcmp(argv[at], "--recover"))
     r = at + 1 == argc ? d2ku_recover(&c, &s) : D2KU_INVALID;
-  else if (!strcmp(argv[at], "--bootstrap"))
+  else if (!strcmp(argv[at], "--bootstrap")) {
     r = D2KU_OK;
+    char prepared_id[D2KU_ID_MAX + 1]; d2ku_source_kind source;
+    if (d2ku_tx_current(&c, prepared_id) == D2KU_OK &&
+        d2ku_tx_source_kind(&c, prepared_id, &source) == D2KU_OK &&
+        source == D2KU_SOURCE_LEGACY_LOCAL)
+      fprintf(stderr, "legacy preparation only: owner-authorized inventory retained; no signed release installed; first worker must verify the selected signed bundle before stopping services\n");
+  }
   else if (!strcmp(argv[at], "--daemon")) {
     r = d2ku_recover(&c, &s);
     if (r != D2KU_OK)

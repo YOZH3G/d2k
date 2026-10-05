@@ -814,11 +814,14 @@ start_engine() {
     [ "$PROBE_MARK" != "$MARK" ] || die "PROBE_MARK должен отличаться от MARK"
     [ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$PROBE_MARK" ] || die "MEASURE_MARK должен отличаться от MARK и PROBE_MARK"
 
+    set -- --health-file "$RUNTIME_DIR/d2kd.health"
+    legacy_stats=${STATS_SEC:-60}
+    if [ "${D2K_LEGACY_LOCAL:-}" = 1 ]; then set --; legacy_stats=1; fi
     spawn_daemon -S -b -m -p "$DP_PID" -x "$DPBIN" -- \
         --queue "$QUEUE_NUM" --mode "$dpmode" --mark "$MARK" \
         --probe-mark "$PROBE_MARK" --udp-reverse-hook \
-        --flows "$FLOWS" --control "$SOCK" --stats "${STATS_SEC:-60}" \
-        --health-file "$RUNTIME_DIR/d2kd.health" --log "$LOG/d2kd.log" || die "датапат не запустился"
+        --flows "$FLOWS" --control "$SOCK" --stats "$legacy_stats" \
+        "$@" --log "$LOG/d2kd.log" || die "датапат не запустился"
 
     # Ждём привязки очереди, а не спим наугад: правила, поставленные до
     # привязки, отправляют пакеты в никуда.
@@ -845,10 +848,14 @@ start_engine() {
     # Журнал задаётся ключом, а не перенаправлением: start-stop-daemon -b
     # потоки потомка не наследует, и вывод уходил бы в никуда — проверено на
     # роутере, файл оставался нулевым при исправно работающем движке.
+    if [ "${D2K_LEGACY_LOCAL:-}" = 1 ]; then
+        "$DIR/boot/d2k-service-adapter" --root "$DIR" --maintenance-fd 4 legacy-greet "${RELEASE##*/}" "$D2K_SERVICE_BITS" || { engine_stop; return 1; }
+        set --
+    else set -- --health-file "$RUNTIME_DIR/d2kc.health"; fi
     spawn_daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
         --control "$SOCK" --catalog "$DIR/state/catalog.json" --live "$LIVE" --mark "$PROBE_MARK" \
         --measure-mark "$MEASURE_MARK" \
-        --health-file "$RUNTIME_DIR/d2kc.health" --log "$LOG/d2kc.log" || { engine_stop; die "контроллер не запустился"; }
+        "$@" --log "$LOG/d2kc.log" || { engine_stop; die "контроллер не запустился"; }
     if ! running "$CT_PID"; then
         engine_stop
         die "контроллер завершился сразу после запуска"
@@ -877,12 +884,14 @@ start_panel() {
     if [ -x "$PANELBIN" ]; then
         prepare_runtime
         start_log_maintenance
+        set -- --health-file "$RUNTIME_DIR/d2kpanel.health"
+        [ "${D2K_LEGACY_LOCAL:-}" != 1 ] || set --
         spawn_daemon -S -b -m -p "$PN_PID" -x "$PANELBIN" -- serve \
             --config "$CONF" --live "$LIVE" --assets "$PANEL_ASSETS" \
             --listen "$PANEL_LISTEN" --state-dir "$STATE_DIR" --mode "$MODE" \
             --queue "$QUEUE_NUM" --service /opt/etc/init.d/S99d2k \
             --engine-pid "$DP_PID" --controller-pid "$CT_PID" \
-            --health-file "$RUNTIME_DIR/d2kpanel.health" --log "$LOG/panel.log" \
+            "$@" --log "$LOG/panel.log" \
             || { say "панель не запустилась — обход это не затрагивает"; return 1; }
     fi
 }
@@ -956,8 +965,10 @@ telegram_start() {
         return 0
     fi
     stop_pidfile "$TG_PID" || return 1
+    set -- --health-file "$RUNTIME_DIR/d2ktg.health"
+    [ "${D2K_LEGACY_LOCAL:-}" != 1 ] || set --
     spawn_daemon -S -b -m -p "$TG_PID" -x "$TGBIN" -- \
-        --config "$CONF" --health-file "$RUNTIME_DIR/d2ktg.health" --log "$LOG/telegram.log" || { write_telegram_status error; return 1; }
+        --config "$CONF" "$@" --log "$LOG/telegram.log" || { write_telegram_status error; return 1; }
     i=0
     while [ $i -lt 20 ]; do
         running "$TG_PID" && break

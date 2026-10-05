@@ -106,7 +106,9 @@ int main(int argc, char **argv) {
     if (lr != D2KU_OK)
       return 1;
     char id[D2KU_ID_MAX + 1], path[1200], asset[1200];
-    if (d2ku_tx_current(&c, id) != D2KU_OK)
+    unsigned char receipt[32];
+    if (d2ku_tx_current(&c, id) != D2KU_OK ||
+        d2ku_tx_receipt(&c, id, receipt) != D2KU_OK)
       return 1;
     snprintf(path, sizeof path, "%s/releases/%s/%s", root, id, bin);
     snprintf(asset, sizeof asset, "%s/releases/%s/files/fake", root, id);

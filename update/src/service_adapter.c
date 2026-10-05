@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
+#include "legacy.h"
 #include "transaction_internal.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -212,6 +213,8 @@ d2ku_rc d2ku_service_configure(d2ku_ctx *c, const char *root,
   char listen[256] = "127.0.0.1:8090", status[1024] = "", ca[1024] = "",
        mode[16] = "apply", tg[16] = "0";
   unsigned long queue = 2000;
+  s->tg_port = 1443;
+  s->legacy_log_fd = -1;
   int fd = openat(c->root_dirfd, "config",
                   O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
   if (!regular(fd)) {
@@ -266,6 +269,14 @@ d2ku_rc d2ku_service_configure(d2ku_ctx *c, const char *root,
       }
     if (!strcmp(p, "TG_RELAY_SECRET"))
       s->identity_required = !*eq;
+    if (!strcmp(p, "TG_PORT")) {
+      char *end;
+      unsigned long v = strtoul(eq, &end, 10);
+      if (!*eq || *end || !v || v > 65535)
+        rc = D2KU_INVALID;
+      else
+        s->tg_port = (uint16_t)v;
+    }
     if (!strcmp(p, "QUEUE_NUM")) {
       char *end;
       errno = 0;
@@ -365,6 +376,7 @@ d2ku_rc d2ku_service_configure(d2ku_ctx *c, const char *root,
   c->state_version = 1;
   c->updater_version = 1;
   c->transaction.arg = s;
+  c->service_config = s;
   c->transaction.capture = d2ku_service_capture;
   c->transaction.services = d2ku_service_call;
   c->health_arg = s;
@@ -682,7 +694,8 @@ d2ku_rc d2ku_service_dispatch(d2ku_service_config *s, const char *action,
     return d2ku_service_health_state(s);
   if (!strcmp(action, "health-http"))
     return d2ku_service_health_http(s);
-  static const char *actions[] = {"start",
+  static const char *actions[] = {"legacy-greet",
+                                  "start",
                                   "stop",
                                   "remove-rules",
                                   "health-rules",
@@ -724,6 +737,17 @@ d2ku_rc d2ku_service_dispatch(d2ku_service_config *s, const char *action,
                       "456789._-") != strlen(release) ||
       *release == '.')
     return D2KU_INVALID;
+  unsigned char legacy_hash[32];
+  d2ku_rc legacy = d2ku_legacy_source(c, release, legacy_hash);
+  if (legacy != D2KU_OK && legacy != D2KU_ABSENT)
+    return legacy;
+  if (!strcmp(action, "legacy-greet"))
+    return legacy == D2KU_OK ? d2ku_legacy_greet(s, release) : D2KU_INVALID;
+  if (legacy == D2KU_OK) {
+    d2ku_rc pre = d2ku_legacy_before(s, action, release, mask);
+    if (pre != D2KU_OK)
+      return pre;
+  }
   char dir[1200], script[1300], bits[24];
   snprintf(dir, sizeof dir, "%s/releases/%s", s->root, release);
   snprintf(script, sizeof script, "%s/S99d2k", dir);
@@ -746,8 +770,18 @@ d2ku_rc d2ku_service_dispatch(d2ku_service_config *s, const char *action,
     setenv("D2K_DIR", s->root, 1);
     setenv("D2K_RELEASE_ROOT", dir, 1);
     setenv("D2K_MANAGED_INTERNAL", "1", 1);
+    if (legacy == D2KU_OK)
+      setenv("D2K_LEGACY_LOCAL", "1", 1);
+    else
+      unsetenv("D2K_LEGACY_LOCAL");
     execl("/bin/sh", "sh", script, "--managed", action, bits, (char *)NULL);
     _exit(127);
   }
-  return wait_child(p);
+  d2ku_rc dispatched = wait_child(p);
+  if (legacy == D2KU_OK) {
+    d2ku_rc after = d2ku_legacy_after(s, action, release, mask);
+    if (dispatched == D2KU_OK)
+      dispatched = after;
+  }
+  return dispatched;
 }
