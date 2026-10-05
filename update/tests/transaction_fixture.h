@@ -23,6 +23,9 @@ typedef struct {
         probe_active, require_live, late_state, sync_count, crash_sync,
         fail_sync;
     int restart_candidate;
+    /* Candidate services report ready only from this fixture time on:
+       a real daemon needs seconds to connect, write heartbeat and listen. */
+    uint64_t ready_at;
     char path[128];
 } fixture;
 static void put(int dir, const char *p, const char *s) {
@@ -143,7 +146,7 @@ static d2ku_rc obs(void *p, unsigned svc, const d2ku_journal *j,
         f->restart_candidate && !strcmp(j->new_release_id, "B") ? f->now : 5;
     o->heartbeat_mono_ms = f->now;
     o->wire = 13;
-    o->ready = 1;
+    o->ready = !strcmp(j->new_release_id, "B") && f->now < f->ready_at ? 0 : 1;
     o->executable_matches = 1;
     strcpy(o->boot_id, "test-boot");
     strcpy(o->release_id, j->new_release_id);

@@ -120,6 +120,21 @@ int main(int argc, char **argv) {
     assert(d2ku_persistent_load(&f.c, &policy) == D2KU_OK &&
            policy.accepted_sequence == 9);
     cleanup(&f);
+    /* Services become ready a few seconds after start: the candidate commits,
+       and the 120 s window counts from the first healthy observation. */
+    setup(&f);
+    f.ready_at = f.now + 5000;
+    assert(d2ku_install(&f.c, &f.r, &s) == D2KU_OK);
+    assert(s.health_complete && f.now >= 1000 + 5000 + 120000);
+    current(&f, "releases/B");
+    cleanup(&f);
+    /* A candidate that never becomes ready is rolled back, not waited on. */
+    setup(&f);
+    f.ready_at = UINT64_MAX;
+    assert(d2ku_install(&f.c, &f.r, &s) == D2KU_HEALTH);
+    current(&f, "releases/A");
+    check_file(f.c.root_dirfd, "service", "A");
+    cleanup(&f);
     setup(&f);
     f.failed = 1;
     assert(d2ku_install(&f.c, &f.r, &s) == D2KU_HEALTH);

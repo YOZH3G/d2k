@@ -1039,8 +1039,8 @@ static d2ku_rc validate(d2ku_ctx *c, d2ku_journal *j, d2ku_status *s,
         if (r != D2KU_OK)
             return r;
     }
-    uint64_t start = real_mono(), observation_start = 0;
-    int observing = 0;
+    uint64_t start = real_mono(), observation_start = 0, launched = 0;
+    int observing = 0, launch_seen = 0;
     for (;;) {
         d2ku_rc ready =
             updater ? probe_poll(c, j->new_release_id, &p) : D2KU_OK;
@@ -1063,18 +1063,29 @@ static d2ku_rc validate(d2ku_ctx *c, d2ku_journal *j, d2ku_status *s,
             r = D2KU_TIME;
             break;
         }
-        if (!observing) {
-            observation_start = stamp;
-            observing = 1;
+        if (!launch_seen) {
+            launched = stamp;
+            launch_seen = 1;
         }
-        if (stamp < observation_start) {
+        if (stamp < launched || (observing && stamp < observation_start)) {
             r = D2KU_TIME;
             break;
         }
         r = !updater && j->old_kind == D2KU_SOURCE_LEGACY_LOCAL
                 ? d2ku_legacy_health(c, j, s) : d2ku_health(c, j, s);
+        if (r == D2KU_HEALTH && !observing &&
+            (stamp - launched) / 1000000 < D2KU_STARTUP_MS) {
+            r = wait_ms(c, 1000);
+            if (r != D2KU_OK)
+                break;
+            continue;
+        }
         if (r != D2KU_OK)
             break;
+        if (!observing) {
+            observation_start = stamp;
+            observing = 1;
+        }
         if (s->health_complete && ready == D2KU_OK)
             break;
         if ((stamp - observation_start) / 1000000 >= D2KU_VALIDATION_MS) {

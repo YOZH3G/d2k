@@ -71,6 +71,11 @@ struct d2ku_policy {
 #define D2KU_SERVICE_TELEGRAM UINT64_C(8)
 #define D2KU_VALIDATION_MS UINT64_C(120000)
 #define D2KU_HEARTBEAT_MS UINT64_C(10000)
+/* Started services get this long to become healthy for the first time
+ * (controller/datapath handshake, heartbeat, panel listen). The 120 s window
+ * of continuous health counts from that first healthy observation; any later
+ * failure still ends validation at once. */
+#define D2KU_STARTUP_MS UINT64_C(30000)
 typedef struct {
     pid_t pid;
     uint64_t start_ticks, heartbeat_mono_ms;
