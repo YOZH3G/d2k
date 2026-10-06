@@ -39,7 +39,11 @@ jobs:
       - name: Instagram resolver DNS lifecycle
         run: sh scripts/test-instagram-dns.sh
       - name: Installer/uninstaller lifecycle in disposable container
-        run: sh scripts/lab-install.sh
+        # Контейнер не грузит модули ядра сам: netfilter-модули, которые
+        # установщик требует от роутера, загружаются на хосте раннера.
+        run: |
+          sudo modprobe -a nfnetlink_queue xt_NFQUEUE xt_connbytes xt_multiport xt_mark xt_connmark xt_conntrack xt_addrtype xt_comment ip6table_mangle
+          sh scripts/lab-install.sh
 
   datapath:
     name: Датапат на C — сборка под целевые арки
