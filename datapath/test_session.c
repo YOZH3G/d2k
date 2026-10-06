@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include "test_nat_stub.h"
 #include "d2k_nat.h"
 #include "d2k_session.h"
 #include "d2k_hold.h"
@@ -1364,6 +1365,7 @@ static void test_tcp_stall(void) {
 }
 
 int main(void) {
+    D2K_TEST_NAT_NO_TABLE();
     test_tcp_stall();
     test_route_mark_does_not_leak();
     test_routed_flag_reset_on_new_syn();

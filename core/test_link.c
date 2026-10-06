@@ -77,7 +77,7 @@ static void send_synthetic(int fd, uint16_t kind, const uint8_t *rest, size_t re
     if (rest_len) {
         memcpy(frame + 6 + D2K_KEY_WIRE_LEN, rest, rest_len);
     }
-    (void)write(fd, frame, 6 + body_len);
+    (void)!write(fd, frame, 6 + body_len);
 }
 
 /* --- запуск и остановка стенда ------------------------------------------ */
@@ -92,7 +92,7 @@ static void probe_write_line(probe *p, const char *line) {
     char buf[700];
     int n = snprintf(buf, sizeof buf, "%s\n", line);
     if (n > 0) {
-        (void)write(p->in_fd, buf, (size_t)n);
+        (void)!write(p->in_fd, buf, (size_t)n);
     }
 }
 
@@ -131,8 +131,8 @@ static int probe_start(probe *p, const char *sock_path) {
         return -1;
     }
     if (pid == 0) {
-        (void)dup2(inpipe[0], STDIN_FILENO);
-        (void)dup2(outpipe[1], STDOUT_FILENO);
+        (void)!dup2(inpipe[0], STDIN_FILENO);
+        (void)!dup2(outpipe[1], STDOUT_FILENO);
         close(inpipe[0]);
         close(inpipe[1]);
         close(outpipe[0]);
@@ -496,7 +496,7 @@ int main(void) {
                 hdr[0] = (uint8_t)(plen >> 24); hdr[1] = (uint8_t)(plen >> 16);
                 hdr[2] = (uint8_t)(plen >> 8);  hdr[3] = (uint8_t)plen;
                 hdr[4] = (uint8_t)(D2K_EV_STATS >> 8); hdr[5] = (uint8_t)D2K_EV_STATS;
-                (void)write(sv[1], hdr, sizeof hdr);
+                (void)!write(sv[1], hdr, sizeof hdr);
                 static uint8_t filler[D2K_CTL_FRAME_MAX];
                 memset(filler, 0x22, body_len);
                 size_t sent = 0;

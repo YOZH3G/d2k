@@ -118,7 +118,9 @@ static void *stand_run(void *arg) {
     struct stand *s = arg;
     for (;;) {
         int c = accept(s->fd, NULL, NULL);
-        if (c < 0) { return NULL; }
+        /* Копия стенда принадлежит потоку: закрыт слушающий дескриптор —
+           поток кончается и освобождает её (LeakSanitizer на Linux). */
+        if (c < 0) { free(s); return NULL; }
 
         if (s->mode == 4) {
             /* Пауза дольше d2k_send_timeout_s обязательна: короткая запись
@@ -297,9 +299,8 @@ static uint16_t stand_start_family(struct stand *s, int mode, int family) {
        Дескриптор общий намеренно: закрытие его вызывающим обязано
        завершать accept() в потоке — на этом стоят тесты обрыва.
 
-       Копия не освобождается намеренно: освободить её мог бы только
-       тот, кто дожидается потока, а стенд по устройству отцеплен.
-       Это тестовый процесс с десятками стендов за прогон. */
+       Копию освобождает сам поток, когда вызывающий закрывает
+       дескриптор и accept() возвращает ошибку (см. stand_run). */
     struct stand *own = malloc(sizeof *own);
     if (!own) { return 0; }
     *own = *s;

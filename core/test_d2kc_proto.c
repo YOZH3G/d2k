@@ -63,9 +63,12 @@ static int run_with_greeting(unsigned version, long wait_ms, char *out, size_t o
     if (pid > 0 && poll(&p, 1, 15000) == 1) {
         int c = accept(lfd, NULL, NULL);
         if (c >= 0) {
-            uint8_t f[6 + D2K_KEY_WIRE_LEN + 6];
+            /* Приветствие несёт и release ID датапата: d2kc принимает только
+               свой выпуск (задача 5). Без него и «своя» версия — чужая. */
+            const size_t idlen = strlen(D2K_RELEASE_ID);
+            uint8_t f[6 + D2K_KEY_WIRE_LEN + 7 + 64];
             memset(f, 0, sizeof f);
-            uint32_t plen = 2 + D2K_KEY_WIRE_LEN + 6;
+            uint32_t plen = (uint32_t)(2 + D2K_KEY_WIRE_LEN + 7 + idlen);
             f[0] = (uint8_t)(plen >> 24); f[1] = (uint8_t)(plen >> 16);
             f[2] = (uint8_t)(plen >> 8);  f[3] = (uint8_t)plen;
             f[4] = (uint8_t)(D2K_EV_PROTO >> 8); f[5] = (uint8_t)D2K_EV_PROTO;
@@ -73,7 +76,9 @@ static int run_with_greeting(unsigned version, long wait_ms, char *out, size_t o
             f[6 + D2K_KEY_WIRE_LEN] = (uint8_t)(version >> 8);
             f[6 + D2K_KEY_WIRE_LEN + 1] = (uint8_t)version;
             f[6 + D2K_KEY_WIRE_LEN + 4] = 0x05; f[6 + D2K_KEY_WIRE_LEN + 5] = 0xdc; /* 1500 */
-            (void)!write(c, f, sizeof f);
+            f[6 + D2K_KEY_WIRE_LEN + 6] = (uint8_t)idlen;
+            memcpy(f + 6 + D2K_KEY_WIRE_LEN + 7, D2K_RELEASE_ID, idlen);
+            (void)!write(c, f, 4 + plen);
             int status = 0;
             long waited = 0;
             pid_t w = 0;
@@ -81,7 +86,13 @@ static int run_with_greeting(unsigned version, long wait_ms, char *out, size_t o
                 /* Командам d2kc нужен читатель: иначе он встанет в write. */
                 uint8_t sink[4096];
                 struct pollfd cp = { c, POLLIN, 0 };
-                if (poll(&cp, 1, 10) == 1) { (void)!read(c, sink, sizeof sink); }
+                /* Закрытый d2kc сокет даёт POLLIN мгновенно (EOF): без паузы
+                   счётчик «10 мс» пробегал весь срок за микросекунды, раньше,
+                   чем вышедший d2kc становился виден waitpid (Linux, CI). */
+                if (poll(&cp, 1, 10) == 1 && read(c, sink, sizeof sink) <= 0) {
+                    struct timespec pause = { 0, 10000000 };
+                    nanosleep(&pause, NULL);
+                }
                 waited += 10;
             }
             if (w == pid) {

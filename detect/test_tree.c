@@ -18,6 +18,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/time.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -746,8 +746,10 @@ int d2k_link_set_addr_family(int fd, const uint8_t *ip4, uint8_t family,
     return 0;
 }
 
-static int addr_probe_flow_bytes(uint8_t *p, const uint8_t src_ip4[4], uint16_t src_port_be,
-                                 const uint8_t dst_ip4[4], uint16_t dst_port_be,
+/* Адреса — 4 байта для IPv4 и 16 для IPv6: параметры объявлены указателями,
+   а не [4], иначе GCC видит чтение 16 байт за границей объявленного массива. */
+static int addr_probe_flow_bytes(uint8_t *p, const uint8_t *src_ip4, uint16_t src_port_be,
+                                 const uint8_t *dst_ip4, uint16_t dst_port_be,
                                  uint8_t transport, uint8_t family) {
     /* src_port_be 0 — голосовой опыт на любой клиентский порт (задача 15). */
     if (!src_ip4 || !dst_ip4 || !dst_port_be || transport != 17 ||

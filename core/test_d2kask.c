@@ -418,7 +418,7 @@ typedef struct {
 static void probe_write_line(probe *p, const char *line) {
     char buf[700];
     int n = snprintf(buf, sizeof buf, "%s\n", line);
-    if (n > 0) { (void)write(p->in_fd, buf, (size_t)n); }
+    if (n > 0) { (void)!write(p->in_fd, buf, (size_t)n); }
 }
 
 static const char *probe_say(probe *p, const char *line) {
@@ -694,7 +694,7 @@ static void send_event_frame(int fd, uint16_t kind,
     k[35] = (uint8_t)(high_port >> 8); k[36] = (uint8_t)high_port;
     k[37] = transport;
     if (rest_len) { memcpy(frame + 6 + D2K_KEY_WIRE_LEN, rest, rest_len); }
-    (void)write(fd, frame, 6 + body_len);
+    (void)!write(fd, frame, 6 + body_len);
 }
 
 static void send_ack_ok(int fd, uint16_t cmd) {

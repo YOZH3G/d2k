@@ -19,6 +19,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include "test_nat_stub.h"
 #include "d2k_session.h"
 #include "d2k_journal.h"
 #include "d2k_quic.h"
@@ -1802,6 +1803,7 @@ static void test_quic_deny(void) {
 }
 
 int main(void) {
+    D2K_TEST_NAT_NO_TABLE();
     test_quic_deny();
     test_quic_post_handshake_stall();
     {

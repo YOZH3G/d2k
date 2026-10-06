@@ -9,6 +9,8 @@
  */
 #define _POSIX_C_SOURCE 200809L
 
+#include "test_nat_stub.h"
+#include "d2k_nat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -118,15 +120,10 @@ static int read_ack(int fd, uint16_t *cmd, int *ok, uint8_t *reason) {
                          (uint32_t)hdr[2] << 8 | hdr[3];
     if (frame_len < 2 || frame_len - 2 > sizeof body) { return 0; }
     size_t body_len = frame_len - 2;
-    got = 0;
-    while (got < body_len) {
-        /* body_len <= sizeof body уже проверено выше, но glibc-фортификация
-           GCC на Ubuntu этого не видит и под -Werror роняет сборку теста:
-           предел повторён рядом с вызовом. */
-        size_t want = body_len - got;
-        if (want > sizeof body - got) { return 0; }
-        ssize_t n = read(fd, body + got, want);
-        if (n > 0) { got += (size_t)n; continue; }
+    /* Тело одним recv(MSG_WAITALL): потоковый UNIX-сокет. Цикл read() по
+       body + got glibc-фортификация GCC 13 (Ubuntu 24.04, x86-64) считала
+       записью «до SSIZE_MAX байт» в body[128] и роняла сборку под -Werror. */
+    if (body_len && recv(fd, body, body_len, MSG_WAITALL) != (ssize_t)body_len) {
         return 0;
     }
     uint16_t type = (uint16_t)((hdr[4] << 8) | hdr[5]);
@@ -640,6 +637,7 @@ static void test_tcp_stall_wire(void) {
 }
 
 int main(void) {
+    D2K_TEST_NAT_NO_TABLE();
     test_tcp_stall_wire();
     test_probe_owner_disconnect();
     check_proto_greeting();

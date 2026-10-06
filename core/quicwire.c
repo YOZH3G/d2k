@@ -142,8 +142,8 @@ size_t d2k_qw_long_hdr_token(uint8_t *out, size_t cap, uint32_t version,
     out[o++] = (uint8_t)(0xc0 | (uint8_t)(w << 4));   /* форма, фикс. бит, тип */
     out[o++] = (uint8_t)(version >> 24); out[o++] = (uint8_t)(version >> 16);
     out[o++] = (uint8_t)(version >> 8);  out[o++] = (uint8_t)version;
-    out[o++] = (uint8_t)dcid_len; memcpy(out + o, dcid, dcid_len); o += dcid_len;
-    out[o++] = (uint8_t)scid_len; memcpy(out + o, scid, scid_len); o += scid_len;
+    out[o++] = (uint8_t)dcid_len; if (dcid_len) { memcpy(out + o, dcid, dcid_len); } o += dcid_len;
+    out[o++] = (uint8_t)scid_len; if (scid_len) { memcpy(out + o, scid, scid_len); } o += scid_len; /* пустой CID — NULL */
     if (type == D2K_QW_LT_INITIAL) {
         size_t n = d2k_qw_varint_write(out + o, cap - o, token_len);
         if (n == 0) { return 0; }
@@ -462,8 +462,8 @@ size_t d2k_qw_retry_build(uint8_t *out, size_t cap, uint32_t version,
     out[o++] = (uint8_t)(0xc0 | (uint8_t)(wire_type << 4));
     out[o++] = (uint8_t)(version >> 24); out[o++] = (uint8_t)(version >> 16);
     out[o++] = (uint8_t)(version >> 8);  out[o++] = (uint8_t)version;
-    out[o++] = (uint8_t)dcid_len; memcpy(out + o, dcid, dcid_len); o += dcid_len;
-    out[o++] = (uint8_t)scid_len; memcpy(out + o, scid, scid_len); o += scid_len;
+    out[o++] = (uint8_t)dcid_len; if (dcid_len) { memcpy(out + o, dcid, dcid_len); } o += dcid_len;
+    out[o++] = (uint8_t)scid_len; if (scid_len) { memcpy(out + o, scid, scid_len); } o += scid_len; /* пустой CID — NULL */
     if (token_len) { memcpy(out + o, token, token_len); o += token_len; }
 
     /* Integrity input is ODCID length || ODCID || Retry without tag. */

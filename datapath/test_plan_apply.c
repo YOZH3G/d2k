@@ -36,7 +36,9 @@ static void put16(uint8_t *b, size_t *n, uint16_t v) {
 }
 static void putrec(uint8_t *b, size_t *n, uint16_t type,
                    const uint8_t *v, uint16_t len) {
-    put16(b, n, type); put16(b, n, len); memcpy(b + *n, v, len); *n += len;
+    put16(b, n, type); put16(b, n, len);
+    if (len) { memcpy(b + *n, v, len); } /* пустая запись: v == NULL */
+    *n += len;
 }
 static size_t tls_fake_plan(uint8_t *plan) {
     uint8_t hello[87] = {0};

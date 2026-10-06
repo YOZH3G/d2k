@@ -207,11 +207,19 @@ static void run(const scenario *s, d2k_result *res)
 static void sig(const d2k_result *r, char *out, size_t cap)
 {
     const d2k_dprops *p = &r->props;
+    /* Подпись для сравнения исходов: обрезка по буферу допустима. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
     snprintf(out, cap, "%s|%s|%s|%s|%d%d%d%d%d%d%d|%d|u%d|f%d|%s",
              d2k_verdict_name(r->verdict), r->path, r->has_hit ? r->hit.name : "-",
              r->strategy, p->reassembles, p->parses_l7, p->validates_checksum,
              p->tolerates_reorder, p->tolerates_left_overlap, p->counts_duplicates,
              p->inspects_syn, p->hop_ttl, r->raw_usable, r->raw_selftest_failed, r->reason);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 static void dump(const d2k_result *r)

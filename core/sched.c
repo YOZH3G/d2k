@@ -3356,7 +3356,7 @@ static int quic_deny_recheck(d2k_sched *s, quic_deny_slot *q) {
     snprintf(t->name, sizeof t->name, "%s", q->name);
     t->transport = 17;
     t->family = q->family;
-    snprintf(t->ip, sizeof t->ip, "%s", q->ip);
+    snprintf(t->ip, sizeof t->ip, "%.*s", (int)sizeof t->ip - 1, q->ip);
     t->port = q->port;
     memcpy(t->trig, q->trig, q->trig_len);
     t->trig_len = q->trig_len;

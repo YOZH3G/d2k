@@ -2,6 +2,10 @@
  * network traffic. Only recvfrom is replaced, with two in-memory packets.
  * This runs the helper code on the host; cross/runtime Linux checks remain
  * separate from these deterministic ownership/wire-format assertions. */
+/* Те же макросы, что в начале raw.c: системные заголовки ниже идут раньше
+   его текста, и без них glibc прячет kill/nanosleep/srandom. */
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE 1
 #define _DARWIN_C_SOURCE 1
 #define D2K_RAW_UNIT_TEST 1
 #include <sys/socket.h>

@@ -304,8 +304,8 @@ void d2k_hmac_sha256(const uint8_t *key, size_t klen,
     memset(k0, 0, sizeof k0);
     if (klen > 64) {
         d2k_sha256(key, klen, k0); /* длинный ключ сжимается хэшем; хвост k0 остаётся нулевым */
-    } else {
-        memcpy(k0, key, klen);
+    } else if (klen) {
+        memcpy(k0, key, klen); /* пустой ключ приходит как NULL */
     }
     uint8_t ipad[64], opad[64];
     for (int i = 0; i < 64; i++) {

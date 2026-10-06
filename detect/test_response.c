@@ -105,7 +105,7 @@ int main(void)
             uint8_t junk[16384], rb[16389], tmp[2048];
             int c = accept(ls, NULL, NULL), k;
             memset(junk, 0xab, sizeof(junk));
-            (void)read(c, tmp, sizeof(tmp));
+            (void)!read(c, tmp, sizeof(tmp));
             rec(rb, 22, junk, sizeof(junk));
             for (k = 0; k < 6; k++) { if (write(c, rb, sizeof(rb)) <= 0) break; }
             sleep(1);

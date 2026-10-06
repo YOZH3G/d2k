@@ -1711,7 +1711,7 @@ static void confirm_transport(d2k_catalog *cat, int link_fd, const char *target,
         close(live_fd);
         CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "confirmed live write");
         FILE *live = fopen(live_path, "r"); char body[32768] = {0};
-        if (live) { fread(body, 1, sizeof body - 1, live); fclose(live); }
+        if (live) { (void)!fread(body, 1, sizeof body - 1, live); fclose(live); }
         CHECK(!strstr(body, "подтверждено, смотрим живой трафик"),
               "confirmed passive watcher must not be exported as an ongoing search");
         unlink(live_path);
@@ -2088,7 +2088,7 @@ int main(int argc, char **argv) {
             close(live_fd);
             CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "family live write");
             FILE *live = fopen(live_path, "r"); char body[32768] = {0};
-            if (live) { fread(body, 1, sizeof body-1, live); fclose(live); }
+            if (live) { (void)!fread(body, 1, sizeof body-1, live); fclose(live); }
             CHECK(strstr(body, "\"groups\"") && strstr(body, "\"suffix\": \"googlevideo.com\"") &&
                   strstr(body, "\"active\": true"), "live exposes actual ACKed area, not individual inheritance proofs");
             unlink(live_path);
@@ -2416,7 +2416,7 @@ int main(int argc, char **argv) {
         if (queued_fd>=0) {
             close(queued_fd); d2k_sched_write_live(s,queued_live,"catalog.json");
             FILE *live=fopen(queued_live,"r"); char body[32768]={0};
-            if(live){fread(body,1,sizeof body-1,live);fclose(live);}
+            if(live){(void)!fread(body,1,sizeof body-1,live);fclose(live);}
             CHECK(!strstr(body,"q-new.googlevideo.com") && strstr(body,"q-failed.googlevideo.com"),
                   "retirement must remove the unplanned name, not the later failed inherited flow");
             unlink(queued_live);
@@ -4521,7 +4521,7 @@ admission_only_run:
                 close(live_fd);
                 CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "queue live write");
                 char body[16384] = {0}; FILE *live = fopen(live_path, "r");
-                if (live) { fread(body, 1, sizeof body - 1, live); fclose(live); }
+                if (live) { (void)!fread(body, 1, sizeof body - 1, live); fclose(live); }
                 const char *row = strstr(body, "burst-2.example");
                 const char *since = row ? strstr(row, "\"since\": \"") : NULL;
                 struct tm tm = {0}; time_t queued_at = 0;
@@ -6830,7 +6830,7 @@ recheck_test:
                 close(live_fd);
                 CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "recheck live write");
                 FILE *live = fopen(live_path, "r"); char body[32768] = {0};
-                if (live) { fread(body, 1, sizeof body - 1, live); fclose(live); }
+                if (live) { (void)!fread(body, 1, sizeof body - 1, live); fclose(live); }
                 CHECK(strstr(body, "\"recheck\": true") != NULL,
                       "recheck: live status hides the recheck mark");
                 unlink(live_path);

@@ -177,7 +177,7 @@ static void probe_write_line(probe *p, const char *line) {
     char buf[700];
     int n = snprintf(buf, sizeof buf, "%s\n", line);
     if (n > 0) {
-        (void)write(p->in_fd, buf, (size_t)n);
+        (void)!write(p->in_fd, buf, (size_t)n);
     }
 }
 
@@ -210,8 +210,8 @@ static int probe_start(probe *p, const char *sock_path) {
         return -1;
     }
     if (pid == 0) {
-        (void)dup2(inpipe[0], STDIN_FILENO);
-        (void)dup2(outpipe[1], STDOUT_FILENO);
+        (void)!dup2(inpipe[0], STDIN_FILENO);
+        (void)!dup2(outpipe[1], STDOUT_FILENO);
         close(inpipe[0]);
         close(inpipe[1]);
         close(outpipe[0]);
@@ -536,7 +536,7 @@ static void send_event_frame(int fd, uint16_t kind,
     k[35] = (uint8_t)(high_port >> 8); k[36] = (uint8_t)high_port;
     k[37] = transport;
     if (rest_len) { memcpy(frame + 6 + D2K_KEY_WIRE_LEN, rest, rest_len); }
-    (void)write(fd, frame, 6 + body_len);
+    (void)!write(fd, frame, 6 + body_len);
 }
 
 static void send_ack_ok(int fd, uint16_t cmd) {
