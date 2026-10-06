@@ -3374,6 +3374,17 @@ int main(int argc, char **argv) {
                   "повторный RST запустил измерение до истечения cooldown");
             CHECK(said("замер отложен после неподтверждённого прошлого замера"),
                   "причина cooldown не отражена в журнале");
+            /* Поле 06.10: один и тот же отказ по одному имени повторялся
+               сотнями строк и раздувал журнал на флеше. Причина уже названа —
+               повтор в пределах десяти минут молчит, после — звучит снова. */
+            d2k_ev h3 = ev_hello(6, 41003, "single-reset.example");
+            d2k_sched_event(s, &h3);
+            d2k_ev r3 = ev_suspect(6, 41003);
+            r3.code = D2K_SUSPECT_RST;
+            (void)d2k_sched_event(s, &r3);
+            settle(s);
+            CHECK(said_count("single-reset.example (TCP) замер отложен") == 1,
+                  "повтор той же причины отдыха записан в журнал снова");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c_rst);

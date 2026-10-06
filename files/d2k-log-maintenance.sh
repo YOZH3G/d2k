@@ -1,5 +1,7 @@
 #!/bin/sh
 # Bound only D2K-owned logs. Copy the retained tail back into the open inode.
+# Defaults (2 MiB, keep 1 MiB per log) suit Entware on a router's internal
+# flash; a developer raises LOGMAX/LOGKEEP in config.
 # This process belongs to the whole service, independently of engine-stop.
 DIR=${D2K_DIR:-/opt/d2k}
 CONF=$DIR/config
@@ -13,15 +15,15 @@ valid_bytes() {
     [ "${#1}" -le 8 ] && [ "$1" -ge 1024 ] && [ "$1" -le 67108864 ]
 }
 
-if ! valid_bytes "${LOGMAX:-14680064}" ||
-   ! valid_bytes "${LOGKEEP:-7340032}" ||
-   [ "${LOGKEEP:-7340032}" -ge "${LOGMAX:-14680064}" ]; then
-    echo 'd2k: invalid LOGMAX/LOGKEEP; using 14 MiB / 7 MiB' >&2
-    LOGMAX=14680064
-    LOGKEEP=7340032
+if ! valid_bytes "${LOGMAX:-2097152}" ||
+   ! valid_bytes "${LOGKEEP:-1048576}" ||
+   [ "${LOGKEEP:-1048576}" -ge "${LOGMAX:-2097152}" ]; then
+    echo 'd2k: invalid LOGMAX/LOGKEEP; using 2 MiB / 1 MiB' >&2
+    LOGMAX=2097152
+    LOGKEEP=1048576
 else
-    LOGMAX=${LOGMAX:-14680064}
-    LOGKEEP=${LOGKEEP:-7340032}
+    LOGMAX=${LOGMAX:-2097152}
+    LOGKEEP=${LOGKEEP:-1048576}
 fi
 # Avoid octal interpretation of configured numbers in shell arithmetic.
 while [ "${LOGMAX#0}" != "$LOGMAX" ]; do LOGMAX=${LOGMAX#0}; done

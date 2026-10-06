@@ -291,6 +291,7 @@ static void describe_oifs(char *buf, size_t cap, const uint32_t *o, size_t n, in
    I-A). Каждая часть читается сама по себе; не
    прочитанная держит прежнее значение. Каждое состояние пишется в журнал
    один раз, при смене, а не раз в 30 с. */
+#define ROUTES_QUIET_NS (600ull * NS_PER_S)
 static void routes_refresh(void) {
     static int last_fail = 0, last_v4 = 1, last_v6 = 1, last_r4 = 1, last_r6 = 1;
     static int last_trunc = 0, first = 1;
@@ -338,15 +339,26 @@ static void routes_refresh(void) {
         }
         last_trunc = st_rm.truncated;
     }
-    if (rc == 1) {
-        char text[512], o4[256], o6[256];
+    /* Поле 06.10: правила Keenetic перескакивают между двумя-тремя наборами,
+       и строка звучала тысячи раз в сутки, раздувая журнал на флеше. Смена
+       применяется сразу; запись — не чаще раза в ROUTES_QUIET_NS, с числом
+       смен между записями, а итоговое состояние пишется по истечении окна. */
+    static uint64_t quiet_until = 0;
+    static unsigned changes = 0;
+    if (rc == 1) { changes++; }
+    uint64_t t = now_ns();
+    if (changes && t >= quiet_until) {
+        char text[512], o4[256], o6[256], more[64] = "";
         (void)d2k_routemark_describe(&routes, text, sizeof text);
         describe_oifs(o4, sizeof o4, routes.oif4, routes.n_oif4, routes.oifs_read4);
         describe_oifs(o6, sizeof o6, routes.oif6, routes.n_oif6, routes.oifs_read6);
+        if (changes > 1) { snprintf(more, sizeof more, " [смен с прошлой записи: %u]", changes); }
         fprintf(stderr, "d2kd: метки маршрута по ip rule (клиент с такой меткой — без плана): %s; "
                         "выход сырой посылки IPv4: %s, IPv6: %s "
-                        "(клиент, уходящий через другой интерфейс, — без плана)\n",
-                text, o4, o6);
+                        "(клиент, уходящий через другой интерфейс, — без плана)%s\n",
+                text, o4, o6, more);
+        changes = 0;
+        quiet_until = t + ROUTES_QUIET_NS;
     }
 }
 static d2k_udp_path udp_path;

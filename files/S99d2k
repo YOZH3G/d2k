@@ -130,7 +130,7 @@ MODE=apply
 FLOWS=2048
 # Период сводки датапата в журнал. Ноль выключает; без сводки нечем понять,
 # видит ли служба трафик вообще.
-STATS_SEC=60
+STATS_SEC=900
 
 # shellcheck disable=SC1090  # путь к конфигурации задан выше и постоянен
 [ -r "$CONF" ] && . "$CONF"
@@ -819,7 +819,7 @@ start_engine() {
     [ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$PROBE_MARK" ] || die "MEASURE_MARK должен отличаться от MARK и PROBE_MARK"
 
     set -- --health-file "$RUNTIME_DIR/d2kd.health"
-    legacy_stats=${STATS_SEC:-60}
+    legacy_stats=${STATS_SEC:-900}
     if [ "${D2K_LEGACY_LOCAL:-}" = 1 ]; then set --; legacy_stats=1; fi
     spawn_daemon -S -b -m -p "$DP_PID" -x "$DPBIN" -- \
         --queue "$QUEUE_NUM" --mode "$dpmode" --mark "$MARK" \

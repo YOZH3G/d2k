@@ -148,6 +148,11 @@
    здоровом трафике одиночный такой RST устраивал шторм парных замеров. */
 #define SCHED_LATE_RST_CONFIRM_MS (30 * 1000)
 #define SCHED_LATE_RST_SLOTS 16
+/* Одно и то же объяснение по одному имени (отдых, мёртвый адрес, одиночное
+   позднее закрытие) звучит не чаще раза в SCHED_QUIET_MS. Поле 06.10: такие
+   повторы шли сотнями строк в сутки и раздували журнал на флеше роутера. */
+#define SCHED_QUIET_SLOTS 64
+#define SCHED_QUIET_MS (10 * 60 * 1000)
 /* Сколько ждать решения по потоку разговора с применённым приёмом голоса.
    Приговор «молчит» датапат выносит через две секунды после приветствия
    (silence_deadline); пятнадцать — с запасом на медленную очередь событий, и
@@ -1127,6 +1132,9 @@ struct d2k_sched {
     dead_address    dead_addrs[SCHED_COOLDOWN_SLOTS];
     late_rst_pending late_rst[SCHED_LATE_RST_SLOTS];
     size_t       late_rst_next;
+    /* Повторяемые объяснения, уже сказанные: ключ и срок молчания. */
+    struct { char key[300]; int64_t until_ms; } quiet[SCHED_QUIET_SLOTS];
+    size_t       quiet_next;
     quic_deny_slot quic_deny[SCHED_QUIC_DENY_SLOTS];
     struct { d2k_resource ref; int64_t expires_ms; } resources[8];
     size_t resource_next;
@@ -1370,6 +1378,27 @@ static void trial_retire(d2k_sched *s, task *t) {
    тащил printf-обвязку в каждый вызов. */
 static void say(d2k_sched *s, const char *fmt, ...) {
     if (!s->say_fn) { return; }
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    s->say_fn(s->say_ctx, line);
+}
+
+/* say(), но повтор того же ключа в пределах SCHED_QUIET_MS молчит. Кольцо
+   вытесняет старое: в худшем случае объяснение прозвучит лишний раз. */
+static void say_quiet(d2k_sched *s, const char *key, const char *fmt, ...) {
+    if (!s->say_fn) { return; }
+    for (size_t i = 0; i < SCHED_QUIET_SLOTS; i++) {
+        if (s->quiet[i].until_ms > s->now_ms && strcmp(s->quiet[i].key, key) == 0) {
+            return;
+        }
+    }
+    size_t slot = s->quiet_next;
+    s->quiet_next = (s->quiet_next + 1) % SCHED_QUIET_SLOTS;
+    snprintf(s->quiet[slot].key, sizeof s->quiet[slot].key, "%s", key);
+    s->quiet[slot].until_ms = s->now_ms + SCHED_QUIET_MS;
     char line[512];
     va_list ap;
     va_start(ap, fmt);
@@ -1888,7 +1917,10 @@ static int late_rst_confirmed(d2k_sched *s, const char *name, const d2k_ev *ev) 
     p->flow.family = family;
     p->seen_ms = s->now_ms;
     p->used = 1;
-    say(s, "по %s одиночное позднее закрытие (%s) — жду второй независимый поток до %d с; "
+    char quiet_key[300];
+    snprintf(quiet_key, sizeof quiet_key, "late %u %s", ev->transport, name);
+    say_quiet(s, quiet_key,
+        "по %s одиночное позднее закрытие (%s) — жду второй независимый поток до %d с; "
            "замер пока не запускаю", name, late_close_what(ev->code),
         SCHED_LATE_RST_CONFIRM_MS / 1000);
     return 0;
@@ -6527,7 +6559,9 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         server_of(ev, srv, sizeof srv, &srv_port);
         dead_address *d = dead_find(s, name, ev->transport, ev->family, srv);
         if (d && s->now_ms < d->until_ms) {
-            say(s, "по %s (TCP) замер отложен после блока адреса %s ещё примерно %lld мин",
+            char quiet_key[300];
+            snprintf(quiet_key, sizeof quiet_key, "dead %s %s", name, srv);
+            say_quiet(s, quiet_key, "по %s (TCP) замер отложен после блока адреса %s ещё примерно %lld мин",
                 name, srv, (long long)((d->until_ms - s->now_ms + 59999) / 60000));
             return 0;
         }
@@ -6540,7 +6574,9 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         /* Транспорт — часть ключа отдыха и называется вслух: поле 03.10,
            Discord — отдых QUIC-повторов приложения читался как отложенный
            TCP-поиск того же имени, который на деле шёл своим ходом. */
-        say(s, "по %s (%s) замер отложен после %s ещё примерно %lld мин",
+        char quiet_key[300];
+        snprintf(quiet_key, sizeof quiet_key, "rest %u %s %s", ev->transport, name, reason);
+        say_quiet(s, quiet_key, "по %s (%s) замер отложен после %s ещё примерно %lld мин",
             name, ev->transport == 17 ? "QUIC" : "TCP", reason,
             (long long)((cooldown_left_ms + 59999) / 60000));
         return 0;

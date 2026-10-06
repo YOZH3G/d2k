@@ -36,6 +36,19 @@ try {
     assert.deepEqual(fs.readFileSync(file), payload, 'invalid configuration must not destroy log content');
   }
 
+  // Defaults fit a router whose Entware lives on internal flash: a log over
+  // 2 MiB keeps its last 1 MiB (field 06.10: 14 MiB per log was too much).
+  {
+    const big = Buffer.concat([Buffer.alloc(2 * 1048576, 'A'), Buffer.alloc(1048576, 'Z')]);
+    fs.writeFileSync(file, big);
+    const plain = { ...env }; delete plain.LOGMAX; delete plain.LOGKEEP;
+    const result = spawnSync('/bin/sh', [helper, 'tick'], { env: plain, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    const kept = fs.readFileSync(file);
+    assert.equal(kept.length, 1048576, 'default bound must be 2 MiB, keeping 1 MiB');
+    assert(kept.equals(Buffer.alloc(1048576, 'Z')), 'default bound must keep the newest 1 MiB');
+  }
+
   // A failed tail cannot truncate the live file, even if it produced partial output.
   const bin = path.join(tmp, 'bin'); fs.mkdirSync(bin);
   fs.writeFileSync(path.join(bin, 'tail'), '#!/bin/sh\nprintf partial\nexit 1\n', { mode: 0o755 });
