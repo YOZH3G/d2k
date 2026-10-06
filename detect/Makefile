@@ -130,3 +130,8 @@ d2k-detect-linux-arm64:
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../core -static \
 		-o $(BUILDDIR)/d2k-detect-linux-arm64 main.c $(SRC) ../core/hello.c $(LDLIBS)
 	@ls -l $(BUILDDIR)/d2k-detect-linux-arm64
+
+.PHONY: test-sni-cli
+check: test-sni-cli
+test-sni-cli: d2k-detect
+	python3 test_sni_cli.py

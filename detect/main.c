@@ -341,16 +341,22 @@ int main(int argc, char **argv)
             return 1;
         }
     } else {
-        char name[160];
+        char name[256];
         if (sni) {
-            snprintf(name, sizeof(name), "%s", sni);
+            size_t n = strlen(sni);
+            if (n >= sizeof name) {
+                fprintf(stderr, "classify: SNI exceeds %zu bytes\n", sizeof name - 1);
+                return 2;
+            }
+            memcpy(name, sni, n + 1);
         } else {
             /* Имя не задано — берём его из адреса. Для TLS это ровно то, по
              * чему DPI и принимает решение, так что умолчание осмысленное. */
             const char *colon = strrchr(addr, ':');
             size_t n = colon ? (size_t)(colon - addr) : strlen(addr);
             if (n >= sizeof(name)) {
-                n = sizeof(name) - 1;
+                fprintf(stderr, "classify: hostname exceeds %zu bytes\n", sizeof name - 1);
+                return 2;
             }
             memcpy(name, addr, n);
             name[n] = '\0';
