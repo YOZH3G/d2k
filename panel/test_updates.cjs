@@ -117,6 +117,8 @@ async function main(){
    assert.doesNotMatch(f.nodes['update-reason'].textContent,/связи|Повторите/,'no lost-link wording without an updater');
    assert.equal(f.nodes['update-action'].hidden,true,'no failure message without an updater');
    assert.equal(f.nodes['nav-updates'].textContent,'','no alarm badge without an updater');
+   assert.equal(f.nodes['update-auto'].disabled,true,'auto-update switch stays visible but cannot be toggled without an updater');
+   assert.match(f.nodes['update-schedule'].textContent,/Станет доступно/,'switch explains why it is off');
  }
  { const f=fixture(); f.app.initUpdates(); f.window.fetch=async()=>{throw Error('connection lost');};
    await f.app.checkUpdates(false);

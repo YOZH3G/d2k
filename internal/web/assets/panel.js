@@ -567,9 +567,10 @@
     write("update-progress-text", measurable ? Math.floor(progress.value) + "% · " + s.received_bytes + " / " + s.total_bytes + " байт" : "").hidden = !measurable;
     var auto = this.$("update-auto"), settings = s.settings;
     if (!(pending && pending.action === "settings")) auto.checked = !!(settings && settings.enabled);
-    auto.disabled = !settings || busy || !!pending || failed || s.state === "unavailable";
-    var schedule = "03:00–05:00 по времени роутера" + (settings && settings.timezone ? " (" + settings.timezone + ")" : "");
-    schedule += settings && settings.enabled ? "" : " · сейчас только проверка";
+    auto.disabled = !settings || busy || !!pending || failed || absent;
+    var schedule = "Ставит новые выпуски в 03:00–05:00 по времени роутера" + (settings && settings.timezone ? " (" + settings.timezone + ")" : "");
+    schedule += settings && settings.enabled ? "" : " · выключено: ночью только проверка";
+    if (absent) schedule = "Станет доступно, когда автообновление будет подключено";
     if (settings && settings.enabled && settings.selected_date && settings.selected_minute >= 180 && settings.selected_minute < 300) {
       var date = str(settings.selected_date), minute = settings.selected_minute;
       schedule += " · ближайшее окно " + date.slice(6,8) + "." + date.slice(4,6) + " в " + Math.floor(minute / 60) + ":" + (minute % 60 < 10 ? "0" : "") + minute % 60;
