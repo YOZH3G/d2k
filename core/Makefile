@@ -978,3 +978,11 @@ test_voice_discovery: test_voice_discovery.c voice.o net4.o voice_discovery.o st
 	$(CC) $(CFLAGS) -o $@ $< voice.o net4.o voice_discovery.o stun.o meas.o crypto.o tls13core.o x25519.o $(TEST_LDFLAGS)
 test-voice-discovery: test_voice_discovery
 	./test_voice_discovery
+
+TESTS += test_catalog_durable
+.PHONY: test-catalog-durable
+check: test-catalog-durable
+test-catalog-durable: test_catalog_durable
+	./test_catalog_durable
+test_catalog_durable: test_catalog_durable.c catalog.c groups.c domain.c $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_catalog_durable.c groups.c domain.c $(TEST_LDFLAGS)

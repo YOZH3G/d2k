@@ -55,6 +55,9 @@
 #ifndef D2K_CATALOG_H
 #define D2K_CATALOG_H
 
+/* Путь вместе с завершающим нулём должен помещаться в диагностику. */
+#define D2K_CATALOG_PATH_MAX 256
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -347,6 +350,9 @@ int d2k_catalog_load(const char *path, d2k_catalog *out, char *err, size_t errca
  * решает, КОГДА писать, — см. спеку про планировщик), а не самому
  * разбору. */
 int d2k_catalog_save(const d2k_catalog *c, const char *path, char *err, size_t errcap);
+/* Durable same-directory replacement; returns failure on either fsync error. */
+int d2k_catalog_save_atomic(const d2k_catalog *cat, const char *path,
+                            char *err, size_t errcap);
 
 /* Освобождает всё, чем владеет *c (тексты планов, массивы планов и
  * привязок в каждой коробке, массив коробок), и обнуляет *c. Безопасно
