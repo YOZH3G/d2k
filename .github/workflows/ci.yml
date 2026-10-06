@@ -58,6 +58,7 @@ jobs:
         env:
           CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
           D2K_LAYOUT_ONLY: '1'
+          D2K_BASELINE_OVERLAP: '1'
           D2K_CAPTURE_DIR: ${{ runner.temp }}/panel-browser/baseline
         run: |
           mkdir -p "$D2K_CAPTURE_DIR"
