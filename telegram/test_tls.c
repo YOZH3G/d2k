@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 typedef struct { int listener; const char *cert; const char *key; char sni[128]; int status; } server_args;
@@ -66,7 +67,7 @@ static int ws_read_client_mux(SSL *ssl, uint8_t *dst, size_t cap, size_t *len) {
 static int ws_write_server_mux(SSL *ssl,uint16_t id,uint8_t type,const uint8_t *payload,size_t payload_len) {
     uint8_t mux[8192], frame[8202];
     size_t mux_len=tg_mux_encode(mux,sizeof(mux),id,type,payload,payload_len);
-    if(!mux_len)return -1;
+    if(!mux_len || mux_len > sizeof mux)return -1;
     frame[0]=0x82;size_t head;
     if(mux_len<126){frame[1]=(uint8_t)mux_len;head=2;}
     else if(mux_len<=UINT16_MAX){frame[1]=126;frame[2]=(uint8_t)(mux_len>>8);frame[3]=(uint8_t)mux_len;head=4;}

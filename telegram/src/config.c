@@ -88,7 +88,8 @@ int tg_config_read(const char *path,tg_config *out) {
         else if(strcmp(key,"TG_ENROLL_PORT")==0)bit=K_ENROLL;
         else if(strcmp(key,"STATE_DIR")==0){bit=K_STATE;dst=state_dir;cap=sizeof(state_dir);}
         if(!bit)continue;
-        if(seen&bit)goto done;seen|=bit;
+        if (seen & bit) { goto done; }
+        seen |= bit;
         if(normalize_shell_value(value)!=0)goto done;
         if(bit==K_ENABLED) {
             if(strcmp(value,"1")==0||strcmp(value,"yes")==0)out->enabled=1;
@@ -115,6 +116,7 @@ done:
 }
 
 void tg_config_clean(tg_config *cfg) {
-    if(!cfg)return;OPENSSL_cleanse(cfg->relay_secret,sizeof(cfg->relay_secret));
+    if (!cfg) { return; }
+    OPENSSL_cleanse(cfg->relay_secret, sizeof(cfg->relay_secret));
     memset(cfg,0,sizeof(*cfg));
 }
