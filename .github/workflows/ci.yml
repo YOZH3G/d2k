@@ -24,6 +24,60 @@ jobs:
       - name: ASan и UBSan HTTP-handler
         run: make -C panel san
 
+  panel-browser:
+    name: Chrome — panel layout regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+        with:
+          chrome-version: stable
+      - name: Build isolated C panel
+        run: make -C panel d2kpanel
+      - name: Chrome rendering, controls and layout
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+          D2K_CAPTURE_DIR: ${{ runner.temp }}/panel-browser/fixed
+        run: |
+          mkdir -p "$D2K_CAPTURE_DIR"
+          node panel/test_browser.cjs 2>&1 | tee "$D2K_CAPTURE_DIR/browser.log"
+      - name: The layout regression must fail with the original CSS
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+          D2K_LAYOUT_ONLY: '1'
+          D2K_CAPTURE_DIR: ${{ runner.temp }}/panel-browser/baseline
+        run: |
+          mkdir -p "$D2K_CAPTURE_DIR"
+          css=internal/web/assets/panel.css
+          backup=$(mktemp)
+          cp "$css" "$backup"
+          trap 'cp "$backup" "$css"; rm -f "$backup"' EXIT
+          # Fixed revision retains the failing layout even after this PR merges.
+          git show 3a3b341eaded9c255d5931bf7446b2beb50607bc:internal/web/assets/panel.css > "$css"
+          if node panel/test_browser.cjs > "$D2K_CAPTURE_DIR/browser.log" 2>&1; then
+            cat "$D2K_CAPTURE_DIR/browser.log"
+            echo 'ERROR: original CSS unexpectedly passed the layout regression'
+            exit 1
+          fi
+          cat "$D2K_CAPTURE_DIR/browser.log"
+          node -e 'const fs=require("node:fs");const log=fs.readFileSync(process.env.D2K_CAPTURE_DIR+"/browser.log","utf8");if(!log.includes("controls must not overlap the brand or one another"))throw Error("Baseline failed for a reason other than the masthead overlap")'
+      - name: Save screenshots and browser logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: panel-chrome-layout
+          path: ${{ runner.temp }}/panel-browser
+          retention-days: 7
+          if-no-files-found: warn
+
   shell:
     name: Скрипты
     # lab-install.sh ставит настоящий C runtime под ARM64: нужен ARM-раннер.
