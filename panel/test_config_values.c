@@ -26,5 +26,19 @@ int main(void) {
     assert(parse("QUEUE_NUM=999999999999999999999999\n") == -1);
     assert(parse("QUEUE_NUM=65536\n") == -1);
     assert(parse("QUEUE_NUM=0\n") == 0);
+    assert(parse("SCHEMA=+1\n") == -1);
+    assert(parse("QUEUE_NUM='+2000'\n") == -1);
+    assert(parse("QUEUE_NUM=' 2000'\n") == -1);
+    assert(parse("QUEUE_NUM=-0\n") == -1);
+    assert(parse("MODE=apply # active mode\nQUEUE_NUM=2000\t# queue\nSCHEMA='1' # schema\n") == 0);
+    assert(parse("MODE=\"apply\" # active mode\nSTATE_DIR='/opt/d2k/#state' # keep literal hash\n") == 0);
+    assert(parse("STATE_DIR=/opt/d2k/state#backup\n") == 0);
+    assert(parse("QUEUE_NUM=2000#not-a-comment\n") == -1);
+    assert(parse("MODE='apply'#not-a-comment\n") == -1);
+    assert(parse("QUEUE_NUM= # missing number\n") == -1);
+    assert(parse("MODE='apply # unterminated quote\n") == -1);
+    char value[] = "'/opt/d2k/#state' # comment";
+    assert(normalize_shell_value(value) == 0);
+    assert(strcmp(value, "/opt/d2k/#state") == 0);
     puts("panel config: quoted values and strict numbers PASS"); return 0;
 }
