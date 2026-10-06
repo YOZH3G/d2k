@@ -99,31 +99,9 @@ static int64_t now_ms(void) {
 /* Атомарное сохранение: временный файл рядом, затем rename. Рядом, а не в
    /tmp — rename между файловыми системами не работает, а /opt и /tmp на
    роутере разные (tmpfs). */
-/* Потолок пути каталога. Не «сколько влезет»: err у вызывающего 512 байт, и
-   путь обязан помещаться в сообщение об ошибке целиком — иначе причина отказа
-   приезжает обрезанной ровно тогда, когда она нужна (gcc ловит это как
-   format-truncation, цель cross). */
-#define CATPATH_MAX 256
-
 static int save_atomic(const d2k_catalog *cat, const char *path,
                        char *err, size_t errcap) {
-    char tmp[CATPATH_MAX + 8];
-    if (strlen(path) >= CATPATH_MAX) {
-        snprintf(err, errcap, "путь каталога длиннее %d байт", CATPATH_MAX - 1);
-        return -1;
-    }
-    int n = snprintf(tmp, sizeof tmp, "%s.new", path);
-    if (n < 0 || (size_t)n >= sizeof tmp) {
-        snprintf(err, errcap, "путь каталога не собрался");
-        return -1;
-    }
-    if (d2k_catalog_save(cat, tmp, err, errcap) != 0) { return -1; }
-    if (rename(tmp, path) != 0) {
-        snprintf(err, errcap, "переименование %s: %s", tmp, strerror(errno));
-        (void)remove(tmp);
-        return -1;
-    }
-    return 0;
+    return d2k_catalog_save_atomic(cat, path, err, errcap);
 }
 
 /* Печать планировщика. Со временем по стенным часам, а не монотонным: строку
@@ -506,7 +484,7 @@ int main(int argc, char **argv) {
     }
     /* Кэш HTTPS переживает перезапуск (ревью I2): иначе первый заход после
        каждого перезапуска снова видел бы портал. Рядом с каталогом. */
-    char https_buf[CATPATH_MAX + 32];
+    char https_buf[D2K_CATALOG_PATH_MAX + 32];
     if (!https_path) {
         const char *slash = strrchr(catpath, '/');
         size_t dirlen = slash ? (size_t)(slash - catpath + 1) : 0;
@@ -519,7 +497,7 @@ int main(int argc, char **argv) {
     /* Поиск обхода HTTP и его подтверждённые планы — рядом с каталогом. */
     g_link_fd = fd;
     g_probe_mark = mark;
-    static char plans_buf[CATPATH_MAX + 32];
+    static char plans_buf[D2K_CATALOG_PATH_MAX + 32];
     {
         const char *slash = strrchr(catpath, '/');
         size_t dirlen = slash ? (size_t)(slash - catpath + 1) : 0;
@@ -610,7 +588,7 @@ int main(int argc, char **argv) {
 
     /* Путь вида для панели: рядом с каталогом, если не задан явно. Панель
        читает его и больше ничего о движке не знает (см. d2k_sched_write_live). */
-    char livebuf[CATPATH_MAX + 16];
+    char livebuf[D2K_CATALOG_PATH_MAX + 16];
     if (!livepath) {
         const char *slash = strrchr(catpath, '/');
         size_t dirlen = slash ? (size_t)(slash - catpath + 1) : 0;

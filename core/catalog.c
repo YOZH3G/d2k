@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 /* catalog.c — каталог: чтение и запись файла, который остаётся общим с
  * Go-панелью. Контракт и обоснования — в шапке d2k_catalog.h; здесь —
  * реализация и её собственные инварианты.
@@ -32,6 +33,9 @@
  * Ни одной forward declaration в файле поэтому не требуется.
  */
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -1369,12 +1373,48 @@ int d2k_catalog_save(const d2k_catalog *c, const char *path, char *err, size_t e
        ровно так же, как настоящий успех (тот же довод, что для Sync/Close
        в Go-версии — internal/catalog/store.go). */
     int had_err = ferror(f);
+    if (!had_err && (fflush(f) != 0 || fsync(fileno(f)) != 0)) had_err = 1;
     if (fclose(f) != 0) {
         set_err(err, errcap, "%s: закрытие файла не удалось", path);
         return -1;
     }
     if (had_err) {
         set_err(err, errcap, "%s: запись не удалась", path);
+        return -1;
+    }
+    return 0;
+}
+
+/* rename в том же каталоге делает замену атомарной, fsync закрепляет её на диске. */
+int d2k_catalog_save_atomic(const d2k_catalog *cat, const char *path,
+                            char *err, size_t errcap) {
+    char tmp[D2K_CATALOG_PATH_MAX + sizeof(".new")], dir[D2K_CATALOG_PATH_MAX];
+    if (!path || strlen(path) >= sizeof dir) {
+        set_err(err, errcap, "слишком длинный путь каталога (максимум %u байт)",
+                (unsigned)(D2K_CATALOG_PATH_MAX - 1)); return -1;
+    }
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    if (d2k_catalog_save(cat, tmp, err, errcap) != 0) {
+        (void)remove(tmp); return -1;
+    }
+    if (rename(tmp, path) != 0) {
+        set_err(err, errcap, "переименование %s: %s", tmp, strerror(errno));
+        (void)remove(tmp); return -1;
+    }
+    const char *slash = strrchr(path, '/');
+    if (slash) {
+        size_t len = slash == path ? 1 : (size_t)(slash - path);
+        memcpy(dir, path, len); dir[len] = '\0';
+    } else strcpy(dir, ".");
+    int fd = open(dir, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        set_err(err, errcap, "открытие каталога %s: %s", dir, strerror(errno));
+        return -1;
+    }
+    int failed = fsync(fd), saved_errno = errno;
+    if (close(fd) != 0 && failed == 0) { failed = -1; saved_errno = errno; }
+    if (failed != 0) {
+        set_err(err, errcap, "синхронизация каталога %s: %s", dir, strerror(saved_errno));
         return -1;
     }
     return 0;
