@@ -34,6 +34,45 @@ jobs:
       - name: GCC with Wall, Wextra and Werror
         run: make -C telegram gcc-warn
 
+  panel-browser:
+    name: Chrome — panel layout regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      D2K_CHROME_NO_SANDBOX: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+        id: chrome
+        with:
+          chrome-version: stable
+      - name: Build isolated C panel
+        run: make -C panel d2kpanel
+      - name: Chrome rendering, controls and layout
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+          D2K_CAPTURE_DIR: ${{ runner.temp }}/panel-browser/fixed
+        run: |
+          mkdir -p "$D2K_CAPTURE_DIR"
+          node panel/test_browser.cjs 2>&1 | tee "$D2K_CAPTURE_DIR/browser.log"
+      - name: Save screenshots and browser logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: panel-chrome-layout
+          path: ${{ runner.temp }}/panel-browser
+          retention-days: 7
+          if-no-files-found: warn
+
   shell:
     name: Скрипты
     # lab-install.sh ставит настоящий C runtime под ARM64: нужен ARM-раннер.

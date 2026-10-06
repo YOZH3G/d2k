@@ -4,8 +4,14 @@
 const assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {spawn}=require('node:child_process');
 const profile=fs.mkdtempSync(path.join(os.tmpdir(),'d2k-browser-'));
-const chrome=spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
- ['--headless','--no-first-run','--hide-scrollbars','--remote-debugging-port=0','--user-data-dir='+profile,'about:blank'],{stdio:'ignore'});
+const chromeArgs=['--headless','--no-first-run','--hide-scrollbars','--remote-debugging-port=0','--user-data-dir='+profile,'about:blank'];
+// The isolated GitHub runner restricts Chrome's user namespace sandbox.
+if(process.env.D2K_CHROME_NO_SANDBOX==='1')chromeArgs.unshift('--no-sandbox');
+let chromeError='';
+const chrome=spawn(process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+ chromeArgs,{stdio:['ignore','ignore','pipe']});
+chrome.on('error',e=>{chromeError+=e.message;});
+chrome.stderr.on('data',data=>{chromeError=(chromeError+data.toString()).slice(-4000);});
 const now=Date.now(),iso=s=>new Date(now-s*1000).toISOString();
 const fixture={knowledge:{
  searches:[
@@ -28,7 +34,7 @@ let ws;
 async function main(){
  let port;
  for(let i=0;i<100;i++){try{port=fs.readFileSync(path.join(profile,'DevToolsActivePort'),'utf8').split('\n')[0];break}catch{}await new Promise(r=>setTimeout(r,100))}
- if(!port)throw Error('Headless browser unavailable');
+ if(!port)throw Error('Headless browser unavailable: '+chromeError);
  const tab=await(await fetch('http://127.0.0.1:'+port+'/json/new?about:blank',{method:'PUT'})).json();
  ws=new WebSocket(tab.webSocketDebuggerUrl);await new Promise((r,j)=>{ws.onopen=r;ws.onerror=j});
  let id=0;const pending=new Map(),exceptions=[],dialogs=[];
@@ -48,6 +54,37 @@ async function main(){
   await until('document.querySelectorAll(".search").length===2','C API must populate the live searches');
   await evaluate('document.fonts.ready');
   assert.equal(await evaluate('document.fonts.check("700 24px Onest")'),true,'C CSP must load the bundled text face');
+  async function checkLayout(){
+  // Раскладка на ширинах содержимого.
+  for(const [name,width,height] of [['narrow',320,740],['phone',390,844],['compact-boundary',640,1020],['overlap-regression',649,1020],['small-tablet',650,1020],['chrome-report',678,1020],['mid-tablet',700,1020],['tablet',768,1024],['tablet-boundary',820,1020],['full-label-boundary',821,1020],['status-regression',854,1020],['large-tablet',971,1020],['nav-boundary',1080,1020],['laptop',1280,800],['wide',1920,1080]]){
+   if(process.env.D2K_BASELINE_OVERLAP==='1'&&width!==649)continue;
+   await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width<600});
+   await evaluate('scrollTo(0,0)');await wait(120);
+   const state=await evaluate(`(()=>{
+    const buttons=[...document.querySelectorAll("#engine-actions [data-control]")];
+    const brand=[...document.querySelectorAll(".mast-id .mark, .mast-id .wordmark")].map(x=>x.getBoundingClientRect());
+    const range=document.createRange();range.selectNodeContents(document.querySelector(".mast-state-text"));
+    const protectedRects=brand.concat([...range.getClientRects()]);
+    const intersects=(a,b)=>a.left<b.right&&a.right>b.left&&a.top<b.bottom&&a.bottom>b.top;
+    return {overflow:document.documentElement.scrollWidth>innerWidth,
+     bad:buttons.filter(x=>{const r=x.getBoundingClientRect();return r.left<0||r.right>innerWidth||r.top<0||r.height<44||r.width<44}).map(x=>x.dataset.control),
+     overlaps:buttons.filter((x,i)=>protectedRects.some(r=>intersects(x.getBoundingClientRect(),r))||buttons.slice(i+1).some(y=>intersects(x.getBoundingClientRect(),y.getBoundingClientRect()))).map(x=>x.dataset.control)};
+   })()`);
+   console.log('layout',name,JSON.stringify(state));
+   if(state.overflow)console.log('overflow by',await evaluate('[...document.body.querySelectorAll("*")].filter(x=>{const r=x.getBoundingClientRect();return r.width&&r.right>innerWidth+1}).map(x=>x.tagName+"."+(x.getAttribute("class")||"")+" right="+Math.round(x.getBoundingClientRect().right)+" style="+(x.getAttribute("style")||"")).slice(0,8)'));
+   if(out){const s=await call('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(out,'panel-'+name+'.png'),Buffer.from(s.data,'base64'))}
+   assert.equal(state.overflow,false,name+' horizontal overflow');
+   assert.deepEqual(state.bad,[],name+' engine controls must be visible 44px targets in the masthead');
+   assert.deepEqual(state.overlaps,[],name+' controls must not overlap the brand, engine status or one another');
+   await evaluate('scrollTo(0,400)');await wait(120);
+   const sticky=await evaluate(`(()=>{const mast=document.querySelector(".mast").getBoundingClientRect();const index=document.querySelector(".index").getBoundingClientRect();return {mastBottom:mast.bottom,indexTop:index.top};})()`);
+   if(out){const s=await call('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(out,'panel-'+name+'-scrolled.png'),Buffer.from(s.data,'base64'))}
+   console.log('sticky',name,JSON.stringify(sticky));
+   assert(sticky.indexTop>=sticky.mastBottom-1,name+' sticky index must stay below the masthead');
+   await evaluate('scrollTo(0,0)');await wait(120);
+  }
+  }
+  if(process.env.D2K_LAYOUT_ONLY){await checkLayout();return;}
   assert.match(await evaluate('document.querySelector("#now-title").textContent'),/Идёт 3 поиска/);
   assert.equal(await evaluate('document.querySelectorAll(".queue-list li").length'),1,'queued searches are listed compactly');
   assert.match(await evaluate('document.querySelector("#engine-state").textContent.trim()'),/^Движок работает, идёт подборрежим: применение$/,
@@ -150,17 +187,7 @@ async function main(){
   assert.doesNotMatch(await evaluate('document.querySelector(".search").textContent'),/выведен из замера/);
   assert.equal(await evaluate('[...document.querySelectorAll(".search")].filter(x=>!x.querySelector(".search-question").hidden).length'),1,'question only on the classifier card');
 
-  // Раскладка на ширинах содержимого.
-  for(const [name,width,height] of [['narrow',320,740],['phone',390,844],['tablet',768,1024],['laptop',1280,800],['wide',1920,1080]]){
-   await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width<600});
-   await evaluate('scrollTo(0,0)');await wait(120);
-   const state=await evaluate('({overflow:document.documentElement.scrollWidth>innerWidth,bad:[...document.querySelectorAll("#engine-actions [data-control]")].filter(x=>{const r=x.getBoundingClientRect();return r.left<0||r.right>innerWidth||r.top<0||r.height<44||r.width<44}).map(x=>x.dataset.control)})');
-   console.log('layout',name,JSON.stringify(state));
-   if(state.overflow)console.log('overflow by',await evaluate('[...document.body.querySelectorAll("*")].filter(x=>{const r=x.getBoundingClientRect();return r.width&&r.right>innerWidth+1}).map(x=>x.tagName+"."+(x.getAttribute("class")||"")+" right="+Math.round(x.getBoundingClientRect().right)+" style="+(x.getAttribute("style")||"")).slice(0,8)'));
-   assert.equal(state.overflow,false,name+' horizontal overflow');
-   assert.deepEqual(state.bad,[],name+' engine controls must be visible 44px targets in the masthead');
-   if(out){const s=await call('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(out,'panel-'+name+'.png'),Buffer.from(s.data,'base64'))}
-  }
+  await checkLayout();
   await call('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});
 
   // Остановка требует подтверждения; все шесть команд доходят до службы.
