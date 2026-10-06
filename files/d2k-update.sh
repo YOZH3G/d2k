@@ -45,8 +45,8 @@ field() { sed -n "s/.*\"$1\":\"\{0,1\}\([^\",}]*\).*/\1/p" "$STATE" 2>/dev/null 
 # Текст для JSON: кавычки и обратные косые экранируются, переводы строк — в пробел.
 jtext() { printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
-current_id() { cat "$DIR/release-id" 2>/dev/null | head -n 1; }
-arch() { cat "$DIR/release-arch" 2>/dev/null | head -n 1; }
+current_id() { head -n 1 "$DIR/release-id" 2>/dev/null; }
+arch() { head -n 1 "$DIR/release-arch" 2>/dev/null; }
 
 # Состояние для панели. Всё, что не передано, берётся из прежнего файла.
 # $1 busy ("", checking, installing); остальное — через переменные.
@@ -162,7 +162,9 @@ install_release() {
                finish false "" "установка не начата: $check_error"; return 1; }
     S_CHECKED=$(now) S_CHECK_OK=true S_CHECK_ERROR=''
     rid=$(latest_id); a=$(arch)
-    [ -n "$rid" ] && [ -n "$a" ] || { finish false "$rid" "установка не начата: неизвестен выпуск или арка роутера"; return 1; }
+    if [ -z "$rid" ] || [ -z "$a" ]; then
+        finish false "$rid" "установка не начата: неизвестен выпуск или арка роутера"; return 1
+    fi
     [ "$rid" != "$(current_id)" ] || { finish true "$rid" "выпуск $rid уже установлен"; return 0; }
     if [ "$1" != manual ] && [ "$rid" = "$(field bad_release)" ]; then
         finish false "$rid" "выпуск $rid однажды не прошёл проверку — ночью не ставится, только вручную"; return 1
