@@ -129,7 +129,8 @@ static void test_idle_stream_storage_is_bounded(void) {
     tg_stream_table table; tg_stream_table_init(&table,TG_STREAM_MAX,16u*1024u*1024u,0);
     size_t accepted=0;tg_stream *first=NULL,*s;
     while((s=tg_stream_open(&table))!=NULL){
-        if(!first)first=s;accepted++;assert(table.memory_bytes<=table.memory_cap);
+        if(!first) { first=s; }
+        accepted++;assert(table.memory_bytes<=table.memory_cap);
     }
     assert(accepted>0 && accepted<TG_STREAM_MAX);
     tg_stream_remove(&table,first);

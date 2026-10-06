@@ -18,7 +18,8 @@ static void stream_free(tg_stream *s){
     if(!s)return;
     if(s->table){s->table->queued_bytes-=s->to_local.bytes;
         s->table->memory_bytes-=sizeof(*s)+s->to_local.memory_bytes;}
-    if(s->fd>=0)close(s->fd);tg_queue_clear(&s->to_local);free(s);
+    if(s->fd>=0) { close(s->fd); }
+    tg_queue_clear(&s->to_local);free(s);
 }
 void tg_stream_table_destroy(tg_stream_table *t) {
     if(!t)return;
@@ -73,7 +74,8 @@ void tg_stream_connect_fail(tg_stream_table *t,tg_stream *s){
 }
 int tg_stream_send_data(tg_stream *s,const uint8_t *data,size_t len){
     if(!s||(!data&&len)||!s->connected||s->remote_closed)return -1;
-    if(len>s->send_credit)return TG_STREAM_NO_CREDIT;s->send_credit-=len;return 0;
+    if(len>s->send_credit) { return TG_STREAM_NO_CREDIT; }
+    s->send_credit-=len;return 0;
 }
 int tg_stream_queue_remote_data(tg_stream *s,const uint8_t *data,size_t len){
     if(!s||s->remote_closed||s->session_lost||!s->table)return -1;
@@ -85,7 +87,8 @@ int tg_stream_queue_remote_data(tg_stream *s,const uint8_t *data,size_t len){
     s->table->queued_bytes+=len;s->recv_unacked+=len;return 0;
 }
 int tg_stream_pop_local(tg_stream *s,uint8_t *dst,size_t cap,size_t *written){
-    if(!s)return -1;size_t memory_before=s->to_local.memory_bytes;
+    if(!s) { return -1; }
+    size_t memory_before=s->to_local.memory_bytes;
     int rc=tg_queue_pop(&s->to_local,dst,cap,written);
     if(rc==0&&s->table){s->table->queued_bytes-=*written;
         s->table->memory_bytes-=memory_before-s->to_local.memory_bytes;}

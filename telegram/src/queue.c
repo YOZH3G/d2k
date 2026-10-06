@@ -19,7 +19,9 @@ int tg_queue_push(tg_byte_queue *q,const uint8_t *data,size_t len,size_t memory_
     tg_queue_node *n=calloc(1,sizeof(*n)); if(!n)return -1;
     n->data=malloc(len); if(!n->data){free(n);return -1;}
     memcpy(n->data,data,len);n->len=len;
-    if(q->tail)q->tail->next=n;else q->head=n;q->tail=n;q->bytes+=len;
+    if(q->tail) { q->tail->next=n; }
+    else { q->head=n; }
+    q->tail=n;q->bytes+=len;
     q->memory_bytes+=len+sizeof(*n);return 0;
 }
 int tg_queue_pop(tg_byte_queue *q,uint8_t *dst,size_t cap,size_t *written) {

@@ -184,7 +184,7 @@ static int run_daemon(const char *config_path) {
         else {healthy=0;failures++;fast_deaths++;}
         if(tg_reconnect_needs_reregister(fast_deaths)){int rer=ensure_registered(&cfg,&url,&identity);fast_deaths=0;identity_registered=rer==0;if(rer!=0)log_msg("identity re-registration after repeated fast session deaths failed");}
         if(!stop_requested){
-            if(tunnel_rc<0)log_msg("relay session ended; reconnecting");
+            if(tunnel_rc<0) { log_msg("relay session ended; reconnecting"); }
             (void)write_status(cfg.status_path,"connecting\n");
             interruptible_wait(tg_reconnect_delay_ms(failures,0,healthy,random_unit()));
         }
@@ -251,7 +251,7 @@ static int check_instagram_ip(const char *host,const char *ip,const char *ca) {
     int fd=tg_tcp_connect_ipv4(ip,443,3000);
     SSL *ssl=fd<0?NULL:tg_tls_connect_fd_sni(ctx,fd,verify,"example.com");
     int rc=ssl?0:1;
-    if(ssl)puts("Meta edge reachable; certificate verified (not a bypass verdict)");
+    if(ssl) { puts("Meta edge reachable; certificate verified (not a bypass verdict)"); }
     SSL_free(ssl);SSL_CTX_free(ctx);if(fd>=0)close(fd);alarm(0);return rc;
 }
 

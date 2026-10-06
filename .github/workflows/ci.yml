@@ -24,6 +24,16 @@ jobs:
       - name: ASan и UBSan HTTP-handler
         run: make -C panel san
 
+  telegram:
+    name: Telegram — GCC warnings and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: OpenSSL development headers
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
+      - name: GCC with Wall, Wextra and Werror
+        run: make -C telegram gcc-warn
+
   shell:
     name: Скрипты
     # lab-install.sh ставит настоящий C runtime под ARM64: нужен ARM-раннер.

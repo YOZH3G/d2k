@@ -26,7 +26,8 @@ int tg_ws_pump_init(tg_ws_pump *p,SSL *ssl) {
 }
 
 void tg_ws_pump_destroy(tg_ws_pump *p) {
-    if(!p)return;release_frames(p,p->tx_head);free(p->rx);memset(p,0,sizeof(*p));p->fd=-1;
+    if(!p) { return; }
+    release_frames(p,p->tx_head);free(p->rx);memset(p,0,sizeof(*p));p->fd=-1;
 }
 
 static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,size_t len) {
@@ -38,7 +39,9 @@ static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,size_t 
     f->bytes=OPENSSL_malloc(alloc);if(!f->bytes){free(f);return -1;}
     if(tg_ws_encode_client_frame(f->bytes,alloc,opcode,data,len,&written)!=0){OPENSSL_clear_free(f->bytes,alloc);free(f);return -1;}
     f->len=written;f->allocated=alloc;
-    if(p->tx_tail)p->tx_tail->next=f;else p->tx_head=f;p->tx_tail=f;p->tx_bytes+=written;
+    if(p->tx_tail) { p->tx_tail->next=f; }
+    else { p->tx_head=f; }
+    p->tx_tail=f;p->tx_bytes+=written;
     p->tx_memory_bytes+=alloc+sizeof(*f);
     return 0;
 }
@@ -69,7 +72,8 @@ static int complete_frame(const uint8_t *b,size_t len,size_t *total) {
 
 static int dispatch_frames(tg_ws_pump *p,tg_ws_message_cb callback,void *ctx) {
     while(p->rx_len){size_t total=0;int ready=complete_frame(p->rx,p->rx_len,&total);
-        if(ready<0)return -1;if(ready==0)return 0;
+        if(ready<0) { return -1; }
+        if(ready==0) { return 0; }
         uint8_t op;const uint8_t *data;size_t len,used;
         if(tg_ws_decode_server_frame(p->rx,total,TG_WS_MAX_MESSAGE,&op,&data,&len,&used)!=0||used!=total)return -1;
         if(op==TG_WS_PING){if(queue_opcode(p,TG_WS_PONG,data,len)!=0)return -1;}

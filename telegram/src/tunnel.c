@@ -28,7 +28,8 @@ static uint64_t monotonic_ms(void) {
 }
 
 static int queue_mux(tg_ws_pump *pump,uint16_t id,uint8_t type,const uint8_t *payload,size_t len) {
-    if(len>65535)return -1;uint8_t *frame=malloc(len+3);if(!frame)return -1;
+    if(len>65535) { return -1; }
+    uint8_t *frame=malloc(len+3);if(!frame)return -1;
     size_t n=tg_mux_encode(frame,len+3,id,type,payload,len);
     int rc=n?tg_ws_pump_queue_binary(pump,frame,n):-1;free(frame);return rc;
 }
@@ -129,7 +130,8 @@ static void start_waiting_connects(tg_stream_table *table,tg_ws_pump *pump,uint6
 }
 
 static void send_window_if_due(const tg_tunnel_config *cfg,tg_ws_pump *pump,tg_stream *s,uint32_t written) {
-    if(!cfg->protocol_v2)return;uint32_t credit=0;
+    if(!cfg->protocol_v2) { return; }
+    uint32_t credit=0;
     if(tg_stream_local_write_complete(s,written,&credit)!=0||!credit)return;
     uint8_t payload[4];(void)tg_window_encode(payload,credit);
     (void)queue_mux(pump,s->id,MUX_WINDOW,payload,sizeof(payload));

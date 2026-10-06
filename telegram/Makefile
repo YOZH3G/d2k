@@ -2,7 +2,7 @@ CC ?= cc
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Werror -pedantic
 RELEASE_ID ?= dev
-CPPFLAGS += -Iinclude -DD2K_RELEASE_ID='"$(RELEASE_ID)"'
+CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Iinclude -DD2K_RELEASE_ID='"$(RELEASE_ID)"'
 BUILD_DIR ?= build
 OPENSSL_CFLAGS ?= $(shell pkg-config --cflags openssl 2>/dev/null)
 OPENSSL_LIBS ?= $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
@@ -72,3 +72,9 @@ arm64:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# GCC проверяет весь runtime и тесты с теми же строгими предупреждениями.
+.PHONY: gcc-warn
+gcc-warn:
+	$(MAKE) clean
+	$(MAKE) CC=gcc test d2ktg
