@@ -1,0 +1,18 @@
+layout overlap-regression {"overflow":false,"bad":[],"overlaps":["reapply"]}
+AssertionError [ERR_ASSERTION]: overlap-regression controls must not overlap the brand, engine status or one another
++ actual - expected
+
++ [
++   'reapply'
++ ]
+- []
+
+    at checkLayout (/home/runner/work/d2k/d2k/panel/test_browser.cjs:78:11)
+    at async main (/home/runner/work/d2k/d2k/panel/test_browser.cjs:87:35) {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: [Array],
+  expected: [],
+  operator: 'deepStrictEqual',
+  diff: 'simple'
+}
