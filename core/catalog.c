@@ -1385,12 +1385,13 @@ int d2k_catalog_save(const d2k_catalog *c, const char *path, char *err, size_t e
     return 0;
 }
 
-/* Same-directory rename preserves visibility; fsync establishes durability. */
+/* rename в том же каталоге делает замену атомарной, fsync закрепляет её на диске. */
 int d2k_catalog_save_atomic(const d2k_catalog *cat, const char *path,
                             char *err, size_t errcap) {
     char tmp[D2K_CATALOG_PATH_MAX + sizeof(".new")], dir[D2K_CATALOG_PATH_MAX];
     if (!path || strlen(path) >= sizeof dir) {
-        set_err(err, errcap, "слишком длинный путь каталога"); return -1;
+        set_err(err, errcap, "слишком длинный путь каталога (максимум %u байт)",
+                (unsigned)(D2K_CATALOG_PATH_MAX - 1)); return -1;
     }
     snprintf(tmp, sizeof tmp, "%s.new", path);
     if (d2k_catalog_save(cat, tmp, err, errcap) != 0) {

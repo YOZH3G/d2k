@@ -99,11 +99,6 @@ static int64_t now_ms(void) {
 /* Атомарное сохранение: временный файл рядом, затем rename. Рядом, а не в
    /tmp — rename между файловыми системами не работает, а /opt и /tmp на
    роутере разные (tmpfs). */
-/* Потолок пути каталога. Не «сколько влезет»: err у вызывающего 512 байт, и
-   путь обязан помещаться в сообщение об ошибке целиком — иначе причина отказа
-   приезжает обрезанной ровно тогда, когда она нужна (gcc ловит это как
-   format-truncation, цель cross). */
-
 static int save_atomic(const d2k_catalog *cat, const char *path,
                        char *err, size_t errcap) {
     return d2k_catalog_save_atomic(cat, path, err, errcap);
