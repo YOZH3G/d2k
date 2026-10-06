@@ -484,7 +484,7 @@
     function write(id, value) { var node = self.$(id); if (node.textContent !== value) node.textContent = value; return node; }
     var body = this.$("updates-body");
     if (body.setAttribute) body.setAttribute("data-mode", absent ? "absent" : "ready");
-    write("update-current", absent ? "без автообновления" : current ? "версия " + current : "версия не определена");
+    write("update-current", absent ? "без автообновления" : current || "не определена");
     var state = this.$("update-state"), changed = state.textContent !== text;
     write("update-state", text);
     if (state.parentElement) state.parentElement.setAttribute("data-tone", tone);

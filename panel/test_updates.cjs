@@ -30,7 +30,7 @@ const json = (data, status=200) => ({ok:status<300,status,json:async()=>data});
     assert.equal(nodes['update-install'].hidden, false);
     assert.equal(nodes['update-install'].disabled, false);
     assert.equal(nodes['update-notes-text'].textContent, '<img src=x onerror=alert(1)>');
-    assert.equal(nodes['update-current'].textContent, 'версия r1');
+    assert.equal(nodes['update-current'].textContent, 'r1', 'подпись «Версия» уже в разметке');
     assert.equal(nodes['update-auto'].checked, true);
     assert.equal(nodes['nav-updates'].textContent, 'новая');
   }
