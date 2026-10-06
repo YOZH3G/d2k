@@ -19,11 +19,51 @@ BASE=${D2K_BASE:-https://raw.githubusercontent.com/$REPO/$REF}
 DIR=/opt/d2k
 SBIN=/opt/sbin
 INIT=/opt/etc/init.d/S99d2k
+OPENWRT_INIT=/etc/init.d/d2k
+OPENWRT_STAGE=
+openwrt_check() {
+    [ -f /etc/openwrt_release ] || return 0
+    if [ ! -r /etc/rc.common ] || [ ! -r /lib/functions/procd.sh ]; then
+        echo 'd2k: OpenWrt без rc.common/procd — автозапуск недоступен' >&2
+        return 0
+    fi
+    if [ -e "$OPENWRT_INIT" ] || [ -L "$OPENWRT_INIT" ]; then
+        if [ -L "$OPENWRT_INIT" ] || [ ! -f "$OPENWRT_INIT" ] ||
+           ! grep -qx '# D2K-owned OpenWrt boot bridge v1' "$OPENWRT_INIT"; then
+            echo "d2k: чужой $OPENWRT_INIT — не перезаписываю; установка/обновление продолжится без хука" >&2
+            return 1
+        fi
+    fi
+}
+prepare_openwrt_hook() {
+    [ -f /etc/openwrt_release ] || return 0
+    openwrt_check || return 0
+    [ -r /etc/rc.common ] && [ -r /lib/functions/procd.sh ] || return 0
+    # Stage on the host filesystem before stopping/replacing the runtime.
+    OPENWRT_STAGE=$(mktemp "$OPENWRT_INIT.XXXXXX") || die "не подготовить хук OpenWrt"
+    fetch "files/d2k-openwrt-init" "$OPENWRT_STAGE"
+    if ! grep -qx '# D2K-owned OpenWrt boot bridge v1' "$OPENWRT_STAGE" ||
+       ! sh -n "$OPENWRT_STAGE" || ! chmod 0755 "$OPENWRT_STAGE"; then
+        die "неверный хук OpenWrt — прежняя установка сохранена"
+    fi
+}
+install_openwrt_hook() (
+    [ -n "$OPENWRT_STAGE" ] || exit 0
+    # Recheck ownership in case another service appeared during installation.
+    openwrt_check || exit 0
+    mv -f "$OPENWRT_STAGE" "$OPENWRT_INIT" || exit 1
+    sh /etc/rc.common "$OPENWRT_INIT" enable || exit 1
+    echo 'd2k: автозапуск OpenWrt включён (ожидание Entware, затем D2K)'
+)
 TMP=
 
 say()  { echo "d2k: $*"; }
 die()  { echo "d2k: $*" >&2; cleanup; exit 1; }
-cleanup() { [ -n "$TMP" ] && rm -rf "$TMP"; TMP=; }
+cleanup() {
+    [ -z "$OPENWRT_STAGE" ] || rm -f "$OPENWRT_STAGE"
+    [ -z "$TMP" ] || rm -rf "$TMP"
+    TMP=
+}
 trap cleanup EXIT INT TERM
 
 # --- арка ----------------------------------------------------------------
@@ -196,6 +236,7 @@ rc=0
 "$TMP/d2kc" >/dev/null 2>&1 || rc=$?
 [ "$rc" = 2 ] || die "скачанный d2kc не запускается на этой системе (код $rc)"
 say "проверено: $("$TMP/d2kpanel" --version | head -1)"
+prepare_openwrt_hook
 
 # --- остановка прежней версии --------------------------------------------
 if [ -x "$INIT" ]; then
@@ -365,5 +406,6 @@ else
     say "автообновление: новые подписанные выпуски ставятся ночью 03:00–05:00; кнопка и тумблер — в панели"
 fi
 
+install_openwrt_hook || say "предупреждение: автозапуск OpenWrt не включён; установка/обновление завершено, проверьте $OPENWRT_INIT и rc.common"
 say "готово"
 say "режим по умолчанию — активный обход (MODE=apply). Для наблюдения задайте MODE=observe."

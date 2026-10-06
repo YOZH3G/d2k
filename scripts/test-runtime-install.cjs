@@ -40,7 +40,7 @@ exit 1
   fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3\n');
   fixture('builds/d2kd-linux-amd64', '#!/bin/sh\nexit 0\n');
   for (const name of ['d2kc']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
-  fixture('files/S99d2k', '#!/bin/sh\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
+  fixture('files/S99d2k', '#!/bin/sh\nprintf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
   for (const name of ['d2k-fw-heal.sh', 'd2k-ppe-deoffload.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
   fixture('files/d2k-instagram-dns.sh', '#!/bin/sh\nprintf "dns-%s\\n" "$1" >> "$CALLS"\n');
@@ -57,7 +57,11 @@ exit 1
   for (const name of ['install', 'uninstall']) {
     const script = fs.readFileSync(name === 'install' && process.env.D2K_INSTALL_FIXTURE_SOURCE ? process.env.D2K_INSTALL_FIXTURE_SOURCE : path.join(root, `scripts/${name}.sh`), 'utf8')
       .replaceAll('/opt', path.join(tmp, 'opt'))
-      .replaceAll('/proc', path.join(tmp, 'proc'))
+      .replaceAll('/etc/openwrt_release', path.join(tmp, 'etc/openwrt_release'))
+      .replaceAll('/etc/rc.common', path.join(tmp, 'etc/rc.common'))
+      .replaceAll('/etc/init.d/d2k', path.join(tmp, 'etc/init.d/d2k'))
+      .replaceAll('/lib/functions/procd.sh', path.join(tmp, 'lib/functions/procd.sh'))
+      .replaceAll('/proc/', `${path.join(tmp, 'proc')}/`)
       .replaceAll('/tmp/d2k', runtime);
     fs.writeFileSync(path.join(tmp, `${name}.sh`), script);
   }
@@ -153,6 +157,57 @@ exit 1
   assert(fs.statSync(installed).mode & 0o111, 'installed helper must be executable');
   const ppe = path.join(tmp, 'opt/d2k/d2k-ppe-deoffload.sh');
   assert(fs.existsSync(ppe) && (fs.statSync(ppe).mode & 0o111), 'installer must install the PPE de-offload helper executable');
+  // Issue #4: OpenWrt does not boot Entware's S99d2k on its own.
+  const hostInit = path.join(tmp, 'etc/init.d/d2k');
+  assert(!fs.existsSync(hostInit), 'Keenetic install must not create a host OpenWrt service');
+  fs.mkdirSync(path.dirname(hostInit), { recursive: true });
+  fs.mkdirSync(path.join(tmp, 'lib/functions'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'etc/openwrt_release'), "DISTRIB_ID='OpenWrt'\n");
+  fs.writeFileSync(path.join(tmp, 'lib/functions/procd.sh'), '# fixture\n');
+  fs.writeFileSync(path.join(tmp, 'etc/rc.common'), '#!/bin/sh\nprintf "host-%s\\n" "$2" >> "$CALLS"\n[ "$2" != enable ] || [ "${HOST_ENABLE_FAIL:-0}" != 1 ]\n', { mode: 0o755 });
+  const templatePath = path.join(root, 'files/d2k-openwrt-init');
+  if (fs.existsSync(templatePath)) fixture('files/d2k-openwrt-init', fs.readFileSync(templatePath, 'utf8')
+    .replaceAll('/etc/rc.common', path.join(tmp, 'etc/rc.common')));
+  run('install');
+  assert(fs.existsSync(hostInit), 'OpenWrt installer must create /etc/init.d/d2k');
+  assert(calls().includes('host-enable'), 'OpenWrt installer must enable its native boot hook');
+  run('install');
+  assert(fs.existsSync(hostInit), 'OpenWrt upgrade must keep the native boot hook');
+  // Missing procd must not turn an otherwise successful update into failure.
+  const procd = path.join(tmp, 'lib/functions/procd.sh');
+  fs.rmSync(procd);
+  run('install');
+  fs.writeFileSync(procd, '# fixture\n');
+  const ownedHook = fs.readFileSync(hostInit);
+  const d2kdSource = path.join(tmp, 'source/builds/d2kd-linux-amd64');
+  const d2kdInstalled = path.join(tmp, 'opt/sbin/d2kd');
+  fs.writeFileSync(d2kdSource, '#!/bin/sh\n# next release\nexit 0\n');
+  fs.writeFileSync(hostInit, '#!/bin/sh\n# another service\n');
+  const conflict = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
+  assert.equal(conflict.status, 0, 'foreign host hook must not block a runtime update');
+  assert.match(conflict.stderr, /чужой/);
+  assert.match(fs.readFileSync(hostInit, 'utf8'), /another service/);
+  assert.deepEqual(fs.readFileSync(d2kdInstalled), fs.readFileSync(d2kdSource), 'runtime update must still complete');
+  fs.writeFileSync(hostInit, ownedHook);
+  // A bad hook is rejected BEFORE stopping or replacing a working runtime.
+  const hookSource = path.join(tmp, 'source/files/d2k-openwrt-init');
+  const hookCurrent = fs.readFileSync(hookSource);
+  fs.writeFileSync(hookSource, '#!/bin/sh\n# invalid hook\n');
+  const beforeCalls = calls(), beforeBinary = fs.readFileSync(d2kdInstalled);
+  fs.writeFileSync(d2kdSource, '#!/bin/sh\n# staged release\nexit 0\n');
+  const badHook = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
+  assert.notEqual(badHook.status, 0, 'invalid native hook must fail preflight');
+  assert.equal(calls(), beforeCalls, 'invalid hook must not stop or start the runtime');
+  assert.deepEqual(fs.readFileSync(d2kdInstalled), beforeBinary, 'invalid hook must not replace binaries');
+  assert.deepEqual(fs.readFileSync(hostInit), ownedHook, 'preflight failure must preserve installed hook');
+  assert.deepEqual(fs.readdirSync(path.dirname(hostInit)), ['d2k'], 'preflight must clean staged host files');
+  fs.writeFileSync(hookSource, hookCurrent);
+  // Enable fails after installation: report missing autostart, not a failed release.
+  const enableFailure = run('install', { HOST_ENABLE_FAIL: '1' });
+  assert.match(enableFailure, /автозапуск OpenWrt не включён/);
+  assert.deepEqual(fs.readFileSync(d2kdInstalled), fs.readFileSync(d2kdSource));
+  assert.deepEqual(fs.readdirSync(path.dirname(hostInit)), ['d2k']);
+  run('install');
   // Uninstall without init must still remove its own tagged -j PPE rules.
   fs.writeFileSync(ppe, '#!/bin/sh\nd2k_ppe_remove() { printf "ppe-remove\\n" >> "$CALLS"; }\n');
   const state = path.join(tmp, 'opt/d2k/state/catalog.json'); fs.writeFileSync(state, '{"learned":true}');
@@ -181,6 +236,8 @@ exit 1
   for (const d of [`${runtime}-fw-heal.lock`, `${runtime}-fw-operation.lock`]) { fs.mkdirSync(d); fs.writeFileSync(path.join(d, 'pid'), '2147480001'); }
   fs.rmSync(iptCalls, { force: true });
   run('uninstall', { IPT_RST: '1' });
+  assert(!fs.existsSync(hostInit), 'keep-state uninstall must remove the native boot hook');
+  assert(calls().includes('host-disable') && calls().includes('host-detach'), 'uninstall must disable the hook and cancel its waiting worker');
   assert.equal(fs.readFileSync(fastnat, 'utf8').trim(), '1', 'uninstall fallback must restore the saved fastnat value');
   const ipt = fs.readFileSync(iptCalls, 'utf8');
   for (const tool of ['iptables', 'ip6tables']) {

@@ -17,6 +17,16 @@ KEEP=${D2K_KEEP_STATE:-0}
 
 say() { echo "d2k: $*"; }
 
+# Cancel the host waiter before stopping any D2K process, so a late /opt mount
+# cannot race uninstall. detach only cancels the waiter.
+OPENWRT_INIT=/etc/init.d/d2k
+if [ ! -L "$OPENWRT_INIT" ] && [ -f "$OPENWRT_INIT" ] &&
+   grep -qx '# D2K-owned OpenWrt boot bridge v1' "$OPENWRT_INIT"; then
+    sh /etc/rc.common "$OPENWRT_INIT" disable || exit 1
+    sh /etc/rc.common "$OPENWRT_INIT" detach || exit 1
+    rm -f "$OPENWRT_INIT"
+fi
+
 # Remove only exact DNS pairs recorded by this installation. If NDM cannot
 # confirm cleanup, stop before deleting the helper/manifest so the owner can
 # retry rather than leaving unexplained static routes behind.
