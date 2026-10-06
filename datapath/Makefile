@@ -395,7 +395,7 @@ test-stun-session: test_stun_session
 # инструмент несобранным с той же строгостью, что и остальной датапат.
 SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
            -fno-omit-frame-pointer -Wall -Wextra -Werror -Iinclude -I$(CORE_DIR)/include
-san:
+san: $(CORE_DIR)/hello_profiles.inc
 	@set -e; for t in $(TESTS); do \
 		echo "== $$t =="; \
 		extra=; if [ "$$t" = test_quic_session ] || [ "$$t" = test_stun_session ] || [ "$$t" = test_udp_path ]; then extra="$(CORE_DIR)/quichello.c $(CORE_DIR)/hello.c $(CORE_DIR)/tls13core.c $(CORE_DIR)/x25519.c"; fi; \
