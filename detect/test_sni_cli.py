@@ -32,11 +32,13 @@ for hello in ["modern", "legacy"]:
                 args += ["--sni", name]
             result = subprocess.run(args, capture_output=True, text=True, check=True)
             assert emitted_sni(result.stdout) == name, "CLI silently changed the requested hostname"
-for explicit in [True, False]:
-    name = "a" * 256
-    args = ["./d2k-detect", "classify", "127.0.0.1:443" if explicit else name + ":443", "--dump-trigger"]
-    if explicit:
-        args += ["--sni", name]
-    result = subprocess.run(args, capture_output=True, text=True)
-    assert result.returncode != 0 and not result.stdout, "oversized SNI must fail explicitly"
+for length in [254, 255, 256]:
+    for explicit in [True, False]:
+        name = ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * (length - 192)])
+        assert len(name) == length
+        args = ["./d2k-detect", "classify", "127.0.0.1:443" if explicit else name + ":443", "--dump-trigger"]
+        if explicit:
+            args += ["--sni", name]
+        result = subprocess.run(args, capture_output=True, text=True)
+        assert result.returncode != 0 and not result.stdout, "oversized SNI must fail explicitly"
 print("CLI SNI: long explicit/default names preserved; oversized input rejected PASS")

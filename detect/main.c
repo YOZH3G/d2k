@@ -341,11 +341,12 @@ int main(int argc, char **argv)
             return 1;
         }
     } else {
-        char name[256];
+        /* DNS name: at most 253 bytes in its presentation form. */
+        char name[254];
         if (sni) {
             size_t n = strlen(sni);
             if (n >= sizeof name) {
-                fprintf(stderr, "classify: SNI exceeds %zu bytes\n", sizeof name - 1);
+                fprintf(stderr, "classify: SNI длиннее %zu байт\n", sizeof name - 1);
                 return 2;
             }
             memcpy(name, sni, n + 1);
@@ -355,7 +356,7 @@ int main(int argc, char **argv)
             const char *colon = strrchr(addr, ':');
             size_t n = colon ? (size_t)(colon - addr) : strlen(addr);
             if (n >= sizeof(name)) {
-                fprintf(stderr, "classify: hostname exceeds %zu bytes\n", sizeof name - 1);
+                fprintf(stderr, "classify: имя узла длиннее %zu байт\n", sizeof name - 1);
                 return 2;
             }
             memcpy(name, addr, n);
