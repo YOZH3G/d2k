@@ -48,10 +48,17 @@ test-header-deadline: test_header_deadline
 test_header_deadline: test_header_deadline.c server.c server.h
 	$(CC) $(CFLAGS) -DD2K_PANEL_HEADER_TIMEOUT_MS=100 -o $@ test_header_deadline.c
 
+.PHONY: test-response-deadline
+test: test-response-deadline
+test-response-deadline: test_response_deadline
+	./test_response_deadline
+test_response_deadline: test_response_deadline.c server.c server.h
+	$(CC) $(CFLAGS) -DD2K_PANEL_RESPONSE_TIMEOUT_MS=100 -o $@ test_response_deadline.c
+
 .PHONY: clean-header-deadline
 clean: clean-header-deadline
 clean-header-deadline:
-	$(RM) test_header_deadline
+	$(RM) test_header_deadline test_response_deadline
 
 test-js:
 	node test_ui.cjs
@@ -67,4 +74,3 @@ test: test_server d2kpanel test-js
 
 clean:
 	rm -f test_server test_server_san d2kpanel
-
