@@ -449,6 +449,11 @@ live entry. Copy+rename from the retained snapshot is restartable; interrupted
 restore never consumes the source. An incomplete snapshot is ignored and the
 old live state remains authoritative. Successful late rollback uses a new
 snapshot of current compatible state and never reuses the old pre-install data.
+After a durable COMMITTED, still under the lock, the transaction prunes
+`releases/` to the new and old (rollback target) IDs and `snapshots/` to its
+own operation. Each doomed entry is renamed to `.gc-<name>` and synced before
+removal; leftover `.gc-*` is finished by the next commit, other dot entries
+(`.stage-*`) are left alone. Pruning is best effort and never changes the result.
 
 `current` changes via a temporary relative symlink, rename and parent fsync.
 The old worker continues running from its original inode through switching.

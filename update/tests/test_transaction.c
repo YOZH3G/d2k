@@ -65,6 +65,39 @@ static void space_accounting(void) {
     assert(d2ku_install(&f.c, &f.r, &s) == D2KU_OK);
     cleanup(&f);
 }
+static int exists(fixture *f, const char *p) {
+    struct stat st;
+    return !fstatat(f->c.root_dirfd, p, &st, AT_SYMLINK_NOFOLLOW);
+}
+/* Every update lays down a whole release and a personal-state snapshot; on a
+ * router's flash they must not pile up. A commit keeps only the running
+ * release, the one rollback returns to and its own snapshot. */
+static void retention(void) {
+    fixture f;
+    d2ku_status s = {0};
+    setup(&f);
+    assert(!mkdirat(f.c.root_dirfd, "releases/Z", 0700));
+    put(f.c.root_dirfd, "releases/Z/d2k-update", "older");
+    assert(!mkdirat(f.c.root_dirfd, "releases/.stage-other", 0700));
+    assert(!mkdirat(f.c.root_dirfd, "snapshots", 0700));
+    assert(!mkdirat(f.c.root_dirfd, "snapshots/older-operation", 0700));
+    put(f.c.root_dirfd, "snapshots/older-operation/seal", "x");
+    assert(d2ku_install(&f.c, &f.r, &s) == D2KU_OK);
+    current(&f, "releases/B");
+    assert(exists(&f, "releases/A") && exists(&f, "releases/B"));
+    assert(!exists(&f, "releases/Z"));
+    assert(exists(&f, "releases/.stage-other"));
+    assert(!exists(&f, "snapshots/older-operation"));
+    assert(exists(&f, "snapshots/operation-1"));
+    /* A failed update removes nothing: the old release is still running. */
+    cleanup(&f);
+    setup(&f);
+    assert(!mkdirat(f.c.root_dirfd, "releases/Z", 0700));
+    f.failed = 1;
+    assert(d2ku_install(&f.c, &f.r, &s) == D2KU_HEALTH);
+    assert(exists(&f, "releases/Z") && exists(&f, "releases/A"));
+    cleanup(&f);
+}
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--boot-probe")) {
         char mode[16] = {0};
@@ -85,6 +118,7 @@ int main(int argc, char **argv) {
     }
 
     space_accounting();
+    retention();
     fixture f;
     d2ku_status s = {0};
     d2ku_journal j;

@@ -490,6 +490,46 @@ static d2ku_rc remove_tree(int at, const char *name) {
         r = D2KU_IO;
     return r;
 }
+/* Drops every entry of `parent` except the named ones. An entry is first
+ * renamed to `.gc-<name>` and only then removed, so power loss never leaves a
+ * half-deleted release under its real ID (prepare would then refuse it as a
+ * receipt mismatch forever). Leftover `.gc-*` from such a loss is finished
+ * here; other dot entries (`.stage-*` of a concurrent prepare) stay. */
+static void prune(d2ku_ctx *c, const char *parent, const char *keep_a,
+                  const char *keep_b) {
+    int all = directory(c->root_dirfd, parent);
+    if (all < 0)
+        return;
+    DIR *dp = fdopendir(dup(all));
+    if (!dp) {
+        close(all);
+        return;
+    }
+    char doomed[64][D2KU_ID_MAX + 8];
+    size_t n = 0;
+    struct dirent *e;
+    while ((e = readdir(dp)) && n < 64) {
+        const char *name = e->d_name;
+        if (!strncmp(name, ".gc-", 4) && valid_id(name + 4)) {
+            snprintf(doomed[n++], sizeof doomed[0], "%s", name);
+            continue;
+        }
+        if (!valid_id(name) || !strcmp(name, keep_a) ||
+            (keep_b && !strcmp(name, keep_b)))
+            continue;
+        char gc[D2KU_ID_MAX + 8];
+        snprintf(gc, sizeof gc, ".gc-%s", name);
+        if (remove_tree(all, gc) == D2KU_OK &&
+            !renameat(all, name, all, gc) && syncfd(c, all) == D2KU_OK)
+            snprintf(doomed[n++], sizeof doomed[0], "%s", gc);
+    }
+    closedir(dp);
+    for (size_t k = 0; k < n; k++)
+        (void)remove_tree(all, doomed[k]);
+    if (n)
+        (void)syncfd(c, all);
+    close(all);
+}
 static int personal_name(const char *p) {
     static const char *denied[] = {
         "update", "update-state", "releases", "current",   "boot",      "run",
@@ -1551,8 +1591,13 @@ static d2ku_rc execute(d2ku_ctx *c, const d2ku_request *r, d2ku_status *s,
     if (rc != D2KU_OK)
         goto recover;
     rc = d2ku_tx_phase(c, &j, D2KU_COMMITTED);
-    if (rc == D2KU_OK)
+    if (rc == D2KU_OK) {
+        /* Still under maintenance: keep the running release, the rollback
+         * target and this operation's snapshot; nothing else is reachable. */
+        prune(c, "releases", j.new_release_id, j.old_release_id);
+        prune(c, "snapshots", j.transaction_id, NULL);
         goto out;
+    }
     /* A failed terminal directory fsync may leave COMMITTED visible. Force an
      * explicit rollback intent using the actual latest sequence before
      * recovery; never interpret the failed store as proof that the old slot is
