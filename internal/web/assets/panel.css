@@ -57,6 +57,7 @@
 
   --gutter: clamp(16px, 3vw, 40px);
   --mast-h: 72px;
+  --mast-offset: var(--mast-h);
   --ease-out: cubic-bezier(.16, 1, .3, 1);
   color-scheme: light;
 }
@@ -100,7 +101,7 @@
 
 html {
   -webkit-text-size-adjust: 100%;
-  scroll-padding-top: calc(var(--mast-h) + 24px);
+  scroll-padding-top: calc(var(--mast-offset) + 24px);
   scrollbar-color: var(--rule) var(--paper);
 }
 
@@ -263,7 +264,7 @@ svg { flex: none; }
 }
 
 .index {
-  position: sticky; top: calc(var(--mast-h) + 1px);
+  position: sticky; top: calc(var(--mast-offset) + 1px);
   align-self: start;
   display: flex; flex-direction: column;
   padding: 36px 0;
@@ -914,8 +915,13 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
 
 @media (max-width: 1080px) {
   .frame { grid-template-columns: minmax(0, 1fr); }
+  .mast { grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; }
+  .mast-state { grid-column: 1 / -1; grid-row: 2; }
+  .mast-actions { grid-column: 2; grid-row: 1; min-width: 0; }
+  .mast-host { display: none; }
+  :root { --mast-h: 112px; }
   .index {
-    position: sticky; top: calc(var(--mast-h) + 1px); z-index: 10;
+    position: sticky; top: calc(var(--mast-offset) + 1px); z-index: 10;
     flex-direction: row; gap: 4px; overflow-x: auto; scrollbar-width: none;
     margin: 0 calc(var(--gutter) * -1); padding: 10px var(--gutter);
     background: color-mix(in srgb, var(--paper) 94%, transparent);
@@ -931,7 +937,7 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
   .index a[aria-current="true"] span::before { display: none; }
   .has-gsap .index-marker { border-radius: 999px; }
   .index a[aria-current="true"] b { color: inherit; opacity: .7; }
-  html { scroll-padding-top: calc(var(--mast-h) + 80px); }
+  html { scroll-padding-top: calc(var(--mast-offset) + 80px); }
 }
 
 @media (max-width: 1360px) {
@@ -953,14 +959,10 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
   .bindings td.c-proto::after { content: " · " attr(data-tail); }
   .bindings td.c-wins, .bindings td.c-when { display: none; }
   .notice { display: block; }
-  .mast { grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; }
-  .mast-state { grid-column: 1 / -1; grid-row: 2; }
-  .mast-actions { grid-column: 2; grid-row: 1; min-width: 0; }
   .mast-actions .btn:not([data-variant="confirm"]):not([data-variant="ghost"]) span,
   .mast-actions .btn .btn-label-long { display: none; }
   .mast-actions .btn:not([data-variant="confirm"]):not([data-variant="ghost"]),
   .mast-actions .btn:has(.btn-label-long) { width: 44px; padding: 0; }
-  .mast-host { display: none; }
   .sheet-head { grid-template-columns: minmax(0, 1fr); }
   .diag { grid-template-columns: minmax(0, 1fr); }
   :root { --mast-h: 112px; }

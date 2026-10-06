@@ -309,8 +309,24 @@
     this.$ = function (id) { return doc.getElementById(id); };
   }
 
+  App.prototype.trackMastHeight = function () {
+    var doc = this.doc, win = this.win;
+    var mast = doc.querySelector && doc.querySelector(".mast");
+    var root = doc.documentElement;
+    if (!mast || !root || !root.style || !root.style.setProperty) return;
+    var update = function () {
+      root.style.setProperty("--mast-offset", Math.ceil(mast.getBoundingClientRect().height) + "px");
+    };
+    update();
+    if (win.ResizeObserver) {
+      this.mastObserver = new win.ResizeObserver(update);
+      this.mastObserver.observe(mast);
+    } else { win.addEventListener("resize", update); }
+  };
+
   App.prototype.start = function () {
     var self = this, doc = this.doc, win = this.win;
+    this.trackMastHeight();
     var input = this.$("filter");
     input.addEventListener("input", function () {
       self.filter = input.value.trim().toLowerCase();

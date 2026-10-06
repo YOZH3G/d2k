@@ -73,7 +73,7 @@ jobs:
             exit 1
           fi
           cat "$D2K_CAPTURE_DIR/browser.log"
-          node -e 'const fs=require("node:fs");const log=fs.readFileSync(process.env.D2K_CAPTURE_DIR+"/browser.log","utf8");if(!log.includes("controls must not overlap the brand or one another"))throw Error("Baseline failed for a reason other than the masthead overlap")'
+          node -e 'const fs=require("node:fs");const log=fs.readFileSync(process.env.D2K_CAPTURE_DIR+"/browser.log","utf8");if(!log.includes("controls must not overlap the brand, engine status or one another"))throw Error("Baseline failed for a reason other than the masthead overlap")'
       - name: Save screenshots and browser logs
         if: always()
         uses: actions/upload-artifact@v7
