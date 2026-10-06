@@ -43,6 +43,7 @@ san: test_server_san
 test-js:
 	node test_ui.cjs
 	node test_poll.cjs
+	node test_status_cache.cjs
 	node test_updates.cjs
 
 test-cli: d2kpanel
@@ -55,3 +56,12 @@ test: test_server d2kpanel test-js
 clean:
 	rm -f test_server test_server_san d2kpanel
 
+.PHONY: test-status-cache clean-status-cache
+test: test-status-cache
+test-status-cache: test_status_cache
+	./test_status_cache
+test_status_cache: test_status_cache.c server.c server.h
+	$(CC) $(CFLAGS) -o $@ test_status_cache.c
+clean: clean-status-cache
+clean-status-cache:
+	$(RM) test_status_cache

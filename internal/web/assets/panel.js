@@ -4,6 +4,7 @@
   "use strict";
 
   var POLL_MS = 2000;
+  var IDLE_POLL_MS = 6000;
   var STALE_MS = 9000;
 
   /* ─── Словарь ─── */
@@ -298,6 +299,8 @@
     this.doc = doc;
     this.win = win;
     this.status = null;
+    this.catalogRevision = null;
+    this.lastPoll = 0;
     this.received = 0;
     this.lastOk = 0;
     this.failed = false;
@@ -345,20 +348,35 @@
     this.poll();
     this.initUpdates();
     this.checkUpdates(false);
-    win.setInterval(function () { if (!doc.hidden) self.poll(); }, POLL_MS);
+    win.setInterval(function () { if (!doc.hidden) self.poll(true); }, POLL_MS);
     win.setInterval(function () { if (!doc.hidden) self.pollUpdates(); }, POLL_MS);
     win.setInterval(function () { self.tick(); }, 1000);
   };
 
-  App.prototype.poll = function () {
+  App.prototype.poll = function (scheduled) {
     var self = this;
     if (this.inflight) return;
+    var idle = this.m && !this.m.hunting &&
+      (!this.m.snap.engine_running || this.m.linked) &&
+      this.m.snap.control_state !== "running" && !this.pending && !this.failed;
+    if (scheduled && idle && Date.now() - this.lastPoll < IDLE_POLL_MS) return;
+    this.lastPoll = Date.now();
     this.inflight = true;
     var ctrl = typeof AbortController === "function" ? new AbortController() : null;
     var timer = this.win.setTimeout(function () { if (ctrl) ctrl.abort(); }, 5000);
-    this.win.fetch("/api/status", { cache: "no-store", signal: ctrl ? ctrl.signal : undefined })
+    var url = "/api/status" + (this.catalogRevision ? "?catalog_revision=" + encodeURIComponent(this.catalogRevision) : "");
+    this.win.fetch(url, { cache: "no-store", signal: ctrl ? ctrl.signal : undefined })
       .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
       .then(function (data) {
+        if (data.catalog_unchanged === true) {
+          if (!self.status || !self.status.knowledge || !data.knowledge ||
+              !data.catalog_revision || data.catalog_revision !== self.status.catalog_revision) {
+            throw new Error("catalog cache mismatch");
+          }
+          data.knowledge.boxes = self.status.knowledge.boxes;
+          data.knowledge.groups = self.status.knowledge.groups;
+        }
+        self.catalogRevision = typeof data.catalog_revision === "string" ? data.catalog_revision : null;
         self.status = data;
         self.received = Date.now();
         self.lastOk = self.received;
@@ -366,6 +384,7 @@
         self.render();
       })
       .catch(function () {
+        self.catalogRevision = null;
         self.failed = true;
         self.renderNotice();
       })

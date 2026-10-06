@@ -130,7 +130,7 @@ async function main(){
   // Опрос не сбрасывает раскрытые подробности, фокус и фильтр.
   await evaluate('document.querySelector(".plan").open=true');
   await evaluate('document.querySelector("[data-control=restart]").focus();window.restartBefore=document.querySelector("[data-control=restart]")');
-  const polls='performance.getEntriesByType("resource").filter(e=>e.name.endsWith("/api/status")).length';
+  const polls='performance.getEntriesByType("resource").filter(e=>new URL(e.name).pathname==="/api/status").length';
   const before=await evaluate(polls);
   await until(polls+'>='+(before+2),'panel must keep polling');
   assert.equal(await evaluate('document.querySelector(".plan").open'),true,'open plan survives polling');
