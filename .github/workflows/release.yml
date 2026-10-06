@@ -46,7 +46,7 @@ jobs:
           tar -xJf zig14.tar.xz
           echo "ZIG=$RUNNER_TEMP/zig-x86_64-linux-0.16.0/zig" >> "$GITHUB_ENV"
           echo "ZIG_MIPS64EL=$RUNNER_TEMP/zig-x86_64-linux-0.14.1/zig" >> "$GITHUB_ENV"
-          sha=$(git rev-parse --short=7 HEAD)
+          sha=$(git -C "$GITHUB_WORKSPACE" rev-parse --short=7 HEAD)
           echo "RELEASE_ID=d2k-$(date -u +%Y%m%d-%H%M)-$sha" >> "$GITHUB_ENV"
           echo "VERSION=$(date -u +%d.%m.%Y) ($sha)" >> "$GITHUB_ENV"
       - name: Сборка девяти арок и проверки под QEMU
