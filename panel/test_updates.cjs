@@ -1,129 +1,120 @@
 "use strict";
-// Real updater JSON contract + panel DOM/action lifecycle; no router access.
+// Раздел «Обновления»: состояние из d2k-update.sh (state/update.json) и
+// команды службы /api/control/update-*; без роутера.
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
 const { App } = require('../internal/web/assets/panel.js');
-const ids = ['updates-body','nav-updates','update-current','update-state','update-reason','update-checked','update-release','update-version','update-notes','update-notes-text','update-progress','update-progress-text','update-check','update-install','update-warning','update-auto','update-schedule','update-result','update-action'];
-function fixture() {
-  const nodes = Object.fromEntries(ids.map(id => [id, {textContent:'',hidden:false,disabled:false,checked:false,style:{},attrs:{},listeners:{},setAttribute(k,v){this.attrs[k]=v;},removeAttribute(k){delete this.attrs[k];},addEventListener(k,v){this.listeners[k]=v;}}]));
-  const requests=[];
-  const document={hidden:false,getElementById:id=>nodes[id]};
-  const window={crypto:require('node:crypto').webcrypto,setTimeout,clearTimeout,fetch:async (url,opts={})=>{requests.push({url,...opts,body:opts.body&&JSON.parse(opts.body)});return {ok:true,status:202,json:async()=>status()};}};
-  return {app:new App(document,window),nodes,requests,window,document};
+const ids = ['updates-body','nav-updates','update-current','update-state','update-reason','update-checked','update-release','update-version','update-notes','update-notes-text','update-progress','update-progress-text','update-check','update-install','update-warning','update-auto','update-schedule','update-result','update-action','update-lamp'];
+function fixture(reply) {
+  const nodes = Object.fromEntries(ids.map(id => [id, {textContent:'',hidden:false,disabled:false,checked:false,style:{},attrs:{},listeners:{},parentElement:{setAttribute(){}},setAttribute(k,v){this.attrs[k]=v;},getAttribute(k){return this.attrs[k];},addEventListener(k,v){this.listeners[k]=v;}}]));
+  const requests = [];
+  const document = {hidden:false,getElementById:id=>nodes[id]};
+  const window = {setTimeout,clearTimeout,fetch:async (url,opts={})=>{requests.push({url,method:opts.method});return reply(url,opts);}};
+  const app = new App(document, window);
+  app.initUpdates();
+  return {app,nodes,requests,window};
 }
-function status(over={}) { return {state:'available',operation_id:'check-one',phase:2,busy:false,received_bytes:0,total_bytes:0,current:{release_id:'installed'},previous:null,available:{release_id:'shown',manifest_sha256:'a'.repeat(64),version:'1.2.3',notes:'<img src=x onerror=alert(1)>',compatible:true},check:{cached:true,fresh:true,result:0,last_success_utc:1791150000},last_result:0,last_error:'',settings:{enabled:true,window_start:180,window_end:300,timezone:'Europe/Volgograd',selected_date:20261006,selected_minute:203},...over}; }
-async function reviewRegressions() {
-  const failures = [];
-  async function run(name, test) {
-    try { await test(); console.log('review regression PASS: ' + name); }
-    catch (error) { failures.push(error); console.error('review regression FAIL: ' + name + '\n' + error.message); }
-  }
-  for (const [action, code, expected] of [
-    ['install', 403, 'Управление обновлениями отключено или запрос не разрешён.'],
-    ['settings', 409, 'Выбор или операция изменились. Проверьте состояние и повторите действие.']
-  ]) {
-    await run(action + code + ' survives unrelated successful polling', async () => {
-      const {app, nodes, window} = fixture();
-      app.initUpdates(); app.renderUpdates(status());
-      const posts = [];
-      window.fetch = async (url, options) => {
-        if (options.method === 'POST') {
-          const body = JSON.parse(options.body); posts.push({url, body});
-          if (url.endsWith('/check')) return {ok:true, status:202, json:async()=>status({operation_id:body.operation_id})};
-          return {ok:false, status:code, json:async()=>code === 403 ? {error:'control_forbidden'} : status({operation_id:'another-operation'})};
-        }
-        return {ok:true, status:200, json:async()=>status({
-          operation_id:'another-operation',
-          last_installation:{operation_id:'other-install', release_id:'other-release', result:0, phase:10, completed_utc:1791150100, reason:''}
-        })};
-      };
-      if (action === 'install') await nodes['update-install'].listeners.click();
-      else { nodes['update-auto'].checked=false; await nodes['update-auto'].listeners.change(); }
-      assert.equal(nodes['update-action'].textContent, expected, 'POST rejection must be explained');
-      await app.pollUpdates(); await app.pollUpdates();
-      assert.equal(nodes['update-action'].textContent, expected, 'unrelated successful GET must retain action error');
-      assert.equal(nodes['update-action'].hidden, false, 'refusal must remain visible');
-      assert.equal(nodes['update-version'].textContent, 'Что изменилось в 1.2.3');
-      assert.equal(posts.length, 1, 'polling must not resend rejected action');
-      await app.checkUpdates(true);
-      assert.equal(nodes['update-action'].hidden, true, 'next explicit accepted action replaces prior refusal');
-    });
-  }
-  for (const retained of [false, true]) {
-    await run('lost install resolves only matching ' + (retained ? 'retained outcome' : 'terminal status'), async () => {
-      const {app, nodes, window} = fixture();
-      app.initUpdates(); app.renderUpdates(status());
-      let operation, outcome = false, posts = 0;
-      window.fetch = async (url, options) => {
-        if (options.method === 'POST') { posts++; operation=JSON.parse(options.body).operation_id; throw Error('response lost'); }
-        const data = outcome ? retained ? status({operation_id:'later-check', last_installation:{operation_id:operation, release_id:'shown', result:0, phase:10, completed_utc:1791150100, reason:''}}) : status({operation_id:operation, busy:false, phase:10, state:'current', current:{release_id:'shown'}}) : status({operation_id:operation, busy:true, phase:3, received_bytes:25, total_bytes:100});
-        return {ok:true, status:200, json:async()=>data};
-      };
-      await nodes['update-install'].listeners.click();
-      assert.match(nodes['update-action'].textContent, /Ответ на установку потерян/, 'matching in-flight status is not an outcome');
-      assert.equal(nodes['update-action'].hidden, false);
-      outcome=true; await app.pollUpdates();
-      assert.equal(nodes['update-action'].hidden, true, 'matching completed outcome resolves lost response');
-      assert.equal(posts, 1, 'reconciliation must never retry install');
-    });
-  }
-  await run('explicit quarantine applicability overrides phase12 legacy fallback', async () => {
-    const {app, nodes} = fixture();
-    app.initUpdates();
-    app.renderUpdates(status({phase:12, quarantine:{active:true, applies_to_available:false, manifest_sha256:'b'.repeat(64), reason:'other release'}}));
-    assert.equal(nodes['update-install'].textContent, 'Установить сейчас');
-    assert.doesNotMatch(nodes['update-warning'].textContent, /Ручной повтор/);
-    app.renderUpdates(status({phase:12, quarantine:{active:true, applies_to_available:true, manifest_sha256:'a'.repeat(64), reason:'health failed'}}));
-    assert.match(nodes['update-install'].textContent, /Повторить/);
-    app.renderUpdates(status({phase:12}));
-    assert.match(nodes['update-install'].textContent, /Повторить/, 'legacy status without contract retains fallback');
-  });
-  if (failures.length) throw new AggregateError(failures, 'Task10 review regressions failed');
+const now = Math.floor(Date.now() / 1000);
+function state(over={}) {
+  return {busy:'',current:'r1',arch:'arm64',auto:true,checked_utc:now-60,check_ok:true,check_error:'',
+    latest:{release_id:'r2',version:'06.10.2026',notes:'<img src=x onerror=alert(1)>',assets:{arm64:{sha256:'a'.repeat(64)}}},
+    last_utc:0,last_ok:false,last_release:'',last_message:'',bad_release:'',...over};
 }
+const json = (data, status=200) => ({ok:status<300,status,json:async()=>data});
 
-async function main(){
- await reviewRegressions();
- const {app,nodes,requests,window,document}=fixture();
- assert.equal(typeof app.renderUpdates,'function','actual panel needs update section renderer');
- app.initUpdates();app.renderUpdates(status());
- app.status={engine:'untouched'};
- assert.equal(nodes['update-notes-text'].textContent,'<img src=x onerror=alert(1)>');
- await app.checkUpdates(false);await app.checkUpdates(true);
- assert.deepEqual(requests.slice(0,2).map(x=>[x.url,x.body.force]),[['/api/update/check',false],['/api/update/check',true]]);
- assert.notEqual(requests[0].body.operation_id,requests[1].body.operation_id);
- app.renderUpdates(status());await nodes['update-install'].listeners.click();
- const install=requests.find(r=>r.url.endsWith('/install'));
- assert.equal(install.body.release_id,'shown');assert.equal(install.body.manifest_sha256,'a'.repeat(64));assert.ok(install.body.operation_id);
- await app.pollUpdates();assert.deepEqual(app.status,{engine:'untouched'});assert.equal(requests.filter(r=>r.url.endsWith('/install')).length,1,'reconnection must only read status');
- app.renderUpdates(status({available:{...status().available,compatible:false}}));assert.equal(nodes['update-install'].disabled,true);assert.match(nodes['update-warning'].textContent,/ABI/);
- for (const check of [{fresh:false,result:0},{fresh:true,result:8}]){app.renderUpdates(status({state:'current',available:null,check}));assert.doesNotMatch(nodes['update-state'].textContent,/последняя доступная/);}
- app.renderUpdates(status({state:'error',phase:3,last_result:8,last_error:'network transfer failed'}));assert.match(nodes['update-state'].textContent,/установить/);assert.match(nodes['update-reason'].textContent,/по сети/);
- app.renderUpdates(status({state:'error',last_result:9,last_error:'Нет доверенного времени'}));assert.match(nodes['update-reason'].textContent,/времени/);
- app.renderUpdates(status({quarantine:{active:true,applies_to_available:true,manifest_sha256:'a'.repeat(64),reason:'health failed'}}));assert.match(nodes['update-install'].textContent,/Повторить/);assert.match(nodes['update-reason'].textContent,/health failed/);
- app.renderUpdates(status({quarantine:{active:true,applies_to_available:false,manifest_sha256:'b'.repeat(64),reason:'other release'}}));assert.equal(nodes['update-install'].textContent,'Установить сейчас');
- app.renderUpdates(status({last_installation:{operation_id:'old-install',release_id:'old-release',result:10,phase:12,completed_utc:1791150100,reason:'health failed'}}));assert.match(nodes['update-result'].textContent,/old-release/);assert.match(nodes['update-result'].textContent,/health failed/);assert.doesNotMatch(nodes['update-result'].textContent,/время завершения не сохранено/);
- app.renderUpdates(status({phase:12,last_result:10,state:'error'}));assert.match(nodes['update-state'].textContent,/Восстановлена/);assert.match(nodes['update-install'].textContent,/Повторить/);
- for (let phase=3;phase<=9;phase++){app.renderUpdates(status({phase,busy:true}));assert.equal(nodes['update-install'].disabled,true);assert.equal(nodes['update-progress'].hidden,true,'no progress without real total bytes');}
- app.renderUpdates(status({phase:3,busy:true,received_bytes:25,total_bytes:100}));assert.equal(nodes['update-progress'].value,25);
- nodes['update-auto'].checked=false;await nodes['update-auto'].listeners.change();assert.equal(requests.at(-1).body.enabled,false);
- document.hidden=true;await app.pollUpdates();assert.equal(requests.at(-1).url,'/api/update/settings');document.hidden=false;
- window.fetch=async()=>{throw Error('connection lost');};app.renderUpdates(status({state:'current',available:null}));await app.pollUpdates();assert.doesNotMatch(nodes['update-state'].textContent,/последняя доступная/);
- // Плоская установка: панель без API обновлений отвечает 404 без JSON, а
- // панель без обновлятора — 503 {state:"unavailable"}. Это не сбой связи.
- for (const reply of [{ok:false,status:404,json:async()=>{throw SyntaxError('not json');}},{ok:false,status:503,json:async()=>({state:'unavailable'})}]) {
-   const f=fixture(); f.app.initUpdates(); f.window.fetch=async()=>reply;
-   await f.app.checkUpdates(false);
-   assert.equal(f.nodes['update-state'].textContent,'Автообновление не подключено','missing updater is not an error');
-   assert.doesNotMatch(f.nodes['update-reason'].textContent,/связи|Повторите/,'no lost-link wording without an updater');
-   assert.equal(f.nodes['update-action'].hidden,true,'no failure message without an updater');
-   assert.equal(f.nodes['nav-updates'].textContent,'','no alarm badge without an updater');
-   assert.equal(f.nodes['update-auto'].disabled,true,'auto-update switch stays visible but cannot be toggled without an updater');
-   assert.match(f.nodes['update-schedule'].textContent,/Станет доступно/,'switch explains why it is off');
- }
- { const f=fixture(); f.app.initUpdates(); f.window.fetch=async()=>{throw Error('connection lost');};
-   await f.app.checkUpdates(false);
-   assert.match(f.nodes['update-state'].textContent,/Не удалось/,'a real lost link still reads as a failure'); }
- assert.match(fs.readFileSync(require('node:path').join(__dirname,'../internal/web/assets/index.html'),'utf8'),/id="updates"[\s\S]*id="diagnostics"/);
- console.log('panel updates: selections, freshness, phases, notes, actions and reconnect passed');
-}
-main().catch(e=>{console.error(e);process.exitCode=1;});
+(async () => {
+  // Новый выпуск: кнопка, заметки как текст, тумблер по состоянию.
+  {
+    const {app,nodes} = fixture(() => json(state()));
+    await app.pollUpdates();
+    assert.equal(nodes['update-state'].textContent, 'Доступна версия 06.10.2026');
+    assert.equal(nodes['update-install'].hidden, false);
+    assert.equal(nodes['update-install'].disabled, false);
+    assert.equal(nodes['update-notes-text'].textContent, '<img src=x onerror=alert(1)>');
+    assert.equal(nodes['update-current'].textContent, 'версия r1');
+    assert.equal(nodes['update-auto'].checked, true);
+    assert.equal(nodes['nav-updates'].textContent, 'новая');
+  }
+  // Установлена последняя: зелёная лампа, кнопки установки нет.
+  {
+    const {app,nodes} = fixture(() => json(state({current:'r2'})));
+    await app.pollUpdates();
+    assert.equal(nodes['update-state'].textContent, 'Установлена последняя версия');
+    assert.equal(nodes['update-install'].hidden, true);
+    assert.equal(nodes['update-lamp'].attrs['data-tone'], 'ok');
+  }
+  // Ошибки проверки и установки объясняются словами утилиты.
+  {
+    const {app,nodes} = fixture(() => json(state({check_ok:false,check_error:'подпись выпуска не сошлась'})));
+    await app.pollUpdates();
+    assert.equal(nodes['update-state'].textContent, 'Не удалось проверить обновления');
+    assert.equal(nodes['update-reason'].textContent, 'подпись выпуска не сошлась');
+  }
+  {
+    const {app,nodes} = fixture(() => json(state({last_utc:now,last_ok:false,last_release:'r2',bad_release:'r2',
+      last_message:'выпуск r2 не прошёл проверку; возвращена прежняя версия'})));
+    await app.pollUpdates();
+    assert.equal(nodes['update-state'].textContent, 'Не удалось установить обновление');
+    assert.match(nodes['update-reason'].textContent, /возвращена прежняя версия/);
+    assert.equal(nodes['update-install'].textContent, 'Повторить установку вручную');
+    assert.match(nodes['update-result'].textContent, /^Последний результат: выпуск r2/);
+  }
+  // Нет утилиты — «не подключено», действия выключены; не проверялось — сказано.
+  {
+    const {app,nodes} = fixture(() => json({absent:true}));
+    await app.pollUpdates();
+    assert.equal(nodes['update-state'].textContent, 'Автообновление не подключено');
+    assert.equal(nodes['update-check'].disabled, true);
+    assert.equal(nodes['update-auto'].disabled, true);
+    assert.equal(nodes['updates-body'].attrs['data-mode'], 'absent');
+  }
+  {
+    const {app,nodes} = fixture(() => json({never:true}));
+    await app.pollUpdates();
+    assert.equal(nodes['update-state'].textContent, 'Обновления ещё не проверялись');
+    assert.equal(nodes['update-auto'].disabled, false, 'тумблер доступен до первой проверки');
+  }
+  // Проверка: POST команды службы, «проверяем…» до свежего checked_utc.
+  {
+    let checked = now - 3600, busy = '';
+    const {app,nodes,requests} = fixture((url,opts) => opts.method === 'POST' ? json({ok:true},202) :
+      json(state({checked_utc:checked,busy})));
+    await app.pollUpdates();
+    busy = 'checking';
+    await nodes['update-check'].listeners.click();
+    assert.deepEqual(requests.filter(r=>r.method==='POST').map(r=>r.url), ['/api/control/update-check']);
+    assert.equal(nodes['update-state'].textContent, 'Проверяем обновления…');
+    assert.equal(nodes['update-check'].disabled, true);
+    busy = ''; await app.pollUpdates();
+    assert.equal(nodes['update-state'].textContent, 'Проверяем обновления…', 'старый результат не завершает проверку');
+    checked = now + 1; await app.pollUpdates();
+    assert.equal(nodes['update-state'].textContent, 'Доступна версия 06.10.2026');
+  }
+  // Установка: потерянный ответ (панель перезапускается) — не ошибка, ждём итога.
+  {
+    let last = 0, current = 'r1', down = false;
+    const {app,nodes,requests} = fixture((url,opts) => {
+      if (opts.method === 'POST') throw Error('panel restarting');
+      if (down) throw Error('panel restarting');
+      return json(state({current,last_utc:last,last_ok:last>0,last_release:last?'r2':'',last_message:last?'установлен выпуск r2':''}));
+    });
+    await app.pollUpdates();
+    await nodes['update-install'].listeners.click();
+    assert.match(nodes['update-state'].textContent, /^Устанавливаем обновление/);
+    assert.equal(nodes['update-action'].hidden, true, 'потерянный ответ на установку не показан ошибкой');
+    down = true; await app.pollUpdates();
+    assert.match(nodes['update-state'].textContent, /^Устанавливаем обновление/);
+    down = false; last = now + 1; current = 'r2'; await app.pollUpdates();
+    assert.equal(nodes['update-state'].textContent, 'Установлена последняя версия');
+    assert.equal(requests.filter(r=>r.method==='POST').length, 1, 'установка не отправляется повторно');
+  }
+  // Отказ службы объясняется, тумблер шлёт on/off.
+  {
+    const {app,nodes,requests} = fixture((url,opts) => opts.method === 'POST' ? json({ok:false},409) : json(state()));
+    await app.pollUpdates();
+    nodes['update-auto'].checked = false;
+    await nodes['update-auto'].listeners.change();
+    assert.equal(requests.filter(r=>r.method==='POST')[0].url, '/api/control/update-auto-off');
+    assert.match(nodes['update-action'].textContent, /другую команду/);
+  }
+  console.log('panel updates: state file, commands, install restart, toggle: PASS');
+})().catch(error => { console.error(error); process.exit(1); });

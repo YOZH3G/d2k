@@ -8,11 +8,8 @@
 # Что здесь НЕ делается и почему:
 #   * ничего не берётся у z2k при неудаче загрузки — подмена артефактов
 #     чужого продукта своими это не запасной путь, а сюрприз;
-#   * автообновление ставится только из ПОДПИСАННОГО выпуска: после плоской
-#     установки скрипт берёт из канала stable загрузочный комплект своей
-#     арки, проверяет подпись закреплённым ниже ключом и переводит установку
-#     под d2k-update. Нет выпуска или подпись не сошлась — остаётся рабочая
-#     плоская установка без автообновления, и это говорится словами.
+#   * автообновление (d2k-update.sh) ставит только ПОДПИСАННЫЙ выпуск: его
+#     архив — это тот же установщик с файлами, запущенный с D2K_LOCAL.
 set -eu
 
 REPO=${D2K_REPO:-necronicle/d2k}
@@ -22,17 +19,6 @@ BASE=${D2K_BASE:-https://raw.githubusercontent.com/$REPO/$REF}
 DIR=/opt/d2k
 SBIN=/opt/sbin
 INIT=/opt/etc/init.d/S99d2k
-# Explicit local bootstrap bundle is staged and verified by the operator/release
-# tooling. No unsigned remote bootstrap is downloaded by this compatibility script.
-if [ -n "${D2K_BOOTSTRAP_BUNDLE:-}" ]; then
-    exec "$D2K_BOOTSTRAP_BUNDLE/d2k-update-boot" --root "$DIR" --bootstrap "$D2K_BOOTSTRAP_BUNDLE"
-fi
-# A managed root may only use the stable update entry; never replace individual
-# files using this historical flat installer, even if current is damaged.
-if [ -L "$DIR/current" ] || [ -d "$DIR/boot" ] || [ -d "$DIR/update-state" ]; then
-    [ -x "$DIR/boot/d2k-service-adapter" ] || { echo 'd2k: managed recovery required' >&2; exit 1; }
-    exec "$DIR/boot/d2k-service-adapter" service install
-fi
 TMP=
 
 say()  { echo "d2k: $*"; }
@@ -126,6 +112,7 @@ fetch "files/config"            "$TMP/config"
 fetch "files/d2k-fw-heal.sh"    "$TMP/d2k-fw-heal.sh"
 fetch "files/d2k-ppe-deoffload.sh" "$TMP/d2k-ppe-deoffload.sh"
 fetch "files/d2k-log-maintenance.sh" "$TMP/d2k-log-maintenance.sh"
+fetch "files/d2k-update.sh" "$TMP/d2k-update.sh"
 fetch "files/001-d2k.sh"        "$TMP/001-d2k.sh"
 fetch "files/d2k-tg-firewall.sh" "$TMP/d2k-tg-firewall.sh"
 fetch "files/d2k-tg-watchdog.sh" "$TMP/d2k-tg-watchdog.sh"
@@ -147,7 +134,7 @@ for face in onest jbmono; do
 done
 
 chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kd" "$TMP/d2ktg" \
-         "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/d2k-ppe-deoffload.sh" "$TMP/d2k-log-maintenance.sh" "$TMP/001-d2k.sh" \
+         "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/d2k-ppe-deoffload.sh" "$TMP/d2k-log-maintenance.sh" "$TMP/d2k-update.sh" "$TMP/001-d2k.sh" \
          "$TMP/d2k-tg-firewall.sh" "$TMP/d2k-tg-watchdog.sh" \
          "$TMP/d2k-instagram-dns.sh" "$TMP/d2k-instagram-dns-scheduler.sh"
 
@@ -238,6 +225,11 @@ done
 install_atomic "$TMP/d2k-fw-heal.sh" "$DIR/d2k-fw-heal.sh"
 install_atomic "$TMP/d2k-ppe-deoffload.sh" "$DIR/d2k-ppe-deoffload.sh"
 install_atomic "$TMP/d2k-log-maintenance.sh" "$DIR/d2k-log-maintenance.sh"
+install_atomic "$TMP/d2k-update.sh" "$DIR/d2k-update.sh"
+# Что стоит и под какую арку — для автообновления. Выпуск называет себя сам
+# (D2K_RELEASE_ID от d2k-update.sh); ручная установка из main выпуска не знает.
+printf '%s\n' "$ARCH" > "$DIR/release-arch.new" && mv -f "$DIR/release-arch.new" "$DIR/release-arch"
+printf '%s\n' "${D2K_RELEASE_ID:-}" > "$DIR/release-id.new" && mv -f "$DIR/release-id.new" "$DIR/release-id"
 install_atomic "$TMP/d2k-tg-firewall.sh" "$DIR/d2k-tg-firewall.sh"
 install_atomic "$TMP/d2k-tg-watchdog.sh" "$DIR/d2k-tg-watchdog.sh"
 install_atomic "$TMP/d2k-instagram-dns.sh" "$DIR/d2k-instagram-dns.sh"
@@ -343,63 +335,10 @@ else
     say "панель отключена (PANEL_LISTEN пуст в $DIR/config)"
 fi
 # --- автообновление ------------------------------------------------------
-#
-# Канал stable публикует .github/workflows/release.yml: release-тег
-# d2k-channel-stable с подписанным stable.json и выпуски с загрузочным
-# комплектом на каждую арку. Ключ закреплён здесь, а не берётся из сети:
-# установщик приходит по HTTPS из того же репозитория, что и ключ.
-UPDATE_FEED=${D2K_UPDATE_FEED:-https://github.com/$REPO/releases/download}
-UPDATE_KEY='-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAqZkq/DsxeFJ1MCEEyFa7yzm80XiWf+cHPR1JsybbMPQ=
------END PUBLIC KEY-----'
-update_fetch() {
-    curl -fsL --proto '=https' --max-time 300 -o "$2" "$UPDATE_FEED/$1"
-}
-update_verified() {
-    # $1 — документ, $2 — его подпись Ed25519 (64 байта).
-    [ "$(wc -c < "$2" | tr -d ' ')" = 64 ] || return 1
-    openssl pkeyutl -verify -pubin -inkey "$TMP/update-key.pem" -rawin \
-        -in "$1" -sigfile "$2" >/dev/null 2>&1
-}
-enable_autoupdate() {
-    printf '%s\n' "$UPDATE_KEY" > "$TMP/update-key.pem" || return 1
-    if ! update_fetch d2k-channel-stable/stable.json "$TMP/stable.json" ||
-       ! update_fetch d2k-channel-stable/stable.json.sig "$TMP/stable.json.sig"; then
-        say "автообновление: подписанного выпуска ещё нет — работает плоская установка без автообновления"
-        return 0
-    fi
-    update_verified "$TMP/stable.json" "$TMP/stable.json.sig" || {
-        say "автообновление: подпись канала не сошлась — автообновление не включено"; return 1; }
-    rid=$(sed -n 's/.*"release_id":"\([A-Za-z0-9][A-Za-z0-9._-]*\)".*/\1/p' "$TMP/stable.json")
-    [ -n "$rid" ] || { say "автообновление: в канале нет выпуска"; return 1; }
-    if ! { update_fetch "$rid/bootstrap-$ARCH.json" "$TMP/bootstrap.json" &&
-           update_fetch "$rid/bootstrap-$ARCH.json.sig" "$TMP/bootstrap.json.sig"; }; then
-        say "автообновление: в выпуске $rid нет комплекта для $ARCH"; return 1
-    fi
-    update_verified "$TMP/bootstrap.json" "$TMP/bootstrap.json.sig" || {
-        say "автообновление: подпись комплекта $rid не сошлась"; return 1; }
-    if ! { grep -q "\"abi\":\"$ARCH\"" "$TMP/bootstrap.json" &&
-           grep -q "\"artifact\":\"d2k-bootstrap-$ARCH.tar\"" "$TMP/bootstrap.json"; }; then
-        say "автообновление: комплект $rid не для $ARCH"; return 1
-    fi
-    update_fetch "$rid/d2k-bootstrap-$ARCH.tar" "$TMP/bootstrap.tar" || {
-        say "автообновление: не скачать комплект $rid"; return 1; }
-    # Подписан описатель, а в нём — хеш архива: архив принимается только
-    # с ровно этим хешем.
-    sum=$(openssl dgst -sha256 -r "$TMP/bootstrap.tar" | cut -d' ' -f1)
-    case "$sum" in ''|*[!0-9a-f]*) return 1 ;; esac
-    grep -q "\"sha256\":\"$sum\",\"size\":" "$TMP/bootstrap.json" || {
-        say "автообновление: архив комплекта не совпал с подписанным описателем"; return 1; }
-    mkdir "$TMP/bootstrap" && tar -xf "$TMP/bootstrap.tar" -C "$TMP/bootstrap" || return 1
-    say "автообновление: перевожу установку под d2k-update (выпуск $rid)"
-    "$TMP/bootstrap/d2k-update-boot" --root "$DIR" --bootstrap "$TMP/bootstrap" || {
-        say "автообновление: перевод не выполнен — плоская установка продолжает работать"; return 1; }
-    say "автообновление включено: новые выпуски ставятся ночью 03:00–05:00, вручную — кнопкой в панели"
-}
-if [ -n "${D2K_LOCAL:-}" ] || [ "${D2K_AUTOUPDATE:-1}" = 0 ]; then
-    say "автообновление не включается (локальная установка или D2K_AUTOUPDATE=0)"
+if [ "${AUTOUPDATE:-$(sed -n 's/^AUTOUPDATE=//p' "$DIR/config" | tail -n 1)}" = 0 ]; then
+    say "автообновление выключено (AUTOUPDATE=0); включается в панели"
 else
-    enable_autoupdate || true
+    say "автообновление: новые подписанные выпуски ставятся ночью 03:00–05:00; кнопка и тумблер — в панели"
 fi
 
 say "готово"

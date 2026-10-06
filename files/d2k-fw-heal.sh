@@ -29,11 +29,6 @@ case ":${PATH}:" in
 esac
 export PATH
 
-DIR=${D2K_DIR:-/opt/d2k}
-if [ -L "$DIR/current" ] || [ -f "$DIR/update-state/bootstrap.pending" ]; then
-    exec "$DIR/boot/d2k-service-adapter" --root "$DIR" service heal
-fi
-
 INIT_SCRIPT="${INIT_SCRIPT:-/opt/etc/init.d/S99d2k}"
 HEAL_LOCK="${HEAL_LOCK:-/tmp/d2k-fw-heal.lock}"
 HEAL_LAST="${HEAL_LAST:-/tmp/d2k-fw-heal.last}"

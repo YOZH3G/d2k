@@ -308,7 +308,8 @@ static int serve(const char *listen_addr, const char *live_path, const char *ass
         /* The operator explicitly selected this panel bind address. Allow
          * same-origin controls there; server.c rejects cross-origin actions. */
         .control_enabled = 1,
-        .update_socket = "/opt/d2k/update-state/updater.sock",
+        .update_state_path = "/opt/d2k/state/update.json",
+        .updater_path = "/opt/d2k/d2k-update.sh",
         .listener_fd = listener,
     };
     printf("d2kpanel %s\nhttp://%s/\n", D2K_PANEL_VERSION, listen_addr);

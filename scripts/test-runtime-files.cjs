@@ -66,19 +66,3 @@ stop
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }
-
-// Подписанный комплект обязан класть ресурсы туда, где их ищет управляемый
-// init ($RELEASE/files/...): иначе d2ktg --check-config не видит CA, старт
-// нового выпуска проваливается и откат идёт через recovery_failed.
-{
-  const inventory = fs.readFileSync(path.join(root, 'update/runtime-files.txt'), 'utf8')
-    .split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(/\s+/))
-    .filter((f) => f[0] === 'runtime').map((f) => f[2]);
-  const init = fs.readFileSync(path.join(root, 'files/S99d2k'), 'utf8');
-  for (const m of init.matchAll(/\$RELEASE\/(files\/[A-Za-z0-9._/-]+)/g)) {
-    const want = m[1];
-    const present = inventory.some((p) => p === want || p.startsWith(want + '/'));
-    assert.ok(present, `init references $RELEASE/${want} but the signed runtime inventory has no such path`);
-  }
-  console.log('runtime inventory: every $RELEASE/files path used by the init script is packaged');
-}

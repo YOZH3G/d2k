@@ -123,7 +123,7 @@ cp internal/web/assets/favicon.svg "$REL/internal/web/assets/"
 mkdir -p "$REL/internal/web/assets/fonts"
 cp internal/web/assets/fonts/onest.woff2 internal/web/assets/fonts/OFL-onest.txt internal/web/assets/fonts/jbmono.woff2 internal/web/assets/fonts/OFL-jbmono.txt "$REL/internal/web/assets/fonts/"
 cp files/S99d2k files/config files/d2k-fw-heal.sh files/001-d2k.sh "$REL/files/"
-cp files/d2k-ppe-deoffload.sh files/d2k-log-maintenance.sh "$REL/files/"
+cp files/d2k-ppe-deoffload.sh files/d2k-log-maintenance.sh files/d2k-update.sh "$REL/files/"
 cp files/d2k-tg-firewall.sh files/d2k-tg-watchdog.sh files/d2k-instagram-dns.sh \
     files/d2k-instagram-dns-scheduler.sh files/meta-ranges.txt files/tg-roots.pem "$REL/files/"
 cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fake/"

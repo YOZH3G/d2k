@@ -45,6 +45,7 @@ exit 1
   for (const name of ['d2k-fw-heal.sh', 'd2k-ppe-deoffload.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
   fixture('files/d2k-instagram-dns.sh', '#!/bin/sh\nprintf "dns-%s\\n" "$1" >> "$CALLS"\n');
   fixture('files/d2k-log-maintenance.sh', fs.readFileSync(path.join(root, 'files/d2k-log-maintenance.sh')));
+  fixture('files/d2k-update.sh', fs.readFileSync(path.join(root, 'files/d2k-update.sh')));
   for (const name of ['meta-ranges.txt', 'tg-roots.pem', 'fake/stun.bin', 'fake/quic_initial_dbankcloud_ru.bin']) fixture(`files/${name}`, 'fixture\n');
   for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'gsap.js', 'fonts/onest.woff2', 'fonts/OFL-onest.txt', 'fonts/jbmono.woff2', 'fonts/OFL-jbmono.txt']) fixture(`internal/web/assets/${name}`, 'fixture\n');
   fs.mkdirSync(path.join(tmp, 'proc/net/netfilter'), { recursive: true });
@@ -202,16 +203,7 @@ exit 1
   fs.writeFileSync(path.join(envRuntime, 'live.json'), '{}');
   run('uninstall', { D2K_RUNTIME_DIR: envRuntime });
   assert(!fs.existsSync(envRuntime), 'explicit valid environment runtime must be cleaned and removed when empty');
-  // The supported installer must route a managed root before downloads, module
-  // changes or flat per-file replacement. An absent task-9 daemon stays explicit.
-  fs.mkdirSync(path.join(tmp, 'opt/d2k/boot'), { recursive: true });
-  fs.writeFileSync(path.join(tmp, 'opt/d2k/boot/d2k-service-adapter'), '#!/bin/sh\nprintf "%s\\n" "$*" > "$CALLS.managed"\nexit 3\n', { mode: 0o755 });
-  const configBefore = fs.readFileSync(config);
-  const managedResult = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
-  assert.equal(managedResult.status, 3, 'managed install must expose unavailable updater instead of replacing flat files');
-  assert.equal(fs.readFileSync(`${env.CALLS}.managed`, 'utf8').trim(), 'service install');
-  assert.deepEqual(fs.readFileSync(config), configBefore, 'managed routing preserves personal configuration');
-  console.log('local installer/helper, managed routing and keep-state uninstall: PASS');
+  console.log('local installer/helper and keep-state uninstall: PASS');
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

@@ -2,7 +2,6 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "server.h"
-#include "update.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -400,6 +399,10 @@ static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
         { "/api/control/reapply", "reapply", "Восстановление правил" },
         { "/api/control/telegram-enable", "telegram-enable", "Включение Telegram-туннеля" },
         { "/api/control/telegram-disable", "telegram-disable", "Отключение Telegram-туннеля" },
+        { "/api/control/update-check", "update-check", "Проверка обновлений" },
+        { "/api/control/update-install", "update-install", "Установка обновления" },
+        { "/api/control/update-auto-on", "update-auto-on", "Включение автообновления" },
+        { "/api/control/update-auto-off", "update-auto-off", "Выключение автообновления" },
     };
     const char *command = NULL, *label = NULL;
     for (size_t i = 0; i < sizeof actions / sizeof actions[0]; i++) {
@@ -463,6 +466,36 @@ static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
     int n = snprintf(body, sizeof body, "{\"ok\":true,\"action\":\"%s\",\"message\":\"Команда запущена\"}", label);
     if (n < 0 || (size_t)n >= sizeof body) { return -1; }
     return response(fd, 202, "Accepted", "application/json; charset=utf-8", body, (size_t)n);
+}
+
+/* Состояние автообновления — файл d2k-update.sh, отдаётся как есть: его
+   пишет только эта утилита, атомарно и целиком. */
+static int api_update(int fd, const d2k_panel_config *cfg) {
+    static const char json[] = "application/json; charset=utf-8";
+    if (!cfg || !cfg->updater_path || access(cfg->updater_path, X_OK) != 0) {
+        static const char body[] = "{\"absent\":true}";
+        return response(fd, 200, "OK", json, body, sizeof body - 1);
+    }
+    char body[16384];
+    size_t n = 0;
+    int in = cfg->update_state_path ?
+        open(cfg->update_state_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW) : -1;
+    if (in >= 0) {
+        for (;;) {
+            ssize_t k = read(in, body + n, sizeof body - n);
+            if (k < 0 && errno == EINTR) continue;
+            if (k <= 0) break;
+            n += (size_t)k;
+            if (n == sizeof body) { n = 0; break; }
+        }
+        close(in);
+    }
+    while (n && (body[n - 1] == '\n' || body[n - 1] == '\r')) n--;
+    if (n < 2 || body[0] != '{' || body[n - 1] != '}') {
+        static const char never[] = "{\"never\":true}";
+        return response(fd, 200, "OK", json, never, sizeof never - 1);
+    }
+    return response(fd, 200, "OK", json, body, n);
 }
 
 static int read_request(int fd, char *buf, size_t cap, size_t *used) {
@@ -785,8 +818,13 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     }
     char *query = strchr(path, '?');
     if (query) { *query = '\0'; }
-    if (!strcmp(path, "/api/update") || !strncmp(path, "/api/update/", 12))
-      return d2k_panel_update_handle(fd, cfg, req, path);
+    if (strcmp(path, "/api/update") == 0) {
+        if (strcmp(method, "GET") != 0) {
+            return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8",
+                            "method not allowed\n", 19);
+        }
+        return api_update(fd, cfg);
+    }
     if (strncmp(path, "/api/control/", sizeof "/api/control/" - 1) == 0) {
         if (strcmp(method, "POST") != 0) {
             return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8",

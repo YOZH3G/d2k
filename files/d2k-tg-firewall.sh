@@ -2,16 +2,6 @@
 # D2K-owned TCP-only Telegram redirect and IPv6 fast-fail rules.
 set -eu
 
-DIR=${D2K_DIR:-/opt/d2k}
-if [ -L "$DIR/current" ] || [ -f "$DIR/update-state/bootstrap.pending" ]; then
-    if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
-        "$DIR/boot/d2k-service-adapter" --root "$DIR" --validate-maintenance-fd 4 || exit 1
-    else
-        case "${1:-}" in start|heal) action=tg-heal;; stop) action=tg-stop-rules;; check) action=health-rules;; *) exit 2;; esac
-        exec "$DIR/boot/d2k-service-adapter" --root "$DIR" service "$action"
-    fi
-fi
-
 SET4=d2k_tg_dc
 SET6=d2k_tg_dc6
 PORT=1443
@@ -68,22 +58,7 @@ stop() {
     fi
 }
 
-check() {
-    # ipset test checks every expected prefix; NAT and filter checks are exact.
-    for c in $CIDRS4; do ipset test "$SET4" "$c" >/dev/null 2>&1 || return 1; done
-    for chain in PREROUTING OUTPUT; do
-        ipt -t nat -C "$chain" -p tcp --dport 443 -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || return 1
-    done
-    if command -v ip6tables >/dev/null 2>&1; then
-        for c in $CIDRS6; do ipset test "$SET6" "$c" >/dev/null 2>&1 || return 1; done
-        for chain in FORWARD OUTPUT; do
-            ip6t -C "$chain" -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset || return 1
-        done
-    fi
-}
-
 case "${1:-}" in
-    check) check ;;
     start) start ;;
     heal) heal ;;
     stop) stop ;;

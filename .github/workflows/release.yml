@@ -1,174 +1,83 @@
-name: Signed D2K release
+name: D2K release
+# Ручной выпуск с main: девять арок, проверки под QEMU, архивы для
+# d2k-update.sh, latest.json с хешами и его подпись Ed25519. Роутеры берут
+# releases/latest/download/latest.json, проверяют подпись закреплённым ключом
+# и ставят архив своей арки его же установщиком.
 on:
   workflow_dispatch:
     inputs:
-      dry_run:
-        type: boolean
-        default: true
-      release_id:
+      notes:
+        description: Что изменилось (покажется в панели)
         type: string
         required: false
-  workflow_call:
-  schedule:
-    - cron: '17 3 * * *'
 permissions:
   contents: read
-# Release and daily refresh share one publisher; never cancel between asset writes.
-# CI calls this workflow on every push; it must not share the publisher's
-# queue, or a push cancels a pending release (GitHub keeps one pending run
-# per group).
 concurrency:
-  group: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && 'd2k-stable-publisher' || format('d2k-release-ci-{0}', github.ref) }}
+  group: d2k-release
   cancel-in-progress: false
 jobs:
-  build:
-    if: github.event_name != 'schedule'
+  release:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    env:
-      REQUESTED_RELEASE: ${{ inputs.release_id }}
-      DRY_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}
-      PUBLIC_CONFIG_TEMPLATE: ${{ vars.D2K_UPDATE_PUBLIC_CONFIG_TEMPLATE }}
-      PUBLIC_KEY_HEX: ${{ vars.D2K_SIGNING_PUBLIC_KEY }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-      - name: Pinned compiler setup and Linux test tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq make gcc cmake perl python3 openssl qemu-user binutils nodejs libssl-dev libcurl4-openssl-dev
-          cd "$RUNNER_TEMP"
-          curl --fail --proto '=https' --proto-redir '=https' --location --max-time 180 https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig16.tar.xz
-          echo '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig16.tar.xz' | sha256sum -c -
-          tar -xJf zig16.tar.xz
-          curl --fail --proto '=https' --proto-redir '=https' --location --max-time 180 https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz -o zig14.tar.xz
-          echo '24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c  zig14.tar.xz' | sha256sum -c -
-          tar -xJf zig14.tar.xz
-          echo "ZIG=$RUNNER_TEMP/zig-x86_64-linux-0.16.0/zig" >> "$GITHUB_ENV"
-          echo "ZIG_MIPS64EL=$RUNNER_TEMP/zig-x86_64-linux-0.14.1/zig" >> "$GITHUB_ENV"
-          echo "SOURCE_DATE_EPOCH=$(git -C "$GITHUB_WORKSPACE" show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
-          echo "OUT=$RUNNER_TEMP/runtime" >> "$GITHUB_ENV"
-          echo "RELEASE_OUT=$RUNNER_TEMP/release" >> "$GITHUB_ENV"
-          echo "DEPS_PROVENANCE=$RUNNER_TEMP/dependencies/DEPENDENCY-PROVENANCE.json" >> "$GITHUB_ENV"
-      - name: Offline regressions and C checks
-        run: |
-          python3 scripts/test-update-release.py
-          make -C update check-manifest check-package check-schedule check-feed
-      # Pinned OpenSSL/curl for nine ABIs take ~30 minutes to build and change
-      # only with the pinned revisions or these scripts. CI and dry runs reuse
-      # them; a publishing run always rebuilds from source.
-      - name: Cached pinned dependencies (CI and dry runs only)
-        if: github.event_name != 'workflow_dispatch' || inputs.dry_run
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ${{ runner.temp }}/dependencies
-          key: d2k-deps-v1-${{ hashFiles('scripts/build-update-deps.sh', 'scripts/build-openssl-tg.sh', 'scripts/build-target.sh', 'scripts/update_release_provenance.py') }}
-      - name: Fresh dependency receipts, full nine ABI runtime and actual QEMU gates
-        shell: bash
-        run: |
-          set -euo pipefail
-          RELEASE_ID=${REQUESTED_RELEASE:-d2k-${GITHUB_SHA:0:12}-${SOURCE_DATE_EPOCH}}
-          echo "RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
-          export RELEASE_ID
-          if [ -f "$DEPS_PROVENANCE" ]; then
-            echo "reusing cached dependency receipts; build-router.sh validates them before use"
-          else
-            python3 scripts/update_release_provenance.py --root "$GITHUB_WORKSPACE" --build-dir "$RUNNER_TEMP/dependencies" --prepare-dependencies --zig "$ZIG" --zig-mips64el "$ZIG_MIPS64EL"
-          fi
-          sh scripts/build-router.sh
-          sh scripts/build-router-tests.sh
-          sh scripts/check-router-builds.sh
-      - name: Bounded deterministic runtime and separate bootstrap packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$DRY_RUN" = true ]; then
-            openssl genpkey -algorithm ED25519 -out "$RUNNER_TEMP/FIXTURE-only.pem"
-            openssl pkey -in "$RUNNER_TEMP/FIXTURE-only.pem" -pubout -outform DER | tail -c 32 > "$RUNNER_TEMP/public.raw"
-            export PUBLIC_KEY_HEX=$(od -An -v -tx1 "$RUNNER_TEMP/public.raw" | tr -d ' \n')
-          else
-            test -n "$PUBLIC_CONFIG_TEMPLATE" && test -n "$PUBLIC_KEY_HEX"
-            python3 -c 'import os,pathlib; b=bytes.fromhex(os.environ["PUBLIC_KEY_HEX"]); assert len(b)==32; pathlib.Path(os.environ["RUNNER_TEMP"]+"/public.raw").write_bytes(b)'
-          fi
-          mkdir "$RELEASE_OUT"
-          for abi in arm64 arm mipsel mips mips64el amd64 x86 ppc64 riscv64; do
-            export ABI=$abi
-            python3 - <<'PY'
-          import os,pathlib
-          abi=os.environ['ABI']; tmp=os.environ['RUNNER_TEMP']
-          config=os.environ.get('PUBLIC_CONFIG_TEMPLATE','')
-          if os.environ['DRY_RUN']=='true':
-              config='D2KU-CONFIG-1\nfeed=https://github.com/necronicle/d2k/releases/download\nca=/etc/ssl/certs/ca-certificates.crt\nabi={abi}\nbuild={build}\nhost=github.com\nhost=release-assets.githubusercontent.com\nkey='+os.environ['PUBLIC_KEY_HEX']+' 1 9223372036854775807\n'
-          config=config.replace('{abi}',abi).replace('{build}',os.environ['SOURCE_DATE_EPOCH'])
-          path=pathlib.Path(tmp)/('public-'+abi+'.conf');path.write_text(config);path.chmod(0o600)
-          PY
-            python3 scripts/package-update.py --root "$GITHUB_WORKSPACE" --build-dir "$OUT" --arch "$abi" --release "$RELEASE_ID" --built-at "$SOURCE_DATE_EPOCH" --out "$RELEASE_OUT"
-            python3 scripts/package-update.py --root "$GITHUB_WORKSPACE" --build-dir "$OUT" --arch "$abi" --release "$RELEASE_ID" --built-at "$SOURCE_DATE_EPOCH" --out "$RELEASE_OUT" --bootstrap --public-config "$RUNNER_TEMP/public-$abi.conf"
-          done
-          python3 scripts/package-update.py --root "$GITHUB_WORKSPACE" --build-dir "$OUT" --release "$RELEASE_ID" --out "$RELEASE_OUT" --finalize
-          if [ "$DRY_RUN" = true ]; then
-            export D2K_SIGNING_KEY="$RUNNER_TEMP/FIXTURE-only.pem"
-            for doc in "$RELEASE_OUT/manifest.json" "$RELEASE_OUT"/bootstrap-*.json; do sh scripts/sign-update.sh "$doc" "$doc.sig"; done
-            for abi in arm64 arm mipsel mips mips64el amd64 x86 ppc64 riscv64; do
-              mkdir -m 700 "$RUNNER_TEMP/stage-$abi"
-              python3 scripts/package-update.py --verify-bootstrap "$RELEASE_OUT/bootstrap-$abi.json" --signature "$RELEASE_OUT/bootstrap-$abi.json.sig" --archive "$RELEASE_OUT/d2k-bootstrap-$abi.tar" --public-key "$RUNNER_TEMP/public.raw" --arch "$abi" --stage "$RUNNER_TEMP/stage-$abi"
-            done
-            python3 scripts/package-update.py --publish --dry-run --out "$RELEASE_OUT" --repository "$GITHUB_REPOSITORY" --public-key "$RUNNER_TEMP/public.raw" --signing-key "$RUNNER_TEMP/FIXTURE-only.pem"
-          fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: gated-release
-          path: ${{ runner.temp }}/release/
-          if-no-files-found: error
-          retention-days: 7
-  publish:
-    needs: build
-    if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run && needs.build.result == 'success'))
-    runs-on: ubuntu-24.04
     environment: d2k-signing
     permissions:
       contents: write
     env:
-      D2K_PROTECTED_SIGNING: '1'
-      SIGNING_ENVIRONMENT_READY: ${{ vars.D2K_SIGNING_ENVIRONMENT_READY }}
-      PRIVATE_KEY: ${{ secrets.D2K_ED25519_PRIVATE_KEY }}
+      NOTES: ${{ inputs.notes }}
       PUBLIC_KEY_HEX: ${{ vars.D2K_SIGNING_PUBLIC_KEY }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        if: github.event_name != 'schedule'
         with:
-          name: gated-release
-          path: ${{ runner.temp }}/release
-      - name: Externally provisioned protected signing material
+          fetch-depth: 0
+      - name: Компиляторы и QEMU
         shell: bash
         run: |
           set -euo pipefail
-          test "$SIGNING_ENVIRONMENT_READY" = true
-          python3 - <<'PY'
-          import os,pathlib
-          root=pathlib.Path(os.environ['RUNNER_TEMP']);key=root/'protected.pem';public=root/'public.raw'
-          assert os.environ['PRIVATE_KEY']
-          key.write_text(os.environ['PRIVATE_KEY']);key.chmod(0o600)
-          b=bytes.fromhex(os.environ['PUBLIC_KEY_HEX']);assert len(b)==32;public.write_bytes(b)
-          PY
-      - name: Daily authenticated sequence recovery or sign gated immutable release
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq make python3 openssl qemu-user binutils file nodejs
+          cd "$RUNNER_TEMP"
+          curl --fail --proto '=https' --location --max-time 180 https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig16.tar.xz
+          echo '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig16.tar.xz' | sha256sum -c -
+          tar -xJf zig16.tar.xz
+          curl --fail --proto '=https' --location --max-time 180 https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz -o zig14.tar.xz
+          echo '24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c  zig14.tar.xz' | sha256sum -c -
+          tar -xJf zig14.tar.xz
+          echo "ZIG=$RUNNER_TEMP/zig-x86_64-linux-0.16.0/zig" >> "$GITHUB_ENV"
+          echo "ZIG_MIPS64EL=$RUNNER_TEMP/zig-x86_64-linux-0.14.1/zig" >> "$GITHUB_ENV"
+          sha=$(git rev-parse --short=7 HEAD)
+          echo "RELEASE_ID=d2k-$(date -u +%Y%m%d-%H%M)-$sha" >> "$GITHUB_ENV"
+          echo "VERSION=$(date -u +%d.%m.%Y) ($sha)" >> "$GITHUB_ENV"
+      - name: Сборка девяти арок и проверки под QEMU
+        run: |
+          set -eu
+          sh scripts/build-router.sh
+          sh scripts/build-router-tests.sh
+          sh scripts/check-router-builds.sh
+      - name: Архивы, latest.json и подпись
+        shell: bash
+        env:
+          PRIVATE_KEY: ${{ secrets.D2K_ED25519_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release"
+          sh scripts/package-release.sh builds "$out"
+          key="$RUNNER_TEMP/signing.pem"
+          trap 'rm -f "$key"' EXIT
+          (umask 077; printf '%s\n' "$PRIVATE_KEY" > "$key")
+          openssl pkeyutl -sign -inkey "$key" -rawin -in "$out/latest.json" -out "$out/latest.json.sig"
+          # Проверка тем же открытым ключом, что закреплён в d2k-update.sh.
+          pub=$(python3 -c 'import base64,os; print(base64.b64encode(bytes.fromhex("302a300506032b6570032100"+os.environ["PUBLIC_KEY_HEX"])).decode())')
+          grep -qF "$pub" files/d2k-update.sh
+          printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$pub" > "$RUNNER_TEMP/public.pem"
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/public.pem" -rawin \
+            -in "$out/latest.json" -sigfile "$out/latest.json.sig"
+      - name: Публикация выпуска
         shell: bash
         run: |
           set -euo pipefail
-          export D2K_SIGNING_KEY="$RUNNER_TEMP/protected.pem"
-          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
-            python3 scripts/package-update.py --fetch-current --repository "$GITHUB_REPOSITORY" --public-key "$RUNNER_TEMP/public.raw" --out "$RUNNER_TEMP/release"
-            python3 scripts/package-update.py --publish --repository "$GITHUB_REPOSITORY" --public-key "$RUNNER_TEMP/public.raw" --signing-key "$D2K_SIGNING_KEY" --out "$RUNNER_TEMP/release"
-          else
-            for doc in "$RUNNER_TEMP/release/manifest.json" "$RUNNER_TEMP/release"/bootstrap-*.json; do sh scripts/sign-update.sh "$doc" "$doc.sig"; done
-            id=$(python3 -c 'import json,os;print(json.load(open(os.environ["RUNNER_TEMP"]+"/release/manifest.json"))["release_id"])')
-            python3 scripts/package-update.py --publish --release "$id" --repository "$GITHUB_REPOSITORY" --public-key "$RUNNER_TEMP/public.raw" --signing-key "$D2K_SIGNING_KEY" --out "$RUNNER_TEMP/release"
-          fi
-      - name: Remove only this job's private signing file
-        if: always()
-        run: rm -f "$RUNNER_TEMP/protected.pem"
+          out="$RUNNER_TEMP/release"
+          gh release create "$RELEASE_ID" --target "$GITHUB_SHA" --latest \
+            --title "D2K $VERSION" --notes "${NOTES:-Выпуск D2K $VERSION}" \
+            "$out"/d2k-*.tar.gz "$out/latest.json" "$out/latest.json.sig"

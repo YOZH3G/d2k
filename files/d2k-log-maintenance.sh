@@ -66,33 +66,15 @@ rotate_one() {
 }
 
 tick() {
-    if [ -L "$DIR/current" ] || [ -f "$DIR/update-state/bootstrap.pending" ]; then
-        if [ "${D2K_MANAGED_INTERNAL:-}" != 1 ]; then
-            # Фоном и под wait: адаптер ждёт замок обслуживания, а во время
-            # обновления его держит та самая транзакция, что останавливает
-            # этот процесс. TERM должен сработать сразу, а не после адаптера.
-            "$DIR/boot/d2k-service-adapter" --root "$DIR" service log-tick &
-            adapter_pid=$!
-            wait "$adapter_pid"
-            rc=$?
-            adapter_pid=
-            return $rc
-        fi
-        "$DIR/boot/d2k-service-adapter" --root "$DIR" --validate-maintenance-fd 4 || return 1
-    fi
     prepare_runtime || return 1
     # Enumerate exact owned names: never rotate unrelated or custom logs.
     for name in d2kd.log d2kc.log panel.log telegram.log d2khttp.log \
-                instagram-dns.log instagram-dns-scheduler.log; do
+                instagram-dns.log instagram-dns-scheduler.log update.log; do
         rotate_one "$LOG/$name"
     done
 }
 
 stop_worker() {
-    if [ -n "${adapter_pid:-}" ]; then
-        kill "$adapter_pid" 2>/dev/null || true
-        wait "$adapter_pid" 2>/dev/null || true
-    fi
     if [ -n "$sleep_pid" ]; then
         kill "$sleep_pid" 2>/dev/null || true
         wait "$sleep_pid" 2>/dev/null || true

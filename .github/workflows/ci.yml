@@ -35,7 +35,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
           find scripts spike -name '*.sh' -print0 | xargs -0 -r shellcheck -s sh
-          shellcheck -s sh files/d2k-instagram-dns.sh
+          shellcheck -s sh files/d2k-instagram-dns.sh files/d2k-update.sh
+      - name: Автообновление — подпись, установка, возврат
+        run: node scripts/test-update.cjs
       - name: Instagram resolver DNS lifecycle
         run: sh scripts/test-instagram-dns.sh
       - name: Installer/uninstaller lifecycle in disposable container
@@ -116,15 +118,3 @@ jobs:
         run: make -C datapath san
       - name: Ядро под санитайзерами
         run: make -C core san
-
-  update-release:
-    name: Nine C runtime ABIs, authenticated packaging, offline publisher
-    # Полная сборка девяти арок и пакетов — на main и по запросу. Pull request
-    # проверяют задания выше; выпуск без зелёного main не публикуется.
-    if: github.event_name != 'pull_request'
-    uses: ./.github/workflows/release.yml
-    # The called workflow declares its publish job with contents: write, and
-    # GitHub refuses to start a caller that grants less. That job runs only on
-    # workflow_dispatch/schedule on main, never from CI.
-    permissions:
-      contents: write

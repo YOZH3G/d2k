@@ -13,14 +13,6 @@
 # видит присваивания — отключаем проверку точечно, а не глушим весь файл.
 # shellcheck disable=SC2154
 
-DIR=${D2K_DIR:-/opt/d2k}
-if [ -L "$DIR/current" ] || [ -f "$DIR/update-state/bootstrap.pending" ]; then
-    case "${table:-}" in mangle|nat|filter)
-        exec "$DIR/boot/d2k-service-adapter" --root "$DIR" service heal ;;
-    esac
-    exit 0
-fi
-
 HEAL="${HEAL:-/opt/d2k/d2k-fw-heal.sh}"
 
 # Сторож возвращает и разгрузку ускорителя (-j PPE, d2k-ppe-deoffload.sh):

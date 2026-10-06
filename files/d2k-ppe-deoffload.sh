@@ -245,15 +245,6 @@ d2k_ppe_status() {
 # ---- запуск напрямую ---------------------------------------------------------
 case "${0##*/}" in
     d2k-ppe-deoffload.sh)
-        _d2k_root=${D2K_DIR:-/opt/d2k}
-        if [ -L "$_d2k_root/current" ] || [ -f "$_d2k_root/update-state/bootstrap.pending" ]; then
-            if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
-                "$_d2k_root/boot/d2k-service-adapter" --root "$_d2k_root" --validate-maintenance-fd 4 || exit 1
-            else
-                case "${1:-}" in ensure) action=ppe-ensure;; remove) action=ppe-remove;; status) action=status;; *) exit 2;; esac
-                exec "$_d2k_root/boot/d2k-service-adapter" --root "$_d2k_root" service "$action"
-            fi
-        fi
         case "${1:-}" in
             ensure) d2k_ppe_ensure ;;
             remove) d2k_ppe_remove ;;
@@ -262,19 +253,3 @@ case "${0##*/}" in
         esac
         ;;
 esac
-
-# Installation health checks every configured rule without repairing it.
-d2k_ppe_check() {
-    d2k_ppe_user_disabled && return 0
-    d2k_ppe_available iptables || return 0
-    for tool in iptables ip6tables; do
-        d2k_ppe_available "$tool" || continue
-        while IFS='|' read -r chain args; do
-            [ -n "$chain" ] || continue
-            # shellcheck disable=SC2086
-            _d2k_ppe_ipt "$tool" -t mangle -C "$chain" $args || return 1
-        done <<RULES
-$(_d2k_ppe_rules)
-RULES
-    done
-}

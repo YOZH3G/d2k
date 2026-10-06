@@ -3,8 +3,8 @@ ZIG ?= /opt/homebrew/bin/zig
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L
 RELEASE_ID ?= dev
 # override: CFLAGS из командной строки (lab-install.sh пересобирает панель с
-# -O1) иначе отбрасывал путь к заголовкам обновлятора и release ID.
-override CFLAGS += -I../update/include -DD2K_RELEASE_ID='"$(RELEASE_ID)"'
+# -O1) иначе отбрасывал release ID.
+override CFLAGS += -DD2K_RELEASE_ID='"$(RELEASE_ID)"'
 VERSION ?= dev
 COMMIT ?=
 BUILT ?=
@@ -14,8 +14,8 @@ DIRTY ?= 0
 
 all: d2kpanel
 
-d2kpanel: main.c server.h server.c update.c update.h ../update/src/ipc.c ../update/include/d2k_update_ipc.h ../runtime/d2k_runtime.h
-	$(CC) $(CFLAGS) -o $@ main.c server.c update.c ../update/src/ipc.c
+d2kpanel: main.c server.h server.c ../runtime/d2k_runtime.h
+	$(CC) $(CFLAGS) -o $@ main.c server.c
 
 TARGET ?= aarch64-linux-musl
 TARGET_FLAGS ?=
@@ -26,20 +26,19 @@ d2kpanel-linux-arm64: release
 release: main.c server.h server.c ../runtime/d2k_runtime.h
 	mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) -static -Wl,-S -Os -std=c11 -Wall -Wextra -Werror \
-		-I../update/include -D_POSIX_C_SOURCE=200809L -DD2K_RELEASE_ID='"$(RELEASE_ID)"' -DD2K_PANEL_VERSION='"$(VERSION)"' \
+		-D_POSIX_C_SOURCE=200809L -DD2K_RELEASE_ID='"$(RELEASE_ID)"' -DD2K_PANEL_VERSION='"$(VERSION)"' \
 		-DD2K_PANEL_COMMIT='"$(COMMIT)"' -DD2K_PANEL_BUILT='"$(BUILT)"' \
-		-DD2K_PANEL_DIRTY=$(DIRTY) -o $(BUILDDIR)/d2kpanel-linux-$(ARCH) main.c server.c update.c ../update/src/ipc.c
+		-DD2K_PANEL_DIRTY=$(DIRTY) -o $(BUILDDIR)/d2kpanel-linux-$(ARCH) main.c server.c
 
-test_server: test_server.c server.h server.c update.c update.h ../update/src/ipc.c ../update/include/d2k_update_ipc.h
-	$(CC) $(CFLAGS) -DD2K_PANEL_ACTION_TIMEOUT_MS=1000 -pthread -o $@ test_server.c server.c update.c ../update/src/ipc.c
+test_server: test_server.c server.h server.c
+	$(CC) $(CFLAGS) -DD2K_PANEL_ACTION_TIMEOUT_MS=1000 -pthread -o $@ test_server.c server.c
 
-test_server_san: test_server.c server.h server.c update.c update.h ../update/src/ipc.c ../update/include/d2k_update_ipc.h
+test_server_san: test_server.c server.h server.c
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-		-DD2K_PANEL_ACTION_TIMEOUT_MS=1000 -pthread -o $@ test_server.c server.c update.c ../update/src/ipc.c
+		-DD2K_PANEL_ACTION_TIMEOUT_MS=1000 -pthread -o $@ test_server.c server.c
 
-san: test_server_san test_update_san
+san: test_server_san
 	ASAN_OPTIONS=detect_leaks=0 ./test_server_san
-	ASAN_OPTIONS=detect_leaks=0 ./test_update_san
 
 test-js:
 	node test_ui.cjs
@@ -54,13 +53,5 @@ test: test_server d2kpanel test-js
 	node test_cli.cjs
 
 clean:
-	rm -f test_server test_server_san test_update test_update_san d2kpanel
+	rm -f test_server test_server_san d2kpanel
 
-.PHONY: test-update
-test-update: test_update
-	./test_update
-test_update: test_update.c server.c update.c update.h ../update/src/ipc.c
-	$(CC) $(CFLAGS) -pthread -o $@ test_update.c server.c update.c ../update/src/ipc.c
-
-test_update_san: test_update.c server.c update.c update.h ../update/src/ipc.c
-	$(CC) $(CFLAGS) -pthread -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ test_update.c server.c update.c ../update/src/ipc.c

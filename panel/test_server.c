@@ -203,6 +203,27 @@ static void test_telegram_status_is_dynamic_and_never_exposes_secret(void) {
     unlink(live);unlink(config);unlink(status);unlink(pid);
 }
 
+/* Состояние автообновления пишет d2k-update.sh; панель отдаёт файл как есть.
+   Нет утилиты — «не подключено», есть, но не проверялось — пустое состояние. */
+static void test_update_state_is_served_from_file(void) {
+    char state[] = "/tmp/d2k-panel-update-state.XXXXXX";
+    write_temp_file(state, "{\"busy\":\"\",\"current\":\"r2\"}\n");
+    d2k_panel_config cfg = { .live_path = "/absent", .asset_dir = "panel/assets",
+                             .update_state_path = state, .updater_path = "/bin/sh" };
+    char response[4096];
+    (void)request(&cfg, "GET /api/update HTTP/1.1\r\nHost: localhost\r\n\r\n", response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "{\"busy\":\"\",\"current\":\"r2\"}") != NULL);
+    unlink(state);
+    (void)request(&cfg, "GET /api/update HTTP/1.1\r\nHost: localhost\r\n\r\n", response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL && strstr(response, "{\"never\":true}") != NULL);
+    cfg.updater_path = "/absent/d2k-update.sh";
+    (void)request(&cfg, "GET /api/update HTTP/1.1\r\nHost: localhost\r\n\r\n", response, sizeof response);
+    assert(strstr(response, "{\"absent\":true}") != NULL);
+    (void)request(&cfg, "POST /api/update HTTP/1.1\r\nHost: localhost\r\n\r\n", response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 405") != NULL);
+}
+
 static void test_unsupported_method_is_rejected(void) {
     d2k_panel_config cfg = { .live_path = "/absent", .asset_dir = "panel/assets" };
     char response[4096];
@@ -258,6 +279,8 @@ static void test_panel_accepts_a_control_action_request(void) {
     static const struct { const char *path; const char *command; } routes[] = {
         { "start", "engine-start" }, { "restart", "engine-restart" },
         { "reapply", "reapply" }, { "telegram-disable", "telegram-disable" },
+        { "update-check", "update-check" }, { "update-install", "update-install" },
+        { "update-auto-on", "update-auto-on" }, { "update-auto-off", "update-auto-off" },
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) {
         char req[512];
@@ -552,6 +575,7 @@ int main(void) {
     test_api_exposes_live_knowledge();
     test_invalid_live_json_is_not_reported_as_empty_knowledge();
     test_telegram_status_is_dynamic_and_never_exposes_secret();
+    test_update_state_is_served_from_file();
     test_unsupported_method_is_rejected();
     test_slow_control_does_not_block_status();
     test_panel_accepts_a_control_action_request();

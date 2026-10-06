@@ -9,14 +9,6 @@ set -eu
 trap 'exit 143' TERM INT HUP
 export PATH="${D2K_STUB_PATH:+$D2K_STUB_PATH:}/opt/sbin:/opt/bin:/sbin:/usr/sbin:/bin:/usr/bin"
 DIR=${D2K_DIR:-/opt/d2k}
-if [ -L "$DIR/current" ] || [ -f "$DIR/update-state/bootstrap.pending" ]; then
-    if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
-        "$DIR/boot/d2k-service-adapter" --root "$DIR" --validate-maintenance-fd 4 || exit 1
-    else
-        case "${1:-}" in refresh) action=dns-refresh;; remove) action=dns-remove;; *) exit 2;; esac
-        exec "$DIR/boot/d2k-service-adapter" --root "$DIR" service "$action"
-    fi
-fi
 TGBIN=${D2K_RELEASE_ROOT:+$D2K_RELEASE_ROOT/d2ktg}
 TGBIN=${TGBIN:-d2ktg}
 META_RANGES=${D2K_META_RANGES:-$DIR/files/meta-ranges.txt}

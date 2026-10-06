@@ -98,16 +98,6 @@ write_attempt() {
 }
 
 tick() {
-    if [ -L "$DIR/current" ] || [ -f "$DIR/update-state/bootstrap.pending" ]; then
-        if [ "${D2K_MANAGED_INTERNAL:-}" != 1 ]; then
-            "$DIR/boot/d2k-service-adapter" --root "$DIR" service dns-tick &
-            child_pid=$!
-            wait "$child_pid"
-            child_pid=
-            return
-        fi
-        "$DIR/boot/d2k-service-adapter" --root "$DIR" --validate-maintenance-fd 4 || return 1
-    fi
     today=$(date +%Y-%m-%d)
     hhmm=$(date +%H%M)
     at=$(run_at)
@@ -160,8 +150,8 @@ case "${1:-run}" in
         while :; do
             tick
             # Пауза — фоновым sleep и wait: trap на TERM срабатывает сразу, а
-            # не после foreground-команды. Иначе управляемая остановка ждёт до
-            # RUN_EVERY, добивает SIGKILL и считает транзакцию сорванной.
+            # не после foreground-команды. Иначе остановка службы ждёт до
+            # RUN_EVERY и добивает SIGKILL.
             sleep "$RUN_EVERY" &
             child_pid=$!
             wait "$child_pid" || true

@@ -13,15 +13,6 @@ DIR=${D2K_DIR:-/opt/d2k}
 PREFIX=${DIR%/*}
 SBIN=$PREFIX/sbin
 INIT=$PREFIX/etc/init.d/S99d2k
-if [ -L "$DIR/current" ] || [ -d "$DIR/boot" ] || [ -d "$DIR/update-state" ]; then
-    if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
-        "$DIR/boot/d2k-service-adapter" --root "$DIR" --validate-maintenance-fd 4 || exit 1
-        # Stop and DNS cleanup have already completed under this held lock.
-        INIT=${D2K_RELEASE_ROOT}/S99d2k
-    else
-        exec "$DIR/boot/d2k-service-adapter" --root "$DIR" service uninstall
-    fi
-fi
 KEEP=${D2K_KEEP_STATE:-0}
 
 say() { echo "d2k: $*"; }
@@ -66,6 +57,9 @@ if [ -f "$DIR/run/d2k-http.pid" ]; then
 fi
 if [ -f "$DIR/run/d2k-log-maintenance.pid" ]; then
     start-stop-daemon -K -q -p "$DIR/run/d2k-log-maintenance.pid" 2>/dev/null || true
+fi
+if [ -f "$DIR/run/d2k-update.pid" ]; then
+    start-stop-daemon -K -q -p "$DIR/run/d2k-update.pid" 2>/dev/null || true
 fi
 [ ! -x "$DIR/d2k-tg-firewall.sh" ] || "$DIR/d2k-tg-firewall.sh" stop >/dev/null 2>&1 || true
 
@@ -164,9 +158,10 @@ rm -f "$PREFIX/etc/init.d/S99d2k" "$PREFIX/etc/init.d/S98d2k-update" "$SBIN/d2k"
 rm -f "$SBIN"/d2kc.before-d2k-* "$SBIN"/d2kc.pre-goal-* "$SBIN"/d2kc.pre-sched-*
 rm -f "$DIR/d2k-ppe-deoffload.sh" "$DIR/d2k-fw-heal.sh"
 rm -f "$DIR/d2k-tg-firewall.sh" "$DIR/d2k-tg-watchdog.sh" "$DIR/d2k-instagram-dns.sh" \
-    "$DIR/d2k-instagram-dns-scheduler.sh" "$DIR/d2k-log-maintenance.sh" \
+    "$DIR/d2k-instagram-dns-scheduler.sh" "$DIR/d2k-log-maintenance.sh" "$DIR/d2k-update.sh" \
+    "$DIR/release-id" "$DIR/release-arch" \
     "$DIR/files/meta-ranges.txt" "$DIR/files/tg-roots.pem"
-rm -rf "$DIR/run" "$DIR/log" "$DIR/panel"
+rm -rf "$DIR/run" "$DIR/log" "$DIR/panel" "$DIR/.update"
 # Свои файлы в /tmp: отметки сторожа и планировщика, брошенные замки.
 rm -f /tmp/d2k-fw-heal.last /tmp/d2k-instagram-dns-last-attempt
 for lock in /tmp/d2k-fw-heal.lock /tmp/d2k-fw-operation.lock; do
@@ -217,25 +212,12 @@ fi
 cleanup_runtime /tmp/d2k
 [ -z "$custom_runtime" ] || cleanup_runtime "$custom_runtime"
 
-if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
-    # Keep maintenance.lock inode: existing waiters must never acquire a second
-    # lock for the same root. Remove code only after all owned writers stopped.
-    rm -rf "${DIR:?}/releases" "${DIR:?}/current" "${DIR:?}/boot" "${DIR:?}/update" "${DIR:?}/snapshots"
-fi
 if [ "$KEEP" = "1" ]; then
     say "сохраняю конфигурацию и каталог изученных коробок в $DIR"
     say "чтобы удалить всё: D2K_KEEP_STATE=0 sh $0"
     rm -f "$DIR/config.new"
 else
-    if [ "${D2K_MANAGED_INTERNAL:-}" = 1 ]; then
-        for owned in "$DIR"/* "$DIR"/.[!.]* "$DIR"/..?*; do
-            [ "$owned" = "$DIR/update-state" ] || rm -rf "$owned"
-        done
-        # Lock/tombstone survives concurrent waiters; a clean reinstall is an
-        # explicit bootstrap operation after all lifecycle clients have exited.
-    else
-        rm -rf "$DIR"
-    fi
+    rm -rf "$DIR"
     say "удалено всё, включая каталог коробок"
 fi
 
