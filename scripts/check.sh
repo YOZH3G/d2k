@@ -62,6 +62,7 @@ node scripts/test-log-maintenance.cjs
 node scripts/test-log-maintenance-process.cjs
 node scripts/test-update.cjs
 node scripts/test-runtime-install.cjs
+node scripts/test-openwrt-init.cjs
 sh scripts/test-readme-commands.sh
 sh scripts/test-architecture.sh
 
@@ -72,6 +73,7 @@ sh scripts/test-architecture.sh
 # указан явно, а не через более широкий глоб по files/, потому что там сейчас
 # ровно один файл и обобщать шаблон под гипотетические будущие не по чему.
 shellcheck -s sh files/S99d2k
+shellcheck -s sh files/d2k-openwrt-init
 shellcheck -s sh files/d2k-instagram-dns.sh
 shellcheck -s sh files/d2k-instagram-dns-scheduler.sh
 shellcheck -s sh files/d2k-log-maintenance.sh

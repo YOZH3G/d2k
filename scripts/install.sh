@@ -19,6 +19,41 @@ BASE=${D2K_BASE:-https://raw.githubusercontent.com/$REPO/$REF}
 DIR=/opt/d2k
 SBIN=/opt/sbin
 INIT=/opt/etc/init.d/S99d2k
+OPENWRT_INIT=/etc/init.d/d2k
+openwrt_check() {
+    [ -f /etc/openwrt_release ] || return 0
+    if [ ! -r /etc/rc.common ] || [ ! -r /lib/functions/procd.sh ]; then
+        echo 'd2k: OpenWrt без rc.common/procd — автозапуск недоступен' >&2
+        return 0
+    fi
+    if [ -e "$OPENWRT_INIT" ] || [ -L "$OPENWRT_INIT" ]; then
+        if [ -L "$OPENWRT_INIT" ] || [ ! -f "$OPENWRT_INIT" ] ||
+           ! grep -qx '# D2K-owned OpenWrt boot bridge v1' "$OPENWRT_INIT"; then
+            echo "d2k: чужой $OPENWRT_INIT — не перезаписываю" >&2
+            return 1
+        fi
+    fi
+}
+install_openwrt_hook() (
+    [ -f /etc/openwrt_release ] || exit 0
+    [ -r /etc/rc.common ] && [ -r /lib/functions/procd.sh ] || exit 0
+    openwrt_check || exit 1
+    hook_stage=$(mktemp "$OPENWRT_INIT.XXXXXX") || exit 1
+    trap 'rm -f "$hook_stage"' EXIT INT TERM
+    if [ -n "${D2K_LOCAL:-}" ]; then
+        cp "$D2K_LOCAL/files/d2k-openwrt-init" "$hook_stage" || exit 1
+    else
+        curl -fsSL --max-time 120 -o "$hook_stage" "$BASE/files/d2k-openwrt-init" || exit 1
+    fi
+    if ! grep -qx '# D2K-owned OpenWrt boot bridge v1' "$hook_stage" ||
+       ! sh -n "$hook_stage" || ! chmod 0755 "$hook_stage"; then
+        exit 1
+    fi
+    mv -f "$hook_stage" "$OPENWRT_INIT" || exit 1
+    sh /etc/rc.common "$OPENWRT_INIT" enable || exit 1
+    echo 'd2k: автозапуск OpenWrt включён (ожидание Entware, затем D2K)'
+)
+openwrt_check || exit 1
 TMP=
 
 say()  { echo "d2k: $*"; }
@@ -341,5 +376,6 @@ else
     say "автообновление: новые подписанные выпуски ставятся ночью 03:00–05:00; кнопка и тумблер — в панели"
 fi
 
+install_openwrt_hook || die "не удалось включить автозапуск OpenWrt"
 say "готово"
 say "режим по умолчанию — активный обход (MODE=apply). Для наблюдения задайте MODE=observe."

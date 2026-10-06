@@ -57,7 +57,11 @@ exit 1
   for (const name of ['install', 'uninstall']) {
     const script = fs.readFileSync(name === 'install' && process.env.D2K_INSTALL_FIXTURE_SOURCE ? process.env.D2K_INSTALL_FIXTURE_SOURCE : path.join(root, `scripts/${name}.sh`), 'utf8')
       .replaceAll('/opt', path.join(tmp, 'opt'))
-      .replaceAll('/proc', path.join(tmp, 'proc'))
+      .replaceAll('/etc/openwrt_release', path.join(tmp, 'etc/openwrt_release'))
+      .replaceAll('/etc/rc.common', path.join(tmp, 'etc/rc.common'))
+      .replaceAll('/etc/init.d/d2k', path.join(tmp, 'etc/init.d/d2k'))
+      .replaceAll('/lib/functions/procd.sh', path.join(tmp, 'lib/functions/procd.sh'))
+      .replaceAll('/proc/', `${path.join(tmp, 'proc')}/`)
       .replaceAll('/tmp/d2k', runtime);
     fs.writeFileSync(path.join(tmp, `${name}.sh`), script);
   }
@@ -134,6 +138,33 @@ exit 1
   assert(fs.statSync(installed).mode & 0o111, 'installed helper must be executable');
   const ppe = path.join(tmp, 'opt/d2k/d2k-ppe-deoffload.sh');
   assert(fs.existsSync(ppe) && (fs.statSync(ppe).mode & 0o111), 'installer must install the PPE de-offload helper executable');
+  // Issue #4: OpenWrt does not boot Entware's S99d2k on its own.
+  const hostInit = path.join(tmp, 'etc/init.d/d2k');
+  assert(!fs.existsSync(hostInit), 'Keenetic install must not create a host OpenWrt service');
+  fs.mkdirSync(path.dirname(hostInit), { recursive: true });
+  fs.mkdirSync(path.join(tmp, 'lib/functions'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'etc/openwrt_release'), "DISTRIB_ID='OpenWrt'\n");
+  fs.writeFileSync(path.join(tmp, 'lib/functions/procd.sh'), '# fixture\n');
+  fs.writeFileSync(path.join(tmp, 'etc/rc.common'), '#!/bin/sh\nprintf "host-%s\\n" "$2" >> "$CALLS"\n', { mode: 0o755 });
+  const templatePath = path.join(root, 'files/d2k-openwrt-init');
+  if (fs.existsSync(templatePath)) fixture('files/d2k-openwrt-init', fs.readFileSync(templatePath, 'utf8')
+    .replaceAll('/etc/rc.common', path.join(tmp, 'etc/rc.common')));
+  run('install');
+  assert(fs.existsSync(hostInit), 'OpenWrt installer must create /etc/init.d/d2k');
+  assert(calls().includes('host-enable'), 'OpenWrt installer must enable its native boot hook');
+  run('install');
+  assert(fs.existsSync(hostInit), 'OpenWrt upgrade must keep the native boot hook');
+  // Missing procd must not turn an otherwise successful update into failure.
+  const procd = path.join(tmp, 'lib/functions/procd.sh');
+  fs.rmSync(procd);
+  run('install');
+  fs.writeFileSync(procd, '# fixture\n');
+  const ownedHook = fs.readFileSync(hostInit);
+  fs.writeFileSync(hostInit, '#!/bin/sh\n# another service\n');
+  const conflict = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
+  assert.notEqual(conflict.status, 0, 'installer must refuse a foreign host service');
+  assert.match(fs.readFileSync(hostInit, 'utf8'), /another service/);
+  fs.writeFileSync(hostInit, ownedHook);
   // Uninstall without init must still remove its own tagged -j PPE rules.
   fs.writeFileSync(ppe, '#!/bin/sh\nd2k_ppe_remove() { printf "ppe-remove\\n" >> "$CALLS"; }\n');
   const state = path.join(tmp, 'opt/d2k/state/catalog.json'); fs.writeFileSync(state, '{"learned":true}');
@@ -162,6 +193,8 @@ exit 1
   for (const d of [`${runtime}-fw-heal.lock`, `${runtime}-fw-operation.lock`]) { fs.mkdirSync(d); fs.writeFileSync(path.join(d, 'pid'), '2147480001'); }
   fs.rmSync(iptCalls, { force: true });
   run('uninstall', { IPT_RST: '1' });
+  assert(!fs.existsSync(hostInit), 'keep-state uninstall must remove the native boot hook');
+  assert(calls().includes('host-disable') && calls().includes('host-detach'), 'uninstall must disable the hook and cancel its waiting worker');
   assert.equal(fs.readFileSync(fastnat, 'utf8').trim(), '1', 'uninstall fallback must restore the saved fastnat value');
   const ipt = fs.readFileSync(iptCalls, 'utf8');
   for (const tool of ['iptables', 'ip6tables']) {
