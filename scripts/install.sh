@@ -353,7 +353,7 @@ UPDATE_KEY='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAqZkq/DsxeFJ1MCEEyFa7yzm80XiWf+cHPR1JsybbMPQ=
 -----END PUBLIC KEY-----'
 update_fetch() {
-    curl -fsSL --proto '=https' --max-time 300 -o "$2" "$UPDATE_FEED/$1"
+    curl -fsL --proto '=https' --max-time 300 -o "$2" "$UPDATE_FEED/$1"
 }
 update_verified() {
     # $1 — документ, $2 — его подпись Ed25519 (64 байта).
