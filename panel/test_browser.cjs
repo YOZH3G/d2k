@@ -167,9 +167,10 @@ async function main(){
   // Опрос не сбрасывает раскрытые подробности, фокус и фильтр.
   await evaluate('document.querySelector(".plan").open=true');
   await evaluate('document.querySelector("[data-control=restart]").focus();window.restartBefore=document.querySelector("[data-control=restart]")');
-  const polls='performance.getEntriesByType("resource").filter(e=>e.name.endsWith("/api/status")).length';
+  const polls='performance.getEntriesByType("resource").filter(e=>new URL(e.name).pathname==="/api/status").length';
   const before=await evaluate(polls);
-  await until(polls+'>='+(before+2),'panel must keep polling');
+  /* В простое опрос раз в 6 с (PR #18): два опроса — до 12 с, ждём 15. */
+  for(let i=0;;i++){if(await evaluate(polls+'>='+(before+2)))break;if(i>=300)throw Error('panel must keep polling');await wait(50)}
   assert.equal(await evaluate('document.querySelector(".plan").open'),true,'open plan survives polling');
   assert.equal(await evaluate('document.activeElement===window.restartBefore'),true,'focused control is not replaced by a poll');
   await evaluate('(()=>{const i=document.querySelector("#filter");i.value="skip";i.dispatchEvent(new Event("input"))})()');

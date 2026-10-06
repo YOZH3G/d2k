@@ -621,21 +621,50 @@ static void buf_json_string(panel_buf *b, const char *s) {
     buf_puts(b, "\"");
 }
 
-static void buf_live_knowledge(panel_buf *b, const char *json, size_t len,
-                               int effective_linked) {
-    const char *value = NULL;
-    size_t value_len = 0;
-    if (!json_top_value(json, "linked", &value, &value_len) ||
-        value < json || (size_t)(value - json) > len ||
-        value_len > len - (size_t)(value - json)) {
-        buf_add(b, json, len);
-        return;
+/* Cache validator for catalog content, not a security/authentication token. */
+static int catalog_revision(const char *json, char out[17]) {
+    const char *keys[] = { "boxes", "groups" };
+    uint64_t hash = UINT64_C(14695981039346656037);
+    int found = 0;
+    for (size_t k = 0; k < 2; ++k) {
+        const char *value = NULL; size_t len = 0;
+        int present = json_top_value(json, keys[k], &value, &len);
+        hash ^= k + 1; hash *= UINT64_C(1099511628211);
+        hash ^= (uint64_t)len; hash *= UINT64_C(1099511628211);
+        if (!present) continue;
+        found = 1;
+        for (size_t i = 0; i < len; ++i) {
+            hash ^= (unsigned char)value[i]; hash *= UINT64_C(1099511628211);
+        }
     }
-    size_t offset = (size_t)(value - json);
-    buf_add(b, json, offset);
-    buf_puts(b, effective_linked ? "true" : "false");
-    size_t suffix_offset = offset + value_len;
-    buf_add(b, json + suffix_offset, len - suffix_offset);
+    snprintf(out, 17, "%016llx", (unsigned long long)hash);
+    return found;
+}
+
+static void buf_live_knowledge(panel_buf *b, const char *json, size_t len,
+                               int effective_linked, int slim) {
+    struct replacement { size_t offset, len; const char *text; } parts[3];
+    const char *keys[] = { "linked", "boxes", "groups" };
+    size_t count = 0;
+    for (size_t k = 0; k < 3; ++k) {
+        if (k && !slim) continue;
+        const char *value = NULL; size_t value_len = 0;
+        if (!json_top_value(json, keys[k], &value, &value_len) ||
+            value < json || (size_t)(value - json) > len ||
+            value_len > len - (size_t)(value - json)) continue;
+        struct replacement part = { (size_t)(value - json), value_len,
+                                     k ? "null" : (effective_linked ? "true" : "false") };
+        size_t i = count++;
+        while (i && parts[i - 1].offset > part.offset) { parts[i] = parts[i - 1]; --i; }
+        parts[i] = part;
+    }
+    size_t offset = 0;
+    for (size_t i = 0; i < count; ++i) {
+        buf_add(b, json + offset, parts[i].offset - offset);
+        buf_puts(b, parts[i].text);
+        offset = parts[i].offset + parts[i].len;
+    }
+    buf_add(b, json + offset, len - offset);
 }
 
 static void append_stage(panel_buf *b, const char *key, const char *title,
@@ -728,7 +757,7 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     buf_puts(b, "]}");
 }
 
-static int api_status(int fd, const d2k_panel_config *cfg) {
+static int api_status(int fd, const d2k_panel_config *cfg, const char *query) {
     char *live = NULL;
     size_t live_len = 0;
     if (cfg && cfg->live_path && json_object_file(cfg->live_path, &live, &live_len) == 0) {
@@ -753,7 +782,16 @@ static int api_status(int fd, const d2k_panel_config *cfg) {
         append_snapshot(&b, cfg, linked, have_catalog, live_fresh,
                         engine_running, controller_running);
         buf_puts(&b, ",\"knowledge\":");
-        buf_live_knowledge(&b, live, live_len, linked);
+        char revision[17];
+        int have_revision = catalog_revision(live, revision);
+        int unchanged = have_revision && query &&
+            strncmp(query, "catalog_revision=", 17) == 0 &&
+            strcmp(query + 17, revision) == 0;
+        buf_live_knowledge(&b, live, live_len, linked, unchanged);
+        if (have_revision) {
+            buf_printf(&b, ",\"catalog_revision\":\"%s\",\"catalog_unchanged\":%s",
+                       revision, unchanged ? "true" : "false");
+        }
         buf_puts(&b, "}");
         if (b.failed) { free(body); free(live); return -1; }
         int rc = response(fd, 200, "OK", "application/json; charset=utf-8",
@@ -855,7 +893,7 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
         return response(fd, 400, "Bad Request", "text/plain; charset=utf-8", "bad request\n", 12);
     }
     char *query = strchr(path, '?');
-    if (query) { *query = '\0'; }
+    if (query) { *query++ = '\0'; }
     if (strcmp(path, "/api/update") == 0) {
         if (strcmp(method, "GET") != 0) {
             return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8",
@@ -873,7 +911,7 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     if (strcmp(method, "GET") != 0) {
         return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8", "method not allowed\n", 19);
     }
-    if (strcmp(path, "/api/status") == 0) { return api_status(fd, cfg); }
+    if (strcmp(path, "/api/status") == 0) { return api_status(fd, cfg, query); }
     if (strcmp(path, "/") == 0) {
         return static_file(fd, cfg, req, "index.html", "text/html; charset=utf-8");
     }
