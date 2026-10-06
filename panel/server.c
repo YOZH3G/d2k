@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -19,6 +20,12 @@
 
 #define REQUEST_MAX (32u * 1024u)
 #define BODY_MAX (1024u * 1024u)
+#ifndef D2K_PANEL_HEADER_TIMEOUT_MS
+#define D2K_PANEL_HEADER_TIMEOUT_MS 5000
+#endif
+#ifndef D2K_PANEL_RESPONSE_TIMEOUT_MS
+#define D2K_PANEL_RESPONSE_TIMEOUT_MS 5000
+#endif
 #ifndef D2K_PANEL_ACTION_TIMEOUT_MS
 #define D2K_PANEL_ACTION_TIMEOUT_MS 60000
 #endif
@@ -226,11 +233,18 @@ static int controller_pid_running(const d2k_panel_config *cfg) {
     return pid_path_running(cfg ? cfg->controller_pid_path : NULL, NULL);
 }
 
-static int write_all(int fd, const void *buf, size_t len) {
+static int write_all(int fd, const void *buf, size_t len, long long deadline) {
     const char *p = buf;
     while (len > 0) {
+        long long remaining = deadline - monotonic_ms();
+        if (remaining <= 0) { errno = ETIMEDOUT; return -1; }
+        struct pollfd ready = { .fd = fd, .events = POLLOUT };
+        int rc = poll(&ready, 1, (int)remaining);
+        if (rc < 0 && errno == EINTR) { continue; }
+        if (rc == 0) { errno = ETIMEDOUT; return -1; }
+        if (rc < 0) { return -1; }
         ssize_t n = write(fd, p, len);
-        if (n < 0 && errno == EINTR) { continue; }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) { continue; }
         if (n <= 0) { return -1; }
         p += n;
         len -= (size_t)n;
@@ -253,8 +267,16 @@ static int response_ex(int fd, int code, const char *reason, const char *type,
         "Referrer-Policy: no-referrer\r\n\r\n",
         code, reason, type, len, extra ? extra : "");
     if (n < 0 || (size_t)n >= sizeof hdr) { return -1; }
-    if (write_all(fd, hdr, (size_t)n) != 0) { return -1; }
-    return len == 0 ? 0 : write_all(fd, body, len);
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) { return -1; }
+    /* One deadline covers headers and body, including repeated partial writes. */
+    const long long deadline = monotonic_ms() + D2K_PANEL_RESPONSE_TIMEOUT_MS;
+    int rc = write_all(fd, hdr, (size_t)n, deadline);
+    if (rc == 0 && len) { rc = write_all(fd, body, len, deadline); }
+    int saved_errno = errno;
+    int restored = fcntl(fd, F_SETFL, flags);
+    if (rc != 0) { errno = saved_errno; return rc; }
+    return restored == 0 ? 0 : -1;
 }
 
 static int response(int fd, int code, const char *reason, const char *type,
@@ -500,7 +522,15 @@ static int api_update(int fd, const d2k_panel_config *cfg) {
 
 static int read_request(int fd, char *buf, size_t cap, size_t *used) {
     *used = 0;
+    const long long deadline = monotonic_ms() + D2K_PANEL_HEADER_TIMEOUT_MS;
     while (*used + 1 < cap) {
+        long long remaining = deadline - monotonic_ms();
+        if (remaining <= 0) { return -2; }
+        struct pollfd ready = { .fd = fd, .events = POLLIN };
+        int rc = poll(&ready, 1, (int)remaining);
+        if (rc < 0 && errno == EINTR) { continue; }
+        if (rc == 0) { return -2; }
+        if (rc < 0) { return -1; }
         ssize_t n = read(fd, buf + *used, cap - *used - 1);
         if (n < 0 && errno == EINTR) { continue; }
         if (n < 0) { return -1; }
@@ -806,10 +836,18 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     size_t used = 0;
     int rr = read_request(fd, req, sizeof req, &used);
     if (rr != 0) {
+        if (rr == -2) {
+            static const char timed_out[] = "request timeout\n";
+            return response(fd, 408, "Request Timeout", "text/plain; charset=utf-8",
+                            timed_out, sizeof timed_out - 1);
+        }
         static const char too_large[] = "request too large\n";
+        static const char bad_request[] = "bad request\n";
         return response(fd, rr > 0 ? 431 : 400,
                         rr > 0 ? "Request Header Fields Too Large" : "Bad Request",
-                        "text/plain; charset=utf-8", too_large, sizeof too_large - 1);
+                        "text/plain; charset=utf-8",
+                        rr > 0 ? too_large : bad_request,
+                        rr > 0 ? sizeof too_large - 1 : sizeof bad_request - 1);
     }
     char method[8], path[256], version[16];
     if (sscanf(req, "%7s %255s %15s", method, path, version) != 3 ||
