@@ -2,7 +2,9 @@ CC ?= cc
 ZIG ?= /opt/homebrew/bin/zig
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L
 RELEASE_ID ?= dev
-CFLAGS += -I../update/include -DD2K_RELEASE_ID='"$(RELEASE_ID)"'
+# override: CFLAGS из командной строки (lab-install.sh пересобирает панель с
+# -O1) иначе отбрасывал путь к заголовкам обновлятора и release ID.
+override CFLAGS += -I../update/include -DD2K_RELEASE_ID='"$(RELEASE_ID)"'
 VERSION ?= dev
 COMMIT ?=
 BUILT ?=
