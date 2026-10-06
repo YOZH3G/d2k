@@ -403,7 +403,11 @@
       headers: body ? { "Content-Type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined, signal: ctrl ? ctrl.signal : undefined
     }).then(function (r) {
-      return r.json().then(function (data) { return { ok: r.ok, code: r.status, data: data }; });
+      /* Ответ не JSON — панель без API обновлений (плоская установка, старая
+         панель отвечает 404 или 405 текстом): это не сбой связи, а отсутствие
+         обновлятора. Сбой связи — это исключение fetch. */
+      return r.json().then(function (data) { return { ok: r.ok, code: r.status, data: data || {} }; },
+        function () { return { ok: false, code: r.status, data: {}, absent: true }; });
     }).finally(function () { win.clearTimeout(timer); });
   };
 
@@ -424,7 +428,9 @@
     this.renderUpdates(this.updateStatus);
     return this.updateRequest("/api/update/" + action, body).then(function (reply) {
       self.updateFailed = false;
+      self.updaterAbsent = !!reply.absent || reply.data.state === "unavailable";
       if (reply.data.state) self.updateStatus = reply.data;
+      if (self.updaterAbsent) { self.updateMessage(""); return; }
       if (!reply.ok) {
         self.updateActionError = { action: action, operation_id: body.operation_id };
         self.updateMessage(reply.code === 409 ? "Выбор или операция изменились. Проверьте состояние и повторите действие." : reply.code === 403 ? "Управление обновлениями отключено или запрос не разрешён." : "Обновлятор недоступен. Повторите проверку позже.");
@@ -449,12 +455,16 @@
   App.prototype.pollUpdates = function () {
     var self = this;
     if (this.doc.hidden || this.updateInflight || this.updatePending || !this.$("updates-body")) return Promise.resolve();
+    /* Без обновлятора опрашивать раз в минуту, а не на каждом шаге панели. */
+    if (this.updaterAbsent && Date.now() - (this.updaterAbsentAt || 0) < 60000) return Promise.resolve();
     this.updateInflight = true;
     var epoch = this.updateEpoch || 0;
     return this.updateRequest("/api/update").then(function (reply) {
       if (epoch !== (self.updateEpoch || 0)) return;
+      self.updaterAbsent = !!reply.absent || reply.data.state === "unavailable";
+      if (self.updaterAbsent) self.updaterAbsentAt = Date.now();
       if (reply.data.state) self.updateStatus = reply.data;
-      self.updateFailed = !reply.ok;
+      self.updateFailed = !reply.ok && !self.updaterAbsent;
       if (reply.ok) {
         var error = self.updateActionError, data = reply.data;
         /* Успешный GET сам по себе не разрешает отказ или потерянный ответ.
@@ -505,7 +515,8 @@
     var compatible = available && available.compatible === true;
     var reason = updateError(s.last_error), tone = "", text = "Обновления ещё не проверялись";
     var installing = busy && phase >= 3 && phase <= 11;
-    if (s.state === "unavailable") { text = "Обновлятор недоступен"; reason = "Служба обновлений не настроена или не запущена. Повторите проверку позже."; tone = "warn"; }
+    var absent = !!this.updaterAbsent || s.state === "unavailable";
+    if (absent) { text = "Автообновление не подключено"; reason = "Эта установка обновляется командой установки. Обновлятор ставится вместе с подписанным выпуском, когда он опубликован."; }
     else if (busy) text = UPDATE_PHASES[phase] || "Обновление выполняется…";
     else if (phase === 13) { text = UPDATE_PHASES[13]; tone = "bad"; }
     else if (phase === 12) { text = "Обновление не завершено. Восстановлена версия " + (current || "предыдущего выпуска"); tone = "warn"; }
@@ -515,22 +526,27 @@
     else if (available && !same) text = "Доступна версия " + (str(available.version) || available.release_id);
     else if (s.state === "current" && fresh && s.last_result === 0) text = "Установлена последняя доступная версия";
     else if (check.cached && !fresh) { text = "Сведения об обновлениях устарели"; reason = "Проверьте обновления, чтобы получить текущий выпуск."; tone = "warn"; }
-    if (pending && pending.action === "check" && !installing) text = "Проверяем обновления…";
+    if (pending && pending.action === "check" && !installing && !absent) text = "Проверяем обновления…";
     if (quarantine.applies_to_available && !busy) { reason = "Автоматическая установка этого выпуска приостановлена после отказа. " + updateError(quarantine.reason); tone = "warn"; }
     function write(id, value) { var node = self.$(id); if (node.textContent !== value) node.textContent = value; return node; }
-    write("update-current", current || "не определён");
+    var body = this.$("updates-body");
+    if (body.setAttribute) body.setAttribute("data-mode", absent ? "absent" : "ready");
+    write("update-current", current || (absent ? "без автообновления" : "не определён"));
     var state = this.$("update-state"), changed = state.textContent !== text;
     write("update-state", text);
     var statusBox = state.parentElement;
     if (statusBox) statusBox.setAttribute("data-tone", tone);
+    /* Зелёный — только подтверждённая свежей подписанной проверкой актуальность. */
+    var lamp = this.$("update-lamp");
+    if (lamp) lamp.setAttribute("data-tone", tone || (!absent && !busy && s.state === "current" && fresh && s.last_result === 0 ? "ok" : "idle"));
     if (changed && !this.doc.hidden && Motion.on()) {
       Motion.g.killTweensOf(state);
       Motion.g.fromTo(state, { opacity: .55, y: 3 }, { opacity: 1, y: 0, duration: .2, clearProps: "opacity,transform" });
     }
     write("update-reason", reason).hidden = !reason;
-    write("update-checked", check.last_success_utc > 0 ? "Последняя успешная проверка: " + localTime(check.last_success_utc * 1000) + (check.fresh ? "" : " · сведения устарели") : "Успешной проверки ещё не было");
+    write("update-checked", check.last_success_utc > 0 ? "проверено " + localTime(check.last_success_utc * 1000) + (check.fresh ? "" : ", сведения устарели") : "успешной проверки ещё не было");
     this.$("update-release").hidden = !available || !!same;
-    write("update-version", available ? "Выпуск " + (str(available.version) || available.release_id) : "");
+    write("update-version", available ? "Что изменилось в " + (str(available.version) || available.release_id) : "");
     /* Подписанный текст выпуска всё равно недоверен для HTML. */
     write("update-notes-text", str(available && available.notes) || "Описание изменений не опубликовано.");
     var install = this.$("update-install");
@@ -541,7 +557,7 @@
     this.updateSelection = !install.disabled && !install.hidden ? { release_id: available.release_id, manifest_sha256: available.manifest_sha256 } : null;
     var checkButton = this.$("update-check");
     checkButton.disabled = !!pending || installing || (busy && phase !== 1);
-    checkButton.setAttribute("data-variant", install.hidden ? "primary" : "ghost");
+    checkButton.setAttribute("data-variant", "ghost");
     var warning = available && !same ? !compatible ? "Для ABI этого роутера нет совместимого пакета. Установка недоступна." : retry ? "Ручной повтор после отказа. Службы кратковременно перезапустятся; закрытие вкладки не отменяет установку." : "Службы кратковременно перезапустятся. Закрытие вкладки не отменяет установку." : "";
     if (available && !same && compatible && !fresh) warning += " Перед установкой нужна успешная свежая проверка.";
     write("update-warning", warning).hidden = !warning;
@@ -552,11 +568,11 @@
     var auto = this.$("update-auto"), settings = s.settings;
     if (!(pending && pending.action === "settings")) auto.checked = !!(settings && settings.enabled);
     auto.disabled = !settings || busy || !!pending || failed || s.state === "unavailable";
-    var schedule = "03:00–05:00 по времени роутера" + (settings && settings.timezone ? " · " + settings.timezone : "");
-    schedule += settings && settings.enabled ? ". Ближайшая установка — в ночном окне." : ". Автоустановка выключена; ночная проверка сохраняется.";
+    var schedule = "03:00–05:00 по времени роутера" + (settings && settings.timezone ? " (" + settings.timezone + ")" : "");
+    schedule += settings && settings.enabled ? "" : " · сейчас только проверка";
     if (settings && settings.enabled && settings.selected_date && settings.selected_minute >= 180 && settings.selected_minute < 300) {
       var date = str(settings.selected_date), minute = settings.selected_minute;
-      schedule += " Выбрано " + date.slice(6,8) + "." + date.slice(4,6) + "." + date.slice(0,4) + " в " + Math.floor(minute / 60) + ":" + (minute % 60 < 10 ? "0" : "") + minute % 60 + ".";
+      schedule += " · ближайшее окно " + date.slice(6,8) + "." + date.slice(4,6) + " в " + Math.floor(minute / 60) + ":" + (minute % 60 < 10 ? "0" : "") + minute % 60;
     }
     write("update-schedule", schedule);
     var result = "", last = s.last_installation;
@@ -565,7 +581,7 @@
       result = "Последний результат: " + outcome + (str(last.release_id) || "D2K") + (last.reason ? ". " + updateError(last.reason) : "") + (last.completed_utc > 0 ? " · " + localTime(last.completed_utc * 1000) : " · время завершения не сохранено");
     } else if (phase === 10 || phase === 12 || phase === 13) result = "Последний результат: " + text + (s.completed_utc > 0 ? " · " + localTime(s.completed_utc * 1000) : " · время завершения не сохранено");
     write("update-result", result).hidden = !result;
-    var nav = write("nav-updates", available && !same ? "новая" : busy ? "…" : tone ? "!" : "");
+    var nav = write("nav-updates", absent ? "" : available && !same ? "новая" : busy ? "…" : tone ? "!" : "");
     nav.setAttribute("data-tone", tone || "idle");
   };
 

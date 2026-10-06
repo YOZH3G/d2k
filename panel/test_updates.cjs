@@ -43,7 +43,7 @@ async function reviewRegressions() {
       await app.pollUpdates(); await app.pollUpdates();
       assert.equal(nodes['update-action'].textContent, expected, 'unrelated successful GET must retain action error');
       assert.equal(nodes['update-action'].hidden, false, 'refusal must remain visible');
-      assert.equal(nodes['update-version'].textContent, 'Выпуск 1.2.3');
+      assert.equal(nodes['update-version'].textContent, 'Что изменилось в 1.2.3');
       assert.equal(posts.length, 1, 'polling must not resend rejected action');
       await app.checkUpdates(true);
       assert.equal(nodes['update-action'].hidden, true, 'next explicit accepted action replaces prior refusal');
@@ -108,6 +108,19 @@ async function main(){
  nodes['update-auto'].checked=false;await nodes['update-auto'].listeners.change();assert.equal(requests.at(-1).body.enabled,false);
  document.hidden=true;await app.pollUpdates();assert.equal(requests.at(-1).url,'/api/update/settings');document.hidden=false;
  window.fetch=async()=>{throw Error('connection lost');};app.renderUpdates(status({state:'current',available:null}));await app.pollUpdates();assert.doesNotMatch(nodes['update-state'].textContent,/последняя доступная/);
+ // Плоская установка: панель без API обновлений отвечает 404 без JSON, а
+ // панель без обновлятора — 503 {state:"unavailable"}. Это не сбой связи.
+ for (const reply of [{ok:false,status:404,json:async()=>{throw SyntaxError('not json');}},{ok:false,status:503,json:async()=>({state:'unavailable'})}]) {
+   const f=fixture(); f.app.initUpdates(); f.window.fetch=async()=>reply;
+   await f.app.checkUpdates(false);
+   assert.equal(f.nodes['update-state'].textContent,'Автообновление не подключено','missing updater is not an error');
+   assert.doesNotMatch(f.nodes['update-reason'].textContent,/связи|Повторите/,'no lost-link wording without an updater');
+   assert.equal(f.nodes['update-action'].hidden,true,'no failure message without an updater');
+   assert.equal(f.nodes['nav-updates'].textContent,'','no alarm badge without an updater');
+ }
+ { const f=fixture(); f.app.initUpdates(); f.window.fetch=async()=>{throw Error('connection lost');};
+   await f.app.checkUpdates(false);
+   assert.match(f.nodes['update-state'].textContent,/Не удалось/,'a real lost link still reads as a failure'); }
  assert.match(fs.readFileSync(require('node:path').join(__dirname,'../internal/web/assets/index.html'),'utf8'),/id="updates"[\s\S]*id="diagnostics"/);
  console.log('panel updates: selections, freshness, phases, notes, actions and reconnect passed');
 }

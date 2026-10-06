@@ -91,35 +91,36 @@
           <h2 id="updates-title">Обновления</h2>
           <p>Новые выпуски D2K. Настройки, регистрация Telegram и найденные обходы сохраняются.</p>
         </header>
-        <div id="updates-body">
-          <p class="update-installed">Установленный выпуск <span id="update-current" class="mono">—</span></p>
-          <div class="update-status" aria-live="polite" aria-atomic="true">
-            <h3 id="update-state">Обновления ещё не проверялись</h3>
-            <p id="update-reason" hidden></p>
+        <div id="updates-body" class="upd" data-mode="loading">
+          <div class="upd-line" aria-live="polite" aria-atomic="true">
+            <span class="lamp" id="update-lamp" data-tone="idle" aria-hidden="true"></span>
+            <div class="upd-text update-status">
+              <h3 id="update-state">Обновления ещё не проверялись</h3>
+              <p class="upd-meta"><span class="update-installed">Версия <span id="update-current" class="mono">—</span></span><span class="upd-sep" aria-hidden="true"> · </span><span id="update-checked">проверка при открытии панели</span></p>
+              <p id="update-reason" hidden></p>
+            </div>
+            <div class="update-actions">
+              <button type="button" class="btn" id="update-install" data-variant="primary" hidden>Установить сейчас</button>
+              <button type="button" class="btn" id="update-check" data-variant="ghost">Проверить</button>
+            </div>
           </div>
-          <p class="update-meta" id="update-checked">Проверка при открытии панели · кеш 15 минут</p>
           <div class="update-release" id="update-release" hidden>
-            <p class="update-version" id="update-version"></p>
             <details class="update-notes" id="update-notes">
-              <summary>Что изменилось</summary>
+              <summary><span id="update-version"></span></summary>
               <div class="update-notes-content"><p id="update-notes-text"></p></div>
             </details>
           </div>
           <div class="update-transfer">
             <progress id="update-progress" max="100" value="0" aria-label="Загрузка выпуска" hidden></progress>
-            <p class="update-meta" id="update-progress-text" hidden></p>
+            <p class="upd-meta" id="update-progress-text" hidden></p>
           </div>
-          <div class="update-actions">
-            <button type="button" class="btn" id="update-install" data-variant="primary" hidden>Установить сейчас</button>
-            <button type="button" class="btn" id="update-check" data-variant="primary">Проверить обновления</button>
-          </div>
-          <p class="update-meta" id="update-warning" hidden></p>
+          <p class="upd-meta" id="update-warning" hidden></p>
           <p class="update-action" id="update-action" role="status" aria-live="polite" hidden></p>
           <div class="update-night">
-            <label for="update-auto"><input type="checkbox" id="update-auto" disabled> Устанавливать автоматически ночью</label>
+            <label for="update-auto"><input type="checkbox" id="update-auto" disabled><span>Ночью ставить сам</span></label>
             <p id="update-schedule">03:00–05:00 по времени роутера</p>
           </div>
-          <p class="update-meta update-result" id="update-result" hidden></p>
+          <p class="upd-meta update-result" id="update-result" hidden></p>
         </div>
       </section>
 
