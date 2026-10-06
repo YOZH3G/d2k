@@ -45,6 +45,19 @@ test-js:
 	node test_poll.cjs
 	node test_updates.cjs
 
+
+.PHONY: test-config-values
+test: test-config-values
+test-config-values: test_config_values
+	./test_config_values
+test_config_values: test_config_values.c main.c server.c
+	$(CC) $(CFLAGS) -o $@ test_config_values.c server.c
+
+.PHONY: clean-config-values
+clean: clean-config-values
+clean-config-values:
+	$(RM) test_config_values
+
 test-cli: d2kpanel
 	node test_cli.cjs
 
