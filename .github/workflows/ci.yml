@@ -57,23 +57,8 @@ jobs:
       - name: Тесты исполнителя планов
         run: make -C datapath check
 
-      - name: Тесты оракула
-        # SO_MARK есть только на Linux. ubuntu-latest даёт его нативному gcc
-        # без кросс-цепочек — ровно то место, где эта ветка ядра (метка на
-        # зонде) вообще компилируется и исполняется в CI: на маке разработки
-        # SO_MARK не определён, и локальный check его никогда не видит.
-        run: make -C core check
-
       - name: Перенесённый Поиск по домену — дерево, адаптер и параллельные измерения
         run: make -C detect check
-
-      - name: Тесты под санитайзерами
-        # «Не упало» и «не читало за буфером» — разные утверждения, а весь
-        # датапат состоит из разбора чужих байтов.
-        run: make -C datapath san
-
-      - name: Тесты оракула под санитайзерами
-        run: make -C core san
 
       - name: Датапат под целевые арки
         # Непереносимость обязана ловиться в тот день, когда её внесли, а не на
@@ -103,8 +88,40 @@ jobs:
             "$cc" -O2 -Wall -Wextra -Werror -c -o /tmp/nfqview-$cc.o nfqview.c
           done
 
+  core:
+    # Отдельное задание, параллельно датапату: тесты ядра ждут настоящих
+    # сетевых таймаутов и идут ~15 минут, задерживать ими остальное незачем.
+    name: Ядро на C — тесты оракула
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Тесты оракула
+        # SO_MARK есть только на Linux. ubuntu-latest даёт его нативному gcc
+        # без кросс-цепочек — ровно то место, где эта ветка ядра (метка на
+        # зонде) вообще компилируется и исполняется в CI: на маке разработки
+        # SO_MARK не определён, и локальный check его никогда не видит.
+        run: make -C core check
+
+  sanitizers:
+    # «Не упало» и «не читало за буфером» — разные утверждения, а весь датапат
+    # состоит из разбора чужих байтов. Под санитайзерами тесты в 2–3 раза
+    # медленнее (~20 минут), поэтому они идут на main и по запросу, а не на
+    # каждом pull request.
+    name: Датапат и ядро под санитайзерами
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Датапат под санитайзерами
+        run: make -C datapath san
+      - name: Ядро под санитайзерами
+        run: make -C core san
+
   update-release:
     name: Nine C runtime ABIs, authenticated packaging, offline publisher
+    # Полная сборка девяти арок и пакетов — на main и по запросу. Pull request
+    # проверяют задания выше; выпуск без зелёного main не публикуется.
+    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/release.yml
     # The called workflow declares its publish job with contents: write, and
     # GitHub refuses to start a caller that grants less. That job runs only on

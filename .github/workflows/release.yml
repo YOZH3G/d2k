@@ -57,6 +57,15 @@ jobs:
         run: |
           python3 scripts/test-update-release.py
           make -C update check-manifest check-package check-schedule check-feed
+      # Pinned OpenSSL/curl for nine ABIs take ~30 minutes to build and change
+      # only with the pinned revisions or these scripts. CI and dry runs reuse
+      # them; a publishing run always rebuilds from source.
+      - name: Cached pinned dependencies (CI and dry runs only)
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/dependencies
+          key: d2k-deps-v1-${{ hashFiles('scripts/build-update-deps.sh', 'scripts/build-openssl-tg.sh', 'scripts/build-target.sh', 'scripts/update_release_provenance.py') }}
       - name: Fresh dependency receipts, full nine ABI runtime and actual QEMU gates
         shell: bash
         run: |
@@ -64,7 +73,11 @@ jobs:
           RELEASE_ID=${REQUESTED_RELEASE:-d2k-${GITHUB_SHA:0:12}-${SOURCE_DATE_EPOCH}}
           echo "RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
           export RELEASE_ID
-          python3 scripts/update_release_provenance.py --root "$GITHUB_WORKSPACE" --build-dir "$RUNNER_TEMP/dependencies" --prepare-dependencies --zig "$ZIG" --zig-mips64el "$ZIG_MIPS64EL"
+          if [ -f "$DEPS_PROVENANCE" ]; then
+            echo "reusing cached dependency receipts; build-router.sh validates them before use"
+          else
+            python3 scripts/update_release_provenance.py --root "$GITHUB_WORKSPACE" --build-dir "$RUNNER_TEMP/dependencies" --prepare-dependencies --zig "$ZIG" --zig-mips64el "$ZIG_MIPS64EL"
+          fi
           sh scripts/build-router.sh
           sh scripts/build-router-tests.sh
           sh scripts/check-router-builds.sh
