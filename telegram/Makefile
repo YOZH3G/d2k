@@ -78,3 +78,11 @@ clean:
 gcc-warn:
 	$(MAKE) clean
 	$(MAKE) CC=gcc test d2ktg
+
+.PHONY: test-identity
+test: test-identity
+test-identity: $(BUILD_DIR)/test-identity
+	./$(BUILD_DIR)/test-identity
+$(BUILD_DIR)/test-identity: test_identity.c src/identity.c include/tg_identity.h
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -o $@ test_identity.c src/identity.c $(OPENSSL_LIBS)

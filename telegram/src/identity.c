@@ -74,24 +74,45 @@ done:
     return result;
 }
 
+static int identity_error(const char *path, const char *reason, int reset) {
+    fprintf(stderr, "d2ktg: %s: %s. ", path, reason);
+    if (reset)
+        fprintf(stderr, "Восстановите файл из резервной копии или удалите его для новой регистрации (install_id изменится).\n");
+    else
+        fprintf(stderr, "Проверьте доступ, владельца и права 0600; существующий файл сохранён.\n");
+    return -1;
+}
+
 static int load_identity(const char *path, tg_identity *out) {
     uint8_t raw[ID_FILE_LEN], pub[32];
     struct stat st;
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return -1;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size != ID_FILE_LEN ||
-        (st.st_mode & 077) != 0 || st.st_uid != geteuid() ||
-        read_all(fd, raw, sizeof(raw)) != 0) {
-        close(fd); return -1;
+    if (fd < 0) {
+        if (errno == ENOENT) return 1;
+        return identity_error(path, strerror(errno), 0);
     }
+    const char *reason = NULL;
+    int reset = 0;
+    if (fstat(fd, &st) != 0) reason = strerror(errno);
+    else if (!S_ISREG(st.st_mode)) reason = "ожидался обычный файл";
+    else if ((st.st_mode & 077) != 0 || st.st_uid != geteuid())
+        reason = "небезопасные права или чужой владелец";
+    else if (st.st_size != ID_FILE_LEN) { reason = "неверный размер файла регистрации"; reset = 1; }
+    else if (read_all(fd, raw, sizeof(raw)) != 0) reason = "ошибка чтения регистрации";
     close(fd);
-    if (memcmp(raw, id_magic, sizeof(id_magic)) != 0) return -1;
+    if (reason) return identity_error(path, reason, reset);
+    if (memcmp(raw, id_magic, sizeof(id_magic)) != 0)
+        return identity_error(path, "повреждён заголовок регистрации", 1);
     out->private_key = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, raw + 24, 32);
-    if (!out->private_key) return -1;
+    if (!out->private_key) return identity_error(path, "OpenSSL не загрузил ключ регистрации", 0);
     size_t pub_len = sizeof(pub);
-    if (EVP_PKEY_get_raw_public_key(out->private_key, pub, &pub_len) != 1 ||
-        pub_len != sizeof(pub) || memcmp(pub, raw + 56, sizeof(pub)) != 0) {
-        EVP_PKEY_free(out->private_key); out->private_key = NULL; return -1;
+    if (EVP_PKEY_get_raw_public_key(out->private_key, pub, &pub_len) != 1 || pub_len != sizeof(pub)) {
+        EVP_PKEY_free(out->private_key); out->private_key = NULL;
+        return identity_error(path, "OpenSSL не прочитал открытый ключ регистрации", 0);
+    }
+    if (memcmp(pub, raw + 56, sizeof(pub)) != 0) {
+        EVP_PKEY_free(out->private_key); out->private_key = NULL;
+        return identity_error(path, "ключи регистрации не совпадают", 1);
     }
     set_hex_id(out->install_id_hex, raw + 8);
     return 0;
@@ -103,7 +124,11 @@ int tg_identity_load_or_mint(const char *path, tg_identity *out) {
     size_t priv_len = 32, pub_len = 32;
     if (!path || !out || strlen(path) > 4000) return -1;
     memset(out, 0, sizeof(*out));
-    if (load_identity(path, out) == 0) return 0;
+    /* Only an absent file permits minting. Invalid or unreadable existing
+     * credentials must survive so an operator can repair or restore them. */
+    int loaded = load_identity(path, out);
+    if (loaded == 0) return 0;
+    if (loaded != 1) return -1;
     memset(raw, 0, sizeof(raw));
     memcpy(raw, id_magic, sizeof(id_magic));
     if (RAND_bytes(raw + 8, 16) != 1) return -1;
