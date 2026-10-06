@@ -80,6 +80,20 @@ int main(void) {
             CHECK(present(d,"rr1.googlevideo.com"));
             CHECK(d2k_group_forget(d,"rr4.googlevideo.com",6,4)==0);
             CHECK(d2k_group_forget(d,"rr1.googlevideo.com",6,4)==0);
+            /* Отказ узла, который неделю больше не встречался, уходит сам:
+               узлы googlevideo меняются, и на старый может больше не прийти
+               никто. Подтверждения не стареют. */
+            observe(d,"rr7.googlevideo.com","plan-a",D2K_GROUP_PLAN_FAILED,modern);
+            observe(d,"rr8.googlevideo.com","plan-a",D2K_GROUP_PLAN_FAILED,modern);
+            for(size_t i=0;i<d->n_observations;i++)
+                if(!strcmp(d->observations[i].name,"rr8.googlevideo.com")) d->observations[i].at=100+6*86400;
+            CHECK(!d2k_group_match(d,"rr7.googlevideo.com",&modern));
+            CHECK(d2k_group_expire(d,100+7*86400,7*86400)==0);
+            /* rr7 и оставшийся QUIC-отказ rr4 того же возраста; rr8 моложе. */
+            CHECK(d2k_group_expire(d,101+7*86400,7*86400)==2);
+            CHECK(!present(d,"rr7.googlevideo.com") && present(d,"rr8.googlevideo.com"));
+            CHECK(present(d,"rr1.googlevideo.com"));
+            CHECK(d2k_group_match(d,"rr7.googlevideo.com",&modern));
             free(d);
         }
     }

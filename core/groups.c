@@ -306,3 +306,17 @@ int d2k_group_forget(d2k_group_state *s,const char *name,uint8_t transport,uint8
     if(dropped) rebuild(s);
     return dropped;
 }
+int d2k_group_expire(d2k_group_state *s,int64_t now,int64_t max_age) {
+    if(!s || max_age<=0 || now<max_age || s->n_observations>D2K_GROUP_OBSERVATION_MAX) return 0;
+    int dropped=0;
+    for(size_t i=0;i<s->n_observations;) {
+        const d2k_group_observation *o=&s->observations[i];
+        if((o->evidence&D2K_GROUP_PLAN_FAILED) && o->at<now-max_age) {
+            s->observations[i]=s->observations[--s->n_observations];
+            memset(&s->observations[s->n_observations],0,sizeof s->observations[0]);
+            dropped++;
+        } else i++;
+    }
+    if(dropped) rebuild(s);
+    return dropped;
+}

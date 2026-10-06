@@ -152,6 +152,9 @@
    позднее закрытие) звучит не чаще раза в SCHED_QUIET_MS. Поле 06.10: такие
    повторы шли сотнями строк в сутки и раздували журнал на флеше роутера. */
 #define SCHED_QUIET_SLOTS 64
+/* Отказ узла семейства живёт неделю; чистка — раз в час. */
+#define SCHED_GROUP_FAIL_MAX_AGE_S (7 * 86400)
+#define SCHED_GROUP_EXPIRE_EVERY_MS (60 * 60 * 1000)
 #define SCHED_QUIET_MS (10 * 60 * 1000)
 /* Сколько ждать решения по потоку разговора с применённым приёмом голоса.
    Приговор «молчит» датапат выносит через две секунды после приветствия
@@ -1132,6 +1135,7 @@ struct d2k_sched {
     dead_address    dead_addrs[SCHED_COOLDOWN_SLOTS];
     late_rst_pending late_rst[SCHED_LATE_RST_SLOTS];
     size_t       late_rst_next;
+    int64_t      groups_expired_ms;   /* последняя чистка старых отказов семейств */
     /* Повторяемые объяснения, уже сказанные: ключ и срок молчания. */
     struct { char key[300]; int64_t until_ms; } quiet[SCHED_QUIET_SLOTS];
     size_t       quiet_next;
@@ -8342,6 +8346,18 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     while (read(s->wake[0], drain, sizeof drain) > 0) { }
 
     quic_deny_tick(s, now_ms);
+    /* Отказы узлов семейства стареют: узел, который неделю никто не встречал,
+       ничего не говорит о плане (поле 06.10, googlevideo). Раз в час и сразу
+       после запуска; при несинхронных часах d2k_group_expire не трогает ничего. */
+    if (s->cat && s->cat->groups &&
+        (!s->groups_expired_ms || now_ms - s->groups_expired_ms >= SCHED_GROUP_EXPIRE_EVERY_MS)) {
+        s->groups_expired_ms = now_ms ? now_ms : 1;
+        int dropped = d2k_group_expire(s->cat->groups, wall_s(s, now_ms), SCHED_GROUP_FAIL_MAX_AGE_S);
+        if (dropped > 0) {
+            s->cat->revision++; s->sync_pending = 1;
+            say(s, "семейства: убраны отказы узлов старше 7 суток (%d)", dropped);
+        }
+    }
     if (s->sync_pending && !s->sync_active) {
         (void)d2k_sched_sync(s);
     }

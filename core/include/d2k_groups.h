@@ -50,6 +50,10 @@ int d2k_group_restore(d2k_group_state *s);
    this transport and family. Returns how many were dropped. */
 int d2k_group_forget(d2k_group_state *s, const char *name,
                      uint8_t transport, uint8_t family);
+/* Failure records older than max_age seconds (wall clock) are dropped:
+   a node nobody met again for that long says nothing about the plan.
+   Confirmations do not age. Returns how many were dropped. */
+int d2k_group_expire(d2k_group_state *s, int64_t now, int64_t max_age);
 const d2k_domain_group *d2k_group_match(const d2k_group_state *s,
                                      const char *name, const d2k_group_key *key);
 #endif
