@@ -11508,7 +11508,7 @@ voice_only_run:
     }
 
     /* Терминальные исходы QUIC не превращаются обратно в подбор обвязкой.
-       Само получение этих исходов сверяется с Go в tests/quic-run. */
+       Само получение этих исходов сверялось с Go донора (обвязка удалена 06.10.2026). */
     {
         const d2k_verdict terminal[] = { D2K_V_CLEAR, D2K_V_ADDRESS, D2K_V_NO_QUIC };
         for (size_t i = 0; i < sizeof terminal / sizeof terminal[0]; i++) {

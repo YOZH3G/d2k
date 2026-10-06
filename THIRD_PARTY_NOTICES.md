@@ -8,7 +8,7 @@ exact embedded data from `files/fake/quic_5.bin`,
 `files/fake/quic_initial_rutracker_org.bin` in the z2k source tree.
 Reference revision: `e9a391347671cbb07663d2bee5b3d92f016c789e`.
 The data in `core/profiles/quic_arms.h` is unchanged (1200 bytes per file);
-`scripts/check-quic-run-parity.sh` independently compares all bytes to the donor.
+All bytes were compared to the donor by a Go harness, removed on 2026-10-06 (see git history).
 These are internal probe hypotheses, not imported user strategies.
 No Zapret/nfqws executable or runtime dependency is introduced.
 
