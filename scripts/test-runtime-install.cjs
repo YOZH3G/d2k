@@ -40,7 +40,7 @@ exit 1
   fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3\n');
   fixture('builds/d2kd-linux-amd64', '#!/bin/sh\nexit 0\n');
   for (const name of ['d2kc']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
-  fixture('files/S99d2k', '#!/bin/sh\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
+  fixture('files/S99d2k', '#!/bin/sh\nprintf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
   for (const name of ['d2k-fw-heal.sh', 'd2k-ppe-deoffload.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
   fixture('files/d2k-instagram-dns.sh', '#!/bin/sh\nprintf "dns-%s\\n" "$1" >> "$CALLS"\n');
@@ -145,7 +145,7 @@ exit 1
   fs.mkdirSync(path.join(tmp, 'lib/functions'), { recursive: true });
   fs.writeFileSync(path.join(tmp, 'etc/openwrt_release'), "DISTRIB_ID='OpenWrt'\n");
   fs.writeFileSync(path.join(tmp, 'lib/functions/procd.sh'), '# fixture\n');
-  fs.writeFileSync(path.join(tmp, 'etc/rc.common'), '#!/bin/sh\nprintf "host-%s\\n" "$2" >> "$CALLS"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(tmp, 'etc/rc.common'), '#!/bin/sh\nprintf "host-%s\\n" "$2" >> "$CALLS"\n[ "$2" != enable ] || [ "${HOST_ENABLE_FAIL:-0}" != 1 ]\n', { mode: 0o755 });
   const templatePath = path.join(root, 'files/d2k-openwrt-init');
   if (fs.existsSync(templatePath)) fixture('files/d2k-openwrt-init', fs.readFileSync(templatePath, 'utf8')
     .replaceAll('/etc/rc.common', path.join(tmp, 'etc/rc.common')));
@@ -160,11 +160,35 @@ exit 1
   run('install');
   fs.writeFileSync(procd, '# fixture\n');
   const ownedHook = fs.readFileSync(hostInit);
+  const d2kdSource = path.join(tmp, 'source/builds/d2kd-linux-amd64');
+  const d2kdInstalled = path.join(tmp, 'opt/sbin/d2kd');
+  fs.writeFileSync(d2kdSource, '#!/bin/sh\n# next release\nexit 0\n');
   fs.writeFileSync(hostInit, '#!/bin/sh\n# another service\n');
   const conflict = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
-  assert.notEqual(conflict.status, 0, 'installer must refuse a foreign host service');
+  assert.equal(conflict.status, 0, 'foreign host hook must not block a runtime update');
+  assert.match(conflict.stderr, /чужой/);
   assert.match(fs.readFileSync(hostInit, 'utf8'), /another service/);
+  assert.deepEqual(fs.readFileSync(d2kdInstalled), fs.readFileSync(d2kdSource), 'runtime update must still complete');
   fs.writeFileSync(hostInit, ownedHook);
+  // A bad hook is rejected BEFORE stopping or replacing a working runtime.
+  const hookSource = path.join(tmp, 'source/files/d2k-openwrt-init');
+  const hookCurrent = fs.readFileSync(hookSource);
+  fs.writeFileSync(hookSource, '#!/bin/sh\n# invalid hook\n');
+  const beforeCalls = calls(), beforeBinary = fs.readFileSync(d2kdInstalled);
+  fs.writeFileSync(d2kdSource, '#!/bin/sh\n# staged release\nexit 0\n');
+  const badHook = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
+  assert.notEqual(badHook.status, 0, 'invalid native hook must fail preflight');
+  assert.equal(calls(), beforeCalls, 'invalid hook must not stop or start the runtime');
+  assert.deepEqual(fs.readFileSync(d2kdInstalled), beforeBinary, 'invalid hook must not replace binaries');
+  assert.deepEqual(fs.readFileSync(hostInit), ownedHook, 'preflight failure must preserve installed hook');
+  assert.deepEqual(fs.readdirSync(path.dirname(hostInit)), ['d2k'], 'preflight must clean staged host files');
+  fs.writeFileSync(hookSource, hookCurrent);
+  // Enable fails after installation: report missing autostart, not a failed release.
+  const enableFailure = run('install', { HOST_ENABLE_FAIL: '1' });
+  assert.match(enableFailure, /автозапуск OpenWrt не включён/);
+  assert.deepEqual(fs.readFileSync(d2kdInstalled), fs.readFileSync(d2kdSource));
+  assert.deepEqual(fs.readdirSync(path.dirname(hostInit)), ['d2k']);
+  run('install');
   // Uninstall without init must still remove its own tagged -j PPE rules.
   fs.writeFileSync(ppe, '#!/bin/sh\nd2k_ppe_remove() { printf "ppe-remove\\n" >> "$CALLS"; }\n');
   const state = path.join(tmp, 'opt/d2k/state/catalog.json'); fs.writeFileSync(state, '{"learned":true}');

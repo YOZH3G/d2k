@@ -21,6 +21,12 @@ start_service() {
 }
 
 boot_wait() {
+    # procd's musl preload breaks Entware/glibc; its rc.common lock must not
+    # stay held by this waiter or be inherited by the long-lived daemons.
+    unset LD_PRELOAD
+    # OpenWrt ash supports rc.common's high-numbered fd (not POSIX sh).
+    # shellcheck disable=SC3023
+    exec 1000>&-
     # procd waits in a separate process, so a late USB/extroot mount does not
     # hold OpenWrt's boot sequence. stop/detach cancels this process.
     while [ ! -x /opt/etc/init.d/S99d2k ] || [ ! -r /opt/d2k/config ]; do
@@ -31,13 +37,14 @@ boot_wait() {
 }
 
 detach() {
-    procd_kill d2k
+    procd_kill d2k 2>/dev/null
 }
 
 stop_service() {
     # rc.common calls stop_service BEFORE procd_kill: cancel the waiter first
-    # so it cannot start D2K after the stop below.
-    detach
+    # so it cannot start D2K after the stop below. Keep the service object for
+    # rc.common's final deletion, avoiding a second delete/ubus "Not found".
+    procd_kill d2k boot 2>/dev/null
     [ ! -x /opt/etc/init.d/S99d2k ] || /opt/etc/init.d/S99d2k stop
 }
 
