@@ -581,6 +581,26 @@ main { min-width: 0; padding-bottom: 80px; }
 }
 .ftag-stamp[data-active="false"] { border-color: var(--ink-3); color: var(--ink-3); border-style: dashed; transform: rotate(3deg); }
 .ftag-sub { font-size: 0.8125rem; color: var(--ink-2); }
+/* Строка-итог и есть рычаг раскрытия: читается как подпись, нажимается как кнопка. */
+.ftag-fold {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  width: 100%; margin: 0; padding: 7px 2px 7px 0;
+  font: 500 0.8125rem/1.35 var(--sans); color: var(--ink-2); text-align: left;
+  background: none; border: 0; border-bottom: 1.5px dashed color-mix(in srgb, var(--kraft-ink) 26%, transparent);
+  cursor: pointer;
+  transition: color .16s;
+}
+.ftag-fold:hover { color: var(--ink); }
+.ftag-fold-dead { color: var(--warn); }
+.ftag-fold-mark {
+  flex: none; width: 16px; height: 16px;
+  fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
+  transition: transform .3s var(--ease-out);
+}
+.ftag-fold[aria-expanded="true"] .ftag-fold-mark { transform: rotate(180deg); }
+.has-gsap .ftag-fold-mark { transition: none; }
+.ftag-more[hidden] { display: none; }
+.ftag-more { padding-top: 2px; }
 .ftag-tree { margin-left: 6px; font-size: 0.875rem; }
 .ftag-tree li {
   position: relative; padding: 3px 0 3px 18px;

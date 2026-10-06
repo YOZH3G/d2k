@@ -45,6 +45,11 @@ int d2k_group_learn(d2k_group_state *s, const d2k_group_observation *o);
 /* Validate saved observations and derive active areas, never trust a saved
    suffix alone. Preserves failure exceptions and frozen admission state. */
 int d2k_group_restore(d2k_group_state *s);
+/* A member that neither the family plan nor its own search reached is
+   unreachable, not evidence against the plan: drop its failure records for
+   this transport and family. Returns how many were dropped. */
+int d2k_group_forget(d2k_group_state *s, const char *name,
+                     uint8_t transport, uint8_t family);
 const d2k_domain_group *d2k_group_match(const d2k_group_state *s,
                                      const char *name, const d2k_group_key *key);
 #endif

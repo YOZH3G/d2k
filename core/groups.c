@@ -289,3 +289,20 @@ const d2k_domain_group *d2k_group_match(const d2k_group_state *s,
     }
     return best;
 }
+int d2k_group_forget(d2k_group_state *s,const char *name,uint8_t transport,uint8_t family) {
+    char norm[256];
+    if(!s || !name || d2k_domain_normalize(name,norm) ||
+       s->n_observations>D2K_GROUP_OBSERVATION_MAX) return 0;
+    int dropped=0;
+    for(size_t i=0;i<s->n_observations;) {
+        const d2k_group_observation *o=&s->observations[i];
+        if(!strcmp(o->name,norm) && o->key.transport==transport && o->key.family==family &&
+           (o->evidence&D2K_GROUP_PLAN_FAILED)) {
+            s->observations[i]=s->observations[--s->n_observations];
+            memset(&s->observations[s->n_observations],0,sizeof s->observations[0]);
+            dropped++;
+        } else i++;
+    }
+    if(dropped) rebuild(s);
+    return dropped;
+}

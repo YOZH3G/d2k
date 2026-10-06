@@ -58,6 +58,31 @@ int main(void) {
     CHECK(g && !strcmp(g->suffix,"googlevideo.com") && !strcmp(g->plan_id,"plan-a"));
     CHECK(!d2k_group_match(s,"evilgooglevideo.com",&modern));
     CHECK(!d2k_group_match(s,"google.com",&modern));
+    {
+        /* Поле 06.10: узел семейства, на котором не помог ни общий план, ни
+           собственный поиск, — недоступен. Его отказы выкидываются целиком:
+           домен снова под общим планом, голосов против плана нет. */
+        d2k_group_state *d=calloc(1,sizeof *d);
+        CHECK(d!=NULL);
+        if(d) {
+            observe(d,"rr1.googlevideo.com","plan-a",1,modern);
+            observe(d,"rr2.googlevideo.com","plan-a",1,modern);
+            observe(d,"rr3.googlevideo.com","plan-a",1,modern);
+            observe(d,"rr4.googlevideo.com","plan-a",D2K_GROUP_PLAN_FAILED,modern);
+            observe(d,"rr4.googlevideo.com","plan-b",D2K_GROUP_PLAN_FAILED,modern);
+            CHECK(!d2k_group_match(d,"rr4.googlevideo.com",&modern));
+            d2k_group_key quic={17,4,3,"",""};
+            observe(d,"rr4.googlevideo.com","plan-q",D2K_GROUP_PLAN_FAILED,quic);
+            CHECK(d2k_group_forget(d,"rr4.googlevideo.com",6,4)==2);
+            CHECK(!present(d,"rr4.googlevideo.com") || d->n_observations==4);
+            const d2k_domain_group *dg=d2k_group_match(d,"rr4.googlevideo.com",&modern);
+            CHECK(dg && !strcmp(dg->plan_id,"plan-a"));
+            CHECK(present(d,"rr1.googlevideo.com"));
+            CHECK(d2k_group_forget(d,"rr4.googlevideo.com",6,4)==0);
+            CHECK(d2k_group_forget(d,"rr1.googlevideo.com",6,4)==0);
+            free(d);
+        }
+    }
     size_t before=s->n_observations;
     for(int i=0;i<100;i++) CHECK(d2k_group_match(s,"a.b.new.googlevideo.com",&modern));
     CHECK(s->n_observations==before); /* Lookup does not enrol every CDN name. */

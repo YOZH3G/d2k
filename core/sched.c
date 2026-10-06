@@ -9589,6 +9589,15 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 cooldown_record(s, t, 2);
                 say(s, "по %s после исчерпания кандидатов новый поиск отложен на 10 мин",
                     t->name);
+                /* Поле 06.10, googlevideo: узел, на котором не помог ни план
+                   семейства, ни собственный поиск, недоступен — это не голос
+                   против плана. Его отказы выкидываются из семейства. */
+                if (!t->by_addr && s->cat->groups &&
+                    d2k_group_forget(s->cat->groups, t->name, t->transport, t->family) > 0) {
+                    s->cat->revision++; s->sync_pending = 1;
+                    say(s, "по %s не помог ни общий план семейства, ни свой — узел недоступен, "
+                           "его отказы из семейства убраны", t->name);
+                }
                 task_fail(s, t, now_ms);
                 moved++;
                 continue;

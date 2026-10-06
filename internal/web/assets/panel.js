@@ -304,6 +304,7 @@
     this.pending = null;
     this.armed = null;
     this.filter = "";
+    this.openTags = {};
     this.flash = null;
     this.$ = function (id) { return doc.getElementById(id); };
   }
@@ -1158,16 +1159,40 @@
         stamp.setAttribute("data-active", String(active));
         if (!active) stamp.title = "Решение сохранено, но применение к семейству сейчас не подтверждено";
         var ev = list(g.evidence);
-        var sub = el(doc, "p", "ftag-sub",
+        /* Отказы узла — по одной строке на узел, с причиной: d2k хранит отказ
+           каждого плана отдельно, человеку нужен узел, а не журнал. */
+        var dead = [], seen = {};
+        list(g.exceptions).forEach(function (x) {
+          var nm = str(x && typeof x === "object" ? x.name : x);
+          if (!nm || seen[nm]) { if (nm) seen[nm].n++; return; }
+          seen[nm] = { name: nm, reason: str(x && x.reason) || "общий план не подошёл", n: 1 };
+          dead.push(seen[nm]);
+        });
+        var fid = wrap.getAttribute("data-flip-id");
+        var open = !!self.openTags[fid] || (!!self.filter && !self.matches(g.suffix));
+        var regionId = "ftag-more-" + gi;
+        var fold = el(doc, "button", "ftag-fold");
+        fold.type = "button";
+        fold.setAttribute("aria-expanded", String(open));
+        fold.setAttribute("aria-controls", regionId);
+        var foldText = el(doc, "span", "ftag-fold-text",
           "Подтверждено на " + count(num(g.evidence_count) || ev.length, "домене", "доменах", "доменах"));
+        if (dead.length) foldText.appendChild(el(doc, "span", "ftag-fold-dead", " · без плана " + dead.length));
+        fold.appendChild(foldText);
+        fold.appendChild(foldMark(doc));
+        var more = el(doc, "div", "ftag-more");
+        more.id = regionId;
+        if (!open) more.hidden = true;
         var tree = el(doc, "ul", "ftag-tree");
         ev.forEach(function (d) { tree.appendChild(el(doc, "li", "", d)); });
-        list(g.exceptions).forEach(function (x) {
-          var nm = x && typeof x === "object" ? x.name : x;
+        dead.forEach(function (x) {
           var li = el(doc, "li", "ex");
-          add(li, str(nm), el(doc, "small", "", " — исключение"));
+          add(li, x.name, el(doc, "small", "", " — " + x.reason.toLowerCase() + (x.n > 1 ? " (планов: " + x.n + ")" : "")));
           tree.appendChild(li);
         });
+        more.appendChild(tree);
+        fold.addEventListener("click", function () { self.toggleTag(wrap, fold, more, fid); });
+        var sub = fold;
         var foot = el(doc, "div", "ftag-foot");
         if (g.plan_id) {
           foot.appendChild(el(doc, "code", "", str(g.plan_id)));
@@ -1188,7 +1213,7 @@
             foot.appendChild(links);
           }
         }
-        add(card, name, ctx, stamp, sub, tree, foot);
+        add(card, name, ctx, stamp, sub, more, foot);
         swing.appendChild(card);
         var tilt = ([-1.4, 0.9, -0.5, 1.6, -1.1, 0.4])[gi % 6];
         wrap.style.setProperty("--tilt", tilt + "deg");
@@ -1211,6 +1236,42 @@
       var grid = rail;
       return [grid];
     });
+  };
+
+  /* Знак раскрытия бирки: рисованная галочка в тон крафта. */
+  function foldMark(doc) {
+    var s = svgEl(doc, "svg", { viewBox: "0 0 16 16", width: "16", height: "16", "aria-hidden": "true" }, "ftag-fold-mark");
+    s.appendChild(svgEl(doc, "path", { d: "M3.5 6 8 10.5 12.5 6" }));
+    return s;
+  }
+
+  /* Бирка разворачивается как сложенная бумага: лист выходит из-под штампа,
+     ветки дерева вырастают по очереди, потяжелевшая бирка качается на нитке.
+     Свёртка — та же сцена назад, быстрее; повторный клик разворачивает её на ходу. */
+  App.prototype.toggleTag = function (wrap, fold, more, fid) {
+    var open = fold.getAttribute("aria-expanded") !== "true";
+    fold.setAttribute("aria-expanded", String(open));
+    if (open) this.openTags[fid] = true; else delete this.openTags[fid];
+    if (!Motion.on()) { more.hidden = !open; return; }
+    var tl = more.__tl;
+    if (tl && tl.isActive()) { tl.timeScale(open ? 1 : 1.6).reversed(!open); return; }
+    if (tl) tl.kill();
+    var g = Motion.g, swing = wrap.querySelector(".ftag-swing"), mark = fold.querySelector(".ftag-fold-mark");
+    var tilt = swing.__tilt || 0;
+    var rows = [].slice.call(more.querySelectorAll("li")).slice(0, 40);
+    more.hidden = false;
+    tl = g.timeline({ paused: true, defaults: { ease: "power3.out" },
+      onComplete: function () { g.set([more, rows], { clearProps: "all" }); more.__tl = null; },
+      onReverseComplete: function () { more.hidden = true; g.set([more, rows], { clearProps: "all" }); more.__tl = null; } });
+    tl.fromTo(more, { height: 0, clipPath: "inset(0% 0% 100% 0%)", overflow: "hidden" },
+        { height: "auto", clipPath: "inset(0% 0% 0% 0%)", duration: 0.55, ease: "power3.inOut" }, 0)
+      .fromTo(mark, { rotation: 0 }, { rotation: 180, duration: 0.45, ease: "back.out(2)", transformOrigin: "50% 50%" }, 0)
+      .fromTo(swing, { rotation: tilt }, { rotation: tilt + (tilt < 0 ? -2.6 : 2.6), duration: 0.22, ease: "power2.out" }, 0.05)
+      .to(swing, { rotation: tilt, duration: 1.1, ease: "elastic.out(1, 0.35)" }, 0.27);
+    if (rows.length) tl.fromTo(rows, { x: -10, autoAlpha: 0 }, { x: 0, autoAlpha: 1, duration: 0.36,
+      stagger: { amount: Math.min(0.4, rows.length * 0.04) } }, 0.16);
+    more.__tl = tl;
+    if (open) tl.timeScale(1).play(0); else tl.progress(1).timeScale(1.6).reverse();
   };
 
   /* Бирки раскачиваются, когда блок впервые попадает на экран и когда набор семейств меняется. */
