@@ -4,8 +4,14 @@
 const assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {spawn}=require('node:child_process');
 const profile=fs.mkdtempSync(path.join(os.tmpdir(),'d2k-browser-'));
+const chromeArgs=['--headless','--no-first-run','--hide-scrollbars','--remote-debugging-port=0','--user-data-dir='+profile,'about:blank'];
+// The isolated GitHub runner restricts Chrome's user namespace sandbox.
+if(process.env.D2K_CHROME_NO_SANDBOX==='1')chromeArgs.unshift('--no-sandbox');
+let chromeError='';
 const chrome=spawn(process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
- ['--headless','--no-first-run','--hide-scrollbars','--remote-debugging-port=0','--user-data-dir='+profile,'about:blank'],{stdio:'ignore'});
+ chromeArgs,{stdio:['ignore','ignore','pipe']});
+chrome.on('error',e=>{chromeError+=e.message;});
+chrome.stderr.on('data',data=>{chromeError=(chromeError+data.toString()).slice(-4000);});
 const now=Date.now(),iso=s=>new Date(now-s*1000).toISOString();
 const fixture={knowledge:{
  searches:[
@@ -28,7 +34,7 @@ let ws;
 async function main(){
  let port;
  for(let i=0;i<100;i++){try{port=fs.readFileSync(path.join(profile,'DevToolsActivePort'),'utf8').split('\n')[0];break}catch{}await new Promise(r=>setTimeout(r,100))}
- if(!port)throw Error('Headless browser unavailable');
+ if(!port)throw Error('Headless browser unavailable: '+chromeError);
  const tab=await(await fetch('http://127.0.0.1:'+port+'/json/new?about:blank',{method:'PUT'})).json();
  ws=new WebSocket(tab.webSocketDebuggerUrl);await new Promise((r,j)=>{ws.onopen=r;ws.onerror=j});
  let id=0;const pending=new Map(),exceptions=[],dialogs=[];

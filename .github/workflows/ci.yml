@@ -28,6 +28,11 @@ jobs:
     name: Chrome — panel layout regression
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      D2K_CHROME_NO_SANDBOX: '1'
     steps:
       - uses: actions/checkout@v7
         with:
