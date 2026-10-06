@@ -20,9 +20,11 @@ DIR=/opt/d2k
 SBIN=/opt/sbin
 INIT=/opt/etc/init.d/S99d2k
 OPENWRT_INIT=/etc/init.d/d2k
+# Признак OpenWrt — один на весь установщик: хук автозапуска и модули ядра.
+OPENWRT_RELEASE=${D2K_OPENWRT_RELEASE:-/etc/openwrt_release}
 OPENWRT_STAGE=
 openwrt_check() {
-    [ -f /etc/openwrt_release ] || return 0
+    [ -f "$OPENWRT_RELEASE" ] || return 0
     if [ ! -r /etc/rc.common ] || [ ! -r /lib/functions/procd.sh ]; then
         echo 'd2k: OpenWrt без rc.common/procd — автозапуск недоступен' >&2
         return 0
@@ -36,7 +38,7 @@ openwrt_check() {
     fi
 }
 prepare_openwrt_hook() {
-    [ -f /etc/openwrt_release ] || return 0
+    [ -f "$OPENWRT_RELEASE" ] || return 0
     openwrt_check || return 0
     [ -r /etc/rc.common ] && [ -r /lib/functions/procd.sh ] || return 0
     # Stage on the host filesystem before stopping/replacing the runtime.
@@ -100,7 +102,6 @@ NF_HINT="модуль не найден в прошивке; на Keenetic ус�
 # OpenWrt: модули netfilter — отдельные пакеты штатного opkg (/bin/opkg, не
 # Entware). Лаборатория 06.10, OpenWrt 24.10.8: без них нет NFQUEUE, без
 # kmod-ipt-nat — таблицы nat (MASQUERADE для QUIC и перенаправление Telegram).
-OPENWRT_RELEASE=${D2K_OPENWRT_RELEASE:-/etc/openwrt_release}
 OPENWRT_OPKG=${D2K_OPENWRT_OPKG:-/bin/opkg}
 OPENWRT_KMODS="kmod-nfnetlink-queue kmod-ipt-nfqueue kmod-ipt-conntrack kmod-ipt-conntrack-extra kmod-ipt-ipset kmod-ipt-extra kmod-ip6tables kmod-ipt-nat kmod-ipt-nat6"
 if [ -f "$OPENWRT_RELEASE" ]; then
