@@ -57,6 +57,30 @@ load_kmod() {
     return 0
 }
 NF_HINT="модуль не найден в прошивке; на Keenetic установите компонент «Модули ядра подсистемы Netfilter»"
+# OpenWrt: модули netfilter — отдельные пакеты штатного opkg (/bin/opkg, не
+# Entware). Лаборатория 06.10, OpenWrt 24.10.8: без них нет NFQUEUE, без
+# kmod-ipt-nat — таблицы nat (MASQUERADE для QUIC и перенаправление Telegram).
+OPENWRT_RELEASE=${D2K_OPENWRT_RELEASE:-/etc/openwrt_release}
+OPENWRT_OPKG=${D2K_OPENWRT_OPKG:-/bin/opkg}
+OPENWRT_KMODS="kmod-nfnetlink-queue kmod-ipt-nfqueue kmod-ipt-conntrack kmod-ipt-conntrack-extra kmod-ipt-ipset kmod-ipt-extra kmod-ip6tables kmod-ipt-nat kmod-ipt-nat6"
+if [ -f "$OPENWRT_RELEASE" ]; then
+    NF_HINT="модуль не найден; на OpenWrt поставьте пакеты: $OPENWRT_OPKG install $OPENWRT_KMODS"
+    if [ -x "$OPENWRT_OPKG" ]; then
+        kmods_have=$("$OPENWRT_OPKG" list-installed 2>/dev/null | cut -d' ' -f1)
+        kmods_missing=
+        for p in $OPENWRT_KMODS; do
+            printf '%s\n' "$kmods_have" | grep -qx "$p" || kmods_missing="$kmods_missing $p"
+        done
+        if [ -n "$kmods_missing" ]; then
+            say "OpenWrt: ставлю модули ядра:$kmods_missing"
+            # shellcheck disable=SC2086  # список пакетов, нарочно словами
+            "$OPENWRT_OPKG" install $kmods_missing >/dev/null 2>&1 ||
+                { "$OPENWRT_OPKG" update >/dev/null 2>&1 &&
+                  "$OPENWRT_OPKG" install $kmods_missing >/dev/null 2>&1; } ||
+                say "OpenWrt: модули не поставились — проверьте интернет и место, затем: $OPENWRT_OPKG install$kmods_missing"
+        fi
+    fi
+fi
 [ -e /proc/net/netfilter/nfnetlink_queue ] || { load_kmod nfnetlink; load_kmod nfnetlink_queue; }
 [ -e /proc/net/netfilter/nfnetlink_queue ] || \
     die "ядро без nfnetlink_queue — $NF_HINT"
