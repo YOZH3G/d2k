@@ -50,6 +50,7 @@ for arch in $ARCHES; do
             D2K_TEST_BINARY="$ROOT/builds/d2kc-linux-$arch" \
             D2K_TEST_RUNNER="qemu-$cpu" \
             D2K_TEST_RUNNER_ARGS='-cpu 24Kc' \
+            D2K_TEST_RELEASE_ID="${RELEASE_ID:-dev}" \
                 node "$ROOT/scripts/test-controller-handshake.cjs"
             ;;
     esac
