@@ -107,6 +107,20 @@ static int copy_value(char *dst, size_t cap, const char *src) {
     return 0;
 }
 
+/* Literal shell-style quoting only; never evaluate config as shell code. */
+static int normalize_shell_value(char *value) {
+    size_t n = strlen(value);
+    if (!n) return 0;
+    if (value[0] == '\'' || value[0] == '"') {
+        if (n < 2 || value[n - 1] != value[0]) return -1;
+        char quote = value[0];
+        value[n - 1] = '\0';
+        memmove(value, value + 1, n - 1);
+        if (strchr(value, quote)) return -1;
+    } else if (value[n - 1] == '\'' || value[n - 1] == '"') return -1;
+    return 0;
+}
+
 static int read_config(const char *path, char *mode, size_t mode_cap,
                        char *listen, size_t listen_cap,
                        char *state_dir, size_t state_cap, int *queue,
@@ -135,10 +149,15 @@ static int read_config(const char *path, char *mode, size_t mode_cap,
         *eq++ = '\0';
         char *key = trim(p), *value = trim(eq);
         if (!known_key(key)) { remember_unknown(unknown, n_unknown, key); continue; }
+        if (strcmp(key, "SCHEMA") && strcmp(key, "MODE") &&
+            strcmp(key, "PANEL_LISTEN") && strcmp(key, "STATE_DIR") &&
+            strcmp(key, "QUEUE_NUM")) continue;
+        if (normalize_shell_value(value) != 0) { fclose(f); return -1; }
         if (strcmp(key, "SCHEMA") == 0) {
             char *end = NULL;
+            errno = 0;
             long schema = strtol(value, &end, 10);
-            if (!end || *end || schema < 0 || schema > 1) { fclose(f); return -1; }
+            if (errno || end == value || *end || schema < 0 || schema > 1) { fclose(f); return -1; }
         } else if (strcmp(key, "MODE") == 0) {
             if (!valid_mode(value)) { fclose(f); return -1; }
             if (!cli_mode && copy_value(mode, mode_cap, value) != 0) { fclose(f); return -1; }
@@ -149,8 +168,9 @@ static int read_config(const char *path, char *mode, size_t mode_cap,
             if (!cli_state && copy_value(state_dir, state_cap, value) != 0) { fclose(f); return -1; }
         } else if (strcmp(key, "QUEUE_NUM") == 0) {
             char *end = NULL;
+            errno = 0;
             long v = strtol(value, &end, 10);
-            if (!end || *end || v < 0 || v > 65535) { fclose(f); return -1; }
+            if (errno || end == value || *end || v < 0 || v > 65535) { fclose(f); return -1; }
             if (!cli_queue) { *queue = (int)v; }
         }
     }
