@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -19,6 +20,9 @@
 
 #define REQUEST_MAX (32u * 1024u)
 #define BODY_MAX (1024u * 1024u)
+#ifndef D2K_PANEL_HEADER_TIMEOUT_MS
+#define D2K_PANEL_HEADER_TIMEOUT_MS 5000
+#endif
 #ifndef D2K_PANEL_ACTION_TIMEOUT_MS
 #define D2K_PANEL_ACTION_TIMEOUT_MS 60000
 #endif
@@ -500,7 +504,14 @@ static int api_update(int fd, const d2k_panel_config *cfg) {
 
 static int read_request(int fd, char *buf, size_t cap, size_t *used) {
     *used = 0;
+    const long long deadline = monotonic_ms() + D2K_PANEL_HEADER_TIMEOUT_MS;
     while (*used + 1 < cap) {
+        long long remaining = deadline - monotonic_ms();
+        if (remaining <= 0) { return -1; }
+        struct pollfd ready = { .fd = fd, .events = POLLIN };
+        int rc = poll(&ready, 1, (int)remaining);
+        if (rc < 0 && errno == EINTR) { continue; }
+        if (rc <= 0) { return -1; }
         ssize_t n = read(fd, buf + *used, cap - *used - 1);
         if (n < 0 && errno == EINTR) { continue; }
         if (n < 0) { return -1; }

@@ -40,6 +40,19 @@ test_server_san: test_server.c server.h server.c
 san: test_server_san
 	ASAN_OPTIONS=detect_leaks=0 ./test_server_san
 
+
+.PHONY: test-header-deadline
+test: test-header-deadline
+test-header-deadline: test_header_deadline
+	./test_header_deadline
+test_header_deadline: test_header_deadline.c server.c server.h
+	$(CC) $(CFLAGS) -DD2K_PANEL_HEADER_TIMEOUT_MS=100 -o $@ test_header_deadline.c
+
+.PHONY: clean-header-deadline
+clean: clean-header-deadline
+clean-header-deadline:
+	$(RM) test_header_deadline
+
 test-js:
 	node test_ui.cjs
 	node test_poll.cjs
