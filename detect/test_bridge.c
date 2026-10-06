@@ -6,8 +6,11 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Объявление обязано совпадать с bridge.c: без последнего параметра (stop)
+   x86-64 передавал мусор из регистра, и мост падал (CI 06.10.2026). */
 d2k_vres d2k_detect_sched_tcp(const char *, uint16_t, d2k_hello, d2k_hello,
-                             uint32_t, int, uint32_t, uint32_t);
+                             uint32_t, int, uint32_t, uint32_t,
+                             const volatile sig_atomic_t *);
 d2k_vres d2k_detect_sched_tcp_base(const char *, uint16_t, d2k_hello, d2k_hello,
                                   uint32_t, int, uint32_t, uint32_t,
                                   const volatile sig_atomic_t *);
@@ -154,7 +157,7 @@ static d2k_vres measure(void)
     uint8_t ctl[] = {0x16, 0x03, 0x01};
     d2k_hello tr = {hello, sizeof hello}, control = {ctl, sizeof ctl};
     return d2k_detect_sched_tcp("192.0.2.1", 443, tr, control,
-                                0x2d, 2, 12000, 321);
+                                0x2d, 2, 12000, 321, NULL);
 }
 
 static size_t build_hello(uint8_t *o, const char *sni)
@@ -185,7 +188,7 @@ int main(void)
     char why[160];
     {
         d2k_hello empty = {0};
-        r = d2k_detect_sched_tcp("192.0.2.1", 443, empty, empty, 0x2d, 2, 12000, 321);
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, empty, empty, 0x2d, 2, 12000, 321, NULL);
         CHECK(r.owns_search && !r.have_arm && r.verdict == D2K_V_FLAKY);
     }
     {
@@ -196,7 +199,7 @@ int main(void)
         tr.bytes = h;
         tr.len = build_hello(h, "blocked.example");
         answer.verdict = D2K_DV_INCONCLUSIVE; answer.has_hit = 0;
-        d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
         CHECK(strcmp(seen_name, "tls:blocked.example") == 0);
         /* Real hello, no server_name extension. */
         {
@@ -207,7 +210,7 @@ int main(void)
             g[n - strlen("x.example") - 9 + 1] = 0xff;
             tr.bytes = g; tr.len = n;
             seen_name[0] = 'Z';
-            d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+            d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
             CHECK(seen_name[0] == '\0');
         }
         /* Max-length SNI is held whole. */
@@ -217,7 +220,7 @@ int main(void)
             memset(big, 'a', 253); big[253] = 0;
             tr.bytes = g; tr.len = build_hello(g, big);
             seen_name[0] = 'Z';
-            d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+            d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
             snprintf(want, sizeof want, "tls:%s", big);
             CHECK(strcmp(seen_name, want) == 0);
         }
@@ -228,7 +231,7 @@ int main(void)
             g[n - 5] = 0;
             tr.bytes = g; tr.len = n;
             seen_name[0] = 'Z';
-            d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+            d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
             CHECK(seen_name[0] == '\0');
         }
     }
@@ -361,7 +364,7 @@ int main(void)
         /* Задача 49: "whole" с ответом базы — без зондов (они прошлого прогона). */
         CHECK(progress_calls == 2 && progress_probes == 3 && strcmp(progress_last, "whole") == 0);
         progress_reset();
-        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321);
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321, NULL);
         CHECK(seen.seed_whole == 0);
         CHECK(progress_calls == 2 && progress_probes == 6 && strcmp(progress_last, "whole") == 0);
     }
@@ -402,7 +405,7 @@ int main(void)
         tr.len = build_hello(h, "rutracker.org");
         memset(&answer, 0, sizeof answer);
         sweep_pass = box_takes;
-        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
         CHECK(seen.accept != NULL);
         CHECK(r.verdict == D2K_V_OPAQUE && r.have_arm && r.owns_search);
         CHECK(r.arm.ttl == 8 && r.arm.repeats == 1 && strcmp(r.arm_name, "ttl-8") == 0);
@@ -411,7 +414,7 @@ int main(void)
            доказала «решает содержимое» — вердикт тот же, что и до правки,
            даже если без неё дерево не нашло бы базы (контроль молчал). */
         sweep_pass = only_oob;
-        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
         CHECK(r.verdict == D2K_V_OPAQUE && !r.have_arm && r.owns_search);
         CHECK(strstr(r.reason, "буфер травится") != NULL);
         CHECK(strstr(r.reason, "«syndata»") != NULL && strstr(r.reason, "«oob»") != NULL);
@@ -422,10 +425,10 @@ int main(void)
         sweep_pass = NULL;
         memset(&answer, 0, sizeof answer);
         answer.verdict = D2K_DV_PREFIX; answer.split_pos = 5; answer.probes = 17;
-        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
         CHECK(r.verdict == D2K_V_PREFIX && r.split_pos == 5 && r.probes == 17);
         sweep_pass = box_takes;
-        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321);
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
         CHECK(r.have_arm);
         /* Фильтр пропускает всё, что план выражает. */
         memset(&p, 0, sizeof p);
