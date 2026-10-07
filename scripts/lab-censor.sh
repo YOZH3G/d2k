@@ -240,7 +240,7 @@ int main(void) {
 }
 PC
 cc -std=c99 -O2 -Icore/include -Idatapath/include -o /tmp/probecheck /tmp/probecheck.c \
-   core/verify.c core/tls13.c core/tls12.c core/tls13core.c core/x25519.c core/crypto.c \
+   core/verify.c core/tls13.c core/tls12.c core/p256.c core/tls13core.c core/x25519.c core/crypto.c \
    core/hello.c core/meas.c core/link.c core/compose.c core/quicconn.c core/quicwire.c core/h3.c
 if ! /tmp/probecheck; then
     fail "СОБСТВЕННЫЙ ЗОНД не доходит до приложения на ГОЛОЙ линии — опыт бессмыслен: он покажет неудачу на каждом плече, включая рабочие"

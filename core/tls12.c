@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include "d2k_crypto.h"
+#include "d2k_p256.h"
 #include "d2k_tls12.h"
 #include "d2k_tls13core.h"
 
@@ -429,8 +430,7 @@ static size_t ch12_build(const char *sni, const uint8_t random[32],
        КРИВУЮ СЕРТИФИКАТА (RFC 4492 §5.1): сервер с сертификатом на P-256,
        не увидев её в списке, отвечает handshake_failure — проверено на
        openssl s_server, тревога 40 на приветствии с одним лишь X25519.
-       Если сервер всё же выберет secp256r1 для обмена, зонд честно откажет:
-       это утверждение о нас, а не о коробке. */
+       Обмен на secp256r1 зонд тоже умеет (d2k_p256.h, поле 07.10.2026). */
     put16(p, 10); p += 2;                          /* supported_groups */
     put16(p, 8); p += 2;
     put16(p, 6); p += 2;
@@ -504,7 +504,8 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
     /* --- флайт сервера --- */
     hs_stream hs;
     memset(&hs, 0, sizeof hs);
-    uint8_t peer_pub[32];
+    uint8_t peer_pub[65];
+    uint16_t group = 0;
     int have_peer = 0, have_done = 0;
     uint16_t suite = 0;
     for (;;) {
@@ -550,18 +551,24 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
                 free(t);
                 return -1;
             }
-            if (get16(b + 1) != GROUP_X25519) {
-                say(err, errcap, "сервер выбрал группу 0x%04x — зонд умеет только X25519",
-                    (unsigned)get16(b + 1));
+            /* X25519 и secp256r1. Поле 07.10.2026 (KN-1811): graph.facebook.com
+               и api.facebook.com в TLS 1.2 выбирают secp256r1, и зонд умевший
+               лишь X25519 отказывал 253 раза за сутки — ни один план этих
+               целей не подтверждался (d2k_p256.h). */
+            group = get16(b + 1);
+            size_t want = group == GROUP_X25519 ? 32 : group == 0x0017 ? 65 : 0;
+            if (want == 0) {
+                say(err, errcap, "сервер выбрал группу 0x%04x — зонд умеет X25519 и secp256r1",
+                    (unsigned)group);
                 free(t);
                 return -1;
             }
-            if (b[3] != 32 || n < 4 + 32) {
-                say(err, errcap, "открытый ключ сервера длиной %u вместо 32", b[3]);
+            if (b[3] != want || n < 4 + want) {
+                say(err, errcap, "открытый ключ сервера длиной %u вместо %zu", b[3], want);
                 free(t);
                 return -1;
             }
-            memcpy(peer_pub, b + 4, 32);
+            memcpy(peer_pub, b + 4, want);
             have_peer = 1;
         } else if (type == HS_CERT_REQ) {
             /* Клиентский сертификат зонду взять негде, а слать пустой значит
@@ -581,14 +588,23 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
     }
 
     /* --- наш ключ, секреты --- */
-    uint8_t priv[32], pub[32], shared[32];
-    if (d2k_t13_random(priv, 32) != 0) {
-        say(err, errcap, "нет случайных байт");
-        free(t);
-        return -1;
-    }
-    if (d2k_x25519_base(pub, priv) != 0 || d2k_x25519(shared, priv, peer_pub) != 0) {
-        say(err, errcap, "X25519 не сошёлся");
+    uint8_t priv[32], pub[65], shared[32];
+    size_t pub_len = group == GROUP_X25519 ? 32 : 65;
+    if (group == GROUP_X25519) {
+        if (d2k_t13_random(priv, 32) != 0) {
+            say(err, errcap, "нет случайных байт");
+            free(t);
+            return -1;
+        }
+        if (d2k_x25519_base(pub, priv) != 0 || d2k_x25519(shared, priv, peer_pub) != 0) {
+            say(err, errcap, "X25519 не сошёлся");
+            free(t);
+            return -1;
+        }
+    } else if (d2k_p256_keypair(priv, pub) != 0 || d2k_p256_ecdh(priv, peer_pub, shared) != 0) {
+        /* Точка сервера не на кривой — тоже сюда: это утверждение о сервере,
+           не о коробке, и в каталог по нему не идёт ничего. */
+        say(err, errcap, "secp256r1 не сошёлся");
         free(t);
         return -1;
     }
@@ -610,16 +626,17 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
 
     /* --- ClientKeyExchange, CCS, Finished --- */
     {
-        uint8_t cke[4 + 1 + 32];
+        uint8_t cke[4 + 1 + 65];
+        size_t cke_len = 4 + 1 + pub_len;
         cke[0] = HS_CKE;
-        cke[1] = 0; cke[2] = 0; cke[3] = 33;
-        cke[4] = 32;
-        memcpy(cke + 5, pub, 32);
-        if (send_plain(t, REC_HANDSHAKE, cke, sizeof cke, err, errcap) != 0) {
+        cke[1] = 0; cke[2] = 0; cke[3] = (uint8_t)(1 + pub_len);
+        cke[4] = (uint8_t)pub_len;
+        memcpy(cke + 5, pub, pub_len);
+        if (send_plain(t, REC_HANDSHAKE, cke, cke_len, err, errcap) != 0) {
             free(t);
             return -1;
         }
-        tr_add(t, cke, sizeof cke);
+        tr_add(t, cke, cke_len);
     }
     {
         uint8_t ccs = 1;
