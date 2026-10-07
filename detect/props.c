@@ -26,7 +26,12 @@ typedef enum {
     SET_CHECKSUM,       /* ТОЛЬКО по проходу */
     SET_PARSES_L7,      /* ТОЛЬКО по проходу */
     SET_DUPLICATES,     /* ТОЛЬКО по проходу */
-    SET_SYN             /* ТОЛЬКО по проходу */
+    SET_SYN,            /* ТОЛЬКО по проходу */
+    SET_MD5,            /* ТОЛЬКО по проходу */
+    SET_SEQ_WINDOW,     /* ТОЛЬКО по проходу */
+    SET_TIMESTAMPS,     /* ТОЛЬКО по проходу */
+    SET_OVERLAP_SNI,    /* ТОЛЬКО по проходу */
+    SET_DUP_DENSE       /* ТОЛЬКО по проходу, то же поле, что SET_DUPLICATES */
 } prop_set;
 
 typedef struct {
@@ -38,10 +43,10 @@ typedef struct {
 static int prop_probes(prop_probe *out, int cap)
 {
     int k = 0;
-    if (cap < 6) {
+    if (cap < 11) {
         return 0;
     }
-    memset(out, 0, sizeof(*out) * 6);
+    memset(out, 0, sizeof(*out) * 11);
 
     out[k].label = "перекрытие слева";
     snprintf(out[k].p.name, sizeof(out[k].p.name), "seqovl-1");
@@ -90,6 +95,44 @@ static int prop_probes(prop_probe *out, int cap)
     out[k].set = SET_SYN;
     k++;
 
+    /* ПОЛЯ, КОТОРЫЕ УЗНАВАЛ ТОЛЬКО ПЕРЕБОР (§0.1 ТЗ, 07.10.2026). По вопросу
+     * на поле и БЕЗ битой суммы: с ней проход значил бы лишь «сумму не
+     * сверяет» (вопрос выше), а не ответ о самом поле. IP ID отдельно не
+     * спрашивается: пакет с нулевым IP ID сервер принимает — это не приём. */
+    out[k].label = "сверка MD5";
+    snprintf(out[k].p.name, sizeof(out[k].p.name), "md5");
+    out[k].p.md5 = 1;
+    out[k].set = SET_MD5;
+    k++;
+
+    out[k].label = "окно seq";
+    snprintf(out[k].p.name, sizeof(out[k].p.name), "seq-out-of-window");
+    out[k].p.seq_shift = -66000;
+    out[k].set = SET_SEQ_WINDOW;
+    k++;
+
+    out[k].label = "метка времени";
+    snprintf(out[k].p.name, sizeof(out[k].p.name), "ts");
+    out[k].p.tcp_ts = 1;
+    out[k].set = SET_TIMESTAMPS;
+    k++;
+
+    /* Размер перекрытия не перебирается (прежде seqovl 2…681): длина —
+     * до конца имени в приветствии, её задаёт run_properties по триггеру. */
+    out[k].label = "перекрытие до конца имени";
+    snprintf(out[k].p.name, sizeof(out[k].p.name), "seqovl-sni");
+    out[k].set = SET_OVERLAP_SNI;
+    k++;
+
+    /* Порог дубликатов: вопрос выше — две копии с паузой 20 мс; здесь —
+     * плотная семёрка без паузы, а не сетка 4×4 копий и пауз. */
+    out[k].label = "плотная серия";
+    snprintf(out[k].p.name, sizeof(out[k].p.name), "badsum-x7");
+    out[k].p.badsum = 1;
+    out[k].p.repeats = 7;
+    out[k].set = SET_DUP_DENSE;
+    k++;
+
     return k;
 }
 
@@ -123,6 +166,21 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok)
             pr->inspects_syn = D2K_TRI_FALSE;
         }
         break;
+    case SET_MD5:
+        if (ok) { pr->validates_md5 = D2K_TRI_FALSE; }
+        break;
+    case SET_SEQ_WINDOW:
+        if (ok) { pr->validates_seq_window = D2K_TRI_FALSE; }
+        break;
+    case SET_TIMESTAMPS:
+        if (ok) { pr->validates_timestamps = D2K_TRI_FALSE; }
+        break;
+    case SET_OVERLAP_SNI:
+        if (ok) { pr->overlap_covers_sni = D2K_TRI_TRUE; }
+        break;
+    case SET_DUP_DENSE:
+        if (ok) { pr->counts_duplicates = D2K_TRI_TRUE; }
+        break;
     }
 }
 
@@ -138,8 +196,8 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                        const d2k_trigger *tr, const d2k_opts *opt,
                        d2k_result *res, d2k_poison *hit)
 {
-    prop_probe pp[6];
-    int n = prop_probes(pp, 6);
+    prop_probe pp[11];
+    int n = prop_probes(pp, 11);
     int i, j;
     char err[160];
 
@@ -154,6 +212,14 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         }
         if (d2k_opts_skipped(opt, p.name)) {
             continue;
+        }
+        if (pp[i].set == SET_OVERLAP_SNI) {
+            /* До конца имени: без имени в приветствии вопрос не задаётся. */
+            if (tr->sni_len <= 0 || tr->sni_off <= 0 ||
+                (size_t)(tr->sni_off + tr->sni_len) >= tr->len) {
+                continue;
+            }
+            p.seqovl = tr->sni_off + tr->sni_len;
         }
         if (p.decoy_hello) {
             p.decoy = opt->control.payload;

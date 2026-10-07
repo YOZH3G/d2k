@@ -303,17 +303,21 @@ static int after_count(const char *name)
 {
     /* Полный перебор — на 3 зонда дешевле (задача 49): три точных дубля
        донора (badsum-x2-g20, badsum-x2-g80, badsum-x7-g0) больше не
-       спрашиваются второй раз. */
+       спрашиваются второй раз.
+       §0.1 ТЗ (07.10.2026): ещё четыре вопроса о свойствах — сверка MD5,
+       окно seq, метка времени, плотная серия — задаются после шести прежних
+       и, как они, до первого прохода. Где свойство не нашло приём, это +4
+       зонда (перекрытие до конца имени у приветствия без SNI не задаётся). */
     static const struct { const char *n; int a; } A[] = {
-        {"youtube", 12}, {"rutracker", 58}, {"flaky", 37}, {"prop-l7", 14},
-        {"none-pass", 100}, {"selftest-fail", 10}, {"selftest-late", 14},
-        {"ctl-late", 13}, {"ctl-dead", 103}, {"ctl-dead-vouched", 103},
-        {"ctl-dead-hit", 15}, {"errors", 100},
+        {"youtube", 12}, {"rutracker", 62}, {"flaky", 41}, {"prop-l7", 14},
+        {"none-pass", 104}, {"selftest-fail", 10}, {"selftest-late", 14},
+        {"ctl-late", 13}, {"ctl-dead", 107}, {"ctl-dead-vouched", 107},
+        {"ctl-dead-hit", 15}, {"errors", 104},
         /* Задача 54: молчащий контроль добавляет ОДИН вопрос — нейтральный
          * байт; подтверждённый с первого раза, он стоит один зонд. Молчание
          * адреса стоит три (единогласие) и снимает весь перебор отравлений. */
-        {"addr-silent", 12}, {"addr-silent-late", 104},
-        {"addr-ack-unseen", 102}, {"addr-ack-err", 103}};
+        {"addr-silent", 12}, {"addr-silent-late", 108},
+        {"addr-ack-unseen", 106}, {"addr-ack-err", 107}};
     size_t i;
     for (i = 0; i < sizeof A / sizeof A[0]; i++) {
         if (strcmp(A[i].n, name) == 0) { return A[i].a; }
@@ -411,6 +415,33 @@ static void test_counts_per_question(void)
     run(find_sc("ctl-dead"), &r);
     o = find_obs(&r, "control");
     CHECK(o && o->pass == 0 && o->fail == 3, "контроль без прохода: все 3 повтора");
+}
+
+/* Поля подделки, которые прежде узнавал только перебор (§0.1 ТЗ, 07.10.2026).
+ * Вопросы идут после шести прежних и, как они, до первого прохода: каждый
+ * ответ записывается в вектор только по проходу. */
+static const script_ent S_FIELD_MD5[] = {{"md5", "+"}, {NULL, NULL}};
+static const script_ent S_FIELD_SEQ[] = {{"seq-out-of-window", "+"}, {NULL, NULL}};
+static const script_ent S_FIELD_TS[]  = {{"ts", "+"}, {NULL, NULL}};
+static void test_props_fields(void)
+{
+    static const scenario md5 = {"props-md5", S_FIELD_MD5, NULL, NULL, NULL, 0, NULL};
+    static const scenario seq = {"props-seq", S_FIELD_SEQ, NULL, NULL, NULL, 0, NULL};
+    static const scenario ts  = {"props-ts",  S_FIELD_TS,  NULL, NULL, NULL, 0, NULL};
+    d2k_result r;
+    printf("свойства: сверка полей подделки\n");
+    fresh_process();
+    run(&md5, &r);
+    CHECK(r.props.validates_md5 == D2K_TRI_FALSE, "MD5: проход не записан");
+    CHECK(r.has_hit && !strcmp(r.hit.name, "md5"), "MD5: приём не стал находкой");
+    fresh_process();
+    run(&seq, &r);
+    CHECK(r.props.validates_seq_window == D2K_TRI_FALSE, "окно seq: проход не записан");
+    CHECK(r.props.validates_md5 == D2K_TRI_UNSET, "MD5 записан без прохода");
+    fresh_process();
+    run(&ts, &r);
+    CHECK(r.props.validates_timestamps == D2K_TRI_FALSE, "метка времени: проход не записан");
+    CHECK(r.props.counts_duplicates == D2K_TRI_UNSET, "дубликаты записаны без прохода");
 }
 
 /* ЗАДАЧА 54. Адрес, который после рукопожатия не принимает НИКАКИХ данных,
@@ -560,6 +591,7 @@ int main(void)
     }
     test_equivalence();
     test_counts_per_question();
+    test_props_fields();
     test_address_silence();
     test_selftest_cache();
     if (fails) {

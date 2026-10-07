@@ -150,6 +150,15 @@ typedef struct {
     d2k_tri tolerates_left_overlap;
     d2k_tri counts_duplicates;
     d2k_tri inspects_syn;
+    /* Сверяет ли коробка поле у подделки (§0.1 ТЗ, 07.10.2026: прежде это
+     * узнавал только перебор). FALSE — подделку с таким полем глотает, а
+     * сервер её отбрасывает; пишется ТОЛЬКО по проходу. */
+    d2k_tri validates_md5;
+    d2k_tri validates_seq_window;
+    d2k_tri validates_timestamps;
+    /* Перекрытие длиной до конца имени взято: коробка оставляет первую копию
+     * всей сигнатуры. Только по проходу. */
+    d2k_tri overlap_covers_sni;
     int     hop_ttl;
 } d2k_dprops;
 
