@@ -27,7 +27,10 @@ int d2k_poison_has_fake(const d2k_poison *p)
     if (p->syn_data || p->oob || p->fake_between) {
         return 0;
     }
-    return p->badsum || p->md5 || p->ttl > 0 || p->seq_shift != 0;
+    /* Метка времени со сдвигом назад — тоже подделка: сервер отбросит её по
+     * PAWS (§0.1, поле 07.10.2026 — вопрос «метка времени» без неё слал
+     * обычное приветствие, и «проход» был ложным). */
+    return p->badsum || p->md5 || p->ttl > 0 || p->seq_shift != 0 || p->tcp_ts;
 }
 
 #define POISON_CAP 128

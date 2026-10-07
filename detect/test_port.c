@@ -404,6 +404,16 @@ static void test_compose_follows_the_vector(void)
 int main(void)
 {
     {
+        /* §0.1 (поле 07.10.2026): вопрос «метка времени» шлёт подделку с одной
+           только сдвинутой меткой; без признания её подделкой зонд слал
+           обычное приветствие, и «проход» был ложным. */
+        d2k_poison ts;
+        memset(&ts, 0, sizeof ts);
+        ts.tcp_ts = 1;
+        if (!d2k_poison_has_fake(&ts)) { fail("подделка с одной меткой времени не признана подделкой"); }
+    }
+
+    {
         int n, applicable6 = 0, ipv4_only = 0;
         const d2k_poison *poisons = d2k_poisons(&n);
         for (int i = 0; i < n; i++) {

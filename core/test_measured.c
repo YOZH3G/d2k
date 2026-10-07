@@ -62,7 +62,8 @@ static void reference(const d2k_arm *a, const d2k_arm_input *in, const uint8_t *
     count = 0;
     unsigned flags = (a->badsum ? D2K_POISON_BADSUM : 0) |
         (a->tcpts ? D2K_POISON_TCPTS_BACK : 0) | (a->ipidzero ? D2K_POISON_IPID_ZERO : 0);
-    int has_fake = !a->between && (a->badsum || a->ttl || a->seq_out);
+    /* Как у сырого зонда (d2k_poison_has_fake): метка времени — тоже подделка. */
+    int has_fake = !a->between && (a->badsum || a->ttl || a->seq_out || a->tcpts);
     if (has_fake) {
         memset(fake, 15, n * 2);
         size_t cp = in->decoy_len < n * 2 ? in->decoy_len : n * 2;
@@ -528,6 +529,11 @@ int main(void) {
     a.seqovl_hello = 0; a.disorder = 0;
     a.tcpts = 1; a.ipidzero = 1; a.ttl = 8; a.seq_out = 1;
     run_case("fooling", a, 289, 0);
+    /* §0.1 (поле 07.10.2026, s3.amazonaws.com): метка времени и окно seq —
+       отдельные вопросы о свойствах; каждый прошедший — подделка с одним
+       этим полем, без битой суммы, и обязан задаваться планом. */
+    memset(&a, 0, sizeof a); a.repeats = 1; a.tcpts = 1; run_case("ts-alone", a, 289, 0);
+    memset(&a, 0, sizeof a); a.repeats = 1; a.seq_out = 1; run_case("seq-out-alone", a, 289, 0);
     if (failures) { fprintf(stderr, "measured: %d failures\n", failures); return 1; }
     puts("measured: exact bytes/lengths/seq/order/delays/fooling and input rejection passed");
     return 0;

@@ -1751,7 +1751,9 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
     size_t ov = a->seqovl_hello ? in->decoy_len : a->seqovl;
     if (ov > D2K_ARM_DECOY_MAX) { return -1; }
     int between = a->between;
-    int fake = !between && (a->badsum || a->ttl || a->seq_out);
+    /* Метка времени — тоже подделка (сервер отбросит её по PAWS): вопрос о
+       ней задаётся без битой суммы (§0.1, 07.10.2026). */
+    int fake = !between && (a->badsum || a->ttl || a->seq_out || a->tcpts);
     int disorder = !between && a->disorder;
     /* raw.c prioritizes fake_between over disorder/seqovl; it uses SNI
      * START, not the old Plan builder's two cuts at 1 and SNI middle. */
