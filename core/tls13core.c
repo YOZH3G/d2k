@@ -216,8 +216,15 @@ size_t d2k_t13_ch_build(const d2k_t13_ch_opts *o, uint8_t *out, size_t cap) {
     if (o->session_id_len) {
         memcpy(out + p, rnd, o->session_id_len); p += o->session_id_len;
     }
-    put16(out + p, 2); p += 2;                    /* cipher_suites */
-    put16(out + p, 0x1301); p += 2;               /* TLS_AES_128_GCM_SHA256 */
+    if (o->offer_tls12) {
+        put16(out + p, 6); p += 2;                /* cipher_suites: 1.3 + 1.2 */
+        put16(out + p, 0x1301); p += 2;           /* TLS_AES_128_GCM_SHA256 */
+        put16(out + p, 0xc02b); p += 2;           /* ECDHE_ECDSA_AES128_GCM_SHA256 */
+        put16(out + p, 0xc02f); p += 2;           /* ECDHE_RSA_AES128_GCM_SHA256 */
+    } else {
+        put16(out + p, 2); p += 2;                /* cipher_suites */
+        put16(out + p, 0x1301); p += 2;           /* TLS_AES_128_GCM_SHA256 */
+    }
     out[p++] = 1; out[p++] = 0;                   /* compression: null */
 
     size_t ext_at = p; p += 2;                    /* длина расширений */
@@ -234,8 +241,16 @@ size_t d2k_t13_ch_build(const d2k_t13_ch_opts *o, uint8_t *out, size_t cap) {
     put16(out + p, 2); p += 2; out[p++] = 1; out[p++] = 0;
 
     put16(out + p, 0x000a); p += 2;               /* supported_groups */
-    put16(out + p, 4); p += 2; put16(out + p, 2); p += 2;
-    put16(out + p, 0x001d); p += 2;               /* x25519 */
+    if (o->offer_tls12) {
+        /* secp256r1 — ради TLS 1.2: обмен на ней и кривая сертификата
+           (RFC 4492 §5.1). В 1.3 ключ один — X25519 (key_share ниже). */
+        put16(out + p, 6); p += 2; put16(out + p, 4); p += 2;
+        put16(out + p, 0x001d); p += 2;           /* x25519 */
+        put16(out + p, 0x0017); p += 2;           /* secp256r1 */
+    } else {
+        put16(out + p, 4); p += 2; put16(out + p, 2); p += 2;
+        put16(out + p, 0x001d); p += 2;           /* x25519 */
+    }
 
     /* signature_algorithms — набор браузера, а не минимальный из трёх.
        Минимальный работал на Google, Cloudflare и Microsoft и получал
@@ -255,8 +270,14 @@ size_t d2k_t13_ch_build(const d2k_t13_ch_opts *o, uint8_t *out, size_t cap) {
     put16(out + p, 0x0601); p += 2;               /* rsa_pkcs1_sha512 */
 
     put16(out + p, 0x002b); p += 2;               /* supported_versions */
-    put16(out + p, 3); p += 2; out[p++] = 2;
-    put16(out + p, 0x0304); p += 2;               /* TLS 1.3 */
+    if (o->offer_tls12) {
+        put16(out + p, 5); p += 2; out[p++] = 4;
+        put16(out + p, 0x0304); p += 2;           /* TLS 1.3 */
+        put16(out + p, 0x0303); p += 2;           /* TLS 1.2 */
+    } else {
+        put16(out + p, 3); p += 2; out[p++] = 2;
+        put16(out + p, 0x0304); p += 2;           /* TLS 1.3 */
+    }
 
     /* ALPN и psk_key_exchange_modes — то, что шлёт браузер. Формально для
        обмена ключами не нужны; практически часть сетей отвечает
@@ -382,6 +403,27 @@ int d2k_t13_finished_mac(const uint8_t secret[32], const uint8_t *tr, size_t tr_
 }
 
 /* --- разбор ServerHello ---------------------------------------------------- */
+
+unsigned d2k_t13_sh_version(const uint8_t *sh, size_t sh_len) {
+    size_t q = 4 + 2 + 32;
+    if (!sh || q + 1 > sh_len) { return 0; }
+    unsigned legacy = get16(sh + 4);
+    q += 1 + sh[q];
+    if (q + 3 > sh_len) { return 0; }
+    q += 3;                                        /* шифр и сжатие */
+    if (q + 2 > sh_len) { return legacy; }         /* без расширений — 1.2 */
+    size_t end = q + 2 + get16(sh + q);
+    q += 2;
+    if (end > sh_len) { end = sh_len; }
+    while (q + 4 <= end) {
+        uint16_t et = get16(sh + q), el = get16(sh + q + 2);
+        q += 4;
+        if (q + el > end) { break; }
+        if (et == 0x002b && el == 2) { return get16(sh + q); }
+        q += el;
+    }
+    return legacy;
+}
 
 int d2k_t13_sh_parse(const uint8_t *sh, size_t sh_len, const uint8_t **peer_key,
                      char *err, size_t errcap) {

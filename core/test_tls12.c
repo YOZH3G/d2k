@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 
 #include "d2k_tls12.h"
+#include "d2k_tls13core.h"
 
 static int fails;
 
@@ -133,9 +134,51 @@ static void test_clienthello_not_shared(void) {
     d2k_tls12_test_barrier = NULL;
 }
 
+/* ОБЕ ВЕРСИИ В ОДНОМ ПРИВЕТСТВИИ (поле 07.10.2026: сервера «только 1.2»
+ * отвечали зонду 1.3 тревогой 70). С offer_tls12 приветствие предлагает
+ * 0304 и 0303, шифры 1.2 и secp256r1; без него — прежнее, только 1.3. По
+ * ServerHello версия определяется supported_versions, а без него — 1.2. */
+static int has_bytes(const uint8_t *b, size_t n, const uint8_t *pat, size_t pn) {
+    for (size_t i = 0; i + pn <= n; i++) { if (!memcmp(b + i, pat, pn)) return 1; }
+    return 0;
+}
+
+static void test_offer_tls12(void) {
+    uint8_t pub[32] = {1}, rnd[32] = {2}, ch[2048];
+    d2k_t13_ch_opts o;
+    memset(&o, 0, sizeof o);
+    o.sni = "example.test"; o.pub = pub; o.random = rnd; o.session_id_len = 32;
+    static const uint8_t v13only[] = {0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04};
+    static const uint8_t vboth[] = {0x00, 0x2b, 0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03};
+    static const uint8_t suites12[] = {0x00, 0x06, 0x13, 0x01, 0xc0, 0x2b, 0xc0, 0x2f};
+    static const uint8_t groups[] = {0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17};
+    size_t n = d2k_t13_ch_build(&o, ch, sizeof ch);
+    check(n > 0 && has_bytes(ch, n, v13only, sizeof v13only) && !has_bytes(ch, n, vboth, sizeof vboth),
+          "без offer_tls12 приветствие изменилось");
+    o.offer_tls12 = 1;
+    n = d2k_t13_ch_build(&o, ch, sizeof ch);
+    check(n > 0 && has_bytes(ch, n, vboth, sizeof vboth), "offer_tls12: нет 0304+0303 в supported_versions");
+    check(has_bytes(ch, n, suites12, sizeof suites12), "offer_tls12: нет шифров c02b/c02f");
+    check(has_bytes(ch, n, groups, sizeof groups), "offer_tls12: нет secp256r1 в группах");
+
+    /* ServerHello: тип, длина, версия 0303, random, sid 0, шифр, сжатие. */
+    uint8_t sh[64];
+    size_t q = 0;
+    sh[q++] = 2; sh[q++] = 0; sh[q++] = 0; sh[q++] = 0;
+    sh[q++] = 3; sh[q++] = 3; memset(sh + q, 7, 32); q += 32;
+    sh[q++] = 0; sh[q++] = 0xc0; sh[q++] = 0x2f; sh[q++] = 0;
+    size_t bare = q;
+    check(d2k_t13_sh_version(sh, bare) == 0x0303, "ServerHello без расширений не прочитан как 1.2");
+    sh[q++] = 0; sh[q++] = 6;                            /* расширения: 6 байт */
+    sh[q++] = 0; sh[q++] = 0x2b; sh[q++] = 0; sh[q++] = 2; sh[q++] = 3; sh[q++] = 4;
+    check(d2k_t13_sh_version(sh, q) == 0x0304, "supported_versions 0304 не прочитан как 1.3");
+    check(d2k_t13_sh_version(sh, 10) == 0, "обрезанный ServerHello не отвергнут");
+}
+
 int main(void) {
     printf("TLS 1.2: проверки без сети\n");
     test_prf_vector();
+    test_offer_tls12();
     test_prf_partial_block();
     test_clienthello_not_shared();
     if (fails) { printf("TLS 1.2: ПРОВАЛОВ %d\n", fails); return 1; }

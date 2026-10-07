@@ -76,6 +76,11 @@ typedef struct {
        считать их в общем ядре значило бы зашить сюда чужой транспорт.
        0 — не добивать. */
     size_t pad_to;
+    /* Предложить ещё и TLS 1.2 (supported_versions 0304+0303, шифры
+       c02b/c02f, группа secp256r1), как браузер. Только TCP-зонд: сервер
+       «только 1.2» иначе отвечает тревогой 70 (поле 07.10.2026), а
+       договорившийся на 1.2 доводится d2k_tls12_resume. QUIC и ECH — 0. */
+    int offer_tls12;
 } d2k_t13_ch_opts;
 
 /* Собирает ClientHello. Возвращает длину сообщения или 0 при отказе. */
@@ -104,6 +109,10 @@ int d2k_t13_ech_accepted(const uint8_t *inner, size_t inner_len,
  * Полным разбором это не притворяется: от ServerHello нужен ровно один смысл
  * — общий ключ, — и делать вид, что проверено что-то ещё, было бы враньём в
  * пользу себе. */
+/* Версия, которую выбрал сервер: 0x0304 по supported_versions, иначе
+ * legacy_version ServerHello (0x0303 — TLS 1.2). 0 — ServerHello обрезан. */
+unsigned d2k_t13_sh_version(const uint8_t *sh, size_t sh_len);
+
 int d2k_t13_sh_parse(const uint8_t *sh, size_t sh_len, const uint8_t **peer_key,
                      char *err, size_t errcap);
 

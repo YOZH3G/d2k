@@ -474,6 +474,9 @@ static size_t ch12_build(const char *sni, const uint8_t random[32],
 
 void (*d2k_tls12_test_barrier)(void);
 
+static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
+                        hs_stream *hs_in, d2k_tls12 **out, char *err, size_t errcap);
+
 int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
                       d2k_tls12 **out, char *err, size_t errcap) {
     if (!out) { say(err, errcap, "некуда положить сессию"); return -1; }
@@ -500,10 +503,44 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
     if (d2k_tls12_test_barrier) { d2k_tls12_test_barrier(); }
     if (write_all(fd, ch, hello_len, err, errcap) != 0) { free(t); return -1; }
     tr_add(t, ch + 5, hello_len - 5);
-
-    /* --- флайт сервера --- */
     hs_stream hs;
     memset(&hs, 0, sizeof hs);
+    return tls12_finish(t, sni, deadline, &hs, out, err, errcap);
+}
+
+/* ПРОДОЛЖЕНИЕ ПОСЛЕ ПРИВЕТСТВИЯ 1.3, НА КОТОРОЕ СЕРВЕР ОТВЕТИЛ 1.2.
+ * Поле 07.10.2026 (KN-1811): report.appmetrica.yandex.net, clck.yandex.net,
+ * rustore, login.live.com — только TLS 1.2; зонд, предлагавший один 1.3,
+ * получал тревогу 70 (protocol_version) 500+ раз за сутки, а настоящий
+ * клиент договаривался на 1.2. Приветствие 1.3 зонда предлагает теперь и
+ * 1.2 (как браузер); выбрал сервер 1.2 — рукопожатие доводит этот клиент.
+ * srv — открытые байты рукопожатия сервера, уже прочитанные клиентом 1.3,
+ * начиная с ServerHello (запись может нести и следующие сообщения). */
+int d2k_tls12_resume(int fd, const char *sni, int deadline_ms,
+                     const uint8_t c_random[32], const uint8_t *ch_msg, size_t ch_len,
+                     const uint8_t *srv, size_t srv_len,
+                     d2k_tls12 **out, char *err, size_t errcap) {
+    if (!out || !c_random || !ch_msg || !srv) { say(err, errcap, "нечем продолжать"); return -1; }
+    d2k_tls12 *t = calloc(1, sizeof *t);
+    if (!t) { say(err, errcap, "нет памяти"); return -1; }
+    t->fd = fd;
+    t->peer_name = -1;
+    memcpy(t->c_random, c_random, 32);
+    if (ch_len > TR_MAX || srv_len > TR_MAX) { say(err, errcap, "рукопожатие длиннее предела"); free(t); return -1; }
+    tr_add(t, ch_msg, ch_len);
+    int64_t deadline = now_ms() + (deadline_ms > 0 ? deadline_ms : 5000);
+    hs_stream hs;
+    memset(&hs, 0, sizeof hs);
+    memcpy(hs.buf, srv, srv_len);
+    hs.len = srv_len;
+    return tls12_finish(t, sni, deadline, &hs, out, err, errcap);
+}
+
+/* Флайт сервера и всё до Finished. hs — поток сообщений (может быть уже
+ * наполнен прочитанным); t — с транскриптом до ServerHello включительно не
+ * считая, его добавит разбор. Владеет t: при отказе освобождает. */
+static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
+                        hs_stream *hs_in, d2k_tls12 **out, char *err, size_t errcap) {
     uint8_t peer_pub[65];
     uint16_t group = 0;
     int have_peer = 0, have_done = 0;
@@ -512,7 +549,7 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
         uint8_t type;
         const uint8_t *msg;
         size_t mlen;
-        if (hs_next(t, &hs, 0, &type, &msg, &mlen, deadline, err, errcap) != 0) {
+        if (hs_next(t, hs_in, 0, &type, &msg, &mlen, deadline, err, errcap) != 0) {
             free(t);
             return -1;
         }

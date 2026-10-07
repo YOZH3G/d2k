@@ -52,6 +52,14 @@ typedef struct d2k_tls12 d2k_tls12;
 int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
                       d2k_tls12 **out, char *err, size_t errcap);
 
+/* Продолжение после приветствия 1.3 (с предложенной 1.2), на которое сервер
+ * ответил 1.2: c_random и ch_msg (сообщение без заголовка записи) — того
+ * приветствия, srv — уже прочитанные открытые байты рукопожатия сервера с
+ * ServerHello. Тот же контракт, что у d2k_tls12_connect. */
+int d2k_tls12_resume(int fd, const char *sni, int deadline_ms,
+                     const uint8_t c_random[32], const uint8_t *ch_msg, size_t ch_len,
+                     const uint8_t *srv, size_t srv_len,
+                     d2k_tls12 **out, char *err, size_t errcap);
 /* Шлёт n байт прикладными данными. 0 или -1 с причиной. */
 int d2k_tls12_write(d2k_tls12 *t, const uint8_t *buf, size_t n,
                     char *err, size_t errcap);

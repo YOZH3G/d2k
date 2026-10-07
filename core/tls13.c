@@ -40,6 +40,7 @@
 #include "d2k_crypto.h"
 #include "d2k_tls13.h"
 #include "d2k_tls13core.h"
+#include "d2k_tls12.h"
 
 #define REC_CCS       20
 #define REC_ALERT     21
@@ -71,6 +72,9 @@ struct d2k_tls {
     /* Остаток прочитанного, ещё не отданный вызывающему. */
     uint8_t  plain[REC_MAX];
     size_t   plain_len, plain_off;
+    /* Сервер выбрал TLS 1.2 на наше приветствие с обеими версиями: сессию
+       ведёт клиент 1.2, чтение и запись идут через него. */
+    d2k_tls12 *v12;
 };
 
 static void say(char *err, size_t cap, const char *fmt, ...) {
@@ -300,6 +304,9 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
     }
     /* Добивка у ядра считается БЕЗ заголовка записи — его тут пять байт. */
     cho.pad_to = want_wire > 5 ? want_wire - 5 : 0;
+    /* И 1.3, и 1.2, как браузер (поле 07.10.2026: сервера «только 1.2»
+       отвечали тревогой 70). ECH — только 1.3 по определению. */
+    cho.offer_tls12 = ech == NULL;
     size_t ch_len;
     if (ech) {
         uint8_t hpke_priv[32], outer_random[32];
@@ -343,6 +350,21 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
             return -1;
         }
         break;
+    }
+    if (!ech && d2k_t13_sh_version(sh, sh_len) == 0x0303) {
+        /* Сервер выбрал 1.2: рукопожатие доводит клиент 1.2 с тем же
+           приветствием и уже прочитанной записью сервера. */
+        int64_t left = deadline - now_ms();
+        d2k_tls12 *v = NULL;
+        if (d2k_tls12_resume(fd, sni, left > 0 ? (int)left : 1, rnd, ch, ch_len,
+                             sh, sh_len, &v, err, errcap) != 0) {
+            free(t);
+            return -1;
+        }
+        t->v12 = v;
+        t->peer_name = d2k_tls12_peer_name(v);
+        *out = t;
+        return 0;
     }
     if (ech && !d2k_t13_ech_accepted(inner, inner_len, sh, sh_len)) {
         say(err, errcap, "ECH не принят сервером: публичное имя не подтверждает origin");
@@ -516,6 +538,7 @@ int d2k_tls_ech_accepted(const d2k_tls *t) { return t && t->ech_accepted; }
 
 int d2k_tls_write(d2k_tls *t, const uint8_t *buf, size_t n, char *err, size_t errcap) {
     if (!t) { say(err, errcap, "сессии нет"); return -1; }
+    if (t->v12) { return d2k_tls12_write(t->v12, buf, n, err, errcap); }
     while (n > 0) {
         size_t take = n > 16384 ? 16384 : n;
         if (write_record(t, REC_APPDATA, buf, take, err, errcap) != 0) { return -1; }
@@ -528,6 +551,7 @@ int d2k_tls_write(d2k_tls *t, const uint8_t *buf, size_t n, char *err, size_t er
 long d2k_tls_read(d2k_tls *t, uint8_t *buf, size_t cap, int wait_ms,
                   char *err, size_t errcap) {
     if (!t) { say(err, errcap, "сессии нет"); return -1; }
+    if (t->v12) { return d2k_tls12_read(t->v12, buf, cap, wait_ms, err, errcap); }
     if (t->plain_off < t->plain_len) {
         size_t take = t->plain_len - t->plain_off;
         if (take > cap) { take = cap; }
@@ -567,4 +591,7 @@ long d2k_tls_read(d2k_tls *t, uint8_t *buf, size_t cap, int wait_ms,
 
 int d2k_tls_peer_name(const d2k_tls *t) { return t ? t->peer_name : -1; }
 
-void d2k_tls_free(d2k_tls *t) { free(t); }
+void d2k_tls_free(d2k_tls *t) {
+    if (t && t->v12) { d2k_tls12_free(t->v12); }
+    free(t);
+}
