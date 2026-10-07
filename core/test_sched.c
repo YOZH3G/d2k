@@ -11983,6 +11983,59 @@ measured_test:
             d2k_sched_alpn_ver_hook = saved_alpn;
             tcp_answer = D2K_V_OPAQUE;
         }
+        /* ПОЛЕ 07.10.2026 (KN-1811, edge-mqtt.facebook.com): приложение
+           Facebook шлёт ClientHello БЕЗ ALPN (запись с провода: TLS 1.3 и
+           0xfb1a, группы 0x11ec/x25519/P-256). Зонд с http/1.1 получал
+           тревогу 120 (no_application_protocol) 211 раз, и ни один план не
+           подтверждался. Клиент без ALPN — не «обычный HTTP-клиент»: зонд
+           повторяет его как есть — без ALPN, и при доказанном блоке
+           рукопожатия засчитывает завершённое рукопожатие. */
+        {
+            d2k_sched_alpn_ver_fn saved_alpn = d2k_sched_alpn_ver_hook;
+            d2k_sched_alpn_ver_hook = stub_alpn_ver;
+            d2k_catalog c = {0};
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 0;
+            ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+            tcp_calls = ver_calls = alpn_ver_calls = 0; alpn_ver_seen_len = 99;
+            const char *nm = "edge-mqtt-noalpn.facebook.example";
+            uint16_t cport = 42435;
+            ver_answer_port = cport;
+            d2k_ev sh;
+            CHECK(tls_shape_event(&sh, nm, D2K_SHAPE_MODERN) == 0, "noalpn: снимок");
+            uint8_t list[256]; size_t ll = 0;
+            CHECK(d2k_hello_alpn(sh.shape, sh.shape_len, list, sizeof list, &ll) == 1 && ll == 12,
+                  "noalpn: ALPN профиля");
+            for (size_t i = 0; ll == 12 && i + 18 <= sh.shape_len; i++) {
+                if (sh.shape[i] == 0x00 && sh.shape[i + 1] == 0x10 && sh.shape[i + 2] == 0 &&
+                    sh.shape[i + 3] == 14 && !memcmp(sh.shape + i + 6, list, 12)) {
+                    sh.shape[i] = 0x0a; sh.shape[i + 1] = 0x0a; /* GREASE: ALPN нет */
+                    break;
+                }
+            }
+            CHECK(d2k_hello_alpn(sh.shape, sh.shape_len, list, sizeof list, &ll) == 0,
+                  "noalpn: в снимке остался ALPN");
+            drain(); forget_sent();
+            d2k_ev h = ev_hello(6, cport, nm); d2k_sched_event(s, &h);
+            d2k_sched_event(s, &sh);
+            d2k_ev su = ev_suspect(6, cport); d2k_sched_event(s, &su);
+            for (int i = 0; i < 60 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 100);
+                d2k_ev ap = ev_applied(6, cport); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            CHECK(alpn_ver_calls >= 1 && alpn_ver_seen_len == 0,
+                  "noalpn: зонд не повторил клиента без ALPN");
+            CHECK(ver_calls == 0, "noalpn: позван HTTP-зонд с http/1.1, которого клиент не предлагал");
+            CHECK(said("ПОДТВЕРЖДЕНО собственным зондом на уровне рукопожатия"),
+                  "noalpn: рукопожатие без ALPN не подтвердило план");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_alpn_ver_hook = saved_alpn;
+            tcp_answer = D2K_V_OPAQUE;
+        }
         /* F3, раунд 2: рукопожатие НЕ было заблокировано (CLEAR), блок
            доказан обрывом объёма (RX-cut, мерился по HTTP — сервер говорит
            HTTP). Рукопожатие тут проходит и без плана, и «доказательство

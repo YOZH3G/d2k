@@ -1310,9 +1310,11 @@ d2k_ver_result d2k_verify_probe_alpn_on(int use_fd, const char *ip, uint16_t por
     r.level = D2K_VER_HANDSHAKE;
     r.handshake_proof = 1;
     r.name_ok = d2k_tls_peer_name(t);
-    snprintf(r.reason, sizeof r.reason,
-             "рукопожатие TLS с ALPN клиента завершено; протокол клиента не HTTP — "
-             "прикладной уровень не измерен");
+    snprintf(r.reason, sizeof r.reason, "%s",
+             alpn_len ? "рукопожатие TLS с ALPN клиента завершено; протокол клиента не HTTP — "
+                        "прикладной уровень не измерен"
+                      : "рукопожатие TLS без ALPN, как у клиента, завершено — "
+                        "прикладной уровень не измерен");
     d2k_tls_free(t);
     return r;
 }

@@ -1004,9 +1004,14 @@ static int client_alpn_nonhttp(const task *t, uint8_t *list, size_t cap, size_t 
     int handshake_blocked = verdict_proves_block(t->res.verdict) ||
                             (t->own_first == 2 && t->res.base_blocked);
     if (!handshake_blocked || t->vol.rx_cut || t->vol.verdict == D2K_VOL_CUT) return 0;
-    /* Только ЯВНЫЙ не-HTTP ALPN (mqtt…). Клиент без ALPN на HTTPS-порту —
-       обычный HTTP-клиент, и HTTP-зонд с ним совместим. */
+    /* Явный не-HTTP ALPN (mqtt…) — и КЛИЕНТ БЕЗ ALPN. Прежде здесь стояло
+       «клиент без ALPN на HTTPS-порту — обычный HTTP-клиент»; поле
+       07.10.2026 (KN-1811) опровергло это: приложение Facebook шлёт к
+       edge-mqtt.facebook.com ClientHello без ALPN (запись с провода), а
+       HTTP-зонд со своим http/1.1 получал тревогу 120 — 211 раз, ни одного
+       подтверждения. Зонд повторяет клиента как есть: без ALPN (len 0). */
     int rc = d2k_hello_alpn(t->trig, t->trig_len, list, cap, len);
+    if (rc == 0) { *len = 0; return 1; }
     if (rc != 1 || *len == 0) { *len = 0; return 0; }
     return !d2k_alpn_is_http(list, *len);
 }
