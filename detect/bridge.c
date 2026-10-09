@@ -381,6 +381,7 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
                 memcpy(out.arm_input.decoy, res.hit.decoy, res.hit.decoy_len);
             }
             snprintf(out.arm_name, sizeof(out.arm_name), "%s", res.hit.name);
+            snprintf(out.arm_path, sizeof(out.arm_path), "%s", res.path);
             out.have_arm = 1;
         } else {
             /* Молчать об этом нельзя: иначе «плана нет» читается как «коробку

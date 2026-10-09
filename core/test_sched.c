@@ -175,6 +175,7 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
     r.split_gap_us = 60000;
     if (tcp_found_arm) {
         r.have_arm = 1; r.arm.badsum = 1;
+        snprintf(r.arm_path, sizeof r.arm_path, "перебор");
         r.arm_input.trigger_len = trigger.len;
         (void)d2k_hello_sni(trigger.bytes, trigger.len, &r.arm_input.sni_off, &r.arm_input.sni_len);
     }
@@ -11878,6 +11879,8 @@ measured_test:
             if (mode == 0) {
                 CHECK(said("НАЙДЕН замером"),
                       "t37: после неудачи сохранённого плана не испытан приём, найденный замером");
+                CHECK(said("путь: перебор"),
+                      "t37: журнал не называет путь находки (полевая доля перебора, §0.1)");
                 CHECK(said("проверяю кандидаты из уже выполненного прямого замера"),
                       "t37: возврат к результату замера не назван");
                 CHECK(used == 2,

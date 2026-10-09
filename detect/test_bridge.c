@@ -107,6 +107,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
                 if (opt->accept && !opt->accept(&l[i], opt->accept_ctx)) break;
                 res->has_hit = 1;
                 res->hit = l[i];
+                snprintf(res->path, sizeof res->path, "перебор");
                 res->verdict = D2K_DV_POISONABLE;
                 snprintf(res->reason, sizeof res->reason,
                          "поток пересобирается, но буфер травится: коробка глотает «%s», "
@@ -251,6 +252,7 @@ int main(void)
     r = measure();
     CHECK(r.have_arm && r.arm.seqovl == 1);
     CHECK(strcmp(r.arm_name, "seqovl-1") == 0);
+    CHECK(r.arm_path[0] == '\0'); /* дерево пути не назвало — мост не выдумывает */
     /* d2k_vres is returned and repeatedly copied by value. No pointer into
      * the adapter's dead stack frame may escape with the result. */
     CHECK(r.arm.name == NULL);
@@ -409,6 +411,7 @@ int main(void)
         CHECK(seen.accept != NULL);
         CHECK(r.verdict == D2K_V_OPAQUE && r.have_arm && r.owns_search);
         CHECK(r.arm.ttl == 8 && r.arm.repeats == 1 && strcmp(r.arm_name, "ttl-8") == 0);
+        CHECK(strcmp(r.arm_path, "перебор") == 0); /* §0.1: путь находки доходит до журнала */
         CHECK(strstr(r.reason, "«oob»") != NULL && strstr(r.reason, "URG") != NULL);
         /* Выразимого нет вовсе: плана нет, но взятая отрава всё равно
            доказала «решает содержимое» — вердикт тот же, что и до правки,
