@@ -494,7 +494,64 @@ static void send_limit_cases(void) {
     }
 }
 
+static void md5_plan_contract(void) {
+    char err[200], text[512];
+    uint8_t tlv[D2K_PLAN_TLV_MAX]; size_t tn = 0;
+    d2k_plan *p = NULL;
+    case_name = "MD5 plan version and send size";
+    const char *body = "proto tcp tls\nwire detect-tcp-v1\n"
+        "payload-pad 1 1400 15\npoison 1 md5 tcpts\n"
+        "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n"
+        "segment 1400\norder forward\n";
+    snprintf(text, sizeof text, "d2k-plan 1 12\n%s", body);
+    int rc = d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tn, err, sizeof err);
+    CHECK(rc == 0);
+    if (rc == 0) {
+        CHECK(d2k_plan_load(tlv, tn, &p, err, sizeof err) == 0);
+        if (p) { CHECK(d2k_plan_max_emit(p) == 1460); }
+        d2k_plan_free(p); p = NULL;
+        tlv[7] = 11;
+        CHECK(d2k_plan_load(tlv, tn, &p, err, sizeof err) != 0);
+        d2k_plan_free(p);
+    }
+    snprintf(text, sizeof text, "d2k-plan 1 11\n%s", body);
+    CHECK(d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tn, err, sizeof err) != 0);
+    CHECK(d2k_plan_text_to_tlv("d2k-plan 1 12\nproto udp quic\npoison 1 md5\n",
+                              tlv, sizeof tlv, &tn, err, sizeof err) != 0);
+    CHECK(d2k_plan_text_to_tlv("d2k-plan 1 12\nproto tcp tls\nwire tcp-template-v1\npoison 1 md5\n",
+                              tlv, sizeof tlv, &tn, err, sizeof err) != 0);
+}
+
+/* The raw sender replaces all TCP options with this exact malformed MD5
+ * signature. Check IPv4/IPv6 and MD5+timestamp priority without a live flow. */
+static void md5_wire(void) {
+    const uint8_t options[20] = {19, 18, 0, 0, 0, 0, 0, 0, 0, 0,
+                                0, 0, 0, 0, 0, 0, 0, 0, 1, 1};
+    uint8_t wire[128], data[] = {1, 2, 3};
+    case_name = "raw MD5 wire header";
+    for (int family = 4; family <= 6; family += 2) {
+        for (unsigned ts = 0; ts < 2; ts++) {
+            d2k_conn c = {0}; c.family = family;
+            d2k_emit e = {0}; e.kind = D2K_EMIT_FAKE;
+            e.wire_profile = D2K_WIRE_DETECT_TCP;
+            e.poison = (1u << 3) | (ts ? D2K_POISON_TCPTS_BACK : 0);
+            e.bytes = data; e.len = sizeof data;
+            size_t ip = family == 6 ? 40 : 20;
+            size_t n = d2k_wire_build(&c, &e, wire, sizeof wire);
+            CHECK(n == ip + 40 + sizeof data);
+            if (n == ip + 40 + sizeof data) {
+                CHECK(wire[ip + 12] == 0xa0);
+                CHECK(memcmp(wire + ip + 20, options, sizeof options) == 0);
+                CHECK(memcmp(wire + ip + 40, data, sizeof data) == 0);
+                CHECK(d2k_wire_tcp_checksum_ok(wire, n));
+            }
+        }
+    }
+}
+
 int main(void) {
+    md5_plan_contract();
+    md5_wire();
     malformed();
     fallback_disorder_pos2();
     rx_volume_fake_sni_split();

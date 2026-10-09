@@ -34,7 +34,10 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
     size_t tn = 0, index = 0;
     if (p.decoy_hello) { p.decoy = decoy; p.decoy_len = dn; }
     if (p.seqovl_exact) { p.seqovl = (int)dn; }
-    if (d2k_arm_from_poison(&p, &a, err, sizeof err) == -1) {
+    int bridge_rc = d2k_arm_from_poison(&p, &a, err, sizeof err);
+    /* MD5 is now required to traverse the complete measured-plan path. */
+    REQUIRE(!p.md5 || bridge_rc == 0);
+    if (bridge_rc == -1) {
         if (cases == 0) { printf("skip %s: %s\n", p.name, err); }
         skipped++; return;
     }
@@ -59,7 +62,8 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
             const d2k_emit *e = &out.v[index++];
             unsigned flags = (s->poison.badsum ? D2K_POISON_BADSUM : 0) |
                 (s->poison.tcp_ts ? D2K_POISON_TCPTS_BACK : 0) |
-                (s->poison.ip_id_zero ? D2K_POISON_IPID_ZERO : 0);
+                (s->poison.ip_id_zero ? D2K_POISON_IPID_ZERO : 0) |
+                (s->poison.md5 ? (1u << 3) : 0);
             REQUIRE(e->seq == (uint32_t)(BASE + s->seq_off + (int64_t)off));
             REQUIRE(e->seq_shift == s->poison.seq_shift);
             REQUIRE(e->kind == (s->kind == D2K_SEND_FAKE ? D2K_EMIT_FAKE : D2K_EMIT_PAYLOAD));
