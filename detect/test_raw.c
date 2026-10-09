@@ -73,7 +73,24 @@ static void test_disorder_pos2_emits_exact_reverse_segments(void)
     memcpy(c.dst + 1, (uint8_t[]){51, 100, 7}, 3);
     memcpy(tr.payload, bytes, sizeof bytes); tr.len = sizeof bytes;
     outgoing_count = 0; memset(outgoing_len, 0, sizeof outgoing_len);
-    CHECK(raw_send_disorder_pos(&c, &tr, 1000, 2) == 0);
+    {
+        /* Состав посылок — d2k_poison_sends, тот же список, по которому шлёт
+           зонд; провод — тем же raw_send, что и у зонда. */
+        d2k_poison p;
+        d2k_sends pl;
+        uint8_t fk[64], sg[64];
+        size_t i;
+        memset(&p, 0, sizeof p);
+        snprintf(p.name, sizeof p.name, "disorder-pos2");
+        p.disorder = 1; p.disorder_pos = 2;
+        CHECK(d2k_poison_sends(&tr, &p, fk, sizeof fk, sg, sizeof sg, &pl) == 0);
+        CHECK(pl.n == 2 && pl.v[0].delay_ms == 0 && pl.v[1].delay_ms == 0 && pl.tail_ms == 0);
+        for (i = 0; i < pl.n; i++) {
+            c.seq = (uint32_t)(1000 + pl.v[i].seq_off);
+            CHECK(raw_send(&c, pl.v[i].bytes, pl.v[i].len, (uint8_t)(TCP_PSH | TCP_ACK),
+                           &pl.v[i].poison) == 0);
+        }
+    }
     CHECK(outgoing_count == 2);
     if (outgoing_count == 2) {
         CHECK(rd32(outgoing[0] + 24) == 1002 && outgoing_len[0] == 44 &&

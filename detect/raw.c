@@ -841,22 +841,6 @@ static int raw_send(raw_conn *c, const uint8_t *payload, size_t plen,
     return 0;
 }
 
-/* The measured pos=2 multidisorder candidate is exactly two segments, sent
- * tail first and then the original two-byte prefix. Keep this separate from
- * SNI-middle disorder: it has neither the third one-byte segment nor a pace. */
-static int raw_send_disorder_pos(raw_conn *c, const d2k_trigger *tr,
-                                 uint32_t base, size_t split)
-{
-    d2k_poison none;
-    memset(&none, 0, sizeof none);
-    if (!c || !tr || split == 0 || split >= tr->len) { return -1; }
-    c->seq = base + (uint32_t)split;
-    if (raw_send(c, tr->payload + split, tr->len - split,
-                 (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) { return -1; }
-    c->seq = base;
-    return raw_send(c, tr->payload, split, (uint8_t)(TCP_PSH | TCP_ACK), &none);
-}
-
 /* sendSYN шлёт SYN с обычным набором опций: MSS, SACK-permitted, метки
  * времени, масштаб окна — ровно то, что кладёт ядро. Голое приветствие без
  * них само по себе аномалия: так не здоровается ни один настоящий клиент, и
@@ -1179,248 +1163,58 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
                          int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
                          char *err, size_t errcap)
 {
-    uint8_t *fake, *seg, *resp;
+    uint8_t *resp;
     raw_conn c;
-    d2k_poison none;
+    d2k_sends plan;
     uint32_t base;
-    size_t resp_len = 0;
+    size_t resp_len = 0, i;
     int rc = 0;
-    size_t n = tr->len;
 
-    memset(&none, 0, sizeof(none));
     if (raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap) != 0) {
         return -1;
     }
-    fake = c.buffers->fake;
-    seg = c.buffers->seg;
     resp = c.buffers->resp;
 
-    /* ШАГ 1: фальшивка в ту же область последовательности, что займёт правда.
+    /* СОСТАВ ПОСЫЛОК — d2k_poison_sends (poison.c): по тому же списку тест
+     * сверяет план датапата, поэтому замер и план не могут разойтись молча.
      *
      * ФАЛЬШИВКА — ОТДЕЛЬНАЯ ПОСЫЛКА, А НЕ НАЧИНКА ПЕРЕКРЫТИЯ. Дамп боевого
      * плеча 2026-08-29 показал, что это разные вещи и идут они подряд:
      *     ttl 63  seq 1:678     len 677   × 7   ← фальшивка, семь копий
      *     ttl 64  seq -680:2    len 682         ← перекрытие слева
      *     ttl 64  seq 2:1210    len 1208        ← остальное приветствие */
-    if (strcmp(p->name, "none") != 0 && d2k_poison_has_fake(p)) {
-        /* ФАЛЬШИВКА ДЛИННЕЕ ПРАВДЫ, и это тоже из дампа: боевое плечо шлёт 677
-         * байт на приветствие в 343, то есть накрывает его целиком И заходит
-         * за край. Коробка, дочитывающая запись до конца, на укороченной
-         * фальшивке осталась бы ждать продолжения и приняла бы настоящие байты
-         * как это продолжение — отравление тогда не срабатывает. */
-        size_t flen = n * 2;
-        int reps = p->repeats < 1 ? 1 : p->repeats;
-        int i;
-        if (flen > sizeof(c.buffers->fake)) {
-            flen = sizeof(c.buffers->fake);
-        }
-        memset(fake, 0x0f, flen);
-        if (p->decoy && p->decoy_len > 0) {
-            /* Коробке, разбирающей протокол, набивка не годится: она её
-             * пропустит мимо и продолжит ждать настоящее приветствие. */
-            size_t k = p->decoy_len < flen ? p->decoy_len : flen;
-            memcpy(fake, p->decoy, k);
-        }
-        for (i = 0; i < reps; i++) {
-            if (raw_send(&c, fake, flen, (uint8_t)(TCP_PSH | TCP_ACK), p) != 0) {
-                snprintf(err, errcap, "%s", strerror(errno));
+    if (d2k_poison_sends(tr, p, c.buffers->fake, sizeof(c.buffers->fake),
+                         c.buffers->seg, sizeof(c.buffers->seg), &plan) != 0) {
+        snprintf(err, errcap, "посылки гипотезы не уместились");
+        raw_close(&c);
+        return -1;
+    }
+    base = c.seq;
+    for (i = 0; i < plan.n; i++) {
+        const d2k_send *s = &plan.v[i];
+        if (s->delay_ms > 0) {
+            if (s->kind == D2K_SEND_FAKE && d2k_detect_stopped(cancel)) {
                 raw_close(&c);
+                snprintf(err, errcap, "context canceled");
                 return -1;
             }
-            if (p->gap_ms > 0 && i + 1 < reps) {
-                if (d2k_detect_stopped(cancel)) {
-                    raw_close(&c);
-                    snprintf(err, errcap, "context canceled");
-                    return -1;
-                }
-                d2k_sleep_ms(p->gap_ms);
-            }
+            d2k_sleep_ms(s->delay_ms);
         }
-        d2k_sleep_ms(15);
-    }
-
-    /* ШАГ 2: настоящие данные. */
-    base = c.seq;
-    if (p->syn_data) {
-        /* ДАННЫЕ В САМОМ SYN. Рукопожатие уже прошло обычным путём, поэтому
-         * здесь мы шлём приветствие сегментом с флагом SYN поверх готового
-         * соединения: коробка увидит SYN и, если она payload в нём не
-         * разбирает, сигнатуру пропустит. */
-        if (raw_send(&c, tr->payload, n, (uint8_t)(TCP_SYN | TCP_PSH | TCP_ACK), &none) != 0) {
-            snprintf(err, errcap, "%s", strerror(errno));
-            raw_close(&c);
-            return -1;
-        }
-    } else if (p->oob) {
-        /* БАЙТ ВНЕ ПОЛОСЫ. Вставляем посторонний символ в середину имени и
-         * помечаем его срочным: сервер по правилам изымет его из потока,
-         * коробка, читающая всё подряд, оставит — и соберёт не ту строку. */
-        static const uint8_t urgb[1] = {0x0f};
-        size_t mid = n / 2;
-        if (tr->sni_len > 1 && tr->sni_off > 0) {
-            mid = (size_t)tr->sni_off + (size_t)tr->sni_len / 2;
-        }
-        if (mid < 1 || mid >= n) {
-            mid = n / 2;
-        }
-        if (raw_send(&c, tr->payload, mid, (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
-            goto senderr;
-        }
-        c.seq = base + (uint32_t)mid;
-        if (raw_send_urg(&c, urgb, 1) != 0) {
-            goto senderr;
-        }
-        c.seq = base + (uint32_t)mid + 1;
-        if (raw_send(&c, tr->payload + mid, n - mid, (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
-            goto senderr;
-        }
-        c.seq = base + (uint32_t)n + 1;
-        if (raw_read_payload(&c, timeout_ms, cancel, resp, sizeof(c.buffers->resp),
-                             &resp_len) != 0) {
-            raw_close(&c);
-            return 0;
-        }
-        rc = d2k_trigger_accepts(tr, resp, resp_len);
-        raw_close(&c);
-        return rc;
-    } else if (p->fake_between) {
-        /* ФАЛЬШИВКА МЕЖДУ КУСКАМИ. Отличие от общего пути — размещение:
-         * сперва настоящий первый кусок, следом фальшивка на его же
-         * продолжение, и только потом настоящий остаток. */
-        size_t mid = 1;
-        size_t flen;
-        d2k_poison fp;
-        int reps = p->repeats < 1 ? 1 : p->repeats;
-        int i;
-        if (tr->sni_len > 1 && tr->sni_off > 0) {
-            mid = (size_t)tr->sni_off;
-        }
-        if (mid >= n) {
-            mid = 1;
-        }
-        if (raw_send(&c, tr->payload, mid, (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
-            goto senderr;
-        }
-        flen = n - mid;
-        if (flen > sizeof(c.buffers->fake)) {
-            flen = sizeof(c.buffers->fake);
-        }
-        memset(fake, 0x0f, flen);
-        memset(&fp, 0, sizeof(fp));
-        fp.badsum = p->badsum;
-        fp.ttl = p->ttl;
-        for (i = 0; i < reps; i++) {
-            c.seq = base + (uint32_t)mid;
-            if (raw_send(&c, fake, flen, (uint8_t)(TCP_PSH | TCP_ACK), &fp) != 0) {
+        c.seq = (uint32_t)((int64_t)base + s->seq_off);
+        if (s->kind == D2K_SEND_URG) {
+            if (raw_send_urg(&c, s->bytes, s->len) != 0) {
                 goto senderr;
             }
-        }
-        d2k_sleep_ms(12);
-        c.seq = base + (uint32_t)mid;
-        if (raw_send(&c, tr->payload + mid, n - mid, (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
-            goto senderr;
-        }
-    } else if (p->disorder_pos > 0) {
-        if (raw_send_disorder_pos(&c, tr, base, (size_t)p->disorder_pos) != 0) {
-            goto senderr;
-        }
-    } else if (p->seqovl > 0 && p->disorder) {
-        /* ПЕРЕКРЫТИЕ ВМЕСТЕ С ПОРЯДКОМ. Боевое плечо 1 пула rkn_tcp именно
-         * такое: multisplit с seqovl И multidisorder на одном соединении.
-         * Замер 2026-08-29: три хоста, которые арсенал берёт, а семьдесят
-         * гипотез нет, стояли ровно на нём. */
-        size_t mid = n / 2;
-        size_t ov = (size_t)p->seqovl;
-        if (tr->sni_len > 1 && tr->sni_off > 0) {
-            mid = (size_t)tr->sni_off + (size_t)tr->sni_len / 2;
-        }
-        if (mid < 2) {
-            mid = 2;
-        }
-        if (mid >= n) {
-            mid = n - 1;
-        }
-        /* Хвост уходит первым, голова — последней и внахлёст слева. */
-        c.seq = base + (uint32_t)mid;
-        if (raw_send(&c, tr->payload + mid, n - mid, (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
-            goto senderr;
-        }
-        d2k_sleep_ms(12);
-        c.seq = base + 1;
-        if (raw_send(&c, tr->payload + 1, mid - 1, (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
-            goto senderr;
-        }
-        d2k_sleep_ms(12);
-        if (ov + 1 > sizeof(c.buffers->seg)) {
-            ov = sizeof(c.buffers->seg) - 1;
-        }
-        memset(seg, 0x0f, ov);
-        if (p->decoy && p->decoy_len > 0) {
-            size_t k = p->decoy_len < ov ? p->decoy_len : ov;
-            memcpy(seg, p->decoy, k);
-        }
-        seg[ov] = tr->payload[0];
-        c.seq = base - (uint32_t)ov;
-        if (raw_send(&c, seg, ov + 1, (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
-            goto senderr;
-        }
-    } else if (p->seqovl > 0) {
-        /* Внахлёст слева: один сегмент с номером base-N, где первые N байт —
-         * приманка. Сервер подрежет левый край окна и возьмёт правду. */
-        size_t ov = (size_t)p->seqovl;
-        if (ov + n > sizeof(c.buffers->seg)) {
-            ov = sizeof(c.buffers->seg) - n;
-        }
-        memset(seg, 0x0f, ov);
-        if (p->decoy && p->decoy_len > 0) {
-            size_t k = p->decoy_len < ov ? p->decoy_len : ov;
-            memcpy(seg, p->decoy, k);
-        }
-        memcpy(seg + ov, tr->payload, n);
-        c.seq = base - (uint32_t)ov;
-        if (raw_send(&c, seg, ov + n, (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
-            goto senderr;
-        }
-    } else if (p->disorder) {
-        /* ТРИ КУСКА, ПЕРВЫЙ БАЙТ — ПОСЛЕДНИМ. Дамп боевого плеча:
-         *   seq 268:344 (76 б), seq 2:268 (266 б), seq 1:2 (1 б)
-         * То есть `multidisorder:pos=1,midsld` режет по единице и по середине
-         * домена, а на провод кладёт задом наперёд. Деление пополам на два
-         * куска это не воспроизводит: коробке достаётся осмысленное начало
-         * записи, и она спокойно дожидается остального.
-         *
-         * РЕЖЕМ ПО ИМЕНИ, А НЕ ПО СЕРЕДИНЕ ПАКЕТА: разорвано имя между
-         * сегментами или лежит в одном куске — это и есть разница между
-         * «сработало» и «нет». */
-        size_t mid = n / 2;
-        size_t from[3], to[3];
-        int i;
-        if (tr->sni_len > 1 && tr->sni_off > 0) {
-            mid = (size_t)tr->sni_off + (size_t)tr->sni_len / 2;
-        }
-        if (mid < 2) {
-            mid = 2;
-        }
-        if (mid >= n) {
-            mid = n - 1;
-        }
-        from[0] = mid; to[0] = n;
-        from[1] = 1;   to[1] = mid;
-        from[2] = 0;   to[2] = 1;
-        for (i = 0; i < 3; i++) {
-            c.seq = base + (uint32_t)from[i];
-            if (raw_send(&c, tr->payload + from[i], to[i] - from[i],
-                         (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
-                goto senderr;
-            }
-            d2k_sleep_ms(12);
-        }
-    } else {
-        if (raw_send(&c, tr->payload, n, (uint8_t)(TCP_PSH | TCP_ACK), &none) != 0) {
+        } else if (raw_send(&c, s->bytes, s->len,
+                            (uint8_t)((s->syn ? TCP_SYN : 0) | TCP_PSH | TCP_ACK),
+                            &s->poison) != 0) {
             goto senderr;
         }
     }
-    c.seq = base + (uint32_t)n;
+    if (plan.tail_ms > 0) {
+        d2k_sleep_ms(plan.tail_ms);
+    }
+    c.seq = base + (uint32_t)plan.stream_len;
 
     if (raw_read_payload(&c, timeout_ms, cancel, resp, sizeof(c.buffers->resp),
                          &resp_len) != 0) {
