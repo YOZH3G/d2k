@@ -1343,7 +1343,7 @@ static int everything_plan_text(d2k_shape shape, const char *decoy, size_t send_
  * ЧЕГО ЗДЕСЬ НЕТ И ПОЧЕМУ. Четыре донорских плеча не выразимы сегодняшним
  * языком Plan, и они ПРОПУЩЕНЫ, а не подменены похожими:
  *
- *   md5      — нужна опция TCP MD5 в заголовке;
+ *   md5      — выражается измеренным сборщиком (detect-tcp-v1);
  *   syndata  — нужна посылка с флагом SYN поверх готового соединения;
  *   oob      — нужен срочный байт (URG) в середине имени;
  *   ipfrag   — нужна IP-фрагментация.
@@ -1726,7 +1726,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         a->ttl > 255 || a->gap_ms > UINT32_MAX / 1000u) { return -1; }
     if (a->disorder_pos) {
         if (!a->disorder || a->disorder_pos >= in->trigger_len || a->seqovl ||
-            a->seqovl_hello || a->badsum || a->repeats || a->gap_ms || a->between ||
+            a->seqovl_hello || a->badsum || a->md5 || a->repeats || a->gap_ms || a->between ||
             a->ttl || a->seq_out || a->decoy_hello || a->tcpts || a->ipidzero ||
             a->oob) { return -1; }
         size_t plan_pos = 0;
@@ -1744,7 +1744,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
             (unsigned)D2K_ARM_SEGMENT_MAX, a->disorder_pos);
     }
     if (a->oob) {
-        if (a->seqovl || a->seqovl_hello || a->badsum || a->repeats || a->gap_ms ||
+        if (a->seqovl || a->seqovl_hello || a->badsum || a->md5 || a->repeats || a->gap_ms ||
             a->disorder || a->between || a->ttl || a->seq_out || a->decoy_hello ||
             a->tcpts || a->ipidzero || in->sni_off == 0 || in->sni_len <= 1 ||
             in->sni_off + in->sni_len > in->trigger_len) { return -1; }
@@ -1760,7 +1760,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
     int between = a->between;
     /* Метка времени — тоже подделка (сервер отбросит её по PAWS): вопрос о
        ней задаётся без битой суммы (§0.1, 07.10.2026). */
-    int fake = !between && (a->badsum || a->ttl || a->seq_out || a->tcpts);
+    int fake = !between && (a->badsum || a->md5 || a->ttl || a->seq_out || a->tcpts);
     int disorder = !between && a->disorder;
     /* raw.c prioritizes fake_between over disorder/seqovl; it uses SNI
      * START, not the old Plan builder's two cuts at 1 and SNI middle. */
@@ -1785,7 +1785,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         size_t body = (fake || between) ? (between ? n - mid : 2 * n) : 0;
         if (ov > body) { body = ov; }
         if (body > D2K_ARM_SEGMENT_MAX) { body = D2K_ARM_SEGMENT_MAX; }
-        size_t hdr = 40 + (fake && a->tcpts ? 12 : 0);
+        size_t hdr = 40 + (fake && a->md5 ? 20 : fake && a->tcpts ? 12 : 0);
         if (body && hdr + body > send_cap) { return -1; }
     }
     if (a->disorder_pos) {
@@ -1837,9 +1837,9 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
             "wire detect-tcp-v1\ninput tls-sni\nsegment %u\n",
             (unsigned)D2K_ARM_SEGMENT_MAX)) { return -1; }
     } else if (append_fmt(buf, cap, &pos,
-        "d2k-plan 1 4\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\n"
+        "d2k-plan 1 %u\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\n"
         "input %zu %zu %zu\nsegment %u\n",
-        n, in->sni_off, in->sni_len, (unsigned)D2K_ARM_SEGMENT_MAX)) { return -1; }
+        a->md5 ? 12u : 4u, n, in->sni_off, in->sni_len, (unsigned)D2K_ARM_SEGMENT_MAX)) { return -1; }
     size_t flen = between ? n - mid : 2 * n;
     const uint8_t *prefix = in->decoy;
     size_t prefix_len = in->decoy_len;
@@ -1850,6 +1850,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         if (a->badsum && append_fmt(buf, cap, &pos, " badsum")) { return -1; }
         if (a->ttl && append_fmt(buf, cap, &pos, " ttl=%u", a->ttl)) { return -1; }
         if (!between) {
+            if (a->md5 && append_fmt(buf, cap, &pos, " md5")) { return -1; }
             if (a->tcpts && append_fmt(buf, cap, &pos, " tcpts")) { return -1; }
             if (a->ipidzero && append_fmt(buf, cap, &pos, " ipidzero")) { return -1; }
             if (a->seq_out && append_fmt(buf, cap, &pos, " seqshift=-66000")) { return -1; }
@@ -1884,6 +1885,8 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
     fb_arm a;
     if (!buf || cap == 0 || !arm) { return -1; }
     a = *arm;
+    /* MD5 is expressed only by the measured/raw wire builder. */
+    if (a.md5) { return -1; }
     if (a.disorder_pos) {
         if (a.disorder_pos > D2K_ARM_DECOY_MAX || !a.disorder || a.seqovl ||
             a.seqovl_hello || a.badsum || a.repeats || a.gap_ms || a.between ||

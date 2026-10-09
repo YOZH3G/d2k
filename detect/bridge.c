@@ -72,10 +72,6 @@ int d2k_arm_from_poison(const d2k_poison *p, d2k_arm *a, char *why, size_t whyca
         snprintf(why, whycap, "срочный байт (URG) языком плана не выражается");
         return -1;
     }
-    if (p->md5) {
-        snprintf(why, whycap, "опция TCP-MD5 языком плана не выражается");
-        return -1;
-    }
     /* The result crosses worker threads by value. Keep its display name
      * in d2k_vres.arm_name, not as a pointer into res.hit/the bridge stack. */
     a->name         = NULL;
@@ -85,6 +81,7 @@ int d2k_arm_from_poison(const d2k_poison *p, d2k_arm *a, char *why, size_t whyca
         return -1;
     }
     a->badsum       = p->badsum;
+    a->md5          = p->md5;
     a->repeats      = p->repeats > 0 ? (unsigned)p->repeats : 0u;
     /* In the original, TTL/seq-shift alone also send a fake (one by
      * default). The Plan builder needs this explicitly to emit its body. */

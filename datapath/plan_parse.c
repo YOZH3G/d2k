@@ -117,6 +117,9 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             break;
         case REC_POISON:
             if (ln != 8) { fail(err, errlen, "порча не 8 байт"); return -1; }
+            if ((b[off + 3] & D2K_POISON_MD5) && rd16(b + 6) < 12) {
+                fail(err, errlen, "md5 требует minexec=12"); return -1;
+            }
             c->poisons++;
             break;
         case REC_SPLIT:
@@ -209,6 +212,14 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
 /* Ссылки обязаны разрешаться. Ноль означает «ничего» и висячей ссылкой не
  * является: фальшивка без порчи законна. */
 static int check_refs(const d2k_plan *p, char *err, size_t errlen) {
+    for (size_t i = 0; i < p->n_poisons; i++) {
+        if ((p->poisons[i].flags & D2K_POISON_MD5) &&
+            (p->minexec < 12 || p->transport != 6 || p->wire_profile != D2K_WIRE_DETECT_TCP)) {
+            fail(err, errlen, "md5 требует minexec=12 и wire detect-tcp-v1 TCP");
+            return -1;
+        }
+    }
+
     if (p->ipfrag && (p->transport != 17 || p->n_splits || p->n_seqovls ||
         p->order || p->input_len || p->input_tls || p->settle_us ||
         p->segment_size || p->wire_profile || p->guards)) {

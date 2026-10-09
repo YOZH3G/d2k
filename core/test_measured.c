@@ -59,10 +59,10 @@ static void reference(const d2k_arm *a, const d2k_arm_input *in, const uint8_t *
     size_t n = in->trigger_len;
     unsigned reps = a->repeats ? a->repeats : 1;
     count = 0;
-    unsigned flags = (a->badsum ? D2K_POISON_BADSUM : 0) |
+    unsigned flags = (a->badsum ? D2K_POISON_BADSUM : 0) | (a->md5 ? D2K_POISON_MD5 : 0) |
         (a->tcpts ? D2K_POISON_TCPTS_BACK : 0) | (a->ipidzero ? D2K_POISON_IPID_ZERO : 0);
     /* Как у сырого зонда (d2k_poison_has_fake): метка времени — тоже подделка. */
-    int has_fake = !a->between && (a->badsum || a->ttl || a->seq_out || a->tcpts);
+    int has_fake = !a->between && (a->badsum || a->md5 || a->ttl || a->seq_out || a->tcpts);
     if (has_fake) {
         memset(fake, 15, n * 2);
         size_t cp = in->decoy_len < n * 2 ? in->decoy_len : n * 2;
@@ -131,11 +131,11 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
        ПЕРВОМУ СЕГМЕНТУ составного приветствия — а это ровно тот случай,
        который встретился в поле 18.09.2026 (1534 байта при MSS 1388, «план
        неприменим к этому пакету» на зонде подтверждения). */
-    if (a.seqovl && !a.disorder && !a.between && !a.badsum && !a.ttl && !a.seq_out) {
+    if (a.seqovl && !a.disorder && !a.between && !a.badsum && !a.md5 && !a.ttl && !a.seq_out) {
         CHECK(parametric);
     }
     if (a.seqovl_hello && a.disorder && !a.between &&
-        !a.badsum && !a.ttl && !a.seq_out) {
+        !a.badsum && !a.md5 && !a.ttl && !a.seq_out) {
         CHECK(parametric);
         CHECK(strstr(text, "split sni_middle +0") != NULL);
     }
@@ -168,7 +168,7 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
     CHECK(out.fate == D2K_ORIG_DROP);
     CHECK(out.n == count);
     CHECK(out.n <= D2K_RESULT_MAX);
-    CHECK(d2k_plan_max_emit(p) <= 1452);
+    CHECK(d2k_plan_max_emit(p) <= (a.md5 ? 1460u : 1452u));
     for (size_t i = 0; i < out.n && i < count; i++) {
         const d2k_emit *e = &out.v[i]; const expected_send *x = &expected[i];
         CHECK(e->seq == x->seq && e->seq_shift == x->shift);
@@ -185,7 +185,8 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
         uint8_t wire[1600];
         d2k_conn conn = {0}; conn.ttl = 64; conn.window = 65535;
         size_t wn = d2k_wire_build(&conn, e, wire, sizeof wire);
-        size_t hdr = 40 + ((x->flags & D2K_POISON_TCPTS_BACK) ? 12 : 0);
+        size_t hdr = 40 + ((x->flags & D2K_POISON_MD5) ? 20
+                         : (x->flags & D2K_POISON_TCPTS_BACK) ? 12 : 0);
         CHECK(wn == hdr + x->len);
         if (wn == hdr + x->len) {
             CHECK(memcmp(wire + hdr, x->bytes, x->len) == 0);
@@ -468,8 +469,8 @@ static size_t measured_max_emit(const d2k_arm *a, const d2k_arm_input *in) {
 }
 
 static void send_limit_cases(void) {
-    static const size_t caps[] = { 1500, 1492, 1452, 1440, 1400, 600 };
-    d2k_arm arms[6];
+    static const size_t caps[] = { 1500, 1492, 1460, 1459, 1452, 1440, 1400, 600 };
+    d2k_arm arms[8];
     memset(arms, 0, sizeof arms);
     arms[0].seqovl_hello = 1; arms[0].decoy_hello = 1;              /* seqovl-hello */
     arms[1].seqovl_hello = 1; arms[1].decoy_hello = 1; arms[1].disorder = 1;
@@ -477,6 +478,8 @@ static void send_limit_cases(void) {
     arms[3].badsum = 1; arms[3].tcpts = 1; arms[3].repeats = 2;
     arms[4].disorder = 1;                                           /* без посылок плана */
     arms[5].seqovl = 336;
+    arms[6].md5 = 1;
+    arms[7].md5 = 1; arms[7].tcpts = 1; /* MD5 replaces, not adds TS */
     d2k_arm_input in;
     memset(&in, 0, sizeof in);
     in.trigger_len = 1558; in.sni_off = 500; in.sni_len = 11; in.decoy_len = 1534;
@@ -534,7 +537,7 @@ static void md5_wire(void) {
             d2k_conn c = {0}; c.family = family;
             d2k_emit e = {0}; e.kind = D2K_EMIT_FAKE;
             e.wire_profile = D2K_WIRE_DETECT_TCP;
-            e.poison = (1u << 3) | (ts ? D2K_POISON_TCPTS_BACK : 0);
+            e.poison = D2K_POISON_MD5 | (ts ? D2K_POISON_TCPTS_BACK : 0);
             e.bytes = data; e.len = sizeof data;
             size_t ip = family == 6 ? 40 : 20;
             size_t n = d2k_wire_build(&c, &e, wire, sizeof wire);
@@ -582,6 +585,10 @@ int main(void) {
        этим полем, без битой суммы, и обязан задаваться планом. */
     memset(&a, 0, sizeof a); a.repeats = 1; a.tcpts = 1; run_case("ts-alone", a, 289, 0);
     memset(&a, 0, sizeof a); a.repeats = 1; a.seq_out = 1; run_case("seq-out-alone", a, 289, 0);
+    memset(&a, 0, sizeof a); a.md5 = 1;
+    run_case("md5-alone", a, 289, 0);
+    a.tcpts = 1; a.badsum = 1; a.repeats = 2;
+    run_case("md5-ts-badsum-segmented", a, 2048, 681);
     if (failures) { fprintf(stderr, "measured: %d failures\n", failures); return 1; }
     puts("measured: exact bytes/lengths/seq/order/delays/fooling and input rejection passed");
     return 0;

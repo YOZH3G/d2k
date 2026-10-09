@@ -446,6 +446,7 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 if (strcmp(f[i], "badsum") == 0) { v->flags |= 1u << 0; }
                 else if (strcmp(f[i], "tcpts") == 0) { v->flags |= 1u << 1; }
                 else if (strcmp(f[i], "ipidzero") == 0) { v->flags |= 1u << 2; }
+                else if (strcmp(f[i], "md5") == 0) { v->flags |= 1u << 3; }
                 else if (strncmp(f[i], "ttl=", 4) == 0) {
                     if (kv_u32(f[i], "ttl", 255, &u) != 0) {
                         say(err, errcap, "строка %zu: ttl вне 0..255 \"%s\"", lineno, f[i]); goto bad;
@@ -644,6 +645,12 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
         p->segment_size || p->wire_profile || p->guards || p->oob_enabled || p->pace_us ||
         p->delay_us)) {
         say(err, errcap, "quicdeny требует minexec=11, UDP и план без воздействий"); goto bad;
+    }
+    for (size_t i = 0; i < p->n_poisons; i++) {
+        if ((p->poisons[i].flags & (1u << 3)) &&
+            (p->minexec < 12 || p->transport != 6 || p->wire_profile != 1)) {
+            say(err, errcap, "md5 требует minexec=12 и wire detect-tcp-v1 TCP"); goto bad;
+        }
     }
     if (p->wire_profile && (p->minexec < 4 || p->transport != 6)) {
         say(err, errcap, "wire detect-tcp-v1 требует minexec=4 и proto tcp"); goto bad;

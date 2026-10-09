@@ -243,8 +243,10 @@ static size_t emit_overhead(const d2k_plan *p, const struct d2k_poison *po) {
     /* Транспорт не объявлен — считаем по TCP: его заголовок шире, и ошибка в
        эту сторону отвергает лишнее, а не пропускает непроходимое. */
     size_t hdr = EMIT_IP_HDR + ((p->transport == 17) ? EMIT_UDP_HDR : EMIT_TCP_HDR);
-    if (po && (po->flags & D2K_POISON_TCPTS_BACK) && p->transport != 17) {
-        hdr += EMIT_TS_OPT;
+    if (po && p->transport != 17) {
+        /* MD5 replaces the timestamp option in detect/raw.c and wire.c. */
+        if (po->flags & D2K_POISON_MD5) { hdr += 20; }
+        else if (po->flags & D2K_POISON_TCPTS_BACK) { hdr += EMIT_TS_OPT; }
     }
     return hdr;
 }

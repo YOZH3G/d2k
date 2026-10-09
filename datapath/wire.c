@@ -87,9 +87,11 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     if (e->ipfrag || (e->wire_profile != 0 && e->wire_profile != D2K_WIRE_DETECT_TCP &&
                       e->wire_profile != D2K_WIRE_TCP_TEMPLATE)) { return 0; }
     int measured = e->wire_profile == D2K_WIRE_DETECT_TCP;
+    if ((e->poison & D2K_POISON_MD5) && !measured) { return 0; }
     int native = e->wire_profile == D2K_WIRE_TCP_TEMPLATE;
     uint8_t native_options[40];
-    size_t opt_len = (e->poison & D2K_POISON_TCPTS_BACK) ? TS_OPT_LEN : 0;
+    size_t opt_len = (e->poison & D2K_POISON_MD5) ? 20
+        : (e->poison & D2K_POISON_TCPTS_BACK) ? TS_OPT_LEN : 0;
     if (native) {
         opt_len = c->tcp_options_len;
         if (opt_len > sizeof native_options || opt_len % 4) return 0;
@@ -169,6 +171,11 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
 
     if (native && opt_len) {
         memcpy(t + TCP_HDR, native_options, opt_len);
+    } else if (e->poison & D2K_POISON_MD5) {
+        /* raw.c: MD5 replaces timestamp/options, not an appended option.
+         * Header was zeroed: the 16-byte signature is deliberately zero. */
+        uint8_t *o = t + TCP_HDR;
+        o[0] = 19; o[1] = 18; o[18] = 1; o[19] = 1;
     } else if (opt_len) {
         uint8_t *o = t + TCP_HDR;
         o[0] = 1; o[1] = 1;              /* NOP, NOP */

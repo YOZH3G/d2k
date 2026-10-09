@@ -392,7 +392,8 @@ int main(void)
     p.syn_data = 0; p.oob = 1;
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
     p.oob = 0; p.md5 = 1;
-    CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
+    CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) == 0);
+    CHECK(arm.md5 && arm.repeats == 1);
     {
         /* ПОЛЕ 04.10, ЧИСТЫЙ КАТАЛОГ: rutracker.org и discord.com. Перебор
            отрав дошёл до «oob» (срочный байт) — коробку он берёт, но языком

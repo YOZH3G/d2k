@@ -280,11 +280,12 @@ static void test_datapath_matches_raw_headers(void)
     uint8_t src[] = {192,0,2,1}, dst[] = {198,51,100,7};
     uint8_t body[1400], a[1600], b[1600];
     for (size_t i = 0; i < sizeof body; i++) { body[i] = (uint8_t)(i * 17); }
-    for (unsigned flags = 0; flags < 32; flags++) {
+    for (unsigned flags = 0; flags < 64; flags++) {
         d2k_poison p = {0}; d2k_emit e = {0}; d2k_conn c = {0};
         p.badsum = !!(flags & 1); p.tcp_ts = !!(flags & 2);
+        p.md5 = !!(flags & 32);
         p.ip_id_zero = !!(flags & 4); p.ttl = flags & 8 ? 8 : 0;
-        e.poison = (uint8_t)(flags & 7); e.ttl = (uint8_t)p.ttl;
+        e.poison = (uint8_t)((flags & 7) | (p.md5 ? D2K_POISON_MD5 : 0)); e.ttl = (uint8_t)p.ttl;
         e.seq = 123456; e.seq_shift = flags & 16 ? -66000 : 0;
         e.wire_profile = D2K_WIRE_DETECT_TCP;
         e.pre = body; e.pre_len = 101; e.bytes = body + 101; e.len = 1299;

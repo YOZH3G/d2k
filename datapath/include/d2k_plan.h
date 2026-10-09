@@ -43,7 +43,8 @@
  * для имени не пропускается (датаграммы клиента снимаются, посылок нет),
  * чтобы клиент ушёл на TCP; это не обход QUIC. Старый исполнитель такие
  * планы не принимает. */
-#define D2K_EXEC_VERSION 11
+/* Version 12: raw TCP-MD5 poison in detect-tcp-v1. */
+#define D2K_EXEC_VERSION 12
 #define D2K_PLAN_PROTO_HTTP 4
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_WIRE_TCP_TEMPLATE 2
@@ -77,6 +78,7 @@ typedef enum {
 #define D2K_POISON_BADSUM     (1u << 0)
 #define D2K_POISON_TCPTS_BACK (1u << 1)
 #define D2K_POISON_IPID_ZERO  (1u << 2)
+#define D2K_POISON_MD5        (1u << 3)
 
 /* Защита потока от подделанных ответов. Не порча и не преобразование
  * исходящего: это решение о ЧУЖОМ входящем пакете, и потому отдельное поле.
