@@ -4948,6 +4948,14 @@ void d2k_sched_free(d2k_sched *s) {
     free(s);
 }
 
+/* Будит цикл d2kc сразу. Тик — 3 с, а ожидания опыта меряются десятками
+   миллисекунд: событие, которое отпускает ожидание (подтверждение установки
+   плана, его применение на потоке зонда), не должно ждать следующего тика. */
+static void wake_loop(d2k_sched *s) {
+    ssize_t ign = write(s->wake[1], "w", 1);
+    (void)ign;
+}
+
 int d2k_sched_wake_fd(const d2k_sched *s) { return s ? s->wake[0] : -1; }
 
 size_t d2k_sched_active(const d2k_sched *s) {
@@ -7702,6 +7710,7 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
             /* Зонд вернулся, ключ его потока известен — сверяем точно. */
             if (!ev_matches_flow(ev, &t->ver_flow) || !plan_id_is_ours(t, ev)) { continue; }
             t->ver_ok = 1;
+            wake_loop(s);
             return;
         }
     }
@@ -8041,7 +8050,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
                 task *t = &s->tasks[i];
                 if (!candidate_trial_matches(t, ev->code, ev->trial_id)) { continue; }
                 if (t->state == T_TRIAL_SETTLE) {
-                    if (ok) { t->trial_acked = 1; }
+                    if (ok) { t->trial_acked = 1; wake_loop(s); }
                     else { exec_refusal(s, t, code, 0); }
                 } else if (!ok && t->state == T_VERIFY) {
                     /* Рабочий поток зонда ещё в сети: разбор — когда вернётся. */

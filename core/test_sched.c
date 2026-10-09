@@ -1392,6 +1392,13 @@ static void spin(d2k_sched *s, int rounds) {
     for (int i = 0; i < rounds; i++) { tick_once(s); }
 }
 
+/* Будилка взведена: цикл d2kc проснётся сразу, а не на следующем тике. */
+static int wake_pending(d2k_sched *s) {
+    struct pollfd pfd;
+    pfd.fd = d2k_sched_wake_fd(s); pfd.events = POLLIN; pfd.revents = 0;
+    return poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN);
+}
+
 /* Крутит планировщик четыреста кругов — две секунды модельного времени.
    Потолок щедрый: на машине разработки подменённый оракул возвращается
    мгновенно, а на медленной сборке — за несколько миллисекунд. */
@@ -5503,8 +5510,12 @@ admission_only_run:
         d2k_sched_event(s, &a);
         for (int i = 0; i < 40; i++) { tick_frozen(s); }
         CHECK(ver_calls == base, "чужое подтверждение установки отпустило ожидание опыта");
+        CHECK(!wake_pending(s), "будилка взведена до подтверждения");
         a = name_probe_ack(id1, 1, D2K_ACK_OK);
         d2k_sched_event(s, &a);
+        /* Тик d2kc — 3 с; ожидание приёма плана — 50 мс. Подтверждение обязано
+           будить цикл, иначе каждый кандидат ждёт до следующего тика. */
+        CHECK(wake_pending(s), "подтверждение установки не разбудило цикл");
         for (int i = 0; i < 400 && ver_calls == base; i++) { tick_frozen(s); }
         for (int i = 0; i < 40; i++) { tick_frozen(s); }
         CHECK(ver_calls == base + 1,
