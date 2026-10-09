@@ -167,6 +167,9 @@ typedef struct {
     const char       *ack;
 } scenario;
 
+/* Фильтр находок, как plannable_hit в bridge.c: NULL — берётся любая. */
+static int (*g_accept)(const d2k_poison *p, void *ctx);
+
 static void run(const scenario *s, d2k_result *res)
 {
     d2k_opts opt;
@@ -178,6 +181,7 @@ static void run(const scenario *s, d2k_result *res)
     opt.write_gap_ms = 2;
     opt.long_gap_ms = 10;
     opt.control_vouched = s->vouched;
+    opt.accept = g_accept;
     memset(&opt.control, 0, sizeof opt.control);
     snprintf(opt.control.name, sizeof opt.control.name, "control");
     memcpy(opt.control.payload, CTL, sizeof(CTL) - 1);
@@ -447,6 +451,35 @@ static void test_props_fields(void)
     CHECK(r.props.counts_duplicates == D2K_TRI_UNSET, "дубликаты записаны без прохода");
 }
 
+/* Находку, которую язык плана не выражает (данные в SYN, TCP-MD5), фильтр
+ * дерева отвергает. Вопросы о свойствах на ней не останавливаются: ответ
+ * пишется в вектор, следующие вопросы задаются, находка — первый проход,
+ * который план выражает. Иначе проход syndata прятал метку времени и
+ * перекрытие до конца имени — в переборе их нет. */
+static int no_syn_md5(const d2k_poison *p, void *ctx)
+{
+    (void)ctx;
+    return !p->syn_data && !p->md5;
+}
+static const script_ent S_SYN_TS[] = {{"syndata", "+"}, {"md5", "+"}, {"ts", "+"}, {NULL, NULL}};
+static void test_props_skip_unplannable(void)
+{
+    static const scenario sc = {"syn-ts", S_SYN_TS, "-", NULL, NULL, 0, NULL};
+    d2k_result r;
+    printf("свойства: невыразимая находка не останавливает вопросы\n");
+    fresh_process();
+    g_accept = no_syn_md5;
+    run(&sc, &r);
+    g_accept = NULL;
+    CHECK(r.has_hit && !strcmp(r.hit.name, "ts"), "находка — не метка времени (%s)",
+          r.has_hit ? r.hit.name : "нет");
+    CHECK(!strcmp(r.path, "свойство"), "путь «%s», ждали «свойство»", r.path);
+    CHECK(r.props.inspects_syn == D2K_TRI_FALSE, "ответ о SYN не записан");
+    CHECK(r.props.validates_md5 == D2K_TRI_FALSE, "ответ о MD5 не записан");
+    CHECK(r.props.validates_timestamps == D2K_TRI_FALSE, "ответ о метке времени не записан");
+    CHECK(find_obs(&r, "poison:syndata") == NULL, "перебор переспросил отвеченный syndata");
+}
+
 /* Перебор не спрашивает второй раз то, на что вопрос о свойствах уже получил
  * ответ сети: при единогласии исход повтора тот же (как задача 49, решение
  * владельца 03.10). Локальная ошибка зонда — не ответ сети: такую гипотезу
@@ -623,6 +656,7 @@ int main(void)
     test_counts_per_question();
     test_props_fields();
     test_sweep_skips_answered();
+    test_props_skip_unplannable();
     test_address_silence();
     test_selftest_cache();
     if (fails) {
