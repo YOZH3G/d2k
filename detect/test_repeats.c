@@ -307,17 +307,20 @@ static int after_count(const char *name)
        §0.1 ТЗ (07.10.2026): ещё четыре вопроса о свойствах — сверка MD5,
        окно seq, метка времени, плотная серия — задаются после шести прежних
        и, как они, до первого прохода. Где свойство не нашло приём, это +4
-       зонда (перекрытие до конца имени у приветствия без SNI не задаётся). */
+       зонда (перекрытие до конца имени у приветствия без SNI не задаётся).
+       План 09.10.2026: перебор не спрашивает второй раз девять гипотез, на
+       которые вопрос о свойствах уже получил ответ сети (−8…−11 зондов там,
+       где свойство не нашло приём; при локальных ошибках — без изменений). */
     static const struct { const char *n; int a; } A[] = {
-        {"youtube", 12}, {"rutracker", 62}, {"flaky", 41}, {"prop-l7", 14},
-        {"none-pass", 104}, {"selftest-fail", 10}, {"selftest-late", 14},
-        {"ctl-late", 13}, {"ctl-dead", 107}, {"ctl-dead-vouched", 107},
+        {"youtube", 12}, {"rutracker", 54}, {"flaky", 30}, {"prop-l7", 14},
+        {"none-pass", 95}, {"selftest-fail", 10}, {"selftest-late", 14},
+        {"ctl-late", 13}, {"ctl-dead", 98}, {"ctl-dead-vouched", 98},
         {"ctl-dead-hit", 15}, {"errors", 104},
         /* Задача 54: молчащий контроль добавляет ОДИН вопрос — нейтральный
          * байт; подтверждённый с первого раза, он стоит один зонд. Молчание
          * адреса стоит три (единогласие) и снимает весь перебор отравлений. */
-        {"addr-silent", 12}, {"addr-silent-late", 108},
-        {"addr-ack-unseen", 106}, {"addr-ack-err", 107}};
+        {"addr-silent", 12}, {"addr-silent-late", 99},
+        {"addr-ack-unseen", 97}, {"addr-ack-err", 98}};
     size_t i;
     for (i = 0; i < sizeof A / sizeof A[0]; i++) {
         if (strcmp(A[i].n, name) == 0) { return A[i].a; }
@@ -442,6 +445,33 @@ static void test_props_fields(void)
     run(&ts, &r);
     CHECK(r.props.validates_timestamps == D2K_TRI_FALSE, "метка времени: проход не записан");
     CHECK(r.props.counts_duplicates == D2K_TRI_UNSET, "дубликаты записаны без прохода");
+}
+
+/* Перебор не спрашивает второй раз то, на что вопрос о свойствах уже получил
+ * ответ сети: при единогласии исход повтора тот же (как задача 49, решение
+ * владельца 03.10). Локальная ошибка зонда — не ответ сети: такую гипотезу
+ * перебор спрашивает. */
+static const script_ent S_MD5_ERR[] = {{"md5", "e"}, {NULL, NULL}};
+static void test_sweep_skips_answered(void)
+{
+    static const char *const dup[] = {
+        "seqovl-1", "disorder", "badsum", "badsum+hello", "badsum-x2-g20",
+        "syndata", "md5", "seq-out-of-window", "badsum-x7"};
+    static const scenario err = {"md5-err", S_MD5_ERR, "-", NULL, NULL, 0, NULL};
+    d2k_result r;
+    char nm[96];
+    size_t i;
+    printf("перебор: отвеченные свойства второй раз не спрашиваются\n");
+    fresh_process();
+    run(find_sc("none-pass"), &r);
+    for (i = 0; i < sizeof dup / sizeof dup[0]; i++) {
+        snprintf(nm, sizeof nm, "poison:%s", dup[i]);
+        CHECK(find_obs(&r, nm) == NULL, "перебор повторил отвеченный вопрос «%s»", dup[i]);
+    }
+    CHECK(find_obs(&r, "poison:badsum-x2-g80") != NULL, "перебор пропустил неотвеченную гипотезу");
+    fresh_process();
+    run(&err, &r);
+    CHECK(find_obs(&r, "poison:md5") != NULL, "локальная ошибка свойства сняла гипотезу с перебора");
 }
 
 /* ЗАДАЧА 54. Адрес, который после рукопожатия не принимает НИКАКИХ данных,
@@ -592,6 +622,7 @@ int main(void)
     test_equivalence();
     test_counts_per_question();
     test_props_fields();
+    test_sweep_skips_answered();
     test_address_silence();
     test_selftest_cache();
     if (fails) {

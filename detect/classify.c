@@ -624,6 +624,17 @@ static void bind_decoy(d2k_poison *p, const d2k_opts *opt)
     }
 }
 
+/* Вопрос о свойствах уже получил на эту гипотезу ответ сети (задача 49 для
+ * дублей самого списка, решение владельца 03.10: трассу не повторяем). */
+static int answered_by_props(const d2k_result *res, const d2k_poison *p)
+{
+    int k;
+    for (k = 0; k < res->nanswered; k++) {
+        if (d2k_poison_same(&res->answered[k], p)) { return 1; }
+    }
+    return 0;
+}
+
 /* --- самопроверка сырого слоя: раз на процесс --------------------------- */
 
 /* Самопроверка проверяет НАШ сырой слой — своё рукопожатие, свои суммы,
@@ -894,10 +905,13 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
             d2k_opts_skipped(opt, p.name)) {
             continue;
         }
+        bind_decoy(&p, opt);
+        if (answered_by_props(res, &p)) {
+            continue;
+        }
         snprintf(pname, sizeof(pname), "poison:%s", p.name);
         obs = d2k_trace_add(res, pname);
         obs->delay_ms = p.gap_ms;
-        bind_decoy(&p, opt);
         /* Единогласие (см. ниже): первый провал решает исход гипотезы. */
         for (r = 0; r < opt->repeats; r++) {
             int rc = d2k_raw_probe_poison_family(ip4, family, pnum, tr, &p, opt->timeout_ms, opt->mark,

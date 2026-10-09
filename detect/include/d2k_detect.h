@@ -140,6 +140,8 @@ typedef struct {
 } d2k_poison;
 
 int d2k_poison_has_fake(const d2k_poison *p);
+/* Одна и та же гипотеза по всем параметрам, кроме имени. */
+int d2k_poison_same(const d2k_poison *a, const d2k_poison *b);
 
 /* Что удалось узнать о самой коробке. UNSET означает «не измерено». */
 typedef struct {
@@ -175,6 +177,7 @@ typedef struct {
 
 #define D2K_TRACE_MAX 512
 #define D2K_NOTES_MAX 8
+#define D2K_ANSWERED_MAX 16
 
 /* Итог зонда ответного направления (TLS 1.2, сертификат открытым текстом). */
 typedef enum {
@@ -250,6 +253,12 @@ typedef struct {
     unsigned long rst_fail_base;
     /* Счётчик сырых соединений потока на старте: ходил ли прогон сырым слоем. */
     unsigned long raw_dial_base;
+
+    /* Гипотезы, на которые вопросы о свойствах получили ответ сети (без
+     * локальной ошибки зонда). Ответ засчитывается только при единогласии,
+     * поэтому повтор дал бы тот же исход: перебор их второй раз не спрашивает. */
+    d2k_poison answered[D2K_ANSWERED_MAX];
+    int        nanswered;
 
     d2k_obs trace[D2K_TRACE_MAX];
     int     ntrace;

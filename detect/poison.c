@@ -53,6 +53,16 @@ static d2k_poison *add(const char *fmt, ...)
     return p;
 }
 
+int d2k_poison_same(const d2k_poison *x, const d2k_poison *y)
+{
+    d2k_poison a = *x, b = *y;
+    memset(a.name, 0, sizeof a.name);
+    memset(b.name, 0, sizeof b.name);
+    if (a.repeats <= 1) { a.repeats = 1; }
+    if (b.repeats <= 1) { b.repeats = 1; }
+    return memcmp(&a, &b, sizeof a) == 0;
+}
+
 /* Та же гипотеза по всем параметрам, кроме имени, уже есть в списке. */
 static int already_listed(const d2k_poison *p)
 {
@@ -60,12 +70,7 @@ static int already_listed(const d2k_poison *p)
     for (k = 0; k < g_npoisons; k++) {
         const d2k_poison *q = &g_poisons[k];
         if (q == p) { continue; }
-        d2k_poison a = *q, b = *p;
-        memset(a.name, 0, sizeof a.name);
-        memset(b.name, 0, sizeof b.name);
-        if (a.repeats <= 1) { a.repeats = 1; }
-        if (b.repeats <= 1) { b.repeats = 1; }
-        if (memcmp(&a, &b, sizeof a) == 0) { return 1; }
+        if (d2k_poison_same(q, p)) { return 1; }
     }
     return 0;
 }

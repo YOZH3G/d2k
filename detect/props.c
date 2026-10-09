@@ -205,7 +205,7 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         d2k_poison p = pp[i].p;
         d2k_obs *obs;
         char label[160];
-        int pass = 0, done = 0, got;
+        int pass = 0, done = 0, local_err = 0, got;
 
         if (d2k_detect_stopped(&opt->cancel)) {
             break;
@@ -242,9 +242,13 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
             done++;
             d2k_raw_note_rc(res, family, rc);
             if (rc <= 0) {
+                local_err = rc < 0;
                 break;
             }
             pass++;
+        }
+        if (!local_err && res->nanswered < D2K_ANSWERED_MAX) {
+            res->answered[res->nanswered++] = p;
         }
         obs->pass = pass;
         obs->fail = done - pass;
