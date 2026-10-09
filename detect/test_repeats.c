@@ -314,7 +314,10 @@ static int after_count(const char *name)
        зонда (перекрытие до конца имени у приветствия без SNI не задаётся).
        План 09.10.2026: перебор не спрашивает второй раз девять гипотез, на
        которые вопрос о свойствах уже получил ответ сети (−8…−11 зондов там,
-       где свойство не нашло приём; при локальных ошибках — без изменений). */
+       где свойство не нашло приём; при локальных ошибках — без изменений).
+       Порядок 10.10: syndata последний. Для этих сценариев число зондов
+       неизменно: находки раньше прежнего места SYN либо все вопросы заданы.
+       Снижение на один для MD5/seq/TS проверяется в test_props_fields. */
     static const struct { const char *n; int a; } A[] = {
         {"youtube", 12}, {"rutracker", 54}, {"flaky", 30}, {"prop-l7", 14},
         {"none-pass", 95}, {"selftest-fail", 10}, {"selftest-late", 14},
@@ -425,7 +428,7 @@ static void test_counts_per_question(void)
 }
 
 /* Поля подделки, которые прежде узнавал только перебор (§0.1 ТЗ, 07.10.2026).
- * Вопросы идут после шести прежних и, как они, до первого прохода: каждый
+ * Выразимые вопросы идут перед syndata и до первого прохода: каждый
  * ответ записывается в вектор только по проходу. */
 static const script_ent S_FIELD_MD5[] = {{"md5", "+"}, {NULL, NULL}};
 static const script_ent S_FIELD_SEQ[] = {{"seq-out-of-window", "+"}, {NULL, NULL}};
@@ -441,6 +444,22 @@ static void test_syndata_last(void)
     }
 }
 
+static const script_ent S_FIELD_SYN[] = {{"syndata", "+"}, {NULL, NULL}};
+static void test_syndata_after_misses(void)
+{
+    static const scenario syn = {"props-syn-last", S_FIELD_SYN, NULL, NULL, NULL, 0, NULL};
+    d2k_result r;
+    fresh_process();
+    run(&syn, &r);
+    CHECK(r.has_hit && r.hit.syn_data, "последний вопрос syndata не задан");
+    /* The fixture has no SNI: ten questions, nine misses and three positive
+     * syndata repeats, plus eight baseline/self-test probes = 20. */
+    CHECK(r.probes == 20, "syndata: зондов %d, ждали 20", r.probes);
+    CHECK(r.nanswered == 10 && r.answered[r.nanswered - 1].syn_data,
+          "syndata не последний отвеченный вопрос");
+    CHECK(r.props.inspects_syn == D2K_TRI_FALSE, "ответ SYN не записан");
+}
+
 static void test_props_fields(void)
 {
     static const scenario md5 = {"props-md5", S_FIELD_MD5, NULL, NULL, NULL, 0, NULL};
@@ -452,21 +471,26 @@ static void test_props_fields(void)
     run(&md5, &r);
     CHECK(r.props.validates_md5 == D2K_TRI_FALSE, "MD5: проход не записан");
     CHECK(r.has_hit && !strcmp(r.hit.name, "md5"), "MD5: приём не стал находкой");
+    /* syndata moved to the end: these findings save its one failing probe.
+     * Before the reorder: MD5 17, seq 18, TS 19; now 16, 17, 18. */
+    CHECK(r.probes == 16, "MD5: зондов %d, ждали 16 (было 17)", r.probes);
+    CHECK(r.props.inspects_syn == D2K_TRI_UNSET, "SYN спросили до MD5");
     fresh_process();
     run(&seq, &r);
     CHECK(r.props.validates_seq_window == D2K_TRI_FALSE, "окно seq: проход не записан");
+    CHECK(r.probes == 17, "seq: зондов %d, ждали 17 (было 18)", r.probes);
     CHECK(r.props.validates_md5 == D2K_TRI_UNSET, "MD5 записан без прохода");
     fresh_process();
     run(&ts, &r);
     CHECK(r.props.validates_timestamps == D2K_TRI_FALSE, "метка времени: проход не записан");
+    CHECK(r.probes == 18, "TS: зондов %d, ждали 18 (было 19)", r.probes);
     CHECK(r.props.counts_duplicates == D2K_TRI_UNSET, "дубликаты записаны без прохода");
 }
 
-/* Находку, которую язык плана не выражает (данные в SYN, TCP-MD5), фильтр
- * дерева отвергает. Вопросы о свойствах на ней не останавливаются: ответ
- * пишется в вектор, следующие вопросы задаются, находка — первый проход,
- * который план выражает. Иначе проход syndata прятал метку времени и
- * перекрытие до конца имени — в переборе их нет. */
+/* The real bridge still rejects syndata. This test additionally rejects
+ * expressible MD5 through its explicit acceptance filter: a rejected hit
+ * must not hide the later timestamp question. syndata is now last and is
+ * never asked after a usable timestamp finding. */
 static int no_syn_md5(const d2k_poison *p, void *ctx)
 {
     (void)ctx;
@@ -666,6 +690,7 @@ int main(void)
     test_equivalence();
     test_counts_per_question();
     test_syndata_last();
+    test_syndata_after_misses();
     test_props_fields();
     test_sweep_skips_answered();
     test_props_skip_unplannable();

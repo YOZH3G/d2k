@@ -89,12 +89,6 @@ static int prop_probes(prop_probe *out, int cap)
     out[k].set = SET_DUPLICATES;
     k++;
 
-    out[k].label = "данные в SYN";
-    snprintf(out[k].p.name, sizeof(out[k].p.name), "syndata");
-    out[k].p.syn_data = 1;
-    out[k].set = SET_SYN;
-    k++;
-
     /* ПОЛЯ, КОТОРЫЕ УЗНАВАЛ ТОЛЬКО ПЕРЕБОР (§0.1 ТЗ, 07.10.2026). По вопросу
      * на поле и БЕЗ битой суммы: с ней проход значил бы лишь «сумму не
      * сверяет» (вопрос выше), а не ответ о самом поле. IP ID отдельно не
@@ -131,6 +125,15 @@ static int prop_probes(prop_probe *out, int cap)
     out[k].p.badsum = 1;
     out[k].p.repeats = 7;
     out[k].set = SET_DUP_DENSE;
+    k++;
+
+    /* SYN precedes the observed name in a live flow. Ask all questions
+     * whose successful send can become a datapath plan before syndata
+     * (owner decision 09.10.2026, plan items 2–3). */
+    out[k].label = "данные в SYN";
+    snprintf(out[k].p.name, sizeof(out[k].p.name), "syndata");
+    out[k].p.syn_data = 1;
+    out[k].set = SET_SYN;
     k++;
 
     return k;
@@ -184,7 +187,7 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok)
     }
 }
 
-/* runProperties задаёт шесть вопросов и заполняет вектор. Возвращает первую
+/* runProperties задаёт вопросы и заполняет вектор. Возвращает первую
  * гипотезу, которая сама по себе сработала, если такая была. */
 int d2k_run_properties(const uint8_t ip4[4], uint16_t port,
     const d2k_trigger *tr, const d2k_opts *opt, d2k_result *res, d2k_poison *hit)
