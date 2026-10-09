@@ -430,6 +430,17 @@ static void test_counts_per_question(void)
 static const script_ent S_FIELD_MD5[] = {{"md5", "+"}, {NULL, NULL}};
 static const script_ent S_FIELD_SEQ[] = {{"seq-out-of-window", "+"}, {NULL, NULL}};
 static const script_ent S_FIELD_TS[]  = {{"ts", "+"}, {NULL, NULL}};
+static void test_syndata_last(void)
+{
+    prop_probe pp[11];
+    int n = prop_probes(pp, 11);
+    CHECK(n == 11 && pp[n - 1].p.syn_data,
+          "syndata должен быть последним вопросом о свойствах");
+    for (int i = 0; i < n - 1; i++) {
+        CHECK(!pp[i].p.syn_data, "syndata перед выразимыми вопросами");
+    }
+}
+
 static void test_props_fields(void)
 {
     static const scenario md5 = {"props-md5", S_FIELD_MD5, NULL, NULL, NULL, 0, NULL};
@@ -474,7 +485,7 @@ static void test_props_skip_unplannable(void)
     CHECK(r.has_hit && !strcmp(r.hit.name, "ts"), "находка — не метка времени (%s)",
           r.has_hit ? r.hit.name : "нет");
     CHECK(!strcmp(r.path, "свойство"), "путь «%s», ждали «свойство»", r.path);
-    CHECK(r.props.inspects_syn == D2K_TRI_FALSE, "ответ о SYN не записан");
+    CHECK(r.props.inspects_syn == D2K_TRI_UNSET, "SYN спросили раньше выразимой находки");
     CHECK(r.props.validates_md5 == D2K_TRI_FALSE, "ответ о MD5 не записан");
     CHECK(r.props.validates_timestamps == D2K_TRI_FALSE, "ответ о метке времени не записан");
     CHECK(find_obs(&r, "poison:syndata") == NULL, "перебор переспросил отвеченный syndata");
@@ -654,6 +665,7 @@ int main(void)
     }
     test_equivalence();
     test_counts_per_question();
+    test_syndata_last();
     test_props_fields();
     test_sweep_skips_answered();
     test_props_skip_unplannable();
