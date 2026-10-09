@@ -1,6 +1,5 @@
 /* Measured arm -> runtime strategy text -> canonical TLV -> real datapath actions.
- * Expected sends follow z2k's exported strategy semantics, not its one-packet
- * raw classifier probe (classify.go strategy() adds multisplit pos=1).
+ * Expected sends follow the raw measurement, including unsplit overlap.
  * D2K_TEST_LEGACY_BUILDER=1 reproduces the replaced builder's mismatches. */
 #include "d2k_compose.h"
 #include "d2k_plantlv.h"
@@ -102,14 +101,6 @@ static void reference(const d2k_arm *a, const d2k_arm_input *in, const uint8_t *
                     0, 0, 0, has_fake ? 15000 : 0);
         expect_send(D2K_EMIT_PAYLOAD, BASE + 1, NULL, 0, tr + 1, mid - 1, 0, 0, 0, 12000);
         expect_send(D2K_EMIT_PAYLOAD, BASE - (uint32_t)ov, overlap, ov, tr, 1, 0, 0, 0, 12000);
-    } else if (ov) {
-        /* The raw classifier probe sends one overlapped segment. Its exported
-         * runtime strategy is multisplit(pos=1): overlap+first byte, then the
-         * remainder at its original sequence number. */
-        expect_send(D2K_EMIT_PAYLOAD, BASE - (uint32_t)ov, overlap, ov, tr, 1,
-                    0, 0, 0, has_fake ? 15000 : 0);
-        expect_send(D2K_EMIT_PAYLOAD, BASE + 1, NULL, 0, tr + 1, n - 1,
-                    0, 0, 0, 0);
     } else {
         expect_send(D2K_EMIT_PAYLOAD, BASE - (uint32_t)ov, overlap, ov, tr, n,
                     0, 0, 0, has_fake ? 15000 : 0);

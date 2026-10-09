@@ -373,8 +373,8 @@ int main(void) {
         input.sni_len = sni_len;
         CHECK(d2k_arm_plan_measured(&arm, &input, plan_text, sizeof plan_text) == 0,
               "seqovl wire regression: план измеренного seqovl-1 не собрался");
-        CHECK(strstr(plan_text, "split payload_start +1\n") != NULL,
-              "seqovl wire regression: z2k multisplit pos=1 потерян в тексте плана");
+        CHECK(strstr(plan_text, "split payload_start +1\n") == NULL,
+              "seqovl wire regression: лишний разрез относительно сырого зонда");
         CHECK(d2k_plan_text_to_tlv(plan_text, tlv, sizeof tlv, &tlv_len,
                                    err, sizeof err) == 0,
               "seqovl wire regression: план не перевёлся в TLV");
@@ -408,21 +408,19 @@ int main(void) {
                     output[got] = '\0';
                     pclose(f);
                 }
-                char expected_first[96], expected_rest[96];
+                char expected_first[96];
                 snprintf(expected_first, sizeof expected_first,
                          "emit payload 0 999 ttl=0 poison=00 0f%02x", hello[0]);
-                snprintf(expected_rest, sizeof expected_rest,
-                         "emit payload 0 1001 ttl=0 poison=00 %02x", hello[1]);
                 int emits = 0;
                 for (char *p = output; (p = strstr(p, "emit ")) != NULL; p += 5) emits++;
-                CHECK(emits == 2,
-                      "seqovl wire regression: seqovl-1 обязан дать два TCP-сегмента (pos=1)");
+                CHECK(emits == 1,
+                      "seqovl wire regression: зонд seqovl-1 шлёт одну посылку");
                 CHECK(strstr(output, expected_first) != NULL,
                       "seqovl wire regression: первый сегмент не несёт 0f + первый байт с seq-1");
-                CHECK(strstr(output, expected_rest) != NULL,
-                      "seqovl wire regression: остаток не начинается с seq+1 после разреза pos=1");
+                CHECK(strstr(output, hex) != NULL,
+                      "seqovl wire regression: полное приветствие должно идти после приставки");
                 CHECK(strstr(output, "fate drop") != NULL,
-                      "seqovl wire regression: исходный пакет не снят при двух собственных сегментах");
+                      "seqovl wire regression: исходный пакет не снят при собственной посылке");
                 remove(plan_path);
                 remove(scenario_path);
             }

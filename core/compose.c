@@ -1730,10 +1730,17 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
             a->ttl || a->seq_out || a->decoy_hello || a->tcpts || a->ipidzero ||
             a->oob) { return -1; }
         size_t plan_pos = 0;
-        return append_fmt(buf, cap, &plan_pos,
+        if (append_fmt(buf, cap, &plan_pos,
             "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
-            "wire detect-tcp-v1\ninput tls-sni\nsegment %u\nsplit payload_start +%u\n"
-            "order reverse\n",
+            "wire detect-tcp-v1\n")) { return -1; }
+        /* A fixed payload cut does not require a name. Preserve the reusable
+         * SNI contract for named inputs, and bind nameless measured inputs. */
+        if (in->sni_off > 0 && in->sni_len > 1) {
+            if (append_fmt(buf, cap, &plan_pos, "input tls-sni\n")) { return -1; }
+        } else if (append_fmt(buf, cap, &plan_pos, "input %zu %zu %zu\n",
+                              in->trigger_len, in->sni_off, in->sni_len)) { return -1; }
+        return append_fmt(buf, cap, &plan_pos,
+            "segment %u\nsplit payload_start +%u\norder reverse\n",
             (unsigned)D2K_ARM_SEGMENT_MAX, a->disorder_pos);
     }
     if (a->oob) {
@@ -1855,9 +1862,8 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         } else if (measured_payload(buf, cap, &pos, 2, ov, prefix, prefix_len)) { return -1; }
         if (append_fmt(buf, cap, &pos, "seqovl payload=2 poison=0\n")) { return -1; }
     }
-    /* The donor's exported seqovl strategy is multisplit(pos=1), including
-     * plain seqovl arms; the property probe itself remains unsplit. */
-    if ((ov || disorder) &&
+    /* Only disorder splits at +1; plain overlap is one raw send. */
+    if (disorder &&
         append_fmt(buf, cap, &pos, "split payload_start +1\n")) { return -1; }
     if ((disorder || between) &&
         append_fmt(buf, cap, &pos, "split payload_start +%zu\n", mid)) { return -1; }

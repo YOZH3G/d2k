@@ -592,8 +592,8 @@ SAN_EXTRA_SRC = httpsprobe.c httpup_logic.c
 # сам тест идёт в обычном check.
 SAN_SKIP = test_quicconn_fc
 
-san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask san-measured san-httpsearch san-volume-context
-	@set -e; for t in $(filter-out test_measured test_httpsearch test_volume_context $(SAN_SKIP),$(TESTS)); do \
+san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask san-measured san-httpsearch san-volume-context san-probe-plan
+	@set -e; for t in $(filter-out test_probe_plan test_measured test_httpsearch test_volume_context $(SAN_SKIP),$(TESTS)); do \
 		echo "== $$t =="; \
 		srcs=$$(echo "$(SRC) $(SAN_EXTRA_SRC)" | tr ' ' '\n' | grep -v '^$$'); \
 		for inc in $$(grep -o '#include "[A-Za-z0-9_]*\.c"' $$t.c | sed 's/#include "//; s/"//'); do \
@@ -1002,3 +1002,8 @@ test-probe-plan: test_probe_plan
 	./test_probe_plan
 test_probe_plan: test_probe_plan.c $(DETECT_SRC) ../detect/include/d2k_detect.h compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h
 	$(CC) $(CFLAGS) -I../detect/include -o $@ test_probe_plan.c $(filter-out ../detect/props.c,$(DETECT_SRC)) compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c $(TEST_LDFLAGS)
+
+.PHONY: san-probe-plan
+san-probe-plan: hello_profiles.inc
+	$(CC) $(SANFLAGS) -I../detect/include -o /tmp/d2k-core-san-test_probe_plan test_probe_plan.c $(filter-out ../detect/props.c,$(DETECT_SRC)) compose.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c -lpthread
+	/tmp/d2k-core-san-test_probe_plan
