@@ -993,3 +993,12 @@ test-catalog-durable: test_catalog_durable
 	./test_catalog_durable
 test_catalog_durable: test_catalog_durable.c catalog.c groups.c domain.c $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_catalog_durable.c groups.c domain.c $(TEST_LDFLAGS)
+
+# Property catalog is included by the test, not linked a second time.
+TESTS += test_probe_plan
+.PHONY: test-probe-plan
+check: test-probe-plan
+test-probe-plan: test_probe_plan
+	./test_probe_plan
+test_probe_plan: test_probe_plan.c $(DETECT_SRC) ../detect/include/d2k_detect.h compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h
+	$(CC) $(CFLAGS) -I../detect/include -o $@ test_probe_plan.c $(filter-out ../detect/props.c,$(DETECT_SRC)) compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c $(TEST_LDFLAGS)
