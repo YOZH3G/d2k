@@ -136,6 +136,9 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
  * exact input constraints. Packet-size checks remain mandatory. */
 int d2k_arm_plan_measured(const d2k_arm *arm, const d2k_arm_input *input,
                           char *buf, size_t cap);
+/* Pure TCP split: the same program is measured by raw.c and exported by sched. */
+int d2k_tcp_split_plan(size_t trigger_len, unsigned split, uint32_t gap_us,
+                       char *buf, size_t cap);
 /* То же с объявленным пределом отправки (0 — не объявлен). Плечо, чья самая
  * длинная посылка (по сегменту замера) в предел не помещается, НЕ строится
  * (-1): урезать измеренные байты значило бы поставить другое воздействие. */

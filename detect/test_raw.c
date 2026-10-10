@@ -817,7 +817,12 @@ static void test_runtime_equals_datapath(const d2k_poison *hyp, size_t length, u
         return; /* No TS: refuse locally, never fall back to another sender. */
     }
     CHECK(probe_rc == 0);
-    if (hyp) {
+    if (hyp && !strcmp(p.name, "tcp-split")) {
+        snprintf(text, sizeof text,
+            "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
+            "wire detect-tcp-v1\nsegment %u\nsplit payload_start +%d\norder forward\npace %u\n",
+            (unsigned)D2K_ARM_SEGMENT_MAX, p.split_pos, (unsigned)p.gap_ms * 1000u);
+    } else if (hyp) {
         d2k_arm arm;
         d2k_arm_input input = {0};
         CHECK(d2k_arm_from_poison(&p, &arm, err, sizeof err) == 0);
@@ -919,6 +924,9 @@ int main(void)
         for (size_t k = 0; k < sizeof sizes / sizeof sizes[0]; k++) {
             for (uint8_t family = 4; family <= 6; family += 2) {
                 test_runtime_equals_datapath(NULL, sizes[k], family);
+                d2k_poison split = {0};
+                strcpy(split.name, "tcp-split"); split.split_pos = 1; split.gap_ms = 12;
+                test_runtime_equals_datapath(&split, sizes[k], family);
                 for (int i = 0; i < count; i++) {
                     if (!ps[i].syn_data && d2k_poison_supports_family(&ps[i], family))
                         test_runtime_equals_datapath(&ps[i], sizes[k], family);

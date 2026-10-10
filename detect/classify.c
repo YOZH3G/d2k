@@ -370,6 +370,38 @@ static int once_probe(const char *host, const char *port, const d2k_trigger *tr,
     int64_t deadline;
 
     err[0] = '\0';
+    /* A split is a measured bypass, not a suggestion to the kernel about
+     * write boundaries. Execute the same packet program that sched exports.
+     * no_raw/unsupported platforms retain socket diagnostics only. */
+    if (ncuts > 0 && !opt->no_raw && d2k_raw_supported()) {
+        uint8_t ip[16];
+        uint8_t family = strchr(host, ':') ? 6 : 4;
+        if (ncuts != 1 || !cuts || cuts[0] <= 0 || (size_t)cuts[0] >= tr->len) {
+            snprintf(err, errcap, "split runtime: invalid cut");
+            return -1;
+        }
+        if (inet_pton(family == 6 ? AF_INET6 : AF_INET, host, ip) != 1) {
+            struct addrinfo hints = {0}, *ai = NULL;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_family = AF_UNSPEC;
+            int rc = getaddrinfo(host, port, &hints, &ai);
+            if (rc || !ai) {
+                snprintf(err, errcap, "split runtime: resolve target: %s", gai_strerror(rc));
+                return -1;
+            }
+            family = ai->ai_family == AF_INET6 ? 6 : 4;
+            if (family == 6)
+                memcpy(ip, &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr, 16);
+            else
+                memcpy(ip, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, 4);
+            freeaddrinfo(ai);
+        }
+        d2k_poison split = {0};
+        snprintf(split.name, sizeof split.name, "tcp-split");
+        split.split_pos = cuts[0]; split.gap_ms = gap_ms;
+        return d2k_raw_probe_poison_family(ip, family, (uint16_t)strtoul(port, NULL, 10),
+            tr, &split, opt->timeout_ms, opt->mark, &opt->cancel, err, errcap);
+    }
     fd = dial_marked(host, port, opt->timeout_ms, opt->mark, err, errcap);
     if (fd < 0) {
         return -1;
@@ -1108,6 +1140,11 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
      * проходит, никакая точка разреза не пройдёт тем более. */
     cut1[0] = 1;
     one = measure(host, port, tr, opt, "split", cut1, 1, opt->write_gap_ms, res, 0);
+    if (one.has_err) {
+        res->verdict = D2K_DV_FLAKY;
+        snprintf(res->reason, sizeof(res->reason), "ошибка замера разреза: %s", one.err);
+        goto done;
+    }
     if (one.pass == 0) {
         /* 2а. КОНТРОЛЬ. Разрез не спас — но прежде чем говорить «пересборка»,
          * надо исключить, что содержимое вообще ни при чём. */
@@ -1241,6 +1278,11 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
      * миллисекунд. Коробка без буфера ведёт себя так же; коробка с буфером и
      * таймаутом успевает склеить сегменты и снова опознать сигнатуру. */
     lng = measure(host, port, tr, opt, "split-long", cut1, 1, opt->long_gap_ms, res, 0);
+    if (lng.has_err) {
+        res->verdict = D2K_DV_FLAKY;
+        snprintf(res->reason, sizeof(res->reason), "ошибка замера разреза: %s", lng.err);
+        goto done;
+    }
     reass = lng.pass == 0;
     res->reassembles = reass ? D2K_TRI_TRUE : D2K_TRI_FALSE;
     res->props.reassembles = res->reassembles;
@@ -1253,6 +1295,11 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         int c[1];
         c[0] = (int)tr->len - 1;
         last = measure(host, port, tr, opt, "split", c, 1, opt->write_gap_ms, res, 0);
+    }
+    if (last.has_err) {
+        res->verdict = D2K_DV_FLAKY;
+        snprintf(res->reason, sizeof(res->reason), "ошибка замера разреза: %s", last.err);
+        goto done;
     }
     if (last.pass == opt->repeats) {
         res->verdict = D2K_DV_WHOLE_PACKET;
@@ -1270,6 +1317,11 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         d2k_tally m;
         c[0] = mid;
         m = measure(host, port, tr, opt, "split", c, 1, opt->write_gap_ms, res, 0);
+        if (m.has_err) {
+            res->verdict = D2K_DV_FLAKY;
+            snprintf(res->reason, sizeof(res->reason), "ошибка замера разреза: %s", m.err);
+            goto done;
+        }
         if (m.pass == opt->repeats) {
             lo = mid;
         } else if (m.pass == 0) {

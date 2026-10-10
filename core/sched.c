@@ -4727,11 +4727,8 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
          * forward split at split_pos with write_gap_ms. No poison search. */
         if (!r->have_arm && (v == D2K_V_PREFIX || v == D2K_V_WHOLE) &&
             r->split_pos > 0 && (size_t)r->split_pos < t->trig_len) {
-            int n = snprintf(t->plans[0], sizeof t->plans[0],
-                "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\n"
-                "split payload_start +%d\norder forward\npace %u\n",
-                r->split_pos, (unsigned)r->split_gap_us);
-            if (n > 0 && (size_t)n < sizeof t->plans[0]) { t->n_plans = 1; }
+            if (d2k_tcp_split_plan(t->trig_len, (unsigned)r->split_pos, r->split_gap_us,
+                                   t->plans[0], sizeof t->plans[0]) == 0) { t->n_plans = 1; }
         }
         /* ЗАМЕР ВЛАДЕЕТ ПОИСКОМ, НО ПОСТАВИТЬ НЕЧЕГО. Поле 04.10, чистый
            каталог: rutracker.org и discord.com — «решает содержимое», взят

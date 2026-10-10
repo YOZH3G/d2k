@@ -99,6 +99,17 @@ static int measured_payload(char *buf, size_t cap, size_t *pos, unsigned id,
     return append_fmt(buf, cap, pos, "\n");
 }
 
+int d2k_tcp_split_plan(size_t trigger_len, unsigned split, uint32_t gap_us,
+                       char *buf, size_t cap) {
+    if (!buf || !cap || trigger_len > D2K_ARM_TRIGGER_MAX ||
+        !split || split >= trigger_len) return -1;
+    int n = snprintf(buf, cap,
+        "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
+        "wire detect-tcp-v1\nsegment %u\nsplit payload_start +%u\norder forward\npace %u\n",
+        (unsigned)D2K_ARM_SEGMENT_MAX, split, (unsigned)gap_us);
+    return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+
 int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
                               size_t send_cap, char *buf, size_t cap) {
     if (!a || !in || !buf || !cap) { return -1; }
@@ -107,6 +118,12 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         in->decoy_len > sizeof in->decoy || in->sni_off > in->trigger_len ||
         in->sni_len > in->trigger_len - in->sni_off || a->repeats > 255 ||
         a->ttl > 255 || a->gap_ms > UINT32_MAX / 1000u) { return -1; }
+    if (a->split_pos && !a->badsum && !a->md5 && !a->repeats && !a->ttl &&
+        !a->seq_out && !a->decoy_hello && !a->tcpts && !a->ipidzero &&
+        !a->disorder && !a->disorder_pos && !a->between && !a->seqovl &&
+        !a->seqovl_hello && !a->oob) {
+        return d2k_tcp_split_plan(in->trigger_len, a->split_pos, a->gap_ms * 1000u, buf, cap);
+    }
     /* The composite ECH question is the recovered field program. The raw
        probe executes this very text, so it cannot measure padded 2*n bytes
        and then arm a different template/TLS modifier/header program. */

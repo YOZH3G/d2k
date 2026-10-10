@@ -42,6 +42,7 @@ static const d2k_result *g_res;   /* чей прогон идёт: номер с
 static int g_ask = -1, g_rep;     /* текущий вопрос сырого слоя и номер его повтора */
 static int g_hs_calls;
 static int g_poison_calls;
+static int g_split_success, g_split_calls, g_split_gaps;
 
 static int pat_rc(const char *pat, int idx)
 {
@@ -80,6 +81,13 @@ int fake_poison(const uint8_t *ip, uint8_t family, uint16_t port, const d2k_trig
     const char *pat = g_default;
     int i, rc;
     (void)ip; (void)family; (void)port; (void)tr; (void)timeout_ms; (void)mark; (void)cancel;
+    if (!strcmp(p->name, "tcp-split")) {
+        g_split_calls++;
+        if (p->gap_ms == 2) g_split_gaps |= 1;
+        if (p->gap_ms == 10) g_split_gaps |= 2;
+        if (g_split_success < 0) snprintf(err, errcap, "raw split: local send failure");
+        return g_split_success;
+    }
     g_poison_calls++;
     for (i = 0; g_script && g_script[i].name; i++) {
         if (strcmp(g_script[i].name, p->name) == 0) { pat = g_script[i].pat; break; }
@@ -774,10 +782,26 @@ static void test_local_plan_error_is_not_a_property(void) {
     CHECK(r.nanswered == 0, "локальный отказ стал ответом сети");
 }
 
+static void test_split_uses_runtime(void) {
+    scenario sc = {"split-runtime", NULL, "-", NULL, "+", 0, NULL, 0};
+    d2k_result r;
+    g_split_success = 1; g_split_calls = g_split_gaps = 0;
+    run(&sc, &r);
+    CHECK(r.verdict == D2K_DV_WHOLE_PACKET && g_split_calls == 9 && g_split_gaps == 3,
+          "split measurement bypassed the production packet runtime: verdict=%d calls=%d gaps=%d",
+          r.verdict, g_split_calls, g_split_gaps);
+    g_split_success = -1; g_split_calls = 0;
+    run(&sc, &r);
+    CHECK(r.verdict == D2K_DV_FLAKY && g_poison_calls == 0 && g_split_calls == 3,
+          "failed raw split is a local failure, not a negative DPI property");
+    g_split_success = 0;
+}
+
 int main(void)
 {
     test_local_plan_error_is_not_a_property();
     srv_start();
+    test_split_uses_runtime();
     bind_list_names();
     if (getenv("CAPTURE")) {
         int i;
