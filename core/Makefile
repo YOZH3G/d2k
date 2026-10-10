@@ -38,7 +38,7 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
           include/d2k_quicprobe.h include/d2k_quic_arms.h include/d2k_ipfrag.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
           include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
           include/d2k_verify.h include/d2k_arm.h include/d2k_stun.h include/d2k_net4.h include/d2k_voice.h ../datapath/include/d2k_plan.h ../datapath/include/d2k_ctl.h ../datapath/include/d2k_ctlsrv.h
-HDR += ../runtime/d2k_runtime.h include/d2k_p256.h
+HDR += ../runtime/d2k_runtime.h include/d2k_p256.h include/d2k_udpruntime.h
 
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
@@ -1033,7 +1033,10 @@ measured.o: measured.c $(HDR) profiles/rx_fake.h
 # plan/wire objects in tests which already link those runtime sources directly.
 UDP_ENGINE_SRC = udpplan.c udpruntime.c plantlv.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c ipfrag.c quic.c quicwire.c crypto.c
 UDP_ENGINE_OBJ = $(addprefix .udp-engine/,$(notdir $(UDP_ENGINE_SRC:.c=.o)))
-libd2k_udp.a: $(UDP_ENGINE_SRC) $(HDR) include/d2k_udpruntime.h
+UDP_ENGINE_HDR = $(HDR) $(wildcard ../datapath/include/*.h) ../datapath/plan_internal.h
+udpplan.o: udpplan.c $(UDP_ENGINE_HDR)
+udpruntime.o: udpruntime.c $(UDP_ENGINE_HDR)
+libd2k_udp.a: $(UDP_ENGINE_SRC) $(UDP_ENGINE_HDR)
 	@mkdir -p .udp-engine
 	@for src in $(UDP_ENGINE_SRC); do $(CC) $(CFLAGS) -c $$src -o .udp-engine/$$(basename $$src .c).o || exit 1; done
 	ar rcs $@ $(UDP_ENGINE_OBJ)
