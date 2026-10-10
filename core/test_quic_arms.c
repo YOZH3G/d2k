@@ -793,9 +793,9 @@ static void test_arm_to_plan(void) {
     const uint8_t *blob = decoy;
 
     struct { d2k_quic_arm_kind kind; int copies; int ttl; int ok; const char *what; } c[] = {
-        { D2K_QA_BLOB,      0,  0, 1, "одиночная приманка" },
-        { D2K_QA_COPIES,   11,  0, 1, "одиннадцать копий" },
-        { D2K_QA_TTL,       0,  3, 1, "приманка с укороченным TTL" },
+        { D2K_QA_BLOB,      0,  0, 0, "legacy diagnostic is not a runtime proof" },
+        { D2K_QA_COPIES,   11,  0, 0, "legacy copies are not exported" },
+        { D2K_QA_TTL,       0,  3, 0, "legacy TTL is not exported" },
         { D2K_QA_FRAG,      0,  0, 0, "legacy fragment без исходной формы — отказ" },
         { D2K_QA_NOT_FOUND, 0,  0, 0, "плечо не найдено — ставить нечего" },
         { D2K_QA_FLAKY,     0,  0, 0, "измерению верить нельзя" },
@@ -937,7 +937,7 @@ static d2k_quic_arm quic_arm_of(d2k_quic_arm_kind kind) {
 
 static void quic_props_compose_checks(void) {
     static const char zero16[] = "payload 1 00000000000000000000000000000000\n";
-    static const char junk_fake[] = "fake payload=1 poison=1 repeats=2 gap_us=0 place=before\n";
+    static const char junk_fake[] = "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n";
     char plan[4096];
     d2k_quic_props p;
     d2k_quic_arm nf = quic_arm_of(D2K_QA_NOT_FOUND);
@@ -982,7 +982,7 @@ static void quic_props_compose_checks(void) {
     p.junk_ahead = D2K_PROP_YES;
     p.longer = D2K_PROP_YES;
     CHECK(d2k_quic_compose_plan(&nf, &p, plan, sizeof plan) == 0 &&
-          strstr(plan, zero16) && strstr(plan, junk_fake) && strstr(plan, "udplen 100\n"),
+          strstr(plan, zero16) && strstr(plan, junk_fake) && !strstr(plan, "udplen"),
           "QUIC мусор+длина: донор склеивает оба приёма");
 
     /* Плечо askArms с фальшивкой ВЫТЕСНЯЕТ мусор (switch донора), длина
@@ -990,7 +990,7 @@ static void quic_props_compose_checks(void) {
     d2k_quic_arm cp = quic_arm_of(D2K_QA_COPIES);
     CHECK(d2k_quic_compose_plan(&cp, &p, plan, sizeof plan) == 0 &&
           strstr(plan, "payload 1 41424344\n") && strstr(plan, "repeats=6") &&
-          !strstr(plan, zero16) && strstr(plan, "udplen 100\n"),
+          !strstr(plan, zero16) && !strstr(plan, "udplen"),
           "QUIC плечо+мусор+длина: не fake плеча + udplen");
 
     /* Фрагментация + мусор: мусор заменяет отсутствующую фальшивку. */
@@ -1000,7 +1000,7 @@ static void quic_props_compose_checks(void) {
     memset(&p, 0, sizeof p);
     p.junk_ahead = D2K_PROP_YES;
     CHECK(d2k_quic_compose_plan(&fr, &p, plan, sizeof plan) == 0 &&
-          strstr(plan, "ipfrag 2\n") && strstr(plan, zero16) && strstr(plan, junk_fake),
+          strstr(plan, "ipfrag 2\n") && !strstr(plan, zero16) && !strstr(plan, "fake "),
           "QUIC фрагменты+мусор: донор ставит мусор перед фрагментами");
 
     /* Фрагментация + длина: у донора udplen идёт ПОСЛЕ drop, а DROP в

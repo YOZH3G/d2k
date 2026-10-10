@@ -45,7 +45,7 @@ typedef enum {
  * получить отказ, а не обрезанное исполнение.
  *
  * d2kd.c выделяет OUT_BUF = D2K_RESULT_MAX * MAX_PKT. */
-#define D2K_RESULT_MAX 26
+#define D2K_RESULT_MAX D2K_WIRE_BATCH_MAX
 
 typedef struct {
     d2k_verdict verdict;

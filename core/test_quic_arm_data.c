@@ -48,6 +48,8 @@ static int g_fd = -1;
 static uint16_t g_seen_port[MAX_SEEN];
 static size_t g_seen_token[MAX_SEEN]; /* длина токена Initial (после Retry) */
 static size_t g_seen_len[MAX_SEEN];
+static size_t g_seen_packet_len[MAX_SEEN];
+static int g_seen_zero_tail[MAX_SEEN];
 static int g_seen_ours[MAX_SEEN];
 static int g_seen_split[MAX_SEEN]; /* первый кадр CRYPTO с ненулевым смещением */
 static volatile int g_seen_n;
@@ -112,7 +114,11 @@ static void *stand_run(void *arg) {
             {
                 d2k_qw_hdr th;
                 if (d2k_qw_hdr_parse(buf, (size_t)n, 0, &th) == 0 && th.long_hdr &&
-                    th.type == D2K_QW_LT_INITIAL) g_seen_token[g_seen_n] = th.token_len;
+                    th.type == D2K_QW_LT_INITIAL) {
+                    g_seen_token[g_seen_n] = th.token_len;g_seen_packet_len[g_seen_n]=th.packet_len;
+                    g_seen_zero_tail[g_seen_n]=1;
+                    for(size_t k=th.packet_len;k<(size_t)n;k++)if(buf[k])g_seen_zero_tail[g_seen_n]=0;
+                }
             }
             g_seen_n++;
         }
@@ -586,11 +592,26 @@ static void test_strategy_questions_on_wire(uint16_t port) {
 }
 #endif
 
+static void test_length_runtime(uint16_t port){
+    uint8_t initial[4096];size_t n=0;
+    CHECK(!d2k_quic_probe_initial(TARGET,initial,sizeof initial,&n),"length input builds");
+    g_mode=M_BOUND;g_seen_n=0;int sent=0;
+    d2k_tally t=d2k_quic_ask_longer_hook("127.0.0.1",port,NULL,0,(d2k_hello){initial,n},
+        400,0,3,NULL,NULL,&sent,NULL);
+    CHECK(t.pass==3 && sent==3,"runtime length question receives bound replies 3/3");
+    pthread_mutex_lock(&g_mu);
+    CHECK(g_seen_n==3,"length sends one datagram per fresh flow");
+    for(int i=0;i<g_seen_n;i++)CHECK(g_seen_len[i]==n+100 && g_seen_packet_len[i]==n && g_seen_zero_tail[i],
+        "length question appends100 outside Initial, exactly as installed Plan");
+    pthread_mutex_unlock(&g_mu);
+}
+
 int main(void) {
     int old_local = d2k_quic_allow_local;
     d2k_quic_allow_local = 1;
     uint16_t port = stand_start();
     if (!port) { puts("FAIL stand"); return 1; }
+    test_length_runtime(port);
     test_bound_replies_only(port);
     test_ladder_handshake_without_data(port);
 #ifndef HEAD_API

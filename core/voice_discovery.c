@@ -8,6 +8,8 @@
 #include <time.h>
 #include <unistd.h>
 #include "d2k_voice_discovery.h"
+#include "d2k_udpruntime.h"
+#include "d2k_compose.h"
 #include "d2k_stun.h"
 #include "d2k_meas.h"
 
@@ -62,18 +64,17 @@ static d2k_discovery_result discovery_probe(uint32_t ip, uint16_t port,
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = ip;
     if (connect(fd, (struct sockaddr *)&a, sizeof a)) { r.error=1; goto done; }
-    if (prefix && len) {
-        if (send(fd,prefix,len,0) != (ssize_t)len) { r.error=1; goto done; }
-        struct timespec pause = {0,15000000};
-        while (nanosleep(&pause,&pause) && errno == EINTR) {}
-    }
     for (unsigned i=0; i<D2K_DISCOVERY_EXCHANGES; i++) {
         uint8_t req[74] = {0,1,0,70}, seed[20], txid[12], reply[2048];
         if (!d2k_stun_request(seed,sizeof seed,txid)) { r.error=1; break; }
         /* Each request has a fresh SSRC, so delayed duplicates cannot
          * count as progress. These are our IDs, never the caller's SSRC. */
         memcpy(req+4,txid,4);
-        if (send(fd,req,sizeof req,0) != sizeof req) { r.error=1; break; }
+        if(i==0 && prefix && len){
+            char plan[16384];
+            if(d2k_voice_arm_plan(prefix,len,1,plan,sizeof plan) ||
+               d2k_udp_plan_send(fd,plan,req,sizeof req,mark)){r.error=1;break;}
+        }else if (send(fd,req,sizeof req,0) != sizeof req) { r.error=1; break; }
         r.sent++;
         int64_t end = milliseconds() + (wait ? wait : 3000);
         int answered = 0;

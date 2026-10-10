@@ -650,9 +650,7 @@ int main(void) {
 
     /* --- ЗАДАЧА 17 -------------------------------------------------------- */
 
-    /* П.3: донор ставит найденную приманку с repeats=max(n,2)
-       (voiceprobe.askVoiceArms). Текст fake_arm и копии, по которым
-       собирается Plan, обязаны совпадать: n=1 едет на провод двумя копиями. */
+    /* Измеренная одна копия должна экспортироваться одной копией. */
     {
         reset();
         g_answer_ip = g_ctl_ip;
@@ -665,9 +663,9 @@ int main(void) {
         o.port = 50003;
         o.mark = 0x2d;
         d2k_voice_res r = d2k_voice_run(&o);
-        CHECK(r.verdict == D2K_VOICE_BLOCKED && strcmp(r.fake_arm, "stun:repeats=2") == 0 &&
-              r.arm_copies == 2,
-              "приманка n=1 поставлена не с repeats=max(n,2), как у донора");
+        CHECK(r.verdict == D2K_VOICE_BLOCKED && strcmp(r.fake_arm, "stun:repeats=1") == 0 &&
+              r.arm_copies == 1,
+              "экспортировано ровно измеренное число копий");
     }
 
     /* П.4: без запрошенной метки прогон НЕ помечен (донор: Marked =

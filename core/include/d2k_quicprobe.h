@@ -249,6 +249,10 @@ typedef d2k_tally (*d2k_quic_ask_fn)(const char *addr, uint16_t port,
                                       int repeats, uint32_t *rtt_ms_out, int *refused_out,
                                       int *sent_out, uint8_t *ttl_in_out);
 extern d2k_quic_ask_fn d2k_quic_ask_hook;
+/* Same oracle, but append 100 zero bytes through the runtime Plan after
+ * fresh-CID construction. No change to encrypted Initial padding. */
+extern d2k_quic_ask_fn d2k_quic_ask_longer_hook;
+extern d2k_quic_ask_fn d2k_quic_ask_frames_hook;
 /* ХОД ПРОГОНА (задача 49): каждый заданный вопрос QUIC-прогона — его имя и
  * сколько зондов реально ушло. Сумма за прогон равна d2k_vres.probes.
  * NULL (умолчание) — никому не нужно; планировщик ставит свой приёмник. */
@@ -676,20 +680,9 @@ int d2k_quic_decoy_from_trigger(d2k_hello trigger, const char *decoy_sni,
 int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
                       char *buf, size_t cap);
 
-/* compose ДОНОРА ЦЕЛИКОМ (questions.go:296-345): плечо askArms И свойства
- * вопросника склеиваются в ОДИН план, как в одну строку у оригинала:
- *   фальшивка плеча, а без неё — подтверждённый «мусор» (16 нулей, 2 копии,
- *     перед Initial);
- *   фрагментация плеча, если выжила на контроле;
- *   подтверждённая «длина» — udplen 100 (к UDP-нагрузке Initial дописываются
- *     100 нулевых байт), КРОМЕ плана с фрагментацией: у донора udplen стоит
- *     после drop и на провод не попадает.
- * arm может быть NULL или NOT_FOUND — тогда план собирается из одних свойств.
- * FLAKY — отказ: прогону с неподтверждёнными метками верить нельзя.
- * Провенанс «длины» (p->longer_profile) в текст плана НЕ входит: текст —
- * идентичность плана (plan-<fnv1a>), и одинаковый на проводе план обязан
- * получить одно имя. Провенанс — в трассе вопросника и журнале.
- * 0 — план в buf; -1 — исполнимого нет либо найденное плечо не выразимо. */
+/* Export one measured question exactly: arm, otherwise one junk prefix,
+ * otherwise runtime udplen100. Independent positive answers are never
+ * multiplied into an unmeasured combined plan. FLAKY always refuses. */
 int d2k_quic_compose_plan(const d2k_quic_arm *arm, const d2k_quic_props *p,
                           char *buf, size_t cap);
 

@@ -17,6 +17,8 @@
 #include "d2k_meas.h"
 #include "d2k_net4.h"
 #include "d2k_stun.h"
+#include "d2k_udpruntime.h"
+#include "d2k_compose.h"
 #include "d2k_voice.h"
 #include "d2k_voice_discovery.h"
 
@@ -192,20 +194,11 @@ static int send_one(uint32_t ip, uint16_t port, const uint8_t *pre, size_t pre_l
         close(fd);
         return -1;
     }
-    /* КОПИЙ СТОЛЬКО, СКОЛЬКО ПРОСИЛИ, И КАЖДАЯ — СВОЯ ДАТАГРАММА: коробка
-       считает датаграммы, и одна длинная из склеенных копий измеряла бы не то. */
-    if (pre && pre_len > 0) {
-        for (int c = 0; c < (copies > 0 ? copies : 1); c++) {
-            if (send(fd, pre, pre_len, 0) < 0) {
-                close(fd);
-                return -1;
-            }
-        }
-    }
-    if (send(fd, req, sizeof req, 0) < 0) {
-        close(fd);
-        return -1;
-    }
+    if (pre && pre_len) {
+        char plan[16384];
+        if(d2k_voice_arm_plan(pre,pre_len,copies>0?(unsigned)copies:1,plan,sizeof plan) ||
+           d2k_udp_plan_send(fd,plan,req,sizeof req,mark)) {close(fd);return -1;}
+    }else if(send(fd,req,sizeof req,0)!=(ssize_t)sizeof req){close(fd);return -1;}
     return fd;
 }
 
@@ -396,9 +389,8 @@ static void voice_ask_arms(const d2k_voice_opt *o, d2k_voice_res *r) {
             if (q.pass != D2K_VOICE_REPEATS) { continue; }
             memcpy(r->arm_bytes, bytes, len);
             r->arm_len = len;
-            /* Донор ставит найденное с repeats=max(n,2) (askVoiceArms):
-               текст и копии, по которым собирается Plan, — одно число. */
-            r->arm_copies = copies[c] < 2 ? 2 : copies[c];
+            /* Export exactly the measured action; an extra copy is a new question. */
+            r->arm_copies = copies[c];
             snprintf(r->fake_arm, sizeof r->fake_arm, "%s:repeats=%d",
                      blobs[b].name, r->arm_copies);
             return;

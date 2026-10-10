@@ -285,7 +285,7 @@ static void post_handshake_stall(void) {
 int main(void) {
     d2k_quic_arm_data_hook=data_pass;
     d2k_quic_allow_local=1; d2k_quic_resolve_hook=resolve;
-    d2k_quic_ask_hook=ask; d2k_quic_ask_control_hook=ask;
+    d2k_quic_ask_hook=ask; d2k_quic_ask_longer_hook=ask; d2k_quic_ask_frames_hook=ask; d2k_quic_ask_control_hook=ask;
     d2k_quic_ask_copies_hook=copies; d2k_quic_ask_ttl_hook=copies;
     d2k_quic_ask_srcport_hook=srcport; d2k_quic_ask_split_hook=split;
     d2k_quic_fragment_hook=fragment;

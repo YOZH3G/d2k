@@ -972,8 +972,12 @@ int main(int argc, char **argv) {
      * =================================================================== */
 
     d2k_quic_ask_fn real_ask = d2k_quic_ask_hook;
+    d2k_quic_ask_fn real_longer = d2k_quic_ask_longer_hook;
+    d2k_quic_ask_fn real_frames = d2k_quic_ask_frames_hook;
     d2k_quic_ask_fn real_control = d2k_quic_ask_control_hook;
     d2k_quic_ask_hook = mock_ask;
+    d2k_quic_ask_longer_hook = mock_ask;
+    d2k_quic_ask_frames_hook = mock_ask;
     d2k_quic_ask_control_hook = mock_ask;
     d2k_quic_ask_srcport_hook = mock_ask_srcport;
     d2k_quic_ask_split_hook = mock_ask_split;
@@ -1246,11 +1250,8 @@ int main(int argc, char **argv) {
               "свойство обязано быть записано, а не только упомянуто в тексте причины");
     }
 
-    /* --- «ДЛИНА» ДЛЯ БОЛЬШОГО ПРИВЕТСТВИЯ: запасной Initial донора ---------
-     * Приветствие снимка (≈1330 байт, как у браузеров с ML-KEM) в 1300 байт
-     * не помещается. Вопрос не пропадает: он задаётся собственным Initial
-     * донора ровно в 1300 байт (questions.go:237) и в трассе и причине
-     * помечен PROFILE — не выдан за форму клиента. */
+    /* Runtime udplen preserves the measured large input; no 1300-byte
+       substitute profile is introduced by the question. */
     {
         static uint8_t big[D2K_QW_MAX_DGRAM];
         size_t big_len = build_large_snapshot(1080, big, sizeof big);
@@ -1271,13 +1272,13 @@ int main(int argc, char **argv) {
         CHECK(r.verdict == D2K_V_OPAQUE, "большой снимок: контроль жив, решает содержимое");
         CHECK(r.qprops.longer != D2K_PROP_UNKNOWN,
               "большое приветствие потеряло вопрос «длина» — запасной Initial донора не задан");
-        CHECK(strcmp(r.qtrace[6].label, "длина PROFILE") == 0 && r.qtrace[6].sent == D2K_QUIC_REPEATS,
-              "трасса обязана пометить «длина» как PROFILE");
-        CHECK(strstr(r.reason, "«длина» задана PROFILE") != NULL,
-              "причина обязана назвать подмену формы PROFILE, а не молчать");
-        CHECK(g_mock_len_1300 == 1, "запасной Initial «длины» обязан быть ровно 1300 байт");
-        CHECK(r.qprops.longer_profile == 1,
-              "свойство «длина» не несёт пометки PROFILE — план выдаст его за форму клиента");
+        CHECK(strcmp(r.qtrace[6].label, "длина") == 0 && r.qtrace[6].sent == D2K_QUIC_REPEATS,
+              "runtime length retains the captured form");
+        CHECK(strstr(r.reason, "«длина» задана PROFILE") == NULL,
+              "runtime length must not claim a profile substitution");
+        CHECK(g_mock_len_1300 == 0, "no replacement with a fixed 1300-byte Initial");
+        CHECK(r.qprops.longer_profile == 0,
+              "length now acts on the captured form, not PROFILE");
     }
 
     /* --- ВОПРОСНИК ЦЕЛИКОМ: СЕМЬ ВОПРОСОВ НА НАСТОЯЩЕМ СНИМКЕ -------------
@@ -1594,6 +1595,8 @@ int main(int argc, char **argv) {
     }
 
     d2k_quic_ask_hook = real_ask;
+    d2k_quic_ask_longer_hook = real_longer;
+    d2k_quic_ask_frames_hook = real_frames;
     d2k_quic_ask_control_hook = real_control;
 
     /* ===================================================================
@@ -1902,12 +1905,18 @@ int main(int argc, char **argv) {
            первой редакции этого теста так и было, и core check вырос на
            минуты. */
         d2k_quic_ask_fn saved_ask = d2k_quic_ask_hook;
+        d2k_quic_ask_fn saved_longer = d2k_quic_ask_longer_hook;
+        d2k_quic_ask_fn saved_frames = d2k_quic_ask_frames_hook;
         d2k_quic_ask_fn saved_control = d2k_quic_ask_control_hook;
         d2k_quic_ask_hook = mock_ask;
+    d2k_quic_ask_longer_hook = mock_ask;
+    d2k_quic_ask_frames_hook = mock_ask;
         d2k_quic_ask_control_hook = mock_ask;
         d2k_vres ok = d2k_quic_classify("203.0.113.7", 443, "x.example",
                                         trig_hello(), ctl_hello(), 0);
         d2k_quic_ask_hook = saved_ask;
+        d2k_quic_ask_longer_hook = saved_longer;
+        d2k_quic_ask_frames_hook = saved_frames;
         d2k_quic_ask_control_hook = saved_control;
         CHECK(ok.verdict != D2K_V_LOCAL_ADDRESS,
               "внешний адрес принят за приватный — проверка закрыла бы весь продукт");

@@ -46,6 +46,8 @@
 /* Version 12: raw TCP-MD5 poison in detect-tcp-v1. */
 #define D2K_EXEC_VERSION 12
 #define D2K_PLAN_PROTO_HTTP 4
+/* Shared result capacity for measured and live packet programs. */
+#define D2K_WIRE_BATCH_MAX 26
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_WIRE_TCP_TEMPLATE 2
 #define D2K_SCHEMA_MAX   1
