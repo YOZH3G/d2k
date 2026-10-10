@@ -248,6 +248,13 @@ static void trace_questions(const d2k_result *res, int repeats, d2k_vres *out)
     }
 }
 
+/* A dial timeout says nothing about the trigger. The full pass gets one
+ * fresh baseline measurement (its existing repeat count), not a replay of
+ * this transient transport failure. Local errors/cancellation are not retried. */
+static int retry_base_timeout(const char *err) {
+    return err && !strncmp(err, "dial tcp ", 9) && strstr(err, ": i/o timeout") != NULL;
+}
+
 /* Полный прогон; seed — ответ уже заданного базового вопроса тем же входом
  * (d2k_opts.seed_whole), NULL — прогон спрашивает базу сам. */
 static d2k_vres sched_tcp(const char *ip, uint16_t port,
@@ -266,7 +273,7 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
                      &tr, &opt, addr, &out) != 0) {
         return out;
     }
-    if (seed && seed->valid) {
+    if (seed && seed->valid && !retry_base_timeout(seed->err)) {
         opt.seed_whole = 1;
         opt.seed_repeats = seed->repeats;
         opt.seed_pass = seed->pass;
@@ -526,7 +533,7 @@ d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
                        ? &res.trace[0] : NULL;
     int asked = b ? b->pass + b->fail : 0;
     out.probes = asked;
-    if (b && res.repeats > 0 && asked >= res.repeats) {
+    if (b && res.repeats > 0 && asked >= res.repeats && !retry_base_timeout(b->err)) {
         /* Вопрос задан целиком — его ответ годится полному прогону. */
         out.base.valid = 1;
         out.base.repeats = res.repeats;

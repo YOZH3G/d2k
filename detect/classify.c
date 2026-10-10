@@ -563,7 +563,8 @@ static d2k_tally measure(const char *host, const char *port, const d2k_trigger *
     obs->delay_ms = gap_ms;
 
     if (opt->seed_whole && ncuts == 0 && strcmp(name, "whole") == 0 &&
-        opt->seed_repeats == opt->repeats) {
+        opt->seed_repeats == opt->repeats &&
+        !(strncmp(opt->seed_err,"dial tcp ",9)==0 && strstr(opt->seed_err,": i/o timeout"))) {
         /* База уже спрошена этим же триггером (см. d2k_opts.seed_whole). */
         t.pass = opt->seed_pass;
         t.fail = opt->seed_fail;

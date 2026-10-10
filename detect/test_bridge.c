@@ -384,6 +384,10 @@ int main(void)
     r = measure_base(0, 2, "connect: refused");
     CHECK(!r.base_blocked && r.verdict == D2K_V_UNREACHABLE);
     CHECK(r.base.valid && strcmp(r.base.err, "connect: refused") == 0);
+    r = measure_base(0, 2, "dial tcp 192.0.2.1:443: i/o timeout");
+    CHECK(!r.base.valid && !r.base_blocked && r.verdict == D2K_V_UNREACHABLE);
+    r = measure_base(0, 2, "context canceled");
+    CHECK(r.base.valid); /* no fresh measurement on local/cancel failure */
     r = measure_base(0, 1, ""); /* брошен на втором повторе */
     CHECK(!r.base_blocked && r.verdict == D2K_V_INCONCLUSIVE && !r.base.valid);
     {
@@ -399,6 +403,15 @@ int main(void)
         r = d2k_detect_sched_tcp_seeded("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321, NULL, &seed);
         CHECK(seen.seed_whole == 1 && seen.seed_repeats == 2 && seen.seed_pass == 0 &&
               seen.seed_fail == 2 && r.verdict == D2K_V_PREFIX);
+        snprintf(seed.err, sizeof seed.err, "dial tcp 192.0.2.1:443: i/o timeout");
+        r = d2k_detect_sched_tcp_seeded("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321, NULL, &seed);
+        CHECK(!seen.seed_whole); /* even an old valid timeout seed must be remeasured */
+        snprintf(seed.err, sizeof seed.err, "context canceled");
+        r = d2k_detect_sched_tcp_seeded("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321, NULL, &seed);
+        CHECK(seen.seed_whole);
+        seed.err[0] = 0;
+        progress_reset();
+        r = d2k_detect_sched_tcp_seeded("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321, NULL, &seed);
         /* Полный прогон отдаёт ход планировщику: каждый вопрос с его зондами. */
         CHECK(seen.on_obs != NULL);
         /* Задача 49: "whole" с ответом базы — без зондов (они прошлого прогона). */

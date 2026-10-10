@@ -112,7 +112,13 @@ int fake_data_ack(const char *host, const char *port, const d2k_opts *opt,
 static const char CTL[] = "BENIGN-CONTROL-PAYLOAD";
 static const char *g_ctl_pat = "+"; /* ответ на контрольную нагрузку по вызовам */
 static int g_ctl_calls;
-static int g_srv_fd;
+static int g_srv_fd, g_silent, g_timeout_seed;
+static void *quiet_connection(void *arg) {
+    struct timespec pause={0,450000000};
+    nanosleep(&pause,NULL);
+    close((int)(intptr_t)arg);
+    return NULL;
+}
 
 static void *srv_thread(void *arg)
 {
@@ -127,7 +133,10 @@ static void *srv_thread(void *arg)
             pat_rc(g_ctl_pat, g_ctl_calls++) > 0) {
             (void)send(c, "OK", 2, 0);
         }
-        close(c); /* обрыв = «убито», мгновенно */
+        if(g_silent && !(n==(ssize_t)(sizeof CTL-1) && !memcmp(buf,CTL,(size_t)n))) {
+            pthread_t th; pthread_create(&th,NULL,quiet_connection,(void *)(intptr_t)c);
+            pthread_detach(th);
+        } else close(c); /* baseline scenarios use immediate close */
     }
 }
 
@@ -182,6 +191,10 @@ static void run(const scenario *s, d2k_result *res)
     opt.write_gap_ms = 2;
     opt.long_gap_ms = 10;
     opt.control_vouched = s->vouched;
+    if(g_timeout_seed) {
+        opt.seed_whole=1; opt.seed_repeats=3; opt.seed_fail=3;
+        snprintf(opt.seed_err,sizeof opt.seed_err,"dial tcp 127.0.0.1:443: i/o timeout");
+    }
     opt.accept = g_accept;
     memset(&opt.control, 0, sizeof opt.control);
     snprintf(opt.control.name, sizeof opt.control.name, "control");
@@ -499,6 +512,17 @@ static void test_white_ts(void)
     CHECK(r.hit.split_pos == 2, "находка семейства C без разреза +2 (split_pos=%d)", r.hit.split_pos);
     CHECK(find_obs(&r, "свойство:ECH-приветствие под меткой") != NULL,
           "составной вопрос семейства C не задан при наличии ECH-приманки");
+
+    /* A timed-out earlier dial is not an answer to the content question.
+       Fresh whole/split connections stay open silently after the trigger;
+       control replies, and the exact measured C product must still win. */
+    g_silent=1; g_timeout_seed=1;
+    run(&sc,&r);
+    CHECK(r.has_hit && !strcmp(r.hit.name,"white-hello-ts") && !strcmp(r.path,"свойство"),
+          "timeout seed prevented fresh silent-trigger/control/C measurement");
+    const d2k_obs *whole=find_obs(&r,"whole");
+    CHECK(whole && whole->fail==3 && !whole->err[0],"fresh post-trigger silence must replace transport error");
+    g_silent=g_timeout_seed=0;
 
     /* Без ECH-приманки вопрос пропускается: та же раскладка, white=0. */
     scenario sc0 = {"white-ts-none", s_white, "-", NULL, NULL, 0, NULL, 0};
