@@ -1070,6 +1070,15 @@ int d2k_qc_stream_send(d2k_qc *c, uint64_t stream_id, const uint8_t *data, size_
        это наш вопрос, и ответ придёт по нему же. Запоминаем его, чтобы не
        перепутать с однонаправленными потоками сервера. */
     if ((stream_id & 0x03) == 0) {
+        if (!c->have_want || c->want_stream != stream_id) {
+            /* Credit belongs to a stream. Carry the finished response into
+               connection usage, then start the new stream at its initial
+               window; the previous stream's MAX_STREAM_DATA does not apply. */
+            c->rx_other += c->rx_want_high;
+            c->rx_want_high = 0;
+            c->fc_stream_limit = 0;
+            c->credit_due &= ~1;
+        }
         c->want_stream = stream_id;
         c->have_want = 1;
         /* Всё, что успело накопиться до вопроса, — чужое: управляющий поток

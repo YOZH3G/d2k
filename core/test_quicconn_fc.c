@@ -26,7 +26,7 @@ static void keys(d2k_qc *c) {
 }
 
 /* Кадры кредита в пакете клиента. */
-static void scan_credit(const uint8_t *p, size_t n, uint64_t *stream_lim, uint64_t *conn_lim) {
+static void scan_credit(const uint8_t *p, size_t n, uint64_t wanted, uint64_t *stream_lim, uint64_t *conn_lim) {
     size_t i = 0, w = 0;
     while (i < n) {
         uint64_t t = 0;
@@ -51,7 +51,7 @@ static void scan_credit(const uint8_t *p, size_t n, uint64_t *stream_lim, uint64
             i += w;
             if (d2k_qw_varint_read(p + i, n - i, &b, &w)) return;
             i += w;
-            if (a == 0 && b > *stream_lim) *stream_lim = b;
+            if (a == wanted && b > *stream_lim) *stream_lim = b;
             break;
         default:
             if (t >= 0x08 && t <= 0x0f) {
@@ -103,15 +103,18 @@ int main(void) {
     srv->dcid_len = 8; memset(srv->dcid, 0x77, 8);
     keys(c); keys(srv);
 
+    uint64_t conn_lim = 1048576;
+    for (uint64_t request = 0; request < 2; request++) {
     static const uint8_t req[] = {0x01, 0x02, 0x03};
-    CHECK(d2k_qc_stream_send(c, 0, req, sizeof req, 1, err, sizeof err) == 0, "request sent");
+    CHECK(d2k_qc_stream_send(c, request * 4, req, sizeof req, 1, err, sizeof err) == 0, "request sent");
 
     const uint64_t total = 1048576;
-    uint64_t sent = 0, stream_lim = 262144, conn_lim = 1048576;
+    uint64_t sent = 0, stream_lim = 262144;
     uint64_t max_stuck = 0;
     for (int iter = 0; iter < 4000 && sent < total; iter++) {
         /* Сервер: пачка кадров в пределах кредита. */
-        uint64_t lim = stream_lim < conn_lim ? stream_lim : conn_lim;
+        uint64_t available = conn_lim > request * total ? conn_lim - request * total : 0;
+        uint64_t lim = stream_lim < available ? stream_lim : available;
         for (int k = 0; k < 24 && sent < total && sent < lim; k++) {
             uint64_t l = 1000;
             if (l > total - sent) l = total - sent;
@@ -120,7 +123,7 @@ int main(void) {
             size_t o = 0;
             int fin = sent + l == total;
             fr[o++] = (uint8_t)(0x08 | 0x04 | 0x02 | (fin ? 1 : 0));
-            o += d2k_qw_varint_write(fr + o, sizeof fr - o, 0);
+            o += d2k_qw_varint_write(fr + o, sizeof fr - o, request * 4);
             o += d2k_qw_varint_write(fr + o, sizeof fr - o, sent);
             o += d2k_qw_varint_write(fr + o, sizeof fr - o, l);
             memset(fr + o, 'x', (size_t)l);
@@ -149,7 +152,7 @@ int main(void) {
             if (d2k_qw_open(&L->rx, &h, pk, L->have_rx ? L->largest_rx : 0, plain, &plen, &pn) != 0) continue;
             if (!L->have_rx || pn > L->largest_rx) L->largest_rx = pn;
             L->have_rx = 1;
-            scan_credit(plain, plen, &stream_lim, &conn_lim);
+            scan_credit(plain, plen, request * 4, &stream_lim, &conn_lim);
         }
         if (max_stuck > 200) break;
     }
@@ -163,9 +166,10 @@ int main(void) {
     CHECK(sent == total, "сервер упёрся в окно 256 КБ: клиент не расширяет кредит");
     CHECK(complete && got == total, "ответ 1 МБ не завершился при честном кредите");
     CHECK(stream_lim > 262144 && conn_lim > 1048576 - 1, "MAX_STREAM_DATA не приходили");
+    }
     d2k_qc_close(c);
     free(srv);
     close(s);
-    if (!fails) puts("QUIC: окно расширяется, ответ 1 МБ приходит целиком");
+    if (!fails) puts("QUIC: окно расширяется, два ответа по 1 МБ приходят целиком");
     return fails != 0;
 }
