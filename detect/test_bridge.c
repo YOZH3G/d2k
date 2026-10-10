@@ -428,19 +428,22 @@ int main(void)
     p.syn_data = 1;
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
     p.syn_data = 0; p.oob = 1;
-    CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
+    /* oob БОЛЬШЕ НЕ ОТКАЗ (поле 10.10.2026): срочный байт выражается планом
+       «oob sni_middle 0f» и исполняется датапатом — мост его принимает. */
+    CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) == 0);
+    CHECK(arm.oob);
     p.oob = 0; p.md5 = 1;
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) == 0);
     CHECK(arm.md5 && arm.repeats == 1);
     {
         /* ПОЛЕ 04.10, ЧИСТЫЙ КАТАЛОГ: rutracker.org и discord.com. Перебор
-           отрав дошёл до «oob» (срочный байт) — коробку он берёт, но языком
-           плана не выражается, — и на этом кончился: кандидатов 0, цель
-           отдыхает. Находка, которую поставить нельзя, для плана — не находка:
-           перебор обязан продолжиться к следующей гипотезе, которую датапат
-           исполнит, а о невыразимой — сказать в причине. */
-        static const char *const box_takes[] = {"oob", "ttl-8", NULL};
-        static const char *const only_oob[] = {"syndata", "oob", NULL};
+           отрав дошёл до невыразимой гипотезы (теперь это syndata — oob стал
+           выразим) — коробку он берёт, но планом не задаётся, — и перебор
+           обязан продолжиться к следующей гипотезе, которую датапат исполнит,
+           а о невыразимой — сказать в причине. */
+        static const char *const box_takes[] = {"syndata", "ttl-8", NULL};
+        static const char *const only_unexpr[] = {"syndata", NULL};
+        static const char *const box_oob[] = {"oob", NULL};
         uint8_t h[300], c[] = {0x16, 0x03, 0x01};
         d2k_hello tr = {h, 0}, ctl = {c, sizeof c};
         tr.len = build_hello(h, "rutracker.org");
@@ -451,15 +454,21 @@ int main(void)
         CHECK(r.verdict == D2K_V_OPAQUE && r.have_arm && r.owns_search);
         CHECK(r.arm.ttl == 8 && r.arm.repeats == 1 && strcmp(r.arm_name, "ttl-8") == 0);
         CHECK(strcmp(r.arm_path, "перебор") == 0); /* §0.1: путь находки доходит до журнала */
-        CHECK(strstr(r.reason, "«oob»") != NULL && strstr(r.reason, "URG") != NULL);
+        CHECK(strstr(r.reason, "«syndata»") != NULL && strstr(r.reason, "SYN") != NULL);
+        /* oob теперь ВЫРАЗИМ: перебор берёт его как найденный план. */
+        sweep_pass = box_oob;
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
+        CHECK(r.verdict == D2K_V_OPAQUE && r.have_arm && r.owns_search);
+        CHECK(r.arm.oob && strcmp(r.arm_name, "oob") == 0);
+        CHECK(strcmp(r.arm_path, "перебор") == 0);
         /* Выразимого нет вовсе: плана нет, но взятая отрава всё равно
            доказала «решает содержимое» — вердикт тот же, что и до правки,
            даже если без неё дерево не нашло бы базы (контроль молчал). */
-        sweep_pass = only_oob;
+        sweep_pass = only_unexpr;
         r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
         CHECK(r.verdict == D2K_V_OPAQUE && !r.have_arm && r.owns_search);
         CHECK(strstr(r.reason, "буфер травится") != NULL);
-        CHECK(strstr(r.reason, "«syndata»") != NULL && strstr(r.reason, "«oob»") != NULL);
+        CHECK(strstr(r.reason, "«syndata»") != NULL);
         CHECK(strstr(r.reason, "SYN") != NULL);
         /* Счёт зондов и точка разреза доходят до планировщика (поле 04.10
            после 06cb9fd: «за 268 с и 0 зондов замера» — правка фильтра

@@ -68,10 +68,9 @@ int d2k_arm_from_poison(const d2k_poison *p, d2k_arm *a, char *why, size_t whyca
         snprintf(why, whycap, "данные в SYN языком плана не выражаются");
         return -1;
     }
-    if (p->oob) {
-        snprintf(why, whycap, "срочный байт (URG) языком плана не выражается");
-        return -1;
-    }
+    a->oob = p->oob; /* срочный байт выражается планом «oob sni_middle 0f»
+                        и исполняется датапатом (поле 10.10.2026, снят отказ);
+                        место байта — середина имени, см. d2k_arm_plan_measured. */
     /* The result crosses worker threads by value. Keep its display name
      * in d2k_vres.arm_name, not as a pointer into res.hit/the bridge stack. */
     a->name         = NULL;
