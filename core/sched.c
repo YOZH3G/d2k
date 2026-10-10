@@ -401,21 +401,24 @@ d2k_sched_vol_fn  d2k_sched_vol_hook  = d2k_volume_probe;
 d2k_sched_vol_path_fn d2k_sched_vol_path_hook = d2k_volume_probe_path;
 d2k_sched_path_ver_fn d2k_sched_path_ver_hook = d2k_verify_probe_path_on;
 d2k_sched_quic_path_ver_fn d2k_sched_quic_path_ver_hook = d2k_verify_probe_quic_path_on;
-/* Прежнее дерево вердиктов (core/verdict.c) отмены не умеет: у него нет ни
-   контекста, ни проверок между зондами. Переходник это НЕ скрывает — он
-   просто не передаёт флаг дальше, и join такого замера ждёт его до конца.
-   Врать сигнатурой («умеет») было бы хуже: цикл рассчитывал бы на быстрый
-   выход, которого нет. */
-static d2k_vres classify_no_cancel(const char *ip, uint16_t port,
+/* Socket-write diagnostics (core/verdict.c) are not packet-runtime proof.
+ * d2kc installs detect's shared executor explicitly. Library users must do
+ * the same: no implicit second bypass engine when the hook is missing. */
+static d2k_vres classify_unconfigured(const char *ip, uint16_t port,
                                    d2k_hello trigger, d2k_hello control,
                                    uint32_t mark, int repeats,
                                    uint32_t gap_us, uint32_t wait_ms,
                                    const volatile sig_atomic_t *stop) {
-    return d2k_classify_cancelable(ip, port, trigger, control, mark, repeats,
-                                   gap_us, wait_ms, stop);
+    (void)ip; (void)port; (void)trigger; (void)control; (void)mark;
+    (void)repeats; (void)gap_us; (void)wait_ms; (void)stop;
+    d2k_vres r = {0};
+    r.verdict = D2K_V_FLAKY;
+    r.owns_search = 1;
+    snprintf(r.reason, sizeof r.reason, "общий исполнитель замера TCP не подключён");
+    return r;
 }
 
-d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
+d2k_sched_tcp_fn d2k_sched_tcp_hook = classify_unconfigured;
 d2k_sched_ech_resolve_fn d2k_sched_ech_resolve_hook = d2k_ech_resolve;
 d2k_sched_replay_ver_fn d2k_sched_replay_ver_hook = d2k_verify_replay_on;
 d2k_sched_tcp_fn  d2k_sched_tcp_base_hook = NULL;

@@ -1981,6 +1981,15 @@ static d2k_ver_result stub_replay(int use_fd, const char *ip, uint16_t port,
 }
 
 int main(int argc, char **argv) {
+    /* A scheduler without the measured packet runtime must never silently
+       substitute the legacy socket-write classifier and export its cuts. */
+    {
+        d2k_hello empty = {0};
+        d2k_vres r = d2k_sched_tcp_hook("127.0.0.1", 0, empty, empty, 0, 1, 0, 1, NULL);
+        CHECK(r.verdict == D2K_V_FLAKY && r.owns_search && !r.probes && !r.have_arm && !r.split_pos,
+              "unconfigured scheduler must refuse socket-only bypass measurement");
+    }
+    if (argc == 2 && !strcmp(argv[1], "--runtime-default-only")) return fails ? 1 : 0;
     d2k_sched_mark_fn saved_mark = d2k_sched_mark_hook;
     int voice_only = argc == 2 && strcmp(argv[1], "--voice-only") == 0;
     int rx_only = argc == 2 && strcmp(argv[1], "--rx-volume-only") == 0;
