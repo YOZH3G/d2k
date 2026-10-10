@@ -692,9 +692,9 @@ cross: hello_profiles.inc
 	done
 	@echo "== test_quic_arms целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-a64 \
-		test_quic_arms.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c measured.c hello.c plantlv.c link.c quicconn.c h3.c -lpthread || exit 1
+		test_quic_arms.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c measured.c hello.c plantlv.c link.c quicconn.c h3.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-mipsel \
-		test_quic_arms.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c measured.c hello.c plantlv.c link.c quicconn.c h3.c -lpthread || exit 1
+		test_quic_arms.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c measured.c hello.c plantlv.c link.c quicconn.c h3.c -lpthread || exit 1
 	@echo "== test_hello целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_hello-a64 \
 		test_hello.c hello.c -lpthread || exit 1
