@@ -692,7 +692,80 @@ static void check_volume_box_fingerprint_persistence(void) {
     d2k_catalog_free(&c);
 }
 
+/* БЕЛОЕ ИМЯ СЕТИ — ВЕРХНЕУРОВНЕВОЕ ПОЛЕ (поле 10.10.2026). SNI-whitelist
+ * коробки различается по оператору и в поле одно имя (hcaptcha.com) сняло
+ * RX-обрыв сразу у нескольких целей за Cloudflare: это свойство сети, не
+ * цели. Хранится рядом с boxes, переживает перезапуск (подбор стоит до 266
+ * зондов). Исход «не найдено» тоже хранится с меткой времени, чтобы не
+ * перебирать список на каждой цели, пока сеть не сменится. */
+static void check_network_whitelist_roundtrip(void) {
+    /* Найдено: имя + метка + searched. */
+    write_tmp("/tmp/d2k-cat-net.json",
+        "{\"boxes\":[],\"network_whitelist\":{\"name\":\"hcaptcha.com\","
+        "\"searched\":true,\"confirmed_utc\":\"2026-10-10T00:48:41Z\"}}");
+    {
+        d2k_catalog c; char err[200] = {0};
+        CHECK(d2k_catalog_load("/tmp/d2k-cat-net.json", &c, err, sizeof err) == 0,
+              "каталог с network_whitelist не прочитался");
+        CHECK(!strcmp(c.net.name, "hcaptcha.com"), "белое имя сети не прочиталось");
+        CHECK(c.net.searched == 1, "метка «подбор доведён» не прочиталась");
+        CHECK(c.net.confirmed_at == 1791593321, "время подтверждения белого имени не то");
+        CHECK(d2k_catalog_save(&c, "/tmp/d2k-cat-net-out.json", err, sizeof err) == 0,
+              "каталог с белым именем не записался");
+        d2k_catalog_free(&c);
+        FILE *rf = fopen("/tmp/d2k-cat-net-out.json", "r");
+        CHECK(rf != NULL, "записанный каталог с белым именем не открылся");
+        if (rf) {
+            char buf[8192]; size_t got = fread(buf, 1, sizeof buf - 1, rf); buf[got] = 0; fclose(rf);
+            CHECK(strstr(buf, "\"network_whitelist\": {") != NULL, "поле network_whitelist не записано");
+            CHECK(strstr(buf, "\"name\": \"hcaptcha.com\"") != NULL, "имя в записи потеряно");
+            CHECK(strstr(buf, "\"searched\": true") != NULL, "метка searched в записи потеряна");
+            CHECK(strstr(buf, "\"confirmed_utc\": \"2026-10-10T00:48:41Z\"") != NULL,
+                  "время в записи не RFC 3339");
+        }
+    }
+    /* Честное «не найдено»: searched=true, имя пустое — сохраняется с меткой,
+       чтобы не перебирать заново. */
+    write_tmp("/tmp/d2k-cat-net-none.json",
+        "{\"boxes\":[],\"network_whitelist\":{\"name\":\"\",\"searched\":true,"
+        "\"confirmed_utc\":\"2026-10-10T00:48:41Z\"}}");
+    {
+        d2k_catalog c; char err[200] = {0};
+        CHECK(d2k_catalog_load("/tmp/d2k-cat-net-none.json", &c, err, sizeof err) == 0,
+              "каталог с «не найдено» не прочитался");
+        CHECK(c.net.name[0] == '\0' && c.net.searched == 1,
+              "«не найдено» с меткой не сохранилось как отдельный исход");
+        CHECK(d2k_catalog_save(&c, "/tmp/d2k-cat-net-none-out.json", err, sizeof err) == 0,
+              "каталог «не найдено» не записался");
+        d2k_catalog_free(&c);
+        FILE *rf = fopen("/tmp/d2k-cat-net-none-out.json", "r");
+        if (rf) {
+            char buf[8192]; size_t got = fread(buf, 1, sizeof buf - 1, rf); buf[got] = 0; fclose(rf);
+            CHECK(strstr(buf, "\"searched\": true") != NULL,
+                  "исход «не найдено» не пережил круговой обход");
+        }
+    }
+    /* Старый файл без поля: не найдено, не искали. */
+    write_tmp("/tmp/d2k-cat-net-old.json", "{\"boxes\":[]}");
+    {
+        d2k_catalog c; char err[200] = {0};
+        CHECK(d2k_catalog_load("/tmp/d2k-cat-net-old.json", &c, err, sizeof err) == 0,
+              "старый каталог без network_whitelist не прочитался");
+        CHECK(c.net.name[0] == '\0' && c.net.searched == 0 && c.net.confirmed_at == 0,
+              "старый файл дал не-пустое белое имя сети");
+        d2k_catalog_save(&c, "/tmp/d2k-cat-net-old-out.json", err, sizeof err);
+        d2k_catalog_free(&c);
+        FILE *rf = fopen("/tmp/d2k-cat-net-old-out.json", "r");
+        if (rf) {
+            char buf[8192]; size_t got = fread(buf, 1, sizeof buf - 1, rf); buf[got] = 0; fclose(rf);
+            CHECK(strstr(buf, "network_whitelist") == NULL,
+                  "пустое белое имя записано лишним полем");
+        }
+    }
+}
+
 int main(void) {
+    check_network_whitelist_roundtrip();
     check_volume_box_fingerprint_persistence();
     check_binding_family_persistence();
     check_recheck_mark_persistence();

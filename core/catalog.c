@@ -977,6 +977,15 @@ static int parse_domain_observations(jctx *j,d2k_group_state *s,int depth,
     }
 }
 
+static int handle_net_whitelist_key(jctx *j, const char *key, void *ctx, int depth,
+                                    char *err, size_t errcap) {
+    d2k_net_whitelist *n = (d2k_net_whitelist *)ctx;
+    if (!strcmp(key, "name")) return jparse_string_fixed(j, n->name, sizeof n->name, "network_whitelist.name", err, errcap);
+    if (!strcmp(key, "searched")) return jparse_bool_i(j, &n->searched, "network_whitelist.searched", err, errcap);
+    if (!strcmp(key, "confirmed_utc")) return jparse_rfc3339(j, &n->confirmed_at, "network_whitelist.confirmed_utc", err, errcap);
+    return jskip_value(j, depth + 1, err, errcap);
+}
+
 static int handle_catalog_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
     d2k_catalog *out = (d2k_catalog *)ctx;
     if (strcmp(key, "boxes") == 0) {
@@ -996,6 +1005,9 @@ static int handle_catalog_key(jctx *j, const char *key, void *ctx, int depth, ch
         if(!strcmp(key,"domain_groups_disabled_at"))
             return jparse_rfc3339(j,&out->groups->disabled_at,"domain_groups_disabled_at",err,errcap);
         return parse_domain_observations(j,out->groups,depth+1,err,errcap);
+    }
+    if (!strcmp(key, "network_whitelist")) {
+        return parse_object(j, handle_net_whitelist_key, &out->net, depth + 1, err, errcap);
     }
     /* domain_groups is a human-readable derived snapshot, never authority
        to activate a rule without its retained learning observations. */
@@ -1365,6 +1377,19 @@ int d2k_catalog_save(const d2k_catalog *c, const char *path, char *err, size_t e
             char at[32]; format_rfc3339(c->groups->disabled_at,at,sizeof at);
             fprintf(f,",\n  \"domain_groups_disabled_at\": \"%s\"",at);
         }
+    }
+    /* Белое имя сети пишется, только если подбор был (найдено или честно
+       «не найдено»): пустое неискомое поле — то же, что его отсутствие,
+       и старый файл не должен обрастать лишним ключом. */
+    if(c->net.searched || c->net.name[0]) {
+        fputs(",\n  \"network_whitelist\": {\"name\": ", f);
+        write_json_string(f, c->net.name);
+        fprintf(f,", \"searched\": %s", c->net.searched?"true":"false");
+        if(c->net.confirmed_at) {
+            char at[32]; format_rfc3339(c->net.confirmed_at,at,sizeof at);
+            fprintf(f,", \"confirmed_utc\": \"%s\"",at);
+        }
+        fputs("}", f);
     }
     fputs("\n}\n", f);
 
