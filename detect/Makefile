@@ -70,7 +70,7 @@ test_response: test_response.c $(OBJ) $(SHARED_OBJ) $(HDR)
 test_threads: test_threads.c poison.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_threads.c poison.o $(LDFLAGS) -lpthread
 
-test_raw: test_raw.c tests/legacy_sends.h raw.c $(filter-out raw.o,$(OBJ)) $(SHARED_OBJ) $(HDR) ../datapath/plan_apply.c
+test_raw: test_raw.c ../datapath/test_runtime_trace.h tests/legacy_sends.h raw.c $(filter-out raw.o,$(OBJ)) $(SHARED_OBJ) $(HDR) ../datapath/plan_apply.c
 	$(CC) $(CFLAGS) -o $@ test_raw.c $(filter-out raw.o,$(OBJ)) $(filter-out ../datapath/plan_apply.o,$(SHARED_OBJ)) $(LDFLAGS) $(LDLIBS)
 
 bridge.o: bridge.c $(HDR) ../core/include/d2k_arm.h ../core/include/d2k_verdict.h

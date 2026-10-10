@@ -8,6 +8,7 @@
 #define _DEFAULT_SOURCE 1
 #define _DARWIN_C_SOURCE 1
 #define D2K_RAW_UNIT_TEST 1
+#include "../datapath/test_runtime_trace.h"
 #include <sys/socket.h>
 #include <sys/types.h>
 static ssize_t raw_test_sendto(int, const void *, size_t, int,
@@ -854,10 +855,10 @@ static void test_runtime_equals_datapath(const d2k_poison *hyp, size_t length, u
     CHECK(outgoing_count == actions.n + 2);
     srandom(12345);
     for (size_t i = 0; i < actions.n && i + 2 < outgoing_count; i++) {
-        CHECK(outgoing_delay[i + 2] == actions.v[i].delay_us);
         size_t n = d2k_wire_build(&conn, &actions.v[i], packet, sizeof packet);
-        CHECK(n > 0 && n == outgoing_len[i + 2]);
-        CHECK(n > 0 && n == outgoing_len[i + 2] && !memcmp(packet, outgoing[i + 2], n));
+        d2k_test_packet measured = {outgoing[i+2], outgoing_len[i+2], outgoing_delay[i+2]};
+        d2k_test_packet applied = {packet, n, actions.v[i].delay_us};
+        CHECK(d2k_test_packet_equal(&measured, &applied));
     }
 done:
     d2k_actions_free(&actions); d2k_plan_free(plan);
