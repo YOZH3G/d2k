@@ -68,7 +68,7 @@ HDR += profiles/rx_fake.h
 HDR += include/d2k_resource.h
 HDR += include/d2k_http_reply.h
 HDR += include/d2k_domain.h include/d2k_groups.h
-SRC += domain.c groups.c
+SRC += domain.c groups.c udpplan.c udpruntime.c
 domain.o: domain.c include/d2k_domain.h profiles/psl_index.h
 groups.o: groups.c include/d2k_groups.h include/d2k_domain.h
 
@@ -1064,7 +1064,6 @@ test_http_runtime: ../datapath/test_runtime_trace.h test_http_runtime.c test_htt
 test-http-runtime: test_http_runtime
 	./test_http_runtime
 
-SRC += udpplan.c udpruntime.c
 TESTS += test_quic_sink
 check: test-quic-sink
 .PHONY: test-quic-sink
