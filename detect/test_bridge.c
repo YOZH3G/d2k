@@ -435,6 +435,18 @@ int main(void)
     p.oob = 0; p.md5 = 1;
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) == 0);
     CHECK(arm.md5 && arm.repeats == 1);
+    /* СЕМЕЙСТВО C ЧЕРЕЗ МОСТ (поле 10.10.2026). Составной приём замера —
+       фальшивое ECH-приветствие под меткой времени, серия ×8, разрез настоящего
+       приветствия +2 — ОБЯЗАН быть выразим планом: мост несёт метку времени,
+       серию и ПРЯМОЙ разрез отдельным полем (split_pos), не путая его с обратным
+       disorder_pos. Так находка замера становится планом plan-680fbe00, а не
+       теряется как невыразимая. Падает на main до правки: там split_pos у плеча
+       нет, и прямой разрез настоящего приветствия мост выразить не мог. */
+    memset(&p, 0, sizeof p);
+    p.tcp_ts = 1; p.decoy_hello = 1; p.repeats = 8; p.split_pos = 2;
+    CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) == 0);
+    CHECK(arm.tcpts && arm.decoy_hello && arm.repeats == 8 && arm.split_pos == 2);
+    CHECK(!arm.disorder && !arm.disorder_pos); /* прямой разрез, не обратный */
     {
         /* ПОЛЕ 04.10, ЧИСТЫЙ КАТАЛОГ: rutracker.org и discord.com. Перебор
            отрав дошёл до невыразимой гипотезы (теперь это syndata — oob стал

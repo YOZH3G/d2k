@@ -1756,7 +1756,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         if (!a->disorder || a->disorder_pos >= in->trigger_len || a->seqovl ||
             a->seqovl_hello || a->badsum || a->md5 || a->repeats || a->gap_ms || a->between ||
             a->ttl || a->seq_out || a->decoy_hello || a->tcpts || a->ipidzero ||
-            a->oob) { return -1; }
+            a->oob || a->split_pos) { return -1; }
         size_t plan_pos = 0;
         if (append_fmt(buf, cap, &plan_pos,
             "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
@@ -1774,7 +1774,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
     if (a->oob) {
         if (a->seqovl || a->seqovl_hello || a->badsum || a->md5 || a->repeats || a->gap_ms ||
             a->disorder || a->between || a->ttl || a->seq_out || a->decoy_hello ||
-            a->tcpts || a->ipidzero || in->sni_off == 0 || in->sni_len <= 1 ||
+            a->tcpts || a->ipidzero || a->split_pos || in->sni_off == 0 || in->sni_len <= 1 ||
             in->sni_off + in->sni_len > in->trigger_len) { return -1; }
         size_t pos = 0;
         return append_fmt(buf, cap, &pos,
@@ -1798,7 +1798,11 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
     }
     if (between) { if (mid >= n) { mid = 1; } ov = 0; }
     else { if (mid < 2) { mid = 2; } if (mid >= n) { mid = n - 1; } }
-    if (!fake && !between && !disorder && !ov && !a->disorder_pos) { return -1; }
+    /* Прямой разрез настоящей нагрузки (семейство C) несовместим с обратным
+       порядком и промежуточной фальшивкой: там свой разрез. Вне окна — отказ,
+       как у disorder_pos: разрез, которого не мерили, ставить нельзя. */
+    if (a->split_pos && (between || disorder || (size_t)a->split_pos >= n)) { return -1; }
+    if (!fake && !between && !disorder && !ov && !a->disorder_pos && !a->split_pos) { return -1; }
     /* ПРЕДЕЛ ОТПРАВКИ (задача 37, I2). Посылки плана режутся сегментом
        D2K_ARM_SEGMENT_MAX — тем же потолком, что у сырого отправителя замера
        (raw.c), так что найденное воздействие уходит теми же сегментами, что и
@@ -1896,6 +1900,11 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         append_fmt(buf, cap, &pos, "split payload_start +1\n")) { return -1; }
     if ((disorder || between) &&
         append_fmt(buf, cap, &pos, "split payload_start +%zu\n", mid)) { return -1; }
+    /* Семейство C: прямой разрез настоящей нагрузки после серии фальшивок,
+       порядок прямой (голова первой). Ровно plan-680fbe00: fake(ECH)×N под
+       меткой времени, затем split payload_start +2. */
+    if (a->split_pos &&
+        append_fmt(buf, cap, &pos, "split payload_start +%u\n", a->split_pos)) { return -1; }
     if (fake || between) {
         if (append_fmt(buf, cap, &pos,
             "fake payload=1 poison=1 repeats=%u gap_us=%u place=%s\n",

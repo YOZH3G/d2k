@@ -202,6 +202,20 @@ int d2k_poison_sends(const d2k_trigger *tr, const d2k_poison *p,
             return -1;
         }
         out->tail_ms = 12;
+    } else if (p->split_pos > 0) {
+        /* Разрез НАСТОЯЩЕЙ нагрузки прямым порядком: голова [0,split) первой,
+         * хвост [split,n) следом, после серии фальшивок под меткой времени.
+         * Так режет настоящее приветствие семейство C (split payload_start +2)
+         * — ровно рабочий plan-680fbe00. Отличие от disorder_pos — порядок:
+         * там хвост уходит ПЕРВЫМ (обратный), здесь голова (прямой). */
+        size_t sp = (size_t)p->split_pos;
+        if (sp >= n) {
+            return -1;
+        }
+        if (push(out, D2K_SEND_PAYLOAD, 0, tr->payload, sp, NULL, pause) != 0 ||
+            push(out, D2K_SEND_PAYLOAD, (int64_t)sp, tr->payload + sp, n - sp, NULL, 0) != 0) {
+            return -1;
+        }
     } else {
         if (push(out, D2K_SEND_PAYLOAD, 0, tr->payload, n, NULL, pause) != 0) {
             return -1;

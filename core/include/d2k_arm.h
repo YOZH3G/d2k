@@ -34,6 +34,10 @@ typedef struct {
     int         tcpts;       /* метка времени со сдвигом назад */
     int         ipidzero;    /* обнулённый идентификатор IP */
     int         oob;         /* вставка байта TCP urgent в середину имени */
+    unsigned    split_pos;   /* прямой разрез настоящей нагрузки в этой позиции
+                                (split payload_start +N, order forward) — так
+                                режет настоящее приветствие семейство C; 0 —
+                                нет. Отличен от disorder_pos (обратный порядок). */
 } d2k_arm;
 
 /* Owned measurement input. No borrowed pointers may cross worker results.

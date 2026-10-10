@@ -94,6 +94,10 @@ int d2k_arm_from_poison(const d2k_poison *p, d2k_arm *a, char *why, size_t whyca
     a->decoy_hello  = p->decoy_hello;
     a->tcpts        = p->tcp_ts;
     a->ipidzero     = p->ip_id_zero;
+    /* Прямой разрез настоящей нагрузки (семейство C: split payload_start +2).
+       Отличен от disorder_pos (обратный порядок) — едет своим полем, его
+       исполняет d2k_arm_plan_measured через «split … + order forward». */
+    a->split_pos    = p->split_pos > 0 ? (unsigned)p->split_pos : 0u;
     if (p->seqovl_exact) {
         /* «Длиной в целое приветствие» — не число, а правило: сборщик кладёт
          * туда приманку целиком. Задать то же число вручную не то же самое —
