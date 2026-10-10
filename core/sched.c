@@ -962,6 +962,17 @@ typedef struct {
     size_t     fb_from;   /* с какого места очереди начинается запасной перебор:
                              ступени RX-лестницы перед ним — из замера */
     unsigned   rx_volume_next_variant;
+    /* ПОДБОР БЕЛОГО ИМЕНИ СЕТИ (поле 10.10.2026). Когда у цели измерен
+       RX-обрыв, а белое имя сети ещё не подобрано (catalog.net не искали),
+       RX-лестница перебирает имена-кандидаты из встроенного списка как
+       приманку: первое, что снимает обрыв (план подтверждён), и есть белое
+       имя сети. net_probe_next — курсор по списку; net_probe_name[k] — имя
+       приманки плана в слоте k очереди (пусто — не из подбора), чтобы при
+       подтверждении записать его в каталог. */
+    int        net_probing;
+    size_t     net_probe_next;
+    char       net_probe_name[SCHED_MAX_PLANS][32];
+    char       net_probe_scratch[32];
     /* Путь находки для строки подтверждения (поле 10.10.2026): какой план
        очереди пришёл из приёма замера и какие — из RX-лестницы. По тексту,
        а не по месту: очередь перестраивается, а план остаётся тем же. */
@@ -3456,15 +3467,69 @@ static void task_done(task *t) {
     t->state = T_FREE;
 }
 
+/* ИМЯ ПРИМАНКИ RX-ЛЕСТНИЦЫ: подтверждённое белое имя сети, иначе семя
+   (восстановленная ручная команда взяла hcaptcha.com, поле 10.10.2026). */
+static const char *rx_decoy_name(const d2k_sched *s) {
+    return s->cat && s->cat->net.name[0] ? s->cat->net.name : "hcaptcha.com";
+}
+
+/* Белое имя сети ещё не решено: не подобрано И не записано честное «не
+   найдено». Только тогда уместен перебор кандидатов (иначе — семя/готовое). */
+static int net_whitelist_undecided(const d2k_sched *s) {
+    return s->cat && !s->cat->net.searched && !s->cat->net.name[0];
+}
+
+/* Потолок зондов задачи. Подбор белого имени сети перебирает до сотен
+   кандидатов (цена названа прямо, §0 «искусственных бюджетов нет»): пока он
+   идёт, потолок расширен на длину списка — только для этой задачи, обычный
+   поиск остаётся на базовом бюджете. */
+static int sched_probe_cap(const task *t) {
+    return SCHED_MAX_PROBES + (t->net_probing ? (int)d2k_net_whitelist_count() : 0);
+}
+
+/* Ещё есть что долить в RX-лестницу: в режиме подбора — непройденные имена
+   списка, иначе — непройденные варианты разреза. */
+static int rx_ladder_pending(const task *t) {
+    return t->net_probing ? t->net_probe_next < d2k_net_whitelist_count()
+                          : t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS;
+}
+
 /* ДОЛИВАЕТ ОЧЕРЕДЬ ИЗ ЗАПАСНОГО ПЕРЕБОРА — третий источник кандидатов после
    готовых планов коробки и синтеза по измеренному вектору (0007/0008).
    Это часть перенесённого поиска, не внешний пул заранее назначенных целей.
    Возвращает число долитых планов. */
 static int next_rx_volume_plan(d2k_sched *s, task *t, d2k_shape sh,
                                char *text, size_t cap) {
+    t->net_probe_scratch[0] = '\0';
+    /* ПОДБОР БЕЛОГО ИМЕНИ СЕТИ: одно имя-кандидат за раз, приманкой перед
+       настоящим ClientHello, разрез +2 (variant 0). Первое, что снимет
+       RX-обрыв (план подтвердится), и есть белое имя — его запишет
+       verify_confirm, прочитав net_probe_name слота. */
+    if (t->net_probing) {
+        while (t->net_probe_next < d2k_net_whitelist_count()) {
+            const char *name = d2k_net_whitelist_name(t->net_probe_next++);
+            if (!name || d2k_rx_volume_plan_named(0, sh, s->send_cap, name, text, cap) != 0) {
+                continue;
+            }
+            uint32_t h = fnv1a(text);
+            int seen = 0;
+            for (size_t i = 0; i < t->n_plans && !seen; i++) {
+                if (strcmp(t->plans[i], text) == 0) { seen = 1; }
+            }
+            for (size_t i = 0; i < t->n_tried && !seen; i++) {
+                if (t->tried[i] == h) { seen = 1; }
+            }
+            if (seen) { continue; }
+            tried_add(t, h);
+            snprintf(t->net_probe_scratch, sizeof t->net_probe_scratch, "%s", name);
+            return 1;
+        }
+        return 0;
+    }
+    const char *decoy = rx_decoy_name(s);
     while (t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS) {
         unsigned variant = t->rx_volume_next_variant++;
-        if (d2k_rx_volume_plan(variant, sh, s->send_cap, text, cap) != 0) { continue; }
+        if (d2k_rx_volume_plan_named(variant, sh, s->send_cap, decoy, text, cap) != 0) { continue; }
         uint32_t h = fnv1a(text);
         int seen = 0;
         for (size_t i = 0; i < t->n_plans && !seen; i++) {
@@ -3494,19 +3559,25 @@ static size_t refill_from_fallback(d2k_sched *s, task *t) {
         }
         snprintf(t->plans[added], sizeof t->plans[added], "%s", text);
         t->plan_boxes[added][0] = '\0';
+        snprintf(t->net_probe_name[added], sizeof t->net_probe_name[added], "%s", t->net_probe_scratch);
         added++;
-        say(s, "по %s очередь кандидатов исчерпана — по замеренному обрыву входящего "
-            "объёма около %d КБ проверяю fake-SNI + split-лестницу (%u/%u)",
-            t->name, t->vol.rx_at_kb, t->rx_volume_next_variant,
-            (unsigned)D2K_RX_VOLUME_PLAN_VARIANTS);
+        if (t->net_probing) {
+            say(s, "по %s подбор белого имени сети: кандидат %zu из %zu как приманка "
+                   "снимает ли RX-обрыв около %d КБ",
+                t->name, t->net_probe_next, d2k_net_whitelist_count(), t->vol.rx_at_kb);
+        } else {
+            say(s, "по %s очередь кандидатов исчерпана — по замеренному обрыву входящего "
+                "объёма около %d КБ проверяю fake-SNI + split-лестницу (%u/%u)",
+                t->name, t->vol.rx_at_kb, t->rx_volume_next_variant,
+                (unsigned)D2K_RX_VOLUME_PLAN_VARIANTS);
+        }
     }
     /* ЛЕСТНИЦА — ТОЛЬКО ПО ЗАМЕРЕННОМУ RX-ОБРЫВУ (задача 37). Прежде флаг
        взводился здесь безусловно, и любая цель на втором доливе получала
        все пять hcaptcha-планов: поле 02.10.2026, edge-mqtt-fallback, у
        коробки — только «rst», vol.rx_cut = 0. Условие лестницы — парный
        RX-volume-профиль (verdict_to_plans), а не исчерпание очереди. */
-    t->rx_volume_candidate_pending = t->vol.rx_cut &&
-        t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS;
+    t->rx_volume_candidate_pending = t->vol.rx_cut && rx_ladder_pending(t);
     size_t ladder = added;
     while (added < cap) {
         char text[sizeof t->plans[0]];
@@ -3526,6 +3597,7 @@ static size_t refill_from_fallback(d2k_sched *s, task *t) {
         tried_add(t, h);
         snprintf(t->plans[added], sizeof t->plans[added], "%s", text);
         t->plan_boxes[added][0] = '\0';
+        t->net_probe_name[added][0] = '\0'; /* не из подбора белого имени */
         added++;
     }
     if (added) {
@@ -3656,7 +3728,7 @@ static int local_refusal_verdict(d2k_sched *s, task *t) {
         t->state = T_PLANNING;
         return 2;
     }
-    if (t->probes >= SCHED_MAX_PROBES || t->unsent_tries >= SCHED_UNSENT_RETRIES) {
+    if (t->probes >= sched_probe_cap(t) || t->unsent_tries >= SCHED_UNSENT_RETRIES) {
         /* Временный отказ, но повторять больше не на что: бюджет исчерпан.
            Кандидат всё равно не виноват — просто испытать его нечем. */
         say(s, "по %s посылка плана не ушла на провод (причина %u), "
@@ -3705,7 +3777,7 @@ static int install_next(d2k_sched *s, task *t) {
     t->exec_nak = 0;
     for (;;) {
     while (t->next_plan < t->n_plans) {
-        if (t->probes >= SCHED_MAX_PROBES) { return -1; }
+        if (t->probes >= sched_probe_cap(t)) { return -1; }
         const char *text = t->plans[t->next_plan++];
         if (t->transport == 17 && quic_text_is_split(text) && quic_split_unfit(s, t)) {
             /* Свой/готовый план разреза другой цели этому клиенту не
@@ -4343,6 +4415,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
     t->arm_hash = 0;
     t->arm_path[0] = '\0';
     memset(t->plan_boxes, 0, sizeof t->plan_boxes);
+    memset(t->net_probe_name, 0, sizeof t->net_probe_name);
     /* Failed reuse does not prove this is the same box. A newly synthesized
        plan must not silently enlarge the first vaguely matching model. */
     t->box_id[0] = '\0';
@@ -4587,23 +4660,33 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
     }
     if (t->transport == 6 && t->vol.rx_cut && sh == D2K_SHAPE_MODERN) {
         char text[sizeof t->plans[0]];
+        /* Белое имя сети не решено — RX-лестница сперва перебирает кандидаты
+           как приманку (поле 10.10.2026); решено — берёт готовое/семя. */
+        t->net_probing = net_whitelist_undecided(s);
         while (t->n_plans < cap &&
                next_rx_volume_plan(s, t, sh, text, sizeof text)) {
             snprintf(t->plans[t->n_plans], sizeof t->plans[t->n_plans], "%s", text);
             t->plan_boxes[t->n_plans][0] = '\0';
+            snprintf(t->net_probe_name[t->n_plans], sizeof t->net_probe_name[t->n_plans],
+                     "%s", t->net_probe_scratch);
             t->n_plans++;
         }
-        t->rx_volume_candidate_pending =
-            t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS;
-        if (t->rx_volume_candidate_pending) {
-            say(s, "по %s сохранённые планы коробки занимают очередь; "
-                "объёмная fake-SNI/split-лестница ждёт их испытания",
-                t->name);
+        t->rx_volume_candidate_pending = rx_ladder_pending(t);
+        if (t->net_probing) {
+            say(s, "по %s белое имя сети не известно — подбираю его из %zu имён "
+                   "списка приманкой под измеренный RX-обрыв около %d КБ",
+                t->name, d2k_net_whitelist_count(), t->vol.rx_at_kb);
+        } else {
+            if (t->rx_volume_candidate_pending) {
+                say(s, "по %s сохранённые планы коробки занимают очередь; "
+                    "объёмная fake-SNI/split-лестница ждёт их испытания",
+                    t->name);
+            }
+            say(s, "по %s повторяемый обрыв входящего identity-тела около %d КБ "
+                   "при полном gzip-ответе: проверю короткую fake-SNI + split-лестницу "
+                   "(приманка «%s») после сохранённых планов",
+                t->name, t->vol.rx_at_kb, rx_decoy_name(s));
         }
-        say(s, "по %s повторяемый обрыв входящего identity-тела около %d КБ "
-               "при полном gzip-ответе: проверю короткую fake-SNI + split-лестницу "
-               "после сохранённых планов",
-            t->name, t->vol.rx_at_kb);
     }
 
     if (r->owns_search) {
@@ -6889,6 +6972,8 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     t->fb_next = 0;
     t->owned_fallback = 0;
     t->rx_volume_next_variant = 0;
+    t->net_probing = 0;
+    t->net_probe_next = 0;
     t->exec_refused = t->exec_probed = 0;
     /* Состояние фазы своих планов, RX-начала и ECH — тоже прошлого поиска
        (финальное ревью core, M3): новый вход вправе снова проверить свои
@@ -7475,6 +7560,21 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     /* Запоминаем владельца подтверждённого плана. */
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
     s->confirms++;
+    /* ПОДБОР БЕЛОГО ИМЕНИ СЕТИ ЗАВЕРШЁН НАХОДКОЙ (поле 10.10.2026). Если
+       подтверждённый план пришёл из перебора имён-кандидатов, его приманка и
+       есть белое имя сети: записываем в каталог как свойство сети, с меткой
+       времени для повторной проверки при деградации. Больше не перебираем. */
+    if (t->net_probing && t->next_plan > 0 && t->net_probe_name[t->next_plan - 1][0]) {
+        d2k_net_whitelist *nw = &s->cat->net;
+        snprintf(nw->name, sizeof nw->name, "%s", t->net_probe_name[t->next_plan - 1]);
+        nw->searched = 1;
+        nw->confirmed_at = wall_s(s, now_ms);
+        s->cat->revision++;
+        s->sync_pending = 1;
+        t->net_probing = 0;
+        say(s, "по %s белое имя сети подобрано: «%s» снимает RX-обрыв — сохраняю как "
+               "свойство сети, подбор больше не повторяю", t->name, nw->name);
+    }
     if (t->ver.replay_proof)
         say(s, "по %s (TCP, ECH) ПОДТВЕРЖДЕНО повтором приветствия клиента на уровне "
                "рукопожатия: %s (путь: %s) — ServerHello под планом (план применён к потоку "
@@ -8292,6 +8392,7 @@ static int layered_rx_result(d2k_sched *s, task *t, int64_t now_ms) {
             t->cached_measure_valid = 0;
             t->researched = 1;
             t->rx_volume_next_variant = 0;
+            t->net_probe_next = 0; /* ладдер строится заново — подбор с начала списка */
             verdict_to_plans(s, t, &t->res);
         } else {
             say(s, "по %s RX-обрыв под кандидатом не подтверждён полным gzip-контролем; "
@@ -8310,7 +8411,7 @@ static int layered_rx_result(d2k_sched *s, task *t, int64_t now_ms) {
             a->body_chunked == b->body_chunked &&
             delta <= (uint64_t)D2K_VOLUME_SLACK * 1024;
     }
-    if (!partial || t->probes >= SCHED_MAX_PROBES) {
+    if (!partial || t->probes >= sched_probe_cap(t)) {
         say(s, "по %s повторный identity-обрыв под кандидатом не подтвердился; "
                "RX-профиль не создаю", t->name);
         ver_close(t); trial_retire(s, t); t->rx_phase = 0;
@@ -9283,7 +9384,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        нечего: измеритель сам сказал, что опыта не было. */
                     if (t->ver.level == D2K_VER_TRANSPORT && !touched &&
                         t->ver_bare_retries < SCHED_BARE_RETRIES &&
-                        t->probes < SCHED_MAX_PROBES) {
+                        t->probes < sched_probe_cap(t)) {
                         t->ver_bare_retries++;
                         say(s, "по %s план %zu: зонд не дошёл (%s), но и плана на его потоке "
                                "не было — опыта не было, ставлю того же кандидата заново",
@@ -9370,7 +9471,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 else verify_confirm(s, t, now_ms);
                 moved++;
             } else if (now_ms >= t->ver_until_ms) {
-                if (s->dropped_seen != t->ver_dropped0 && t->probes < SCHED_MAX_PROBES) {
+                if (s->dropped_seen != t->ver_dropped0 && t->probes < sched_probe_cap(t)) {
                     /* Связь теряла события с тех пор, как план встал. Значит
                        «применения не было» может означать «было, но событие о
                        нём не доехало», — а это разные вещи, и вторая не улика
@@ -9463,7 +9564,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        Minor 1–2): кончился бюджет кандидатов или память
                        own_seen. Сказать прямо, сколько НЕ испытано, и не
                        называть их «не подтвердившимися». */
-                    if (t->probes >= SCHED_MAX_PROBES || t->own_seen_full) {
+                    if (t->probes >= sched_probe_cap(t) || t->own_seen_full) {
                         size_t left = (t->next_plan < t->n_plans ? t->n_plans - t->next_plan : 0) +
                                       own_first_plans(s, t, 2);
                         say(s, "по %s свои подтверждённые планы испытаны не все: %s; "
@@ -9631,7 +9732,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                         continue;
                     }
                 }
-                if (t->probes >= SCHED_MAX_PROBES && t->next_plan < t->n_plans) {
+                if (t->probes >= sched_probe_cap(t) && t->next_plan < t->n_plans) {
                     /* Кончился БЮДЖЕТ, а не кандидаты (задача 24, D2K_SPEC §3):
                        поиск не завершён, и это не «обхода нет». Только пока
                        кандидаты ЕСТЬ: если они кончились на том же зонде,
@@ -9639,7 +9740,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     if (partial_finish(s, t, now_ms)) { moved++; continue; }
                     say(s, "по %s бюджет зондов исчерпан (зондов %d из %d) — поиск не "
                            "завершён, это не «обхода нет»; цель отдыхает",
-                        t->name, t->probes, SCHED_MAX_PROBES);
+                        t->name, t->probes, sched_probe_cap(t));
                     cooldown_record(s, t, 2);
                     say(s, "по %s после исчерпания бюджета зондов новый поиск отложен на %lld мин",
                         t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
@@ -9648,6 +9749,24 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     continue;
                 }
                 if (partial_finish(s, t, now_ms)) { moved++; continue; }
+                /* ПОДБОР БЕЛОГО ИМЕНИ СЕТИ ДОВЕДЁН ДО КОНЦА, НАХОДКИ НЕТ (поле
+                   10.10.2026). Все имена списка опробованы приманкой, ни одно
+                   не сняло RX-обрыв — честный исход «не найдено», с меткой
+                   времени: не перебираем список заново на каждой цели, пока
+                   сеть не сменится. Бюджет обрыва (не полный проход списка)
+                   сюда не попадает — там net_probe_next < длины списка. */
+                if (t->net_probing && t->net_probe_next >= d2k_net_whitelist_count() &&
+                    s->cat && !s->cat->net.searched) {
+                    s->cat->net.searched = 1;
+                    s->cat->net.name[0] = '\0';
+                    s->cat->net.confirmed_at = wall_s(s, now_ms);
+                    s->cat->revision++;
+                    s->sync_pending = 1;
+                    t->net_probing = 0;
+                    say(s, "по %s белое имя сети не найдено: ни одно из %zu имён списка "
+                           "не сняло RX-обрыв — запоминаю исход, подбор не повторяю",
+                        t->name, d2k_net_whitelist_count());
+                }
                 if (t->fb_queue) {
                     say(s, "по %s выведенные из замера и запасные планы исчерпаны "
                            "(зондов %d) — цель отдыхает", t->name, t->probes);

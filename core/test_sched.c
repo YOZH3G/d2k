@@ -1246,6 +1246,15 @@ static int sent_contains_plan_payload(const char *fragment) {
     return 0;
 }
 
+/* Белое имя сети уже решено на фиксированном имени (поле 10.10.2026): тесты
+   МЕХАНИКИ RX-лестницы (порядок, gzip-гейтинг, приоритет кандидата), а не
+   ПОДБОРА имени, задают приманку явно, иначе лестница ушла бы в перебор
+   266 имён и сломала бы их инварианты. */
+static void net_name_known(d2k_catalog *c, const char *name) {
+    snprintf(c->net.name, sizeof c->net.name, "%s", name);
+    c->net.searched = 1;
+}
+
 static int region_has_encoded(const uint8_t *bytes, size_t bytes_len,
                               const char *fragment, unsigned target_depth) {
     char current[1024], next[2048];
@@ -3578,6 +3587,7 @@ int main(int argc, char **argv) {
        (RX-лестница fake-first), а не «не подтвердилось» и отдых. */
     {
         d2k_catalog cr = {0};
+        net_name_known(&cr, "hcaptcha.com");
         d2k_sched *s = d2k_sched_new(&cr, sv[0], 0x2d);
         saidbuf[0] = '\0';
         d2k_sched_set_say(s, collect_say, NULL);
@@ -8955,6 +8965,7 @@ rx_volume_tests:
             bd->enabled = 1; bd->level = 3; bd->transport = 6;
             bd->shape = D2K_SHAPE_MODERN; bd->family = 4;
         }
+        net_name_known(&c, "hcaptcha.com");
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         saidbuf[0] = '\0'; forget_sent();
         d2k_sched_set_say(s, collect_say, NULL);
@@ -9005,6 +9016,7 @@ rx_volume_tests:
        критерия, не просто статус заголовков. */
     {
         d2k_catalog cRx = {0};
+        net_name_known(&cRx, "hcaptcha.com");
         d2k_sched *s = d2k_sched_new(&cRx, sv[0], 0x2d);
         saidbuf[0] = '\0';
         forget_sent();
@@ -9095,6 +9107,7 @@ rx_volume_tests:
         d2k_catalog_free(&cLate);
 
         d2k_catalog cLateConfirmed = {0};
+        net_name_known(&cLateConfirmed, "hcaptcha.com");
         s = d2k_sched_new(&cLateConfirmed, sv[0], 0x2d);
         saidbuf[0] = '\0';
         forget_sent();
@@ -9121,6 +9134,81 @@ rx_volume_tests:
         d2k_catalog_free(&cLateConfirmed);
     }
 
+    /* ПОДБОР БЕЛОГО ИМЕНИ СЕТИ (поле 10.10.2026). Когда у цели измерен
+       RX-обрыв, а белое имя сети не решено, RX-лестница перебирает кандидаты
+       из встроенного списка приманкой; решено — берёт готовое/семя. */
+    {
+        /* net не решён → первая приманка из списка (9gag.com), не hcaptcha. */
+        d2k_catalog cN = {0};
+        d2k_sched *s = d2k_sched_new(&cN, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 1;
+        d2k_ev h = ev_hello(6, 40087, "net-probe.test"), sh;
+        d2k_sched_event(s, &h);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0, "net-probe shape fixture");
+        d2k_sched_event(s, &sh);
+        prime_late_rst(s, h.name, 40187);
+        d2k_ev su = ev_suspect(6, 40087); su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(said("белое имя сети не известно — подбираю"),
+              "подбор белого имени не запущен при RX-обрыве и неизвестном имени");
+        CHECK(sent_contains_plan_payload("9gag.com"),
+              "первая приманка подбора — не первое имя списка");
+        CHECK(!sent_contains_plan_payload("hcaptcha.com"),
+              "подбор послал семя hcaptcha вместо кандидата списка");
+        vol_rx_cut = 0;
+        d2k_sched_free(s); d2k_catalog_free(&cN);
+    }
+    {
+        /* net.name известно → лестница берёт его, подбора нет. */
+        d2k_catalog cL = {0};
+        snprintf(cL.net.name, sizeof cL.net.name, "learned-white.example");
+        cL.net.searched = 1; cL.net.confirmed_at = 1791593321;
+        d2k_sched *s = d2k_sched_new(&cL, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 1;
+        d2k_ev h = ev_hello(6, 40088, "net-known.test"), sh;
+        d2k_sched_event(s, &h);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0, "net-known shape fixture");
+        d2k_sched_event(s, &sh);
+        prime_late_rst(s, h.name, 40188);
+        d2k_ev su = ev_suspect(6, 40088); su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(!said("подбираю его из"), "известное белое имя всё равно подбиралось заново");
+        CHECK(sent_contains_plan_payload("learned-white.example"),
+              "лестница не взяла подтверждённое белое имя сети");
+        CHECK(!sent_contains_plan_payload("9gag.com"),
+              "при известном имени лестница перебрала список");
+        vol_rx_cut = 0;
+        d2k_sched_free(s); d2k_catalog_free(&cL);
+    }
+    {
+        /* net: честное «не найдено» записано → подбора нет, лестница на семени. */
+        d2k_catalog cS = {0};
+        cS.net.searched = 1; cS.net.name[0] = '\0'; cS.net.confirmed_at = 1791593321;
+        d2k_sched *s = d2k_sched_new(&cS, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 1;
+        d2k_ev h = ev_hello(6, 40089, "net-none.test"), sh;
+        d2k_sched_event(s, &h);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0, "net-none shape fixture");
+        d2k_sched_event(s, &sh);
+        prime_late_rst(s, h.name, 40189);
+        d2k_ev su = ev_suspect(6, 40089); su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(!said("подбираю его из"), "при записанном «не найдено» подбор запустился заново");
+        CHECK(sent_contains_plan_payload("hcaptcha.com") && !sent_contains_plan_payload("9gag.com"),
+              "после «не найдено» лестница не на семени");
+        vol_rx_cut = 0;
+        d2k_sched_free(s); d2k_catalog_free(&cS);
+    }
+
     /* Полная очередь сохранённых планов коробки не должна вытеснять новый
        RX-volume-кандидат навсегда. Все восемь сохранённых испытываются
        первыми; после восьми отказов в проводной очереди появляется профильная
@@ -9128,6 +9216,7 @@ rx_volume_tests:
     {
         d2k_catalog cFull;
         memset(&cFull, 0, sizeof cFull);
+        net_name_known(&cFull, "hcaptcha.com");
         cFull.boxes = calloc(1, sizeof *cFull.boxes);
         CHECK(cFull.boxes != NULL, "не удалось создать коробку для полной очереди");
         if (cFull.boxes) {
