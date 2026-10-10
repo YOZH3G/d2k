@@ -70,6 +70,7 @@ static int ask_q(d2k_quic_arm_context *c, d2k_quic_arm *r, d2k_quic_arm_question
     struct timespec t0,t1;
     clock_gettime(CLOCK_MONOTONIC,&t0);
     q->need_complete=c->need_complete;
+    q->budget_pk=c->budget_pk;
     d2k_quic_arm_data d=c->data(q,c->data_user);
     clock_gettime(CLOCK_MONOTONIC,&t1);
     if(c->spent) {

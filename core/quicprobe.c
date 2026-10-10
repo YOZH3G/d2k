@@ -2735,7 +2735,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                             .spent=arm_budget_spent,
                             .path=arm_path[0]?arm_path:NULL,
                             .no_split=arm_split_unfit,
-                            .need_complete=1};
+                            .need_complete=1, .budget_pk=dq.budget_pk};
                         arm->data_cut_seen = 1;
                         if (data_cut == 2) {
                             /* Перепроверка перед снятием запрета QUIC: нужен

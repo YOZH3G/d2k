@@ -4,7 +4,7 @@
 #include "d2k_quichello.h"
 #include "d2k_quic.h"
 static int calls, fails, lose_base_mark, junk16_asks, all_pass;
-static int fragment_calls;
+static int fragment_calls, arm_second_stalls;
 static size_t first_prefix;
 static uint8_t first_arm_hello[2048];
 static size_t first_arm_hello_len;
@@ -77,6 +77,10 @@ static d2k_tally arm_probe(const d2k_quic_arm_question *q,const char *sni,
         else t.fail=D2K_QUIC_REPEATS;
         return t;
     }
+    if(arm_second_stalls && q->control) {
+        d2k_tally t={0}; t.marked=1; t.fail=D2K_QUIC_REPEATS;
+        *sent=D2K_QUIC_REPEATS; return t;
+    }
     /* Fragment survival names nothing: the wire layer draws a fresh donor
        neutralName() per repeat (arms.go:204-205), never the control
        snapshot's name or the scheduler decoy. */
@@ -130,7 +134,11 @@ static d2k_quic_arm_data data_cut(const d2k_quic_arm_question *q,const char *sni
         arm_need_complete = q->need_complete;
         arm_budget_seen = q->budget_pk;
         data_calls++;
-        d.verdict=D2K_QAD_PASS; d.app_bytes=D2K_QUIC_ARM_DATA_BYTES;
+        /* A short complete first response succeeds only when no packet-budget
+           reproduction was requested. With it, the silent second request cuts. */
+        d.verdict=arm_second_stalls && q->budget_pk ? D2K_QAD_CUT : D2K_QAD_PASS;
+        d.app_bytes=1100;
+        if(arm_second_stalls) CHECK(q->budget_pk==direct_budget);
     }
     return d;
 }
@@ -226,15 +234,24 @@ static void post_handshake_stall(void) {
     CHECK(strstr(r.reason,"после рукопожатия")!=NULL);
     CHECK(arm.data_cut==1);
     /* Поле 04.10: свой запрос мерится бюджетом коробки (по умолчанию 25),
-       плечи — прежним правилом одного ответа. Воспроизведение — выход. */
-    CHECK(direct_budget==D2K_QUIC_BOX_BUDGET_PKTS && arm_budget_seen==0);
+       плечи обязаны пройти тот же бюджет. Воспроизведение — выход. */
+    CHECK(direct_budget==D2K_QUIC_BOX_BUDGET_PKTS && arm_budget_seen==D2K_QUIC_BOX_BUDGET_PKTS);
     CHECK(arm.data_cut_seen==1);
     /* Бюджет коробки из замера доходит до своего запроса и переживает прогон. */
     memset(&arm,0,sizeof arm); arm.data_cut=1; arm.budget_pk=17;
     calls=0; data_calls=direct_data_calls=0; direct_budget=0;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
-    CHECK(r.verdict==D2K_V_OPAQUE && direct_budget==17 && arm.budget_pk==17);
+    CHECK(r.verdict==D2K_V_OPAQUE && direct_budget==17 && arm_budget_seen==17 && arm.budget_pk==17);
+    /* Both strategy and fallback arms must reject first-response-only success. */
+    memset(&arm,0,sizeof arm); arm.data_cut=1; arm.budget_pk=17;
+    calls=0; data_calls=direct_data_calls=0; arm_second_stalls=1;
+    char saved_mode=strategy_mode; strategy_mode='Y';
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(r.verdict==D2K_V_OPAQUE && arm.kind==D2K_QA_NOT_FOUND);
+    CHECK(data_calls>2 && arm_budget_seen==17);
+    arm_second_stalls=0; strategy_mode=saved_mode;
     /* Перепроверка перед снятием запрета QUIC (data_cut 2): только прямые
        запросы, плечи не меряются. Прежде вход сводился к 0/1, и ветка
        «2» была мёртвой — перепроверка мерила плечи. */

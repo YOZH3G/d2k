@@ -21,7 +21,7 @@ typedef struct {
        после рукопожатия — сравнение с прямым запросом на том же пути). */
     int need_complete;
     /* Поле 04.10 (rua.gr): бюджет коробки в пакетах для воспроизведения
-       обрыва своим запросом. 0 — один запрос, как прежде (плечи). Больше
+       обрыва своим запросом. 0 — один запрос (без воспроизведения обрыва). Больше
        нуля — запросы на новых потоках той же связи, пока она не перенесёт
        2 × budget_pk датаграмм или сервер не замолчит (PING). */
     unsigned budget_pk;
@@ -119,6 +119,8 @@ typedef struct {
     int no_split;
     /* Задача 50, раунд 3: этап данных засчитывает только ответ целиком. */
     int need_complete;
+    /* Same data-stage packet budget as the direct comparison; 0: one response. */
+    unsigned budget_pk;
 } d2k_quic_arm_context;
 
 /* Runtime transport for one original askArms question. It receives the SNI
