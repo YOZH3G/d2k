@@ -503,6 +503,10 @@ int main(void)
         answer.verdict = D2K_DV_PREFIX; answer.split_pos = 5; answer.probes = 17;
         r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
         CHECK(r.verdict == D2K_V_PREFIX && r.split_pos == 5 && r.probes == 17);
+        dialled = 0;
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
+        CHECK(r.verdict == D2K_V_FLAKY && r.split_pos == 0 && !r.have_arm && r.owns_search);
+        dialled = 1;
         sweep_pass = box_takes;
         r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
         CHECK(r.have_arm);

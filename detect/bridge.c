@@ -306,6 +306,16 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
     snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);
     out.split_pos = res.split_pos;
     out.probes = res.probes;
+    /* Socket-only split diagnostics remain useful on unsupported hosts, but
+       cannot arm a packet program that the measurement never executed. */
+    if ((res.verdict == D2K_DV_PREFIX || res.verdict == D2K_DV_WHOLE_PACKET) &&
+        d2k_raw_dial_count() == res.raw_dial_base) {
+        out.verdict = D2K_V_FLAKY;
+        out.split_pos = 0;
+        snprintf(out.reason, sizeof out.reason,
+                 "разрез проверен только записями сокета — общий пакетный исполнитель не участвовал");
+        return out;
+    }
     if (refused.first[0]) {
         size_t n;
         if (!res.has_hit) {
