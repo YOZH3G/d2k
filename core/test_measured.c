@@ -575,8 +575,28 @@ static void whitelist_names(void) {
     CHECK(shape_ok);
 }
 
+/* ИМЯ ПРИМАНКИ RX-ЛЕСТНИЦЫ ЗАДАЁТСЯ (поле 10.10.2026): белое имя сети вместо
+ * зашитого hcaptcha.com. Имя — в бинарном payload, не в тексте плана, поэтому
+ * сверяем, что РАЗНЫЕ имена дают разный план, а обёртка по умолчанию равна
+ * плану с hcaptcha.com. Пустое имя — отказ. */
+static void rx_volume_named(void) {
+    case_name = "rx-volume named decoy";
+    char def[4096], hc[4096], other[4096], empty[4096];
+    CHECK(d2k_rx_volume_plan(0, D2K_SHAPE_MODERN, 1492, def, sizeof def) == 0);
+    CHECK(d2k_rx_volume_plan_named(0, D2K_SHAPE_MODERN, 1492, "hcaptcha.com", hc, sizeof hc) == 0);
+    CHECK(!strcmp(def, hc)); /* обёртка по умолчанию = hcaptcha.com */
+    CHECK(d2k_rx_volume_plan_named(0, D2K_SHAPE_MODERN, 1492, "9gag.com", other, sizeof other) == 0);
+    CHECK(strcmp(def, other) != 0); /* другое имя — другой план */
+    CHECK(d2k_rx_volume_plan_named(0, D2K_SHAPE_MODERN, 1492, "", empty, sizeof empty) != 0);
+    CHECK(d2k_rx_volume_plan_named(0, D2K_SHAPE_MODERN, 1492, NULL, empty, sizeof empty) != 0);
+    /* Разрез и форма плана не зависят от имени. */
+    CHECK(strstr(other, "split payload_start +2\norder forward\n") != NULL);
+    CHECK(strstr(other, "poison 1 tcpts\n") != NULL);
+}
+
 int main(void) {
     whitelist_names();
+    rx_volume_named();
     md5_plan_contract();
     md5_wire();
     malformed();

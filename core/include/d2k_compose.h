@@ -153,6 +153,10 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
 #define D2K_RX_VOLUME_PLAN_VARIANTS 5
 int d2k_rx_volume_plan(unsigned variant, d2k_shape shape, size_t send_cap,
                        char *buf, size_t cap);
+/* То же, но имя приманки задаётся (белое имя сети, поле 10.10.2026). Пустое
+ * имя — отказ: план без приманки смысла не имеет. */
+int d2k_rx_volume_plan_named(unsigned variant, d2k_shape shape, size_t send_cap,
+                             const char *name, char *buf, size_t cap);
 
 /* БЕЛЫЙ СПИСОК ИМЁН-ПРИМАНОК (поле 10.10.2026). SNI-whitelist коробки за
  * RX-обрывом объёма различается по оператору: 266 имён — СЕМЯ, снятое
