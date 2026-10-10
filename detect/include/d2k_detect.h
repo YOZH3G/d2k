@@ -16,6 +16,7 @@
 #ifndef D2K_DETECT_H
 #define D2K_DETECT_H
 
+#include "d2k_arm.h"
 #include <stddef.h>
 #include <sys/types.h>
 #include <stdint.h>
@@ -97,7 +98,7 @@ typedef enum {
     D2K_ACCEPT_TLSRECORD     /* любая запись TLS, включая алерт (ControlTrigger) */
 } d2k_accept_t;
 
-#define D2K_TRIGGER_MAX 16384
+#define D2K_TRIGGER_MAX D2K_ARM_TRIGGER_MAX
 #define D2K_TRIGGER_NAME_MAX 260 /* "tls:" + SNI до 253 + NUL, с запасом */
 
 /* Что шлём и как понимаем, что ответ пришёл. */
@@ -148,40 +149,9 @@ int d2k_poison_has_fake(const d2k_poison *p);
 /* Одна и та же гипотеза по всем параметрам, кроме имени. */
 int d2k_poison_same(const d2k_poison *a, const d2k_poison *b);
 
-/* ЧТО СЫРОЙ ЗОНД КЛАДЁТ НА ПРОВОД — одним списком посылок.
- *
- * Замер — эталон: план обязан повторить на проводе ровно то, что прошло
- * проверку (решение владельца 09.10.2026). Поэтому состав посылок задаётся
- * здесь, в одном месте: по нему шлёт сырой зонд (raw.c), и с ним же тест
- * сверяет действия датапата по каждой гипотезе. Заголовки (окно, IP ID,
- * сумма, метка времени) строят raw.c и datapath/wire.c в профиле
- * detect-tcp-v1; здесь — какие посылки, в каком порядке, с какими номерами,
- * байтами, порчей и паузами. */
-#define D2K_SEND_FAKE    0  /* подделка: сервер выбросит, коробка возьмёт */
-#define D2K_SEND_PAYLOAD 1  /* настоящие байты приветствия */
-#define D2K_SEND_URG     2  /* посторонний байт со срочным указателем */
-#define D2K_SEND_MAX     16
-typedef struct {
-    int            kind;     /* D2K_SEND_* */
-    int            syn;      /* флаг SYN поверх готового соединения (syndata) */
-    int64_t        seq_off;  /* номер относительно начала приветствия, до seq_shift */
-    const uint8_t *bytes;
-    size_t         len;
-    d2k_poison     poison;   /* порча посылки; у настоящих байтов — нулевая */
-    int            delay_ms; /* пауза ПЕРЕД посылкой */
-} d2k_send;
-typedef struct {
-    d2k_send v[D2K_SEND_MAX];
-    size_t   n;
-    int      tail_ms;    /* пауза после последней посылки, до чтения ответа */
-    int      stream_len; /* на сколько байт сдвинулся поток (oob: +1) */
-} d2k_sends;
-/* fake и seg — буферы вызывающего: в них собираются подделка и сегмент
- * перекрытия, посылки ссылаются на них и на tr->payload. 0 — список готов,
- * -1 — не уместилось. */
-int d2k_poison_sends(const d2k_trigger *tr, const d2k_poison *p,
-                     uint8_t *fake, size_t fake_cap, uint8_t *seg, size_t seg_cap,
-                     d2k_sends *out);
+
+/* Pure conversion shared by raw execution and the scheduler bridge. */
+int d2k_arm_from_poison(const d2k_poison *, d2k_arm *, char *, size_t);
 
 /* Что удалось узнать о самой коробке. UNSET означает «не измерено». */
 typedef struct {

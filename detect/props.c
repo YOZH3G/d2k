@@ -319,7 +319,8 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         obs->fail = done - pass;
         if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
         got = pass == opt->repeats;
-        apply_set(&res->props, pp[i].set, got);
+        /* A local compile/apply/send refusal is not an answer from the box. */
+        if (!local_err) apply_set(&res->props, pp[i].set, got);
         /* Находку, которую план не выражает (фильтр дерева, d2k_opts.accept),
          * не берём и не останавливаемся: ответ уже в векторе, а следующие
          * вопросы могут найти выразимый приём — в переборе их может не быть. */

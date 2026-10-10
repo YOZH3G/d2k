@@ -738,8 +738,21 @@ static void test_selftest_cache(void)
     }
 }
 
+static void test_local_plan_error_is_not_a_property(void) {
+    d2k_result r = {0}; d2k_opts opt = {0}; d2k_trigger tr = {0}; d2k_poison hit = {0};
+    opt.repeats = 3; opt.white.len = 2;
+    tr.len = 2049; tr.sni_off = 100; tr.sni_len = 11;
+    g_script = NULL; g_default = "e"; g_res = &r; g_ask = -1;
+    CHECK(d2k_run_properties((uint8_t[]){192,0,2,1}, 443, &tr, &opt, &r, &hit) == 0,
+          "локальный отказ стал находкой");
+    d2k_dprops expected = {0};
+    CHECK(!memcmp(&r.props, &expected, sizeof expected), "локальный отказ изменил свойства коробки");
+    CHECK(r.nanswered == 0, "локальный отказ стал ответом сети");
+}
+
 int main(void)
 {
+    test_local_plan_error_is_not_a_property();
     srv_start();
     bind_list_names();
     if (getenv("CAPTURE")) {

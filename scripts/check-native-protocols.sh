@@ -9,7 +9,7 @@ if [ "${1:-}" != --inside ]; then
     cd "$ROOT"
     tar -cf - core/include datapath/include core/verify.c core/tls13.c core/tls12.c core/p256.c \
         core/tls13core.c core/x25519.c core/crypto.c core/hello.c core/hello_profiles.inc \
-        core/meas.c core/link.c core/compose.c core/quicconn.c core/quicwire.c core/h3.c \
+        core/meas.c core/link.c core/compose.c core/measured.c core/quicconn.c core/quicwire.c core/h3.c \
         tests/native-protocol-probe.c tests/native-h3-server.py scripts/check-native-protocols.sh \
         | tar -C "$WORK" -xf -
     docker run --rm -v "$WORK:/w" -w /w gcc:14 sh scripts/check-native-protocols.sh --inside
@@ -21,7 +21,7 @@ apt-get install -y -qq openssl python3-aioquic >/dev/null
 cc -std=c99 -O2 -Wall -Wextra -Werror -Icore/include -Idatapath/include \
     -o /tmp/native-probe tests/native-protocol-probe.c core/verify.c core/tls13.c \
     core/tls12.c core/p256.c core/tls13core.c core/x25519.c core/crypto.c core/hello.c core/meas.c \
-    core/link.c core/compose.c core/quicconn.c core/quicwire.c core/h3.c
+    core/link.c core/compose.c core/measured.c core/quicconn.c core/quicwire.c core/h3.c
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout /tmp/native-key.pem -out /tmp/native-cert.pem -days 1 -nodes \
     -subj /CN=ipv6.example -addext subjectAltName=DNS:ipv6.example >/dev/null 2>&1

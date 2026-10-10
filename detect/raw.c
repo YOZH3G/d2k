@@ -28,6 +28,9 @@
  */
 #include "d2k_detect.h"
 #include "d2k_arm.h"
+#include "d2k_compose.h"
+#include "d2k_plantlv.h"
+#include "d2k_wire.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -169,8 +172,6 @@ enum {
 
 typedef struct {
     uint8_t recv[65535];
-    uint8_t fake[2 * D2K_TRIGGER_MAX];
-    uint8_t seg[D2K_TRIGGER_MAX + 4096];
     uint8_t resp[8192];
 } raw_buffers;
 
@@ -185,6 +186,8 @@ typedef struct {
     uint32_t seq; /* наш следующий номер */
     uint32_t ack; /* что подтверждаем */
     int      rule_up;
+    uint8_t tcp_options[12];
+    uint8_t tcp_options_len;
     /* raw_recv returns a slice which must survive until the next receive
      * on THIS connection, without being overwritten by another worker. */
     raw_buffers *buffers; /* heap-owned: do not grow the router worker stack */
@@ -997,6 +1000,23 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
             if (ack != c->seq + 1) {
                 continue;
             }
+            /* Keep negotiated timestamps for tcp-template-v1. The SYN
+               offered TSval=1; echo the peer's actual SYN-ACK timestamp. */
+            const uint8_t *tcp = c->buffers->recv + (c->family == 6 ? 0 :
+                (size_t)(c->buffers->recv[0] & 15) * 4);
+            size_t hlen = (size_t)(tcp[12] >> 4) * 4;
+            for (size_t off = 20; off < hlen;) {
+                uint8_t kind = tcp[off];
+                if (!kind) break;
+                if (kind == 1) { off++; continue; }
+                if (off + 2 > hlen || tcp[off + 1] < 2 || tcp[off + 1] > hlen - off) break;
+                if (kind == 8 && tcp[off + 1] == 10) {
+                    memcpy(c->tcp_options, (uint8_t[]){1,1,8,10,0,0,0,1,0,0,0,0}, 12);
+                    memcpy(c->tcp_options + 8, tcp + off + 2, 4);
+                    c->tcp_options_len = 12;
+                }
+                off += tcp[off + 1];
+            }
             c->seq++;
             c->ack = seq + 1;
             if (raw_send(c, NULL, 0, TCP_ACK, &none) != 0) {
@@ -1099,33 +1119,6 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
     return 0;
 }
 
-/* sendURG шлёт один байт как срочные данные: флаг URG плюс указатель за ним.
- * Сервер по RFC 793 изымает такой байт из потока, коробка — обычно нет. */
-static int raw_send_urg(raw_conn *c, const uint8_t *payload, size_t plen)
-{
-    uint8_t pkt[256];
-    d2k_poison none;
-    size_t n;
-    uint8_t *t;
-    uint16_t sum;
-
-    memset(&none, 0, sizeof(none));
-    n = build_ip_tcp(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
-                       c->seq, c->ack, (uint8_t)(TCP_PSH | TCP_ACK | TCP_URG),
-                       payload, plen, &none, NULL, 0);
-    if (n == 0) {
-        return -1;
-    }
-    size_t ihl = c->family == 6 ? 40 : 20;
-    t = pkt + ihl;
-    /* Указатель срочности — сразу за нашим байтом. */
-    t[18] = 0x00;
-    t[19] = (uint8_t)plen;
-    sum = tcp_checksum_family(c->family, c->src, c->dst, t, n - ihl);
-    wr16(t + 16, sum);
-    return raw_sendto(c, pkt, n);
-}
-
 /* probeRawHandshake — самопроверка сырого слоя: доходит ли наше собственное
  * рукопожатие. Проверять его отправкой полезной нагрузки нельзя — поле
  * 2026-08-28, googlevideo: тот фронтенд обслуживает только заблокированные
@@ -1150,6 +1143,64 @@ int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t 
  * too long» на одном и том же EMSGSIZE); она снимается таблицей в
  * tests/compare.sh, а не подгонкой кода. */
 
+/* The measured Plan is the program, not a second description reconstructed
+ * after the experiment. Same compiler, parser, TLS modifiers, segmentation,
+ * ordering and IP/TCP builder as the datapath. Only the sink differs. */
+static int raw_send_plan(raw_conn *c, const d2k_trigger *tr, const d2k_poison *p,
+                         const d2k_detect_stop *cancel, char *err, size_t errcap)
+{
+    d2k_arm arm;
+    d2k_arm_input input = {0};
+    d2k_plan *plan = NULL;
+    d2k_actions out = {0};
+    d2k_pkt pkt = {0};
+    d2k_conn conn = {0};
+    struct plan_buffers { char text[8192]; uint8_t tlv[D2K_PLAN_TLV_MAX]; uint8_t packet[8192]; };
+    struct plan_buffers *b = NULL;
+    size_t tn = 0;
+    int rc = -1;
+    if (errcap) err[0] = '\0';
+    if (d2k_arm_from_poison(p, &arm, err, errcap)) return -1;
+    if (p->decoy_len > sizeof input.decoy || (p->decoy_len && !p->decoy)) {
+        snprintf(err, errcap, "приманку измерительного плана нельзя сохранить целиком");
+        return -1;
+    }
+    input.trigger_len = tr->len;
+    input.sni_off = tr->sni_off; input.sni_len = tr->sni_len;
+    input.decoy_len = p->decoy_len;
+    if (p->decoy_len) memcpy(input.decoy, p->decoy, p->decoy_len);
+    b = malloc(sizeof *b);
+    if (!b) { snprintf(err, errcap, "нет памяти для измерительного плана"); return -1; }
+    if (d2k_arm_plan_measured(&arm, &input, b->text, sizeof b->text) ||
+        d2k_plan_text_to_tlv(b->text, b->tlv, sizeof b->tlv, &tn, err, errcap) ||
+        d2k_plan_load(b->tlv, tn, &plan, err, errcap)) goto done;
+    pkt.seq = c->seq; pkt.payload = tr->payload; pkt.payload_len = tr->len;
+    pkt.have_sni = tr->sni_off > 0 && tr->sni_len > 0;
+    pkt.sni_off = tr->sni_off; pkt.sni_len = tr->sni_len;
+    if (d2k_plan_apply(plan, NULL, &pkt, &out) || out.fate != D2K_ORIG_DROP) goto done;
+    conn.family = c->family; conn.ack = c->ack; conn.window = 65535; conn.ttl = 64;
+    memcpy(&conn.src_ip, c->src, 4); memcpy(&conn.dst_ip, c->dst, 4);
+    memcpy(conn.src_ip6, c->src, 16); memcpy(conn.dst_ip6, c->dst, 16);
+    conn.src_port = htons(c->sport); conn.dst_port = htons(c->dport);
+    memcpy(conn.tcp_options, c->tcp_options, c->tcp_options_len);
+    conn.tcp_options_len = c->tcp_options_len;
+    for (size_t i = 0; i < out.n; i++) {
+        if (d2k_detect_stopped(cancel)) { snprintf(err, errcap, "context canceled"); goto done; }
+        if (out.v[i].delay_us) d2k_sleep_ms((int)(out.v[i].delay_us / 1000));
+        size_t n = d2k_wire_build(&conn, &out.v[i], b->packet, sizeof b->packet);
+        if (!n || raw_sendto(c, b->packet, n)) goto done;
+    }
+    /* Historical receive-side grace period; not an emission instruction. */
+    if (p->disorder && !p->disorder_pos && !p->seqovl && !p->seqovl_exact && !p->fake_between)
+        d2k_sleep_ms(12);
+    c->seq += (uint32_t)tr->len + (p->oob ? 1u : 0u);
+    rc = 0;
+done:
+    if (rc && errcap && !err[0]) snprintf(err, errcap, "не удалось исполнить измерительный план");
+    d2k_actions_free(&out); d2k_plan_free(plan); free(b);
+    return rc;
+}
+
 /* probePoison — ОДИН зонд, собранный из независимых приёмов.
  *
  * Боевое плечо для googlevideo это фальшивка С БИТОЙ СУММОЙ И НИЗКИМ TTL плюс
@@ -1165,9 +1216,7 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
 {
     uint8_t *resp;
     raw_conn c;
-    d2k_sends plan;
-    uint32_t base;
-    size_t resp_len = 0, i;
+    size_t resp_len = 0;
     int rc = 0;
 
     if (raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap) != 0) {
@@ -1175,47 +1224,26 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
     }
     resp = c.buffers->resp;
 
-    /* СОСТАВ ПОСЫЛОК — d2k_poison_sends (poison.c): по тому же списку тест
-     * сверяет план датапата, поэтому замер и план не могут разойтись молча.
-     *
-     * ФАЛЬШИВКА — ОТДЕЛЬНАЯ ПОСЫЛКА, А НЕ НАЧИНКА ПЕРЕКРЫТИЯ. Дамп боевого
-     * плеча 2026-08-29 показал, что это разные вещи и идут они подряд:
-     *     ttl 63  seq 1:678     len 677   × 7   ← фальшивка, семь копий
-     *     ttl 64  seq -680:2    len 682         ← перекрытие слева
-     *     ttl 64  seq 2:1210    len 1208        ← остальное приветствие */
-    if (d2k_poison_sends(tr, p, c.buffers->fake, sizeof(c.buffers->fake),
-                         c.buffers->seg, sizeof(c.buffers->seg), &plan) != 0) {
-        snprintf(err, errcap, "посылки гипотезы не уместились");
-        raw_close(&c);
-        return -1;
-    }
-    base = c.seq;
-    for (i = 0; i < plan.n; i++) {
-        const d2k_send *s = &plan.v[i];
-        if (s->delay_ms > 0) {
-            if (s->kind == D2K_SEND_FAKE && d2k_detect_stopped(cancel)) {
-                raw_close(&c);
-                snprintf(err, errcap, "context canceled");
-                return -1;
-            }
-            d2k_sleep_ms(s->delay_ms);
+    /* Direct control and SYN-data have no bypass Plan. All expressible
+       hypotheses execute the Plan; a compile/apply failure never falls back
+       to the old sender and cannot become a positive measurement. */
+    if (strcmp(p->name, "none") && !p->syn_data) {
+        if (raw_send_plan(&c, tr, p, cancel, err, errcap)) {
+            raw_close(&c); return -1;
         }
-        c.seq = (uint32_t)((int64_t)base + s->seq_off);
-        if (s->kind == D2K_SEND_URG) {
-            if (raw_send_urg(&c, s->bytes, s->len) != 0) {
-                goto senderr;
-            }
-        } else if (raw_send(&c, s->bytes, s->len,
-                            (uint8_t)((s->syn ? TCP_SYN : 0) | TCP_PSH | TCP_ACK),
-                            &s->poison) != 0) {
-            goto senderr;
-        }
+        goto receive;
     }
-    if (plan.tail_ms > 0) {
-        d2k_sleep_ms(plan.tail_ms);
-    }
-    c.seq = base + (uint32_t)plan.stream_len;
 
+    /* Non-bypass diagnostics only: direct control / unsupported SYN-data.
+       Neither can be promoted to a measured bypass plan by the bridge. */
+    d2k_poison none = {0};
+    if (raw_send(&c, tr->payload, tr->len,
+                 (uint8_t)(TCP_PSH | TCP_ACK | (p->syn_data ? TCP_SYN : 0)), &none)) {
+        goto senderr;
+    }
+    c.seq += (uint32_t)tr->len;
+
+receive:
     if (raw_read_payload(&c, timeout_ms, cancel, resp, sizeof(c.buffers->resp),
                          &resp_len) != 0) {
         raw_close(&c);

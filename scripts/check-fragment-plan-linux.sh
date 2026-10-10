@@ -14,7 +14,7 @@ make -C core hello_profiles.inc
 "${D2K_ZIG:-zig}" cc -target aarch64-linux-musl -std=c99 -O2 -Wall -Wextra -Werror \
     -I"$D2K_ROOT/datapath/include" -I"$D2K_ROOT/core/include" \
     "$D2K_ROOT/tests/fragment-plan/raw.c" "$D2K_TMP/raw.o" \
-    tests/fragment-plan/nfq.c tests/fragment-plan/compose.c core/compose.c core/plantlv.c core/hello.c core/meas.c core/link.c \
+    tests/fragment-plan/nfq.c tests/fragment-plan/compose.c core/compose.c core/measured.c core/plantlv.c core/hello.c core/meas.c core/link.c \
     core/quichello.c core/tls13core.c core/x25519.c core/quic.c core/quicwire.c core/crypto.c core/ipfrag.c \
     datapath/plan_parse.c datapath/plan_apply.c datapath/session.c datapath/hold.c datapath/capture.c \
     datapath/track.c datapath/tls.c datapath/wire.c datapath/wire_udp.c datapath/nat.c \

@@ -33,7 +33,7 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = stun.c net4.c voice.c voice_discovery.c meas.c verdict.c crypto.c quicwire.c tls13core.c quicconn.c h3.c quic.c quicprobe.c quicarms.c ipfrag.c props.c hello.c catalog.c match.c compose.c link.c plantlv.c x25519.c tls13.c tls12.c p256.c volume.c sched.c quichello.c verify.c
+SRC     = stun.c net4.c voice.c voice_discovery.c meas.c verdict.c crypto.c quicwire.c tls13core.c quicconn.c h3.c quic.c quicprobe.c quicarms.c ipfrag.c props.c hello.c catalog.c match.c compose.c measured.c link.c plantlv.c x25519.c tls13.c tls12.c p256.c volume.c sched.c quichello.c verify.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicprobe.h include/d2k_quic_arms.h include/d2k_ipfrag.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
           include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
@@ -98,7 +98,7 @@ TESTS += test_httpsearch
 check: test-httpsearch
 .PHONY: test-httpsearch
 test_httpsearch: test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c include/d2k_httpsearch.h
-	$(CC) $(CFLAGS) -o $@ test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c $(TEST_LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
 test-httpsearch: test_httpsearch
 	./test_httpsearch
 
@@ -115,8 +115,8 @@ check: test-verify-http
 .PHONY: test-verify-http
 test-verify-http: test_verify_http
 	./test_verify_http
-test_verify_http: test_verify_http.c verify.c quicconn.c tls12.o p256.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< tls12.o p256.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_verify_http: test_verify_http.c verify.c quicconn.c tls12.o p256.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< tls12.o p256.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 check: test-http-reply
 .PHONY: test-http-reply
 test-http-reply: test_http_reply
@@ -131,8 +131,8 @@ test-groups-catalog: test_groups_catalog
 test_groups_catalog: test_groups_catalog.c catalog.o groups.o domain.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< catalog.o groups.o domain.o $(LDFLAGS)
 
-test_ech: test_ech.c verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_ech: test_ech.c verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 
 .PHONY: test-ech
 test-ech: test_ech
@@ -142,7 +142,7 @@ check: test-ech
 
 .PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-rst-trigger test-voice-sched test-verify FORCE
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o groups.o domain.o match.o compose.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o d2kask d2kc d2kvoice
+all: meas.o verdict.o crypto.o quic.o quicprobe.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o d2kask d2kc d2kvoice
 
 
 meas.o: meas.c $(HDR)
@@ -394,8 +394,8 @@ TESTS += test_quic_split
 test_quicprobe: test_quicprobe.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quicprobe.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(TEST_LDFLAGS)
 
-test_quic_arms: test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o hello.o plantlv.o link.o quicconn.o h3.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o hello.o plantlv.o link.o quicconn.o h3.o $(TEST_LDFLAGS)
+test_quic_arms: test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o measured.o hello.o plantlv.o link.o quicconn.o h3.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o measured.o hello.o plantlv.o link.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 test_p256: test_p256.c p256.o tls13core.o crypto.o x25519.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_p256.c p256.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
@@ -433,8 +433,8 @@ test_catalog: test_catalog.c catalog.o groups.o domain.o $(HDR)
 test_match: test_match.c match.o catalog.o groups.o domain.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_match.c match.o catalog.o groups.o domain.o $(TEST_LDFLAGS)
 
-test_compose: test_compose.c compose.o hello.o meas.o link.o $(HDR) $(TESTHDR)
-	$(CC) $(CFLAGS) -o $@ test_compose.c compose.o hello.o meas.o link.o $(TEST_LDFLAGS)
+test_compose: test_compose.c compose.o measured.o hello.o meas.o link.o $(HDR) $(TESTHDR)
+	$(CC) $(CFLAGS) -o $@ test_compose.c compose.o measured.o hello.o meas.o link.o $(TEST_LDFLAGS)
 test_link: test_link.c link.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_link.c link.o $(TEST_LDFLAGS)
 
@@ -448,8 +448,8 @@ test_link: test_link.c link.o $(HDR)
 # замера. Без pthread — сам d2kask однопоточный (arm+wait — обычный
 # последовательный цикл по d2k_link_next, тем же приёмом, что
 # wait_for_event в compose.c).
-d2kask: d2kask.c compose.o hello.o meas.o link.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ d2kask.c compose.o hello.o meas.o link.o $(LDFLAGS)
+d2kask: d2kask.c compose.o measured.o hello.o meas.o link.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ d2kask.c compose.o measured.o hello.o meas.o link.o $(LDFLAGS)
 
 # test_d2kask зовёт настоящий d2kask подпроцессом (execv "./d2kask" — см. её
 # шапку) — hello.o нужен ей САМОЙ (build_hello_hex_file собирает настоящее
@@ -557,8 +557,8 @@ test_d2kc_proto: test_d2kc_proto.c $(HDR)
 
 check: all test-stun test-voice test-tls12 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-sched-modes test-verify test-volume test-httpup-logic test-measured
 
-test_measured: test_measured.c compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h ../datapath/wire.c ../datapath/include/d2k_session.h
-	$(CC) $(CFLAGS) -o $@ test_measured.c compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
+test_measured: test_measured.c compose.o measured.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h ../datapath/wire.c ../datapath/include/d2k_session.h
+	$(CC) $(CFLAGS) -o $@ test_measured.c compose.o measured.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
 
 test-measured: test_measured
 	./test_measured
@@ -583,13 +583,13 @@ SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=al
 # ниже (D2KASK_BIN), иначе санитайзер проверял бы только ТЕСТ, а не саму
 # утилиту, которую он должен ловить прежде всего.
 san-measured: hello_profiles.inc
-	$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-test_measured test_measured.c compose.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread
+	$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-test_measured test_measured.c compose.c measured.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread
 	/tmp/d2k-core-san-test_measured
 
 # test_httpsearch, как и test_measured, берёт исполнитель плана датапата:
 # общий цикл ниже его не слинкует.
 san-httpsearch:
-	$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-test_httpsearch test_httpsearch.c httpsearch.c httpup_logic.c plantlv.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c -lpthread
+	$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-test_httpsearch test_httpsearch.c httpsearch.c httpup_logic.c plantlv.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread
 	/tmp/d2k-core-san-test_httpsearch
 
 # test_volume_context подставляет свои заглушки verify/tls12 вместо
@@ -620,7 +620,7 @@ san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask san-meas
 		/tmp/d2k-core-san-$$t; \
 	done
 	@echo "== d2kask (санитайзер самой утилиты, не только теста) =="
-	@$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-d2kask d2kask.c compose.c hello.c meas.c link.c
+	@$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-d2kask d2kask.c compose.c measured.c hello.c meas.c link.c
 	@D2KASK_BIN=/tmp/d2k-core-san-d2kask /tmp/d2k-core-san-test_d2kask
 	@echo "санитайзеры: все проверки прошли"
 
@@ -692,9 +692,9 @@ cross: hello_profiles.inc
 	done
 	@echo "== test_quic_arms целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-a64 \
-		test_quic_arms.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c hello.c plantlv.c link.c quicconn.c h3.c -lpthread || exit 1
+		test_quic_arms.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c measured.c hello.c plantlv.c link.c quicconn.c h3.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-mipsel \
-		test_quic_arms.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c hello.c plantlv.c link.c quicconn.c h3.c -lpthread || exit 1
+		test_quic_arms.c props.c quicprobe.c quicarms.c ipfrag.c net4.c quichello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c compose.c measured.c hello.c plantlv.c link.c quicconn.c h3.c -lpthread || exit 1
 	@echo "== test_hello целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_hello-a64 \
 		test_hello.c hello.c -lpthread || exit 1
@@ -717,9 +717,9 @@ cross: hello_profiles.inc
 		test_match.c match.c catalog.c groups.c domain.c -lpthread || exit 1
 	@echo "== test_compose целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_compose-a64 \
-		test_compose.c compose.c hello.c meas.c link.c -lpthread || exit 1
+		test_compose.c compose.c measured.c hello.c meas.c link.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_compose-mipsel \
-		test_compose.c compose.c hello.c meas.c link.c -lpthread || exit 1
+		test_compose.c compose.c measured.c hello.c meas.c link.c -lpthread || exit 1
 	@echo "== test_link целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_link-a64 \
 		test_link.c link.c -lpthread || exit 1
@@ -727,44 +727,44 @@ cross: hello_profiles.inc
 		test_link.c link.c -lpthread || exit 1
 	@echo "== test_plantlv целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_plantlv-a64 \
-		test_plantlv.c plantlv.c compose.c hello.c meas.c link.c -lpthread || exit 1
+		test_plantlv.c plantlv.c compose.c measured.c hello.c meas.c link.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_plantlv-mipsel \
-		test_plantlv.c plantlv.c compose.c hello.c meas.c link.c -lpthread || exit 1
+		test_plantlv.c plantlv.c compose.c measured.c hello.c meas.c link.c -lpthread || exit 1
 	@echo "== test_sched целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_sched-a64 \
 		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_sched-mipsel \
 		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
 		verify.c quicconn.c h3.c -lpthread || exit 1
 	@echo "== d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kask-a64 \
-		d2kask.c compose.c hello.c meas.c link.c || exit 1
+		d2kask.c compose.c measured.c hello.c meas.c link.c || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-d2kask-mipsel \
-		d2kask.c compose.c hello.c meas.c link.c || exit 1
+		d2kask.c compose.c measured.c hello.c meas.c link.c || exit 1
 	@echo "== test_verify целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_verify-a64 \
-		test_verify.c verify.c quicconn.c quicwire.c h3.c compose.c hello.c meas.c link.c tls13.c tls12.c p256.c tls13core.c x25519.c crypto.c \
+		test_verify.c verify.c quicconn.c quicwire.c h3.c compose.c measured.c hello.c meas.c link.c tls13.c tls12.c p256.c tls13core.c x25519.c crypto.c \
 		-lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_verify-mipsel \
-		test_verify.c verify.c quicconn.c quicwire.c h3.c compose.c hello.c meas.c link.c tls13.c tls12.c p256.c tls13core.c x25519.c crypto.c \
+		test_verify.c verify.c quicconn.c quicwire.c h3.c compose.c measured.c hello.c meas.c link.c tls13.c tls12.c p256.c tls13core.c x25519.c crypto.c \
 		-lpthread || exit 1
 	@echo "== d2kc целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-a64 \
 		d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
-		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
+		verify.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-mipsel \
 		d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
-		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
+		verify.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
 	@echo "== test_measured целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_measured-a64 \
-		test_measured.c compose.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
+		test_measured.c compose.c measured.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_measured-mipsel \
-		test_measured.c compose.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
+		test_measured.c compose.c measured.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
 	@echo "== test_d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_d2kask-a64 \
 		test_d2kask.c hello.c link.c -lpthread || exit 1
@@ -811,14 +811,14 @@ release: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -static -Wl,-S \
 		-o $(BUILDDIR)/d2kc-linux-$(ARCH) d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c \
-		crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c link.c \
-		volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread
+		crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c \
+		volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread
 	@ls -l $(BUILDDIR)/d2kc-linux-$(ARCH)
 
 d2kask-aarch64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
-		-o $(BUILDDIR)/d2kask-aarch64 d2kask.c compose.c hello.c meas.c link.c
+		-o $(BUILDDIR)/d2kask-aarch64 d2kask.c compose.c measured.c hello.c meas.c link.c
 	@ls -l $(BUILDDIR)/d2kask-aarch64
 
 test-plantlv: test_plantlv
@@ -827,8 +827,8 @@ test-plantlv: test_plantlv
 # ../datapath/planlab — не украшение: тест прогоняет переведённый план через
 # НАСТОЯЩИЙ исполнитель датапата. Без этой зависимости цель проходила бы на
 # чистом дереве только потому, что planlab случайно собрал кто-то раньше.
-test_plantlv: test_plantlv.c plantlv.o compose.o hello.o meas.o link.o $(HDR) ../datapath/planlab
-	$(CC) $(CFLAGS) -o $@ $< plantlv.o compose.o hello.o meas.o link.o $(TEST_LDFLAGS)
+test_plantlv: test_plantlv.c plantlv.o compose.o measured.o hello.o meas.o link.o $(HDR) ../datapath/planlab
+	$(CC) $(CFLAGS) -o $@ $< plantlv.o compose.o measured.o hello.o meas.o link.o $(TEST_LDFLAGS)
 
 test-sched: test_sched sched.o quichello.o plantlv.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o
 	./test_sched
@@ -850,9 +850,9 @@ test-sched-modes: test_sched sched.o quichello.o plantlv.o verify.o tls12.o p256
 # умолчание verify_default зовёт d2k_verify_probe). Тест зонд подменяет, но
 # умолчание всё равно линкуется: крючок — точка подмены, а не условная сборка.
 test_sched: test_sched.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
-            hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o $(HDR)
+            hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
-		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o $(TEST_LDFLAGS)
+		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 # Стенд test_verify.c — СВОЙ (не общий test_stand.h): он единственный умеет
 # довести рукопожатие TLS 1.3 до конца и умеет НЕ довести, а без этого уровни
@@ -860,27 +860,27 @@ test_sched: test_sched.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o
 # связывании — тем же расписанием ключей, что у клиента, стенд работает с
 # другой стороны. compose.o тянет за собой hello.o/meas.o/link.o: зонд зовёт
 # d2k_props_contact, а она живёт там же, где остальной опрос свойств.
-test_verify: test_verify.c verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_verify: test_verify.c verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 
 test-verify: test_verify
 	./test_verify
 
-test_quicconn6: test_quicconn6.c quicconn.o quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< quicconn.o quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_quicconn6: test_quicconn6.c quicconn.o quicwire.o compose.o measured.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< quicconn.o quicwire.o compose.o measured.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 
 # Includes quicconn.c itself: the retransmit timer is connection state, and
 # the test needs a ready 1-RTT connection without a live server.
-test_quicconn_rtx: test_quicconn_rtx.c quicconn.c quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_quicconn_rtx: test_quicconn_rtx.c quicconn.c quicwire.o compose.o measured.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< quicwire.o compose.o measured.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 
 .PHONY: test-quicconn-rtx
 check: test-quicconn-rtx
 test-quicconn-rtx: test_quicconn_rtx
 	./test_quicconn_rtx
 
-test_quicconn_fc: test_quicconn_fc.c quicconn.c quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quicconn_fc.c quicwire.o compose.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_quicconn_fc: test_quicconn_fc.c quicconn.c quicwire.o compose.o measured.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quicconn_fc.c quicwire.o compose.o measured.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 
 .PHONY: test-quicconn-fc
 test-quicconn-fc: test_quicconn_fc
@@ -890,7 +890,7 @@ TESTS += test_quicconn_fc
 
 # Поле 04.10 (rua.gr): воспроизведение обрыва своим запросом мерится бюджетом
 # коробки. Включает quicconn.c ради связи с ключами без живого сервера.
-REPRO_OBJS = props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o h3.o compose.o link.o
+REPRO_OBJS = props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o h3.o compose.o measured.o link.o
 test_quic_repro_budget: test_quic_repro_budget.c quicconn.c $(REPRO_OBJS) $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quic_repro_budget.c $(REPRO_OBJS) $(TEST_LDFLAGS)
 
@@ -922,8 +922,8 @@ check: test-volume-context
 test-volume-context: test_volume_context
 	./test_volume_context
 
-test_volume: test_volume.c volume.o verify.o tls13.o tls13core.o tls12.o p256.o x25519.o crypto.o compose.o meas.o hello.o link.o quicconn.o quicwire.o h3.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< volume.o verify.o tls13.o tls13core.o tls12.o p256.o x25519.o crypto.o compose.o meas.o hello.o link.o quicconn.o quicwire.o h3.o $(TEST_LDFLAGS)
+test_volume: test_volume.c volume.o verify.o tls13.o tls13core.o tls12.o p256.o x25519.o crypto.o compose.o measured.o meas.o hello.o link.o quicconn.o quicwire.o h3.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< volume.o verify.o tls13.o tls13core.o tls12.o p256.o x25519.o crypto.o compose.o measured.o meas.o hello.o link.o quicconn.o quicwire.o h3.o $(TEST_LDFLAGS)
 
 test-volume: test_volume
 	./test_volume
@@ -955,11 +955,11 @@ $(DETECT_OBJ): FORCE
 	$(MAKE) -C ../detect $(notdir $@)
 
 d2kc: d2kc.c httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
-      hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
+      hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
       $(DETECT_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o \
-		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
-		$(DETECT_OBJ) $(TEST_LDFLAGS)
+		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
+		$(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
 
 clean:
 	rm -f *.o $(TESTS) d2kask d2kc hello_profiles.inc
@@ -1017,10 +1017,13 @@ TESTS += test_probe_plan
 check: test-probe-plan
 test-probe-plan: test_probe_plan
 	./test_probe_plan
-test_probe_plan: test_probe_plan.c $(DETECT_SRC) ../detect/include/d2k_detect.h compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h
-	$(CC) $(CFLAGS) -I../detect/include -o $@ test_probe_plan.c $(filter-out ../detect/props.c,$(DETECT_SRC)) compose.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c $(TEST_LDFLAGS)
+test_probe_plan: test_probe_plan.c ../detect/tests/legacy_sends.h $(DETECT_SRC) ../detect/include/d2k_detect.h compose.o measured.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h
+	$(CC) $(CFLAGS) -I../detect/include -o $@ test_probe_plan.c $(filter-out ../detect/props.c,$(DETECT_SRC)) compose.o measured.o plantlv.o hello.o meas.o link.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
 
 .PHONY: san-probe-plan
 san-probe-plan: hello_profiles.inc
-	$(CC) $(SANFLAGS) -I../detect/include -o /tmp/d2k-core-san-test_probe_plan test_probe_plan.c $(filter-out ../detect/props.c,$(DETECT_SRC)) compose.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c -lpthread
+	$(CC) $(SANFLAGS) -I../detect/include -o /tmp/d2k-core-san-test_probe_plan test_probe_plan.c $(filter-out ../detect/props.c,$(DETECT_SRC)) compose.c measured.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread
 	/tmp/d2k-core-san-test_probe_plan
+
+measured.o: measured.c $(HDR) profiles/rx_fake.h
+	$(CC) $(CFLAGS) -c -o $@ $<

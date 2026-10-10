@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "d2k_plan.h"
+#include "d2k_arm.h"
 #include "plan_internal.h"
 #include "d2k_quic.h" /* d2k_quic_initial_split_crypto — задача 40 */
 
@@ -328,7 +329,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
          * SNI metadata is provided by the normal session TLS parser. */
         const uint8_t *b = in->payload;
         size_t n = in->payload_len;
-        if (n < 9 || n > 2048 || b[0] != 0x16 || b[1] != 3 || b[5] != 1 ||
+        if (n < 9 || n > D2K_ARM_TRIGGER_MAX || b[0] != 0x16 || b[1] != 3 || b[5] != 1 ||
             !in->have_sni || in->sni_len <= 1 || !in->sni_off ||
             in->sni_off > n || in->sni_len > n - in->sni_off) { return -1; }
         /* ЗАПИСЬ ЦЕЛИКОМ ИЛИ ЕЁ НАЧАЛО — ВХОД В ОБОИХ СЛУЧАЯХ.
@@ -359,11 +360,14 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         return -1; /* not the input for which fixed measured bytes were built */
     }
 
+    d2k_emit *v = NULL;
+    size_t n = 0;
+    int owns_payload = 1;
     if (p->oob_enabled) {
         size_t mid = 0;
         if (anchor_offset(in, p->oob_anchor, &mid) != 0 ||
             mid == 0 || mid >= in->payload_len) { return -1; }
-        d2k_emit *v = calloc(3, sizeof *v);
+        v = calloc(3, sizeof *v);
         if (!v) { return -1; }
         v[0].kind = D2K_EMIT_PAYLOAD;
         v[0].seq = in->seq;
@@ -385,10 +389,8 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         v[2].bytes = in->payload + mid;
         v[2].len = in->payload_len - mid;
 
-        out->fate = D2K_ORIG_DROP;
-        out->n = 3;
-        out->v = v;
-        return 0;
+        n = 3;
+        goto finalize; /* same wire profile and segmentation as every Plan */
     }
 
     size_t *pts = NULL;
@@ -407,7 +409,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     /* Разнос во времени тоже означает владение нагрузкой: выдержать паузу
        перед правдой можно только тогда, когда правду выпускаем мы сами.
        Оригинал, отпущенный ядром, уходит когда ему угодно. */
-    int owns_payload = (n_pts > 0) || (p->n_seqovls > 0) || (p->pace_us > 0) ||
+    owns_payload = (n_pts > 0) || (p->n_seqovls > 0) || (p->pace_us > 0) ||
                        (p->settle_us > 0) || (p->delay_us > 0) || p->ipfrag ||
                        p->udplen || p->qsplit;
     /* Оригинал, отданный ядру после наших сырых фальшивок, может не уйти
@@ -463,12 +465,12 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         return 0;
     }
 
-    d2k_emit *v = calloc(max_emits, sizeof *v);
+    v = calloc(max_emits, sizeof *v);
     if (!v) {
         free(pts);
         return -1;
     }
-    size_t n = 0;
+    n = 0;
 
     /* Фальшивки, стоящие перед всеми кусками. */
     for (size_t i = 0; i < p->n_fakes; i++) {
@@ -679,6 +681,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         }
     }
     free(pts);
+finalize:
     for (size_t i = 0; i < n; i++) { v[i].wire_profile = p->wire_profile; }
     if (p->segment_size || in->segment_cap) {
         /* Match raw_send: split the concatenated prefix+body, preserving

@@ -1,4 +1,4 @@
-/* Raw measurement sends are the oracle, through the bridge and real executor.
+/* The pre-unification schedule is a frozen compatibility oracle.
  * Include the property catalog itself, as detect/test_repeats.c does: new
  * questions automatically enter this test without a second handwritten list. */
 #include "d2k_compose.h"
@@ -14,6 +14,9 @@ int d2k_arm_from_poison(const d2k_poison *, d2k_arm *, char *, size_t);
 void d2k_sched_progress_note(const char *q, int pass, int fail) {
     (void)q; (void)pass; (void)fail;
 }
+#ifndef D2K_SEND_MAX
+#include "../detect/tests/legacy_sends.h"
+#endif
 static unsigned failures, cases, skipped;
 #define BASE 10000u
 #define REQUIRE(c) do { if (!(c)) { \
@@ -32,6 +35,10 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
     uint8_t tlv[D2K_PLAN_TLV_MAX];
     char text[8192], err[200];
     size_t tn = 0, index = 0;
+    /* C uses the recovered field program, not the historical padded fake.
+       Its full text/TLV check is below; test_raw compares actual IP/TCP bytes
+       at the probe sendto boundary against RX-plan execution. */
+    if (!strcmp(p.name, "white-hello-ts")) return;
     if (p.decoy_hello) { p.decoy = decoy; p.decoy_len = dn; }
     if (p.seqovl_exact) { p.seqovl = (int)dn; }
     int bridge_rc = d2k_arm_from_poison(&p, &a, err, sizeof err);
@@ -51,6 +58,12 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
     /* No decoy pointer means padding, including non-hello overlap probes. */
     in.decoy_len = p.decoy_len;
     if (p.decoy_len) { memcpy(in.decoy, p.decoy, p.decoy_len); }
+    /* Larger triggers do not expand the existing owned-overlap contract.
+       A non-representable overlap must refuse, not clamp its measured bytes. */
+    if ((unsigned)p.seqovl > D2K_ARM_DECOY_MAX) {
+        REQUIRE(d2k_arm_plan_measured(&a, &in, text, sizeof text) == -1);
+        skipped++; goto done;
+    }
     REQUIRE(d2k_poison_sends(tr, &p, fake, sizeof fake, seg, sizeof seg, &sends) == 0);
     REQUIRE(d2k_arm_plan_measured(&a, &in, text, sizeof text) == 0);
     REQUIRE(d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tn, err, sizeof err) == 0);
@@ -59,11 +72,6 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
     pkt.have_sni = tr->sni_len > 0; pkt.sni_off = tr->sni_off; pkt.sni_len = tr->sni_len;
     REQUIRE(d2k_plan_apply(plan, NULL, &pkt, &out) == 0);
     REQUIRE(out.fate == D2K_ORIG_DROP);
-    /* oob: срочный байт на проводе задаётся URG-указателем, а не отдельной
-       посылкой-фальшивкой, и его побайтную развёртку проверяет датапат своим
-       тестом; здесь довольно того, что измеренный приём стал загружаемым
-       планом, который датапат принял (fate DROP). */
-    if (p.oob) { goto done; }
     for (size_t i = 0; i < sends.n; i++) {
         const d2k_send *s = &sends.v[i];
         for (size_t off = 0; off < s->len; ) {
@@ -79,6 +87,7 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
             REQUIRE(e->seq_shift == s->poison.seq_shift);
             REQUIRE(e->kind == (s->kind == D2K_SEND_FAKE ? D2K_EMIT_FAKE : D2K_EMIT_PAYLOAD));
             REQUIRE(e->wire_profile == D2K_WIRE_DETECT_TCP);
+            REQUIRE(e->urgent == (s->kind == D2K_SEND_URG));
             REQUIRE(e->poison == flags && e->ttl == s->poison.ttl);
             REQUIRE(e->delay_us == (off ? 0u : (unsigned)s->delay_ms * 1000u));
             REQUIRE(e->pre_len + e->len == n);
@@ -94,7 +103,7 @@ done:
 }
 
 int main(void) {
-    static const size_t lengths[] = {512, 1400, 1401, 2048};
+    static const size_t lengths[] = {512, 1400, 1401, 2048, 2049, D2K_TRIGGER_MAX};
     uint8_t decoy[681];
     int np;
     const d2k_poison *ps = d2k_poisons(&np);
@@ -124,9 +133,8 @@ int main(void) {
     /* СОСТАВНОЙ ПЛАН СЕМЕЙСТВА C СОБИРАЕТСЯ И ИСПОЛНЯЕТСЯ (поле 10.10.2026).
        Вопрос «ECH-приветствие под меткой» обязан дать ровно plan-680fbe00:
        fake под меткой времени, серия ×8, разрез настоящего приветствия +2,
-       прямой порядок. Round-trip байт-в-байт уже проверен выше (run_case);
-       здесь — что план несёт именно эти множители, а не огрызок на одну копию
-       без разреза (как было до правки). */
+       прямой порядок. Здесь сравниваются весь текст, TLV и каталожный ID;
+       detect/test_raw.c независимо сравнивает полные runtime-пакеты. */
     {
         prop_probe pp[12];
         int nq = prop_probes(pp, 12), found = 0, i;
@@ -149,6 +157,26 @@ int main(void) {
             }
             if (d2k_arm_plan_measured(&a, &in, text, sizeof text) != 0) {
                 printf("семейство C: план не собрался\n"); failures++; break;
+            }
+            {
+                char expected[8192];
+                uint8_t got_tlv[D2K_PLAN_TLV_MAX], want_tlv[D2K_PLAN_TLV_MAX];
+                size_t got_n = 0, want_n = 0;
+                /* Real ECH seed: the complete serialized program, including ID. */
+                if (d2k_white_decoy_hello("hcaptcha.com", in.decoy, sizeof in.decoy,
+                                         &in.decoy_len) ||
+                    d2k_arm_plan_measured(&a, &in, text, sizeof text) ||
+                    d2k_rx_volume_plan(0, D2K_SHAPE_MODERN, 0, expected, sizeof expected) ||
+                    d2k_plan_text_to_tlv(text, got_tlv, sizeof got_tlv, &got_n, err, sizeof err) ||
+                    d2k_plan_text_to_tlv(expected, want_tlv, sizeof want_tlv, &want_n, err, sizeof err) ||
+                    strcmp(text, expected) || got_n != want_n || memcmp(got_tlv, want_tlv, got_n)) {
+                    fprintf(stderr, "семейство C: arm != plan-680fbe00 (text/TLV)\n"); failures++;
+                }
+                uint64_t hash = 1469598103934665603ULL;
+                for (const char *c = text; *c; c++) { hash ^= (unsigned char)*c; hash *= 1099511628211ULL; }
+                if ((uint32_t)hash != 0x680fbe00u) {
+                    fprintf(stderr, "семейство C: неверный ID plan-%08x\n", (unsigned)(uint32_t)hash); failures++;
+                }
             }
             if (!strstr(text, "poison 1 tcpts")) { printf("семейство C: нет «poison 1 tcpts»\n"); failures++; }
             if (!strstr(text, "fake payload=1 poison=1 repeats=8")) {

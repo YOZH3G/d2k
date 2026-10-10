@@ -40,9 +40,10 @@ typedef struct {
                                 нет. Отличен от disorder_pos (обратный порядок). */
 } d2k_arm;
 
-/* Owned measurement input. No borrowed pointers may cross worker results.
- * Scheduler captures at most 2048 bytes; larger external inputs are an
- * explicit unsupported conversion, never silently truncated. */
+/* Owned decoy input. No borrowed pointers may cross worker results.
+ * Trigger bytes stay with the caller; the raw trigger supports 16 KiB even
+ * though scheduler snapshots and owned decoys currently hold 2048 bytes. */
+#define D2K_ARM_TRIGGER_MAX 16384
 #define D2K_ARM_DECOY_MAX 2048
 /* Existing raw sender's segment ceiling, shared rather than copied. */
 #define D2K_ARM_SEGMENT_MAX 1400

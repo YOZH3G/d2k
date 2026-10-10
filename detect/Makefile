@@ -16,6 +16,13 @@ LDLIBS  ?= -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
+.DEFAULT_GOAL := all
+
+SHARED_SRC = ../core/measured.c ../core/hello.c ../core/plantlv.c ../core/quic.c ../core/quicwire.c ../core/crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c
+SHARED_OBJ = $(SHARED_SRC:.c=.o)
+$(filter-out ../core/hello.o,$(SHARED_OBJ)): FORCE
+	$(MAKE) -C $(dir $@) $(notdir $@)
+
 SRC = classify.c poison.c props.c raw.c trigger.c response.c
 # bridge.c — только для сборки в составе d2kc: он тянет заголовки ядра.
 BRIDGE = bridge.c
@@ -38,39 +45,39 @@ all: d2k-detect
 main.o: main.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-d2k-detect: main.o $(OBJ) ../core/hello.o
-	$(CC) $(CFLAGS) -o $@ main.o $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
+d2k-detect: main.o $(OBJ) $(SHARED_OBJ)
+	$(CC) $(CFLAGS) -o $@ main.o $(OBJ) $(SHARED_OBJ) $(LDFLAGS) $(LDLIBS)
 
-test_port: test_port.c $(OBJ) ../core/hello.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_port.c $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
+test_port: test_port.c $(OBJ) $(SHARED_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_port.c $(OBJ) $(SHARED_OBJ) $(LDFLAGS) $(LDLIBS)
 
 # Стенд поднимает поддельную коробку в отдельном потоке; самому измерителю
 # потоки не нужны, поэтому pthread — только у этой линковки.
-test_tree: test_tree.c $(OBJ) ../core/hello.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_tree.c $(OBJ) ../core/hello.o $(LDFLAGS) -lpthread
+test_tree: test_tree.c $(OBJ) $(SHARED_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_tree.c $(OBJ) $(SHARED_OBJ) $(LDFLAGS) -lpthread
 
 # Повторы и кэш самопроверки: классификатор и свойства включены в тест
 # исходником (#include), сырой слой подменён сценарием ответов.
-test_repeats: test_repeats.c classify.c props.c poison.o trigger.o response.o raw.o ../core/hello.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_repeats.c poison.o trigger.o response.o raw.o ../core/hello.o $(LDFLAGS) -lpthread
+test_repeats: test_repeats.c classify.c props.c poison.o trigger.o response.o raw.o $(SHARED_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_repeats.c poison.o trigger.o response.o raw.o $(SHARED_OBJ) $(LDFLAGS) -lpthread
 
-test_bridge: test_bridge.c bridge.o poison.o ../core/hello.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_bridge.c bridge.o poison.o ../core/hello.o $(LDFLAGS) -lpthread
+test_bridge: test_bridge.c bridge.o poison.o $(SHARED_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_bridge.c bridge.o poison.o $(SHARED_OBJ) $(LDFLAGS) -lpthread
 
-test_response: test_response.c response.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_response.c $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
+test_response: test_response.c $(OBJ) $(SHARED_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_response.c $(OBJ) $(SHARED_OBJ) $(LDFLAGS) $(LDLIBS)
 
 test_threads: test_threads.c poison.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_threads.c poison.o $(LDFLAGS) -lpthread
 
-test_raw: test_raw.c raw.c $(filter-out raw.o,$(OBJ)) ../core/hello.o $(HDR) ../datapath/wire.c ../datapath/include/d2k_plan.h
-	$(CC) $(CFLAGS) -o $@ test_raw.c $(filter-out raw.o,$(OBJ)) ../core/hello.o ../datapath/wire.c $(LDFLAGS) $(LDLIBS)
+test_raw: test_raw.c tests/legacy_sends.h raw.c $(filter-out raw.o,$(OBJ)) $(SHARED_OBJ) $(HDR) ../datapath/plan_apply.c
+	$(CC) $(CFLAGS) -o $@ test_raw.c $(filter-out raw.o,$(OBJ)) $(filter-out ../datapath/plan_apply.o,$(SHARED_OBJ)) $(LDFLAGS) $(LDLIBS)
 
 bridge.o: bridge.c $(HDR) ../core/include/d2k_arm.h ../core/include/d2k_verdict.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test_raw6_live: test_raw6_live.c $(OBJ) ../core/hello.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
+test_raw6_live: test_raw6_live.c $(OBJ) $(SHARED_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(OBJ) $(SHARED_OBJ) $(LDFLAGS) $(LDLIBS)
 
 check: d2k-detect test_port test_tree test_repeats test_bridge test_threads test_raw test_response
 	@# Отправка в сокет — только через d2k_send_nosig: SIGPIPE на мёртвом пире
@@ -128,10 +135,18 @@ d2k-detect-linux-arm64:
 	$(MAKE) -C ../core hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../core -static \
-		-o $(BUILDDIR)/d2k-detect-linux-arm64 main.c $(SRC) ../core/hello.c $(LDLIBS)
+		-o $(BUILDDIR)/d2k-detect-linux-arm64 main.c $(SRC) $(SHARED_SRC) $(LDLIBS)
 	@ls -l $(BUILDDIR)/d2k-detect-linux-arm64
 
 .PHONY: test-sni-cli
 check: test-sni-cli
 test-sni-cli: d2k-detect
 	python3 test_sni_cli.py
+
+# Actual raw send loop + shared executor, with only OS boundaries mocked.
+.PHONY: san-raw
+san-raw:
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+		-o /tmp/d2k-detect-san-raw test_raw.c $(filter-out raw.c,$(SRC)) \
+		$(filter-out ../datapath/plan_apply.c,$(SHARED_SRC)) $(LDLIBS)
+	/tmp/d2k-detect-san-raw

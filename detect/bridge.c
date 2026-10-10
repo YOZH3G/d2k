@@ -54,61 +54,6 @@ static int stop_asked(void *ctx)
     return task_stop && *task_stop;
 }
 
-/* Плечо измерителя в термины сборщика планов.
- *
- * Возврат 0 — выразимо, -1 — язык плана этого не знает. Отказ здесь — пробел
- * РЕАЛИЗАЦИИ, а не отрицательное свойство коробки (0007 п.3): воздействие
- * найдено и на замере сработало, просто поставить его мы сегодня не умеем.
- * Подставлять «похожее» нельзя — это был бы план, отличающийся от того, что
- * прошло проверку. */
-int d2k_arm_from_poison(const d2k_poison *p, d2k_arm *a, char *why, size_t whycap)
-{
-    memset(a, 0, sizeof(*a));
-    if (p->syn_data) {
-        snprintf(why, whycap, "данные в SYN языком плана не выражаются");
-        return -1;
-    }
-    a->oob = p->oob; /* срочный байт выражается планом «oob sni_middle 0f»
-                        и исполняется датапатом (поле 10.10.2026, снят отказ);
-                        место байта — середина имени, см. d2k_arm_plan_measured. */
-    /* The result crosses worker threads by value. Keep its display name
-     * in d2k_vres.arm_name, not as a pointer into res.hit/the bridge stack. */
-    a->name         = NULL;
-    if (p->seq_shift != 0 && p->seq_shift != -66000) {
-        snprintf(why, whycap, "сдвиг TCP seq %d не выражается флагом seq_out",
-                 (int)p->seq_shift);
-        return -1;
-    }
-    a->badsum       = p->badsum;
-    a->md5          = p->md5;
-    a->repeats      = p->repeats > 0 ? (unsigned)p->repeats : 0u;
-    /* In the original, TTL/seq-shift alone also send a fake (one by
-     * default). The Plan builder needs this explicitly to emit its body. */
-    if (a->repeats == 0 && d2k_poison_has_fake(p)) { a->repeats = 1; }
-    a->gap_ms       = p->gap_ms > 0 ? (unsigned)p->gap_ms : 0u;
-    a->disorder     = p->disorder;
-    a->disorder_pos = p->disorder_pos > 0 ? (unsigned)p->disorder_pos : 0u;
-    a->between      = p->fake_between;
-    a->ttl          = p->ttl > 0 ? (unsigned)p->ttl : 0u;
-    a->seq_out      = p->seq_shift != 0;
-    a->decoy_hello  = p->decoy_hello;
-    a->tcpts        = p->tcp_ts;
-    a->ipidzero     = p->ip_id_zero;
-    /* Прямой разрез настоящей нагрузки (семейство C: split payload_start +2).
-       Отличен от disorder_pos (обратный порядок) — едет своим полем, его
-       исполняет d2k_arm_plan_measured через «split … + order forward». */
-    a->split_pos    = p->split_pos > 0 ? (unsigned)p->split_pos : 0u;
-    if (p->seqovl_exact) {
-        /* «Длиной в целое приветствие» — не число, а правило: сборщик кладёт
-         * туда приманку целиком. Задать то же число вручную не то же самое —
-         * см. комментарий к seqovlExact у донора. */
-        a->seqovl_hello = 1;
-    } else if (p->seqovl > 0) {
-        a->seqovl = (unsigned)p->seqovl;
-    }
-    return 0;
-}
-
 /* НАХОДКА, КОТОРУЮ НЕЛЬЗЯ ПОСТАВИТЬ, ДЛЯ ПЛАНА — НЕ НАХОДКА.
  *
  * Поле 04.10, чистый каталог: rutracker.org и discord.com. Перебор отрав

@@ -25,7 +25,9 @@ static int raw_test_getsockname(int, struct sockaddr *, socklen_t *);
 #define bind raw_test_bind
 #define connect raw_test_connect
 #define getsockname raw_test_getsockname
+#define d2k_sleep_ms runtime_sleep_ms
 #include "raw.c"
+#undef d2k_sleep_ms
 #undef recvfrom
 #undef sendto
 #undef socket
@@ -35,7 +37,26 @@ static int raw_test_getsockname(int, struct sockaddr *, socklen_t *);
 #undef getsockname
 #include <fcntl.h>
 #include "d2k_wire.h"
+#include "d2k_compose.h"
+#include "d2k_plantlv.h"
+int d2k_arm_from_poison(const d2k_poison *, d2k_arm *, char *, size_t);
+/* Fixed entropy at the OS boundary, shared by both real executor calls. */
+static FILE *runtime_entropy(const char *path, const char *mode) {
+    if (strcmp(path, "/dev/urandom")) return fopen(path, mode);
+    FILE *f = tmpfile();
+    if (!f) return NULL;
+    for (int i = 0; i < 128; i++) fputc((i * 17 + 3) & 255, f);
+    rewind(f); return f;
+}
+#define fopen runtime_entropy
+#define wr16 apply_wr16
+#include "../datapath/plan_apply.c"
+#undef fopen
+#undef wr16
 
+#ifndef D2K_SEND_MAX
+#include "tests/legacy_sends.h"
+#endif
 #define WORKERS 16
 #define PORTS_PER_WORKER 128
 static uint16_t ports[WORKERS][PORTS_PER_WORKER];
@@ -43,9 +64,12 @@ static uint8_t incoming[2][128];
 static size_t incoming_len[2];
 static unsigned incoming_noise;
 static uint8_t incoming_src[2][16];
-static uint8_t outgoing[4][2048];
-static size_t outgoing_len[4];
+static uint8_t outgoing[512][4096];
+static size_t outgoing_len[512];
 static size_t outgoing_count;
+static unsigned pending_delay, outgoing_delay[512];
+void runtime_sleep_ms(int ms) { pending_delay += (unsigned)ms * 1000u; }
+
 static int failures;
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "raw:%d: %s\n", __LINE__, #c); failures++; \
@@ -55,9 +79,11 @@ static ssize_t raw_test_sendto(int fd, const void *buf, size_t len, int flags,
                                const struct sockaddr *addr, socklen_t alen)
 {
     (void)fd; (void)flags; (void)addr; (void)alen;
-    if (outgoing_count >= 4 || len > sizeof outgoing[0]) { return -1; }
+    if (outgoing_count >= 512 || len > sizeof outgoing[0]) { return -1; }
     memcpy(outgoing[outgoing_count], buf, len);
+    outgoing_delay[outgoing_count] = pending_delay; pending_delay = 0;
     outgoing_len[outgoing_count++] = len;
+    if (outgoing_count == 2) srandom(12345); /* entropy boundary after handshake */
     return (ssize_t)len;
 }
 
@@ -74,8 +100,9 @@ static void test_disorder_pos2_emits_exact_reverse_segments(void)
     memcpy(tr.payload, bytes, sizeof bytes); tr.len = sizeof bytes;
     outgoing_count = 0; memset(outgoing_len, 0, sizeof outgoing_len);
     {
-        /* Состав посылок — d2k_poison_sends, тот же список, по которому шлёт
-           зонд; провод — тем же raw_send, что и у зонда. */
+        /* Замороженный список прежнего отправителя проверяет raw_send,
+           оставшийся для рукопожатия и прямого контроля. Обходный
+           runtime через Plan проверяется отдельно ниже. */
         d2k_poison p;
         d2k_sends pl;
         uint8_t fk[64], sg[64];
@@ -104,10 +131,12 @@ static void test_disorder_pos2_emits_exact_reverse_segments(void)
 /* raw_dial harness: sockets are /dev/null descriptors (no root, no
  * network); the receive socket answers our own SYN with a SYN-ACK. */
 static int dial_recv_fd = -1;
+static int mock_family = AF_INET;
+static int peer_timestamps = 1;
 static int raw_test_socket(int domain, int type, int proto)
 {
     int fd = open("/dev/null", O_RDONLY);
-    (void)domain;
+    mock_family = domain;
     if (fd >= 0 && type == SOCK_RAW && proto == IPPROTO_TCP) { dial_recv_fd = fd; }
     return fd;
 }
@@ -121,6 +150,12 @@ static int raw_test_getsockname(int fd, struct sockaddr *a, socklen_t *n)
 {
     struct sockaddr_in local = {0};
     (void)fd;
+    if (mock_family == AF_INET6) {
+        struct sockaddr_in6 v6 = {0};
+        v6.sin6_family = AF_INET6;
+        memcpy(&v6.sin6_addr, (uint8_t[]){0x20,1,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,1}, 16);
+        memcpy(a, &v6, sizeof v6); *n = sizeof v6; return 0;
+    }
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = htonl(0xc0000201); /* 192.0.2.1 */
     memcpy(a, &local, sizeof local);
@@ -147,10 +182,29 @@ ssize_t raw_test_recvfrom(int fd, void *buf, size_t len, int flags,
         const uint8_t *syn = outgoing[0];
         size_t n;
         if (outgoing_count == 0) { return -1; }
-        n = build_ipv4_tcp(buf, len, syn + 16, syn + 12, rd16(syn + 22), rd16(syn + 20),
-                           7000, rd32(syn + 24) + 1, TCP_SYN | TCP_ACK,
-                           NULL, 0, &none, NULL, 0);
-        return n ? (ssize_t)n : -1;
+        uint8_t packet[128];
+        int ipv6 = (syn[0] >> 4) == 6;
+        size_t iplen = ipv6 ? 40 : 20;
+        n = build_ip_tcp(packet, sizeof packet, ipv6 ? 6 : 4,
+                         syn + (ipv6 ? 24 : 16), syn + (ipv6 ? 8 : 12),
+                         rd16(syn + iplen + 2), rd16(syn + iplen),
+                         7000, rd32(syn + iplen + 4) + 1, TCP_SYN | TCP_ACK,
+                         NULL, 0, &none, (uint8_t[]){1,1,8,10,0,0,0x23,0x28,0,0,0,1},
+                         peer_timestamps ? 12 : 0);
+        if (!n) return -1;
+        if (outgoing_count > 2) packet[iplen + 13] = TCP_RST;
+        if (ipv6) {
+            struct sockaddr_in6 peer = {0};
+            peer.sin6_family = AF_INET6; memcpy(&peer.sin6_addr, syn + 24, 16);
+            memcpy(addr, &peer, sizeof peer); *alen = sizeof peer;
+            n -= 40;
+            if (n > len) return -1;
+            memcpy(buf, packet + 40, n);
+        } else {
+            if (n > len) return -1;
+            memcpy(buf, packet, n);
+        }
+        return (ssize_t)n;
     }
     if (fd < 0 || fd > 1 || incoming_len[fd] > len) { return -1; }
     memcpy(buf, incoming[fd], incoming_len[fd]);
@@ -723,6 +777,105 @@ static void test_rule_through_nft(void)
     d2k_raw_rule_hook = raw_rule_system;
 }
 
+static void test_runtime_equals_datapath(const d2k_poison *hyp, size_t length, uint8_t family)
+{
+    d2k_trigger tr = {0};
+    d2k_poison p = {0};
+    uint8_t decoy[2048], tlv[D2K_PLAN_TLV_MAX], packet[4096];
+    size_t dn = 0, tn = 0;
+    char text[8192], err[200];
+    d2k_plan *plan = NULL;
+    d2k_actions actions = {0};
+    d2k_pkt in = {0};
+    d2k_conn conn = {0};
+    CHECK(d2k_white_decoy_hello("hcaptcha.com", decoy, sizeof decoy, &dn) == 0);
+    memcpy(tr.payload, decoy, dn); tr.len = length;
+    tr.payload[3] = (uint8_t)((length - 5) >> 8); tr.payload[4] = (uint8_t)(length - 5);
+    for (size_t i = 0; i < tr.payload[43]; i++) tr.payload[44 + i] = (uint8_t)(0x80 + i);
+    tr.payload[6] = 0; tr.payload[7] = (uint8_t)((length - 9) >> 8); tr.payload[8] = (uint8_t)(length - 9); tr.sni_off = 100; tr.sni_len = 11;
+    strcpy(p.name, "white-hello-ts");
+    p.tcp_ts = 1; p.decoy_hello = 1; p.repeats = 8; p.split_pos = 2;
+    p.decoy = decoy; p.decoy_len = dn;
+    if (hyp) {
+        p = *hyp;
+        if (p.decoy_hello || p.seqovl_exact) { p.decoy = decoy; p.decoy_len = dn; }
+        if (p.seqovl_exact) p.seqovl = (int)dn;
+    }
+    outgoing_count = 0; pending_delay = 0;
+    pthread_once(&g_sweep_once, sweep_noop);
+    d2k_raw_rule_hook = test_rule_hook; rule_rc = 0;
+    /* No socket or firewall call escapes the harness. Invoke the production
+       probe entry point, including its real send loop and raw_sendto. */
+    const uint8_t ip4[] = {198,51,100,7};
+    const uint8_t ip6[] = {0x20,1,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,7};
+    int probe_rc = d2k_raw_probe_poison_family(family == 6 ? ip6 : ip4, family, 443, &tr, &p,
+                               100, 0, NULL, err, sizeof err);
+    if (probe_rc && peer_timestamps) fprintf(stderr, "runtime %s len=%zu: rc=%d %s packets=%zu\n", p.name, length, probe_rc, err, outgoing_count);
+    if (!peer_timestamps && !hyp) {
+        CHECK(probe_rc == -1); CHECK(outgoing_count == 2);
+        dial_recv_fd = -1;
+        return; /* No TS: refuse locally, never fall back to another sender. */
+    }
+    CHECK(probe_rc == 0);
+    if (hyp) {
+        d2k_arm arm;
+        d2k_arm_input input = {0};
+        CHECK(d2k_arm_from_poison(&p, &arm, err, sizeof err) == 0);
+        input.trigger_len = tr.len; input.sni_off = tr.sni_off; input.sni_len = tr.sni_len;
+        input.decoy_len = p.decoy_len;
+        if (p.decoy_len) memcpy(input.decoy, p.decoy, p.decoy_len);
+        CHECK(d2k_arm_plan_measured(&arm, &input, text, sizeof text) == 0);
+    } else {
+        CHECK(d2k_rx_volume_plan(0, D2K_SHAPE_MODERN, 0, text, sizeof text) == 0);
+    }
+    CHECK(d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tn, err, sizeof err) == 0);
+    CHECK(d2k_plan_load(tlv, tn, &plan, err, sizeof err) == 0);
+    if (!plan || outgoing_count < 3) { failures++; goto done; }
+    size_t iplen = family == 6 ? 40 : 20;
+    in.seq = rd32(outgoing[0] + iplen + 4) + 1;
+    in.payload = tr.payload; in.payload_len = tr.len;
+    in.have_sni = 1; in.sni_off = tr.sni_off; in.sni_len = tr.sni_len;
+    CHECK(d2k_plan_apply(plan, NULL, &in, &actions) == 0);
+    memcpy(&conn.src_ip, outgoing[0] + 12, 4); memcpy(&conn.dst_ip, outgoing[0] + 16, 4);
+    if (family == 6) {
+        memcpy(conn.src_ip6, outgoing[0] + 8, 16); memcpy(conn.dst_ip6, outgoing[0] + 24, 16);
+    }
+    memcpy(&conn.src_port, outgoing[0] + iplen, 2); memcpy(&conn.dst_port, outgoing[0] + iplen + 2, 2);
+    conn.family = family; conn.ack = 7001; conn.window = 65535; conn.ttl = 64;
+    /* The raw connection offered TS=1 in its SYN; template traffic carries
+       that negotiated option, fake TS is 1-1000. */
+    memcpy(conn.tcp_options, (uint8_t[]){1,1,8,10,0,0,0,1,0,0,0x23,0x28}, 12);
+    conn.tcp_options_len = 12;
+    CHECK(outgoing_count == actions.n + 2);
+    srandom(12345);
+    for (size_t i = 0; i < actions.n && i + 2 < outgoing_count; i++) {
+        CHECK(outgoing_delay[i + 2] == actions.v[i].delay_us);
+        size_t n = d2k_wire_build(&conn, &actions.v[i], packet, sizeof packet);
+        CHECK(n > 0 && n == outgoing_len[i + 2]);
+        CHECK(n > 0 && n == outgoing_len[i + 2] && !memcmp(packet, outgoing[i + 2], n));
+    }
+done:
+    d2k_actions_free(&actions); d2k_plan_free(plan);
+    dial_recv_fd = -1;
+}
+
+static void test_plan_rejection_has_error(void) {
+    d2k_trigger tr = {0};
+    d2k_poison p = {0};
+    char err[160] = "sentinel";
+    tr.len = 675;
+    strcpy(p.name, "invalid-decoy");
+    outgoing_count = 0; pending_delay = 0;
+    p.tcp_ts = 1; p.decoy_hello = 1; p.repeats = 8; p.split_pos = 2;
+    p.decoy_len = D2K_ARM_DECOY_MAX + 1;
+    CHECK(d2k_raw_probe_poison((uint8_t[]){198,51,100,7}, 443, &tr, &p, 100, 0, NULL, err, sizeof err) == -1);
+    CHECK(err[0] && strcmp(err, "sentinel"));
+    strcpy(err, "sentinel"); p.decoy_len = 1; p.decoy = NULL;
+    outgoing_count = 0; pending_delay = 0;
+    CHECK(d2k_raw_probe_poison((uint8_t[]){198,51,100,7}, 443, &tr, &p, 100, 0, NULL, err, sizeof err) == -1);
+    CHECK(err[0] && strcmp(err, "sentinel"));
+}
+
 int main(void)
 {
     {
@@ -759,6 +912,26 @@ int main(void)
         CHECK(build_ip_tcp(packet, sizeof packet, 6, src, dst, 1000, 443,
                             42, 43, TCP_ACK, body, sizeof body, &p, NULL, 0) == 0);
     }
+    {
+        static const size_t sizes[] = {675, 1400, 1401, 2048, 2049, D2K_TRIGGER_MAX};
+        int count = 0;
+        const d2k_poison *ps = d2k_poisons(&count);
+        for (size_t k = 0; k < sizeof sizes / sizeof sizes[0]; k++) {
+            for (uint8_t family = 4; family <= 6; family += 2) {
+                test_runtime_equals_datapath(NULL, sizes[k], family);
+                for (int i = 0; i < count; i++) {
+                    if (!ps[i].syn_data && d2k_poison_supports_family(&ps[i], family))
+                        test_runtime_equals_datapath(&ps[i], sizes[k], family);
+                }
+            }
+        }
+        peer_timestamps = 0;
+        test_runtime_equals_datapath(NULL, 675, 4);
+        test_runtime_equals_datapath(NULL, 675, 6);
+        peer_timestamps = 1;
+        printf("runtime equality: family C + %d catalog hypotheses, 6 lengths, IPv4/IPv6, complete packets and delays\n", count - 1);
+    }
+    test_plan_rejection_has_error();
     test_concurrent_ports_are_unique();
     test_checksum_matches_original();
     test_receive_is_owned_by_connection();
