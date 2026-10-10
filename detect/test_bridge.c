@@ -327,6 +327,44 @@ int main(void)
     dialled = 1;
     memset(&answer, 0, sizeof answer);
 
+    /* ОТВЕТЫ TCP-ВОПРОСОВ О СВОЙСТВАХ — В ТРАССУ ВЕРДИКТА (поле 10.10.2026).
+       QUIC пишет каждый вопрос в qtrace, и журнал печатает «вопрос «…»: N/M»;
+       у TCP трасса дерева до планировщика не доходила, и промах «метка
+       времени» на rutracker.org пришлось выводить из порядка дерева.
+       Копируются только вопросы о свойствах: база, разрез и гипотезы
+       перебора — не вопросы о свойствах. Ярлык — целиком, не обрубок. */
+    {
+        answer.verdict = D2K_DV_OPAQUE;
+        answer.raw_usable = 1;
+        answer.repeats = 2;
+        answer.ntrace = 6;
+        snprintf(answer.trace[0].probe, sizeof answer.trace[0].probe, "whole");
+        answer.trace[0].fail = 2;
+        snprintf(answer.trace[1].probe, sizeof answer.trace[1].probe, "свойство:перекрытие слева");
+        answer.trace[1].fail = 1;
+        snprintf(answer.trace[2].probe, sizeof answer.trace[2].probe, "свойство:метка времени");
+        answer.trace[2].pass = 2;
+        snprintf(answer.trace[3].probe, sizeof answer.trace[3].probe, "свойство:сверка MD5");
+        answer.trace[3].fail = 1;
+        snprintf(answer.trace[3].err, sizeof answer.trace[3].err, "sendto: Operation not permitted");
+        snprintf(answer.trace[4].probe, sizeof answer.trace[4].probe, "свойство:перекрытие до конца имени");
+        answer.trace[4].fail = 1;
+        snprintf(answer.trace[5].probe, sizeof answer.trace[5].probe, "poison:seqovl-16");
+        answer.trace[5].fail = 1;
+        r = measure();
+        CHECK(strcmp(r.qtrace[0].label, "перекрытие слева") == 0);
+        CHECK(r.qtrace[0].sent == 1 && r.qtrace[0].answered == 0 && r.qtrace[0].outcome == D2K_PROP_NO);
+        CHECK(strcmp(r.qtrace[1].label, "метка времени") == 0);
+        CHECK(r.qtrace[1].sent == 2 && r.qtrace[1].answered == 2 && r.qtrace[1].outcome == D2K_PROP_YES);
+        CHECK(strcmp(r.qtrace[2].label, "сверка MD5") == 0);
+        CHECK(r.qtrace[2].outcome == D2K_PROP_UNKNOWN); /* локальная ошибка зонда — не измерено */
+        CHECK(strcmp(r.qtrace[3].label, "перекрытие до конца имени") == 0);
+        CHECK(r.qtrace[4].label[0] == '\0'); /* whole и poison:* — не вопросы о свойствах */
+        /* Все вопросы каталога свойств обязаны помещаться в трассу. */
+        CHECK(D2K_QTRACE_MAX >= 11);
+        memset(&answer, 0, sizeof answer);
+    }
+
     /* Базовый вопрос донора отдельно (задача 32): тот же измеритель, та же
        метка/повторы/контроль, но без ответного направления и сырого слоя;
        блокировка — ни одного прохода и ни одной ошибки транспорта. */

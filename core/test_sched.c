@@ -100,6 +100,8 @@ static int snapshot_enabled, snapshot_entered, snapshot_release, snapshot_ok;
    со счётом проверки),
    как настоящий через on_obs, и только потом ждёт отпуска на snapshot_cv. */
 static int tcp_progress_notes;
+/* Поле 10.10.2026: подменённый замер отдаёт трассу TCP-вопросов о свойствах. */
+static int tcp_trace_lines;
 static int quic_progress_notes; /* задача 49: то же для QUIC */
 static int ver_snapshot_enabled, ver_snapshot_entered, ver_snapshot_release;
 
@@ -178,6 +180,12 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
         snprintf(r.arm_path, sizeof r.arm_path, "перебор");
         r.arm_input.trigger_len = trigger.len;
         (void)d2k_hello_sni(trigger.bytes, trigger.len, &r.arm_input.sni_off, &r.arm_input.sni_len);
+    }
+    if (tcp_trace_lines) {
+        snprintf(r.qtrace[0].label, sizeof r.qtrace[0].label, "метка времени");
+        r.qtrace[0].sent = 3; r.qtrace[0].answered = 0; r.qtrace[0].outcome = D2K_PROP_NO;
+        snprintf(r.qtrace[1].label, sizeof r.qtrace[1].label, "сверка MD5");
+        r.qtrace[1].sent = 1; r.qtrace[1].answered = 0; r.qtrace[1].outcome = D2K_PROP_UNKNOWN;
     }
     if (tcp_progress_notes) {
         d2k_sched_progress_note("split", 0, 500);
@@ -8030,6 +8038,7 @@ lifecycle_test:
         saidbuf[0] = '\0';
         d2k_sched_set_say(s, collect_say, NULL);
         tcp_answer = D2K_V_PREFIX;
+        tcp_trace_lines = 1;
         ver_answer = D2K_VER_APPLICATION;
         ver_fail_first = mode == 0 ? 1 : 0;
         ver_answer_port = (uint16_t)(40082 + mode);
@@ -8056,6 +8065,17 @@ lifecycle_test:
               "кандидат не подтверждён — сценарий теста не сложился");
         CHECK(named && eol && named < eol,
               "строка подтверждения кандидата не называет путь находки");
+        /* Трасса TCP-вопросов и id плана в журнале (поле 10.10.2026): без них
+           промах вопроса и «какой это был план 1 из 8» по журналу не видны. */
+        CHECK(said("вопрос «метка времени»: 0/3") && said("вопрос «сверка MD5»: 0/1 — не измерено"),
+              "ответы TCP-вопросов о свойствах не попали в журнал");
+        if (ok) {
+            const char *pid = strstr(ok, "plan-");
+            char needle[64];
+            snprintf(needle, sizeof needle, "(%.13s, порт зонда", pid ? pid : "plan-?");
+            CHECK(pid && said(needle),
+                  "строка «поставил план N из M» не называет id подтверждённого плана");
+        }
         if (mode == 0) {
             CHECK(fb && ok && fb < ok,
                   "до плана перебора подтвердился другой кандидат");
@@ -8068,6 +8088,7 @@ lifecycle_test:
         }
         if (fails > fails_before) fprintf(stderr, "%s\n", saidbuf);
         ver_fail_first = 0;
+        tcp_trace_lines = 0;
         d2k_sched_free(s);
         d2k_catalog_free(&cf);
     }
@@ -11871,6 +11892,7 @@ measured_test:
         ver_app_after_tcp_search = 0;
         vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0; vol_rx_tls_unavailable = 0;
         snapshot_enabled = 0;
+        tcp_trace_lines = 1; /* поле 10.10.2026: трасса вопросов и в ветке узнанной коробки */
         for (int mode = 0; mode < 5; mode++) {
             /* 0 — замер нашёл приём (disorder у донора; здесь плечо badsum);
                1 — замер владеет поиском и приёма не нашёл;
@@ -11943,6 +11965,8 @@ measured_test:
             CHECK(tcp_calls == 1, "t37: прямой замер выполнен не ровно один раз");
             CHECK(said("готовых планов узнанной коробки"),
                   "t37: сохранённый план узнанной коробки не испытан первым");
+            CHECK(said("вопрос «метка времени»: 0/3"),
+                  "t37: ответы TCP-вопросов не напечатаны в ветке готовых планов коробки");
             CHECK(!sent_contains_plan_payload("hcaptcha.com") && !said("fake-SNI"),
                   "t37: RX fake-SNI-лестница пошла без замеренного RX-обрыва");
             if (mode == 0) {
@@ -11998,6 +12022,7 @@ measured_test:
             d2k_sched_free(s); d2k_catalog_free(&c);
         }
         tcp_answer = D2K_V_OPAQUE; tcp_owns_search = tcp_found_arm = 0;
+        tcp_trace_lines = 0;
         ver_answer = D2K_VER_APPLICATION;
 
         /* F3: клиент — MQTT поверх TLS 1.3 (ALPN «mqtt», «mqttv5»). Зонд
