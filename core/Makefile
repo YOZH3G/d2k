@@ -210,6 +210,23 @@ hello_profiles.inc: profiles/modern.hex profiles/legacy.hex
 		printf 'static const char d2k_profile_%s_hex[] = "%s";\n' "$$name" "$$hex" >> $@; \
 	done
 
+# core/tcp1620_whitelist.inc — 266 имён-кандидатов белого списка, встроенных
+# в бинарник (compose.c #include'ит напрямую, как hello.c — hello_profiles.inc).
+# Генерируется ИЗ profiles/tcp1620_whitelist.txt МЕХАНИЧЕСКИ: пустые строки и
+# строки-комментарии на '#' выкидываются, CR срезается, остальное — по строке
+# на имя. Эта цель не решает, что внутри списка, только переносит текст в
+# компилируемый вид; источник правится только в .txt. Сам .inc в git не идёт
+# (core/* в .gitignore, .txt — исключение, .inc — нет), это вывод сборки.
+tcp1620_whitelist.inc: profiles/tcp1620_whitelist.txt
+	@rm -f $@
+	@echo "/* Сгенерировано из profiles/tcp1620_whitelist.txt core/Makefile'ом. Правь .txt, не этот файл. */" > $@
+	@echo "static const char *const d2k_tcp1620_whitelist[] = {" >> $@
+	@sed -e 's/\r$$//' -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$$/d' \
+		-e 's/.*/    "&",/' profiles/tcp1620_whitelist.txt >> $@
+	@echo "};" >> $@
+
+compose.o: compose.c $(HDR) tcp1620_whitelist.inc
+
 props.o: props.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 

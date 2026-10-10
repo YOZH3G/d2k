@@ -154,6 +154,14 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
 int d2k_rx_volume_plan(unsigned variant, d2k_shape shape, size_t send_cap,
                        char *buf, size_t cap);
 
+/* БЕЛЫЙ СПИСОК ИМЁН-ПРИМАНОК (поле 10.10.2026). SNI-whitelist коробки за
+ * RX-обрывом объёма различается по оператору: 266 имён — СЕМЯ, снятое
+ * (net4people/bbs#490), каждое переподтверждается на живой сети. Встроены в
+ * бинарник из profiles/tcp1620_whitelist.txt (как приветствия холодного
+ * старта), доступ — через accessor, не путь к файлу. Имя за концом — NULL. */
+size_t      d2k_net_whitelist_count(void);
+const char *d2k_net_whitelist_name(size_t i);
+
 /* СКОЛЬКО ВСЕГО ПЛЕЧ В ЗАПАСНОМ ПЕРЕБОРЕ.
  *
  * Нужно бюджету зондов: он обязан покрывать ЛЕСТНИЦУ ЦЕЛИКОМ, иначе поиск

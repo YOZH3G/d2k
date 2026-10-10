@@ -552,7 +552,31 @@ static void md5_wire(void) {
     }
 }
 
+/* БЕЛЫЙ СПИСОК ИМЁН ВСТРОЕН В БИНАРНИК (поле 10.10.2026). Как и приветствия
+ * холодного старта, 266 имён-кандидатов не читаются файлом на роутере, а
+ * генерируются из profiles/tcp1620_whitelist.txt в .inc core/Makefile'ом.
+ * Доступ — через accessor, а не через путь к файлу. */
+static void whitelist_names(void) {
+    case_name = "network whitelist seed";
+    size_t n = d2k_net_whitelist_count();
+    CHECK(n == 266);
+    const char *first = d2k_net_whitelist_name(0);
+    const char *last = n ? d2k_net_whitelist_name(n - 1) : NULL;
+    CHECK(first && !strcmp(first, "9gag.com"));
+    CHECK(last && !strcmp(last, "zoho.com"));
+    CHECK(d2k_net_whitelist_name(n) == NULL); /* за концом — NULL, не мусор */
+    int shape_ok = 1;
+    for (size_t i = 0; i < n; i++) {
+        const char *s = d2k_net_whitelist_name(i);
+        if (!(s && s[0] && !strchr(s, ' ') && !strchr(s, '"') && strchr(s, '.'))) {
+            shape_ok = 0;
+        }
+    }
+    CHECK(shape_ok);
+}
+
 int main(void) {
+    whitelist_names();
     md5_plan_contract();
     md5_wire();
     malformed();

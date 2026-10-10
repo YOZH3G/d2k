@@ -99,6 +99,17 @@
 #include "d2k_quicprobe.h" /* d2k_quic_arm: перевод подобранного плеча в текст плана */
 #include "d2k_plan.h" /* datapath/include — D2K_POISON_BADSUM, тот же публичный контракт, что уже читает d2k_link.h через d2k_ctl.h */
 #include "profiles/rx_fake.h"
+/* 266 имён-кандидатов белого списка, сгенерированы core/Makefile'ом из
+ * profiles/tcp1620_whitelist.txt (вывод сборки, в git не идёт — как
+ * hello_profiles.inc). Объявляет d2k_tcp1620_whitelist[] и его размер. */
+#include "tcp1620_whitelist.inc"
+
+size_t d2k_net_whitelist_count(void) {
+    return sizeof d2k_tcp1620_whitelist / sizeof d2k_tcp1620_whitelist[0];
+}
+const char *d2k_net_whitelist_name(size_t i) {
+    return i < d2k_net_whitelist_count() ? d2k_tcp1620_whitelist[i] : NULL;
+}
 
 /* --------------------------------------------------------------------
  * Сборка канонической TLV-формы плана — см. большой комментарий в шапке
