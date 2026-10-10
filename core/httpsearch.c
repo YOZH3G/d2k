@@ -62,6 +62,9 @@ d2k_hs_answer d2k_hs_judge(const char *host, const char *head, size_t n,
         head[11] < '0' || head[11] > '9') {
         return D2K_HS_GARBAGE;
     }
+    size_t end=0;
+    for(size_t i=0;i+3<n;i++) if(!memcmp(head+i,"\r\n\r\n",4)) { end=i+4; break; }
+    if(!end) return D2K_HS_GARBAGE; /* status alone can precede a portal Location */
     char portal[256];
     if (host && d2k_httpup_portal_location(host, head, n, portal, sizeof portal)) {
         return D2K_HS_INJECTED;
@@ -254,6 +257,7 @@ static int poison_key_spec(const char *key, char *spec, size_t cap) {
 }
 
 static int known_key(const char *k) {
+    if (!strcmp(k,"fake-badsum-whole")) return 1;
     for (size_t i = 0; i < N_CANDS; i++) { if (!strcmp(CANDS[i], k)) return 1; }
     char spec[64];
     return poison_key_spec(k, spec, sizeof spec) == 0;
@@ -272,7 +276,7 @@ int d2k_hs_candidate_text(const char *key, const uint8_t id[16], char *buf, size
     if (!strncmp(key, "fake-", 5) || !strncmp(key, "fake:", 5)) {
         static const char fake[] = "GET / HTTP/1.1\r\nHost: " HS_DECOY "\r\n\r\n";
         char spec[64];
-        if (!strcmp(key, "fake-badsum")) { snprintf(spec, sizeof spec, "badsum"); }
+        if (!strcmp(key, "fake-badsum") || !strcmp(key,"fake-badsum-whole")) { snprintf(spec, sizeof spec, "badsum"); }
         else if (!strcmp(key, "fake-seqshift")) { snprintf(spec, sizeof spec, "seqshift=-66000"); }
         else if (poison_key_spec(key, spec, sizeof spec) != 0) { return -1; }
         ADD("payload 1 ");
@@ -281,7 +285,7 @@ int d2k_hs_candidate_text(const char *key, const uint8_t id[16], char *buf, size
         ADD("poison 1 %s\n", spec);
         ADD("fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n");
     }
-    ADD("split sni_middle +0\n");
+    if(strcmp(key,"fake-badsum-whole")) ADD("split sni_middle +0\n");
     if (!strcmp(key, "disorder")) {
         /* Та же пауза между кусками, что у вопроса порядка в TLS-поиске
            (D2K_PACE_PIECE_US, compose.h). */
@@ -333,6 +337,7 @@ typedef struct {
 typedef struct { char host[256]; uint8_t family, addr[16]; } pend;
 
 enum { PH_IDLE = 0, PH_BASE, PH_ACK, PH_RUN, PH_APPLIED };
+enum { HQ_OWN=0, HQ_SPLIT, HQ_CHECKSUM, HQ_PRODUCT, HQ_FALLBACK, HQ_END };
 
 struct d2k_httpsearch {
     d2k_hs_ops ops;
@@ -349,6 +354,8 @@ struct d2k_httpsearch {
         char cands[N_CANDS * 4 + 8][40];
         size_t n_cands, idx;
         int ok;            /* настоящих ответов подряд у текущего кандидата */
+        int question, next_question;
+        int split_no, checksum_no;
         int judged;        /* судимых испытаний: ответ сервера или вставка под планом */
         uint32_t job_seq;  /* номер текущего запуска зонда */
         int fd;
@@ -592,10 +599,17 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
     r->wall = 0;
     r->no_before_ms = now + D2K_HS_RECHECK_MS;
     if (hs->ops.changed) { hs->ops.changed(hs->ops.ctx); }
+    if(hs->cur.question>=HQ_SPLIT && hs->cur.question<=HQ_PRODUCT)
+        say(hs,"HTTP %s: путь: свойство — %s; тот же запрос, APPLIED и два ответа без вставки",
+            hs->cur.host,hs->cur.question==HQ_PRODUCT ? "разрез и checksum-приманка вместе после двух отрицательных контролей" :
+            hs->cur.question==HQ_CHECKSUM ? "checksum-приманка перед целым запросом" : "разрез имени");
     say(hs, "HTTP %s: обход найден — «%s», %d настоящих ответа сервера подряд под пробным "
             "планом; поставлен постоянным (форма HTTP)", hs->cur.host, key, HS_CONFIRM);
     finish(hs, now);
 }
+
+static void add_cand(d2k_httpsearch *, const char *);
+static void build_fallback(d2k_httpsearch *);
 
 static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now) {
     const char *key = hs->cur.cands[hs->cur.idx];
@@ -618,6 +632,12 @@ static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now)
     }
     say(hs, "HTTP %s: «%s» — %s%s%s", hs->cur.host, key, d2k_hs_answer_name(r->answer),
         r->why[0] ? ": " : "", r->why);
+    if(r->answer!=D2K_HS_CONNECT_FAIL && r->answer!=D2K_HS_NONE) {
+        if(!strcmp(key,"split")) hs->cur.split_no=1;
+        if(!strcmp(key,"fake-badsum-whole")) hs->cur.checksum_no=1;
+        if(hs->cur.question==HQ_SPLIT) hs->cur.next_question=HQ_CHECKSUM;
+        else if(hs->cur.question==HQ_CHECKSUM) hs->cur.next_question=HQ_PRODUCT;
+    }
     hs->cur.ok = 0;
     hs->cur.idx++;
     next_candidate(hs, now);
@@ -626,7 +646,20 @@ static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now)
 static void next_candidate(d2k_httpsearch *hs, int64_t now) {
     drop_socket(hs);
     hs->cur.sport = 0;
-    if (hs->cur.idx >= hs->cur.n_cands) { all_failed(hs, now); return; }
+    while(hs->cur.idx>=hs->cur.n_cands) {
+        if(hs->cur.next_question==HQ_SPLIT && hs->cur.split_no) hs->cur.next_question=HQ_CHECKSUM;
+        if(hs->cur.next_question==HQ_CHECKSUM && hs->cur.checksum_no) hs->cur.next_question=HQ_PRODUCT;
+        hs->cur.question=hs->cur.next_question;
+        hs->cur.next_question=HQ_FALLBACK;
+        switch(hs->cur.question) {
+        case HQ_SPLIT: add_cand(hs,"split"); break;
+        case HQ_CHECKSUM: add_cand(hs,"fake-badsum-whole"); break;
+        case HQ_PRODUCT: add_cand(hs,"fake-badsum"); break;
+        case HQ_FALLBACK: build_fallback(hs); hs->cur.next_question=HQ_END; break;
+        default: break;
+        }
+        if(hs->cur.question==HQ_END) { all_failed(hs,now); return; }
+    }
     const char *key = hs->cur.cands[hs->cur.idx];
     char text[2048];
     d2k_hs_job job;
@@ -680,6 +713,11 @@ static void build_cands(d2k_httpsearch *hs) {
         if (!best) break;
         add_cand(hs, best->key);
     }
+    hs->cur.question=HQ_OWN;
+    hs->cur.next_question=HQ_SPLIT;
+}
+
+static void build_fallback(d2k_httpsearch *hs) {
     add_cand(hs, "split");
     add_cand(hs, "disorder");
     if (hs->n_measured) {
@@ -813,7 +851,7 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
         drop_socket(hs);
         if (r->answer == D2K_HS_INJECTED) {
             build_cands(hs);
-            say(hs, "HTTP %s: база — вставка провайдера воспроизведена; вопросов к коробке %zu",
+            say(hs, "HTTP %s: база — вставка провайдера воспроизведена; своих планов %zu, затем вопросы разреза и checksum-приманки",
                 hs->cur.host, hs->cur.n_cands);
             next_candidate(hs, now);
             return;

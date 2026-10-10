@@ -24,6 +24,7 @@ static const char INJECT[] =
 static const char REAL[] = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>";
 
 static void test_judge(void) {
+    CHECK(d2k_hs_judge("target.example","HTTP/1.1 200 OK\r\nLocation: http://lawfilter.ertelecom.ru", 53, 1, 5)==D2K_HS_GARBAGE,"incomplete headers cannot prove real server");
     CHECK(d2k_hs_judge("rutracker.org", INJECT, sizeof INJECT - 1, 98000, 700) == D2K_HS_INJECTED,
           "вставка поля не узнана");
     CHECK(d2k_hs_judge("rutracker.org", INJECT, sizeof INJECT - 1, 98000, 120000) == D2K_HS_INJECTED,
@@ -266,7 +267,7 @@ static void test_search(void) {
     /* Повторная вставка во время поиска нового поиска не начинает. */
     d2k_httpsearch_portal(hs, "www.fast-torrent.ru", 4, IP, now);
     CHECK(f.set_probe_n == 1 && f.start_n == 1, "повторная вставка сорвала идущий поиск");
-    trial(hs, &f, &now, 1, D2K_HS_INJECTED);
+    trial(hs, &f, &now, 1, D2K_HS_CONNECT_FAIL); /* local failure -> fallback */
     CHECK(f.del_probe_n == 1 && f.close_n >= 1, "пробный план не снят после испытания");
     /* Вопрос 2 — тот же разрез, хвост первым. */
     CHECK(f.set_probe_n == 2 && strstr(f.last_probe_plan, "order reverse"), "второй вопрос — не обратный порядок");
@@ -403,7 +404,7 @@ static void test_measured_poison(void) {
     int64_t now = 1000;
     d2k_httpsearch_portal(hs, "c.example", 4, IP, now);
     base_injected(hs, &f, &now);
-    trial(hs, &f, &now, 1, D2K_HS_INJECTED);   /* split */
+    trial(hs, &f, &now, 1, D2K_HS_CONNECT_FAIL);   /* split unmeasured -> fallback */
     trial(hs, &f, &now, 1, D2K_HS_INJECTED);   /* disorder */
     CHECK(strstr(f.last_probe_plan, "fake payload=1") && strstr(f.last_probe_plan, "ttl=5") &&
           strstr(f.last_probe_plan, "badsum"), "третий вопрос — не измеренная порча");
@@ -505,7 +506,40 @@ static void test_persist(void) {
     d2k_httpsearch_free(hs);
 }
 
+static void test_portal_properties(void) {
+    fake f={0}; d2k_hs_ops ops=ops_of(&f);
+    d2k_httpsearch *hs=d2k_httpsearch_new(&ops);
+    int64_t now=1;
+    d2k_httpsearch_portal(hs,"portal-target.example",4,IP,now);
+    d2k_hs_result r=res(D2K_HS_INJECTED); r.seq=f.job.seq; r.fd=f.job.fd;
+    d2k_httpsearch_result(hs,&r,++now);
+    CHECK(strstr(f.last_probe_plan,"split sni_middle") && !strstr(f.last_probe_plan,"fake "),"property: split control");
+    trial(hs,&f,&now,1,D2K_HS_SILENT);
+    CHECK(strstr(f.last_probe_plan,"badsum") && !strstr(f.last_probe_plan,"split "),"property: pure checksum question, unchanged real request");
+    trial(hs,&f,&now,1,D2K_HS_INJECTED);
+    CHECK(strstr(f.last_probe_plan,"badsum") && strstr(f.last_probe_plan,"split sni_middle"),"property: measured two NOs ask product, not disorder");
+    trial(hs,&f,&now,1,D2K_HS_REAL);
+    CHECK(!f.set_plan_n,"one header response does not confirm question");
+    trial(hs,&f,&now,1,D2K_HS_REAL);
+    CHECK(f.set_plan_n==1 && strstr(f.said,"путь: свойство") && f.set_probe_n==4,"portal property must confirm exact composite before fallback");
+    d2k_httpsearch_free(hs);
+}
+
+static void test_reused_property_answer(void) {
+    fake f={0}; d2k_hs_ops ops=ops_of(&f);
+    d2k_httpsearch *hs=d2k_httpsearch_new(&ops); int64_t now=1;
+    d2k_httpsearch_portal(hs,"saved.example",4,IP,now); base_injected(hs,&f,&now);
+    trial(hs,&f,&now,1,D2K_HS_REAL); trial(hs,&f,&now,1,D2K_HS_REAL);
+    d2k_httpsearch_portal(hs,"saved.example",4,IP,now+=D2K_HS_RECHECK_MS+1);
+    base_injected(hs,&f,&now); trial(hs,&f,&now,1,D2K_HS_SILENT);
+    CHECK(strstr(f.last_probe_plan,"badsum") && !strstr(f.last_probe_plan,"split "),
+          "saved split NO must advance to checksum, not skip properties through dedup");
+    d2k_httpsearch_free(hs);
+}
+
 int main(void) {
+    test_portal_properties();
+    test_reused_property_answer();
     test_judge();
     test_candidates();
     test_probe();
