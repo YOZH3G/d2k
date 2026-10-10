@@ -1623,6 +1623,9 @@ static int same_flow(const seen_name *s, const d2k_ev *ev) {
 
 static int ech_rr_known(const d2k_sched *s, const char *name, const char *public_name);
 static void ech_rr_store(d2k_sched *s, const char *name, int has, const char *public_name);
+/* Имя ECH-приманки (net.name либо семя hcaptcha.com) — определено ниже, но
+   нужно раньше, в выдаче измерителя (составной вопрос семейства C). */
+static const char *rx_decoy_name(const d2k_sched *s);
 
 static void remember(d2k_sched *s, const d2k_ev *ev) {
     if (ev->name[0] == '\0') { return; }
@@ -2643,15 +2646,21 @@ static void *worker_run(void *vp) {
         /* repeats<=0 — то же умолчание (три), что у d2k_meas: второе число
            здесь развело бы два места по умолчанию (d2k_verdict.h). gap/wait
            нулями — та же передача умолчания вниз. */
-        /* Белое имя сети подобрано — передаём его приманкой, чтобы измеритель
-           задал вопрос «приветствие под меткой времени» (поле 10.10.2026).
-           Только когда базовый ответ не переиспользуется (seed): белый крючок
-           — для полного прогона. */
-        uint8_t wbuf[2048]; /* белое приветствие-record ~700 байт, с запасом */
+        /* ECH-ПРИМАНКА для составного вопроса семейства C «ECH-приветствие под
+           меткой времени» (поле 10.10.2026, уточнение владельца по ECH). Шаблон
+           cloudflare-ech / fake_default_tls с ECH-расширением: коробка не читает
+           в нём имя и не режет по нему. Даётся ВСЕГДА (не только при подобранном
+           белом имени): с пустым каталогом — семя hcaptcha.com, иначе — имя из
+           net.name (rx_decoy_name — тот же источник, что у RX-лестницы). Так
+           слой рукопожатия берётся замером и на первой встрече C-цели, до любого
+           подбора белого имени. Объёмный слой (16 КБ) здесь не трогаем — его
+           снимает отдельный путь. Только когда базовый ответ не переиспользуется
+           (seed): белый крючок — для полного прогона. */
+        uint8_t wbuf[2048]; /* ECH-приветствие-record ~700 байт, с запасом */
         size_t wlen = 0;
         d2k_hello white = {0};
-        if (!seed && d2k_sched_tcp_white_hook && s->cat && s->cat->net.name[0] &&
-            d2k_white_decoy_hello(s->cat->net.name, wbuf, sizeof wbuf, &wlen) == 0) {
+        if (!seed && d2k_sched_tcp_white_hook &&
+            d2k_white_decoy_hello(rx_decoy_name(s), wbuf, sizeof wbuf, &wlen) == 0) {
             white.bytes = wbuf;
             white.len = wlen;
         }

@@ -121,6 +121,44 @@ int main(void) {
             cases++;
         }
     }
+    /* СОСТАВНОЙ ПЛАН СЕМЕЙСТВА C СОБИРАЕТСЯ И ИСПОЛНЯЕТСЯ (поле 10.10.2026).
+       Вопрос «ECH-приветствие под меткой» обязан дать ровно plan-680fbe00:
+       fake под меткой времени, серия ×8, разрез настоящего приветствия +2,
+       прямой порядок. Round-trip байт-в-байт уже проверен выше (run_case);
+       здесь — что план несёт именно эти множители, а не огрызок на одну копию
+       без разреза (как было до правки). */
+    {
+        prop_probe pp[12];
+        int nq = prop_probes(pp, 12), found = 0, i;
+        d2k_trigger tr = {0};
+        tr.len = 1400; tr.sni_off = 466; tr.sni_len = 11;
+        for (size_t j = 0; j < tr.len; j++) { tr.payload[j] = (uint8_t)(j * 13 + 3); }
+        tr.payload[0] = 0x16; tr.payload[1] = 3; tr.payload[2] = 1;
+        for (i = 0; i < nq; i++) {
+            d2k_poison p = pp[i].p;
+            d2k_arm a;
+            d2k_arm_input in = {0};
+            char text[8192], err[200];
+            if (strcmp(p.name, "white-hello-ts") != 0) { continue; }
+            found = 1;
+            p.decoy = decoy; p.decoy_len = sizeof decoy;
+            in.trigger_len = tr.len; in.sni_off = tr.sni_off; in.sni_len = tr.sni_len;
+            in.decoy_len = p.decoy_len; memcpy(in.decoy, p.decoy, p.decoy_len);
+            if (d2k_arm_from_poison(&p, &a, err, sizeof err) != 0) {
+                printf("семейство C: мост отверг приём: %s\n", err); failures++; break;
+            }
+            if (d2k_arm_plan_measured(&a, &in, text, sizeof text) != 0) {
+                printf("семейство C: план не собрался\n"); failures++; break;
+            }
+            if (!strstr(text, "poison 1 tcpts")) { printf("семейство C: нет «poison 1 tcpts»\n"); failures++; }
+            if (!strstr(text, "fake payload=1 poison=1 repeats=8")) {
+                printf("семейство C: нет серии ×8\n"); failures++;
+            }
+            if (!strstr(text, "split payload_start +2")) { printf("семейство C: нет разреза +2\n"); failures++; }
+            if (!strstr(text, "order forward")) { printf("семейство C: нет прямого порядка\n"); failures++; }
+        }
+        if (!found) { printf("семейство C: вопрос «white-hello-ts» не найден\n"); failures++; }
+    }
     prop_probe allq[12];
     int n_questions = prop_probes(allq, 12);
     printf("probe-plan: %u inputs, %d catalog hypotheses, %d questions, %u skipped, %u mismatches\n",
