@@ -7252,6 +7252,23 @@ static void budget_cut_reject(d2k_sched *s, task *t) {
     t->state = T_PLANNING;
 }
 
+/* ТРАССА ВОПРОСНИКА — по строке на заданный вопрос. Свойство говорит «помог
+   ли приём», трасса — «что при этом видели»: без неё «приём не сработал»
+   неотличимо от «зонд не долетел по другой причине» (см. d2k_quic_step). С
+   10.10.2026 сюда же идут TCP-вопросы о свойствах (detect/bridge.c), и
+   печатать трассу обязана каждая ветка, принявшая вердикт: ветка готовых
+   планов узнанной коробки её прежде пропускала. */
+static void say_question_trace(d2k_sched *s, const task *t, const d2k_vres *r) {
+    for (size_t qi = 0; qi < D2K_QTRACE_MAX; qi++) {
+        const d2k_quic_step *st = &r->qtrace[qi];
+        if (!st->label[0]) { continue; }
+        say(s, "по %s вопрос «%s»: %u/%u%s", t->name, st->label,
+            (unsigned)st->answered, (unsigned)st->sent,
+            st->outcome == D2K_PROP_UNKNOWN ? " — не измерено" :
+            (st->outcome == D2K_PROP_YES ? " — взял" : ""));
+    }
+}
+
 /* ПУТЬ НАХОДКИ ПОДТВЕРЖДАЕМОГО КАНДИДАТА (поле 10.10.2026, §0.1 ТЗ). Доля
    «перебора» считается по журналу; успех запасного перебора и RX-лестницы
    прежде писался без пути, и счёт видел только находки замера. Порядок —
@@ -8884,6 +8901,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     say(s, "по %s прямой замер подтвердил блокировку (%s: %s) за %d зондов "
                            "замера — сначала проверяю %zu готовых планов узнанной коробки",
                         t->name, verdict_name(r.verdict), r.reason, r.probes, known);
+                    say_question_trace(s, t, &r);
                     moved++;
                     continue;
                 }
@@ -8939,18 +8957,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                ровно эти строки говорят, куда движку расти, и ровно они
                теряются первыми, если складывать их в текст причины (384
                байта на весь вердикт). См. d2k_quic_props_findings. */
-            /* ТРАССА ВОПРОСНИКА — по строке на заданный вопрос. Свойство
-               говорит «помог ли приём», трасса — «что при этом видели»:
-               без неё «приём не сработал» неотличимо от «зонд не долетел по
-               другой причине» (см. d2k_quic_step). */
-            for (size_t qi = 0; qi < D2K_QTRACE_MAX; qi++) {
-                const d2k_quic_step *st = &r.qtrace[qi];
-                if (!st->label[0]) { continue; }
-                say(s, "по %s вопрос «%s»: %u/%u%s", t->name, st->label,
-                    (unsigned)st->answered, (unsigned)st->sent,
-                    st->outcome == D2K_PROP_UNKNOWN ? " — не измерено" :
-                    (st->outcome == D2K_PROP_YES ? " — взял" : ""));
-            }
+            say_question_trace(s, t, &r);
             {
                 char found[1024];
                 if (d2k_quic_props_findings(&r.qprops, found, sizeof found) > 0) {
@@ -9687,8 +9694,13 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             /* Порт зонда — в строке НАРОЧНО: пробный план ставится только для
                него, и расхождение «поставили под порт P, зонд ушёл с Q»
                иначе не видно ничем, а стоит оно выброшенным успехом. */
-            say(s, "по %s поставил план %zu из %zu (порт зонда %u) — испытываю его собственным зондом",
-                t->name, t->next_plan, t->n_plans,
+            /* Id плана — тот же, что назовёт подтверждение (plan_ident):
+               иначе «план 1 из 8» по журналу не опознать (поле 10.10.2026). */
+            char trial_id[40];
+            uint8_t trial_wire[D2K_PLAN_ID_LEN];
+            plan_ident(t->plans[t->next_plan - 1], trial_id, sizeof trial_id, trial_wire);
+            say(s, "по %s поставил план %zu из %zu (%s, порт зонда %u) — испытываю его собственным зондом",
+                t->name, t->next_plan, t->n_plans, trial_id,
                 (unsigned)ntohs(t->probe_sport_be));
             moved++;
         }

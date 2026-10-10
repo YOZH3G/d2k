@@ -256,6 +256,41 @@ static void progress_seen(void *ctx, const d2k_obs *o)
     d2k_sched_progress_note(o->probe, o->pass, o->fail);
 }
 
+/* ОТВЕТЫ ВОПРОСОВ О СВОЙСТВАХ — ПЛАНИРОВЩИКУ (поле 10.10.2026). У QUIC каждый
+ * вопрос лежит в d2k_vres.qtrace, и журнал печатает «вопрос «…»: N/M»; у TCP
+ * трасса дерева дальше измерителя не шла, и промах вопроса «метка времени»
+ * на rutracker.org пришлось выводить из порядка дерева. Копируются только
+ * наблюдения «свойство:*»: база, разрез и гипотезы перебора — не вопросы о
+ * свойствах. Исход: все повторы прошли — YES, промах — NO, локальная ошибка
+ * зонда — UNKNOWN (сети зонд не достиг). Ярлык режется только по границе
+ * символа UTF-8 (r-73.1). */
+static void trace_questions(const d2k_result *res, int repeats, d2k_vres *out)
+{
+    static const char pfx[] = "свойство:";
+    size_t qi = 0;
+    int i;
+    for (i = 0; i < res->ntrace && qi < D2K_QTRACE_MAX; i++) {
+        const d2k_obs *o = &res->trace[i];
+        d2k_quic_step *st;
+        const char *label;
+        size_t n;
+        if (strncmp(o->probe, pfx, sizeof(pfx) - 1) != 0) { continue; }
+        label = o->probe + sizeof(pfx) - 1;
+        n = strlen(label);
+        if (n > sizeof(st->label) - 1) {
+            n = sizeof(st->label) - 1;
+            while (n > 0 && ((unsigned char)label[n] & 0xC0) == 0x80) { n--; }
+        }
+        st = &out->qtrace[qi++];
+        memcpy(st->label, label, n);
+        st->label[n] = '\0';
+        st->sent = (uint8_t)(o->pass + o->fail > 255 ? 255 : o->pass + o->fail);
+        st->answered = (uint8_t)(o->pass > 255 ? 255 : o->pass);
+        st->outcome = o->err[0] ? D2K_PROP_UNKNOWN
+                    : (repeats > 0 && o->pass == repeats) ? D2K_PROP_YES : D2K_PROP_NO;
+    }
+}
+
 /* Полный прогон; seed — ответ уже заданного базового вопроса тем же входом
  * (d2k_opts.seed_whole), NULL — прогон спрашивает базу сам. */
 static d2k_vres sched_tcp(const char *ip, uint16_t port,
@@ -302,6 +337,7 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
         return out;
     }
     out.verdict = map_verdict(res.verdict);
+    trace_questions(&res, opt.repeats, &out);
     out.split_gap_us = (uint32_t)opt.write_gap_ms * 1000u;
     snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);
     out.split_pos = res.split_pos;

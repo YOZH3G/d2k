@@ -246,6 +246,11 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
             d2k_raw_note_rc(res, family, rc);
             if (rc <= 0) {
                 local_err = rc < 0;
+                /* Локальная ошибка — в трассу: иначе «0/3» читается как
+                 * ответ сети, а сети зонд не достиг (поле 10.10.2026). */
+                if (local_err && obs->err[0] == '\0') {
+                    snprintf(obs->err, sizeof(obs->err), "%s", err);
+                }
                 break;
             }
             pass++;
