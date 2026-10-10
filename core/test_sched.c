@@ -8014,6 +8014,64 @@ lifecycle_test:
         d2k_catalog_free(&cf);
     }
 
+    /* --- подтверждение из запасного перебора называет путь ----------------
+     *
+     * Поле 10.10.2026: TCP-блок провайдера взял план из запасного перебора,
+     * а журнал писал только «ПОДТВЕРЖДЕНО … plan-X». Доля перебора по строке
+     * «путь: перебор» эту находку не видела (§0.1 ТЗ). Режим 0: первый
+     * кандидат — выведенный из замера — проваливается, подтверждается план
+     * перебора. Режим 1: подтверждается сам кандидат замера, и перебором его
+     * журнал не называет — иначе доля перебора считалась бы по всем. */
+    for (int mode = 0; mode < 2; mode++) {
+        int fails_before = fails;
+        d2k_catalog cf;
+        memset(&cf, 0, sizeof cf);
+        d2k_sched *s = d2k_sched_new(&cf, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = mode == 0 ? 1 : 0;
+        ver_answer_port = (uint16_t)(40082 + mode);
+        ver_calls = 0;
+        d2k_ev h = ev_hello(6, ver_answer_port, mode == 0 ? "путь-перебора.цель" : "путь-замера.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, ver_answer_port);
+        d2k_sched_event(s, &su);
+        for (int i = 0; i < 1500 && !said("ПОДТВЕРЖДЕНО"); i++) {
+            spin(s, 120);
+            drain();
+            d2k_ev ap = ev_applied(6, ver_answer_port);
+            d2k_sched_event(s, &ap);
+            spin(s, 5);
+        }
+        drain();
+
+        const char *fb = strstr(saidbuf, "кандидаты замера исчерпаны");
+        const char *ok = strstr(saidbuf, "ПОДТВЕРЖДЕНО");
+        const char *eol = ok ? strchr(ok, '\n') : NULL;
+        const char *named = ok ? strstr(ok, "(путь: ") : NULL;
+        const char *sweep = ok ? strstr(ok, "(путь: перебор)") : NULL;
+        CHECK(ok && total_bindings(&cf) == 1,
+              "кандидат не подтверждён — сценарий теста не сложился");
+        CHECK(named && eol && named < eol,
+              "строка подтверждения кандидата не называет путь находки");
+        if (mode == 0) {
+            CHECK(fb && ok && fb < ok,
+                  "до плана перебора подтвердился другой кандидат");
+            CHECK(sweep && eol && sweep < eol,
+                  "строка подтверждения плана из перебора не называет путь «перебор»");
+        } else {
+            CHECK(!fb, "запасной перебор пошёл, хотя кандидат замера подтвердился");
+            CHECK(!(sweep && eol && sweep < eol),
+                  "кандидат, выведенный из замера, назван перебором");
+        }
+        if (fails > fails_before) fprintf(stderr, "%s\n", saidbuf);
+        ver_fail_first = 0;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cf);
+    }
+
     /* --- отказ отправки + ОБОРВАННЫЙ ЗОНД: кандидат не виноват -----------
      *
      * 0009, U2, пропущенный путь. Сочетание обычное: посылка плана не ушла,
