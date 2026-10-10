@@ -421,6 +421,7 @@ d2k_sched_replay_ver_fn d2k_sched_replay_ver_hook = d2k_verify_replay_on;
 d2k_sched_tcp_fn  d2k_sched_tcp_base_hook = NULL;
 d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook = NULL;
 d2k_sched_tcp_white_fn d2k_sched_tcp_white_hook = NULL;
+d2k_sched_tcp_seeded_white_fn d2k_sched_tcp_seeded_white_hook = NULL;
 d2k_sched_tcp_ack_fn d2k_sched_tcp_ack_hook = NULL;
 d2k_sched_quic_base_fn  d2k_sched_quic_base_hook = NULL;
 d2k_sched_quic_seeded_fn d2k_sched_quic_seeded_hook = NULL;
@@ -2649,24 +2650,30 @@ static void *worker_run(void *vp) {
         /* ECH-ПРИМАНКА для составного вопроса семейства C «ECH-приветствие под
            меткой времени» (поле 10.10.2026, уточнение владельца по ECH). Шаблон
            cloudflare-ech / fake_default_tls с ECH-расширением: коробка не читает
-           в нём имя и не режет по нему. Даётся ВСЕГДА (не только при подобранном
-           белом имени): с пустым каталогом — семя hcaptcha.com, иначе — имя из
-           net.name (rx_decoy_name — тот же источник, что у RX-лестницы). Так
-           слой рукопожатия берётся замером и на первой встрече C-цели, до любого
-           подбора белого имени. Объёмный слой (16 КБ) здесь не трогаем — его
-           снимает отдельный путь. Только когда базовый ответ не переиспользуется
-           (seed): белый крючок — для полного прогона. */
+           в нём имя и не режет по нему. Даётся ВСЕГДА, НЕЗАВИСИМО ОТ seed: с
+           пустым каталогом — семя hcaptcha.com, иначе имя из net.name
+           (rx_decoy_name — тот же источник, что у RX-лестницы).
+
+           ПОЧЕМУ НЕЗАВИСИМО ОТ seed (поле ac4edeb, 19 сайтов): у целей семейства
+           C профильный замер ловит ClientHello клиента и идёт SEEDED (снятыми
+           байтами). Пока приманка считалась только при !seed, у этих целей
+           opt->white был пуст, вопрос пропускался — цель падала в старое
+           поведение. Теперь приманка доходит и на seeded-путь (отдельный крючок,
+           сигнатуру seeded менять нельзя). Объёмный слой (16 КБ) здесь не
+           трогаем — его снимает отдельный путь. */
         uint8_t wbuf[2048]; /* ECH-приветствие-record ~700 байт, с запасом */
         size_t wlen = 0;
         d2k_hello white = {0};
-        if (!seed && d2k_sched_tcp_white_hook &&
-            d2k_white_decoy_hello(rx_decoy_name(s), wbuf, sizeof wbuf, &wlen) == 0) {
+        int want_white = d2k_white_decoy_hello(rx_decoy_name(s), wbuf, sizeof wbuf, &wlen) == 0;
+        if (want_white) {
             white.bytes = wbuf;
             white.len = wlen;
         }
-        r = seed && d2k_sched_tcp_seeded_hook
+        r = seed && white.len && d2k_sched_tcp_seeded_white_hook
+            ? d2k_sched_tcp_seeded_white_hook(t->ip, t->port, trig, ctl, white, s->measure_mark, 0, 0, 0, &t->stop, seed)
+            : seed && d2k_sched_tcp_seeded_hook
             ? d2k_sched_tcp_seeded_hook(t->ip, t->port, trig, ctl, s->measure_mark, 0, 0, 0, &t->stop, seed)
-            : white.len
+            : white.len && d2k_sched_tcp_white_hook
             ? d2k_sched_tcp_white_hook(t->ip, t->port, trig, ctl, white, s->measure_mark, 0, 0, 0, &t->stop)
             : d2k_sched_tcp_hook(t->ip, t->port, trig, ctl, s->measure_mark, 0, 0, 0, &t->stop);
     }

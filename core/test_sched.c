@@ -1808,6 +1808,20 @@ static d2k_vres stub_tcp_seeded(const char *ip, uint16_t port, d2k_hello trigger
     seeded_fail = seed ? seed->fail : -1;
     return stub_tcp(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop);
 }
+/* Полный прогон С ОТВЕТОМ БАЗЫ И ECH-ПРИМАНКОЙ (поле ac4edeb): у целей
+   семейства C замер идёт снятыми байтами (seed), и приманка обязана доходить и
+   сюда — иначе составной ECH-вопрос не задаётся. Запоминаем длину приманки. */
+static int seeded_white_calls, seeded_white_len;
+static d2k_vres stub_tcp_seeded_white(const char *ip, uint16_t port, d2k_hello trigger,
+                                      d2k_hello control, d2k_hello white, uint32_t mark,
+                                      int repeats, uint32_t gap_us, uint32_t wait_ms,
+                                      const volatile sig_atomic_t *stop,
+                                      const d2k_base_seed *seed) {
+    (void)seed;
+    seeded_white_calls++;
+    seeded_white_len = (int)white.len;
+    return stub_tcp(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop);
+}
 /* QUIC: базовый вопрос и полный прогон с его ответом. */
 static int quic_base_calls, quic_seeded_calls, quic_seeded_ctl;
 static d2k_vres stub_quic_base(const char *ip, uint16_t port, const char *sni,
@@ -12519,6 +12533,52 @@ own_first_test:
             CHECK(seeded_calls == 1 && seeded_pass == 0 && seeded_fail == 3,
                   "own-first: полный замер не получил ответ базового вопроса (I2)");
             d2k_sched_tcp_seeded_hook = NULL;
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_app_after_tcp_search = 0;
+        }
+
+        /* (c) ECH-ПРИМАНКА ДОХОДИТ ДО SEEDED-ПУТИ (поле ac4edeb, 19 сайтов).
+           Цель семейства C мерится снятыми байтами клиента (seed): профильный
+           замер ловит ClientHello и переиспользует его. До правки ECH-приманка
+           считалась только при !seed, и составной вопрос «ECH-приветствие под
+           меткой» на seeded-пути НЕ ЗАДАВАЛСЯ (в поле — 0 вхождений в журнале),
+           цель падала в старое поведение. Теперь планировщик зовёт seeded+white
+           крючок с непустой ECH-приманкой (семя hcaptcha.com даже при пустом
+           net.name), и вопрос задаётся на snapshot-замере тоже.
+
+           ПАДАЕТ БЕЗ ПРАВКИ: обычный seeded-крючок приманку не нёс, и на
+           seeded-пути seeded_white_calls оставался 0. */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-cf-seed", pid, 2, 3, "ech-seed-first.own", 6, D2K_SHAPE_MODERN, 4,
+                    1790000000, 0);
+            tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 1; base_blocked_answer = 1;
+            /* Только seeded+white крючок: если приманка не дойдёт до seeded-пути,
+               вызов уйдёт в обычный путь и seeded_white_calls останется 0. */
+            d2k_sched_tcp_seeded_white_hook = stub_tcp_seeded_white;
+            seeded_white_calls = 0; seeded_white_len = -1; seeded_calls = 0;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42121;
+            d2k_ev h = ev_hello(6, 42121, "ech-seed-second.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42121); d2k_sched_event(s, &su);
+            for (int i = 0; i < 40 && !said("ПОДТВЕРЖДЕНО"); i++) {
+                spin(s, 200);
+                d2k_ev ap = ev_applied(6, 42121); d2k_sched_event(s, &ap);
+                spin(s, 5);
+            }
+            CHECK(base_calls == 1 && tcp_calls == 1,
+                  "ECH seed: полный замер не выполнен ровно раз");
+            CHECK(seeded_white_calls == 1 && seeded_white_len > 2,
+                  "ECH seed: seeded-замер не получил ECH-приманку");
+            CHECK(seeded_calls == 0,
+                  "ECH seed: вызван обычный seeded-крючок вместо seeded+white");
+            d2k_sched_tcp_seeded_white_hook = NULL;
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
             ver_app_after_tcp_search = 0;

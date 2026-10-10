@@ -473,6 +473,20 @@ d2k_vres d2k_detect_sched_tcp_seeded(const char *ip, uint16_t port,
     return sched_tcp(ip, port, trigger, control, none, mark, repeats, gap_us, wait_ms, stop, seed);
 }
 
+/* Тот же прогон С ОТВЕТОМ БАЗЫ И ECH-ПРИМАНКОЙ (d2k_sched_tcp_seeded_white_fn,
+   поле 10.10.2026). У целей семейства C профильный замер идёт SEEDED (снятыми
+   байтами клиента), и без этого крючка приманка туда не доходила — составной
+   ECH-вопрос не задавался. sched_tcp уже умеет и seed, и white сразу. */
+d2k_vres d2k_detect_sched_tcp_seeded_white(const char *ip, uint16_t port,
+                                           d2k_hello trigger, d2k_hello control,
+                                           d2k_hello white, uint32_t mark, int repeats,
+                                           uint32_t gap_us, uint32_t wait_ms,
+                                           const volatile sig_atomic_t *stop,
+                                           const d2k_base_seed *seed)
+{
+    return sched_tcp(ip, port, trigger, control, white, mark, repeats, gap_us, wait_ms, stop, seed);
+}
+
 /* БАЗОВЫЙ ВОПРОС ДОНОРА ОТДЕЛЬНО (задача 32 d2k, d2k_sched_tcp_base_hook).
  *
  * Не новый зонд «по мотивам», а тот же d2k_classify_run, остановленный на

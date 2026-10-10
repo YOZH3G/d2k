@@ -195,6 +195,18 @@ typedef d2k_vres (*d2k_sched_tcp_white_fn)(const char *ip, uint16_t port,
                                            uint32_t gap_us, uint32_t wait_ms,
                                            const volatile sig_atomic_t *stop);
 extern d2k_sched_tcp_white_fn d2k_sched_tcp_white_hook;
+/* ПОЛНЫЙ ПРОГОН С ОТВЕТОМ БАЗЫ И ECH-ПРИМАНКОЙ (поле 10.10.2026). У целей
+ * семейства C профильный замер ловит ClientHello клиента и идёт SEEDED
+ * (снятыми байтами), а seeded-крючок приманки не нёс — составной ECH-вопрос
+ * не задавался. Этот крючок несёт И ответ базы (seed), И ECH-приманку, чтобы
+ * вопрос задавался и на seeded-пути. NULL — зовётся обычный seeded-крючок. */
+typedef d2k_vres (*d2k_sched_tcp_seeded_white_fn)(const char *ip, uint16_t port,
+                                                  d2k_hello trigger, d2k_hello control,
+                                                  d2k_hello white, uint32_t mark, int repeats,
+                                                  uint32_t gap_us, uint32_t wait_ms,
+                                                  const volatile sig_atomic_t *stop,
+                                                  const d2k_base_seed *seed);
+extern d2k_sched_tcp_seeded_white_fn d2k_sched_tcp_seeded_white_hook;
 /* ПРИНИМАЕТ ЛИ АДРЕС ДАННЫЕ (задача 54, fix round 1 I2). Перепроверка
  * адреса, у которого есть вердикт address, начинается с этого вопроса ДО
  * любого зонда с триггером: один нейтральный байт, ожидание подтверждения TCP

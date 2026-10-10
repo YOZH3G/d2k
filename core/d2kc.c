@@ -70,6 +70,12 @@ d2k_vres d2k_detect_sched_tcp_white(const char *ip, uint16_t port,
                                     uint32_t mark, int repeats,
                                     uint32_t gap_us, uint32_t wait_ms,
                                     const volatile sig_atomic_t *stop);
+d2k_vres d2k_detect_sched_tcp_seeded_white(const char *ip, uint16_t port,
+                                           d2k_hello trigger, d2k_hello control, d2k_hello white,
+                                           uint32_t mark, int repeats,
+                                           uint32_t gap_us, uint32_t wait_ms,
+                                           const volatile sig_atomic_t *stop,
+                                           const d2k_base_seed *seed);
 
 /* Период тика. Унаследован с Go-стороны (controller.go: time.NewTicker(3 *
    time.Second)) и там же обоснован: счётчики ядра опрашиваются по часам, а не
@@ -568,6 +574,10 @@ int main(int argc, char **argv) {
     /* Белое имя сети приманкой для вопроса «приветствие под меткой» (поле
      * 10.10.2026): отдельный крючок, т.к. сигнатуру основного менять нельзя. */
     d2k_sched_tcp_white_hook = d2k_detect_sched_tcp_white;
+    /* Тот же белый крючок, но на seeded-пути: у целей семейства C замер идёт
+     * снятыми байтами клиента (seed), и без этого приманка не доходила — вопрос
+     * не задавался в поле (прогон ac4edeb, 19 сайтов). */
+    d2k_sched_tcp_seeded_white_hook = d2k_detect_sched_tcp_seeded_white;
     /* Перепроверка адреса с вердиктом address — сначала один нейтральный
      * байт, до любого триггера (задача 54). */
     d2k_sched_tcp_ack_hook = d2k_detect_sched_tcp_ack;
