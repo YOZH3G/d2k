@@ -962,6 +962,13 @@ typedef struct {
     size_t     fb_from;   /* с какого места очереди начинается запасной перебор:
                              ступени RX-лестницы перед ним — из замера */
     unsigned   rx_volume_next_variant;
+    /* Путь находки для строки подтверждения (поле 10.10.2026): какой план
+       очереди пришёл из приёма замера и какие — из RX-лестницы. По тексту,
+       а не по месту: очередь перестраивается, а план остаётся тем же. */
+    uint64_t   arm_hash;
+    char       arm_path[32];
+    uint64_t   rx_hashes[D2K_RX_VOLUME_PLAN_VARIANTS];
+    size_t     n_rx_hashes;
     int        res_ready;   /* пишется потоком под мьютексом планировщика */
     /* Ход измерителя (задачи 48, 49): ask_probes — зонды, потраченные задачей
        ВНЕ счётчика кандидатов t->probes (бюджет SCHED_MAX_PROBES): прогоны
@@ -3468,6 +3475,7 @@ static int next_rx_volume_plan(d2k_sched *s, task *t, d2k_shape sh,
         }
         if (seen) { continue; }
         tried_add(t, h);
+        t->rx_hashes[t->n_rx_hashes++ % D2K_RX_VOLUME_PLAN_VARIANTS] = fnv1a(text);
         return 1;
     }
     return 0;
@@ -4332,6 +4340,8 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
     t->n_plans = 0;
     t->fb_queue = 0;
     t->search_owned = r->owns_search;
+    t->arm_hash = 0;
+    t->arm_path[0] = '\0';
     memset(t->plan_boxes, 0, sizeof t->plan_boxes);
     /* Failed reuse does not prove this is the same box. A newly synthesized
        plan must not silently enlarge the first vaguely matching model. */
@@ -4546,6 +4556,8 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
         if (rc == 0) {
             memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
             t->n_plans++;
+            t->arm_hash = fnv1a(text);
+            snprintf(t->arm_path, sizeof t->arm_path, "%s", r->arm_path);
             /* Путь находки — в той же строке: доля «перебора» в поле меряет,
                чего классификатор ещё не знает (§0.1 ТЗ, 09.10.2026). */
             say(s, "по %s приём «%s» НАЙДЕН замером%s%s%s — ставлю его первым кандидатом",
@@ -7240,6 +7252,24 @@ static void budget_cut_reject(d2k_sched *s, task *t) {
     t->state = T_PLANNING;
 }
 
+/* ПУТЬ НАХОДКИ ПОДТВЕРЖДАЕМОГО КАНДИДАТА (поле 10.10.2026, §0.1 ТЗ). Доля
+   «перебора» считается по журналу; успех запасного перебора и RX-лестницы
+   прежде писался без пути, и счёт видел только находки замера. Порядок —
+   как у источника на панели: свой план коробки, затем приём замера с путём
+   дерева, затем ступень RX-лестницы, затем запасной перебор. */
+static const char *candidate_path(const task *t) {
+    size_t i = t->next_plan ? t->next_plan - 1 : 0;
+    if (t->n_known > 0 && t->next_plan <= t->n_known) return "свой план";
+    uint64_t h = fnv1a(t->plans[i]);
+    if (t->arm_hash && h == t->arm_hash) return t->arm_path[0] ? t->arm_path : "приём замера";
+    size_t n = t->n_rx_hashes < D2K_RX_VOLUME_PLAN_VARIANTS
+        ? t->n_rx_hashes : D2K_RX_VOLUME_PLAN_VARIANTS;
+    for (size_t k = 0; k < n; k++)
+        if (t->rx_hashes[k] == h) return "RX-лестница";
+    if (t->fb_queue && i >= t->fb_from) return "перебор";
+    return "вывод из замера";
+}
+
 static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     const char *text = t->plans[t->next_plan - 1];
     char plan_id[40], box_id[40];
@@ -7430,18 +7460,19 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     s->confirms++;
     if (t->ver.replay_proof)
         say(s, "по %s (TCP, ECH) ПОДТВЕРЖДЕНО повтором приветствия клиента на уровне "
-               "рукопожатия: %s — ServerHello под планом (план применён к потоку зонда); "
-               "без ключей клиента прикладной уровень не измерен",
-            t->name, plan_id);
+               "рукопожатия: %s (путь: %s) — ServerHello под планом (план применён к потоку "
+               "зонда); без ключей клиента прикладной уровень не измерен",
+            t->name, plan_id, candidate_path(t));
     else if (t->ver.handshake_proof)
-        say(s, "по %s (TCP) ПОДТВЕРЖДЕНО собственным зондом на уровне рукопожатия: %s — "
-               "TLS с ALPN клиента завершён (план применён к потоку зонда); протокол "
-               "клиента не HTTP, прикладной уровень не измерен",
-            t->name, plan_id);
+        say(s, "по %s (TCP) ПОДТВЕРЖДЕНО собственным зондом на уровне рукопожатия: %s "
+               "(путь: %s) — TLS с ALPN клиента завершён (план применён к потоку зонда); "
+               "протокол клиента не HTTP, прикладной уровень не измерен",
+            t->name, plan_id, candidate_path(t));
     else
-    say(s, "по %s (%s) ПОДТВЕРЖДЕНО собственным зондом: %s, приложение ответило %d "
-           "(план применён к потоку зонда)",
-        t->name, t->transport == 17 ? "QUIC" : "TCP", plan_id, t->ver.status);
+    say(s, "по %s (%s) ПОДТВЕРЖДЕНО собственным зондом: %s (путь: %s), приложение "
+           "ответило %d (план применён к потоку зонда)",
+        t->name, t->transport == 17 ? "QUIC" : "TCP", plan_id, candidate_path(t),
+        t->ver.status);
     /* Одна строка на подтверждение: пакеты и исход проверки бюджета. */
     if (t->ver.replay_proof)
         say(s, "по %s бюджет потока не применим (задача 55): %s — привязка помечена "
