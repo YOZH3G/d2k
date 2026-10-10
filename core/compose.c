@@ -1676,20 +1676,30 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
     return d2k_arm_plan(&a, shape, decoy, send_cap, buf, cap);
 }
 
+/* Полный TLS-record ClientHello с именем name в SNI, из восстановленного
+   fake_default_tls (profiles/rx_fake.h). Один источник для RX-лестницы и для
+   приманки вопроса «приветствие под меткой времени» (поле 10.10.2026). */
+int d2k_white_decoy_hello(const char *name, uint8_t *out, size_t cap, size_t *len) {
+    size_t hl = 0;
+    if (!out || cap < 5 || !name || !name[0] ||
+        d2k_hello_rename(d2k_rx_fake_template + 5, sizeof d2k_rx_fake_template - 5,
+                          name, out + 5, cap - 5, &hl) != 0) { return -1; }
+    /* hello_rename accepts the handshake, not its record wrapper. */
+    memcpy(out, d2k_rx_fake_template, 3);
+    out[3] = (uint8_t)(hl >> 8);
+    out[4] = (uint8_t)hl;
+    *len = hl + 5;
+    return 0;
+}
+
 int d2k_rx_volume_plan_named(unsigned variant, d2k_shape shape, size_t send_cap,
                              const char *name, char *buf, size_t cap) {
     static const unsigned split_at[D2K_RX_VOLUME_PLAN_VARIANTS] = {2, 1, 3, 4, 5};
     uint8_t hello[D2K_COMPOSE_HELLO_MAX];
     size_t hello_len = 0, pos = 0;
     if (!buf || cap == 0 || variant >= D2K_RX_VOLUME_PLAN_VARIANTS ||
-        shape != D2K_SHAPE_MODERN || !name || !name[0] ||
-        d2k_hello_rename(d2k_rx_fake_template + 5, sizeof d2k_rx_fake_template - 5,
-                          name, hello + 5, sizeof hello - 5, &hello_len) != 0) { return -1; }
-    /* hello_rename accepts the handshake, not its record wrapper. */
-    memcpy(hello, d2k_rx_fake_template, 3);
-    hello[3] = (uint8_t)(hello_len >> 8);
-    hello[4] = (uint8_t)hello_len;
-    hello_len += 5;
+        shape != D2K_SHAPE_MODERN ||
+        d2k_white_decoy_hello(name, hello, sizeof hello, &hello_len) != 0) { return -1; }
     /* Recovered manual command and capture: eight 675-byte fake_default_tls
        copies, rnd/dupsid, original TS minus 1000, then split at +2 without
        nodrop. Adjacent split positions remain follow-up hypotheses. */

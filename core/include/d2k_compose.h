@@ -157,6 +157,9 @@ int d2k_rx_volume_plan(unsigned variant, d2k_shape shape, size_t send_cap,
  * имя — отказ: план без приманки смысла не имеет. */
 int d2k_rx_volume_plan_named(unsigned variant, d2k_shape shape, size_t send_cap,
                              const char *name, char *buf, size_t cap);
+/* Полный TLS-record ClientHello с name в SNI (приманка). 0 — собрано в out,
+ * *len — длина; -1 — имя пустое или не поместилось. */
+int d2k_white_decoy_hello(const char *name, uint8_t *out, size_t cap, size_t *len);
 
 /* БЕЛЫЙ СПИСОК ИМЁН-ПРИМАНОК (поле 10.10.2026). SNI-whitelist коробки за
  * RX-обрывом объёма различается по оператору: 266 имён — СЕМЯ, снятое

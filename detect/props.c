@@ -31,7 +31,8 @@ typedef enum {
     SET_SEQ_WINDOW,     /* ТОЛЬКО по проходу */
     SET_TIMESTAMPS,     /* ТОЛЬКО по проходу */
     SET_OVERLAP_SNI,    /* ТОЛЬКО по проходу */
-    SET_DUP_DENSE       /* ТОЛЬКО по проходу, то же поле, что SET_DUPLICATES */
+    SET_DUP_DENSE,      /* ТОЛЬКО по проходу, то же поле, что SET_DUPLICATES */
+    SET_WHITE_TS        /* проход → не сверяет метку И разбирает L7 (белое имя) */
 } prop_set;
 
 typedef struct {
@@ -43,10 +44,10 @@ typedef struct {
 static int prop_probes(prop_probe *out, int cap)
 {
     int k = 0;
-    if (cap < 11) {
+    if (cap < 12) {
         return 0;
     }
-    memset(out, 0, sizeof(*out) * 11);
+    memset(out, 0, sizeof(*out) * 12);
 
     out[k].label = "перекрытие слева";
     snprintf(out[k].p.name, sizeof(out[k].p.name), "seqovl-1");
@@ -127,6 +128,25 @@ static int prop_probes(prop_probe *out, int cap)
     out[k].set = SET_DUP_DENSE;
     k++;
 
+    /* ПРИМАНКА-ПРИВЕТСТВИЕ ПОД МЕТКОЙ ВРЕМЕНИ (поле 10.10.2026, разбор
+     * 2026-10-10-tcp-block-analysis.md, раздел «Предложение»). Та же отрава
+     * TS−1000, что у вопроса «метка времени», но фальшивка — ЦЕЛОЕ приветствие
+     * с белым именем сети (opt->white), а не набивка; одна копия, правда
+     * целиком, без разреза. Проход при промахе «метки времени» значит: коробка
+     * принимает пакет со старой меткой И разбирает фальшивое приветствие,
+     * закрепляя поток по имени приманки. План из того же: fake(приветствие) +
+     * poison tcpts, одна копия, правда целиком — выразим. Задаётся ТОЛЬКО при
+     * известном белом имени (иначе приманка не из whitelist и промах ложный) —
+     * см. пропуск в d2k_run_properties_family. Место — после «плотной серии»,
+     * перед «данными в SYN» (решение владельца 09.10: syndata последним). */
+    out[k].label = "приветствие под меткой";
+    snprintf(out[k].p.name, sizeof(out[k].p.name), "white-hello-ts");
+    out[k].p.tcp_ts = 1;
+    out[k].p.decoy_hello = 1;
+    out[k].p.repeats = 1;
+    out[k].set = SET_WHITE_TS;
+    k++;
+
     /* SYN precedes the observed name in a live flow. Ask all questions
      * whose successful send can become a datapath plan before syndata
      * (owner decision 09.10.2026, plan items 2–3). */
@@ -184,6 +204,15 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok)
     case SET_DUP_DENSE:
         if (ok) { pr->counts_duplicates = D2K_TRI_TRUE; }
         break;
+    case SET_WHITE_TS:
+        /* Проход: коробка приняла пакет со старой меткой (метку не сверяет) И
+         * разобрала фальшивое приветствие (разбирает L7), закрепив поток по
+         * имени приманки. Оба вывода — только по проходу (§2.4). */
+        if (ok) {
+            pr->validates_timestamps = D2K_TRI_FALSE;
+            pr->parses_l7 = D2K_TRI_TRUE;
+        }
+        break;
     }
 }
 
@@ -199,8 +228,8 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                        const d2k_trigger *tr, const d2k_opts *opt,
                        d2k_result *res, d2k_poison *hit)
 {
-    prop_probe pp[11];
-    int n = prop_probes(pp, 11);
+    prop_probe pp[12];
+    int n = prop_probes(pp, 12);
     int i, j;
     char err[160];
 
@@ -224,7 +253,16 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
             }
             p.seqovl = tr->sni_off + tr->sni_len;
         }
-        if (p.decoy_hello) {
+        if (pp[i].set == SET_WHITE_TS) {
+            /* Приманка — БЕЛОЕ ИМЯ СЕТИ, не контроль. Нет имени — нет вопроса:
+             * фальшивка не из whitelist была бы отброшена коробкой, и промах
+             * читался бы ложно (поле 10.10.2026). */
+            if (opt->white.len < 2) {
+                continue;
+            }
+            p.decoy = opt->white.payload;
+            p.decoy_len = opt->white.len;
+        } else if (p.decoy_hello) {
             p.decoy = opt->control.payload;
             p.decoy_len = opt->control.len;
         }

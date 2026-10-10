@@ -420,6 +420,7 @@ d2k_sched_ech_resolve_fn d2k_sched_ech_resolve_hook = d2k_ech_resolve;
 d2k_sched_replay_ver_fn d2k_sched_replay_ver_hook = d2k_verify_replay_on;
 d2k_sched_tcp_fn  d2k_sched_tcp_base_hook = NULL;
 d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook = NULL;
+d2k_sched_tcp_white_fn d2k_sched_tcp_white_hook = NULL;
 d2k_sched_tcp_ack_fn d2k_sched_tcp_ack_hook = NULL;
 d2k_sched_quic_base_fn  d2k_sched_quic_base_hook = NULL;
 d2k_sched_quic_seeded_fn d2k_sched_quic_seeded_hook = NULL;
@@ -2642,8 +2643,22 @@ static void *worker_run(void *vp) {
         /* repeats<=0 — то же умолчание (три), что у d2k_meas: второе число
            здесь развело бы два места по умолчанию (d2k_verdict.h). gap/wait
            нулями — та же передача умолчания вниз. */
+        /* Белое имя сети подобрано — передаём его приманкой, чтобы измеритель
+           задал вопрос «приветствие под меткой времени» (поле 10.10.2026).
+           Только когда базовый ответ не переиспользуется (seed): белый крючок
+           — для полного прогона. */
+        uint8_t wbuf[2048]; /* белое приветствие-record ~700 байт, с запасом */
+        size_t wlen = 0;
+        d2k_hello white = {0};
+        if (!seed && d2k_sched_tcp_white_hook && s->cat && s->cat->net.name[0] &&
+            d2k_white_decoy_hello(s->cat->net.name, wbuf, sizeof wbuf, &wlen) == 0) {
+            white.bytes = wbuf;
+            white.len = wlen;
+        }
         r = seed && d2k_sched_tcp_seeded_hook
             ? d2k_sched_tcp_seeded_hook(t->ip, t->port, trig, ctl, s->measure_mark, 0, 0, 0, &t->stop, seed)
+            : white.len
+            ? d2k_sched_tcp_white_hook(t->ip, t->port, trig, ctl, white, s->measure_mark, 0, 0, 0, &t->stop)
             : d2k_sched_tcp_hook(t->ip, t->port, trig, ctl, s->measure_mark, 0, 0, 0, &t->stop);
     }
 

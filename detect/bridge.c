@@ -166,7 +166,7 @@ static d2k_verdict map_verdict(d2k_verdict_t v)
 /* Вход измерителя из аргументов крючка — общий у полного прогона и у его
  * базового вопроса. 0 — готово; -1 — мерить нечем, out заполнен. */
 static int bridge_input(const char *ip, uint16_t port,
-                        d2k_hello trigger, d2k_hello control,
+                        d2k_hello trigger, d2k_hello control, d2k_hello white,
                         uint32_t mark, int repeats,
                         uint32_t gap_us, uint32_t wait_ms,
                         const volatile sig_atomic_t *stop,
@@ -218,6 +218,15 @@ static int bridge_input(const char *ip, uint16_t port,
          * silent unvouched control cannot prove an address block. The
          * scheduler hook carries no explicit operator-vouch argument. */
         optp->control_vouched = 0;
+    }
+    /* Белое имя сети приманкой для вопроса «приветствие под меткой» (поле
+       10.10.2026): полный ClientHello-record, не имя контроля. Пусто —
+       вопрос не задаётся. Планировщик строит его из подтверждённого имени. */
+    if (white.bytes && white.len >= 2 && white.len <= D2K_TRIGGER_MAX) {
+        memcpy(optp->white.payload, white.bytes, white.len);
+        optp->white.len = white.len;
+        optp->white.accept = D2K_ACCEPT_TLSRECORD;
+        snprintf(optp->white.name, sizeof(optp->white.name), "white");
     }
 
     optp->repeats = repeats;
@@ -294,7 +303,7 @@ static void trace_questions(const d2k_result *res, int repeats, d2k_vres *out)
 /* Полный прогон; seed — ответ уже заданного базового вопроса тем же входом
  * (d2k_opts.seed_whole), NULL — прогон спрашивает базу сам. */
 static d2k_vres sched_tcp(const char *ip, uint16_t port,
-                          d2k_hello trigger, d2k_hello control,
+                          d2k_hello trigger, d2k_hello control, d2k_hello white,
                           uint32_t mark, int repeats,
                           uint32_t gap_us, uint32_t wait_ms,
                           const volatile sig_atomic_t *stop, const d2k_base_seed *seed)
@@ -305,7 +314,7 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
     d2k_result res;
     char addr[96];
 
-    if (bridge_input(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop,
+    if (bridge_input(ip, port, trigger, control, white, mark, repeats, gap_us, wait_ms, stop,
                      &tr, &opt, addr, &out) != 0) {
         return out;
     }
@@ -434,7 +443,19 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
                               uint32_t gap_us, uint32_t wait_ms,
                               const volatile sig_atomic_t *stop)
 {
-    return sched_tcp(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop, NULL);
+    d2k_hello none = {0};
+    return sched_tcp(ip, port, trigger, control, none, mark, repeats, gap_us, wait_ms, stop, NULL);
+}
+
+/* Тот же прогон, но с белым именем сети приманкой (d2k_sched_tcp_white_fn,
+   поле 10.10.2026): планировщик зовёт его, когда имя подобрано. */
+d2k_vres d2k_detect_sched_tcp_white(const char *ip, uint16_t port,
+                                    d2k_hello trigger, d2k_hello control, d2k_hello white,
+                                    uint32_t mark, int repeats,
+                                    uint32_t gap_us, uint32_t wait_ms,
+                                    const volatile sig_atomic_t *stop)
+{
+    return sched_tcp(ip, port, trigger, control, white, mark, repeats, gap_us, wait_ms, stop, NULL);
 }
 
 /* Тот же прогон с ответом базового вопроса (d2k_sched_tcp_seeded_fn). */
@@ -445,7 +466,8 @@ d2k_vres d2k_detect_sched_tcp_seeded(const char *ip, uint16_t port,
                                      const volatile sig_atomic_t *stop,
                                      const d2k_base_seed *seed)
 {
-    return sched_tcp(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop, seed);
+    d2k_hello none = {0};
+    return sched_tcp(ip, port, trigger, control, none, mark, repeats, gap_us, wait_ms, stop, seed);
 }
 
 /* БАЗОВЫЙ ВОПРОС ДОНОРА ОТДЕЛЬНО (задача 32 d2k, d2k_sched_tcp_base_hook).
@@ -522,8 +544,9 @@ d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
     d2k_result res;
     char addr[96];
     base_ctx bc;
+    d2k_hello none = {0};
 
-    if (bridge_input(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop,
+    if (bridge_input(ip, port, trigger, control, none, mark, repeats, gap_us, wait_ms, stop,
                      &tr, &opt, addr, &out) != 0) {
         return out;
     }

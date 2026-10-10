@@ -99,7 +99,7 @@ int main(void) {
             tr.payload[5] = 1; tr.payload[6] = 0;
             tr.payload[7] = (uint8_t)((tr.len - 9) >> 8); tr.payload[8] = (uint8_t)(tr.len - 9);
             for (int i = 0; i < np; i++) { run_case(ps[i], &tr, decoy, sizeof decoy); }
-            prop_probe pp[11]; int nq = prop_probes(pp, 11);
+            prop_probe pp[12]; int nq = prop_probes(pp, 12);
             for (int i = 0; i < nq; i++) {
                 if (pp[i].set == SET_OVERLAP_SNI) {
                     if (!named) { continue; }
@@ -110,7 +110,9 @@ int main(void) {
             cases++;
         }
     }
-    printf("probe-plan: %u inputs, %d catalog hypotheses, 11 questions, %u skipped, %u mismatches\n",
-           cases, np, skipped, failures);
+    prop_probe allq[12];
+    int n_questions = prop_probes(allq, 12);
+    printf("probe-plan: %u inputs, %d catalog hypotheses, %d questions, %u skipped, %u mismatches\n",
+           cases, np, n_questions, skipped, failures);
     return failures ? 1 : 0;
 }

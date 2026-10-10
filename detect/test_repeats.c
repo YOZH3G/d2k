@@ -165,6 +165,7 @@ typedef struct {
     const char       *ctl;
     int               vouched;
     const char       *ack;
+    int               white;   /* 1 — задать opt.white (белое имя сети приманкой) */
 } scenario;
 
 /* Фильтр находок, как plannable_hit в bridge.c: NULL — берётся любая. */
@@ -187,6 +188,16 @@ static void run(const scenario *s, d2k_result *res)
     memcpy(opt.control.payload, CTL, sizeof(CTL) - 1);
     opt.control.len = sizeof(CTL) - 1;
     opt.control.accept = D2K_ACCEPT_ANY;
+    memset(&opt.white, 0, sizeof opt.white);
+    if (s->white) {
+        /* Белое имя сети приманкой: содержимое для стенда неважно (fake_poison
+           его игнорирует), важно, что len>=2 — иначе вопрос пропускается. */
+        static const uint8_t wrec[] = {0x16, 0x03, 0x01, 0x00, 0x05, 1, 0, 0, 1, 0};
+        memcpy(opt.white.payload, wrec, sizeof wrec);
+        opt.white.len = sizeof wrec;
+        opt.white.accept = D2K_ACCEPT_TLSRECORD;
+        snprintf(opt.white.name, sizeof opt.white.name, "white");
+    }
     memset(&t, 0, sizeof t);
     snprintf(t.name, sizeof t.name, "test");
     memcpy(t.payload, PAY, sizeof(PAY) - 1);
@@ -245,25 +256,25 @@ static script_ent S_FLAKY[] = {
 static const script_ent S_PROPHIT_L7[] = {{"badsum+hello", "+"}, {NULL, NULL}};
 
 static scenario SC[] = {
-    {"youtube", S_YOUTUBE, NULL, NULL, NULL, 0, NULL},
-    {"rutracker", S_RUTRACKER, NULL, NULL, NULL, 0, NULL},
-    {"flaky", S_FLAKY, NULL, NULL, NULL, 0, NULL},
-    {"prop-l7", S_PROPHIT_L7, NULL, NULL, NULL, 0, NULL},
-    {"none-pass", NULL, "-", NULL, NULL, 0, NULL},
-    {"selftest-fail", NULL, "-", "e", NULL, 0, NULL},
-    {"selftest-late", S_YOUTUBE, NULL, "-e+", NULL, 0, NULL},
-    {"ctl-late", S_YOUTUBE, NULL, NULL, "-+", 0, NULL},
-    {"ctl-dead", NULL, "-", NULL, "-", 0, NULL},
-    {"ctl-dead-vouched", NULL, "-", NULL, "-", 1, NULL},
-    {"ctl-dead-hit", S_YOUTUBE, NULL, NULL, "-", 1, NULL},
-    {"errors", NULL, "e", NULL, NULL, 0, NULL},
+    {"youtube", S_YOUTUBE, NULL, NULL, NULL, 0, NULL, 0},
+    {"rutracker", S_RUTRACKER, NULL, NULL, NULL, 0, NULL, 0},
+    {"flaky", S_FLAKY, NULL, NULL, NULL, 0, NULL, 0},
+    {"prop-l7", S_PROPHIT_L7, NULL, NULL, NULL, 0, NULL, 0},
+    {"none-pass", NULL, "-", NULL, NULL, 0, NULL, 0},
+    {"selftest-fail", NULL, "-", "e", NULL, 0, NULL, 0},
+    {"selftest-late", S_YOUTUBE, NULL, "-e+", NULL, 0, NULL, 0},
+    {"ctl-late", S_YOUTUBE, NULL, NULL, "-+", 0, NULL, 0},
+    {"ctl-dead", NULL, "-", NULL, "-", 0, NULL, 0},
+    {"ctl-dead-vouched", NULL, "-", NULL, "-", 1, NULL, 0},
+    {"ctl-dead-hit", S_YOUTUBE, NULL, NULL, "-", 1, NULL, 0},
+    {"errors", NULL, "e", NULL, NULL, 0, NULL, 0},
     /* Задача 54 (поле 04.10, cdn.cookielaw.org, 104.18.86.0/24): рукопожатие
      * проходит, а сервер не подтверждает ни одного байта данных — ни
      * приветствия, ни контроля, ни одного нейтрального байта. */
-    {"addr-silent", NULL, "-", NULL, "-", 0, "-"},
-    {"addr-silent-late", NULL, "-", NULL, "-", 0, "-+"},
-    {"addr-ack-unseen", NULL, "-", NULL, "-", 0, "u"},
-    {"addr-ack-err", NULL, "-", NULL, "-", 0, "e"},
+    {"addr-silent", NULL, "-", NULL, "-", 0, "-", 0},
+    {"addr-silent-late", NULL, "-", NULL, "-", 0, "-+", 0},
+    {"addr-ack-unseen", NULL, "-", NULL, "-", 0, "u", 0},
+    {"addr-ack-err", NULL, "-", NULL, "-", 0, "e", 0},
 };
 #define NSC ((int)(sizeof SC / sizeof SC[0]))
 
@@ -435,19 +446,62 @@ static const script_ent S_FIELD_SEQ[] = {{"seq-out-of-window", "+"}, {NULL, NULL
 static const script_ent S_FIELD_TS[]  = {{"ts", "+"}, {NULL, NULL}};
 static void test_syndata_last(void)
 {
-    prop_probe pp[11];
-    int n = prop_probes(pp, 11);
-    CHECK(n == 11 && pp[n - 1].p.syn_data,
+    prop_probe pp[12];
+    int n = prop_probes(pp, 12);
+    CHECK(n == 12 && pp[n - 1].p.syn_data,
           "syndata должен быть последним вопросом о свойствах");
     for (int i = 0; i < n - 1; i++) {
         CHECK(!pp[i].p.syn_data, "syndata перед выразимыми вопросами");
     }
+    /* Вопрос «приветствие под меткой» — после «плотной серии», перед syndata
+       (поле 10.10.2026, раздел «Предложение»). */
+    int white_at = -1, dense_at = -1;
+    for (int i = 0; i < n; i++) {
+        if (pp[i].p.tcp_ts && pp[i].p.decoy_hello) { white_at = i; }
+        if (!strcmp(pp[i].p.name, "badsum-x7")) { dense_at = i; }
+    }
+    CHECK(white_at == n - 2, "«приветствие под меткой» не предпоследний (перед syndata)");
+    CHECK(dense_at >= 0 && dense_at < white_at,
+          "«приветствие под меткой» не после «плотной серии»");
+}
+
+/* Вопрос «приветствие под меткой времени» с белым именем сети (поле
+   10.10.2026). Проход при промахе «метки времени»: коробка приняла пакет со
+   старой меткой И разобрала фальшивое приветствие — validates_timestamps=нет,
+   parses_l7=да; приём выразим планом (путь «свойство»). Без белого имени
+   вопрос не задаётся. */
+static void test_white_ts(void)
+{
+    static const script_ent s_white[] = {
+        {"ts", "-"}, {"white-hello-ts", "+"}, {NULL, NULL}};
+    scenario sc = {"white-ts", s_white, "-", NULL, NULL, 0, NULL, 1};
+    d2k_result r;
+    memset(&r, 0, sizeof r);
+    run(&sc, &r);
+    CHECK(r.has_hit && !strcmp(r.hit.name, "white-hello-ts"),
+          "вопрос «приветствие под меткой» не стал находкой");
+    CHECK(r.props.validates_timestamps == D2K_TRI_FALSE,
+          "проход «приветствия под меткой» не записал «метку не сверяет»");
+    CHECK(r.props.parses_l7 == D2K_TRI_TRUE,
+          "проход «приветствия под меткой» не записал «разбирает L7»");
+    CHECK(!strcmp(r.path, "свойство"), "путь находки «%s», ждали «свойство»", r.path);
+    CHECK(find_obs(&r, "свойство:приветствие под меткой") != NULL,
+          "вопрос «приветствие под меткой» не задан при известном белом имени");
+
+    /* Без белого имени вопрос пропускается: та же раскладка, white=0. */
+    scenario sc0 = {"white-ts-none", s_white, "-", NULL, NULL, 0, NULL, 0};
+    memset(&r, 0, sizeof r);
+    run(&sc0, &r);
+    CHECK(find_obs(&r, "свойство:приветствие под меткой") == NULL,
+          "вопрос «приветствие под меткой» задан без белого имени");
+    CHECK(!(r.has_hit && !strcmp(r.hit.name, "white-hello-ts")),
+          "без белого имени приём «приветствие под меткой» всё равно найден");
 }
 
 static const script_ent S_FIELD_SYN[] = {{"syndata", "+"}, {NULL, NULL}};
 static void test_syndata_after_misses(void)
 {
-    static const scenario syn = {"props-syn-last", S_FIELD_SYN, NULL, NULL, NULL, 0, NULL};
+    static const scenario syn = {"props-syn-last", S_FIELD_SYN, NULL, NULL, NULL, 0, NULL, 0};
     d2k_result r;
     fresh_process();
     run(&syn, &r);
@@ -462,9 +516,9 @@ static void test_syndata_after_misses(void)
 
 static void test_props_fields(void)
 {
-    static const scenario md5 = {"props-md5", S_FIELD_MD5, NULL, NULL, NULL, 0, NULL};
-    static const scenario seq = {"props-seq", S_FIELD_SEQ, NULL, NULL, NULL, 0, NULL};
-    static const scenario ts  = {"props-ts",  S_FIELD_TS,  NULL, NULL, NULL, 0, NULL};
+    static const scenario md5 = {"props-md5", S_FIELD_MD5, NULL, NULL, NULL, 0, NULL, 0};
+    static const scenario seq = {"props-seq", S_FIELD_SEQ, NULL, NULL, NULL, 0, NULL, 0};
+    static const scenario ts  = {"props-ts",  S_FIELD_TS,  NULL, NULL, NULL, 0, NULL, 0};
     d2k_result r;
     printf("свойства: сверка полей подделки\n");
     fresh_process();
@@ -499,7 +553,7 @@ static int no_syn_md5(const d2k_poison *p, void *ctx)
 static const script_ent S_SYN_TS[] = {{"syndata", "+"}, {"md5", "+"}, {"ts", "+"}, {NULL, NULL}};
 static void test_props_skip_unplannable(void)
 {
-    static const scenario sc = {"syn-ts", S_SYN_TS, "-", NULL, NULL, 0, NULL};
+    static const scenario sc = {"syn-ts", S_SYN_TS, "-", NULL, NULL, 0, NULL, 0};
     d2k_result r;
     printf("свойства: невыразимая находка не останавливает вопросы\n");
     fresh_process();
@@ -525,7 +579,7 @@ static void test_sweep_skips_answered(void)
     static const char *const dup[] = {
         "seqovl-1", "disorder", "badsum", "badsum+hello", "badsum-x2-g20",
         "syndata", "md5", "seq-out-of-window", "badsum-x7"};
-    static const scenario err = {"md5-err", S_MD5_ERR, "-", NULL, NULL, 0, NULL};
+    static const scenario err = {"md5-err", S_MD5_ERR, "-", NULL, NULL, 0, NULL, 0};
     d2k_result r;
     char nm[96];
     size_t i;
@@ -640,7 +694,7 @@ static void test_selftest_cache(void)
     /* Кэш есть, а сырой слой сломался: первые же отказы этого прогона
      * перепроверяют слой, и провал ведёт себя ровно как провал самопроверки. */
     {
-        scenario broken = {"broken", NULL, "e", "e", NULL, 0, NULL};
+        scenario broken = {"broken", NULL, "e", "e", NULL, 0, NULL, 0};
         fresh_process();
         run(find_sc("youtube"), &r);
         run(&broken, &r);
@@ -690,6 +744,7 @@ int main(void)
     test_equivalence();
     test_counts_per_question();
     test_syndata_last();
+    test_white_ts();
     test_syndata_after_misses();
     test_props_fields();
     test_sweep_skips_answered();

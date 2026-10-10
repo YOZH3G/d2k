@@ -184,6 +184,17 @@ typedef d2k_vres (*d2k_sched_tcp_seeded_fn)(const char *ip, uint16_t port,
                                             const volatile sig_atomic_t *stop,
                                             const d2k_base_seed *seed);
 extern d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook;
+/* ПОЛНЫЙ ПРОГОН С БЕЛЫМ ИМЕНЕМ СЕТИ ПРИМАНКОЙ (поле 10.10.2026). Тот же
+ * прогон, что d2k_sched_tcp_hook, плюс белое имя сети (целый ClientHello) для
+ * вопроса «приветствие под меткой времени»: имя — из каталога, не из контроля,
+ * а сигнатуру основного крючка менять нельзя, поэтому отдельный крючок.
+ * NULL — имя не известно, зовётся обычный крючок (вопрос не задаётся). */
+typedef d2k_vres (*d2k_sched_tcp_white_fn)(const char *ip, uint16_t port,
+                                           d2k_hello trigger, d2k_hello control,
+                                           d2k_hello white, uint32_t mark, int repeats,
+                                           uint32_t gap_us, uint32_t wait_ms,
+                                           const volatile sig_atomic_t *stop);
+extern d2k_sched_tcp_white_fn d2k_sched_tcp_white_hook;
 /* ПРИНИМАЕТ ЛИ АДРЕС ДАННЫЕ (задача 54, fix round 1 I2). Перепроверка
  * адреса, у которого есть вердикт address, начинается с этого вопроса ДО
  * любого зонда с триггером: один нейтральный байт, ожидание подтверждения TCP
