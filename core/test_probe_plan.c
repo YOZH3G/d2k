@@ -37,10 +37,16 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
     int bridge_rc = d2k_arm_from_poison(&p, &a, err, sizeof err);
     /* MD5 is now required to traverse the complete measured-plan path. */
     REQUIRE(!p.md5 || bridge_rc == 0);
+    /* oob (срочный байт) выражается планом «oob sni_middle 0f» и исполняется
+       датапатом (поле 10.10.2026): мост обязан его принять, а не отвергнуть. */
+    REQUIRE(!p.oob || bridge_rc == 0);
     if (bridge_rc == -1) {
         if (cases == 0) { printf("skip %s: %s\n", p.name, err); }
         skipped++; return;
     }
+    /* oob ставит URG-байт в середину ИМЕНИ: без имени в приветствии плана нет
+       (как перекрытие до конца имени). Для безымянного входа — пропуск. */
+    if (p.oob && (tr->sni_len <= 1 || tr->sni_off <= 0)) { skipped++; return; }
     in.trigger_len = tr->len; in.sni_off = tr->sni_off; in.sni_len = tr->sni_len;
     /* No decoy pointer means padding, including non-hello overlap probes. */
     in.decoy_len = p.decoy_len;
@@ -53,6 +59,11 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
     pkt.have_sni = tr->sni_len > 0; pkt.sni_off = tr->sni_off; pkt.sni_len = tr->sni_len;
     REQUIRE(d2k_plan_apply(plan, NULL, &pkt, &out) == 0);
     REQUIRE(out.fate == D2K_ORIG_DROP);
+    /* oob: срочный байт на проводе задаётся URG-указателем, а не отдельной
+       посылкой-фальшивкой, и его побайтную развёртку проверяет датапат своим
+       тестом; здесь довольно того, что измеренный приём стал загружаемым
+       планом, который датапат принял (fate DROP). */
+    if (p.oob) { goto done; }
     for (size_t i = 0; i < sends.n; i++) {
         const d2k_send *s = &sends.v[i];
         for (size_t off = 0; off < s->len; ) {
