@@ -219,6 +219,11 @@ run() {
         if [ "$hour" = 03 ] || [ "$hour" = 04 ]; then
             if [ "$(cat "$WORK/night" 2>/dev/null)" != "$day" ]; then
                 mkdir -p "$WORK"; echo "$day" > "$WORK/night"
+                # Тумблер меняет config, а цикл живёт с запуска службы:
+                # значение при старте могло устареть (поле 10.10.2026).
+                # shellcheck disable=SC1090
+                AUTOUPDATE=$(AUTOUPDATE=1; [ ! -r "$CONF" ] || . "$CONF" >/dev/null 2>&1
+                             echo "$AUTOUPDATE")
                 if [ "$AUTOUPDATE" = 1 ]; then
                     # Отдельной сессией: установщик останавливает службу,
                     # а с ней и этот цикл.
