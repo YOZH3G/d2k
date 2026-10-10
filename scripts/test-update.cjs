@@ -133,6 +133,37 @@ try {
   assert.equal(run('auto', 'on').status, 0);
   assert.equal(read(path.join(dir, 'config')), 'MODE=apply\nAUTOUPDATE=1\n');
   assert.equal(state().auto, true);
+  // Тумблер выключает ночную установку и у УЖЕ ИДУЩЕГО цикла (поле 10.10.2026):
+  // run читал AUTOUPDATE один раз при старте, и «auto off» без перезапуска
+  // цикла не мешал ночью поставить выпуск. Час — из файла, запуск установки —
+  // запись вызова start-stop-daemon.
+  {
+    const clock = path.join(tmp, 'clock'); fs.mkdirSync(clock);
+    const hour = path.join(tmp, 'hour'); fs.writeFileSync(hour, '12\n');
+    const ssd = path.join(tmp, 'ssd.log');
+    fs.writeFileSync(path.join(clock, 'date'),
+      `#!/bin/sh\n[ "$1" = +%H ] && exec cat "${hour}"\nexec /bin/date "$@"\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(clock, 'start-stop-daemon'),
+      `#!/bin/sh\necho "$*" >> "${ssd}"\n`, { mode: 0o755 });
+    const nightEnv = { ...env, D2K_STUB_PATH: `${clock}:${stub}`, D2K_UPDATE_TICK: '1' };
+    const wait = ms => spawnSync('/bin/sleep', [String(ms / 1000)]);
+    const loop = require('node:child_process').spawn('/bin/sh', [updater, 'run'], { env: nightEnv, stdio: 'ignore' });
+    try {
+      fs.rmSync(path.join(dir, '.update/night'), { force: true });
+      wait(1500);
+      assert.equal(spawnSync('/bin/sh', [updater, 'auto', 'off'], { env: nightEnv }).status, 0);
+      fs.writeFileSync(hour, '03\n');
+      for (let i = 0; i < 40 && !fs.existsSync(path.join(dir, '.update/night')); i++) wait(250);
+      wait(1500);
+      assert(fs.existsSync(path.join(dir, '.update/night')), 'ночной цикл не дошёл до окна 03:00');
+      assert(!fs.existsSync(ssd), 'auto off не остановил ночную установку у идущего цикла');
+      assert.match(read(path.join(dir, 'log/update.log')), /проверка: последний выпуск/,
+        'при выключенной установке цикл не сделал ночную проверку');
+    } finally {
+      loop.kill('SIGTERM');
+    }
+    assert.equal(run('auto', 'on').status, 0);
+  }
   // OpenWrt без USB (07.10.2026): /opt — флеш корня. Архив, распаковка и
   // копия прежней версии (~20 МБ) — в RAM, а не на флеш.
   {
