@@ -1501,6 +1501,9 @@ static int quic_plan_text(const d2k_quic_arm *arm, const uint8_t *blob, size_t b
 
     if (arm) {
         switch (arm->kind) {
+        case D2K_QA_SPLIT:
+            if(!arm->original || arm->frag_kind || arm->ttl) return -1;
+            break;
         case D2K_QA_BLOB:   break;
         case D2K_QA_COPIES:
             if (arm->copies <= 0 || arm->copies > 255) { return -1; }
@@ -1550,7 +1553,9 @@ static int quic_plan_text(const d2k_quic_arm *arm, const uint8_t *blob, size_t b
     if (!has_fake && !frag && !udplen) { return -1; }
 
     size_t pos = 0;
-    if (frag) {
+    if (arm && arm->kind==D2K_QA_SPLIT) {
+        if(append_fmt(buf,cap,&pos,"d2k-plan 1 10\nid 00000000000000000000000000000000\nproto udp quic\nquicsplit 1\n")!=0) return -1;
+    } else if (frag) {
         if (append_fmt(buf,cap,&pos,"d2k-plan 1 7\nid 00000000000000000000000000000000\n"
                                    "proto udp quic\nipfrag %d\n",frag)!=0) return -1;
     } else if (udplen) {
@@ -1601,7 +1606,7 @@ static int quic_plan_text(const d2k_quic_arm *arm, const uint8_t *blob, size_t b
 int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
                       char *buf, size_t cap) {
     if (!arm || !buf || cap == 0 || !quic_arm_found(arm)) { return -1; }
-    if (arm->kind == D2K_QA_SPLIT) {
+    if (arm->kind == D2K_QA_SPLIT && !arm->len) {
         return arm->original && !blen ? quic_split_plan_text(buf, cap) : -1;
     }
     return quic_plan_text(arm, blob, blen, 0, 0, buf, cap);
@@ -1613,13 +1618,14 @@ int d2k_quic_compose_plan(const d2k_quic_arm *arm, const d2k_quic_props *p,
     /* Метки опытов не подтверждены — верить нельзя ни плечу, ни свойствам
        того же прогона. */
     if (arm && arm->kind == D2K_QA_FLAKY) { return -1; }
-    if (arm && arm->kind == D2K_QA_SPLIT) {
+    if (arm && arm->kind == D2K_QA_SPLIT && !arm->len) {
         return arm->original && arm->len == 0 ? quic_split_plan_text(buf, cap) : -1;
     }
     const d2k_quic_arm *use = quic_arm_found(arm) ? arm : NULL;
     /* Задача 40, круг 1: план остаточного разрешения — РОВНО одна безобидная
        датаграмма перед Initial; «длину» вместе с ним не мерили. */
-    int clearance = use && use->strategy == D2K_QS_CLEARANCE;
+    int clearance = use && (use->strategy == D2K_QS_CLEARANCE ||
+        use->strategy == D2K_QS_TTL_LIFETIME || use->kind==D2K_QA_SPLIT);
     return quic_plan_text(use, use ? use->bytes : NULL, use ? use->len : 0,
                           p->junk_ahead == D2K_PROP_YES,
                           (p->longer == D2K_PROP_YES && !clearance) ? QUIC_UDPLEN_INCREMENT : 0u,

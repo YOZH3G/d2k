@@ -50,10 +50,10 @@ typedef struct {
 #define D2K_QUIC_BENIGN_LEN 16
 extern const uint8_t d2k_quic_benign[D2K_QUIC_BENIGN_LEN];
 
-/* Сколько опросов могут стоить два вопроса стратегии: каждый — до одного
-   повтора, пока исход не решающий (правило задачи 35). Бюджет Run выводится
-   и из этого числа. */
-#define D2K_QUIC_STRATEGY_ASKS_MAX 4u
+/* Верхняя граница: benign/split/TTL — до двух опросов каждый;
+   адаптивное произведение fake×split — один опрос. Бюджет Run выводится
+   из этой границы, без изменения критерия 3/3. */
+#define D2K_QUIC_STRATEGY_ASKS_MAX 7u
 typedef d2k_tally (*d2k_quic_arm_probe_fn)(const d2k_quic_arm_question *, void *, int *);
 
 /* Порог и вердикты этапа данных — d2k_quicprobe.h (D2K_QUIC_ARM_DATA_BYTES). */
@@ -114,6 +114,8 @@ typedef struct {
     /* Вопросы IP-фрагментации уже заданы стратегией (оба её ответа «нет»):
        перебор askArms их не повторяет. */
     int frag_answered;
+    int split_failed; /* plain split measured NO, permits adaptive fake x split */
+    int ttl_pair_answered; /* post-handshake quic5 x2 TTL3 already measured */
     /* Финальное ревью core, I1: разрез CRYPTO клиенту неприменим (ClientHello
        шире датаграммы) — вопрос о нём не задаётся, он не может стать планом. */
     int no_split;

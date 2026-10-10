@@ -301,7 +301,7 @@ int main(void) {
     CHECK(first_prefix==1200); /* quic5 before properties' 16-byte junk */
     CHECK(arm_hello_count>=2 && arm_hello_changed>0);
     CHECK(arm.original && arm.len==1200 && arm.ttl==3 && arm.copies==6);
-    CHECK(fragment_calls==2 && arm.frag_kind==1 && arm.frag_survives==D2K_PROP_YES);
+    CHECK(fragment_calls==2 && arm.frag_kind==0 && arm.frag_survives==D2K_PROP_YES);
     CHECK(data_calls==4); /* quic5, copies 6, ttl 3, frag pos8; never the survival control */
     CHECK(strategy_calls==4 && arm.strategy==D2K_QS_LADDER); /* два вопроса, по одному повтору */
     /* Круг 1: заданное до предела повторов не задаётся снова — ни приманкой

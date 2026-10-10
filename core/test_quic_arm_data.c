@@ -511,6 +511,35 @@ static void test_strategy_questions_on_wire(uint16_t port) {
     CHECK(d.local_port && first_split == 1, "этап данных: первый Initial соединения разрезан");
     CHECK(d.verdict == D2K_QAD_NO_HANDSHAKE, "этап данных разреза: стенд без рукопожатия — не прошло");
 
+    /* Adaptive fake x split: same eleven prefixes before the reshaped
+       Initial on all three filter ports and on the data-stage port. */
+    q.blob=d2k_quic_original_blob(3,&q.blob_len,NULL); q.copies=11;
+    seen_reset();
+    t=d2k_quic_ask_arm_hook(&q,TARGET,port,150,0,&sent);
+    (void)nanosleep(&nap,NULL);
+    CHECK(sent==3 && t.pass==3, "fake x split filter must run 3/3");
+    int good=0;
+    pthread_mutex_lock(&g_mu);
+    for(int i=0;i<g_seen_n;i++) if(g_seen_ours[i]) {
+        int prefixes=0;
+        for(int j=0;j<i;j++) if(g_seen_port[j]==g_seen_port[i] && g_seen_len[j]==620) prefixes++;
+        good += prefixes==11 && g_seen_split[i];
+    }
+    pthread_mutex_unlock(&g_mu);
+    CHECK(good==3,"fake x split: exact prefixes and CRYPTO order on filter wire");
+    seen_reset();
+    d=d2k_quic_arm_data_hook(&q,TARGET,NULL,port,100,0);
+    (void)nanosleep(&nap,NULL);
+    good=0;
+    pthread_mutex_lock(&g_mu);
+    for(int i=0;i<g_seen_n;i++) if(g_seen_port[i]==d.local_port && g_seen_ours[i]) {
+        int prefixes=0;
+        for(int j=0;j<i;j++) if(g_seen_port[j]==d.local_port && g_seen_len[j]==620) prefixes++;
+        good=prefixes==11 && g_seen_split[i]; break;
+    }
+    pthread_mutex_unlock(&g_mu);
+    CHECK(good,"fake x split: same question on data-stage wire");
+
     /* Остаточное разрешение: ровно одна безобидная датаграмма, затем Initial
        на той же четвёрке — и в фильтре, и на этапе данных. */
     memset(&q, 0, sizeof q);

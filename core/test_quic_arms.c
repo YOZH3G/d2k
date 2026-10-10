@@ -36,6 +36,7 @@
 #include "d2k_meas.h"
 #include "d2k_compose.h"
 #include "d2k_plantlv.h"
+#include "d2k_plan.h"
 #include "d2k_quicprobe.h"
 #include "d2k_quic_arms.h"
 /* d2k_quic_is_initial — им проверяется, что снятые приманки доехали в бинарник
@@ -1093,6 +1094,30 @@ static void quic_strategy_compose_checks(void) {
     p.split_crypto = D2K_PROP_YES;
     CHECK(d2k_quic_compose_plan(&nf, &p, plan, sizeof plan) != 0,
           "QUIC: свойство «кадры» само по себе стало планом");
+    sp.len=620; sp.bytes[0]=0x40; sp.copies=11;
+    CHECK(d2k_quic_compose_plan(&sp,&p,plan,sizeof plan)==0 &&
+          strstr(plan,"quicsplit 1") && strstr(plan,"repeats=11") && !strstr(plan,"udplen"),
+          "fake x split: composer must preserve the measured product");
+    CHECK(d2k_quic_arm_plan(&sp,sp.bytes,sp.len,plan,sizeof plan)==0 &&
+          d2k_plan_text_to_tlv(plan,tlv,sizeof tlv,&n,err,sizeof err)==0,
+          "fake x split: both composer paths export the product");
+    d2k_plan *runtime=NULL;
+    CHECK(d2k_plan_load(tlv,n,&runtime,err,sizeof err)==0,"fake x split: runtime loads composer output");
+    if(runtime) {
+        d2k_pkt in={0}; d2k_actions out={0}; uint8_t expected[1500]; size_t en=0;
+        in.payload=d2k_test_v1_initial; in.payload_len=sizeof d2k_test_v1_initial;
+        CHECK(d2k_quic_initial_split_crypto(in.payload,in.payload_len,expected,sizeof expected,&en)==0,
+              "fake x split: same measured transform builds expected encrypted Initial");
+        CHECK(d2k_plan_apply(runtime,NULL,&in,&out)==0 && out.n==12 && out.fate==D2K_ORIG_DROP,
+              "fake x split runtime emits eleven prefixes and one reshaped original");
+        if(out.n==12) {
+            for(size_t k=0;k<11;k++) CHECK(out.v[k].len==sp.len && !memcmp(out.v[k].bytes,sp.bytes,sp.len),
+                                          "fake x split exact prefix bytes");
+            CHECK(out.v[11].len==en && !memcmp(out.v[11].bytes,expected,en),
+                  "fake x split exact encrypted Initial equals measurement transform");
+        }
+        d2k_actions_free(&out); d2k_plan_free(runtime);
+    }
     /* Неполное плечо разреза (не original) — не план. */
     sp.original = 0;
     CHECK(d2k_quic_compose_plan(&sp, &p, plan, sizeof plan) != 0,

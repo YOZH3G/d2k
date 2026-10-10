@@ -4555,7 +4555,9 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
             }
             if (arm_found && (t->arm.strategy == D2K_QS_CLEARANCE ||
                               t->arm.strategy == D2K_QS_SPLIT ||
-                              t->arm.strategy == D2K_QS_FRAG)) {
+                              t->arm.strategy == D2K_QS_FRAG ||
+                              t->arm.strategy == D2K_QS_TTL_LIFETIME ||
+                              t->arm.strategy == D2K_QS_FAKE_SPLIT)) {
                 /* Задача 40: план собран из ответа вопроса, приманки не
                    перебирались. */
                 say(s, "по %s (QUIC) стратегия из замера за %d %s: %s",
@@ -4575,8 +4577,8 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
                     t->name);
             }
             if (qp->longer == D2K_PROP_YES) {
-                if (t->arm.strategy == D2K_QS_CLEARANCE) {
-                    say(s, "по %s (QUIC) «длина» взяла, но с безобидной датаграммой её не мерили — "
+                if (t->arm.strategy == D2K_QS_CLEARANCE || t->arm.strategy == D2K_QS_TTL_LIFETIME) {
+                    say(s, "по %s (QUIC) «длина» взяла, но с выбранным воздействием её не мерили — "
                            "в план не входит", t->name);
                 } else if (t->arm.kind == D2K_QA_SPLIT) {
                     say(s, "по %s (QUIC) «длина» взяла, но с разрезом CRYPTO её не мерили — "

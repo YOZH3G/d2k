@@ -140,13 +140,39 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
         if(ask(c,&r,candidates[i],repeats[j],0,0,0,&measured)) {
             chosen=candidates[i]; r.copies=repeats[j]; break;
         }
+        /* Field e/f: fake_default x11 gets bound replies but not a usable
+           connection. Plain split failed. Ask their product only on this
+           measured contrast, never launch a Cartesian sweep. */
+        if(c && c->split_failed && !c->no_split && candidates[i]==3 && repeats[j]==11 &&
+           r.n_trace && r.trace[r.n_trace-1].answered>0 &&
+           ((r.trace[r.n_trace-1].answered<D2K_QUIC_REPEATS && !r.trace[r.n_trace-1].not_measured) ||
+            r.trace[r.n_trace-1].data==D2K_QAD_CUT ||
+            r.trace[r.n_trace-1].data==D2K_QAD_NO_HANDSHAKE)) {
+            d2k_quic_arm_question q={.copies=11,.split=1};
+            const char *name;
+            q.blob=d2k_quic_original_blob(3,&q.blob_len,&name);
+            if(ask_q(c,&r,&q,"частичный ответ на приманку: fake_default ×11 вместе с разрезом CRYPTO",
+                     &measured,NULL)) {
+                r.kind=c->marked?D2K_QA_SPLIT:D2K_QA_FLAKY;
+                r.strategy=D2K_QS_FAKE_SPLIT; r.copies=11; r.len=q.blob_len;
+                memcpy(r.bytes,q.blob,q.blob_len);
+                snprintf(r.blob_name,sizeof r.blob_name,"%s",name);
+                snprintf(r.reason,sizeof r.reason,"приманка ×11 и разрез вместе: фильтр 3/3 и этап данных прошли");
+                return r;
+            }
+        }
     }
     /* 3. Preferred successful fake, then quic5, then default (embedded,
        therefore all available). TTL is an independent original axis. */
+    if (chosen>=0 && !r.copies) r.copies=1;
     int decoy=chosen>=0?chosen:0;
+    int ttl_copies=r.copies ? r.copies : 2;
     const int ttls[]={3,5,8,12};
-    for(size_t i=0;i<4;i++) if(ask(c,&r,decoy,1,ttls[i],0,0,&measured)) {
-        chosen=decoy; r.ttl=ttls[i]; break;
+    for(size_t i=0;i<4;i++) {
+        if(c && c->ttl_pair_answered && decoy==0 && ttl_copies==2 && ttls[i]==3) continue;
+        if(ask(c,&r,decoy,ttl_copies,ttls[i],0,0,&measured)) {
+        chosen=decoy; r.copies=ttl_copies; r.ttl=ttls[i]; break;
+        }
     }
     /* 4. Survival on control precedes every fragmentation arm. Уже заданные
        стратегией (оба её ответа «нет») вопросы фрагментации не повторяются:
@@ -156,8 +182,8 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
         const char *name="";
         const uint8_t *blob=d2k_quic_original_blob((size_t)chosen,&r.len,&name);
         memcpy(r.bytes,blob,r.len); snprintf(r.blob_name,sizeof r.blob_name,"%s",name);
-        /* Original compose emits repeats=2 when no repeat axis succeeded. */
-        if(!r.copies) r.copies=2;
+        /* Fragment-only questions did not measure fake+fragment together. */
+        r.frag_kind=0;
         r.kind=r.ttl?D2K_QA_TTL:D2K_QA_COPIES;
     } else if(r.frag_kind) r.kind=D2K_QA_FRAG;
     if(c && !c->marked) r.kind=D2K_QA_FLAKY;
@@ -198,6 +224,25 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
     d2k_quic_arm r; memset(&r,0,sizeof r);
     r.kind=D2K_QA_NOT_FOUND; r.original=1; r.strategy=D2K_QS_NONE;
     r.clearance=D2K_PROP_UNKNOWN; r.split_crypto=D2K_PROP_UNKNOWN;
+
+    int8_t ttl_asked=0;
+    int8_t ttl_answer=D2K_PROP_UNKNOWN;
+    if(c && c->need_complete && c->budget_pk) {
+        d2k_quic_arm_question q={.copies=2,.ttl=3};
+        const char *name;
+        q.blob=d2k_quic_original_blob(0,&q.blob_len,&name);
+        if((ttl_answer=strategy_ask(c,&r,&q,
+            "срок жизни после Initial: quic5 ×2 с TTL 3 перед приветствием",
+            &ttl_asked))==D2K_PROP_YES) {
+            memcpy(r.bytes,q.blob,q.blob_len); r.len=q.blob_len;
+            snprintf(r.blob_name,sizeof r.blob_name,"%s",name);
+            r.copies=2; r.ttl=3; r.kind=c->marked?D2K_QA_TTL:D2K_QA_FLAKY;
+            r.strategy=D2K_QS_TTL_LIFETIME; r.incomplete=0;
+            snprintf(r.reason,sizeof r.reason,
+                "пост-рукопожатный обрыв снят: quic5 ×2 TTL3; полный ответ и бюджет данных прошли");
+            return r;
+        }
+    }
 
     d2k_quic_arm_question benign={0};
     benign.blob=d2k_quic_benign; benign.blob_len=D2K_QUIC_BENIGN_LEN;
@@ -262,6 +307,8 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
             d2k_quic_arm_context local=*c;
             local.benign_answered=r.clearance_asked;
             local.frag_answered=both_no;
+            local.ttl_pair_answered=ttl_answer==D2K_PROP_NO;
+            local.split_failed=r.split_crypto==D2K_PROP_NO;
             d2k_quic_arm l=d2k_quic_original_arms(&local);
             c->next=local.next; c->marked=local.marked;
             size_t head=r.n_trace;
@@ -281,11 +328,13 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
             r.clearance=cl; r.split_crypto=sp;
             r.clearance_asked=cla; r.split_asked=spa;
             if(both_no) r.frag_survives=fs;
-            r.strategy=D2K_QS_LADDER;
+            r.strategy=l.strategy==D2K_QS_FAKE_SPLIT ? l.strategy : D2K_QS_LADDER;
             r.incomplete=r.incomplete||strategy_incomplete||take<l.n_trace;
             /* Причина перебора — его собственная строка, урезанная так,
                чтобы вместе с заголовком влезть в r.reason. */
-            if(both_no) {
+            if(r.strategy==D2K_QS_FAKE_SPLIT) {
+                snprintf(r.reason,sizeof r.reason,"%s",l.reason);
+            } else if(both_no) {
                 const char *fw = fs==D2K_PROP_NO ? "фрагм. не доживают" :
                                  fs==D2K_PROP_YES ? "фрагм. не прошли" : "фрагм. не измерены";
                 snprintf(r.reason,sizeof r.reason,

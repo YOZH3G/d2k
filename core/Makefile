@@ -394,8 +394,8 @@ TESTS += test_quic_split
 test_quicprobe: test_quicprobe.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quicprobe.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o quicconn.o h3.o $(TEST_LDFLAGS)
 
-test_quic_arms: test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o measured.o hello.o plantlv.o link.o quicconn.o h3.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o measured.o hello.o plantlv.o link.o quicconn.o h3.o $(TEST_LDFLAGS)
+test_quic_arms: ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c test_quic_arms.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o measured.o hello.o plantlv.o link.o quicconn.o h3.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_arms.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c props.o quicprobe.o quicarms.o ipfrag.o net4.o quichello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o compose.o measured.o hello.o plantlv.o link.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 test_p256: test_p256.c p256.o tls13core.o crypto.o x25519.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_p256.c p256.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)

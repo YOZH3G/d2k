@@ -16,8 +16,8 @@ static d2k_tally probe(const d2k_quic_arm_question *q, void *u, int *sent) {
     const uint8_t *rut=d2k_quic_original_blob(2,&unused,NULL);
     const uint8_t *def=d2k_quic_original_blob(3,&unused,NULL);
     int pass=mode==0 || mode==7;
-    if(mode==2) pass=q->blob==rut && (q->copies==11 || q->ttl==8 || (q->copies==1 && !q->ttl));
-    if(mode==3) pass=q->blob==def && (q->copies==11 || q->ttl==12);
+    if(mode==2) pass=q->blob==rut && ((q->copies==11 && !q->ttl) || q->ttl==8 || (q->copies==1 && !q->ttl));
+    if(mode==3) pass=q->blob==def && ((q->copies==11 && !q->ttl) || q->ttl==12);
     if(mode==4) pass=q->ttl==5;
     if(mode==6) pass=q->control || q->frag==3;
     if(mode==8) pass=q->control;
@@ -36,7 +36,7 @@ int main(void) {
     if(calls==4) {
         CHECK(seen[0].copies==1 && seen[0].ttl==0);
         CHECK(seen[1].copies==6 && seen[1].ttl==0);
-        CHECK(seen[2].copies==1 && seen[2].ttl==3);
+        CHECK(seen[2].copies==6 && seen[2].ttl==3);
         CHECK(seen[3].frag==1 && seen[3].control);
         for(int i=0;i<4;i++) CHECK(strcmp(seen[i].addr,pool[0])==0);
         CHECK(memcmp(r.bytes,seen[0].blob,r.len)==0);
@@ -65,6 +65,7 @@ int main(void) {
         } else if(mode==4) {
             CHECK(!strcmp(r.blob_name,"quic5") && r.copies==2 && r.ttl==5);
             CHECK(calls==12 && r.probes==33);
+            CHECK(seen[10].copies==2 && seen[10].ttl==5);
         } else if(mode==5) {
             CHECK(r.kind==D2K_QA_NOT_FOUND && !r.incomplete && r.len==0);
             CHECK(r.frag_survives==D2K_PROP_NO && calls==14 && r.probes==42);
@@ -82,7 +83,7 @@ int main(void) {
     CHECK(r.kind==D2K_QA_NOT_FOUND && !r.incomplete && r.frag_survives==D2K_PROP_YES);
     mode=0;calls=0;c.marked=1;c.can_ask=one_question;
     r=d2k_quic_original_arms(&c);
-    CHECK(calls==1 && r.probes==3 && r.incomplete && r.copies==2);
+    CHECK(calls==1 && r.probes==3 && r.incomplete && r.copies==1);
     CHECK(r.trace[1].not_measured==2); /* same budget, checked between questions */
     if(fail) return 1;
     puts("original askArms: passed"); return 0;

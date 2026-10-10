@@ -85,6 +85,61 @@ static d2k_quic_arm run(const char *c, const char *s, int residual, size_t n_poo
     return d2k_quic_strategy_arms(&ctx);
 }
 
+/* Field f: direct H3 stalls, quic5 x2 TTL3 plan carries six requests.
+ * This is a question about that contrast, not a successful cheap filter. */
+static int ttl_calls, ttl_data_calls, ttl_cut;
+static d2k_tally ttl_probe(const d2k_quic_arm_question *q, void *u, int *sent) {
+    (void)u; ttl_calls++; *sent=3;
+    size_t n; const uint8_t *b=d2k_quic_original_blob(0,&n,NULL);
+    int same=q->blob==b && q->blob_len==n && q->copies==2 && q->ttl==3 && !q->split && !q->frag;
+    return (d2k_tally){.pass=same?3:0,.fail=same?0:3,.marked=1};
+}
+static d2k_quic_arm_data ttl_data(const d2k_quic_arm_question *q, void *u) {
+    (void)u; ttl_data_calls++;
+    CHECK(q->need_complete && q->budget_pk==25);
+    return (d2k_quic_arm_data){.verdict=ttl_cut?D2K_QAD_CUT:D2K_QAD_PASS};
+}
+static void test_ttl_lifetime(void) {
+    d2k_quic_arm_context c={.pool=pool,.n_pool=1,.marked=1,.probe=ttl_probe,
+                          .data=ttl_data,.need_complete=1,.budget_pk=25};
+    d2k_quic_arm r=d2k_quic_strategy_arms(&c);
+    CHECK(r.kind==D2K_QA_TTL && r.copies==2 && r.ttl==3);
+    CHECK(r.strategy!=D2K_QS_LADDER && ttl_calls==1 && ttl_data_calls==1);
+    ttl_cut=1; ttl_calls=ttl_data_calls=0;
+    r=d2k_quic_strategy_arms(&c);
+    CHECK(r.kind==D2K_QA_NOT_FOUND); /* first complete response cannot win */
+    CHECK(ttl_data_calls==1); /* fallback must not repeat the same question */
+}
+
+static int combo_calls, combo_cut, combo_partial;
+static d2k_tally combo_probe(const d2k_quic_arm_question *q, void *u, int *sent) {
+    (void)u; *sent=3;
+    size_t n; const uint8_t *b=d2k_quic_original_blob(3,&n,NULL);
+    int match=q->blob==b && q->copies==11 && !q->ttl && !q->frag;
+    if(match && q->split) combo_calls++;
+    int pass=match ? (combo_partial && !q->split ? 2:3):0;
+    return (d2k_tally){.pass=pass,.fail=3-pass,.marked=1};
+}
+static d2k_quic_arm_data combo_data(const d2k_quic_arm_question *q, void *u) {
+    (void)u;
+    return (d2k_quic_arm_data){.verdict=q->split && !combo_cut?D2K_QAD_PASS:D2K_QAD_CUT};
+}
+static void test_fake_split(void) {
+    d2k_quic_arm_context c={.pool=pool,.n_pool=1,.marked=1,.probe=combo_probe,.data=combo_data};
+    d2k_quic_arm r=d2k_quic_strategy_arms(&c);
+    CHECK(combo_calls==1 && r.kind==D2K_QA_SPLIT && r.copies==11 && r.len==620);
+    CHECK(r.strategy!=D2K_QS_LADDER);
+    combo_partial=1; combo_calls=0;
+    r=d2k_quic_strategy_arms(&c);
+    CHECK(combo_calls==1 && r.kind==D2K_QA_SPLIT);
+    combo_cut=1; combo_calls=0;
+    r=d2k_quic_strategy_arms(&c);
+    CHECK(combo_calls==1 && r.kind==D2K_QA_NOT_FOUND);
+    c.no_split=1; combo_calls=0;
+    r=d2k_quic_strategy_arms(&c);
+    CHECK(combo_calls==0 && r.kind==D2K_QA_NOT_FOUND);
+}
+
 int main(void) {
     static const uint8_t zero16[16];
     marked_ok = 1;
@@ -218,6 +273,8 @@ int main(void) {
     CHECK(r.kind == D2K_QA_FLAKY);
     marked_ok = 1;
 
+    test_ttl_lifetime();
+    test_fake_split();
     if (fails) return 1;
     puts("QUIC strategy from answers: passed");
     return 0;

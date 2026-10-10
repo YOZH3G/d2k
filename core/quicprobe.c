@@ -1527,9 +1527,9 @@ static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
     size_t prefix_len=q->blob_len;
     int ttl=q->ttl;
     int copies=q->copies>1?q->copies:1;
-    if(q->split && (q->frag || q->blob_len || neutral)) {
+    if(q->split && (q->frag || neutral)) {
         if(sent_out)*sent_out=0;
-        return bad; /* разрез CRYPTO мерится один, без приманок и фрагментов */
+        return bad; /* разрез CRYPTO не совместим с фрагментами и нейтральным контролем */
     }
     if(q->frag) {
         if(q->blob_len || d2k_ipfrag_shape(q->frag,&plan)!=0) {

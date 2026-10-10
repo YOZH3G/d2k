@@ -395,6 +395,8 @@ typedef enum {
     D2K_QS_CLEARANCE,  /* одна безобидная датаграмма перед Initial */
     D2K_QS_SPLIT,      /* разрез ClientHello на кадры CRYPTO */
     D2K_QS_LADDER,     /* ответа нет — запасной перебор askArms */
+    D2K_QS_FAKE_SPLIT, /* partial fake response, then measured fake x CRYPTO split */
+    D2K_QS_TTL_LIFETIME, /* limited-hop decoy changes post-handshake progress */
     D2K_QS_FRAG        /* оба ответа «нет», IP-фрагментация (вопрос замера) прошла */
 } d2k_quic_strategy;
 
@@ -550,8 +552,8 @@ static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge3(int handshake, 
  * fakes + 2 candidates x 2 copy counts + 4 TTLs + fragment survival + 4
  * fragment shapes = 18 questions. The Run budget is derived from it. */
 #define D2K_QUIC_ARM_QUESTIONS_MAX 18u
-/* 18 вопросов askArms плюс до 4 опросов стратегии (задача 40). */
-#define D2K_QUIC_ARM_STEPS 24
+/* 18 резервных вопросов плюс до 7 опросов стратегии, включая произведение. */
+#define D2K_QUIC_ARM_STEPS 26
 typedef struct {
     char label[192];
     char addr[D2K_QUIC_ADDR_LEN];
