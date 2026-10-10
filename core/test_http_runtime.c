@@ -56,6 +56,18 @@ static void alter_program(char *text) {
 int main(int argc, char **argv) {
     D2K_TEST_NAT_NO_TABLE();
     int force_divergence=argc==2 && !strcmp(argv[1],"--diverge");
+    /* New entries in the candidate catalog automatically enter the gate.
+       The three measured routes below additionally compare actual callback
+       outputs, so a search/export mismatch cannot hide behind this compiler. */
+    for(size_t k=0;k<d2k_hs_candidate_count();k++) {
+        const uint8_t trial_id[16]={1}, permanent_id[16]={2};
+        char trial_text[2048]={0},permanent_text[2048]={0};
+        const char *key=d2k_hs_candidate_key(k);
+        CHECK(!d2k_hs_candidate_text(key,trial_id,trial_text,sizeof trial_text),"catalog trial program");
+        CHECK(!d2k_hs_candidate_text(key,permanent_id,permanent_text,sizeof permanent_text),"catalog permanent program");
+        for(int family=4;family<=6;family+=2)
+            CHECK(same_execution(trial_text,permanent_text,family),"catalog runtime equality");
+    }
     for(int family=4;family<=6;family+=2)for(int answer=0;answer<3;answer++) {
         fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
         d2k_httpsearch_portal(hs,"portal-target.example",(uint8_t)family,IP,now);base_injected(hs,&f,&now);
