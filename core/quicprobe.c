@@ -1791,6 +1791,10 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
             req_at = now;
             bytes = last = 0;
             complete = 0;
+            /* HEADERS and status belong to this request stream. A complete
+               prior response cannot validate DATA-only bytes on the next. */
+            head_len = 0;
+            status = 0;
             continue;
         }
         if (act == D2K_QSTALL_PROBE) { (void)d2k_qc_ping(c, err, sizeof err); }
@@ -1808,6 +1812,7 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
             else if (head_len >= D2K_VERIFY_HEADER_LIMIT) { head_full = 1; break; }
         }
         d2k_qc_app_progress(c, &bytes, &complete);
+        if (status == 451) break; /* Explicit refusal belongs to this response. */
         if (bytes > last) { last = bytes; progress_at = qp_now_ms(); }
         if (closed) break;
     }

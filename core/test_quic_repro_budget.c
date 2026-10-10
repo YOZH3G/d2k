@@ -30,6 +30,8 @@ enum {
     M_MANY,              /* до 200 коротких полных ответов, PING подтверждается */
     M_CUT_LATER,         /* первый ответ целиком (2 пакета), второй встаёт после HEADERS */
     M_ONE_BIG_CUT,       /* один ответ без FIN: 15 пакетов, тишина */
+    M_SECOND_451,       /* a later response explicitly refuses access */
+    M_NO_HEADERS,        /* first response is valid; later streams contain only DATA */
     M_ALIVE_NO_ANSWER    /* первый ответ целиком, дальше только подтверждает PING */
 };
 
@@ -58,8 +60,10 @@ static int srv_stream(stand *st, uint64_t sid, uint64_t off, int headers, size_t
     size_t b = 0;
     if (headers) {
         static const uint8_t h[] = {0x01, 0x03, 0x00, 0x00, 0xd9};
-        memcpy(body, h, sizeof h);
-        b += sizeof h;
+        static const uint8_t denied[] = {0x01, 0x08, 0x00, 0x00, 0x5f, 0x09, 0x03, '4', '5', '1'};
+        if (st->mode == M_SECOND_451 && st->requests > 1) {
+            memcpy(body, denied, sizeof denied); b += sizeof denied;
+        } else { memcpy(body, h, sizeof h); b += sizeof h; }
     }
     if (data) {
         body[b++] = 0x00;
@@ -83,7 +87,7 @@ static int srv_stream(stand *st, uint64_t sid, uint64_t off, int headers, size_t
 
 static void srv_ack(stand *st) {
     /* Молчащий сервер не отвечает и на PING. */
-    if (st->mode != M_MANY && st->mode != M_ALIVE_NO_ANSWER) return;
+    if (st->mode != M_MANY && st->mode != M_NO_HEADERS && st->mode != M_ALIVE_NO_ANSWER) return;
     level *L = &st->srv->lv[D2K_QW_LEVEL_APP];
     uint8_t ab[32];
     size_t an = build_ack(ab, sizeof ab, L->largest_rx);
@@ -103,6 +107,13 @@ static void srv_request(stand *st, uint64_t sid) {
         if (srv_stream(st, sid, (uint64_t)(a + b), 0, 300, 1) > 0) st->responses++;
         break;
     }
+    case M_SECOND_451:
+        if (st->responses < 200 && srv_stream(st, sid, 0, 1, 200, 1) > 0) st->responses++;
+        break;
+    case M_NO_HEADERS:
+        if (st->responses < 200 && srv_stream(st, sid, 0, st->requests == 1, 200, 1) > 0)
+            st->responses++;
+        break;
     case M_MANY:
         if (st->responses < 200 && srv_stream(st, sid, 0, 1, 200, 1) > 0) st->responses++;
         break;
@@ -291,10 +302,18 @@ int main(void) {
     CHECK(d.verdict == D2K_QAD_NOT_RUN && st.pings >= 1,
           "сервер жив и подтверждает PING, ответа нет: не обрыв, не измерено");
 
-    /* Без бюджета (плечи) — прежнее правило: один полный ответ засчитан. */
+    d = run(M_SECOND_451, 25, &st);
+    CHECK(d.verdict == D2K_QAD_CUT && st.requests == 2,
+          "second stream HTTP 451 stops the experiment as a refusal");
+
+    d = run(M_NO_HEADERS, 25, &st);
+    CHECK(d.verdict != D2K_QAD_PASS && st.requests == 2,
+          "second stream without HEADERS cannot inherit the first HTTP status");
+
+    /* Без запрошенного воспроизведения — прежнее правило: один полный ответ засчитан. */
     d = run(M_CUT_LATER, 0, &st);
     CHECK(d.verdict == D2K_QAD_PASS && st.requests == 1,
-          "без бюджета (этап данных плеча) один полный ответ засчитывается, как прежде");
+          "без бюджета один полный ответ засчитывается, как прежде");
 
     if (!fails) puts("test_quic_repro_budget: all passed");
     return fails != 0;
