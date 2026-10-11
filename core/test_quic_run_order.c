@@ -5,6 +5,7 @@
 #include "d2k_quic.h"
 static int calls, fails, lose_base_mark, junk16_asks, all_pass;
 static int fragment_calls, arm_second_stalls;
+static int candidate_passed, diagnostics_after_pass;
 static size_t first_prefix;
 static uint8_t first_arm_hello[2048];
 static size_t first_arm_hello_len;
@@ -22,6 +23,7 @@ static d2k_tally answer(int n,int *sent) {
 static d2k_tally ask(const char *ip,uint16_t port,const uint8_t *pre,size_t len,
     d2k_hello msg,uint32_t wait,uint32_t mark,int n,uint32_t *rtt,int *ref,int *sent,uint8_t *ttl) {
     (void)ip;(void)port;(void)wait;(void)mark;
+    if(candidate_passed && !pre) diagnostics_after_pass++;
     if(pre && !first_prefix) first_prefix=len;
     if(pre && len==16) junk16_asks++;
     if(pre) {
@@ -110,6 +112,7 @@ static d2k_quic_arm_data data_pass(const d2k_quic_arm_question *q,const char *sn
     data_calls++;
     d2k_quic_arm_data d; memset(&d,0,sizeof d);
     d.verdict=D2K_QAD_PASS; d.app_bytes=D2K_QUIC_ARM_DATA_BYTES;
+    candidate_passed=1;
     return d;
 }
 /* Задача 50, раунд 2: прямой этап данных — без воздействия. Обрыв после
@@ -299,10 +302,10 @@ int main(void) {
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE);
     CHECK(first_prefix==1200); /* quic5 before properties' 16-byte junk */
-    CHECK(arm_hello_count>=2 && arm_hello_changed>0);
-    CHECK(arm.original && arm.len==1200 && arm.ttl==3 && arm.copies==6);
-    CHECK(fragment_calls==2 && arm.frag_kind==0 && arm.frag_survives==D2K_PROP_YES);
-    CHECK(data_calls==4); /* quic5, copies 6, ttl 3, frag pos8; never the survival control */
+    CHECK(arm_hello_count==1); /* first complete arm ends search */
+    CHECK(arm.original && arm.len==1200 && arm.ttl==0 && arm.copies==1);
+    CHECK(fragment_calls==0 && arm.frag_kind==0 && arm.frag_survives==D2K_PROP_UNKNOWN);
+    CHECK(data_calls==1); /* quic5 passed; no copies/TTL/fragment refinements */
     CHECK(strategy_calls==4 && arm.strategy==D2K_QS_LADDER); /* два вопроса, по одному повтору */
     /* Круг 1: заданное до предела повторов не задаётся снова — ни приманкой
        0x00…0 перебора, ни «мусором»/«кадрами» вопросника. */
@@ -317,17 +320,19 @@ int main(void) {
     snprintf(arm.probe_path,sizeof arm.probe_path,"%s",want_path);
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
-    CHECK(data_calls==4 && !strcmp(arm.probe_path,want_path));
+    CHECK(data_calls==1 && !strcmp(arm.probe_path,want_path));
     /* Задача 40: остаточное разрешение есть — план из ответа, перебора нет,
        «мусор» вопросника второй раз не задаётся. */
     want_path[0]=0; memset(&arm,0,sizeof arm);
     calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='Y';
+    candidate_passed=diagnostics_after_pass=0;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE && arm.kind==D2K_QA_BLOB && arm.strategy==D2K_QS_CLEARANCE);
     CHECK(arm.len==D2K_QUIC_BENIGN_LEN && arm.copies==1 && strategy_calls==1 && data_calls==1);
     CHECK(fragment_calls==0 && first_prefix==0);
     CHECK(r.qprops.junk_ahead==D2K_PROP_YES && r.qtrace[0].sent==0);
+    CHECK(diagnostics_after_pass==0);
     /* Оба «нет», фрагменты проходят: план из ответа фрагментации. */
     memset(&arm,0,sizeof arm);
     calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='N';

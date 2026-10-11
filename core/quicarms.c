@@ -130,15 +130,14 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
         /* 0x00…0 ×1 — ровно вопрос «остаточное разрешение»; на него уже есть
            решающее «нет» (задача 40), второй раз он исхода не изменит. */
         if(b==4 && c && c->benign_answered) continue;
-        if(ask(c,&r,b,1,0,0,0,&measured)) { chosen=b; break; }
+        if(ask(c,&r,b,1,0,0,0,&measured)) { chosen=b; r.copies=1; goto selected; }
     }
-    /* 2. Either the successful fake, or quic5 then fake_default_quic. */
-    int candidates[2]={chosen>=0?chosen:0,3};
-    int nc=chosen>=0?1:2;
+    /* 2. Single copies failed: quic5 then fake_default_quic with repeats. */
+    const int candidates[2]={0,3};
     const int repeats[]={6,11};
-    for(int i=0;i<nc && !r.copies;i++) for(size_t j=0;j<2;j++) {
+    for(int i=0;i<2;i++) for(size_t j=0;j<2;j++) {
         if(ask(c,&r,candidates[i],repeats[j],0,0,0,&measured)) {
-            chosen=candidates[i]; r.copies=repeats[j]; break;
+            chosen=candidates[i]; r.copies=repeats[j]; goto selected;
         }
         /* Field e/f: fake_default x11 gets bound replies but not a usable
            connection. Plain split failed. Ask their product only on this
@@ -162,22 +161,23 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
             }
         }
     }
-    /* 3. Preferred successful fake, then quic5, then default (embedded,
-       therefore all available). TTL is an independent original axis. */
-    if (chosen>=0 && !r.copies) r.copies=1;
-    int decoy=chosen>=0?chosen:0;
-    int ttl_copies=r.copies ? r.copies : 2;
+    /* 3. No complete fake/repeat candidate: measure quic5 x2 with TTL. */
+    int decoy=0;
+    int ttl_copies=2;
     const int ttls[]={3,5,8,12};
     for(size_t i=0;i<4;i++) {
         if(c && c->ttl_pair_answered && decoy==0 && ttl_copies==2 && ttls[i]==3) continue;
         if(ask(c,&r,decoy,ttl_copies,ttls[i],0,0,&measured)) {
-        chosen=decoy; r.copies=ttl_copies; r.ttl=ttls[i]; break;
+        chosen=decoy; r.copies=ttl_copies; r.ttl=ttls[i]; goto selected;
         }
     }
     /* 4. Survival on control precedes every fragmentation arm. Уже заданные
        стратегией (оба её ответа «нет») вопросы фрагментации не повторяются:
        их исход тот же, и он уже в трассе. */
     if(!(c && c->frag_answered)) ask_frag(c,&r);
+selected:
+    /* A complete measured candidate ends search (§0.1). Later axes neither
+       strengthen this exact action nor justify changing its wire program. */
     if(chosen>=0) {
         const char *name="";
         const uint8_t *blob=d2k_quic_original_blob((size_t)chosen,&r.len,&name);

@@ -174,8 +174,8 @@ int main(void) {
     CHECK(r.clearance == D2K_PROP_NO && r.split_crypto == D2K_PROP_NO);
     CHECK(r.frag_survives == D2K_PROP_NO && !r.frag_kind);
     /* 3 вопроса стратегии; приманки ×1 без 0x00…0 (4), копии quic5 ×6/×11 и
-       fake_default_quic ×6/×11 (4), TTL 3/5/8/12 (4); фрагменты — один раз. */
-    CHECK(calls == 3 + 12 && ladder_calls == 1 + 12 && r.n_trace == 15);
+       fake_default_quic ×6/×11 (4); после PASS TTL не задаётся. */
+    CHECK(calls == 3 + 8 && ladder_calls == 1 + 8 && r.n_trace == 11);
     {
         int controls = 0, benign = 0;
         for (int i = 0; i < calls && i < 64; i++) {
@@ -246,8 +246,8 @@ int main(void) {
     /* 7. Не отправилось оба раза — тоже неизмеримо; запасной перебор находит. */
     ladder_pass = 1;
     r = run("EE", "EE", 0, 1);
-    /* quic5 ×1, ×6, TTL 3, контроль выживания фрагментов */
-    CHECK(calls == 4 + 4 && r.strategy == D2K_QS_LADDER && r.kind == D2K_QA_TTL);
+    /* quic5 ×1 completes; later axes are unnecessary. */
+    CHECK(calls == 4 + 1 && r.strategy == D2K_QS_LADDER && r.kind == D2K_QA_COPIES);
     CHECK(r.clearance == D2K_PROP_UNKNOWN && r.split_crypto == D2K_PROP_UNKNOWN);
     ladder_pass = 0;
 

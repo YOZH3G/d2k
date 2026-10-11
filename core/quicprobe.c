@@ -2667,10 +2667,17 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                                 snprintf(arm->reason, sizeof arm->reason, "budget exhausted before askArms");
                             }
                         }
-                        /* Original Run uses the SAME residual policy and cursor:
-                           arm questions first, properties afterwards. No extra
-                           clean-address control consumes the first spare IP. */
-                        qp_questions_step(&r, pool, n_pool, &next_addr, residual,
+                        /* The arm already passed its handshake AND data stage.
+                           Unrelated diagnostics cannot improve this candidate
+                           and must not delay it or poison its mark evidence.
+                           Classify-only and failed searches retain diagnostics. */
+                        int have_arm=arm && arm->original && arm->n_trace &&
+                                     arm->kind!=D2K_QA_NOT_FOUND && arm->kind!=D2K_QA_FLAKY &&
+                                     arm->trace[arm->n_trace-1].data==D2K_QAD_PASS &&
+                                     arm->trace[arm->n_trace-1].answered==D2K_QUIC_REPEATS &&
+                                     !arm->trace[arm->n_trace-1].not_measured;
+                        if(have_arm) reason_append(&r,"; кандидат прошёл этап данных — дальнейшие вопросы не нужны");
+                        else qp_questions_step(&r, pool, n_pool, &next_addr, residual,
                                           port, sni, trigger, dyn_wait, mark,
                                           &all_marked, &start,
                                           arm ? arm->clearance_asked : 0,
