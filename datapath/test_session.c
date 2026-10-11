@@ -2112,6 +2112,32 @@ int main(void) {
         d2k_session_free(g);
     }
 
+    /* A new SYN must not erase the binding of still queued old sends. */
+    {
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        CHECK(!d2k_plan_load(plan_with_send_id, sizeof plan_with_send_id, &gp,
+                            err, sizeof err), "pending SYN fixture plan");
+        CHECK(!d2k_plantab_set_name(d2k_session_plans(g),
+            (const uint8_t *)"hetzner.com", 11, 1, gp), "pending SYN binding");
+        n = build_pkt(pkt, 46003, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        d2k_result pending = r;
+        CHECK(pending.applied && pending.binding.generation,
+              "pending SYN fixture did not select a binding");
+        n = build_pkt(pkt, 46003, 0x02, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+        CHECK(!r.applied, "bare SYN unexpectedly applied a plan");
+        for (size_t i = 0; i <= pending.n_out; i++)
+            d2k_session_sent(g, 1200 + i, &pending.key, pending.execution_id);
+        const d2k_jrn_entry *e = last_of_kind(g, D2K_JRN_PLAN_DONE);
+        CHECK(e && e->execution_id == pending.execution_id &&
+              e->binding.generation == pending.binding.generation &&
+              e->binding.kind == pending.binding.kind,
+              "new SYN erased the binding of pending execution DONE");
+        d2k_session_free(g);
+    }
+
     /* One 5-tuple may be reused while old delayed packets still exist. */
     {
         d2k_session *g = d2k_session_new(64, 64);
