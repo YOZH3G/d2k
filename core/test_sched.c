@@ -230,6 +230,12 @@ static int vol_rx_packets; /* задача 55: пакеты на обрыве id
 static int vol_rx_packet_only; /* gzip оборван на том же бюджете пакетов */
 static int vol_rx_short;              /* ответ завершён, но короче полосы */
 static uint64_t vol_rx_short_bytes;   /* его тело */
+/* ОБРЫВ ДОКАЗАН ТОЛЬКО ПЕРВЫМ ПРОГОНОМ. Поле 12.10.2026,
+   www.tampermonkey.net: парная проба сошлась (identity 15627/15627), а
+   назначенный следом повтор дал непарный результат — одно измерение
+   оборвалось, второе дошло целиком. Иначе повтор «переоткрывал» бы обрыв сам,
+   и потеря доказательства в тесте была бы не видна. */
+static int vol_rx_cut_first_only;
 static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
                                int plain, int tls12, size_t hello_wire,
                                uint32_t mark) {
@@ -245,7 +251,8 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     memset(&r, 0, sizeof r);
     r.verdict = vol_answer;
     r.at_kb = vol_at_kb;
-    r.rx_cut = vol_rx_cut; r.rx_wire_basis = vol_rx_wire_basis;
+    int rx_cut = vol_rx_cut && !(vol_rx_cut_first_only && vol_calls > 1);
+    r.rx_cut = rx_cut; r.rx_wire_basis = vol_rx_wire_basis;
     r.rx_tls_unavailable = vol_rx_tls_unavailable;
     r.rx_short = vol_rx_short;
     r.rx_short_bytes = vol_rx_short_bytes;
@@ -253,9 +260,9 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     r.rx_partial_bytes = vol_partial_bytes;
     r.rx_partial_wire_bytes = vol_partial_wire_bytes;
     r.rx_at_kb = vol_rx_at_kb;
-    r.rx_cut_packets = vol_rx_cut ? vol_rx_packets : 0;
+    r.rx_cut_packets = rx_cut ? vol_rx_packets : 0;
     r.rx_expected_kb = 96;
-    r.rx_compressed_complete = vol_rx_cut && !vol_rx_packet_only;
+    r.rx_compressed_complete = rx_cut && !vol_rx_packet_only;
     if (resource_fixture) {
         r.n_resources = 1;
         strcpy(r.resources[0].host, "assets.example");
@@ -6369,6 +6376,93 @@ shape_test:
               "task31/rx: брошенная RX-пара разобрана как неподтверждённое позднее закрытие");
         d2k_sched_free(s); d2k_catalog_free(&empty);
         vol_hold = 0;
+    }
+
+    /* ЗАДАЧА 31, ДОКАЗАННЫЙ ОБРЫВ: СНИМОК НЕ АННУЛИРУЕТ ПОЛУЧЕННЫЙ ОТВЕТ.
+       Поле 12.10.2026, www.tampermonkey.net. Парный объёмный замер сошёлся
+       полностью («TX chunked identity-тело повторно оборвалось около 15 КБ;
+       gzip завершился; RX identity 15627/15627, пакетов 26/26»), и следующей
+       же строкой прогон был аннулирован ради повтора байтами клиента (1543
+       против 1578). Повтор дал НЕпарный результат — одно измерение
+       оборвалось, второе дошло целиком, — и ответ стал ложным отрицанием:
+       «позднее закрытие не подтвердилось парными измерениями ответа» и покой
+       на десять минут. Так погибли три эпизода подряд по этой цели, при
+       эталоне с VPS 30182 байта против 15963 с роутера (8 раз из 8).
+
+       Байтовый бюджет ОТВЕТА считается ПОСЛЕ успешного рукопожатия и от формы
+       приветствия не зависит (см. «не семейный путь» в sched.c): доказанный
+       обрыв забирается ДО повтора снимком, а повтор идёт за коробкой и её
+       планами — за тем, что от байт клиента действительно зависит, — и
+       отвеченный вопрос объёма не переспрашивает. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = ver_calls = 0; vol_entered = 0;
+        vol_last_wire = 0; tcp_last_wire = 0;
+        vol_answer = D2K_VOL_PASSED;
+        vol_rx_cut = 1; vol_rx_cut_first_only = 1; vol_rx_at_kb = 15;
+        vol_rx_packet_only = 0; vol_rx_packets = 0; vol_rx_wire_basis = 0;
+        vol_rx_short = 0; vol_rx_short_bytes = 0; vol_rx_tls_unavailable = 0;
+        vol_partial_bytes = vol_partial_wire_bytes = 0; vol_direct_complete = 0;
+        /* Рукопожатие у позднего обрыва проходит — режется только ответ. */
+        tcp_answer = D2K_V_CLEAR;
+        vol_hold = 1;
+        const char *name = "late.rst.snap.cut.example";
+        d2k_ev h1 = ev_hello(6, 41152, name);
+        d2k_sched_event(s, &h1);
+        d2k_ev r1 = ev_suspect(6, 41152); r1.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &r1);
+        d2k_ev h2 = ev_hello(6, 41153, name);
+        d2k_sched_event(s, &h2);
+        d2k_ev r2 = ev_suspect(6, 41153); r2.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &r2);
+        spin(s, 30);
+        for (int i = 0; i < 2000 && !vol_entered; i++) usleep(1000);
+        CHECK(vol_entered && tcp_calls == 0,
+              "task31/rx-cut: RX-пара позднего закрытия не началась");
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, name,
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31/rx-cut: снимок");
+        d2k_sched_event(s, &sh);
+        d2k_ev other = {0}; other.kind = D2K_EV_SHAPE; other.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "neighbour.rx.cut.example",
+              other.shape, sizeof other.shape, &other.shape_len) == 0,
+              "task31/rx-cut: соседний снимок");
+        d2k_sched_event(s, &other);
+        vol_hold = 0;
+        spin(s, 200);
+        /* Условие дефекта: снимок пришёл ИМЕННО во время объёмного шага и
+           перезапуск действительно назначен. Без этих двух строк проверка
+           ничего не воспроизводит. */
+        CHECK(said("останавливаю устаревший прогон"),
+              "task31/rx-cut: снимок не остановил объёмный прогон — условие не воспроизведено");
+        const char *restart = strstr(saidbuf, "повторяю поиск его байтами");
+        CHECK(restart != NULL,
+              "task31/rx-cut: повтор байтами клиента не назначен — условие не воспроизведено");
+        /* Доказанный обрыв потреблён, и потреблён ДО повтора. */
+        const char *proven = strstr(saidbuf, "подтверждён повторяемый обрыв входящего ответа");
+        CHECK(proven != NULL,
+              "task31/rx-cut: доказанный обрыв ответа потерян вместе с аннулированным прогоном");
+        CHECK(proven && restart && proven < restart,
+              "task31/rx-cut: обрыв забран не до повтора снимком");
+        CHECK(!said("позднее закрытие не подтвердилось"),
+              "task31/rx-cut: доказанный обрыв объявлен неподтверждённым");
+        CHECK(!said("повторный замер позднего обрыва отложен"),
+              "task31/rx-cut: доказанный обрыв отправил цель на покой");
+        /* Отвеченный вопрос объёма не переспрашивается: именно второй,
+           непарный замер и убивал эпизод в поле. */
+        CHECK(vol_calls == 1,
+              "task31/rx-cut: повтор снимком переспросил уже отвеченный вопрос объёма");
+        CHECK(tcp_calls == 1 && tcp_last_wire == sh.shape_len,
+              "task31/rx-cut: повтор за коробкой шёл не байтами клиента");
+        CHECK(!said("прямой замер не подтвердил блокировку") &&
+              !said("напрямую проходит") && !said("результат неубедителен"),
+              "task31/rx-cut: эпизод с доказанным обрывом кончился отрицательным вердиктом");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        vol_hold = 0; vol_rx_cut = 0; vol_rx_cut_first_only = 0; vol_rx_at_kb = 24;
+        tcp_answer = D2K_V_OPAQUE;
     }
 
     /* ЗАДАЧА 31, QUIC: Initial клиента этой цели пришёл во время прогона,
