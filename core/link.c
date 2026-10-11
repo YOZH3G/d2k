@@ -302,7 +302,19 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
             out->name[nl] = '\0';
         }
         break;
+    case D2K_EV_HTTP_RESPONSE:
     case D2K_EV_HTTP_PORTAL:
+        if(out->kind==D2K_EV_HTTP_RESPONSE) {
+            if(rlen<18)return -1;
+            rlen-=18;const uint8_t *meta=rest+rlen;
+            out->live_http_status=(uint16_t)((unsigned)meta[0]<<8|meta[1]);
+            for(unsigned i=0;i<8;i++) {
+                out->live_body_bytes=(out->live_body_bytes<<8)|meta[2+i];
+                out->live_request_no=(out->live_request_no<<8)|meta[10+i];
+            }
+            if(!out->live_request_no || rest[0]<1 || rest[0]>3 || out->live_http_status>599 ||
+               (rest[0]==1 && out->live_http_status<200))return -1;
+        }
         if (rlen < 2 || rlen < 2u + rest[1]) {
             say(err, errcap, "вставка HTTP без признака или с обрезанным именем");
             return -1;
@@ -312,12 +324,14 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         out->name[rest[1]] = '\0';
         {
             size_t off = 2u + rest[1];
+            if(out->kind==D2K_EV_HTTP_RESPONSE && rlen<off+50+D2K_CTL_BINDING_LEN)return -1;
             if (rlen != off && rlen < off + 50) {
                 say(err, errcap, "вставка HTTP с обрезанным контекстом исполнения");
                 return -1;
             }
             if (rlen >= off + 50) {
                 size_t path_len = (size_t)rest[off + 48] << 8 | rest[off + 49];
+                if(out->kind==D2K_EV_HTTP_RESPONSE && rlen!=off+50+path_len+D2K_CTL_BINDING_LEN)return -1;
                 if (path_len >= sizeof out->live_http_path || (rlen != off + 50 + path_len && rlen != off + 50 + path_len + D2K_CTL_BINDING_LEN)) {
                     say(err, errcap, "вставка HTTP с обрезанным контекстом запроса");
                     return -1;

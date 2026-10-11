@@ -6,7 +6,7 @@
  * не отвечает. Ответ, пришедший раньше, чем сервер физически мог ответить,
  * сервером не послан.
  *
- * Модуль видит начальное окно и последующие HTTP PSH-пакеты в обе стороны.
+ * Модуль видит начальное окно и весь последующий HTTP-поток в обе стороны.
  * Он узнаёт вставку по трём признакам сразу:
  *   1. ответ — 30x с Location на хост блокировки (метки как в
  *      d2k_httpup_portal_location), и этот хост не равен Host запроса;
@@ -48,6 +48,10 @@ typedef struct d2k_http80 d2k_http80;
 
 typedef struct {
     int action;            /* D2K_HTTP80_* */
+    int response;          /* 1: complete framing, 2: unknown, 3: portal (no timing claim) */
+    unsigned status;       /* final HTTP status, if observed */
+    uint64_t body_bytes;    /* observed body excluding chunk framing */
+    uint64_t request_no;    /* request ordinal within this observed connection */
     int injection;         /* ЭТОТ пакет — первая узнанная вставка запроса */
     int answered;          /* 307 ушёл клиенту (ставит d2k_http80_swap) */
     size_t flow;           /* REPLACE: чей поток (для d2k_http80_swap) */
@@ -60,7 +64,7 @@ typedef struct {
     uint64_t reply_ns;     /* запрос → ответ */
     d2k_binding_context binding;
     uint64_t execution_id; /* completed live request execution, else zero */
-    uint64_t request_ms;   /* monotonic request start, generation boundary */
+    uint64_t request_ms;   /* monotonic request start; identity is the binding */
     uint8_t plan_id[16], trial_id[16];
     char request_path[D2K_HTTP80_TARGET_MAX]; /* safe GET path, empty = reproduction gap */
     char host[256];        /* Host запроса (без :80) */
@@ -108,6 +112,10 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
 void d2k_http80_executed(d2k_http80 *h, const uint8_t *pkt, size_t len,
     uint64_t now_ns, uint64_t execution_id,
     const uint8_t plan_id[16], const uint8_t trial_id[16], const d2k_binding_context *);
+
+/* Finalize a response observation after this original packet's NFQUEUE
+ * verdict. Any failed/non-ACCEPT delivery invalidates the response witness. */
+void d2k_http80_delivered(d2k_http80 *,const uint8_t *,size_t,int accepted,d2k_http80_res *);
 
 /* Исполнение REPLACE (ревью I3) — обязательный второй шаг. Пока его не было,
  * поток ничьим не считается: ни RST, ни снятия копий. Порядок:

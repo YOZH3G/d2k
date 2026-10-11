@@ -659,7 +659,7 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
 /* The same request snapshot encoder is used by d2kd and socket regressions. */
 void d2k_ctlsrv_http80_event(d2k_ctl *ctl, const d2k_http80_res *r) {
     if (!ctl) { return; }
-    uint8_t body[D2K_KEY_WIRE_LEN + 2 + 255 + 50 + D2K_HTTP80_TARGET_MAX + D2K_CTL_BINDING_LEN];
+    uint8_t body[D2K_KEY_WIRE_LEN + 2 + 255 + 50 + D2K_HTTP80_TARGET_MAX + D2K_CTL_BINDING_LEN + 18];
     size_t hl = strlen(r->host);
     if (hl > 255) { return; }
     memset(body, 0, D2K_KEY_WIRE_LEN);
@@ -669,7 +669,7 @@ void d2k_ctlsrv_http80_event(d2k_ctl *ctl, const d2k_http80_res *r) {
     body[33] = (uint8_t)(r->client_port >> 8); body[34] = (uint8_t)r->client_port;
     body[35] = (uint8_t)(r->server_port >> 8); body[36] = (uint8_t)r->server_port;
     body[37] = 6;
-    body[D2K_KEY_WIRE_LEN] = r->answered ? 1 : 0;
+    body[D2K_KEY_WIRE_LEN] = r->response ? (uint8_t)r->response : (r->answered ? 1 : 0);
     body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)hl;
     memcpy(body + D2K_KEY_WIRE_LEN + 2, r->host, hl);
     size_t off = D2K_KEY_WIRE_LEN + 2 + hl;
@@ -684,5 +684,11 @@ void d2k_ctlsrv_http80_event(d2k_ctl *ctl, const d2k_http80_res *r) {
     body[off + 49] = (uint8_t)path_len;
     memcpy(body + off + 50, r->request_path, path_len);
     d2k_ctl_binding_write(body+off+50+path_len,&r->binding);
-    d2k_ctl_event(ctl, D2K_EV_HTTP_PORTAL, body, off + 50 + path_len + D2K_CTL_BINDING_LEN);
+    size_t end=off+50+path_len+D2K_CTL_BINDING_LEN;
+    if(r->response) {
+        body[end++]=(uint8_t)(r->status>>8);body[end++]=(uint8_t)r->status;
+        for(unsigned i=0;i<8;i++)body[end++]=(uint8_t)(r->body_bytes>>(56-8*i));
+        for(unsigned i=0;i<8;i++)body[end++]=(uint8_t)(r->request_no>>(56-8*i));
+    }
+    d2k_ctl_event(ctl,r->response?D2K_EV_HTTP_RESPONSE:D2K_EV_HTTP_PORTAL,body,end);
 }

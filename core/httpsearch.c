@@ -844,12 +844,21 @@ static void start_next(d2k_httpsearch *hs, int64_t now) {
     }
 }
 
+static rec *live_owner(d2k_httpsearch *hs,const char *host,uint8_t family,
+    const uint8_t plan_id[16],const d2k_binding_context *binding,uint64_t execution_id,int64_t request_ms) {
+    static const uint8_t no_pending[16];
+    if(!hs || !plan_id || !execution_id || request_ms<=0 || !host_ok(host) || (family!=4 && family!=6))return NULL;
+    rec *r=rec_find(hs,host,family);
+    if(!r || !r->key[0] || r->revoked || !d2k_binding_equal(&r->binding,binding) ||
+       memcmp(r->install_id,no_pending,16) || memcmp(r->installed_plan_id,plan_id,16))return NULL;
+    return r;
+}
+
 int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t family,
                                 const uint8_t *addr, const uint8_t plan_id[16], const d2k_binding_context *binding, uint64_t execution_id, int64_t request_ms, const char *path, int64_t now) {
-    if(!hs||!addr||!plan_id||!execution_id||request_ms<=0||!host_ok(host)||(family!=4&&family!=6))return 0;
-    rec *r=rec_find(hs,host,family);if(!r||!r->key[0]||r->revoked||!d2k_binding_equal(&r->binding,binding))return 0;
-    static const uint8_t no_pending[16];
-    if(memcmp(r->install_id,no_pending,16) || memcmp(r->installed_plan_id,plan_id,16))return 0;
+    if(!addr)return 0;
+    rec *r=live_owner(hs,host,family,plan_id,binding,execution_id,request_ms);
+    if(!r)return 0;
     r->revoked=1;r->no_before_ms=0;
     r->repro_gap=!hs_path_ok(path);
     r->repeat_path[0]=0;
@@ -868,7 +877,21 @@ int d2k_httpsearch_control(d2k_httpsearch *hs,const d2k_ev *ev,int64_t now) {
     if(!hs || !ev)return 0;
     if(ev->kind==D2K_EV_ACK && ev->code==D2K_CMD_SET_NAME_BOUND)
         d2k_httpsearch_install_ack(hs,ev->trial_id,((ev->num>>8)&0xffu)==1u,&ev->execution_binding);
-    if(ev->kind==D2K_EV_HTTP_PORTAL && !ev->code && ev->transport==6 && ev->high_port==80) {
+    if(ev->kind==D2K_EV_HTTP_RESPONSE && (ev->code==1 || ev->code==2) &&
+       ev->transport==6 && ev->high_port==80 && ev->live_request_no) {
+        static const uint8_t zero[16];
+        rec *r=live_owner(hs,ev->name,ev->family,ev->plan_id,&ev->execution_binding,
+                          ev->live_execution,ev->live_request_ms);
+        if(!r || memcmp(ev->trial_id,zero,16))return 0;
+        /* Per-request observation, never persistent target/application DONE. */
+        say(hs,"HTTP live target=%s IPv%u request=%llu execution=%llu plan=%s generation=%llu outcome=%s status=%u body=%llu; scope=request, connection=pending",
+            ev->name,(unsigned)ev->family,(unsigned long long)ev->live_request_no,
+            (unsigned long long)ev->live_execution,r->key,(unsigned long long)ev->execution_binding.generation,
+            ev->code==2?"unknown":"response-complete",(unsigned)ev->live_http_status,(unsigned long long)ev->live_body_bytes);
+        return 1;
+    }
+    if(((ev->kind==D2K_EV_HTTP_PORTAL && !ev->code) ||
+        (ev->kind==D2K_EV_HTTP_RESPONSE && ev->code==3)) && ev->transport==6 && ev->high_port==80) {
         static const uint8_t zero[16];
         if(!memcmp(ev->trial_id,zero,16))
             return d2k_httpsearch_bound_failure(hs,ev->name,ev->family,ev->high_ip,ev->plan_id,

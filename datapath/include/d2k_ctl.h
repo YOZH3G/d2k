@@ -149,6 +149,9 @@ static inline int d2k_ctl_binding_read(d2k_binding_context *b,const uint8_t *p,s
  * live execution can carry nonzero execution. Empty path means that the
  * failed request cannot be reproduced safely by the HTTP probe. */
 #define D2K_EV_HTTP_PORTAL 0x000B
+/* Same identity envelope, code=1 complete framing/2 unknown/3 portal;
+ * after binding: HTTP status u16, body bytes u64, request ordinal u64. */
+#define D2K_EV_HTTP_RESPONSE 0x000C
 /* Подтверждение команды: тип команды u16, признак успеха u8, код причины u8
  * (значим только при признаке успеха 0, см. D2K_ACK_*).
  *

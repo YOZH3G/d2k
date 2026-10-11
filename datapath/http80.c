@@ -1,7 +1,7 @@
 /* http80.c — вставка провайдера в открытый HTTP (задача 51), см. d2k_http80.h.
  *
  * Таблица фиксированного размера, вытеснение самого давнего. Решение
- * принимается на первом пакете ответа каждого разобранного запроса.
+ * принимает потоковый ответ каждого разобранного запроса.
  * Следующий запрос узнаётся только на известной границе TCP-потока.
  */
 #include <stdlib.h>
@@ -11,6 +11,7 @@
 #include "d2k_http80.h"
 #include "d2k_httpup.h"
 #include "d2k_packet.h"
+#include "d2k_http_response.h"
 
 enum {
     ST_FREE = 0,
@@ -34,6 +35,10 @@ typedef struct {
     uint32_t request_seq;
     int next_known;
     int request_get;
+    d2k_http_response reply;
+    uint32_t reply_next;
+    uint64_t reply_time, reply_kstamp, request_no;
+    int reply_started, reply_segments;
     d2k_binding_context binding;
     uint64_t execution_id;
     uint8_t plan_id[16], trial_id[16];
@@ -241,6 +246,28 @@ void d2k_http80_executed(d2k_http80 *h, const uint8_t *pkt, size_t len,
     memcpy(f->trial_id, trial_id, 16);
 }
 
+static void request_result(const flow *f,d2k_http80_res *r) {
+    r->family=f->family;memcpy(r->client,f->client,16);memcpy(r->server,f->server,16);
+    r->client_port=f->cport;r->server_port=f->sport;
+    r->execution_id=f->execution_id;r->binding=f->binding;r->request_ms=f->t_req/1000000u;
+    r->request_no=f->request_no;r->status=f->reply.status;r->body_bytes=f->reply.body_bytes;
+    memcpy(r->plan_id,f->plan_id,16);memcpy(r->trial_id,f->trial_id,16);
+    if(f->request_get && !strchr(f->target,'?') && !strchr(f->target,'#') && !strchr(f->target,'\\'))
+        memcpy(r->request_path,f->target,sizeof r->request_path);
+    memcpy(r->host,f->host,sizeof r->host);
+}
+
+void d2k_http80_delivered(d2k_http80 *h,const uint8_t *p,size_t n,int accepted,d2k_http80_res *r) {
+    d2k_packet_view v;
+    if(accepted || !h || !r || !d2k_packet_parse(p,n,&v) || v.protocol!=6)return;
+    const uint8_t *tcp=p+v.l4;size_t thl=(size_t)(tcp[12]>>4)*4;
+    if(d2k_packet_u16(tcp)!=80 || (v.total==v.l4+thl && !(tcp[13]&0x05)))return;
+    flow *f=find(h,v.family,v.dst.bytes,d2k_packet_u16(tcp+2),v.src.bytes,80,0);
+    if(!f || (f->state!=ST_REQUEST && r->response!=1))return;
+    f->reply.invalid=1;f->reply.complete=0;f->state=ST_DONE;
+    request_result(f,r);r->response=2;
+}
+
 void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t now,
                        uint64_t ks,
                        uint8_t *out, size_t out_cap, uint8_t *rst, size_t rst_cap,
@@ -273,6 +300,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
         if ((flags & 0x12) == 0x02) {          /* SYN без ACK: новый поток */
             if (!f) { f = make(h, v.family, client, cport, server, 80, now); }
             else { memset(f->host, 0, sizeof f->host); }
+            f->request_no=0;
             f->state = ST_SYN;
             f->t_syn = now;
             f->k_syn = ks;
@@ -299,6 +327,10 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
                 /* Client ACK gives the response sequence for this request,
                  * including a preceding response spanning many segments. */
                 if (f->state == ST_IDLE) f->server_next = ack;
+                memset(&f->reply,0,sizeof f->reply);
+                f->reply.head_only=plen>=5 && !memcmp(pay,"HEAD ",5);
+                f->reply_next=f->server_next;f->reply_started=0;f->reply_segments=0;
+                f->request_no++;
                 f->request_seq = seq;
                 f->request_get = plen >= 4 && !memcmp(pay, "GET ", 4);
                 f->execution_id = 0;
@@ -337,43 +369,47 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
         h->st.dropped++;
         return;
     }
-    if (plen == 0 || f->state != ST_REQUEST) { return; }
-
-    /* Первый ответ сервера с нагрузкой: решение принимается здесь и один раз. */
-    f->state = f->next_known ? ST_IDLE : ST_DONE;
-    uint64_t dt = now >= f->t_req ? now - f->t_req : 0;
-    uint64_t rtt = f->rtt;
-    if (f->krtt && f->k_req && ks >= f->k_req) {
-        /* Все четыре метки ядра есть: замер без задержки очереди и d2kd. */
-        rtt = f->krtt;
-        dt = ks - f->k_req;
+    if(f->state!=ST_REQUEST || (!plen && !(flags&0x05)))return;
+    /* Only a fully old retransmission is ignorable. Gaps and partial overlap
+       are unknown; never splice header/body bytes across missing TCP data. */
+    if(seq!=f->reply_next) {
+        if((int32_t)(seq-f->reply_next)<0 &&
+           (int32_t)(seq+(uint32_t)plen-f->reply_next)<=0 && !(flags&0x04)) {
+            if((flags&0x01) && seq+(uint32_t)plen==f->reply_next) {
+                pay+=plen;plen=0;seq=f->reply_next; /* FIN is new, bytes are not */
+            } else return;
+        } else f->reply.invalid=1;
     }
-    if (seq != f->server_next || ack != f->client_next || rtt == 0 || dt * 2 >= rtt ||
-        !d2k_httpup_portal_location(f->host, (const char *)pay, plen,
-                                    r->portal, sizeof r->portal)) {
-        r->portal[0] = '\0';
+    if(ack!=f->client_next || (flags&0x04))f->reply.invalid=1;
+    if(!f->reply_started && plen) {
+        f->reply_started=1;f->reply_time=now;f->reply_kstamp=ks;
+    }
+    int had_header=f->reply.header_done;
+    if(plen)f->reply_segments++;
+    d2k_http_response_feed(&f->reply,pay,plen,(flags&0x01)!=0);
+    f->reply_next=seq+(uint32_t)plen;
+    uint64_t dt=f->reply_time>=f->t_req?f->reply_time-f->t_req:0;
+    uint64_t rtt=f->rtt;
+    if(f->krtt && f->k_req && f->reply_kstamp>=f->k_req) {
+        rtt=f->krtt;dt=f->reply_kstamp-f->k_req;
+    }
+    int known_portal=!had_header && f->reply.header_done &&
+        d2k_httpup_portal_location(f->host,f->reply.head,f->reply.head_len,r->portal,sizeof r->portal);
+    int portal=known_portal && !f->reply.interim && rtt && dt<rtt/2;
+    if(known_portal && !portal) {
+        request_result(f,r);r->response=3;f->state=ST_INJECTED;return;
+    }
+    if(!portal) {
+        if(f->reply.complete || f->reply.invalid) {
+            request_result(f,r);r->response=f->reply.invalid?2:1;
+            f->state=!f->reply.invalid && f->next_known && !(flags&0x05)?ST_IDLE:ST_DONE;
+        }
         return;
     }
-    f->state = ST_INJECTED;
-    h->st.injections++;
-    r->injection = 1;
-    r->family = v.family;
-    memcpy(r->client, f->client, sizeof r->client);
-    memcpy(r->server, f->server, sizeof r->server);
-    r->client_port = f->cport;
-    r->server_port = f->sport;
-    r->rtt_ns = rtt;
-    r->reply_ns = dt;
-    r->execution_id = f->execution_id;
-    r->binding=f->binding;
-    r->request_ms = f->t_req / 1000000u;
-    memcpy(r->plan_id, f->plan_id, sizeof r->plan_id);
-    memcpy(r->trial_id, f->trial_id, sizeof r->trial_id);
-
-    if (f->request_get && !strchr(f->target, '?') && !strchr(f->target, '#') &&
-        !strchr(f->target, '\\'))
-        memcpy(r->request_path, f->target, sizeof r->request_path);
-    memcpy(r->host, f->host, sizeof r->host);
+    f->state=ST_INJECTED;h->st.injections++;
+    r->injection=1;request_result(f,r);r->rtt_ns=rtt;r->reply_ns=dt;
+    /* A prefix already accepted by the kernel cannot be replaced atomically. */
+    if(f->reply_segments!=1)return;
 
     if (!d2k_http80_https(h, f->host, now)) { return; }
     char redirect[D2K_HTTP80_TARGET_MAX + 512];

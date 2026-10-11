@@ -125,8 +125,9 @@ static int identity_portal(d2k_ctl *ctl,d2k_httpsearch *hs,const d2k_result *exe
     if(variant==1)portal.binding.epoch[0]^=1;
     if(variant==2)memset(&portal.binding,0,sizeof portal.binding);
     if(variant==3)portal.trial_id[0]=1;
+    if(variant>=4) {portal.response=variant-3;portal.status=variant==6?302:200;portal.body_bytes=24576;portal.request_no=2;}
     d2k_ctlsrv_http80_event(ctl,&portal);d2k_ctl_flush(ctl);
-    CHECK(!d2k_link_next(identity_peer,&ev,100,err,sizeof err)&&ev.kind==D2K_EV_HTTP_PORTAL,"production HTTP event encoder/decoder");
+    CHECK(!d2k_link_next(identity_peer,&ev,100,err,sizeof err)&&ev.kind==(variant>=4?D2K_EV_HTTP_RESPONSE:D2K_EV_HTTP_PORTAL),"production HTTP event encoder/decoder");
     CHECK(ev.live_execution==portal.execution_id &&
           !memcmp(ev.execution_binding.epoch,portal.binding.epoch,16),"request snapshot survives socket");
     return d2k_httpsearch_control(hs,&ev,(int64_t)portal.request_ms+1);
@@ -155,6 +156,9 @@ static void live_identity(d2k_ctl *ctl,d2k_ctlsrv *cx,int peer,int family,const 
           "datapath atomically preserves replacement from stale delete");
     live_flow(cx->sess,family,53011,live_host,1,0,NULL);
     d2k_result current=last_live_execution;
+    CHECK(identity_portal(ctl,hs,&current,family,4)==1 && !f.del_plan_n,"owned complete live response is reported without remeasurement");
+    CHECK(identity_portal(ctl,hs,&current,family,5)==1 && !f.del_plan_n,"unknown observation never revokes working plan");
+    CHECK(!identity_portal(ctl,hs,&old,family,4),"old complete response cannot validate replacement");
     CHECK(!identity_portal(ctl,hs,&current,family,1),"foreign table epoch cannot revoke");
     CHECK(!identity_portal(ctl,hs,&current,family,2),"unknown binding cannot revoke");
     CHECK(!identity_portal(ctl,hs,&current,family,3),"probe cannot revoke permanent binding");

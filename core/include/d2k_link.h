@@ -161,6 +161,8 @@ typedef struct {
     d2k_binding_context execution_binding; /* table epoch + generation; not application proof */
     uint64_t live_execution; /* HTTP_PORTAL: completed request execution, 0 = unbound */
     uint64_t live_request_ms; /* monotonic start on the same host as controller */
+    uint16_t live_http_status;
+    uint64_t live_body_bytes, live_request_no;
     char live_http_path[1024]; /* replayable GET path; never cookies/query credentials */
     /* SUSPECT: чем подозрительный пакет отличался от остальных в этом же
      * потоке. Из этих байт складывается ОТПЕЧАТОК коробки, и без них каталог

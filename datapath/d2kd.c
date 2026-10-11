@@ -654,7 +654,7 @@ static int http80_io_rst(void *c, const uint8_t *p, size_t n) {
    отправлен), 0 — дальше обычным путём. Заменять и снимать — только в
    режиме apply с сырым сокетом: в наблюдении трафик не трогается. */
 static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
-                       const uint8_t *p, size_t n, uint64_t t, uint64_t kstamp) {
+                       const uint8_t *p, size_t n, uint64_t t, uint64_t kstamp, d2k_http80_res *observation) {
     if (!http80) { return 0; }
     static uint8_t out[D2K_HTTP80_TARGET_MAX + 1024];
     static uint8_t rst[128];
@@ -662,6 +662,7 @@ static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
     d2k_http80_res r;
     d2k_http80_packet(http80, p, n, t, kstamp, raw ? out : NULL, raw ? sizeof out : 0,
                       rst, sizeof rst, &r);
+    *observation=r;
     /* Событие — после исхода замены (ревью N1): признак «307 ушёл» в нём
        верный, и контроллер не повторяет SET_HTTPS зря. */
     if (r.injection && (r.action != D2K_HTTP80_REPLACE || !raw)) { d2k_ctlsrv_http80_event(ctl, &r); }
@@ -1458,11 +1459,12 @@ int main(int argc, char **argv) {
                        их вставку не заменяем и о ней не сообщаем, иначе
                        собственный замер HTTP (шаг 4) мерил бы нашу же
                        замену. */
+                    d2k_http80_res http_observation={0};
                     if (np.have_payload && !np.truncated &&
                         !(probe_mark && np.have_mark && np.mark == probe_mark) &&
                         http80_step(q, mode == MODE_APPLY ? raw : NULL, ctl, np.id,
                                     np.payload, np.payload_len, t,
-                                    np.have_tstamp ? np.tstamp_ns : 0)) {
+                                    np.have_tstamp ? np.tstamp_ns : 0, &http_observation)) {
                         continue;
                     }
 
@@ -1945,6 +1947,13 @@ int main(int argc, char **argv) {
                         }
                     } else if (!delayed_originals && res.applied && mode == MODE_APPLY) {
                         d2k_session_sent(sess, t, &res.key, res.execution_id);
+                    }
+                    if(!controller_probe && np.have_payload && !np.truncated) {
+                        d2k_http80_delivered(http80,np.payload,np.payload_len,
+                            !original_failed && !delayed_originals && verdict==D2K_NF_ACCEPT,
+                            &http_observation);
+                        if(http_observation.response && http_observation.execution_id)
+                            d2k_ctlsrv_http80_event(ctl,&http_observation);
                     }
                     /* One live-request result after the actual raw sends and
                        NFQUEUE verdict. PREPARED alone is never success. */

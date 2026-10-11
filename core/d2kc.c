@@ -662,6 +662,9 @@ int main(int argc, char **argv) {
                     case D2K_EV_EXCHANGE: seen_exchange++; break;
                     case D2K_EV_APPLIED:  seen_applied++; break;
                     case D2K_EV_REFUSED:  seen_refused++; break;
+                    case D2K_EV_HTTP_RESPONSE:
+                        (void)d2k_httpsearch_control(g_hs,&ev,now_ms());
+                        break;
                     case D2K_EV_HTTP_PORTAL:
                         (void)d2k_httpsearch_control(g_hs,&ev,now_ms());
                         if (hp) { http_portal(hp, fd, &ev, now_ms()); }

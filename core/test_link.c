@@ -302,6 +302,20 @@ int main(void) {
         CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == 0 &&
               ev.plan_id[0] == 0x42 && ev.live_execution == 72 && ev.live_request_ms == 99 && !strcmp(ev.live_http_path, "/False/"),
               "HTTP portal lost exact executed plan identity");
+        uint8_t response[sizeof bound+D2K_CTL_BINDING_LEN+18]={0};
+        memcpy(response,bound,sizeof bound);response[0]=1;
+        uint8_t *meta=response+sizeof bound;
+        meta[7]=9;meta[8]=D2K_BIND_NAME;meta[9]=4;meta[10]=D2K_PLAN_SHAPE_HTTP;meta[12]=7;
+        meta+=D2K_CTL_BINDING_LEN;meta[1]=200;meta[8]=1;meta[9]=2;meta[17]=2;
+        send_synthetic(sv[0],D2K_EV_HTTP_RESPONSE,response,sizeof response);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.kind==D2K_EV_HTTP_RESPONSE &&
+              ev.code==1 && ev.live_http_status==200 && ev.live_body_bytes==258 && ev.live_request_no==2 &&
+              ev.execution_binding.generation==9 && ev.execution_binding.epoch[0]==7 && ev.live_execution==72,
+              "complete live response keeps framing and binding over control socket");
+        for(size_t k=sizeof bound;k<sizeof response;k++) {
+            send_synthetic(sv[0],D2K_EV_HTTP_RESPONSE,response,k);
+            CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)==-1,"truncated live response evidence accepted");
+        }
         const uint8_t cut[] = {0, 13, 'r','u'};
         send_synthetic(sv[0], D2K_EV_HTTP_PORTAL, cut, sizeof cut);
         CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == -1,

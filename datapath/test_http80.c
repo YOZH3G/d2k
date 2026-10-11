@@ -11,6 +11,7 @@
 #include "d2k_http80.h"
 #include "d2k_wire.h"
 #include "d2k_httpup.h"
+#include "d2k_http_response.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -426,9 +427,147 @@ static void test_https_table(void) {
 
 /* Field h: a complete first response does not cover the next request.
  * Retransmission and a request-looking body must not create another request. */
+/* A portal header may span TCP packets. The first fragment already went
+ * to the client, so a late recognition must report, never inject a new 307. */
+static void test_response_framing(void) {
+    const char *bad[]={
+      "HTTP/1.1 200 OK\r\nX: x\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
+      "HTTP/1.1 200 O\rK\r\nContent-Length: 0\r\n\r\n",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;foo=\"unterminated\r\nx\r\n0\r\n\r\n",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n:\r\n\r\n",
+      "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n",
+      "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n",
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000000\r\n"};
+    for(size_t j=0;j<sizeof bad/sizeof *bad;j++) {
+        d2k_http_response x={0};
+        for(size_t k=0;k<strlen(bad[j]);k++)d2k_http_response_feed(&x,(const uint8_t *)bad[j]+k,1,0);
+        d2k_http_response_feed(&x,NULL,0,1);
+        CHECK(x.invalid && !x.complete,"malformed/partial framing never gives complete");
+    }
+    const char *good="HTTP/1.1 103 Early Hints\r\nLink: /x\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;foo=\"bar\"\r\nx\r\n0\r\nX-Trailer: yes\r\n\r\n";
+    d2k_http_response x={0};
+    for(size_t k=0;k<strlen(good);k++)d2k_http_response_feed(&x,(const uint8_t *)good+k,1,0);
+    CHECK(x.complete && !x.invalid && x.status==200 && x.body_bytes==1,"interim and split chunk framing");
+}
+
+static void test_response_completion(void) {
+    const char *heads[]={
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"};
+    for(int v6=0;v6<2;v6++) for(int mode=0;mode<3;mode++) {
+        d2k_http80 *h=d2k_http80_new();flow f=v6?flow6(52200):flow4(52200);
+        uint64_t t=9000*MS;open_flow(h,&f,t,GET);
+        uint8_t plan[16]={8},trial[16]={0};
+        d2k_binding_context binding={.generation=9,.kind=D2K_BIND_NAME,
+            .family=(uint8_t)(v6?6:4),.shape=D2K_PLAN_SHAPE_HTTP,.epoch={7}};
+        d2k_http80_executed(h,b,(v6?60:40)+strlen(GET),t+99*MS,81,plan,trial,&binding);
+        uint32_t seq=SISN+1,ack=CISN+1+(uint32_t)strlen(GET);
+        size_t n=pkt(&f,0,F_ACK|F_PSH,seq,ack,heads[mode],b);
+        PKT(h,b,n,t+197*MS,&r);seq+=(uint32_t)strlen(heads[mode]);
+        CHECK(!r.response,"headers alone cannot complete a live body");
+        const char *part=mode==1?"4\r\nab":"ab";
+        n=pkt(&f,0,F_ACK|F_PSH,seq,ack,part,b);
+        PKT(h,b,n,t+198*MS,&r);seq+=(uint32_t)strlen(part);
+        CHECK(!r.response,"partial live body remains pending");
+        PKT(h,b,n,t+199*MS,&r);
+        CHECK(!r.response,"duplicate body does not complete or double count");
+        part=mode==1?"cd\r\n0\r\nX-Trailer: yes\r\n\r\n":"cd";
+        n=pkt(&f,0,F_ACK|F_PSH|(mode==2?F_FIN:0),seq,ack,part,b);
+        PKT(h,b,n,t+200*MS,&r);
+        CHECK(r.response==1 && r.status==200 && r.body_bytes==4,"complete framing of live response");
+        CHECK(r.request_no==1 && r.execution_id==81 && d2k_binding_equal(&r.binding,&binding),
+              "complete response retains its actual request execution");
+        PKT(h,b,n,t+201*MS,&r);
+        CHECK(!r.response,"completion emitted exactly once");
+        d2k_http80_free(h);
+    }
+}
+
+static void test_response_delivery(void) {
+    for(int v6=0;v6<2;v6++) for(int early=0;early<2;early++) {
+        d2k_http80 *h=d2k_http80_new();flow f=v6?flow6(52300):flow4(52300);
+        uint64_t t=10000*MS;open_flow(h,&f,t,GET);
+        const char *head="HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
+        uint32_t ack=CISN+1+(uint32_t)strlen(GET);
+        size_t n=pkt(&f,0,F_ACK|F_PSH,SISN+1,ack,head,b);
+        PKT(h,b,n,t+197*MS,&r);d2k_http80_delivered(h,b,n,!early,&r);
+        if(early)CHECK(r.response==2,"failed header delivery makes live result unknown");
+        n=pkt(&f,0,F_ACK|F_PSH,SISN+1+(uint32_t)strlen(head),ack,"ok",b);
+        PKT(h,b,n,t+198*MS,&r);d2k_http80_delivered(h,b,n,early,&r);
+        CHECK(r.response!=1,"no complete witness after failed delivery anywhere in response");
+        d2k_http80_free(h);
+    }
+}
+
+static void test_retransmitted_fin(void) {
+    d2k_http80 *h=d2k_http80_new();flow f=flow4(52440);uint64_t t=12000*MS;
+    open_flow(h,&f,t,GET);
+    const char *msg="HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nok";
+    uint32_t ack=CISN+1+(uint32_t)strlen(GET);
+    size_t n=pkt(&f,0,F_ACK|F_PSH,SISN+1,ack,msg,b);PKT(h,b,n,t+197*MS,&r);
+    CHECK(!r.response,"close framing waits for FIN");
+    n=pkt(&f,0,F_ACK|F_PSH|F_FIN,SISN+1,ack,msg,b);PKT(h,b,n,t+198*MS,&r);
+    CHECK(r.response==1 && r.body_bytes==2,"new FIN on repeated bytes completes once without counting bytes twice");
+    d2k_http80_free(h);
+}
+
+static void test_response_gap(void) {
+    for(int mode=0;mode<4;mode++) {
+        d2k_http80 *h=d2k_http80_new();flow f=flow4(52450);uint64_t t=12000*MS;
+        open_flow(h,&f,t,GET);
+        const char *head="HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
+        uint32_t ack=CISN+1+(uint32_t)strlen(GET),seq=SISN+1;
+        size_t n=pkt(&f,0,F_ACK|F_PSH,seq,ack,head,b);PKT(h,b,n,t+197*MS,&r);
+        seq+=(uint32_t)strlen(head);
+        n=pkt(&f,0,F_ACK|(mode==2?F_RST:mode==3?F_FIN:F_PSH),
+            mode==0?seq+1:mode==1?seq-1:seq,ack,mode>=2?NULL:"cd",b);
+        PKT(h,b,n,t+198*MS,&r);
+        CHECK(r.response==2,"gap overlap reset or premature FIN is unknown, not complete");
+        n=pkt(&f,1,F_ACK|F_PSH,ack,seq+10,GET,b);PKT(h,b,n,t+199*MS,&r);
+        n=pkt(&f,0,F_ACK|F_PSH,seq+10,ack+(uint32_t)strlen(GET),
+              "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",b);
+        PKT(h,b,n,t+200*MS,&r);
+        CHECK(r.response!=1,"unknown response boundary cannot be reset by client ACK into a new proof");
+        d2k_http80_free(h);
+    }
+}
+
+static void test_late_portal_not_complete(void) {
+    d2k_http80 *h=d2k_http80_new();flow f=flow4(52400);uint64_t t=12000*MS;
+    open_flow(h,&f,t,GET);
+    const char *portal="HTTP/1.1 302 Found\r\nLocation: http://lawfilter.ertelecom.ru/\r\nContent-Length: 0\r\n\r\n";
+    size_t n=pkt(&f,0,F_ACK|F_PSH,SISN+1,CISN+1+(uint32_t)strlen(GET),portal,b);
+    PKT(h,b,n,t+250*MS,&r);
+    CHECK(!r.injection && r.response==3,"late portal violates class criterion without timing proof of injection");
+    d2k_http80_free(h);
+}
+
+static void test_split_portal(void) {
+    for(int v6=0;v6<2;v6++) {
+        d2k_http80 *h=d2k_http80_new();flow f=v6?flow6(52100):flow4(52100);
+        uint64_t t=8000*MS;open_flow(h,&f,t,GET);
+        CHECK(!d2k_http80_set_https(h,"rutracker.org",12,t+10000*MS),"split portal HTTPS fixture");
+        const size_t cut=40;char first[64];memcpy(first,INJECT,cut);first[cut]=0;
+        size_t n=pkt(&f,0,F_ACK|F_PSH,SISN+1,CISN+1+(uint32_t)strlen(GET),first,b);
+        PKT(h,b,n,t+99*MS+700000,&r);
+        CHECK(!r.injection,"incomplete portal header is not yet evidence");
+        n=pkt(&f,0,F_ACK|F_PSH,SISN+1+(uint32_t)cut,CISN+1+(uint32_t)strlen(GET),INJECT+cut,b);
+        PKT(h,b,n,t+160*MS,&r);
+        CHECK(r.injection,"split Location portal remains observable");
+        CHECK(r.action==D2K_HTTP80_PASS,"already delivered prefix cannot be replaced by 307");
+        PKT(h,b,n,t+161*MS,&r);
+        CHECK(!r.injection,"split portal retransmission is not new evidence");
+        d2k_http80_free(h);
+    }
+}
+
 static void test_keepalive_later(void) {
     for (int v6 = 0; v6 < 2; v6++) {
     for (int bound = 0; bound < 2; bound++) {
+    for (int large = 0; large < 2; large++) {
     d2k_http80 *h = d2k_http80_new();
     const uint64_t T = 7000 * MS;
     flow f = v6 ? flow6(52000) : flow4(52000);
@@ -439,10 +578,23 @@ static void test_keepalive_later(void) {
         .family=(uint8_t)(v6?6:4),.shape=D2K_PLAN_SHAPE_HTTP,.epoch={0x81}};
     d2k_http80_executed(h, b, (v6 ? 60 : 40) + strlen(GET), T + 99 * MS, 71, plan, trial, &binding);
     static const char OK200[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-    size_t n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, req_end, OK200, b);
+    const char *first=large?"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6000\r\n":OK200;
+    size_t n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, req_end, first, b);
     PKT(h, b, n, T + 197 * MS, &r);
     CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "real first response is neutral");
-    uint32_t s2 = SISN + 1 + (uint32_t)strlen(OK200);
+    uint32_t s2 = SISN + 1 + (uint32_t)strlen(first);
+    if(large) {
+        char body[1537];memset(body,'x',1536);body[1536]=0;
+        CHECK(!r.response,"24 KiB chunk response cannot complete on headers");
+        for(unsigned i=0;i<16;i++) {
+            n=pkt(&f,0,F_ACK|(i%2?F_PSH:0),s2,req_end,body,b);
+            PKT(h,b,n,T+(198+i)*MS,&r);s2+=1536;
+            CHECK(!r.response,"24 KiB body waits for terminating chunk including non-PSH segments");
+        }
+        n=pkt(&f,0,F_ACK|F_PSH,s2,req_end,"\r\n0\r\n\r\n",b);
+        PKT(h,b,n,T+220*MS,&r);s2+=7;
+        CHECK(r.response==1 && r.body_bytes==24576 && r.execution_id==71,"field-shaped 24 KiB first response completes its own execution");
+    }
     /* Old request retransmission must not disable observation of the next. */
     n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
     PKT(h, b, n, T + 250 * MS, &r);
@@ -472,6 +624,7 @@ static void test_keepalive_later(void) {
     CHECK(st.requests == 2 && st.injections == 1 && st.answered == 0 && st.dropped == 0,
           "both requests and exactly one portal must be counted");
     d2k_http80_free(h);
+    }
     }
     }
 }
@@ -527,6 +680,13 @@ int main(void) {
     test_swap_failure();
     test_kernel_clock();
     test_keepalive_later();
+    test_split_portal();
+    test_response_completion();
+    test_response_framing();
+    test_response_delivery();
+    test_late_portal_not_complete();
+    test_response_gap();
+    test_retransmitted_fin();
     test_unseen_counted();
     if (fails) {
         printf("test_http80: провалов %d\n", fails);
