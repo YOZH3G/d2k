@@ -132,6 +132,7 @@ static void test_disorder_pos2_emits_exact_reverse_segments(void)
 /* raw_dial harness: sockets are /dev/null descriptors (no root, no
  * network); the receive socket answers our own SYN with a SYN-ACK. */
 static int dial_recv_fd = -1;
+static int dial_silent, payload_recv_error;
 static int mock_family = AF_INET;
 static int peer_timestamps = 1;
 static int raw_test_socket(int domain, int type, int proto)
@@ -179,6 +180,9 @@ ssize_t raw_test_recvfrom(int fd, void *buf, size_t len, int flags,
 {
     (void)flags;
     if (fd >= 0 && fd == dial_recv_fd) {
+        if (dial_silent || (payload_recv_error && outgoing_count >= 3)) {
+            errno = dial_silent ? dial_silent : EIO; return -1;
+        }
         d2k_poison none = {0};
         const uint8_t *syn = outgoing[0];
         size_t n;
@@ -882,6 +886,40 @@ static void test_plan_rejection_has_error(void) {
     CHECK(err[0] && strcmp(err, "sentinel"));
 }
 
+/* A handshake timeout is distinguishable from a local runtime failure and
+ * must escape both public entry points without sending any trigger. */
+static void test_connect_timeout_is_not_a_trigger_result(void) {
+    d2k_trigger tr = {0}; d2k_poison poison = {0};
+    tr.payload[0] = 1; tr.payload[1] = 2; tr.len = 2;
+    poison.split_pos = 1;
+    d2k_raw_rule_hook = test_rule_hook;
+    rule_rc = 0; dial_silent = EAGAIN;
+    for (int family = 4; family <= 6; family += 2) {
+        uint8_t ip[16] = {198, 51, 100, 1}; char err[160] = "";
+        if (family == 6) { memset(ip, 0, sizeof ip); ip[0] = 0x20; ip[1] = 1; ip[15] = 1; }
+        outgoing_count = 0; dial_recv_fd = -1;
+        CHECK(d2k_raw_probe_handshake_family(ip, (uint8_t)family, 443, 1, 0x2d,
+              NULL, err, sizeof err) == -2);
+        CHECK(outgoing_count == 1);
+        outgoing_count = 0; dial_recv_fd = -1;
+        CHECK(d2k_raw_probe_poison_family(ip, (uint8_t)family, 443, &tr, &poison,
+              1, 0x2d, NULL, err, sizeof err) == -2);
+        CHECK(outgoing_count == 1);
+        dial_silent = EIO;
+        outgoing_count = 0; dial_recv_fd = -1;
+        CHECK(d2k_raw_probe_poison_family(ip, (uint8_t)family, 443, &tr, &poison,
+              1, 0x2d, NULL, err, sizeof err) == -1);
+        CHECK(outgoing_count == 1);
+        dial_silent = 0; payload_recv_error = 1; strcpy(poison.name, "none");
+        outgoing_count = 0; dial_recv_fd = -1;
+        CHECK(d2k_raw_probe_poison_family(ip, (uint8_t)family, 443, &tr, &poison,
+              5, 0x2d, NULL, err, sizeof err) == -1);
+        CHECK(outgoing_count >= 3);
+        payload_recv_error = 0; dial_silent = EAGAIN;
+    }
+    dial_silent = 0;
+}
+
 int main(void)
 {
     {
@@ -940,6 +978,7 @@ int main(void)
         peer_timestamps = 1;
         printf("runtime equality: family C + %d catalog hypotheses, 6 lengths, IPv4/IPv6, complete packets and delays\n", count - 1);
     }
+    test_connect_timeout_is_not_a_trigger_result();
     test_plan_rejection_has_error();
     test_concurrent_ports_are_unique();
     test_checksum_matches_original();

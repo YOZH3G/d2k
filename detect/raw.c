@@ -870,7 +870,8 @@ static int raw_send_syn(raw_conn *c)
     return raw_sendto(c, pkt, n);
 }
 
-/* recv возвращает следующий сегмент ОТ НАШЕГО пира. */
+/* recv returns our peer's segment, a wait/deadline, or a local error. */
+enum { RAW_RECV_WAIT = -1, RAW_RECV_ERROR = -2 };
 static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
                     const uint8_t **payload, size_t *plen,
                     int64_t deadline, const d2k_detect_stop *cancel)
@@ -889,7 +890,8 @@ static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
         const uint8_t *t;
         size_t tlen;
         if (n < 0) {
-            return -1;
+            return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
+                ? RAW_RECV_WAIT : RAW_RECV_ERROR;
         }
         if (c->family == 6) {
             /* Linux IPv6 raw TCP receives the transport segment, without IP header. */
@@ -934,9 +936,9 @@ static int raw_read_payload(raw_conn *c, int timeout_ms, const d2k_detect_stop *
         uint32_t seq, ack;
         const uint8_t *pay;
         size_t plen;
-        if (raw_recv(c, &flags, &seq, &ack, &pay, &plen, deadline, cancel) != 0) {
-            continue;
-        }
+        int received = raw_recv(c, &flags, &seq, &ack, &pay, &plen, deadline, cancel);
+        if (received == RAW_RECV_ERROR) return RAW_RECV_ERROR;
+        if (received != 0) continue;
         if (flags & TCP_RST) {
             return -1; /* RST */
         }
@@ -989,9 +991,12 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
             snprintf(err, errcap, "context canceled");
             return -1;
         }
-        if (raw_recv(c, &flags, &seq, &ack, &pay, &plen, deadline, cancel) != 0) {
-            continue;
+        int received = raw_recv(c, &flags, &seq, &ack, &pay, &plen, deadline, cancel);
+        if (received == RAW_RECV_ERROR) {
+            snprintf(err, errcap, "classify: recvfrom: %s", strerror(errno));
+            return -1;
         }
+        if (received != 0) continue;
         if (flags & TCP_RST) {
             snprintf(err, errcap, "classify: сервер ответил RST на SYN");
             return -1;
@@ -1027,7 +1032,7 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
         }
     }
     snprintf(err, errcap, "classify: SYN-ACK не пришёл");
-    return -1;
+    return D2K_RAW_CONNECT_TIMEOUT;
 }
 
 /* dialRaw поднимает соединение своими руками и возвращает его установленным. */
@@ -1112,9 +1117,10 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
     t_raw_dials++;
     c->rule_up = suppress_kernel_rst(c);
 
-    if (raw_handshake(c, timeout_ms, cancel, err, errcap) != 0) {
+    int rc = raw_handshake(c, timeout_ms, cancel, err, errcap);
+    if (rc != 0) {
         raw_close(c);
-        return -1;
+        return rc;
     }
     return 0;
 }
@@ -1129,9 +1135,8 @@ int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t 
                             char *err, size_t errcap)
 {
     raw_conn c;
-    if (raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap) != 0) {
-        return -1;
-    }
+    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap);
+    if (dial_rc != 0) return dial_rc;
     raw_close(&c);
     return 1;
 }
@@ -1219,9 +1224,8 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
     size_t resp_len = 0;
     int rc = 0;
 
-    if (raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap) != 0) {
-        return -1;
-    }
+    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap);
+    if (dial_rc != 0) return dial_rc;
     resp = c.buffers->resp;
 
     /* Direct control and SYN-data have no bypass Plan. All expressible
@@ -1244,11 +1248,12 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
     c.seq += (uint32_t)tr->len;
 
 receive:
-    if (raw_read_payload(&c, timeout_ms, cancel, resp, sizeof(c.buffers->resp),
-                         &resp_len) != 0) {
-        raw_close(&c);
-        return 0;
+    rc = raw_read_payload(&c, timeout_ms, cancel, resp, sizeof(c.buffers->resp), &resp_len);
+    if (rc == RAW_RECV_ERROR) {
+        snprintf(err, errcap, "classify: recvfrom: %s", strerror(errno));
+        raw_close(&c); return -1;
     }
+    if (rc != 0) { raw_close(&c); return 0; }
     rc = d2k_trigger_accepts(tr, resp, resp_len);
     raw_close(&c);
     return rc;

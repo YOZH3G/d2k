@@ -287,12 +287,13 @@ int d2k_split_offsets(const int *cuts, int ncuts, int n, d2k_span *out, int cap)
 /* Соединение для сокетных зондов. Та же метка, что и на сырых: сокетные зонды
  * (целиком, разрез, контроль) обязаны идти мимо десинка ровно так же, иначе
  * половина дерева меряет одно, половина другое. */
-static int dial_marked(const char *host, const char *port, int timeout_ms,
-                       uint32_t mark, char *err, size_t errcap)
+static int dial_marked_mode(const char *host, const char *port, int timeout_ms,
+                       uint32_t mark, char *err, size_t errcap, int require_mark)
 {
     struct addrinfo hints, *ai = NULL, *p;
     int fd = -1, rc;
 
+    if (errcap) err[0] = '\0';
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = strchr(host, ':') ? AF_INET6 : AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -313,7 +314,11 @@ static int dial_marked(const char *host, const char *port, int timeout_ms,
         if (fd < 0) {
             continue;
         }
-        (void)setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+        int marked = setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+        if (require_mark && mark && marked != 0) {
+            snprintf(err, errcap, "transport control: SO_MARK: %s", strerror(errno));
+            close(fd); freeaddrinfo(ai); return -1;
+        }
         /* Без этого ядро склеит наши записи в один сегмент, и весь замер
          * превратится в измерение самого себя. */
         (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -356,11 +361,18 @@ static int dial_marked(const char *host, const char *port, int timeout_ms,
     return -1;
 }
 
-/* once — одно соединение: пишем триггер по кускам, ждём ответ.
- * Возврат: 1 прошло, 0 не прошло, -1 ошибка зонда. */
+static int dial_marked(const char *host, const char *port, int timeout_ms,
+                       uint32_t mark, char *err, size_t errcap)
+{
+    return dial_marked_mode(host, port, timeout_ms, mark, err, errcap, 0);
+}
+
+/* One connection: write the trigger, then wait for its reply. A raw connect
+ * timeout additionally returns the actual numeric peer, before any trigger
+ * was sent, so transport recovery cannot switch to a new DNS answer. */
 static int once_probe(const char *host, const char *port, const d2k_trigger *tr,
                       const d2k_opts *opt, const int *cuts, int ncuts, int gap_ms,
-                      char *err, size_t errcap)
+                      char *err, size_t errcap, char *raw_peer, size_t peer_cap)
 {
     d2k_span sp[8];
     int nsp, i, fd;
@@ -395,6 +407,10 @@ static int once_probe(const char *host, const char *port, const d2k_trigger *tr,
             else
                 memcpy(ip, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, 4);
             freeaddrinfo(ai);
+        }
+        if (!inet_ntop(family == 6 ? AF_INET6 : AF_INET, ip, raw_peer, (socklen_t)peer_cap)) {
+            snprintf(err, errcap, "split runtime: peer address: %s", strerror(errno));
+            return -1;
         }
         d2k_poison split = {0};
         snprintf(split.name, sizeof split.name, "tcp-split");
@@ -616,8 +632,49 @@ static d2k_tally measure(const char *host, const char *port, const d2k_trigger *
         if (d2k_detect_stopped(&opt->cancel)) {
             break;
         }
-        rc = once_probe(host, port, tr, opt, cuts, ncuts, gap_ms, err, sizeof(err));
+        char raw_peer[INET6_ADDRSTRLEN] = "";
+        rc = once_probe(host, port, tr, opt, cuts, ncuts, gap_ms, err, sizeof(err),
+                        raw_peer, sizeof raw_peer);
         res->probes++;
+        if (rc == D2K_RAW_CONNECT_TIMEOUT) {
+            /* The trigger was never sent: this is not one of its repeats.
+             * Compare a fresh kernel TCP handshake, then retry this unsent
+             * trial once. A second raw failure leaves the question unknown;
+             * never retry a negative reply after sending the trigger. */
+            d2k_obs *transport = d2k_trace_add(res, "transport:raw-connect");
+            transport->fail = 1;
+            snprintf(transport->err, sizeof transport->err, "%s", err);
+            obs_done(opt, transport);
+            if (!d2k_detect_stopped(&opt->cancel)) {
+                d2k_obs *control = d2k_trace_add(res, "transport:tcp-control");
+                int fd = dial_marked_mode(raw_peer, port, opt->timeout_ms, opt->mark,
+                                          err, sizeof err, 1);
+                res->probes++;
+                if (fd >= 0) { control->pass = 1; close(fd); }
+                else {
+                    control->fail = 1;
+                    snprintf(control->err, sizeof control->err, "%s", err);
+                }
+                obs_done(opt, control);
+                if (fd >= 0 && !d2k_detect_stopped(&opt->cancel)) {
+                    rc = once_probe(raw_peer, port, tr, opt, cuts, ncuts, gap_ms, err, sizeof err,
+                                    raw_peer, sizeof raw_peer);
+                    res->probes++;
+                    if (rc == D2K_RAW_CONNECT_TIMEOUT) {
+                        transport = d2k_trace_add(res, "transport:raw-connect-retry");
+                        transport->fail = 1;
+                        snprintf(transport->err, sizeof transport->err, "%s", err);
+                        obs_done(opt, transport);
+                    }
+                }
+            }
+            if (rc == D2K_RAW_CONNECT_TIMEOUT) {
+                t.has_err = 1;
+                snprintf(t.err, sizeof t.err, "%s", err);
+                snprintf(obs->err, sizeof obs->err, "%s", err);
+                break;
+            }
+        }
         if (rc < 0) {
             t.fail++;
             if (!t.has_err) {

@@ -9,6 +9,14 @@
  * (те же сценарии, те же ответы, все повторы). Совпадение подписи значит, что
  * вердикт, путь, находка, стратегия и вектор свойств не изменились; меняется
  * только число зондов. */
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE 1
+#include <sys/socket.h>
+#include <netdb.h>
+static int transport_getaddrinfo(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+static int transport_setsockopt(int, int, int, const void *, socklen_t);
+#define getaddrinfo transport_getaddrinfo
+#define setsockopt transport_setsockopt
 #define d2k_raw_probe_handshake_family fake_handshake
 #define d2k_raw_probe_poison_family    fake_poison
 #define d2k_raw_supported              fake_raw_supported
@@ -18,6 +26,24 @@
 #define D2K_DATA_ACK_PROBE             fake_data_ack
 #include "classify.c"
 #include "props.c"
+#undef getaddrinfo
+#undef setsockopt
+static int transport_dns_calls, transport_fail_mark;
+static int transport_getaddrinfo(const char *host, const char *port,
+                                const struct addrinfo *hints, struct addrinfo **ai) {
+    if (!strcmp(host, "transport-switch.test"))
+        host = transport_dns_calls++ == 0 ? "127.0.0.2" : "127.0.0.1";
+    return getaddrinfo(host, port, hints, ai);
+}
+static int transport_setsockopt(int fd, int level, int name, const void *value, socklen_t len) {
+    /* Loopback tests model the Linux-only bypass mark; no host routing rule
+     * or privilege is required. Other socket operations remain real. */
+    if (level == SOL_SOCKET && name == SO_MARK) {
+        if (transport_fail_mark) { errno = EPERM; return -1; }
+        return 0;
+    }
+    return setsockopt(fd, level, name, value, len);
+}
 
 #include <pthread.h>
 
@@ -43,6 +69,7 @@ static int g_ask = -1, g_rep;     /* текущий вопрос сырого с
 static int g_hs_calls;
 static int g_poison_calls;
 static int g_split_success, g_split_calls, g_split_gaps;
+static int g_split_connect_failures, g_split_response_failures;
 
 static int pat_rc(const char *pat, int idx)
 {
@@ -83,6 +110,12 @@ int fake_poison(const uint8_t *ip, uint8_t family, uint16_t port, const d2k_trig
     (void)ip; (void)family; (void)port; (void)tr; (void)timeout_ms; (void)mark; (void)cancel;
     if (!strcmp(p->name, "tcp-split")) {
         g_split_calls++;
+        if (g_split_connect_failures > 0) {
+            g_split_connect_failures--;
+            snprintf(err, errcap, "raw connect timeout");
+            return -2;
+        }
+        if (g_split_response_failures > 0) { g_split_response_failures--; return 0; }
         if (p->gap_ms == 2) g_split_gaps |= 1;
         if (p->gap_ms == 10) g_split_gaps |= 2;
         if (g_split_success < 0) snprintf(err, errcap, "raw split: local send failure");
@@ -797,11 +830,95 @@ static void test_split_uses_runtime(void) {
     g_split_success = 0;
 }
 
+static const char *transport_cancel_at;
+static int transport_cancelled;
+static int transport_is_cancelled(void *ctx) { (void)ctx; return transport_cancelled; }
+static void transport_progress(void *ctx, const d2k_obs *o) {
+    *(int *)ctx += o->pass + o->fail;
+    if (transport_cancel_at && !strcmp(o->probe, transport_cancel_at)) transport_cancelled = 1;
+}
+
+static void test_split_recovers_only_unsent_transport_failure(void) {
+    d2k_opts opt = {0}; d2k_trigger tr = {0}; d2k_result r = {0};
+    int cut = 1, units = 0; const char *port = strrchr(g_addr, ':') + 1;
+    opt.on_obs = transport_progress; opt.on_obs_ctx = &units;
+    opt.repeats = 3; opt.timeout_ms = 100; opt.mark = 0;
+    memcpy(tr.payload, PAY, sizeof PAY - 1); tr.len = sizeof PAY - 1;
+    g_split_success = 1; g_split_calls = 0; g_split_connect_failures = 1;
+    d2k_tally tally = measure("127.0.0.1", port, &tr, &opt, "split", &cut, 1, 0, &r, 0);
+    CHECK(!tally.has_err && tally.pass == 3 && tally.fail == 0,
+          "an unsent split prevents three actual successful trials");
+    CHECK(r.probes == 5 && g_split_calls == 4 && units == 5,
+          "missing raw attempt / fresh TCP control / retry accounting: %d", r.probes);
+
+    memset(&r, 0, sizeof r); g_split_calls = 0; g_split_connect_failures = 10;
+    tally = measure("127.0.0.1", port, &tr, &opt, "split", &cut, 1, 0, &r, 0);
+    CHECK(tally.has_err && tally.pass == 0 && g_split_calls == 2 && r.probes == 3,
+          "persistent raw failure must stop after the diagnostic pair");
+
+    memset(&r, 0, sizeof r); g_split_calls = 0; g_split_connect_failures = 0;
+    g_split_response_failures = 1;
+    tally = measure("127.0.0.1", port, &tr, &opt, "split", &cut, 1, 0, &r, 0);
+    CHECK(!tally.has_err && tally.pass == 2 && tally.fail == 1 && r.probes == 3 && g_split_calls == 3,
+          "a failed trigger was retried into a false unanimous result");
+    /* A fresh kernel control that cannot connect must not authorize a retry. */
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {0}; socklen_t sl = sizeof sa;
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(0x7f000001u);
+    CHECK(fd >= 0 && bind(fd, (struct sockaddr *)&sa, sizeof sa) == 0 &&
+          getsockname(fd, (struct sockaddr *)&sa, &sl) == 0, "transport control fixture");
+    char closed_port[16]; snprintf(closed_port, sizeof closed_port, "%u", ntohs(sa.sin_port));
+    memset(&r, 0, sizeof r); g_split_calls = 0; g_split_connect_failures = 1;
+    units = 0;
+    tally = measure("127.0.0.1", closed_port, &tr, &opt, "split", &cut, 1, 0, &r, 0);
+    CHECK(tally.has_err && tally.pass == 0 && g_split_calls == 1 && r.probes == 2 && units == 2,
+          "failed transport control authorized a split or hid its cost");
+    close(fd);
+
+    memset(&r, 0, sizeof r); g_split_calls = 0; g_split_connect_failures = 1;
+    transport_dns_calls = 0;
+    tally = measure("transport-switch.test", port, &tr, &opt, "split", &cut, 1, 0, &r, 0);
+    CHECK(tally.has_err && tally.pass == 0 && g_split_calls == 1 && transport_dns_calls == 1,
+          "transport recovery silently changed the target's resolved address");
+
+    memset(&r, 0, sizeof r); g_split_calls = 0; g_split_connect_failures = 1;
+    opt.mark = 0x2d; transport_fail_mark = 1;
+    tally = measure("127.0.0.1", port, &tr, &opt, "split", &cut, 1, 0, &r, 0);
+    CHECK(tally.has_err && tally.pass == 0 && g_split_calls == 1,
+          "unmarked TCP control authorized raw recovery");
+    transport_fail_mark = 0; opt.mark = 0;
+
+    const char *cancel_stages[] = {"transport:raw-connect", "transport:tcp-control"};
+    for (int stage = 0; stage < 2; stage++) {
+        memset(&r, 0, sizeof r); g_split_calls = 0; g_split_connect_failures = 1;
+        units = 0; transport_cancelled = 0; transport_cancel_at = cancel_stages[stage];
+        opt.cancel.fn = transport_is_cancelled;
+        tally = measure("127.0.0.1", port, &tr, &opt, "split", &cut, 1, 0, &r, 0);
+        CHECK(tally.has_err && tally.pass == 0 && g_split_calls == 1 &&
+              r.probes == stage + 1 && units == stage + 1,
+              "cancellation allowed another transport experiment");
+    }
+    transport_cancel_at = NULL; transport_cancelled = 0; opt.cancel.fn = NULL;
+
+    /* Exercise the complete classifier, not only its repeat helper. */
+    scenario sc = {"split-recovered", NULL, "-", NULL, "+", 0, NULL, 0};
+    d2k_result before, after;
+    g_split_connect_failures = 0; g_split_calls = 0;
+    run(&sc, &before);
+    g_split_connect_failures = 1; g_split_calls = 0;
+    run(&sc, &after);
+    CHECK(after.verdict == D2K_DV_WHOLE_PACKET && after.split_pos == before.split_pos &&
+          after.probes == before.probes + 2 && g_split_calls == 10,
+          "recovered classifier lost the measured split or entered fallback");
+    g_split_success = 0;
+}
+
 int main(void)
 {
     test_local_plan_error_is_not_a_property();
     srv_start();
     test_split_uses_runtime();
+    test_split_recovers_only_unsent_transport_failure();
     bind_list_names();
     if (getenv("CAPTURE")) {
         int i;

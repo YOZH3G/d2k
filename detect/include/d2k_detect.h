@@ -353,6 +353,10 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
 
 /* --- сырой слой (raw.c) ------------------------------------------------- */
 
+/* No SYN-ACK before the raw handshake deadline; no trigger was sent.
+ * Distinct from local errors (-1) and a sent trigger that did not pass (0). */
+#define D2K_RAW_CONNECT_TIMEOUT (-2)
+
 int  d2k_raw_supported(void);
 /* Счётчики ПОТОКА (прогон идёт в одном потоке целиком): отказы вставки
  * правила подавления RST и сырые соединения. Прогон сравнивает их со своим
@@ -371,7 +375,8 @@ size_t d2k_raw_pending_count(void);
 typedef int (*d2k_raw_rule_fn)(const char *cmd);
 extern d2k_raw_rule_fn d2k_raw_rule_hook;
 /* probe_poison — ОДИН зонд, собранный из независимых приёмов.
- * Возврат: 1 — прошло, 0 — не прошло, -1 — ошибка зонда (err заполнен). */
+ * Возврат: 1 — прошло, 0 — не прошло, -1 — ошибка зонда (err заполнен);
+ * D2K_RAW_CONNECT_TIMEOUT — TCP не установился, триггер не отправлен. */
 int  d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
                           const d2k_trigger *tr, const d2k_poison *p,
                           int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
