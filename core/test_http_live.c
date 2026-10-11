@@ -30,7 +30,7 @@ static size_t live_packet(int family,uint16_t port,uint32_t seq,int syn,const ch
         sum=(sum&65535u)+(sum>>16);pkt[th+16]=(uint8_t)(sum>>8);pkt[th+17]=(uint8_t)sum;}
     CHECK(n&&d2k_wire_tcp_checksum_ok(pkt,n),"live packet is valid");return n;
 }
-typedef struct { uint8_t bytes[6][4096]; d2k_test_packet packets[6]; size_t n; } live_trace;
+typedef struct { uint8_t bytes[12][4096]; d2k_test_packet packets[12]; size_t n; } live_trace;
 static void live_flow(d2k_session *s,int family,uint16_t port,const char *host,int want,int probe,live_trace *trace) {
     uint8_t pkt[4096],out[65536];d2k_result r;
     size_t n=live_packet(family,port,10000,1,"",pkt);
@@ -311,9 +311,81 @@ static void live_restore(int family) {
     d2k_link_close(peer);d2k_ctl_close(ctl);d2k_session_free(s);
     unlink(path);unlink(cat);unlink(log);unlink(sock);rmdir(dir);
 }
+static void segmented_packet(d2k_session *s,int probe,const uint8_t *pkt,size_t n,
+                             uint64_t time,uint8_t *out,d2k_result *r,live_trace *trace) {
+    if(probe)d2k_session_packet_probe(s,pkt,n,time,out,65536,r);
+    else d2k_session_packet(s,pkt,n,time,out,65536,r);
+    CHECK(trace->n+r->n_out+1<=12,"segmented trace capacity");
+    for(size_t i=0;i<r->n_out && trace->n<12;i++) {
+        size_t at=trace->n++;memcpy(trace->bytes[at],out+r->out[i].off,r->out[i].len);
+        trace->packets[at]=(d2k_test_packet){trace->bytes[at],r->out[i].len,r->out[i].delay_us};
+    }
+    if(r->verdict==D2K_VERDICT_ACCEPT && trace->n<12) {
+        size_t at=trace->n++;memcpy(trace->bytes[at],pkt,n);
+        trace->packets[at]=(d2k_test_packet){trace->bytes[at],n,0};
+    }
+    if(r->applied)for(size_t i=0;i<r->n_out+1;i++)
+        d2k_session_sent(s,time+1,&r->key,r->execution_id);
+}
+static void live_segmented_headers(void) {
+    for(int family=4;family<=6;family+=2)for(int mode=0;mode<5;mode++) {
+        live_trace traces[2]={0};
+        for(int probe=0;probe<2;probe++) {
+            d2k_session *s=d2k_session_new(128,128);d2k_plan *p=NULL;
+            char text[4096],err[200];uint8_t tlv[8192],id[16]={1};size_t len=0;
+            CHECK(!d2k_hs_candidate_text("fake-badsum-whole",id,text,sizeof text),"candidate fixture");
+            CHECK(!d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&len,err,sizeof err),"candidate TLV");
+            CHECK(!d2k_plan_load(tlv,len,&p,err,sizeof err),"candidate load");
+            CHECK(!d2k_plantab_set_name_family(d2k_session_plans(s),(const uint8_t *)live_host,
+                  strlen(live_host),1,p,D2K_PLAN_SHAPE_HTTP,probe?htons(56000):0,(uint8_t)family),"install trial or permanent");
+            uint8_t pkt[4096],out[65536];d2k_result r;live_trace *trace=&traces[probe];
+            d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
+            size_t n=live_packet(family,56000,10000,1,"",pkt);
+            segmented_packet(s,probe,pkt,n,1000000000,out,&r,trace);
+            char first[1301];const char *head="GET / HTTP/1.1\r\nHost: portal-target.example\r\nCookie: ";
+            memset(first,'x',sizeof first-1);memcpy(first,head,strlen(head));first[sizeof first-1]=0;
+            uint32_t seq=10001;n=live_packet(family,56000,seq,0,first,pkt);seq+=(uint32_t)strlen(first);
+            segmented_packet(s,probe,pkt,n,1100000000,out,&r,trace);
+            CHECK(r.applied,"first request protected with complete Host");
+            if(mode==0) {
+                segmented_packet(s,probe,pkt,n,1100000002,out,&r,trace);
+                CHECK(!r.applied,"retransmission is not another HTTP request");
+            }
+            const char *tails[]={"cookie-end\r\n\r\n","cookie-end\r\nContent-Length: ",
+                "cookie-end\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+                "cookie-end\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n","cookie-end\r\n\r\n"};
+            if(mode==4)seq++; /* missing byte is not a new boundary */
+            n=live_packet(family,56000,seq,0,tails[mode],pkt);seq+=(uint32_t)strlen(tails[mode]);
+            segmented_packet(s,probe,pkt,n,1200000000,out,&r,trace);
+            CHECK(!r.applied,"header continuation is not another request");
+            if(mode==1) {
+                n=live_packet(family,56000,seq,0,"4\r\n\r\nbo",pkt);seq+=7;
+                segmented_packet(s,probe,pkt,n,1300000000,out,&r,trace);
+                CHECK(!r.applied,"Content-Length completion and body do not reapply");
+                n=live_packet(family,56000,seq,0,"dy",pkt);seq+=2;
+                segmented_packet(s,probe,pkt,n,1350000000,out,&r,trace);
+            }
+            const char *next="GET /False/ HTTP/1.1\r\nHost: portal-target.example\r\n\r\n";
+            n=live_packet(family,56000,seq,0,next,pkt);
+            segmented_packet(s,probe,pkt,n,1400000000,out,&r,trace);
+            CHECK(!!r.applied==(mode<2),"second request protected only after proven segmented boundary");
+            d2k_session_free(s);
+        }
+        CHECK(d2k_test_trace_equal(traces[0].packets,traces[0].n,traces[1].packets,traces[1].n),
+              "segmented HTTP trial and permanent execution full packets match");
+        if(live_diverge && traces[0].n>1) {
+            /* Packet 0 is the accepted SYN; packet 1 is the emitted fake. */
+            traces[0].bytes[1][traces[0].packets[1].len-1]^=1;
+            CHECK(d2k_test_trace_equal(traces[0].packets,traces[0].n,traces[1].packets,traces[1].n),
+                  "segmented HTTP gate detects deliberate runtime divergence");
+        }
+    }
+}
+
 int main(int argc,char **argv) {
     live_diverge=argc==2&&!strcmp(argv[1],"--diverge");
     D2K_TEST_NAT_NO_TABLE();
     live_restore(4);live_restore(6);
+    live_segmented_headers();
     printf("HTTP live controller/control/Session: IPv4/6 full packets + lifecycle, %d failures\n",fails);return fails?1:0;
 }

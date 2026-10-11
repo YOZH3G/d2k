@@ -748,7 +748,7 @@ static void test_keepalive_doubt(void) {
     CHECK(ps.http_open_end == 1 && ps.http_unaligned == 0, "неизвестный конец запроса не посчитан");
     d2k_session_free(k.s);
 
-    /* Заголовок первого запроса не кончился в сегменте — граница неизвестна. */
+    /* Граница становится известна после последовательного окончания заголовков. */
     memset(&k, 0, sizeof k);
     k.s = ka_session(http_split_plan(29), "rutracker.org");
     ka_open(&k, 1000, 5000, 80);
@@ -758,7 +758,7 @@ static void test_keepalive_doubt(void) {
     CHECK(!k.r.applied, "продолжение заголовка изменено");
     ka_answer(&k, 100);
     ka_send(&k, REQ3);
-    CHECK(!k.r.applied, "запрос после заголовка в двух сегментах изменён");
+    CHECK(k.r.applied, "запрос после доказанного окончания заголовков остался без плана");
     CHECK(ka_stats(k.s).http_open_end == 1, "заголовок в двух сегментах не посчитан");
     d2k_session_free(k.s);
 }

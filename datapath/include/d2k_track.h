@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "d2k_plan.h"
+#include "d2k_http_request_stream.h"
 #include "d2k_plans.h"
 #include "d2k_quic.h"
 
@@ -272,11 +273,14 @@ struct d2k_flow {
        соединения). http_flow — поток начался запросом HTTP на порт 80;
        http_conn — граница следующего запроса известна: он начнётся с номера
        http_next. Узнанный там запрос получает план своего имени, как первый.
-       Любое сомнение (не с начала сегмента, пропуск, неизвестный конец)
-       снимает http_conn до конца потока. */
+       Незавершённые заголовки дочитываются общим request stream parser.
+       Неоднозначная длина, пропуск и конвейер внутри сегмента оставляют
+       границу неизвестной; поиск HTTP-текста внутри тела не выполняется. */
     uint8_t http_flow;
     uint8_t http_conn;
     uint32_t http_next;
+    uint8_t http_headers;
+    d2k_http_request_stream http_request;
     uint32_t pending_fin_seq;
     uint8_t pending_fin;
     /* Когда пришёл первый FIN с этим концом: запись после него живёт окно

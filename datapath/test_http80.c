@@ -12,6 +12,7 @@
 #include "d2k_wire.h"
 #include "d2k_httpup.h"
 #include "d2k_http_response.h"
+#include "d2k_http_request_stream.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -661,11 +662,72 @@ static void test_unseen_counted(void) {
     n = pkt(&k, 1, F_ACK | F_PSH, req_end, SISN + 1 + (uint32_t)strlen(OK200), GET, b);
     PKT(h, b, n, T + 300 * MS, &r);
     d2k_http80_stats st = d2k_http80_get_stats(h);
-    CHECK(st.requests == 2, "разобранных запросов не 2");
+    CHECK(st.requests == 3, "полный Host с незавершённым Cookie тоже начинает наблюдение");
     CHECK(st.untracked == 1, "запрос соединения без SYN в таблице не сосчитан");
-    CHECK(st.unparsed == 1, "запрос не целиком в первом сегменте не сосчитан");
+    CHECK(st.unparsed == 0, "незавершённый Cookie ошибочно отвергнут вместо ожидания хвоста");
     CHECK(st.later == 1, "следующий запрос соединения не сосчитан");
     d2k_http80_free(h);
+}
+
+static void test_segmented_headers(void) {
+ for(int v6=0;v6<2;v6++) {
+  d2k_http80 *h=d2k_http80_new();flow f=v6?flow6(56000):flow4(56000);
+  const char *first="GET / HTTP/1.1\r\nHost: portal-target.example\r\nCookie: beginning";
+  const char *tail="-end\r\n\r\n";
+  const char *answer="HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+  open_flow(h,&f,MS,first);
+  const uint8_t plan[16]={1},trial[16]={0};
+  d2k_binding_context binding={.generation=7,.kind=D2K_BIND_NAME,
+    .family=(uint8_t)(v6?6:4),.shape=D2K_PLAN_SHAPE_HTTP,.epoch={9}};
+  d2k_http80_executed(h,b,(v6?60:40)+strlen(first),100*MS,81,plan,trial,&binding);
+  uint32_t seq=CISN+1+(uint32_t)strlen(first);
+  size_t n=pkt(&f,1,F_ACK|F_PSH,seq,SISN+1,tail,b);seq+=(uint32_t)strlen(tail);
+  PKT(h,b,n,101*MS,&r);
+  n=pkt(&f,0,F_ACK|F_PSH,SISN+1,seq,answer,b);PKT(h,b,n,200*MS,&r);
+  CHECK(r.response==1 && r.status==200,"complete response after segmented request is observed");
+  CHECK(r.execution_id==81 && r.request_no==1 && d2k_binding_equal(&r.binding,&binding),
+        "early execution identity survives fragmented request headers");
+  n=pkt(&f,1,F_ACK|F_PSH,seq,SISN+1+(uint32_t)strlen(answer),GET,b);seq+=(uint32_t)strlen(GET);
+  PKT(h,b,n,210*MS,&r);
+  d2k_http80_executed(h,b,n,210*MS,82,plan,trial,&binding);
+  n=pkt(&f,0,F_ACK|F_PSH,SISN+1+(uint32_t)strlen(answer),seq,INJECT,b);PKT(h,b,n,210*MS+700000,&r);
+  CHECK(r.injection,"portal on next request after segmented headers is observed");
+  CHECK(r.execution_id==82 && r.request_no==2 && d2k_binding_equal(&r.binding,&binding),
+        "portal belongs to the second request execution");
+  d2k_http80_free(h);
+ }
+
+}
+
+static void test_request_stream(void) {
+    const char *cases[]={
+        "GET / HTTP/1.1\r\nHost: a.example\r\nCookie: large-value\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 4\r\n\r\nbody",
+        "GET / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nbody",
+        "GET / HTTP/1.1\r\nHost: a.example\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a.example\r\nUpgrade: websocket\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 1 2\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a.example\r\nContent-Length : 0\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a.example\r\nCookie: x\r\n folded\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n"
+    };
+    for(size_t k=0;k<sizeof cases/sizeof cases[0];k++)for(size_t cut=1;cut<strlen(cases[k]);cut++) {
+        const uint8_t *p=(const uint8_t *)cases[k];size_t n=strlen(cases[k]);
+        d2k_http_request_stream st;d2k_http_request_stream_init(&st,0xfffffff0u);
+        d2k_http_request_stream_feed(&st,st.start,p,cut);
+        /* A full retransmission is not new framing input. */
+        d2k_http_request_stream_feed(&st,st.start,p,cut);
+        d2k_http_request_stream_feed(&st,st.start+(uint32_t)cut,p+cut,n-cut);
+        CHECK((!st.invalid && st.header_done && !st.past_end && st.next==st.end)==(k<2),
+              "every segmentation preserves valid framing and rejects ambiguity");
+    }
+    d2k_http_request_stream st;const uint8_t *p=(const uint8_t *)cases[0];
+    d2k_http_request_stream_init(&st,100);d2k_http_request_stream_feed(&st,100,p,20);
+    d2k_http_request_stream_feed(&st,121,p+21,strlen(cases[0])-21);
+    CHECK(st.invalid,"missing byte cannot establish boundary");
+    d2k_http_request_stream_init(&st,100);d2k_http_request_stream_feed(&st,100,p,20);
+    d2k_http_request_stream_feed(&st,119,p+19,strlen(cases[0])-19);
+    CHECK(st.invalid,"partial overlap cannot establish boundary");
 }
 
 int main(void) {
@@ -688,6 +750,8 @@ int main(void) {
     test_response_gap();
     test_retransmitted_fin();
     test_unseen_counted();
+    test_segmented_headers();
+    test_request_stream();
     if (fails) {
         printf("test_http80: провалов %d\n", fails);
         return 1;

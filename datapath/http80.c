@@ -12,6 +12,7 @@
 #include "d2k_httpup.h"
 #include "d2k_packet.h"
 #include "d2k_http_response.h"
+#include "d2k_http_request_stream.h"
 
 enum {
     ST_FREE = 0,
@@ -34,6 +35,7 @@ typedef struct {
     uint32_t server_next, client_next;
     uint32_t request_seq;
     int next_known;
+    d2k_http_request_stream request;
     int request_get;
     d2k_http_response reply;
     uint32_t reply_next;
@@ -268,6 +270,30 @@ void d2k_http80_delivered(d2k_http80 *h,const uint8_t *p,size_t n,int accepted,d
     request_result(f,r);r->response=2;
 }
 
+/* Recognize identity in a prefix; framing is completed by the shared stream
+ * parser. This is not the stricter complete-request HTTPS upgrade API. */
+static int request_prefix(const uint8_t *p,size_t n,flow *f) {
+    d2k_http_req req;
+    if(!d2k_http_request(p,n,&req) || req.host_len>=sizeof f->host)return 0;
+    size_t method=n>=4&&!memcmp(p,"GET ",4)?4:n>=5&&!memcmp(p,"HEAD ",5)?5:0;
+    if(!method)return 0;
+    size_t end=method;
+    while(end<n && p[end]!=' ') {
+        if(p[end]<=0x20 || p[end]==0x7f || p[end]=='#')return 0;
+        end++;
+    }
+    if(end==n || end-method>=sizeof f->target)return 0;
+    memcpy(f->target,p+method,end-method);f->target[end-method]=0;
+    memcpy(f->host,p+req.host_off,req.host_len);f->host[req.host_len]=0;
+    return 1;
+}
+static void request_feed(flow *f,uint32_t seq,const uint8_t *p,size_t n) {
+    d2k_http_request_stream_feed(&f->request,seq,p,n);
+    f->client_next=f->request.next;
+    f->next_known=f->request.header_done && !f->request.invalid &&
+        !f->request.past_end && f->request.next==f->request.end;
+}
+
 void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t now,
                        uint64_t ks,
                        uint8_t *out, size_t out_cap, uint8_t *rst, size_t rst_cap,
@@ -313,17 +339,14 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
         }
         f->touched = now;
         if (plen > 0 && f->state != ST_OPEN && f->state != ST_SYN) { h->st.later++; }
+        if(f->state==ST_REQUEST && plen)request_feed(f,seq,pay,plen);
         if ((f->state == ST_OPEN || f->state == ST_IDLE) && plen > 0) {
             /* A retransmission cannot become a new request or erase its
              * known boundary. A gap/overlap remains unclassified. */
             if (seq != f->client_next) { return; }
-            d2k_http_req req;
-            /* Первая нагрузка клиента — запрос целиком в одном пакете, ровно
-               с начала потока. Кусок запроса не разобрать: решать не по чему. */
-            if (d2k_httpup_request_target((const char *)pay, plen, f->host, sizeof f->host,
-                                          f->target, sizeof f->target)) {
-                f->next_known = d2k_http_request(pay, plen, &req) &&
-                    req.end_known && req.end == plen;
+            if (request_prefix(pay,plen,f)) {
+                d2k_http_request_stream_init(&f->request,seq);
+                request_feed(f,seq,pay,plen);
                 /* Client ACK gives the response sequence for this request,
                  * including a preceding response spanning many segments. */
                 if (f->state == ST_IDLE) f->server_next = ack;
@@ -380,7 +403,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
             } else return;
         } else f->reply.invalid=1;
     }
-    if(ack!=f->client_next || (flags&0x04))f->reply.invalid=1;
+    if(!f->next_known || ack!=f->client_next || (flags&0x04))f->reply.invalid=1;
     if(!f->reply_started && plen) {
         f->reply_started=1;f->reply_time=now;f->reply_kstamp=ks;
     }
@@ -411,7 +434,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
     /* A prefix already accepted by the kernel cannot be replaced atomically. */
     if(f->reply_segments!=1)return;
 
-    if (!d2k_http80_https(h, f->host, now)) { return; }
+    if (!f->next_known || f->request.length || !d2k_http80_https(h, f->host, now)) { return; }
     char redirect[D2K_HTTP80_TARGET_MAX + 512];
     size_t rl = d2k_httpup_redirect_https(f->host, f->target, redirect, sizeof redirect);
     uint16_t window = (uint16_t)((unsigned)t[14] << 8 | t[15]);
@@ -455,15 +478,6 @@ int d2k_http80_swap(d2k_http80 *h, d2k_http80_res *r, const uint8_t *out, const 
 
 static int lc(uint8_t c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 
-static int name_is(const uint8_t *p, size_t i, size_t e, const char *lname) {
-    size_t n = strlen(lname);
-    if (e - i < n) { return 0; }
-    for (size_t k = 0; k < n; k++) {
-        if (lc(p[i + k]) != (uint8_t)lname[k]) { return 0; }
-    }
-    return 1;
-}
-
 int d2k_http_request(const uint8_t *p, size_t n, d2k_http_req *r) {
     if (!p || !r) { return 0; }
     memset(r, 0, sizeof *r);
@@ -479,9 +493,8 @@ int d2k_http_request(const uint8_t *p, size_t n, d2k_http_req *r) {
     if (i + 10 > n || memcmp(p + i, " HTTP/1.", 8) || (p[i + 8] != '0' && p[i + 8] != '1') ||
         p[i + 9] != '\r' || i + 10 >= n || p[i + 10] != '\n') { return 0; }
     i += 11;
-    int found = 0, n_len = 0, open_end = 0;
+    int found = 0;
     size_t off = 0, len = 0;
-    uint64_t body = 0;
     /* Строки заголовка, пока они целиком в этом сегменте. */
     while (i < n) {
         size_t e = i;
@@ -491,26 +504,7 @@ int d2k_http_request(const uint8_t *p, size_t n, d2k_http_req *r) {
             r->head_len = e + 2;
             break;
         }
-        if (name_is(p, i, e, "content-length:")) {
-            /* Одно значение, только цифры (OWS вокруг). Два Content-Length
-               или мусор — конец запроса не знаем. */
-            size_t v = i + 15;
-            while (v < e && (p[v] == ' ' || p[v] == '\t')) { v++; }
-            size_t ve = e;
-            while (ve > v && (p[ve - 1] == ' ' || p[ve - 1] == '\t')) { ve--; }
-            uint64_t cl = 0;
-            int ok = ve > v && ve - v <= 10;
-            for (size_t k = v; ok && k < ve; k++) {
-                if (p[k] < '0' || p[k] > '9') { ok = 0; break; }
-                cl = cl * 10u + (uint64_t)(p[k] - '0');
-            }
-            if (!ok || n_len++) { open_end = 1; }
-            body = cl;
-        } else if (name_is(p, i, e, "transfer-encoding:") || name_is(p, i, e, "upgrade:")) {
-            /* chunked и т. п. — конец только разбором тела; Upgrade — после
-               ответа 101 поток уже не HTTP. Границы дальше не знаем. */
-            open_end = 1;
-        } else if (e - i >= 5 && lc(p[i]) == 'h' && lc(p[i + 1]) == 'o' && lc(p[i + 2]) == 's' &&
+        if (e - i >= 5 && lc(p[i]) == 'h' && lc(p[i + 1]) == 'o' && lc(p[i + 2]) == 's' &&
             lc(p[i + 3]) == 't' && p[i + 4] == ':') {
             if (found++) { return 0; }
             size_t v = i + 5;
@@ -558,11 +552,11 @@ int d2k_http_request(const uint8_t *p, size_t n, d2k_http_req *r) {
     if (found != 1) { return 0; }
     r->host_off = off;
     r->host_len = len;
-    /* Конец запроса известен, только если заголовок кончился здесь и тело
-       задано одним Content-Length (или его нет). */
-    if (r->head_len && !open_end && r->head_len + body <= 0x7fffffffu) {
-        r->end_known = 1;
-        r->end = r->head_len + body;
+    d2k_http_request_stream framing;
+    d2k_http_request_stream_init(&framing,0);
+    d2k_http_request_stream_feed(&framing,0,p,n);
+    if(framing.header_done && !framing.invalid) {
+        r->end_known=1;r->head_len=framing.head_len;r->end=framing.end;
     }
     return 1;
 }

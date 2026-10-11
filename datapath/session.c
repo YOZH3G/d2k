@@ -1834,8 +1834,9 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        предыдущего запроса. Запрос, начинающийся ровно на ней, с начала
        сегмента, — вход плана своего имени, как первый. Всё прочее —
        конвейер внутри сегмента, сегмент через границу, пропущенная граница
-       (очередь видит после окна только сегменты с PSH), не запрос на
-       границе — идёт как есть, считается, и граница дальше не ищется. */
+       не запрос на границе — идёт как есть, считается, и граница дальше
+       не ищется. Конец заголовков может прийти последующими сегментами:
+       их framing ведёт тот же parser, что и наблюдатель HTTP-ответа. */
     int http_hello = 0;
     const char *http_skip = NULL;
     size_t http_off = 0, http_len = 0;
@@ -1849,6 +1850,13 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             http_tried = 1;
             http_hello = d2k_http_request(pkt + payload_off, payload_len, &hr);
             fl->http_flow = (uint8_t)http_hello;
+        } else if (fl->http_headers) {
+            d2k_http_request_stream_feed(&fl->http_request,in_seq,pkt+payload_off,payload_len);
+            if(fl->http_request.invalid || fl->http_request.past_end) {
+                fl->http_headers=0;s->http_unaligned++;
+            } else if(fl->http_request.header_done) {
+                fl->http_headers=0;fl->http_conn=1;fl->http_next=fl->http_request.end;
+            }
         } else if (fl->http_conn) {
             const int32_t d = (int32_t)(in_seq - fl->http_next);
             if (d == 0) {
@@ -1889,6 +1897,9 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             http_len = hr.host_len;
             if (later) { s->http_later++; }
             fl->http_conn = 0;
+            d2k_http_request_stream_init(&fl->http_request,in_seq);
+            d2k_http_request_stream_feed(&fl->http_request,in_seq,pkt+payload_off,payload_len);
+            fl->http_headers=!fl->http_request.invalid && !fl->http_request.header_done;
             if (!hr.end_known) {
                 s->http_open_end++;
             } else if (hr.end < payload_len) {

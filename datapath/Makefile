@@ -41,7 +41,7 @@ LINUXSRC = nfq.c raw.c routemark_nl.c
 DAEMON   = d2kd.c
 HDR     = include/d2k_icmpguard.h include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h include/d2k_udp_path.h include/d2k_routemark.h include/d2k_capture.h include/d2k_plan.h include/d2k_nat.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_ctq.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h include/d2k_http80.h plan_internal.h $(COREHDR)
 
-HDR += include/d2k_http_response.h
+HDR += include/d2k_http_response.h include/d2k_http_request_stream.h
 HDR += ../runtime/d2k_runtime.h ../runtime/d2k_protocol.h include/d2k_http_trace.h
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
