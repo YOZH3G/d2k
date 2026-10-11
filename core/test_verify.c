@@ -808,6 +808,33 @@ int main(int argc,char **argv) {
               !strcmp(scan.refs[1].host, "third.example"),
               "streamed public CSS hints depend on chunk boundaries or include unsafe context");
     }
+    /* ПОДСКАЗКА ИЗ ТЕЛА CSS, А НЕ ИЗ ТЕГА (поле 12.10.2026). Крупный файл
+       цели бывает указан только внутри таблицы стилей другого хоста: у
+       style.sndcdn.com нужный путь лежал в CSS с a-v2.sndcdn.com, поэтому
+       зонд объёма просил «/» и получал 403 на 243 байта, не входя в полосу.
+       Ссылка собирается по байтам и проходит ту же строгую проверку. */
+    {
+        static const char css[] =
+            "@charset \"utf-8\";\n"
+            "@import url(\"https://Fonts.Example/soehne-6ee1b930.css\");\n"
+            ".a{background:url('https://img.example/p.png');color:red}\n"
+            ".b{src:url(https://second.example/late.css)}\n"
+            ".c{src:url(\"https://third.example/q.css?token=secret\")}\n";
+        for (size_t chunk = 1; chunk < 40; chunk++) {
+            d2k_resource_scan scan = {0};
+            for (size_t i = 0; i < strlen(css); i += chunk) {
+                size_t take = strlen(css) - i;
+                if (take > chunk) take = chunk;
+                d2k_resource_feed(&scan, (const uint8_t *)css + i, take);
+            }
+            CHECK(scan.count == 2 &&
+                  !strcmp(scan.refs[0].host, "fonts.example") &&
+                  !strcmp(scan.refs[0].path, "/soehne-6ee1b930.css") &&
+                  !strcmp(scan.refs[1].host, "second.example") &&
+                  !strcmp(scan.refs[1].path, "/late.css"),
+                  "CSS body hints are missed, chunk-dependent or include unsafe context");
+        }
+    }
     CHECK(!d2k_resource_path_ok("//evil/a.css") &&
           !d2k_resource_path_ok("/a.css?token=secret") &&
           !d2k_resource_path_ok("/a/../b.css") &&

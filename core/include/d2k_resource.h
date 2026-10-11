@@ -13,6 +13,13 @@ typedef struct {
     char tag[2048];
     size_t used, seen;
     int active, quote, comment, raw;
+    /* Абсолютная ссылка, собираемая вне разбора тегов: крупный файл цели
+     * бывает указан только внутри CSS (url(...) или @import). Поле 12.10.2026:
+     * путь style.sndcdn.com лежал в CSS другого хоста и в подсказки не
+     * попадал, поэтому зонд объёма просил «/» и получал 403 на 243 байта. */
+    char url[600];
+    size_t url_used;
+    int url_active;
     d2k_resource refs[D2K_RESOURCE_COUNT];
     size_t count;
 } d2k_resource_scan;
@@ -108,6 +115,28 @@ static inline void d2k_resource_feed(d2k_resource_scan *s, const uint8_t *buf, s
     if (!s) return;
     for (size_t i = 0; i < n && s->seen < 32768; i++, s->seen++) {
         unsigned char c = buf[i];
+        /* Сборка абсолютной ссылки идёт по каждому байту и независимо от
+         * разбора тегов: так подсказка находится и в CSS, где тегов нет.
+         * Проверяет её тот же строгий d2k_resource_add — только https,
+         * только публичный путь, только .css, без запросов и токенов. */
+        if (s->url_active) {
+            if (c == '"' || c == '\'' || c == '(' || c == ')' || c == ';' ||
+                c == ',' || c == '<' || c == '>' || d2k_resource_space(c)) {
+                s->url[s->url_used] = 0;
+                if (s->url_used > 8) { d2k_resource_add(s, s->url); }
+                s->url_active = 0;
+                s->url_used = 0;
+            } else if (s->url_used + 1 < sizeof s->url) {
+                s->url[s->url_used++] = (char)c;
+            } else {
+                s->url_active = 0;
+                s->url_used = 0;
+            }
+        } else if (c == 'h') {
+            s->url_active = 1;
+            s->url_used = 0;
+            s->url[s->url_used++] = 'h';
+        }
         if (!s->active) {
             if (c == '<') { s->active = 1; s->used = 0; s->quote = 0; }
             continue;
