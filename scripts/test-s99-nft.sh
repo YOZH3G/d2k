@@ -136,13 +136,14 @@ want 'meta l4proto tcp ct direction original th dport { 0-65535 } ct original pa
 want 'meta l4proto tcp ct direction original th dport { 0-65535 } ct original packets 9-18446744073709551615 tcp flags & rst == rst queue num 2000 bypass'
 want 'meta l4proto tcp ct direction reply th sport { 0-65535 } ct reply packets 9-18446744073709551615 tcp flags & fin == fin queue num 2000 bypass'
 want 'meta l4proto tcp ct direction original th dport { 80 } ct original packets 9-18446744073709551615 tcp flags & psh == psh queue num 2000 bypass'
+want 'meta l4proto tcp ct direction reply th sport { 80 } ct reply packets 9-18446744073709551615 tcp flags & psh == psh queue num 2000 bypass'
 want 'meta l4proto udp ct direction reply th sport { 0-65535 } ct reply packets 1-8 queue num 2000 bypass'
 want 'meta l4proto udp ct direction original th dport { 50000-50099, 1400, 3478-3481, 5349, 19294-19344 } ct original packets 1-4 queue num 2000 bypass'
 want 'icmp type time-exceeded icmp code 0 queue num 2000 bypass'
 want 'icmpv6 type time-exceeded icmpv6 code 0 queue num 2000 bypass'
 want 'meta nfproto ipv4 meta l4proto udp meta mark 0x2d masquerade'
 want 'jump in_rules'
-[ "$(printf '%s\n' "$r" | grep -c 'queue num 2000 bypass')" -eq 13 ] || fail "expected 13 queue rules (6 out, 7 in)"
+[ "$(printf '%s\n' "$r" | grep -c 'queue num 2000 bypass')" -eq 14 ] || fail "expected 14 queue rules (6 out, 8 in)"
 # Order inside out: exclusions before the first queue rule.
 first_queue=$(printf '%s\n' "$r" | grep -n 'queue num' | head -1 | cut -d: -f1)
 last_return=$(printf '%s\n' "$r" | sed -n '/chain out {/,/^	}/p' | grep -n 'return' | tail -1 | cut -d: -f1)

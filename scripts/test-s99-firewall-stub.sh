@@ -118,6 +118,9 @@ ok "without ip6tables mangle the service runs IPv4-only and says so"
 # снимает его вместе с цепочкой.
 rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
 S99_SNIPPET='fw_up && fw_installed' s99 || fail "fw_up with the ICMP rule failed"
+for tool in iptables ip6tables; do
+    rules "$tool" mangle | grep -qx -- '-A D2K_IN -p tcp -m conntrack --ctdir REPLY -m multiport --sports 80 -m connbytes --connbytes 9: --connbytes-dir reply --connbytes-mode packets --tcp-flags PSH PSH -j NFQUEUE --queue-num 2000 --queue-bypass' || fail "$tool: late HTTP replies are invisible"
+done
 rules iptables mangle | grep -qx -- '-A D2K_IN -p icmp --icmp-type 11/0 -j NFQUEUE --queue-num 2000 --queue-bypass' \
     || fail "IPv4 time-exceeded is not queued in D2K_IN"
 rules ip6tables mangle | grep -qx -- '-A D2K_IN -p ipv6-icmp --icmpv6-type 3/0 -j NFQUEUE --queue-num 2000 --queue-bypass' \

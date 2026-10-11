@@ -109,9 +109,9 @@ VOICE_PORTS=50000:50099,1400,3478:3481,5349,19294:19344
 VOICE_CONNBYTES=0:4
 # ОТКРЫТЫЙ HTTP, KEEP-ALIVE (поле 04.10.2026, www.fast-torrent.ru): коробка
 # смотрит КАЖДЫЙ запрос соединения, а второй запрос браузера лежит далеко за
-# окном CONNBYTES. После окна в очередь идут только сегменты клиента на этот
-# порт с флагом PSH — запросы, а не поток подтверждений; d2kd применяет к
-# запросу на известной границе план его имени и пропускает остальное.
+# окном CONNBYTES. После окна в очередь идут PSH в обе стороны на этом
+# порту: запросы и ответы, без чистых ACK. d2kd применяет план запроса на
+# известной границе и наблюдает ответ для приёмки живого исполнения.
 HTTP_KEEPALIVE_PORTS=80
 MODE=apply
 FLOWS=2048
@@ -380,6 +380,10 @@ fw_family_up() (
     "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$HTTP_KEEPALIVE_PORTS" \
         -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
         --tcp-flags PSH PSH -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    # Replies on reused HTTP connections must remain visible to live acceptance.
+    "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$HTTP_KEEPALIVE_PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
+        --tcp-flags PSH PSH -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
     "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
@@ -611,6 +615,7 @@ table inet $NFT_TABLE {
 		meta l4proto { tcp, udp } th sport { $dns } return
 		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $late tcp flags & rst == rst $q
 		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $late tcp flags & fin == fin $q
+		meta l4proto tcp ct direction reply th sport { $(nft_list "$HTTP_KEEPALIVE_PORTS") } ct reply packets $late tcp flags & psh == psh $q
 		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $win $q
 		meta l4proto udp ct direction reply th sport { $ports } ct reply packets $win $q
 		meta l4proto udp ct direction reply th sport { $voice } ct reply packets $voicewin $q
@@ -854,6 +859,10 @@ fw_family_installed() (
         --queue-bypass 2>/dev/null || return 1
     "$fw_tool" -t mangle -C "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m multiport --dports "$HTTP_KEEPALIVE_PORTS" \
         -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
+        --tcp-flags PSH PSH -j NFQUEUE --queue-num "$QUEUE_NUM" \
+        --queue-bypass 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m multiport --sports "$HTTP_KEEPALIVE_PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
         --tcp-flags PSH PSH -j NFQUEUE --queue-num "$QUEUE_NUM" \
         --queue-bypass 2>/dev/null || return 1
     [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" \
