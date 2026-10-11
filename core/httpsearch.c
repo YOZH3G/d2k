@@ -1285,7 +1285,11 @@ static void *runner_main(void *arg) {
 d2k_hs_runner *d2k_hs_runner_new(void) {
     d2k_hs_runner *r = calloc(1, sizeof *r);
     if (!r) { return NULL; }
-    if (pipe(r->wake) != 0) { free(r); return NULL; }
+    /* `< 0`, а не `!= 0`: системный pipe на MIPS возвращает первый дескриптор
+       в v0 (второй в v1), и обёртка musl отдаёт это значение как есть — успех
+       там положительный. Та же ловушка разобрана у d2k_sched_new (sched.c);
+       проверка — test_mips_pipe. */
+    if (pipe(r->wake) < 0) { free(r); return NULL; }
     for (int i = 0; i < 2; i++) {
         int fl = fcntl(r->wake[i], F_GETFL, 0);
         if (fl >= 0) { (void)fcntl(r->wake[i], F_SETFL, fl | O_NONBLOCK); }

@@ -124,6 +124,24 @@ test_httpsprobe: test_httpsprobe.c httpsprobe.c hello.o tls13.o tls12.o p256.o t
 	$(CC) $(CFLAGS) -o $@ test_httpsprobe.c httpsprobe.c hello.o tls13.o tls12.o p256.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 test-httpsprobe: test_httpsprobe
 	./test_httpsprobe
+
+# Ловушка MIPS: системный pipe там возвращает первый дескриптор (fd[0]) в v0, а
+# не нуль, и обёртка musl отдаёт это значение как есть (см. шапку
+# test_mips_pipe.c и d2k_sched_new в sched.c). Проверка на ХОСТЕ: те же два
+# конструктора с побудочной трубой компилируются с подменённой обёрткой — тот
+# же приём, что у httpsearch_compare_test.o. Без этого ловушку видит только
+# настоящий mips/mipsel-роутер, которого в проверках нет.
+TESTS += test_mips_pipe
+check: test-mips-pipe
+.PHONY: test-mips-pipe
+httpsearch_mips_pipe.o: httpsearch.c include/d2k_httpsearch.h include/d2k_httpup.h $(HDR)
+	$(CC) $(CFLAGS) -Dpipe=d2k_test_mips_pipe -c httpsearch.c -o $@
+httpsprobe_mips_pipe.o: httpsprobe.c include/d2k_httpsprobe.h $(HDR)
+	$(CC) $(CFLAGS) -Dpipe=d2k_test_mips_pipe -c httpsprobe.c -o $@
+test_mips_pipe: test_mips_pipe.c httpsearch_mips_pipe.o httpsprobe_mips_pipe.o httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) include/d2k_httpsearch.h include/d2k_httpsprobe.h
+	$(CC) $(CFLAGS) -o $@ test_mips_pipe.c httpsearch_mips_pipe.o httpsprobe_mips_pipe.o httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
+test-mips-pipe: test_mips_pipe
+	./test_mips_pipe
 TESTS += test_verify_http
 check: test-verify-http
 .PHONY: test-verify-http
@@ -623,6 +641,22 @@ SAN_EXTRA_SRC = httpsprobe.c httpup_logic.c
 # сам тест идёт в обычном check.
 SAN_SKIP = test_quicconn_fc
 SAN_SKIP += test_http_compare_failure
+# test_mips_pipe нужна подмена pipe() ровно в двух объектниках: общий цикл
+# слинковал бы настоящие httpsearch.c/httpsprobe.c, и ловушка MIPS не
+# проверялась бы вовсе. Свой блок ниже.
+SAN_SKIP += test_mips_pipe
+
+.PHONY: san-mips-pipe
+san: san-mips-pipe
+san-mips-pipe:
+	@set -eu; mips_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/d2k-mips-pipe-san.XXXXXX"); \
+		trap 'rm -rf "$$mips_dir"' EXIT HUP INT TERM; \
+		$(CC) $(SANFLAGS) -Dpipe=d2k_test_mips_pipe -c httpsearch.c -o "$$mips_dir/httpsearch.o"; \
+		$(CC) $(SANFLAGS) -Dpipe=d2k_test_mips_pipe -c httpsprobe.c -o "$$mips_dir/httpsprobe.o"; \
+		$(CC) $(SANFLAGS) -o "$$mips_dir/test" test_mips_pipe.c "$$mips_dir/httpsearch.o" \
+			"$$mips_dir/httpsprobe.o" httpup_logic.c plantlv.c quic.c quicwire.c crypto.c \
+			../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_SRC) -lpthread; \
+		"$$mips_dir/test"
 
 .PHONY: san-http-compare-failure
 san: san-http-compare-failure

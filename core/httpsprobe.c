@@ -356,7 +356,9 @@ d2k_httpsprobe *d2k_httpsprobe_new(uint32_t mark, d2k_https_probe_fn probe) {
     p->wake[0] = p->wake[1] = -1;
     pthread_mutex_init(&p->mu, NULL);
     pthread_cond_init(&p->cv, NULL);
-    if (pipe(p->wake) != 0) {
+    /* `< 0`, а не `!= 0`: на MIPS pipe() возвращает первый дескриптор, а не
+       нуль (см. d2k_sched_new в sched.c и test_mips_pipe). */
+    if (pipe(p->wake) < 0) {
         p->wake[0] = p->wake[1] = -1;
     } else {
         for (int i = 0; i < 2; i++) {
