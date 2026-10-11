@@ -868,6 +868,14 @@ SCHED_TEST_OBJ = httpsprobe.o httpsearch.o httpup_logic.o sched.o quichello.o pl
     quic.o quicwire.o quicprobe.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
     hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o \
     x25519.o verify.o tls12.o p256.o quicconn.o h3.o
+TESTS += test_sched_trial
+check: test-sched-trial
+.PHONY: test-sched-trial
+test_sched_trial: test_sched_trial.c test_sched.c $(SCHED_TEST_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(SCHED_TEST_OBJ) $(TEST_LDFLAGS)
+test-sched-trial: test_sched_trial
+	./test_sched_trial
+
 test_sched: test_sched.c $(SCHED_TEST_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(SCHED_TEST_OBJ) $(TEST_LDFLAGS)
 

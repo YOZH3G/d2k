@@ -1163,7 +1163,7 @@ static size_t collect_addr_probes(uint8_t dst[][4], uint8_t trial[][D2K_TRIAL_ID
 
 /* Read the last REC_ID from complete command frames. Trial IDs are binary,
    not a printable catalog hash; never derive the expectation from the plan. */
-static int last_plan_id(uint8_t out[16]) {
+static int last_plan_identity(uint8_t out[16],uint8_t trial[16]) {
     int found = 0;
     for (size_t off = 0; off + 6 <= sent_len;) {
         const uint8_t *p = sentbuf + off;
@@ -1191,6 +1191,11 @@ static int last_plan_id(uint8_t out[16]) {
                 if (size > len - at) break;
                 if (record == 1 && size == 16) {
                     memcpy(out, body + at, 16);
+                    if(trial) {
+                        memset(trial,0,16);
+                        if(type==D2K_CMD_SET_NAME_PROBE)memcpy(trial,p+4+n-16,16);
+                        if(type==D2K_CMD_SET_ADDR_PROBE)memcpy(trial,body+38,16);
+                    }
                     found = 1;
                 }
                 at += size;
@@ -1200,6 +1205,8 @@ static int last_plan_id(uint8_t out[16]) {
     }
     return found;
 }
+
+static int last_plan_id(uint8_t out[16]) { return last_plan_identity(out,NULL); }
 
 /* SET_NAME(_PROBE) несёт шестнадцатеричный текстовый план. Ищем в отправленной
    команде фрагмент его внутреннего payload, закодированный дважды: сначала
@@ -1364,7 +1371,7 @@ static d2k_ev ev_applied(uint8_t transport, uint16_t cport) {
     d2k_ev e = ev_hello(transport, cport, "");
     e.kind = D2K_EV_APPLIED;
     e.name[0] = '\0';
-    (void)last_plan_id(e.plan_id);
+    (void)last_plan_identity(e.plan_id,e.trial_id);
     return e;
 }
 
@@ -10677,6 +10684,7 @@ voice_only_run:
             /* Следующий поток того же клиента, тот же Plan ID, но без trial ID
                опыта — это не наш опыт: один plan hash опыта не называет. */
             ap = ev_applied(17, 40201);
+            memset(ap.trial_id, 0, sizeof ap.trial_id);
             d2k_sched_event(s, &ap);
             ex = ev_exchange(17, 40201, 0);
             d2k_sched_event(s, &ex);

@@ -350,3 +350,5 @@ ACK/request/conditional-delete теперь несут и проверяют н�
   приёмка fast-torrent/mailsuite остаются открытыми.
 
 Продолжение HTTP-приёмки: [исполнение каждого запроса и trial identity](2026-10-11-http-trial-execution-proof.md).
+
+Продолжение общей приёмки кандидатов: [trial в раннем и позднем APPLIED](2026-10-11-scheduler-trial-proof.md).

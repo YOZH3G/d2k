@@ -7829,6 +7829,15 @@ static int plan_id_is_ours(const task *t, const d2k_ev *ev) {
     return memcmp(ev->plan_id, t->ver_plan_id, D2K_PLAN_ID_LEN) == 0;
 }
 
+/* An exact flow and plan can recur. Only the current installation's trial
+ * binds a completion to this experiment, before or after verifier return. */
+static int applied_trial_is_ours(const task *t,const d2k_ev *ev) {
+    uint8_t present=0;
+    for(size_t i=0;i<D2K_TRIAL_ID_LEN;i++)present|=ev->trial_id[i];
+    return present && candidate_trial_matches(t,t->by_addr?D2K_CMD_SET_ADDR_PROBE:
+                                                D2K_CMD_SET_NAME_PROBE,ev->trial_id);
+}
+
 /* Применение НАШЕГО кандидата к НАШЕЙ цели? Полный ключ сверим после зонда. */
 static int applied_of_candidate(const task *t, const d2k_ev *ev) {
     if ((ev->family ? ev->family : 4) != t->family) { return 0; }
@@ -7953,7 +7962,7 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
                Пока зонд работает, сохраняем полные ключи нескольких событий:
                чужое соединение может прийти первым и иметь тот же порт на
                другом клиенте. Переполнение теряет улику, но не создаёт успех. */
-            if (!applied_of_candidate(t, ev)) { continue; }
+            if (!applied_trial_is_ours(t,ev) || !applied_of_candidate(t, ev)) { continue; }
             int duplicate = 0;
             for (size_t k = 0; k < t->ver_seen; k++) {
                 if (ev_matches_flow(ev, &t->ver_early[k])) { duplicate = 1; break; }
@@ -7972,7 +7981,8 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
         }
         if (t->state == T_VERIFY_WAIT) {
             /* Зонд вернулся, ключ его потока известен — сверяем точно. */
-            if (!ev_matches_flow(ev, &t->ver_flow) || !plan_id_is_ours(t, ev)) { continue; }
+            if (!applied_trial_is_ours(t,ev) || !ev_matches_flow(ev, &t->ver_flow) ||
+                !plan_id_is_ours(t, ev)) { continue; }
             t->ver_ok = 1;
             wake_loop(s);
             return;
