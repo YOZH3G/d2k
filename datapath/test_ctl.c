@@ -38,6 +38,19 @@ static int fails;
 
 static const char *SOCK = "/tmp/d2k-test-ctl.sock";
 
+static void check_execution(const uint8_t *p, const d2k_result *r) {
+    uint64_t id = 0, generation = 0;
+    for (unsigned b = 0; b < 8; b++) {
+        id = id * 256 + p[b];
+        generation = generation * 256 + p[8+b];
+    }
+    CHECK(id == r->execution_id && generation == r->binding.generation,
+          "wire fate lost its original execution/generation");
+    CHECK(p[16] == r->binding.kind && p[17] == r->binding.family &&
+          p[18] == r->binding.shape && p[19] == r->binding.temporary,
+          "wire fate lost binding context");
+}
+
 static int dial(void) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un sa;
@@ -1461,6 +1474,14 @@ int main(void) {
             d2k_session_sent(sess, 1001 + i, &r.key, r.execution_id);
         }
 
+        /* Replace before journal serialization: the event belongs to r. */
+        d2k_plan *replacement = NULL;
+        char replace_err[128];
+        CHECK(!d2k_plan_load(plan_with_id, sizeof plan_with_id, &replacement,
+                            replace_err, sizeof replace_err), "replacement fixture");
+        CHECK(!d2k_plantab_set_name(d2k_session_plans(sess),
+            (const uint8_t *)"id.example", 10, 1010, replacement), "reinstall before pump");
+
         d2k_ctlsrv_pump(c, sess, &seen);
         d2k_ctl_flush(c);
 
@@ -1479,9 +1500,10 @@ int main(void) {
                 continue;
             }
             found = 1;
-            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN),
+            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN + D2K_CTL_EXECUTION_LEN),
                   "тело APPLIED не содержит Plan ID и trial ID фиксированной ширины");
-            if (n == (ssize_t)(D2K_KEY_WIRE_LEN + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN)) {
+            if (n == (ssize_t)(D2K_KEY_WIRE_LEN + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN + D2K_CTL_EXECUTION_LEN)) {
+                check_execution(ev + D2K_KEY_WIRE_LEN + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN, &r);
                 CHECK(memcmp(ev + D2K_KEY_WIRE_LEN, want_id, sizeof want_id) == 0,
                       "идентификатор на проводе не тот, что приехал записью REC_ID");
                 CHECK(memcmp(ev + D2K_KEY_WIRE_LEN + D2K_PLAN_ID_LEN,
@@ -1592,7 +1614,7 @@ int main(void) {
             if (type != D2K_EV_REFUSED) {
                 continue;
             }
-            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 2 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN),
+            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 2 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN + D2K_CTL_EXECUTION_LEN),
                   "тело REFUSED не содержит код, Plan ID и trial ID");
             if (n < (ssize_t)(D2K_KEY_WIRE_LEN + 1)) {
                 continue;
@@ -1605,13 +1627,19 @@ int main(void) {
                 seen_damaged = 1;
                 /* Идентичность обязана доехать: без неё повреждение нельзя
                    приписать ни попытке, ни плану. */
-                CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 2 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN),
+                CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 2 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN + D2K_CTL_EXECUTION_LEN),
                       "повреждение приехало без Plan ID/trial ID");
                 int nonzero = 0;
                 for (int b = 0; b < 16; b++) {
                     if (ev[D2K_KEY_WIRE_LEN + 1 + b]) { nonzero = 1; }
                 }
                 CHECK(nonzero, "идентификатор плана у повреждения нулевой");
+            }
+            if (n == (ssize_t)(D2K_KEY_WIRE_LEN + 2 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN + D2K_CTL_EXECUTION_LEN)) {
+                const d2k_result empty = {0};
+                const d2k_result *want = ev[D2K_KEY_WIRE_LEN] == D2K_REFUSE_NONE ? &empty :
+                    ev[D2K_KEY_WIRE_LEN] == D2K_REFUSE_TOO_LONG ? &r : &rd;
+                check_execution(ev + D2K_KEY_WIRE_LEN + 2 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN, want);
             }
         }
         CHECK(seen_plain, "обычный отказ применить план приехал не с нулевым кодом");

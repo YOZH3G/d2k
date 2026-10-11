@@ -40,6 +40,25 @@
 
 static uint8_t g_scratch[D2K_CTL_FRAME_MAX + HDR];
 
+/* Absence is unknown, a truncated extension is malformed. This context is
+ * process-local and cannot by itself establish live/application success. */
+static int execution_context(d2k_ev *out, const uint8_t *p, size_t n) {
+    if (!n) return 0;
+    if (n != D2K_CTL_EXECUTION_LEN || p[16] > D2K_BIND_FLOW ||
+        (p[17] && p[17] != 4 && p[17] != 6) ||
+        p[18] > D2K_PLAN_SHAPE_HTTP || p[19] > 1) return -1;
+    for (unsigned b = 0; b < 8; b++) {
+        out->execution_id = (out->execution_id << 8) | p[b];
+        out->execution_binding.generation =
+            (out->execution_binding.generation << 8) | p[8+b];
+    }
+    out->execution_binding.kind = p[16];
+    out->execution_binding.family = p[17];
+    out->execution_binding.shape = p[18];
+    out->execution_binding.temporary = p[19];
+    return 0;
+}
+
 static void say(char *err, size_t cap, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 
@@ -407,6 +426,11 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         if (rlen >= D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN) {
             memcpy(out->trial_id, rest + D2K_PLAN_ID_LEN, D2K_TRIAL_ID_LEN);
         }
+        if (execution_context(out, rest + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN,
+                              rlen - D2K_PLAN_ID_LEN - D2K_TRIAL_ID_LEN)) {
+            say(err, errcap, "повреждён контекст исполнения APPLIED");
+            return -1;
+        }
         break;
     case D2K_EV_PROTO:
         if (rlen > 6) {
@@ -454,6 +478,12 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         memcpy(out->trial_id, rest + 1 + D2K_PLAN_ID_LEN, D2K_TRIAL_ID_LEN);
         if (rlen > 1+D2K_PLAN_ID_LEN+D2K_TRIAL_ID_LEN)
             out->client_shape = rest[1+D2K_PLAN_ID_LEN+D2K_TRIAL_ID_LEN];
+        if (rlen > 2+D2K_PLAN_ID_LEN+D2K_TRIAL_ID_LEN &&
+            execution_context(out, rest + 2+D2K_PLAN_ID_LEN+D2K_TRIAL_ID_LEN,
+                              rlen - 2-D2K_PLAN_ID_LEN-D2K_TRIAL_ID_LEN)) {
+            say(err, errcap, "повреждён контекст исполнения REFUSED");
+            return -1;
+        }
         break;
     default:
         /* Вид события, которого этот модуль пока не разбирает глубже, —

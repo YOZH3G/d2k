@@ -220,6 +220,39 @@ static d2k_ev ev_with_seen(uint8_t seen_types) {
 }
 
 int main(void) {
+    /* Independent wire fixture: high bytes, both fates, every truncated tail. */
+    for (unsigned refused = 0; refused < 2; refused++) {
+        int sv[2];
+        CHECK(!socketpair(AF_UNIX, SOCK_STREAM, 0, sv), "execution context socketpair");
+        const size_t base = refused ? 34u : 32u;
+        uint8_t rest[54] = {0};
+        uint8_t *p = rest + base;
+        for (unsigned b = 0; b < 8; b++) { p[b] = 1+b; p[8+b] = 0x81+b; }
+        p[16] = D2K_BIND_FLOW; p[17] = 6; p[18] = D2K_PLAN_SHAPE_QUIC; p[19] = 1;
+        d2k_ev ev; char err[128];
+        const uint16_t kind = refused ? D2K_EV_REFUSED : D2K_EV_APPLIED;
+        send_synthetic(sv[0], kind, rest, base + D2K_CTL_EXECUTION_LEN);
+        CHECK(!d2k_link_next(sv[1], &ev, 100, err, sizeof err) &&
+              ev.execution_id == UINT64_C(0x0102030405060708) &&
+              ev.execution_binding.generation == UINT64_C(0x8182838485868788) &&
+              ev.execution_binding.kind == D2K_BIND_FLOW && ev.execution_binding.family == 6 &&
+              ev.execution_binding.shape == D2K_PLAN_SHAPE_QUIC && ev.execution_binding.temporary == 1,
+              "execution context endian/IPv6/probe fields lost");
+        for (size_t tail = 1; tail < D2K_CTL_EXECUTION_LEN; tail++) {
+            send_synthetic(sv[0], kind, rest, base + tail);
+            CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == -1,
+                  "truncated execution context accepted");
+        }
+        p[17] = 5;
+        send_synthetic(sv[0], kind, rest, base + D2K_CTL_EXECUTION_LEN);
+        CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == -1,
+              "invalid execution family accepted");
+        send_synthetic(sv[0], kind, rest, base);
+        CHECK(!d2k_link_next(sv[1], &ev, 100, err, sizeof err) &&
+              !ev.execution_id && !ev.execution_binding.generation,
+              "legacy frame fabricated execution context");
+        close(sv[0]); close(sv[1]);
+    }
     /* v10 (задача 51): вставка провайдера в HTTP и имя с HTTPS. */
     {
         int sv[2];
@@ -1057,6 +1090,24 @@ int main(void) {
         CHECK(ack.code == D2K_CMD_SET_NAME, "ack не на команду SET_NAME");
         CHECK(((ack.num >> 8) & 0xFFu) == 1, "годная команда подтверждена как отвергнутая");
         CHECK((ack.num & 0xFFu) == D2K_ACK_OK, "у успеха причина не D2K_ACK_OK");
+
+        d2k_ev first = {0}, second = {0};
+        (void)probe_say(&p, "hello ok.example");
+        CHECK(!next_of_kind(fd, D2K_EV_APPLIED, 8, &first, e2, sizeof e2),
+              "bound execution did not reach controller");
+        CHECK(first.execution_id && first.execution_binding.generation &&
+              first.execution_binding.kind == D2K_BIND_NAME &&
+              first.execution_binding.family == 4 && !first.execution_binding.temporary,
+              "Session/journal/control/link lost execution binding");
+        CHECK(!d2k_link_set_name(fd, "ok.example", 6, tiny_hex,
+              D2K_LINK_SHAPE_GRANDFATHER, e1, sizeof e1), "same plan reinstall");
+        CHECK(!next_of_kind(fd, D2K_EV_ACK, 8, &ack, e2, sizeof e2), "reinstall ACK");
+        (void)probe_say(&p, "hello ok.example");
+        CHECK(!next_of_kind(fd, D2K_EV_APPLIED, 8, &second, e2, sizeof e2), "reinstalled execution");
+        CHECK(second.execution_id != first.execution_id &&
+              second.execution_binding.generation != first.execution_binding.generation &&
+              !memcmp(first.plan_id, second.plan_id, sizeof first.plan_id),
+              "same hash reinstall collapsed distinct execution generations");
     }
 
     /* --- SET_NAME с негодным планом — ack ok=0, причина D2K_ACK_BAD_PLAN --- */

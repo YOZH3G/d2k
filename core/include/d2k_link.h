@@ -157,6 +157,8 @@ typedef struct {
      * и его нельзя приписать кандидату. */
     uint8_t  plan_id[D2K_PLAN_ID_LEN];
     uint8_t  trial_id[D2K_TRIAL_ID_LEN];
+    uint64_t execution_id; /* APPLIED/REFUSED: snapshot from the executed plan */
+    d2k_binding_context execution_binding; /* process-local; not application proof */
     uint64_t live_execution; /* HTTP_PORTAL: completed request execution, 0 = unbound */
     uint64_t live_request_ms; /* monotonic start on the same host as controller */
     char live_http_path[1024]; /* replayable GET path; never cookies/query credentials */

@@ -71,7 +71,12 @@
 /* v13: mandatory release ID after send limit: u8 length + 1..64 bytes. */
 /* v14: HTTP_PORTAL carries execution, plan/trial identity, monotonic request
  * start and the replayable GET path (no query); zero context is not proof. */
-#define D2K_CTL_PROTO_VERSION 14
+/* v15: APPLIED/REFUSED append the immutable process-local execution binding. */
+#define D2K_CTL_PROTO_VERSION 15
+
+/* Execution ID u64 BE, binding generation u64 BE, kind/family/shape/temporary.
+ * Process-local identity only; not sufficient for cross-restart live proof. */
+#define D2K_CTL_EXECUTION_LEN 20u
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */

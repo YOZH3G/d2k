@@ -628,6 +628,17 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             continue;
         }
         if (type == D2K_EV_REFUSED) body[n++] = d2k_session_client_shape(s, &e->key);
+        if (type == D2K_EV_APPLIED || type == D2K_EV_REFUSED) {
+            /* Snapshot from journal, never the current plan-table entry. */
+            for (unsigned b = 0; b < 8; b++)
+                body[n++] = (uint8_t)(e->execution_id >> (56 - 8*b));
+            for (unsigned b = 0; b < 8; b++)
+                body[n++] = (uint8_t)(e->binding.generation >> (56 - 8*b));
+            body[n++] = e->binding.kind;
+            body[n++] = e->binding.family;
+            body[n++] = e->binding.shape;
+            body[n++] = e->binding.temporary;
+        }
         d2k_ctl_event(ctl, type, body, n);
     }
 }
