@@ -12132,6 +12132,8 @@ measured_test:
             CHECK(!sent_contains_plan_payload("hcaptcha.com") && !said("fake-SNI"),
                   "t37: RX fake-SNI-лестница пошла без замеренного RX-обрыва");
             if (mode == 0) {
+                CHECK(said("outcome=failed path=fallback") && said("live=unknown"),
+                      "t37: failed fallback has no final search summary");
                 CHECK(said("НАЙДЕН замером"),
                       "t37: после неудачи сохранённого плана не испытан приём, найденный замером");
                 CHECK(said("путь: перебор"),
@@ -12172,6 +12174,9 @@ measured_test:
                 CHECK(said("запасного перебора") && used > 1,
                       "t37: без выразимого плана запасной список не испытан");
             } else if (mode == 7) {
+                CHECK(said("outcome=probe-confirmed path=fallback") &&
+                      said("live=unknown") && said("elapsed_ms=") && said("queue_ms="),
+                      "t37: detect fallback success has no cost/proof-scoped summary");
                 CHECK(ver_calls == 2 && said("ПОДТВЕРЖДЕНО собственным зондом") &&
                       !said("измеренный кандидат не подтвердился на применённом потоке") &&
                       !said("запасного перебора"),
@@ -12196,6 +12201,52 @@ measured_test:
         tcp_answer = D2K_V_OPAQUE; tcp_owns_search = tcp_found_arm = 0;
         tcp_trace_lines = 0;
         ver_answer = D2K_VER_APPLICATION;
+
+        /* A direct result must not acquire the generic task_fail label;
+           resting cleanup and shutdown must not emit it a second time. */
+        {
+            d2k_catalog c = {0};
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            tcp_answer = D2K_V_CLEAR;
+            spin(s, 1);
+            d2k_ev h = ev_hello(6, 42429, "summary-direct.example");
+            d2k_ev su = ev_suspect(6, 42429);
+            d2k_sched_event(s, &h); d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(said("outcome=probe-direct path=direct") && !said("outcome=failed"),
+                  "summary: direct success was lost or reported as failure");
+            d2k_sched_free(s);
+            const char *row = strstr(saidbuf, "итог поиска:");
+            CHECK(row && !strstr(row + 1, "итог поиска:"),
+                  "summary: terminal outcome duplicated on cleanup");
+            d2k_catalog_free(&c);
+            tcp_answer = D2K_V_OPAQUE;
+        }
+
+        {
+            d2k_catalog c = {0};
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            tcp_block_until_stop = 1;
+            spin(s, 1);
+            for (uint16_t i = 0; i < 2; i++) {
+                d2k_ev h = ev_hello(6, (uint16_t)(42427 + i),
+                    i ? "summary-queued.example" : "summary-active.example");
+                d2k_ev su = ev_suspect(6, (uint16_t)(42427 + i));
+                d2k_sched_event(s, &h); d2k_sched_event(s, &su);
+            }
+            skip_ahead(s, 100); /* still inside the 250 ms admission gap */
+            d2k_sched_free(s);
+            const char *row = strstr(saidbuf, "target=summary-queued.example");
+            CHECK(row && strstr(row, "outcome=shutdown path=none") &&
+                  strstr(row, "elapsed_ms=100 queue_ms=100 live=unknown"),
+                  "summary: shutdown omitted queued work or lost queue time");
+            tcp_block_until_stop = 0;
+            d2k_catalog_free(&c);
+        }
 
         /* F3: клиент — MQTT поверх TLS 1.3 (ALPN «mqtt», «mqttv5»). Зонд
            подтверждения предлагает ЕГО ALPN, а не http/1.1, и засчитывает
@@ -12244,6 +12295,9 @@ measured_test:
             CHECK(ver_calls == 0, "t37/F3: для не-HTTP клиента позван HTTP-зонд");
             CHECK(said("ПОДТВЕРЖДЕНО собственным зондом на уровне рукопожатия"),
                   "t37/F3: рукопожатие с ALPN клиента не подтвердило план");
+            CHECK(said("outcome=probe-confirmed path=property") &&
+                  said("live=unknown") && !said("elapsed_ms=-1"),
+                  "t37/F3: property summary loses clock or claims live proof");
             const d2k_cat_binding *bd = binding_of(&c, nm, 6);
             CHECK(bd && bd->verified_by == D2K_VERBY_PROBE_HANDSHAKE,
                   "t37/F3: привязка не помечена уровнем рукопожатия (выдана за приложение)");

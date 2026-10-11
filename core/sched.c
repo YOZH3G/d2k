@@ -612,6 +612,10 @@ typedef struct {
     unsigned   hot_count;
     int64_t    rest_until_ms;
     int        probes;
+    uint64_t   report_id;
+    int        report_closed;
+    int64_t    report_admitted_ms; /* -1 until scheduler time is known */
+    int64_t    report_queue_ms;
 
     /* ГОЛОС/АДРЕСНЫЙ UDP: поток, к которому применился приём, и наблюдения.
        Обратная датаграмма не доказывает протокольный или прикладной успех.
@@ -1204,6 +1208,7 @@ struct d2k_sched {
     size_t       limit_logged;      /* последний названный в журнале предел */
     unsigned     limiter_logged;    /* и причина */
     size_t       meas_limit;
+    uint64_t     report_sequence;
 
     /* Проход по каталогу, разложенный на порции (см. d2k_sched_sync_step):
        где остановились и просили ли начать заново. */
@@ -3161,7 +3166,11 @@ static void ver_close(task *t) {
 /* Единственное место, где задача обнуляется. Не memset на месте: у неё есть
    поле, чей «пусто» не ноль (см. prop_close выше), и разложить это по всем
    точкам сброса значило бы завести столько же мест, где про него забудут. */
-static void task_reset(task *t) {
+static void search_report(d2k_sched *s, task *t, int64_t now_ms,
+                          const char *outcome, const char *path);
+
+static void task_reset(d2k_sched *s, task *t) {
+    search_report(s, t, s->now_ms, "local-abort", NULL);
     if (t->prop_bound_fd > 0) { close(t->prop_bound_fd); }
     /* СТРОГО БОЛЬШЕ НУЛЯ. Задачи живут в занулённом массиве, и при самом
        первом сбросе здесь лежит ноль — не «сокет номер ноль», а «поля ещё не
@@ -3310,6 +3319,7 @@ static void quic_deny_install(d2k_sched *s, task *t, int64_t now_ms);
 static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     t->partial_valid = 0; /* поиск кончился — его частичный обход ему и принадлежал */
     join_worker(t);
+    search_report(s, t, now_ms, "failed", NULL);
     contact_close(t);
     if (t->transport == 17 && t->stall_cut) {
         t->stall_cut = 0;
@@ -3436,7 +3446,7 @@ static int quic_deny_active(const d2k_sched *s, const char *name, uint8_t family
 }
 
 static int launch_or_queue(d2k_sched *s, task *t);
-static void task_done(task *t);
+static void task_done(d2k_sched *s, task *t);
 static task *task_of(d2k_sched *s, const char *name, uint8_t transport, uint8_t family);
 static task *task_free_slot(d2k_sched *s);
 
@@ -3445,11 +3455,11 @@ static task *task_free_slot(d2k_sched *s);
 static int quic_deny_recheck(d2k_sched *s, quic_deny_slot *q) {
     task *t = task_of(s, q->name, 17, q->family);
     if (t && t->state != T_RESTING) return 1;      /* поиск по имени уже идёт */
-    if (t) { task_done(t); }
+    if (t) { task_done(s, t); }
     if (!q->trig_len || !q->ip[0]) return 0;
     t = task_free_slot(s);
     if (!t) return 0;
-    task_reset(t);
+    task_reset(s, t);
     snprintf(t->name, sizeof t->name, "%s", q->name);
     t->transport = 17;
     t->family = q->family;
@@ -3496,12 +3506,13 @@ static void quic_deny_tick(d2k_sched *s, int64_t now_ms) {
     }
 }
 
-static void task_done(task *t) {
+static void task_done(d2k_sched *s, task *t) {
     join_worker(t);
+    search_report(s, t, s->now_ms, "cancelled", NULL);
     contact_close(t);
     prop_close(t);
     ver_close(t);
-    task_reset(t);
+    task_reset(s, t);
     t->state = T_FREE;
 }
 
@@ -5070,6 +5081,7 @@ void d2k_sched_free(d2k_sched *s) {
             (void)addr_probe_remove(s, &s->tasks[i], err, sizeof err);
         }
         join_worker(&s->tasks[i]);
+        search_report(s, &s->tasks[i], s->now_ms, "shutdown", NULL);
         /* Сокеты обращений закрываем сами: поток к этому моменту уже вернулся,
            а дескриптор принадлежит задаче, а не ему. */
         contact_close(&s->tasks[i]);
@@ -5714,7 +5726,7 @@ static int start_search(d2k_sched *s, task *t) {
                    "мерить до снимка нечем", t->name);
             return 1;
         }
-        task_reset(t);
+        task_reset(s, t);
         return 0;
     }
     select_resource_path(s, t);
@@ -5836,7 +5848,7 @@ static int start_search(d2k_sched *s, task *t) {
         t->asked_shape = t->ech_offer ? D2K_LINK_SHAPE_ECH_TCP :
             (uint8_t)d2k_hello_shape(t->trig, t->trig_len);
         if (start_worker(s, t, JOB_CLASSIFY) != 0) {
-            task_reset(t);
+            task_reset(s, t);
             return 0;
         }
         say(s, "по %s позднее закрытие: сначала проверяю только повторяемый обрыв входящего ответа",
@@ -5859,7 +5871,7 @@ static int start_search(d2k_sched *s, task *t) {
     t->asked_shape = t->ech_offer ? D2K_LINK_SHAPE_ECH_TCP :
         (uint8_t)(t->transport == 17 ? D2K_SHAPE_UNKNOWN : d2k_hello_shape(t->trig, t->trig_len));
     if (start_worker(s, t, JOB_CLASSIFY) != 0) {
-        task_reset(t);
+        task_reset(s, t);
         return 0;
     }
     say(s, "по %s (%s) начинаю поиск: %s:%u, приветствие %zu байт%s",
@@ -6046,7 +6058,7 @@ static void voice_start(d2k_sched *s, task *t) {
     t->state = T_VOICE_MEASURE;
     if (start_worker(s, t, JOB_VOICE) != 0) {
         say(s, "по %s голосовой C-замер не запустился", t->name);
-        task_reset(t);
+        task_reset(s, t);
         return;
     }
     say(s, "по %s (голос) запускаю C-замер живого потока и перебор исходных приманок",
@@ -6062,6 +6074,14 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
     t->voice_discovery_verified = r.discovery_verified;
 
     if (r.verdict != D2K_VOICE_BLOCKED) {
+        /* CLEAR does not identify whether the known prefix or the subsequent
+         * bare Discovery probe succeeded. Do not infer its source from cache. */
+        search_report(s, t, now_ms,
+            r.verdict == D2K_VOICE_CLEAR
+                ? (t->voice_known_prefix_valid ? "probe-clear" : "probe-direct")
+                : "inconclusive",
+            r.verdict == D2K_VOICE_CLEAR
+                ? (t->voice_known_prefix_valid ? "unknown" : "direct") : "none");
         if (t->voice_known_prefix_valid && r.verdict == D2K_VOICE_CLEAR) {
             say(s, "по %s (голос) сохраняю подтверждённый приём: %s", t->name, r.reason);
         } else say(s, "по %s (голос) временный Plan не ставлю: измерение не подтвердило "
@@ -6483,6 +6503,8 @@ static int family_recovery_start(d2k_sched *s, task *t) {
 }
 
 static int launch_task(d2k_sched *s, task *t) {
+    if (t->state == T_QUEUED && s->clock_seen && s->now_ms >= t->queued_ms)
+        t->report_queue_ms += s->now_ms - t->queued_ms;
     t->started_ms = s->clock_seen ? s->now_ms : 0;
     /* Новый поиск (перемер по снимку и т.п.) считает время с себя. Переход
        «свои планы → полный замер» сюда не приходит (own_first_continue зовёт
@@ -6510,6 +6532,12 @@ static int launch_task(d2k_sched *s, task *t) {
 }
 
 static int launch_or_queue(d2k_sched *s, task *t) {
+    if (!t->report_id || t->report_closed) {
+        t->report_id = ++s->report_sequence;
+        t->report_closed = 0;
+        t->report_admitted_ms = s->clock_seen ? s->now_ms : -1;
+        t->report_queue_ms = 0;
+    }
     size_t active = measurements_in_flight(s);
     /* Before the first scheduler tick, model time is intentionally unknown.
        Do not stamp a start at zero and later compare it with the first real
@@ -6523,7 +6551,8 @@ static int launch_or_queue(d2k_sched *s, task *t) {
         if (queued_measurements(s) >= SCHED_MAX_QUEUED_MEASUREMENTS) {
             say(s, "по %s измерение не поставлено: ограниченная очередь заполнена; "
                    "следующий поток снова сможет поднять подозрение", t->name);
-            task_reset(t);
+            search_report(s, t, s->now_ms, "queue-full", "none");
+            task_reset(s, t);
             return 0;
         }
         t->state = T_QUEUED;
@@ -6621,6 +6650,7 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     s->sync_pending = 1;
     say(s, "по %s (%s) ПОДТВЕРЖДЕНО протокольным ответом: %s",
         t->name, is_stun ? "STUN" : "голос", plan_id);
+    search_report(s, t, now_ms, is_stun ? "stun-confirmed" : "discovery-confirmed", NULL);
 }
 
 static void voice_fail(d2k_sched *s, task *t, int64_t now_ms) {
@@ -6755,7 +6785,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
                "разговора — снимаю ждущий опыт (не проверено, кандидат не судим) "
                "и меряю новую точку", t->name, srv, (unsigned)sport);
         trial_retire(s, t);
-        task_done(t);
+        task_done(s, t);
         t = NULL;
     }
     if (t && t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
@@ -6809,7 +6839,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
                watcher with a targeted measurement task. */
             say(s, "по %s позднее закрытие после app-data — проверяю повторяемость обрыва ответа",
                 t->name);
-            task_done(t);
+            task_done(s, t);
             t = NULL;
         }
     }
@@ -6867,18 +6897,18 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         }
         say(s, "по %s подозрение при подтверждённом плане — наблюдение прекращаю",
             t->name);
-        task_done(t);
+        task_done(s, t);
         return 0;
     }
     t = task_free_slot(s);
     if (!t) {
         t = task_watching_slot(s);
-        if (t) { task_done(t); }
+        if (t) { task_done(s, t); }
     }
     if (!t) {
         return 0; /* мест нет — подозрение придёт снова, датапат не молчит */
     }
-    task_reset(t);
+    task_reset(s, t);
     snprintf(t->name, sizeof t->name, "%s", name);
     t->transport = ev->transport;
     t->family = ev->family ? ev->family : 4;
@@ -6905,7 +6935,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         say(s, "по %s отдельный поиск не запускаю: совместимое семейство уже установлено; "
                "новый поток наследует его план (форма %u, IPv%u)",
             t->name, (unsigned)t->trigger_shape, (unsigned)t->family);
-        task_reset(t);
+        task_reset(s, t);
         return 0;
     }
     say(s, "по %s источник нового замера: подозрение %u, исполнение плана %u, форма %u, IPv%u",
@@ -6977,6 +7007,7 @@ static int quic_own_initial(const d2k_sched *s, const task *t,
 
 static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_t len) {
     if (len == 0 || len > sizeof t->trig) { return; }
+    search_report(s, t, s->now_ms, "superseded", NULL);
     /* Байты могут лежать в самой задаче (t->snap): memmove, и копия
        гасится — перемер у задачи один. */
     memmove(t->trig, bytes, len);
@@ -7412,6 +7443,48 @@ static const char *candidate_path(const task *t) {
     return "вывод из замера";
 }
 
+/* One terminal row per admitted search, including failures. These are the
+   existing scheduler accounting units, not a count of wire packets. They
+   include measurement progress and candidate/question trials; a single
+   verifier can perform more than one connection. Never label this as live
+   application proof. Cross-search/run aggregation is a separate layer. */
+static void search_report(d2k_sched *s, task *t, int64_t now_ms,
+                          const char *outcome, const char *path) {
+    if (!t->report_id || t->report_closed) return;
+    t->report_closed = 1;
+    if (!s->say_fn) return;
+    if (!path) {
+        path = "none";
+        if (t->next_plan && t->next_plan <= t->n_plans) {
+            const char *p = candidate_path(t);
+            path = !strcmp(p, "свой план") || t->own_first == 2 ? "own-plan" :
+                   !strcmp(p, "перебор") || !strcmp(p, "RX-лестница") ? "fallback" : "property";
+        }
+    }
+    pthread_mutex_lock(&s->mu);
+    int measured = t->ask_probes;
+    pthread_mutex_unlock(&s->mu);
+    int64_t elapsed = t->report_admitted_ms >= 0 && now_ms >= t->report_admitted_ms
+        ? now_ms - t->report_admitted_ms : -1;
+    int64_t queued = t->report_queue_ms;
+    if (t->state == T_QUEUED && s->clock_seen && now_ms >= t->queued_ms)
+        queued += now_ms - t->queued_ms;
+    char line[1024];
+    const char *proto = t->transport == 6 ? "tcp" :
+        !strcmp(outcome, "stun-confirmed") ? "stun" :
+        !strcmp(outcome, "discovery-confirmed") ? "discovery" :
+        is_voice_class(t->name, t->transport) || t->trigger_shape == D2K_LINK_SHAPE_VOICE
+            ? "udp" : "quic";
+    snprintf(line, sizeof line,
+        "итог поиска: search=%llu target=%s protocol=%s family=%u "
+        "outcome=%s path=%s probe_units=%lld accounting=scheduler "
+        "elapsed_ms=%lld queue_ms=%lld live=unknown",
+        (unsigned long long)t->report_id, t->name, proto,
+        (unsigned)t->family, outcome, path, (long long)t->probes + measured,
+        (long long)elapsed, (long long)queued);
+    s->say_fn(s->say_ctx, line);
+}
+
 static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     const char *text = t->plans[t->next_plan - 1];
     char plan_id[40], box_id[40];
@@ -7689,6 +7762,9 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        каталога ниже). Пробная запись порта зонда своё отслужила и снимается
        точно (задача 20): прежде trial_installed просто обнулялся, и запись
        по уже свободному порту стояла до LRU, вытесняя подтверждённое. */
+    search_report(s, t, now_ms,
+                  t->partial_finishing || t->ver.budget == D2K_BUDGET_CUT
+                      ? "probe-partial" : "probe-confirmed", transferred ? "own-plan" : NULL);
     trial_retire(s, t);
     ver_close(t);
     t->state = T_WATCHING;
@@ -8183,7 +8259,7 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
            "работы приложения клиента — уровень и источник подтверждения не меняются",
         t->name, (unsigned)ev->num);
     /* Освобождаем задачу наблюдения. Подтверждённый план остаётся стоять. */
-    task_done(t);
+    task_done(s, t);
 }
 
 int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
@@ -8261,7 +8337,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
                            "местный отказ, опыта не было, кандидат не судим",
                         t->name, (unsigned)(ev->num & 0xffu));
                     trial_retire(s, t);
-                    task_done(t);
+                    task_done(s, t);
                 }
             }
         }
@@ -8538,6 +8614,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         s->clock_seen = 1;
         s->mono_base_ms = now_ms;
         s->wall_base_s = (int64_t)time(NULL);
+        for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+            task *t = &s->tasks[i];
+            if (t->report_id && !t->report_closed && t->report_admitted_ms < 0)
+                t->report_admitted_ms = now_ms;
+        }
         /* Events may beat the first timer tick. Their local zero timestamp
            is provisional; rebase admission pacing when the clock becomes
            meaningful so uptime/model-clock differences cannot release the
@@ -8578,7 +8659,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (queued_family_ready(s,t)) {
                 say(s,"по %s прежнюю очередь снимаю: новое семейство уже установлено; "
                       "следующий поток наследует обход без отдельного замера",t->name);
-                task_done(t); moved++; continue;
+                task_done(s, t); moved++; continue;
             }
             /* Срок — ДО приоритета восстановления семейства (задача 24):
                приоритет решает, кому достанется слот, а не продлевает жизнь
@@ -8587,7 +8668,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (now_ms - t->queued_ms > SCHED_TASK_LIFE_MS) {
                 say(s, "по %s подозрение устарело в очереди — сетевой замер не запускал",
                     t->name);
-                task_done(t);
+                task_done(s, t);
                 moved++;
                 continue;
             }
@@ -8597,7 +8678,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         }
 
         if (t->state == T_RESTING) {
-            if (now_ms >= t->rest_until_ms) { task_done(t); moved++; }
+            if (now_ms >= t->rest_until_ms) { task_done(s, t); moved++; }
             continue;
         }
         if (t->started_ms == 0) { t->started_ms = now_ms; }
@@ -8609,12 +8690,12 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                    вслух по журналу. */
                 say(s, "по %s (QUIC) формы приветствия так и не пришло — мерить нечем",
                     t->name);
-                task_done(t);
+                task_done(s, t);
             } else if (t->state == T_WATCHING) {
                 /* Наблюдение за живым трафиком кончилось ничем — и это НЕ
                    неудача: план уже подтверждён зондом и записан, снимать его
                    (task_fail) не за что. Просто освобождаем место. */
-                task_done(t);
+                task_done(s, t);
             } else if (t->own_first == 2) {
                 /* СРОК ФАЗЫ СВОИХ ПЛАНОВ (финальное ревью core, I2). Фаза
                    своих планов идёт на сроке запуска; упёршись в него, она
@@ -8648,7 +8729,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                    кандидата никто не судил (финальное ревью, п.1). Новый
                    замер возможен только по новому подозрению из датапата. */
                 trial_retire(s, t);
-                task_done(t);
+                task_done(s, t);
             } else {
                 /* СРОК ЗАДАЧИ ИСТЁК — И ЕСЛИ ЗАМЕР ЕЩЁ ШЁЛ, ЭТО НАДО СКАЗАТЬ.
                    Иначе в журнале остаётся «поисков идёт 1» и тишина, а
@@ -8773,7 +8854,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (t->trigger_planned == D2K_LINK_PLANNED_NO && installed_family_ready(s, t, 0, 0)) {
                 say(s, "по %s снимок подтвердил совместимое установленное семейство; "
                        "отдельный поиск прекращаю без перебора", t->name);
-                task_done(t); moved++; continue;
+                task_done(s, t); moved++; continue;
             }
             remember_resources(s, t->vol.resources, t->vol.n_resources);
             /* ПРОГОН, ОСТАНОВЛЕННЫЙ РАДИ СНИМКА, — НЕ ВЕРДИКТ (задача 31).
@@ -8794,6 +8875,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     }
                     say(s, "по %s позднее закрытие не подтвердилось парными измерениями ответа; "
                            "перебор не запускаю", t->name);
+                    search_report(s, t, now_ms, "inconclusive", "none");
                     /* Не блок: неубедительный замер, как у прямого вердикта
                        без доказательства. Без cooldown здоровый трафик с
                        поздними RST повторял пару каждые две минуты. */
@@ -9006,6 +9088,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        "подбор и применение обхода не запускаю",
                     t->name, verdict_name(r.verdict), r.reason);
                 if (r.verdict == D2K_V_CLEAR) {
+                    search_report(s, t, now_ms, "probe-direct", "direct");
                     if (t->vol.rx_direct_complete) {
                         uint8_t shape = t->transport == 17 ? D2K_LINK_SHAPE_QUIC :
                             t->ech_offer ? D2K_LINK_SHAPE_ECH_TCP :
@@ -9023,6 +9106,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            "это временный ограничитель, а не запись в каталоге",
                         t->name, (long long)((delay_ms + 59999) / 60000));
                 } else {
+                    search_report(s, t, now_ms, "inconclusive", "none");
                     cooldown_record(s, t, 2);
                     say(s, "по %s результат неубедителен — повторный замер отложен на %lld мин",
                         t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));
