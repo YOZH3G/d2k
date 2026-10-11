@@ -424,38 +424,50 @@ static void test_https_table(void) {
     d2k_http80_free(h);
 }
 
-/* KEEP-ALIVE (поле 04.10.2026): первый запрос получил настоящий ответ, второй
-   запрос того же соединения — вставку. Узнавание и замена 307 — только для
-   первого ответа потока: на следующем запросе ни события, ни замены, ни
-   снятия пакетов, даже если имя с HTTPS. План имени покрывает такие запросы
-   сам (session.c); здесь — только «не сработать мимо». */
+/* Field h: a complete first response does not cover the next request.
+ * Retransmission and a request-looking body must not create another request. */
 static void test_keepalive_later(void) {
+    for (int v6 = 0; v6 < 2; v6++) {
+    for (int bound = 0; bound < 2; bound++) {
     d2k_http80 *h = d2k_http80_new();
     const uint64_t T = 7000 * MS;
-    CHECK(d2k_http80_set_https(h, "rutracker.org", 13, T + 3600 * 1000 * MS) == 0,
-          "имя с HTTPS не принято");
-    flow f = flow4(52000);
+    flow f = v6 ? flow6(52000) : flow4(52000);
     uint32_t req_end = CISN + 1 + (uint32_t)strlen(GET);
     open_flow(h, &f, T, GET);
+    uint8_t plan[16] = {0x42}, trial[16] = {0};
+    d2k_http80_executed(h, b, (v6 ? 60 : 40) + strlen(GET), T + 99 * MS, 71, plan, trial);
     static const char OK200[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     size_t n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, req_end, OK200, b);
-    PKT(h, b, n, T + 99 * MS + 98 * MS, &r);
-    CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "настоящий ответ принят за вставку");
+    PKT(h, b, n, T + 197 * MS, &r);
+    CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "real first response is neutral");
     uint32_t s2 = SISN + 1 + (uint32_t)strlen(OK200);
+    /* Old request retransmission must not disable observation of the next. */
+    n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
+    PKT(h, b, n, T + 250 * MS, &r);
     n = pkt(&f, 1, F_ACK | F_PSH, req_end, s2, GET, b);
     PKT(h, b, n, T + 300 * MS, &r);
-    CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "второй запрос соединения не прошёл как есть");
+    CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "second request passes unchanged");
+    if (bound) d2k_http80_executed(h, b, n, T + 300 * MS, 72, plan, trial);
+    n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
+    d2k_http80_executed(h, b, n, T + 300 * MS, 999, plan, trial);
     uint32_t req2_end = req_end + (uint32_t)strlen(GET);
     n = pkt(&f, 0, F_ACK | F_PSH | F_FIN, s2, req2_end, INJECT, b);
     PKT(h, b, n, T + 300 * MS + 500000ull, &r);
-    CHECK(!r.injection && r.action == D2K_HTTP80_PASS && r.len == 0,
-          "вставка на втором запросе соединения сработала узнаванием/заменой");
+    CHECK(r.injection && r.action == D2K_HTTP80_PASS && r.len == 0,
+          "live portal on second request must be reported, not silently ignored");
+    CHECK(!strcmp(r.host, "RuTracker.org"), "second request evidence retains target");
+    CHECK(!strcmp(r.request_path, "/forum/index.php"), "failed request path must survive live evidence");
+    CHECK(r.execution_id == (bound ? 72u : 0u) &&
+          (bound ? !memcmp(r.plan_id, plan, 16) : r.plan_id[0] == 0),
+          "portal must identify the completed execution of this request");
     PKT(h, b, n, T + 300 * MS + 600000ull, &r);
-    CHECK(r.action == D2K_HTTP80_PASS, "копия вставки на втором запросе снята");
+    CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "portal retransmission is not new evidence");
     d2k_http80_stats st = d2k_http80_get_stats(h);
-    CHECK(st.requests == 1 && st.injections == 0 && st.answered == 0 && st.dropped == 0,
-          "счётчики после второго запроса не те");
+    CHECK(st.requests == 2 && st.injections == 1 && st.answered == 0 && st.dropped == 0,
+          "both requests and exactly one portal must be counted");
     d2k_http80_free(h);
+    }
+    }
 }
 
 /* ПОЛЕ 04.10.2026, 13:17:59: Safari показал портал провайдера, а у d2kd
@@ -490,7 +502,7 @@ static void test_unseen_counted(void) {
     n = pkt(&k, 1, F_ACK | F_PSH, req_end, SISN + 1 + (uint32_t)strlen(OK200), GET, b);
     PKT(h, b, n, T + 300 * MS, &r);
     d2k_http80_stats st = d2k_http80_get_stats(h);
-    CHECK(st.requests == 1, "разобранных запросов не 1");
+    CHECK(st.requests == 2, "разобранных запросов не 2");
     CHECK(st.untracked == 1, "запрос соединения без SYN в таблице не сосчитан");
     CHECK(st.unparsed == 1, "запрос не целиком в первом сегменте не сосчитан");
     CHECK(st.later == 1, "следующий запрос соединения не сосчитан");

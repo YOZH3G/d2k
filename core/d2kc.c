@@ -662,6 +662,14 @@ int main(int argc, char **argv) {
                     case D2K_EV_APPLIED:  seen_applied++; break;
                     case D2K_EV_REFUSED:  seen_refused++; break;
                     case D2K_EV_HTTP_PORTAL:
+                        if (g_hs && ev.live_execution && ev.code == 0) {
+                            static const uint8_t no_trial[16];
+                            if (!memcmp(ev.trial_id, no_trial, sizeof no_trial)) {
+                                (void)d2k_httpsearch_bound_failure(g_hs, ev.name,
+                                    ev.family, ev.high_ip, ev.plan_id, ev.live_request_ms,
+                                    ev.live_http_path, now_ms());
+                            }
+                        }
                         if (hp) { http_portal(hp, fd, &ev, now_ms()); }
                         break;
                     default: break;

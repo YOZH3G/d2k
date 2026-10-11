@@ -157,6 +157,9 @@ typedef struct {
      * и его нельзя приписать кандидату. */
     uint8_t  plan_id[D2K_PLAN_ID_LEN];
     uint8_t  trial_id[D2K_TRIAL_ID_LEN];
+    uint64_t live_execution; /* HTTP_PORTAL: completed request execution, 0 = unbound */
+    uint64_t live_request_ms; /* monotonic start on the same host as controller */
+    char live_http_path[1024]; /* replayable GET path; never cookies/query credentials */
     /* SUSPECT: чем подозрительный пакет отличался от остальных в этом же
      * потоке. Из этих байт складывается ОТПЕЧАТОК коробки, и без них каталог
      * хранил бы факт «был сброс», по которому одну коробку от другой не

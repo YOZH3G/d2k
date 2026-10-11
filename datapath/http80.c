@@ -1,8 +1,8 @@
 /* http80.c — вставка провайдера в открытый HTTP (задача 51), см. d2k_http80.h.
  *
- * Только первые пакеты потоков порта 80; таблица фиксированного размера,
- * вытеснение самого давнего. Решение принимается на первом пакете сервера с
- * нагрузкой после запроса — дальше поток модулю неинтересен.
+ * Таблица фиксированного размера, вытеснение самого давнего. Решение
+ * принимается на первом пакете ответа каждого разобранного запроса.
+ * Следующий запрос узнаётся только на известной границе TCP-потока.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +16,7 @@ enum {
     ST_FREE = 0,
     ST_SYN,        /* видели SYN клиента */
     ST_OPEN,       /* видели SYN/ACK: RTT замерен, ISN сервера известен */
+    ST_IDLE,       /* ответ наблюдался; известна граница следующего запроса */
     ST_REQUEST,    /* видели запрос GET/HEAD целиком */
     ST_INJECTED,   /* вставка узнана и пропущена как есть */
     ST_SWAP,       /* 307 собран, ждёт d2k_http80_swap; пакеты проходят */
@@ -30,6 +31,11 @@ typedef struct {
     uint64_t t_syn, t_req, touched, rtt;
     uint64_t k_syn, k_req, krtt;   /* то же по меткам ядра; 0 — нет */
     uint32_t server_next, client_next;
+    uint32_t request_seq;
+    int next_known;
+    int request_get;
+    uint64_t execution_id;
+    uint8_t plan_id[16], trial_id[16];
     char host[256];
     char target[D2K_HTTP80_TARGET_MAX];
 } flow;
@@ -216,6 +222,22 @@ static flow *make(d2k_http80 *h, uint8_t family, const uint8_t *client, uint16_t
     return pick;
 }
 
+void d2k_http80_executed(d2k_http80 *h, const uint8_t *pkt, size_t len,
+    uint64_t now, uint64_t execution_id,
+    const uint8_t plan_id[16], const uint8_t trial_id[16]) {
+    d2k_packet_view v;
+    if (!h || !execution_id || !plan_id || !trial_id ||
+        !d2k_packet_parse(pkt, len, &v) || v.protocol != 6) return;
+    const uint8_t *tcp = pkt + v.l4;
+    if (d2k_packet_u16(tcp + 2) != 80) return;
+    flow *f = find(h, v.family, v.src.bytes, d2k_packet_u16(tcp),
+                   v.dst.bytes, 80, now);
+    if (!f || f->state != ST_REQUEST || f->request_seq != rd32(tcp + 4)) return;
+    f->execution_id = execution_id;
+    memcpy(f->plan_id, plan_id, 16);
+    memcpy(f->trial_id, trial_id, 16);
+}
+
 void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t now,
                        uint64_t ks,
                        uint8_t *out, size_t out_cap, uint8_t *rst, size_t rst_cap,
@@ -260,12 +282,25 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
         }
         f->touched = now;
         if (plen > 0 && f->state != ST_OPEN && f->state != ST_SYN) { h->st.later++; }
-        if (f->state == ST_OPEN && plen > 0) {
+        if ((f->state == ST_OPEN || f->state == ST_IDLE) && plen > 0) {
+            /* A retransmission cannot become a new request or erase its
+             * known boundary. A gap/overlap remains unclassified. */
+            if (seq != f->client_next) { return; }
+            d2k_http_req req;
             /* Первая нагрузка клиента — запрос целиком в одном пакете, ровно
                с начала потока. Кусок запроса не разобрать: решать не по чему. */
-            if (seq == f->client_next &&
-                d2k_httpup_request_target((const char *)pay, plen, f->host, sizeof f->host,
+            if (d2k_httpup_request_target((const char *)pay, plen, f->host, sizeof f->host,
                                           f->target, sizeof f->target)) {
+                f->next_known = d2k_http_request(pay, plen, &req) &&
+                    req.end_known && req.end == plen;
+                /* Client ACK gives the response sequence for this request,
+                 * including a preceding response spanning many segments. */
+                if (f->state == ST_IDLE) f->server_next = ack;
+                f->request_seq = seq;
+                f->request_get = plen >= 4 && !memcmp(pay, "GET ", 4);
+                f->execution_id = 0;
+                memset(f->plan_id, 0, sizeof f->plan_id);
+                memset(f->trial_id, 0, sizeof f->trial_id);
                 f->state = ST_REQUEST;
                 f->t_req = now;
                 f->k_req = ks;
@@ -301,7 +336,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
     if (plen == 0 || f->state != ST_REQUEST) { return; }
 
     /* Первый ответ сервера с нагрузкой: решение принимается здесь и один раз. */
-    f->state = ST_DONE;
+    f->state = f->next_known ? ST_IDLE : ST_DONE;
     uint64_t dt = now >= f->t_req ? now - f->t_req : 0;
     uint64_t rtt = f->rtt;
     if (f->krtt && f->k_req && ks >= f->k_req) {
@@ -325,6 +360,14 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
     r->server_port = f->sport;
     r->rtt_ns = rtt;
     r->reply_ns = dt;
+    r->execution_id = f->execution_id;
+    r->request_ms = f->t_req / 1000000u;
+    memcpy(r->plan_id, f->plan_id, sizeof r->plan_id);
+    memcpy(r->trial_id, f->trial_id, sizeof r->trial_id);
+
+    if (f->request_get && !strchr(f->target, '?') && !strchr(f->target, '#') &&
+        !strchr(f->target, '\\'))
+        memcpy(r->request_path, f->target, sizeof r->request_path);
     memcpy(r->host, f->host, sizeof r->host);
 
     if (!d2k_http80_https(h, f->host, now)) { return; }

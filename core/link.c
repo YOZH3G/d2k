@@ -300,6 +300,28 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         out->code = rest[0];
         memcpy(out->name, rest + 2, rest[1]);
         out->name[rest[1]] = '\0';
+        {
+            size_t off = 2u + rest[1];
+            if (rlen != off && rlen < off + 50) {
+                say(err, errcap, "вставка HTTP с обрезанным контекстом исполнения");
+                return -1;
+            }
+            if (rlen >= off + 50) {
+                size_t path_len = (size_t)rest[off + 48] << 8 | rest[off + 49];
+                if (path_len >= sizeof out->live_http_path || rlen != off + 50 + path_len) {
+                    say(err, errcap, "вставка HTTP с обрезанным контекстом запроса");
+                    return -1;
+                }
+                for (size_t i = 0; i < 8; i++)
+                    out->live_execution = (out->live_execution << 8) | rest[off + i];
+                memcpy(out->plan_id, rest + off + 8, 16);
+                memcpy(out->trial_id, rest + off + 24, 16);
+                for (size_t i = 0; i < 8; i++)
+                    out->live_request_ms = (out->live_request_ms << 8) | rest[off + 40 + i];
+                memcpy(out->live_http_path, rest + off + 50, path_len);
+                out->live_http_path[path_len] = '\0';
+            }
+        }
         break;
     case D2K_EV_SUSPECT:
         if (rlen < 1) {

@@ -231,6 +231,17 @@ int main(void) {
         CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == 0 &&
               ev.kind == D2K_EV_HTTP_PORTAL && ev.code == 1 &&
               strcmp(ev.name, "rutracker.org") == 0, "HTTP_PORTAL разобран не так");
+        uint8_t bound[sizeof rest + 50 + 7] = {0};
+        memcpy(bound, rest, sizeof rest);
+        bound[sizeof rest + 7] = 72;
+        bound[sizeof rest + 8] = 0x42;
+        bound[sizeof rest + 47] = 99;
+        bound[sizeof rest + 49] = 7;
+        memcpy(bound + sizeof rest + 50, "/False/", 7);
+        send_synthetic(sv[0], D2K_EV_HTTP_PORTAL, bound, sizeof bound);
+        CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == 0 &&
+              ev.plan_id[0] == 0x42 && ev.live_execution == 72 && ev.live_request_ms == 99 && !strcmp(ev.live_http_path, "/False/"),
+              "HTTP portal lost exact executed plan identity");
         const uint8_t cut[] = {0, 13, 'r','u'};
         send_synthetic(sv[0], D2K_EV_HTTP_PORTAL, cut, sizeof cut);
         CHECK(d2k_link_next(sv[1], &ev, 100, err, sizeof err) == -1,

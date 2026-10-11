@@ -6,11 +6,11 @@
  * не отвечает. Ответ, пришедший раньше, чем сервер физически мог ответить,
  * сервером не послан.
  *
- * Модуль видит первые пакеты HTTP-потока (очередь отдаёт по восемь в каждую
- * сторону) и узнаёт вставку по трём признакам сразу:
+ * Модуль видит начальное окно и последующие HTTP PSH-пакеты в обе стороны.
+ * Он узнаёт вставку по трём признакам сразу:
  *   1. ответ — 30x с Location на хост блокировки (метки как в
  *      d2k_httpup_portal_location), и этот хост не равен Host запроса;
- *   2. ответ стоит ровно в начале потока сервера (seq = ISN+1 из SYN/ACK) и
+ *   2. ответ стоит на ожидаемом клиентом seq (ACK текущего запроса) и
  *      подтверждает ровно конец запроса (ack);
  *   3. ответ пришёл раньше половины RTT, замеренного этим же потоком
  *      (SYN → SYN/ACK). Половина — запас на разброс: настоящий ответ не
@@ -47,7 +47,7 @@ typedef struct d2k_http80 d2k_http80;
 
 typedef struct {
     int action;            /* D2K_HTTP80_* */
-    int injection;         /* ЭТОТ пакет — первая узнанная вставка потока */
+    int injection;         /* ЭТОТ пакет — первая узнанная вставка запроса */
     int answered;          /* 307 ушёл клиенту (ставит d2k_http80_swap) */
     size_t flow;           /* REPLACE: чей поток (для d2k_http80_swap) */
     size_t len;            /* REPLACE: длина пакета в out */
@@ -57,13 +57,17 @@ typedef struct {
     uint16_t client_port, server_port;   /* хостовый порядок */
     uint64_t rtt_ns;       /* SYN → SYN/ACK этого потока */
     uint64_t reply_ns;     /* запрос → ответ */
+    uint64_t execution_id; /* completed live request execution, else zero */
+    uint64_t request_ms;   /* monotonic request start, generation boundary */
+    uint8_t plan_id[16], trial_id[16];
+    char request_path[D2K_HTTP80_TARGET_MAX]; /* safe GET path, empty = reproduction gap */
     char host[256];        /* Host запроса (без :80) */
     char portal[256];      /* хост из Location вставки */
 } d2k_http80_res;
 
 typedef struct {
     uint64_t requests;     /* разобранных запросов GET/HEAD */
-    uint64_t injections;   /* узнанных вставок (по потоку один раз) */
+    uint64_t injections;   /* узнанных вставок, без повторного счёта ретрансляции */
     uint64_t answered;     /* из них заменено на 307 */
     uint64_t swap_failed;  /* вердикт с заменой не принят — ушла вставка */
     uint64_t dropped;      /* снятых пакетов сервера после замены */
@@ -96,6 +100,12 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
                        uint64_t kstamp_ns,
                        uint8_t *out, size_t out_cap, uint8_t *rst, size_t rst_cap,
                        d2k_http80_res *r);
+
+/* Call only after all sends and the original verdict completed. The tuple
+ * and request sequence must still match the observed request. */
+void d2k_http80_executed(d2k_http80 *h, const uint8_t *pkt, size_t len,
+    uint64_t now_ns, uint64_t execution_id,
+    const uint8_t plan_id[16], const uint8_t trial_id[16]);
 
 /* Исполнение REPLACE (ревью I3) — обязательный второй шаг. Пока его не было,
  * поток ничьим не считается: ни RST, ни снятия копий. Порядок:

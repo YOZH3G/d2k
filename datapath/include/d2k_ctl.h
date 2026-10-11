@@ -69,7 +69,9 @@
  * Старый контроллер принял бы код 8 за обычное подозрение и пустил бы полный
  * поиск вместо узкого RX-замера с повторяемостью. */
 /* v13: mandatory release ID after send limit: u8 length + 1..64 bytes. */
-#define D2K_CTL_PROTO_VERSION 13
+/* v14: HTTP_PORTAL carries execution, plan/trial identity, monotonic request
+ * start and the replayable GET path (no query); zero context is not proof. */
+#define D2K_CTL_PROTO_VERSION 14
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */
@@ -119,7 +121,11 @@
 /* Вставка провайдера в открытый HTTP (задача 51): ключ потока (клиент и
  * сервер, порт 80), затем признак u8 (1 — клиенту ушёл 307 на https, 0 —
  * вставка пропущена как есть), длина имени u8 и Host запроса. Сообщение, а не
- * обязательство: по нему контроллер проверяет HTTPS имени. */
+ * обязательство: по нему контроллер проверяет HTTPS имени.
+ * v14 tail after Host: execution u64, plan[16], trial[16], request_ms u64,
+ * path_len u16, GET path[path_len]. Integers are big endian. Only completed
+ * live execution can carry nonzero execution. Empty path means that the
+ * failed request cannot be reproduced safely by the HTTP probe. */
 #define D2K_EV_HTTP_PORTAL 0x000B
 /* Подтверждение команды: тип команды u16, признак успеха u8, код причины u8
  * (значим только при признаке успеха 0, см. D2K_ACK_*).
