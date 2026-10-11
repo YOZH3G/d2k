@@ -36,9 +36,12 @@ static void live_flow(d2k_session *s,int family,uint16_t port,const char *host,i
     if(probe)d2k_session_packet_probe(s,pkt,n,1000000000,out,sizeof out,&r);
     else d2k_session_packet(s,pkt,n,1000000000,out,sizeof out,&r);
     char req[512];snprintf(req,sizeof req,"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: browser\r\n\r\n",host);
+    uint32_t next_seq=10001;
     if(trace)trace->n=0;
     for(unsigned request=0;request<2;request++) {
-    n=live_packet(family,port,10001+(uint32_t)(request*strlen(req)),0,req,pkt);
+    if(request)snprintf(req,sizeof req,"GET /False/ HTTP/1.1\r\nHost: %s\r\nUser-Agent: browser\r\n\r\n",host);
+    n=live_packet(family,port,next_seq,0,req,pkt);
+    next_seq+=(uint32_t)strlen(req);
     if(probe)d2k_session_packet_probe(s,pkt,n,1100000000,out,sizeof out,&r);
     else d2k_session_packet(s,pkt,n,1100000000,out,sizeof out,&r);
     if(!want){CHECK(!r.applied&&!r.n_out,"unbound live host unchanged");return;}

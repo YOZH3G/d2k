@@ -146,13 +146,17 @@ static d2k_hs_answer probe_local(const char *answer, int close_only, char *statu
     return r.answer;
 }
 
-typedef struct { int fd; const char *first, *second; } ka_srv;
+typedef struct { int fd; const char *first, *second; const char *path; int matched; } ka_srv;
 static void *serve_keepalive(void *arg) {
     ka_srv *v=arg; int c=accept(v->fd,NULL,NULL); if(c<0)return NULL;
     struct timeval tv={1,0}; setsockopt(c,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     char buf[2048];
     for(int i=0;i<2;i++) {
-        if(recv(c,buf,sizeof buf,0)<=0)break;
+        ssize_t got=recv(c,buf,sizeof buf,0);if(got<=0)break;
+        if(i==1) {
+            char expected[1100];int en=snprintf(expected,sizeof expected,"GET %s HTTP/1.1\r\n",v->path?v->path:"/");
+            v->matched=got>=en&&!memcmp(buf,expected,(size_t)en);
+        }
         struct timespec ts={0,20000000};nanosleep(&ts,NULL);
         const char *answer=i ? v->second : v->first;
         if(!answer)break;
@@ -161,21 +165,27 @@ static void *serve_keepalive(void *arg) {
     }
     close(c);return NULL;
 }
-static d2k_hs_result keepalive_local(const char *first,const char *second) {
-    ka_srv v={socket(AF_INET,SOCK_STREAM,0),first,second};
+static d2k_hs_result keepalive_path(const char *first,const char *second,const char *path) {
+    ka_srv v={socket(AF_INET,SOCK_STREAM,0),first,second,path,0};
     struct sockaddr_in a={0};a.sin_family=AF_INET;a.sin_addr.s_addr=htonl(0x7f000001u);
     socklen_t al=sizeof a; CHECK(!bind(v.fd,(struct sockaddr *)&a,sizeof a)&&!listen(v.fd,1),"keepalive listen");
     getsockname(v.fd,(struct sockaddr *)&a,&al);d2k_hs_probe_port=ntohs(a.sin_port);d2k_hs_probe_ms=800;
     pthread_t th;pthread_create(&th,NULL,serve_keepalive,&v);
     d2k_hs_job job={0};job.fd=socket(AF_INET,SOCK_STREAM,0);job.family=4;job.addr[0]=127;job.addr[3]=1;
-    snprintf(job.host,sizeof job.host,"target.example");d2k_hs_result r;d2k_hs_probe_run(&job,&r);
+    snprintf(job.host,sizeof job.host,"target.example");
+    if(path)snprintf(job.repeat_path,sizeof job.repeat_path,"%s",path);
+    d2k_hs_result r;d2k_hs_probe_run(&job,&r);
     close(job.fd);pthread_join(th,NULL);close(v.fd);
+    if(path)CHECK(v.matched,"actual second socket request must retain observed path");
     d2k_hs_probe_port=80;d2k_hs_probe_ms=6000;return r;
 }
+static d2k_hs_result keepalive_local(const char *first,const char *second) { return keepalive_path(first,second,NULL); }
 static void test_keepalive_portal(void) {
     const char *complete="HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none";
     d2k_hs_result r=keepalive_local(complete,INJECT);
     CHECK(r.answer==D2K_HS_INJECTED,"first 200 then same-connection portal must reject candidate");
+    r=keepalive_path(complete,INJECT,"/False/");
+    CHECK(r.answer==D2K_HS_INJECTED,"portal on observed second path rejects candidate");
 #ifdef D2K_HS_KEEPALIVE_PROOF
     CHECK(r.complete_responses==1,"portal is not a second complete success");
 #endif
@@ -612,18 +622,24 @@ static void test_bound_failure(void) {
     CHECK(textid!=NULL,"permanent id present");
     for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(textid[4+i*2])*16+hexval(textid[5+i*2]));
     id[0]^=1;
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,now+2)&&!f.del_plan_n,"foreign plan failure cannot revoke own plan");
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,"/False/",now+2)&&!f.del_plan_n,"foreign plan failure cannot revoke own plan");
     id[0]^=1;
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",6,IP,id,now+1,now+2)&&!f.del_plan_n,"other family cannot revoke own plan");
-    CHECK(d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,now+2)==1,"bound live portal must revoke confirmed success");
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",6,IP,id,now+1,"/False/",now+2)&&!f.del_plan_n,"other family cannot revoke own plan");
+    CHECK(d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,"/False/",now+2)==1,"bound live portal must revoke confirmed success");
     CHECK(f.del_plan_n==1&&!d2k_httpsearch_plan_of(hs,"bound.example",4)&&d2k_httpsearch_busy(hs),"revoked plan hidden and remeasurement started immediately");
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,now+2)&&f.del_plan_n==1,"duplicate failure cannot delete again");
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,"/False/",now+2)&&f.del_plan_n==1,"duplicate failure cannot delete again");
+    CHECK(!strcmp(f.job.repeat_path,"/False/"),"bound observed path must reach baseline probe");
     base_injected(hs,&f,&now);
+    d2k_httpsearch_ack(hs,f.trial,1,now+=10);
+    CHECK(!strcmp(f.job.repeat_path,"/False/"),"bound observed path must reach candidate probe");
+    /* Finish this already started candidate before using the trial helper. */
+    d2k_httpsearch_applied(hs,f.plan_id);d2k_hs_result first=res(D2K_HS_REAL);first.fd=f.job.fd;first.seq=f.job.seq;
+    d2k_httpsearch_result(hs,&first,now+=100);
     CHECK(strstr(f.last_probe_plan,"split ")!=NULL,"revoked old plan remains first hypothesis");
     int64_t old_request=now;
-    trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+    trial(hs,&f,&now,1,D2K_HS_REAL);
     int deleted=f.del_plan_n;
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,old_request,now+1)&&f.del_plan_n==deleted,
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,old_request,"/False/",now+1)&&f.del_plan_n==deleted,
           "same-hash old request cannot revoke a newly confirmed generation");
     CHECK(d2k_httpsearch_plan_of(hs,"bound.example",4)!=NULL,"new generation remains confirmed");
     d2k_httpsearch_free(hs);
@@ -631,8 +647,27 @@ static void test_bound_failure(void) {
 
 #endif
 
+static void test_missing_repro_context(void) {
+    char too_long[1025];memset(too_long,'a',sizeof too_long-1);too_long[0]='/';too_long[sizeof too_long-1]=0;
+    const char *invalid[]={too_long,"", "/?token=hidden", "/a#fragment", "http://other/", "/bad\r\nInjected:x"};
+    for(size_t k=0;k<sizeof invalid/sizeof invalid[0];k++) {
+        fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
+        d2k_httpsearch_portal(hs,"context.example",4,IP,now);base_injected(hs,&f,&now);
+        trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+        uint8_t id[16];const char *idtext=strstr(f.last_plan,"\nid ");
+        for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(idtext[4+2*i])*16+hexval(idtext[5+2*i]));
+        int starts=f.start_n;
+        CHECK(d2k_httpsearch_bound_failure(hs,"context.example",4,IP,id,now+1,invalid[k],now+2)==1,"lost context still revokes success");
+        d2k_httpsearch_portal(hs,"context.example",4,IP,now+3);
+        CHECK(!d2k_httpsearch_plan_of(hs,"context.example",4)&&f.start_n==starts&&!d2k_httpsearch_busy(hs),"unsupported context cannot silently become GET /");
+        CHECK(!strstr(f.said,"hidden")&&!strstr(f.said,"Injected:x"),"request values are not logged");
+        d2k_httpsearch_free(hs);
+    }
+}
+
 int main(void) {
 #ifdef D2K_HS_KEEPALIVE_PROOF
+    test_missing_repro_context();
     test_bound_failure();
     test_single_response_not_confirmation();
 #endif

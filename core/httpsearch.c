@@ -94,6 +94,16 @@ d2k_hs_answer d2k_hs_judge(const char *host, const char *head, size_t n,
 
 /* --- зонд -------------------------------------------------------------------- */
 
+static int hs_path_ok(const char *path) {
+    if(!path||path[0]!='/'||path[1]=='/')return 0;
+    size_t n=0;
+    for(;path[n];n++) {
+        unsigned char c=(unsigned char)path[n];
+        if(n>=1023||c<=32||c>=127||c=='?'||c=='#'||c=='\\')return 0;
+    }
+    return n>0;
+}
+
 typedef struct { int fd; int64_t first_us; struct timespec sent; char head[4096]; size_t used; } hs_reader;
 static long hs_read(void *ctx, uint8_t *buf, size_t cap, int wait_ms, char *err, size_t errcap) {
     hs_reader *s=ctx; int64_t until=mono_ms()+wait_ms;
@@ -123,6 +133,9 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
     r->fd = job ? job->fd : -1;
     r->seq = job ? job->seq : 0;
     if (!job || job->fd < 0) { snprintf(r->why, sizeof r->why, "нет сокета"); return; }
+    if(job->repeat_path[0]&&!hs_path_ok(job->repeat_path)) {
+        r->answer=D2K_HS_GARBAGE;snprintf(r->why,sizeof r->why,"unsupported observed HTTP path");return;
+    }
     int fd = job->fd;
 #ifdef SO_NOSIGPIPE
     int no_sigpipe=1; (void)setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&no_sigpipe,sizeof no_sigpipe);
@@ -174,10 +187,11 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
     clock_gettime(CLOCK_MONOTONIC, &c1);
     r->rtt_us = (int64_t)(c1.tv_sec - c0.tv_sec) * 1000000 + (c1.tv_nsec - c0.tv_nsec) / 1000;
 
-    char req[512];
-    int rl=snprintf(req,sizeof req,"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",job->host);
-    if(rl<=0||(size_t)rl>=sizeof req){r->answer=D2K_HS_GARBAGE;return;}
+    char req[1536];
     for(unsigned request=0;request<2;request++) {
+        const char *path=request&&job->repeat_path[0]?job->repeat_path:"/";
+        int rl=snprintf(req,sizeof req,"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",path,job->host);
+        if(rl<=0||(size_t)rl>=sizeof req){r->answer=D2K_HS_GARBAGE;return;}
         hs_reader reader={0};reader.fd=fd;clock_gettime(CLOCK_MONOTONIC,&reader.sent);
         int64_t until=mono_ms()+d2k_hs_probe_ms;size_t sent=0;
         while(sent<(size_t)rl) {
@@ -328,6 +342,8 @@ typedef struct {
     char host[256];
     uint8_t family;
     char key[40];          /* подтверждённый кандидат; "" — нет */
+    char repeat_path[1024];
+    int repro_gap;
     int64_t installed_ms; /* monotonic controller/datapath generation boundary */
     int revoked;          /* old key is only a hypothesis, not saved success */
     uint64_t seq;          /* порядок подтверждения: свежие — первыми */
@@ -350,6 +366,7 @@ struct d2k_httpsearch {
     struct {
         int phase;
         char host[256];
+        char repeat_path[1024];
         uint8_t family, addr[16];
         int recheck;
         char cands[N_CANDS * 4 + 8][40];
@@ -549,6 +566,7 @@ static int open_job(d2k_httpsearch *hs, d2k_hs_job *job) {
     job->family = hs->cur.family;
     memcpy(job->addr, hs->cur.addr, sizeof job->addr);
     snprintf(job->host, sizeof job->host, "%s", hs->cur.host);
+    snprintf(job->repeat_path,sizeof job->repeat_path,"%s",hs->cur.repeat_path);
     return 0;
 }
 
@@ -743,6 +761,11 @@ static void start(d2k_httpsearch *hs, const char *host, uint8_t family, const ui
     hs->cur.family = family;
     memcpy(hs->cur.addr, addr, family == 6 ? 16 : 4);
     hs->cur.recheck = recheck;
+    rec *context=rec_find(hs,host,family);
+    if(context&&context->repro_gap) {
+        say(hs,"HTTP %s: контекст запроса утрачен или не поддержан — воспроизведение не начато",host);return;
+    }
+    if(context)snprintf(hs->cur.repeat_path,sizeof hs->cur.repeat_path,"%s",context->repeat_path);
     d2k_hs_job job;
     hs->cur.job_seq = ++hs->job_seq;
     int opened = open_job(hs, &job) == 0;
@@ -773,15 +796,21 @@ static void start_next(d2k_httpsearch *hs, int64_t now) {
 }
 
 int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t family,
-                                const uint8_t *addr, const uint8_t plan_id[16], int64_t request_ms, int64_t now) {
+                                const uint8_t *addr, const uint8_t plan_id[16], int64_t request_ms, const char *path, int64_t now) {
     if(!hs||!addr||!plan_id||!host_ok(host)||(family!=4&&family!=6))return 0;
     rec *r=rec_find(hs,host,family);if(!r||!r->key[0]||r->revoked||request_ms<=r->installed_ms)return 0;
     uint8_t expected[16];stable_id(r->key,expected);
     if(memcmp(expected,plan_id,16))return 0;
     r->revoked=1;r->no_before_ms=0;
+    r->repro_gap=!hs_path_ok(path);
+    r->repeat_path[0]=0;
+    if(!r->repro_gap)snprintf(r->repeat_path,sizeof r->repeat_path,"%s",path);
     if(hs->ops.del_plan)hs->ops.del_plan(hs->ops.ctx,r->host,r->family);
     if(hs->ops.changed)hs->ops.changed(hs->ops.ctx);
     say(hs,"HTTP %s: связанная вставка под постоянным планом — успех отозван, нужна перепроверка",host);
+    if(hs->cur.phase!=PH_IDLE&&hs->cur.family==family&&!strcasecmp(hs->cur.host,host)) {
+        drop_probe(hs);finish(hs,now);
+    }
     d2k_httpsearch_portal(hs,host,family,addr,now);
     return 1;
 }
@@ -796,6 +825,9 @@ void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
         if (hs->q[i].family == family && !strcasecmp(hs->q[i].host, host)) { return; }
     }
     rec *r = rec_find(hs, host, family);
+    if(r&&r->repro_gap) {
+        say(hs,"HTTP %s: контекст запроса утрачен или не поддержан — подтверждение по GET / запрещено",host);return;
+    }
     if (r && (!r->key[0] || r->revoked) && now < r->no_before_ms) { return; }
     if (hs->cur.phase == PH_IDLE) {
         start(hs, host, family, addr, r && r->key[0], now);
@@ -836,6 +868,7 @@ void d2k_httpsearch_ack(d2k_httpsearch *hs, const uint8_t trial[16], int ok, int
     job.family = hs->cur.family;
     memcpy(job.addr, hs->cur.addr, sizeof job.addr);
     snprintf(job.host, sizeof job.host, "%s", hs->cur.host);
+    snprintf(job.repeat_path,sizeof job.repeat_path,"%s",hs->cur.repeat_path);
     if (!hs->ops.start_probe || hs->ops.start_probe(hs->ops.ctx, &job) != 0) {
         say(hs, "HTTP %s: зонд не запустился — поиск остановлен", hs->cur.host);
         drop_probe(hs);

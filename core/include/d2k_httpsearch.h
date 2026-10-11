@@ -80,6 +80,7 @@ typedef struct {
     uint8_t family;
     uint8_t addr[16];
     char host[256];
+    char repeat_path[1024]; /* empty only for generic initial GET / experience */
 } d2k_hs_job;
 
 typedef struct {
@@ -162,7 +163,7 @@ size_t d2k_hs_plan_poisons(const char *plan_text, char out[][64], size_t cap);
 /* Caller must bind this failure to the current live execution/generation.
  * Plan hash alone is insufficient; this function additionally checks own key. */
 int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t family,
-                                const uint8_t *addr, const uint8_t plan_id[16], int64_t request_ms, int64_t now_ms);
+                                const uint8_t *addr, const uint8_t plan_id[16], int64_t request_ms, const char *path, int64_t now_ms);
 void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
                            const uint8_t *addr, int64_t now_ms);
 /* Подтверждение SET_NAME_PROBE (trial ID и признак успеха). */
