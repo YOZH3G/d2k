@@ -1078,6 +1078,14 @@ test_http_runtime: ../datapath/test_runtime_trace.h test_http_runtime.c test_htt
 test-http-runtime: test_http_runtime
 	./test_http_runtime
 
+TESTS += test_http_live
+check: test-http-live
+.PHONY: test-http-live
+test_http_live: test_http_live.c test_httpsearch.c ../datapath/test_runtime_trace.h d2kc httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c libd2k_udp.a tls13core.o x25519.o link.o
+	$(CC) $(CFLAGS) -o $@ test_http_live.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c tls13core.o x25519.o link.o $(TEST_LDFLAGS)
+test-http-live: test_http_live
+	./test_http_live
+
 TESTS += test_quic_sink
 check: test-quic-sink
 .PHONY: test-quic-sink
@@ -1088,7 +1096,7 @@ test-quic-sink: test_quic_sink
 
 # The complete runtime gates include production translation units directly;
 # give them dedicated sanitizer links rather than linking a second copy.
-SAN_SKIP += test_udp_runtime test_quic_sink test_http_runtime
+SAN_SKIP += test_udp_runtime test_quic_sink test_http_runtime test_http_live
 SAN_EXTRA_SRC += $(filter-out $(SRC),$(UDP_ENGINE_SRC))
 .PHONY: san-udp-runtime
 san: san-udp-runtime
@@ -1099,6 +1107,11 @@ san-udp-runtime: hello_profiles.inc
 	/tmp/d2k-san-quic-sink
 	$(CC) $(SANFLAGS) -o /tmp/d2k-san-http-runtime test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) tls13core.c x25519.c -lpthread
 	/tmp/d2k-san-http-runtime
+.PHONY: san-http-live
+san: san-http-live
+san-http-live: hello_profiles.inc d2kc
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-http-live test_http_live.c httpsearch.c link.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) tls13core.c x25519.c -lpthread
+	/tmp/d2k-san-http-live
 .PHONY: cross-runtime-gates
 cross: cross-runtime-gates
 cross-runtime-gates: hello_profiles.inc

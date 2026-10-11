@@ -1834,19 +1834,22 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        (очередь видит после окна только сегменты с PSH), не запрос на
        границе — идёт как есть, считается, и граница дальше не ищется. */
     int http_hello = 0;
+    const char *http_skip = NULL;
     size_t http_off = 0, http_len = 0;
     /* Порт 80 (ревью M-1): Host без порта означает 80, и запрос на другой
        порт — не наш вход. */
     if (!fl->saw_hello && fwd && t[2] == 0 && t[3] == 80) {
         d2k_http_req hr;
-        int later = 0;
+        int later = 0, http_tried = 0;
         if (!fl->http_checked && fl->saw_syn && in_seq == fl->syn_seq + 1u) {
             fl->http_checked = 1;
+            http_tried = 1;
             http_hello = d2k_http_request(pkt + payload_off, payload_len, &hr);
             fl->http_flow = (uint8_t)http_hello;
         } else if (fl->http_conn) {
             const int32_t d = (int32_t)(in_seq - fl->http_next);
             if (d == 0) {
+                http_tried = 1;
                 http_hello = d2k_http_request(pkt + payload_off, payload_len, &hr);
                 later = http_hello;
                 if (!http_hello) {
@@ -1859,6 +1862,23 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                    целиком до границы — тело или повтор: не наше. */
                 fl->http_conn = 0;
                 s->http_unaligned++;
+            }
+        }
+        /* A failed request/stream parse is not a missing installed plan.
+         * This changes only the diagnostic, never eligibility or ownership. */
+        if (!http_hello) {
+            const uint8_t *pay = pkt + payload_off;
+            size_t method = 0;
+            while (method < payload_len && method < 20 &&
+                   pay[method] >= 'A' && pay[method] <= 'Z') method++;
+            if (method && method + 1 < payload_len &&
+                pay[method] == ' ' && pay[method + 1] == '/') {
+                if (!fl->saw_syn)
+                    http_skip = "HTTP: начало TCP не наблюдалось — граница запроса не доказана";
+                else if (http_tried)
+                    http_skip = "HTTP: Host или запрос не разобран в этом сегменте";
+                else
+                    http_skip = "HTTP: граница запроса не доказана или уже пройдена";
             }
         }
         if (http_hello) {
@@ -2084,7 +2104,7 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         return 0;
     }
     if (!use) {
-        out->skipped = "плана для этой цели нет";
+        out->skipped = http_skip ? http_skip : "плана для этой цели нет";
         /* refuse() — ТОЛЬКО когда это действительно приветствие, которому не
            нашлось плана (ревью, пункт 3), а не на каждом пакете, что сюда
            заходит. use остаётся NULL по ДВУМ разным причинам: либо это
