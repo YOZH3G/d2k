@@ -65,6 +65,7 @@ HDR += ../runtime/d2k_runtime.h include/d2k_p256.h include/d2k_udpruntime.h
 # (datapath/ctlprobe.c), отдельным процессом, а не петля-мишень в потоке.
 HDR += include/d2k_ip6frag_send.h
 HDR += profiles/rx_fake.h
+HDR += include/d2k_tls12.h
 HDR += include/d2k_resource.h
 HDR += include/d2k_http_reply.h
 HDR += include/d2k_domain.h include/d2k_groups.h
@@ -1124,3 +1125,21 @@ cross-runtime-gates: hello_profiles.inc
 	done
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-http-runtime-a64 test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
 	$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-http-runtime-mipsel test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
+
+# TLS record progress is observable independently of successful decryption.
+TESTS += test_tls_rx12
+check: test-tls-rx12
+.PHONY: test-tls-rx12 san-tls-rx12 cross-tls-rx12
+test_tls_rx12: test_tls_rx12.c tls12.c include/d2k_tls12.h p256.o tls13core.o crypto.o x25519.o libd2k_udp.a
+	$(CC) $(CFLAGS) -o $@ $< p256.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
+test-tls-rx12: test_tls_rx12
+	./test_tls_rx12
+SAN_SKIP += test_tls_rx12
+san: san-tls-rx12
+san-tls-rx12:
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-tls-rx12 test_tls_rx12.c p256.c tls13core.c crypto.c x25519.c -lpthread
+	/tmp/d2k-san-tls-rx12
+cross: cross-tls-rx12
+cross-tls-rx12:
+	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-tls-rx12-a64 test_tls_rx12.c p256.c tls13core.c crypto.c x25519.c -lpthread
+	$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-tls-rx12-mipsel test_tls_rx12.c p256.c tls13core.c crypto.c x25519.c -lpthread

@@ -70,6 +70,11 @@ long d2k_tls_read(d2k_tls *t, uint8_t *buf, size_t cap, int wait_ms,
  * доказательства от неё не растёт (§4.2). Её задача одна: не записать в
  * «подтверждено» разговор с коробкой, которая терминирует TLS и отдаёт
  * страницу блокировки — для зонда это выглядит РОВНО как рабочий обход. */
+/* Consumed TLS record bytes (including headers); missing is declared body only. */
+uint16_t d2k_tls_version(const d2k_tls *t);
+uint64_t d2k_tls_rx_wire_bytes(const d2k_tls *t);
+uint32_t d2k_tls_rx_record_missing(const d2k_tls *t);
+
 int  d2k_tls_peer_name(const d2k_tls *t);
 
 void d2k_tls_free(d2k_tls *t);

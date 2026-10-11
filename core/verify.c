@@ -1149,8 +1149,12 @@ static d2k_ver_result verify_probe13_internal(int use_fd, const char *ip, uint16
     snprintf(r.reason, sizeof r.reason, "рукопожатие завершено, приложение молчит");
 
     budget_io io = { fd_packets, fd_peer_spoke, &r.fd };
+    r.negotiated_tls=d2k_tls_version(t);
+    uint64_t wire_before=d2k_tls_rx_wire_bytes(t);
     request_page_budget(read13, write13, t, host, encoding, path,
                         deadline_ms, 0, &io, g_verify_budget, &r, err, sizeof err);
+    r.rx_tls_wire_bytes=d2k_tls_rx_wire_bytes(t)-wire_before;
+    r.rx_tls_record_missing=d2k_tls_rx_record_missing(t);
     long dp = d2k_verify_packets_hook(r.fd);
     r.data_packets = dp > 0 ? (unsigned)dp : 0;
     /* Сессию освобождаем, сокет — нет: d2k_tls_free владения им не берёт
@@ -1318,6 +1322,7 @@ d2k_ver_result d2k_verify_probe_alpn_on(int use_fd, const char *ip, uint16_t por
     }
     r.level = D2K_VER_HANDSHAKE;
     r.handshake_proof = 1;
+    r.negotiated_tls=d2k_tls_version(t);
     r.name_ok = d2k_tls_peer_name(t);
     snprintf(r.reason, sizeof r.reason, "%s",
              alpn_len ? "рукопожатие TLS с ALPN клиента завершено; протокол клиента не HTTP — "
@@ -1384,8 +1389,12 @@ static d2k_ver_result verify_probe12_internal(int use_fd, const char *ip, uint16
     snprintf(r.reason, sizeof r.reason, "рукопожатие 1.2 завершено, приложение молчит");
 
     budget_io io = { fd_packets, fd_peer_spoke, &r.fd };
+    r.negotiated_tls=0x0303;
+    uint64_t wire_before=d2k_tls12_rx_wire_bytes(t);
     request_page_budget(read12, write12, t, host, encoding, path,
                         deadline_ms, 1, &io, g_verify_budget, &r, err, sizeof err);
+    r.rx_tls_wire_bytes=d2k_tls12_rx_wire_bytes(t)-wire_before;
+    r.rx_tls_record_missing=d2k_tls12_rx_record_missing(t);
     long dp = d2k_verify_packets_hook(r.fd);
     r.data_packets = dp > 0 ? (unsigned)dp : 0;
     d2k_tls12_free(t);

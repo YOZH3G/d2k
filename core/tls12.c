@@ -77,6 +77,8 @@
 
 struct d2k_tls12 {
     int      fd;
+    uint64_t rx_wire_bytes;
+    uint32_t rx_record_missing;
     uint8_t  c_key[16], s_key[16];
     uint8_t  c_salt[4], s_salt[4];
     uint64_t c_seq, s_seq;
@@ -107,9 +109,10 @@ static int64_t now_ms(void) {
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static uint16_t get16(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] << 8 | p[1]); }
 
-static int read_exact(int fd, uint8_t *buf, size_t n, int64_t deadline,
+static int read_exact(d2k_tls12 *t, uint8_t *buf, size_t n, int body, int64_t deadline,
                       char *err, size_t errcap) {
     size_t got = 0;
+    t->rx_record_missing = body ? (uint32_t)n : 0;
     while (got < n) {
         int64_t left = deadline - now_ms();
         if (left <= 0) {
@@ -117,7 +120,7 @@ static int read_exact(int fd, uint8_t *buf, size_t n, int64_t deadline,
             return -1;
         }
         struct pollfd p;
-        p.fd = fd; p.events = POLLIN; p.revents = 0;
+        p.fd = t->fd; p.events = POLLIN; p.revents = 0;
         int pr = poll(&p, 1, (int)(left > 1000 ? 1000 : left));
         if (pr < 0) {
             if (errno == EINTR) { continue; }
@@ -125,7 +128,7 @@ static int read_exact(int fd, uint8_t *buf, size_t n, int64_t deadline,
             return -1;
         }
         if (pr == 0) { continue; }
-        ssize_t r = recv(fd, buf + got, n - got, 0);
+        ssize_t r = recv(t->fd, buf + got, n - got, 0);
         if (r == 0) {
             say(err, errcap, "соединение закрыто на %zu-м байте из %zu", got, n);
             return -1;
@@ -136,6 +139,8 @@ static int read_exact(int fd, uint8_t *buf, size_t n, int64_t deadline,
             return -1;
         }
         got += (size_t)r;
+        t->rx_wire_bytes += (uint64_t)r;
+        if(body)t->rx_record_missing=(uint32_t)(n-got);
     }
     return 0;
 }
@@ -276,7 +281,7 @@ static int read_record(d2k_tls12 *t, int encrypted, uint8_t *type,
                        uint8_t *payload, size_t cap, size_t *len,
                        int64_t deadline, char *err, size_t errcap) {
     uint8_t hdr[5];
-    if (read_exact(t->fd, hdr, 5, deadline, err, errcap) != 0) { return -1; }
+    if (read_exact(t, hdr, 5, 0, deadline, err, errcap) != 0) { return -1; }
     /* На TLS/443 сетевой узел иногда отвечает открытым HTTP (на Rutracker
        Cloudflare прислал HTTP/1.1 400). P/ из HTTP/ — не TLS length=20527. */
     if (memcmp(hdr, "HTTP/", 5) == 0) {
@@ -292,7 +297,7 @@ static int read_record(d2k_tls12 *t, int encrypted, uint8_t *type,
             hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], rlen);
         return -1;
     }
-    if (read_exact(t->fd, t->raw, rlen, deadline, err, errcap) != 0) { return -1; }
+    if (read_exact(t, t->raw, rlen, 1, deadline, err, errcap) != 0) { return -1; }
     *type = hdr[0];
 
     /* CCS не шифруется никогда и содержимого не несёт. */
@@ -781,3 +786,6 @@ long d2k_tls12_read(d2k_tls12 *t, uint8_t *buf, size_t cap, int wait_ms,
 int d2k_tls12_peer_name(const d2k_tls12 *t) { return t ? t->peer_name : -1; }
 
 void d2k_tls12_free(d2k_tls12 *t) { free(t); }
+
+uint64_t d2k_tls12_rx_wire_bytes(const d2k_tls12 *t) { return t ? t->rx_wire_bytes : 0; }
+uint32_t d2k_tls12_rx_record_missing(const d2k_tls12 *t) { return t ? (t->rx_record_missing) : 0; }

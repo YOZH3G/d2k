@@ -79,6 +79,9 @@ typedef enum {
 typedef struct {
     d2k_ver_level level;
     int      status;        /* код состояния HTTP, 0 — не разобран */
+    uint16_t negotiated_tls; /* 0x0303 TLS1.2, 0x0304 TLS1.3; zero without handshake */
+    uint64_t rx_tls_wire_bytes; /* actual TLS recv bytes after handshake, incl. record headers */
+    uint32_t rx_tls_record_missing; /* missing declared record body; not plaintext */
     uint64_t body_bytes;    /* прочитанное тело HTTP, без chunk framing */
     uint64_t body_expected; /* Content-Length либо измеренное число chunk-байт */
     int      body_complete; /* тело полностью прочитано по HTTP framing */

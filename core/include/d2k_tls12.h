@@ -70,6 +70,10 @@ long d2k_tls12_read(d2k_tls12 *t, uint8_t *buf, size_t cap, int wait_ms,
                     char *err, size_t errcap);
 
 /* Совпало ли имя в сертификате: 1 да, 0 НЕТ, -1 сказать нечего. */
+/* Consumed TLS record bytes (including headers); missing is declared body only. */
+uint64_t d2k_tls12_rx_wire_bytes(const d2k_tls12 *t);
+uint32_t d2k_tls12_rx_record_missing(const d2k_tls12 *t);
+
 int d2k_tls12_peer_name(const d2k_tls12 *t);
 
 void d2k_tls12_free(d2k_tls12 *t);

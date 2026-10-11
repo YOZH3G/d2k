@@ -72,6 +72,8 @@ static int fails;
 #define ROLE_REDIRECT_COMPLETE 64
 #define ROLE_REDIRECT_TRUNCATED 65
 #define ROLE_PUBLIC_HTML 66
+#define ROLE_PARTIAL_TLS 67
+#define ROLE_BAD_TAG_TLS 68
 
 static const struct {
     const char *text;
@@ -221,8 +223,8 @@ static int rec_read(int fd, struct dir *d, int enc, uint8_t *type,
     return 0;
 }
 
-static int rec_write(int fd, struct dir *d, uint8_t type,
-                     const uint8_t *data, size_t n) {
+static int rec_write_mode(int fd, struct dir *d, uint8_t type,
+                     const uint8_t *data, size_t n, int mode) {
     if (n + 1 + 16 > REC_MAX) { return -1; }
     uint8_t out[REC_MAX + 5];
     uint8_t inner[REC_MAX];
@@ -239,7 +241,12 @@ static int rec_write(int fd, struct dir *d, uint8_t type,
     }
     memcpy(out + 5 + n + 1, tag, 16);
     d->seq++;
-    return wr_all(fd, out, 5 + n + 1 + 16);
+    if(mode==2)out[5+n]^=1;
+    return wr_all(fd, out, mode==1 ? 14005 : 5 + n + 1 + 16);
+}
+
+static int rec_write(int fd, struct dir *d, uint8_t type, const uint8_t *data, size_t n) {
+    return rec_write_mode(fd,d,type,data,n,0);
 }
 
 static int derive_secret(const uint8_t secret[32], const char *label,
@@ -605,6 +612,12 @@ static void *stand_run(void *arg) {
     memcpy(stand_request, req, copy);
     stand_request[copy] = '\0';
 
+    if(s->role==ROLE_PARTIAL_TLS||s->role==ROLE_BAD_TAG_TLS) {
+        uint8_t payload[16367];memset(payload,'x',sizeof payload);
+        memcpy(payload,"HTTP/1.1 200 OK\r\nContent-Length: 16300\r\n\r\n",42);
+        (void)rec_write_mode(c,&wr,REC_APPDATA,payload,sizeof payload,s->role==ROLE_PARTIAL_TLS?1:2);
+        close(c);return NULL;
+    }
     if (stand_same_origin_redirect) {
         static const char moved[] =
             "HTTP/1.1 301 Moved Permanently\r\n"
@@ -762,7 +775,21 @@ static uint16_t closed_port(void) {
     return ntohs(a.sin_port);
 }
 
-int main(void) {
+static void test_rx_wire_progress(void) {
+    for(int bad=0;bad<2;bad++) {
+        struct stand s;uint16_t port=stand_start(&s,bad?ROLE_BAD_TAG_TLS:ROLE_PARTIAL_TLS);
+        d2k_ver_result r=d2k_verify_probe_identity_on(-1,"127.0.0.1",port,"wire.example",800,0,0);
+        CHECK(r.negotiated_tls==0x0304,"wire progress retains negotiated TLS version");
+        CHECK(r.level==D2K_VER_HANDSHAKE&&!r.status&&!r.body_bytes&&!r.body_complete,
+              "partial/bad-tag ciphertext must never become HTTP plaintext");
+        CHECK(r.rx_tls_wire_bytes==(bad?16389u:14005u),"actual consumed TLS wire bytes missing or handshake counted");
+        CHECK(r.rx_tls_record_missing==(bad?0u:2384u),"full bad-tag record is not a truncated record");
+        d2k_verify_close(&r);stand_stop(&s);
+    }
+}
+int main(int argc,char **argv) {
+    test_rx_wire_progress();
+    if(argc==2&&!strcmp(argv[1],"--wire-progress-only"))return fails?1:0;
     const char *html = "<head><!-- <link rel='stylesheet' href='//bad.test/a.css'> -->"
         "<script>var x=\"<link rel='stylesheet' href='//bad.test/b.css'>\";</script>"
         "<LINK HREF='https://Assets.Example/a.min.css' REL='stylesheet'>"
