@@ -258,6 +258,10 @@ extern d2k_quic_ask_fn d2k_quic_ask_frames_hook;
  * NULL (умолчание) — никому не нужно; планировщик ставит свой приёмник. */
 typedef void (*d2k_quic_progress_fn)(const char *question, int probes);
 extern d2k_quic_progress_fn d2k_quic_progress_hook;
+/* Called only between complete arm questions, with no live probe socket.
+ * A scheduler pause is not network time. <0 cancels without sending. */
+typedef int (*d2k_quic_yield_fn)(uint32_t *paused_ms);
+extern d2k_quic_yield_fn d2k_quic_yield_hook;
 /* Base/residual control rebuilds every repeat from the captured profile with
  * a neutral random SNI and fresh CID. Other tree questions remain unchanged. */
 extern d2k_quic_ask_fn d2k_quic_ask_control_hook;

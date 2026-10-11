@@ -897,6 +897,12 @@ typedef struct {
     /* Рабочий поток оракула. */
     pthread_t  th;
     int        th_live;
+    struct d2k_sched *worker_owner;
+    /* request/waiting under owner->mu; parked and timestamp belong to loop. */
+    int quic_yield_request, quic_yield_waiting, quic_parked;
+    int64_t quic_parked_ms;
+    int64_t quic_clock_ms, quic_wait_started_ms;
+    uint64_t quic_tcp_turn;
     /* Просьба бросить замер, адресованная ЭТОЙ задаче. Взводит цикл (см.
        join_worker), читает измеритель. Обнуляется вместе со всей задачей в
        task_reset. */
@@ -1325,6 +1331,8 @@ struct d2k_sched {
 
     int          wake[2];     /* самопайп: рабочий поток будит цикл */
     pthread_mutex_t mu;       /* охраняет res/res_ready/th_live задач */
+    pthread_cond_t question_cv;
+    uint64_t tcp_admission_sequence;
 };
 
 static int addr_probe_remove(d2k_sched *s, task *t, char *err, size_t errcap) {
@@ -2289,6 +2297,32 @@ static void ask_settle(task *t, int run_probes) {
     if (fin > t->ask_probes) t->ask_probes = fin;
 }
 
+/* Keep the exact search stack and answers while lending the slot to TCP.
+ * The hook runs before a complete question, never between filter and data. */
+static int sched_quic_yield(uint32_t *paused_ms) {
+    progress_sink *k=&g_progress_sink;
+    *paused_ms=0;
+    if(!k->s || !k->t)return 0;
+    d2k_sched *s=k->s;task *t=k->t;
+    struct timespec begin,end;
+    pthread_mutex_lock(&s->mu);
+    if(t->stop){pthread_mutex_unlock(&s->mu);return -1;}
+    if(!t->quic_yield_request){pthread_mutex_unlock(&s->mu);return 0;}
+    clock_gettime(CLOCK_MONOTONIC,&begin);
+    t->quic_yield_waiting=1;
+    t->quic_wait_started_ms=t->quic_clock_ms;
+    ssize_t ignored=write(s->wake[1],"w",1);(void)ignored;
+    while(t->quic_yield_waiting && !t->stop)
+        pthread_cond_wait(&s->question_cv,&s->mu);
+    int stopped=t->stop;
+    pthread_mutex_unlock(&s->mu);
+    clock_gettime(CLOCK_MONOTONIC,&end);
+    int64_t ns=(int64_t)(end.tv_sec-begin.tv_sec)*1000000000+end.tv_nsec-begin.tv_nsec;
+    uint64_t ms=ns>0?((uint64_t)ns+999999)/1000000:0;
+    *paused_ms=ms>UINT32_MAX?UINT32_MAX:(uint32_t)ms;
+    return stopped?-1:0;
+}
+
 static void sched_quic_progress(const char *question, int probes) {
     d2k_sched_progress_note(question, probes, 0);
 }
@@ -2801,6 +2835,8 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     if (job == JOB_CONTACT) { t->prop_bound_fd = -1; contact_close(t); }
     if (job == JOB_VERIFY) { t->probe_fd = -1; }
     t->job = job;
+    t->worker_owner=s;
+    t->quic_yield_request=t->quic_yield_waiting=t->quic_parked=0;
     t->res_ready = 0;
     /* Новый поток — новый вопрос; зонды прежних прогонов (база задачи 32,
        повтор по снимку) остаются на счету задачи. Прежний поток присоединён. */
@@ -2841,9 +2877,15 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
  * его обнуляет task_reset, когда задача начинает жизнь заново. */
 static void join_worker(task *t) {
     if (t->th_live) {
+        d2k_sched *s=t->worker_owner;
+        if(s)pthread_mutex_lock(&s->mu);
         t->stop = 1;
+        t->quic_yield_waiting=0;
+        if(s){pthread_cond_broadcast(&s->question_cv);pthread_mutex_unlock(&s->mu);}
         pthread_join(t->th, NULL);
         t->th_live = 0;
+        t->quic_parked=t->quic_yield_request=0;
+        t->worker_owner=NULL;
     }
 }
 
@@ -4806,6 +4848,7 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     /* Ход QUIC-прогона — тем же приёмником, что TCP (задача 49). Приёмник
        поточный: вне рабочего потока задачи вызов ничего не делает. */
     d2k_quic_progress_hook = sched_quic_progress;
+    d2k_quic_yield_hook = sched_quic_yield;
     /* The MIPS Linux pipe syscall returns the first descriptor in v0 (and
        the second in v1); Zig's musl wrapper exposes that positive value here
        instead of normalizing success to POSIX's zero. The descriptor pair is
@@ -4824,6 +4867,11 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
         free(s);
         errno = mutex_error;
         return NULL;
+    }
+    int cond_error=pthread_cond_init(&s->question_cv,NULL);
+    if(cond_error){
+        pthread_mutex_destroy(&s->mu);close(s->wake[0]);close(s->wake[1]);
+        free(s);errno=cond_error;return NULL;
     }
     return s;
 }
@@ -5093,6 +5141,7 @@ void d2k_sched_free(d2k_sched *s) {
         prop_close(&s->tasks[i]);
         ver_close(&s->tasks[i]);
     }
+    pthread_cond_destroy(&s->question_cv);
     pthread_mutex_destroy(&s->mu);
     if (s->wake[0] >= 0) { close(s->wake[0]); }
     if (s->wake[1] >= 0) { close(s->wake[1]); }
@@ -6188,14 +6237,14 @@ static int meas_state(task_state st);
 static size_t measurements_in_flight(const d2k_sched *s) {
     size_t n = 0;
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++)
-        if (meas_state(s->tasks[i].state)) n++;
+        if (meas_state(s->tasks[i].state) && !s->tasks[i].quic_parked) n++;
     return n;
 }
 
 static size_t queued_measurements(const d2k_sched *s) {
     size_t n = 0;
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        if (s->tasks[i].state == T_QUEUED) { n++; }
+        if (s->tasks[i].state == T_QUEUED || s->tasks[i].quic_parked) { n++; }
     }
     return n;
 }
@@ -6508,6 +6557,7 @@ static int family_recovery_start(d2k_sched *s, task *t) {
 }
 
 static int launch_task(d2k_sched *s, task *t) {
+    if(t->transport==6)s->tcp_admission_sequence++;
     if (t->state == T_QUEUED && s->clock_seen && s->now_ms >= t->queued_ms)
         t->report_queue_ms += s->now_ms - t->queued_ms;
     t->started_ms = s->clock_seen ? s->now_ms : 0;
@@ -8573,7 +8623,56 @@ static int queued_before(const task *a, const task *b) {
     return a->queued_ms < b->queued_ms;
 }
 
+/* Only the loop lends/releases a slot. Worker flags are read under mu;
+ * no task state, trial or classification result changes on a pause. */
+static void quic_yield_tick(d2k_sched *s,int64_t now_ms) {
+    int tcp_waiting=0;
+    for(size_t i=0;i<SCHED_MAX_TASKS;i++)
+        if(s->tasks[i].state==T_QUEUED && s->tasks[i].transport==6)tcp_waiting=1;
+    int need_slot=tcp_waiting && measurements_in_flight(s)>=s->meas_limit;
+    task *resume=NULL;
+    int parked_log[SCHED_MAX_TASKS]={0};
+    pthread_mutex_lock(&s->mu);
+    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
+        task *t=&s->tasks[i];
+        if(t->state!=T_ASKING || t->transport!=17 || t->job!=JOB_CLASSIFY)continue;
+        t->quic_clock_ms=now_ms;
+        t->quic_yield_request=need_slot;
+        if(t->quic_yield_waiting && !t->quic_parked){
+            t->quic_parked=1;t->quic_parked_ms=t->quic_wait_started_ms;
+            t->quic_tcp_turn=s->tcp_admission_sequence;parked_log[i]=1;
+        }
+        if(t->quic_parked && (!tcp_waiting || t->quic_tcp_turn!=s->tcp_admission_sequence) &&
+           (!resume || t->quic_parked_ms<resume->quic_parked_ms))resume=t;
+    }
+    int64_t resumed_wait=-1;
+    if(resume && measurements_in_flight(s)<s->meas_limit &&
+       (!s->measure_start_seen || now_ms-s->last_measure_start_ms>=SCHED_START_GAP_MS)) {
+        int64_t wait=now_ms-resume->quic_parked_ms;
+        if(wait>0){resume->report_queue_ms+=wait;resume->started_ms+=wait;}
+        resumed_wait=wait;
+        resume->quic_parked=resume->quic_yield_waiting=resume->quic_yield_request=0;
+        s->last_measure_start_ms=now_ms;s->measure_start_seen=1;
+        pthread_cond_broadcast(&s->question_cv);
+    }
+    pthread_mutex_unlock(&s->mu);
+    for(size_t i=0;i<SCHED_MAX_TASKS;i++)if(parked_log[i])
+        say(s,"по %s (QUIC) вопрос завершён: уступаю слот ожидающему TCP, ответы сохранены",s->tasks[i].name);
+    if(resumed_wait>=0)
+        say(s,"по %s (QUIC) продолжаю со следующего вопроса после очереди (%lld мс)",resume->name,(long long)resumed_wait);
+}
+
 static task *queued_pick(d2k_sched *s) {
+    int tcp_first=0;
+    for(size_t i=0;i<SCHED_MAX_TASKS;i++)if(s->tasks[i].quic_parked)tcp_first=1;
+    if(tcp_first){
+        task *best=NULL;
+        for(size_t i=0;i<SCHED_MAX_TASKS;i++){
+            task *t=&s->tasks[i];
+            if(t->state==T_QUEUED && t->transport==6 && (!best || queued_before(t,best)))best=t;
+        }
+        if(best)return best;
+    }
     int recovery = 0;
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++)
         if (s->tasks[i].state == T_QUEUED && family_recovery_eligible(s, &s->tasks[i]))
@@ -8647,6 +8746,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     uint8_t drain[64];
     while (read(s->wake[0], drain, sizeof drain) > 0) { }
 
+    /* A worker may already be waiting when this tick crosses its lifetime.
+       Acknowledge that pause before applying any network/task deadline. */
+    quic_yield_tick(s,now_ms);
     quic_deny_tick(s, now_ms);
     /* Отказы узлов семейства стареют: узел, который неделю никто не встречал,
        ничего не говорит о плане (поле 06.10, googlevideo). Раз в час и сразу
@@ -8697,7 +8799,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             continue;
         }
         if (t->started_ms == 0) { t->started_ms = now_ms; }
-        if (now_ms - t->started_ms > SCHED_TASK_LIFE_MS) {
+        if (!t->quic_parked && now_ms - t->started_ms > SCHED_TASK_LIFE_MS) {
             if (t->state == T_SHAPE_WAIT) {
                 /* Формы так и не дождались: человек ушёл со страницы, и
                    повторять приветствие некому. Это НЕ неудача плана —
@@ -9989,6 +10091,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             moved++;
         }
     }
+    quic_yield_tick(s,now_ms);
     moved += queued_release(s, now_ms);
     return moved;
 }

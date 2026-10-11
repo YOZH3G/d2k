@@ -1181,3 +1181,17 @@ cross: cross-tls-rx12
 cross-tls-rx12:
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-tls-rx12-a64 test_tls_rx12.c p256.c tls13core.c crypto.c x25519.c -lpthread
 	$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-tls-rx12-mipsel test_tls_rx12.c p256.c tls13core.c crypto.c x25519.c -lpthread
+
+# A blocked QUIC question sequence must yield a measurement slot to TCP.
+test_sched_quic_yield: test_sched_quic_yield.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+.PHONY: test-sched-quic-yield
+test-sched-quic-yield: test_sched_quic_yield
+	./test_sched_quic_yield
+check: test-sched-quic-yield
+TESTS += test_sched_quic_yield
+.PHONY: san-sched-quic-yield
+san: san-sched-quic-yield
+san-sched-quic-yield: hello_profiles.inc tcp1620_whitelist.inc
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-sched-quic-yield test_sched_quic_yield.c $(sort $(filter-out sched.c,$(SCHED_TEST_OBJ:.o=.c)) $(UDP_ENGINE_SRC)) -lpthread
+	/tmp/d2k-san-sched-quic-yield

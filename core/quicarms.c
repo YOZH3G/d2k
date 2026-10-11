@@ -25,11 +25,17 @@ const uint8_t d2k_quic_benign[D2K_QUIC_BENIGN_LEN] = {0};
    данных не состоялся. Решающий исход — measured без retry. */
 /* Ход прогона (задача 49), см. d2k_quicprobe.h. */
 d2k_quic_progress_fn d2k_quic_progress_hook = NULL;
+d2k_quic_yield_fn d2k_quic_yield_hook = NULL;
 
 static int ask_q(d2k_quic_arm_context *c, d2k_quic_arm *r, d2k_quic_arm_question *q,
                  const char *label, int *measured, int *retry) {
     *measured=0;
     if(retry) *retry=0;
+    uint32_t paused_ms=0;
+    if(d2k_quic_yield_hook && d2k_quic_yield_hook(&paused_ms)<0) {
+        r->incomplete=1; return 0;
+    }
+    if(paused_ms && c && c->spent)c->spent(c->limit_user,paused_ms);
     q->label=label;
     if(r->n_trace>=D2K_QUIC_ARM_STEPS) { r->incomplete=1; return 0; }
     d2k_quic_arm_step *step=&r->trace[r->n_trace++];

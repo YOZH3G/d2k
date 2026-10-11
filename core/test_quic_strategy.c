@@ -187,7 +187,30 @@ static void test_length_before_fallback(void) {
     }
 }
 
+static unsigned yielded_budget;
+static int yield_cancel,yield_probes;
+static int test_yield(uint32_t *ms){*ms=50;return yield_cancel?-1:0;}
+static void test_yield_spent(void *u,uint32_t ms){(void)u;yielded_budget+=ms;}
+static int test_yield_can(void *u){(void)u;return yielded_budget>=50;}
+static d2k_tally test_yield_probe(const d2k_quic_arm_question *q,void *u,int *sent){
+    (void)q;(void)u;yield_probes++;*sent=3;return (d2k_tally){.pass=3,.marked=1};
+}
+static void test_yield_budget(void){
+    d2k_quic_yield_fn saved=d2k_quic_yield_hook;
+    d2k_quic_yield_hook=test_yield;
+    for(yield_cancel=0;yield_cancel<2;yield_cancel++){
+        yielded_budget=0;yield_probes=0;
+        d2k_quic_arm_context c={.pool=pool,.n_pool=1,.marked=1,
+            .probe=test_yield_probe,.can_ask=test_yield_can,.spent=test_yield_spent};
+        d2k_quic_arm r=d2k_quic_strategy_arms(&c);
+        if(!yield_cancel){CHECK(yield_probes==1 && yielded_budget==50);CHECK(r.kind==D2K_QA_BLOB && !r.incomplete);}
+        else {CHECK(!yield_probes);CHECK(r.kind==D2K_QA_NOT_FOUND && r.incomplete);}
+    }
+    d2k_quic_yield_hook=saved;
+}
+
 int main(void) {
+    test_yield_budget();
     test_length_before_fallback();
     static const uint8_t zero16[16];
     marked_ok = 1;
