@@ -2132,8 +2132,7 @@ int main(void) {
             d2k_session_sent(g, 1200 + i, &pending.key, pending.execution_id);
         const d2k_jrn_entry *e = last_of_kind(g, D2K_JRN_PLAN_DONE);
         CHECK(e && e->execution_id == pending.execution_id &&
-              e->binding.generation == pending.binding.generation &&
-              e->binding.kind == pending.binding.kind,
+              !memcmp(&e->binding, &pending.binding, sizeof e->binding),
               "new SYN erased the binding of pending execution DONE");
         d2k_session_free(g);
     }

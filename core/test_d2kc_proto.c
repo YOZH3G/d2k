@@ -121,6 +121,16 @@ static int run_with_greeting(unsigned version, long wait_ms, char *out, size_t o
 }
 
 int main(void) {
+    /* Offline release gate must agree with the actual control handshake. */
+    pid_t self = fork();
+    if (self == 0) {
+        execl("./d2kc", "d2kc", "--self-check", (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    CHECK(self > 0 && waitpid(self, &status, 0) == self &&
+          WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "offline self-check disagrees with control protocol");
     signal(SIGPIPE, SIG_IGN);
     char err[4096];
     int rc = run_with_greeting(7, 10000, err, sizeof err);

@@ -38,7 +38,7 @@ test-config: $(BUILD_DIR)/test-config
 
 d2ktg: $(BUILD_DIR)/d2ktg
 
-$(BUILD_DIR)/d2ktg: ../runtime/d2k_runtime.h src/main.c src/config.c src/tls.c src/ws.c src/ws_pump.c src/identity.c src/register.c src/enroll.c src/net.c src/wire.c src/tunnel.c src/listener.c src/streams.c src/queue.c src/session.c
+$(BUILD_DIR)/d2ktg: ../runtime/d2k_runtime.h ../runtime/d2k_protocol.h src/main.c src/config.c src/tls.c src/ws.c src/ws_pump.c src/identity.c src/register.c src/enroll.c src/net.c src/wire.c src/tunnel.c src/listener.c src/streams.c src/queue.c src/session.c
 	mkdir -p $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -pthread -o $@ $(filter %.c,$^) $(OPENSSL_LIBS)
 

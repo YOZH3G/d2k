@@ -225,10 +225,11 @@ int main(void) {
         int sv[2];
         CHECK(!socketpair(AF_UNIX, SOCK_STREAM, 0, sv), "execution context socketpair");
         const size_t base = refused ? 34u : 32u;
-        uint8_t rest[54] = {0};
+        uint8_t rest[34 + D2K_CTL_EXECUTION_LEN] = {0};
         uint8_t *p = rest + base;
         for (unsigned b = 0; b < 8; b++) { p[b] = 1+b; p[8+b] = 0x81+b; }
         p[16] = D2K_BIND_FLOW; p[17] = 6; p[18] = D2K_PLAN_SHAPE_QUIC; p[19] = 1;
+        for (unsigned b = 0; b < 16; b++) p[20+b] = (uint8_t)(0xf0+b);
         d2k_ev ev; char err[128];
         const uint16_t kind = refused ? D2K_EV_REFUSED : D2K_EV_APPLIED;
         send_synthetic(sv[0], kind, rest, base + D2K_CTL_EXECUTION_LEN);
@@ -236,7 +237,8 @@ int main(void) {
               ev.execution_id == UINT64_C(0x0102030405060708) &&
               ev.execution_binding.generation == UINT64_C(0x8182838485868788) &&
               ev.execution_binding.kind == D2K_BIND_FLOW && ev.execution_binding.family == 6 &&
-              ev.execution_binding.shape == D2K_PLAN_SHAPE_QUIC && ev.execution_binding.temporary == 1,
+              ev.execution_binding.shape == D2K_PLAN_SHAPE_QUIC && ev.execution_binding.temporary == 1 &&
+              !memcmp(ev.execution_binding.epoch, p+20, 16),
               "execution context endian/IPv6/probe fields lost");
         for (size_t tail = 1; tail < D2K_CTL_EXECUTION_LEN; tail++) {
             send_synthetic(sv[0], kind, rest, base + tail);
@@ -1096,6 +1098,7 @@ int main(void) {
         CHECK(!next_of_kind(fd, D2K_EV_APPLIED, 8, &first, e2, sizeof e2),
               "bound execution did not reach controller");
         CHECK(first.execution_id && first.execution_binding.generation &&
+              memcmp(first.execution_binding.epoch, (const uint8_t[16]){0}, 16) &&
               first.execution_binding.kind == D2K_BIND_NAME &&
               first.execution_binding.family == 4 && !first.execution_binding.temporary,
               "Session/journal/control/link lost execution binding");
@@ -1106,6 +1109,7 @@ int main(void) {
         CHECK(!next_of_kind(fd, D2K_EV_APPLIED, 8, &second, e2, sizeof e2), "reinstalled execution");
         CHECK(second.execution_id != first.execution_id &&
               second.execution_binding.generation != first.execution_binding.generation &&
+              !memcmp(first.execution_binding.epoch, second.execution_binding.epoch, 16) &&
               !memcmp(first.plan_id, second.plan_id, sizeof first.plan_id),
               "same hash reinstall collapsed distinct execution generations");
     }

@@ -49,6 +49,8 @@ static void check_execution(const uint8_t *p, const d2k_result *r) {
     CHECK(p[16] == r->binding.kind && p[17] == r->binding.family &&
           p[18] == r->binding.shape && p[19] == r->binding.temporary,
           "wire fate lost binding context");
+    CHECK(!memcmp(p+20, r->binding.epoch, sizeof r->binding.epoch),
+          "late wire fate lost original table epoch");
 }
 
 static int dial(void) {

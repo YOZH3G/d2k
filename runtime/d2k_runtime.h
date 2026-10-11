@@ -13,7 +13,8 @@
 #ifndef D2K_RELEASE_ID
 #define D2K_RELEASE_ID "dev"
 #endif
-#define D2K_RUNTIME_WIRE 13u
+#include "d2k_protocol.h"
+#define D2K_RUNTIME_WIRE D2K_CTL_PROTO_VERSION
 static inline int d2k_runtime_id_valid(const char *id) {
     size_t n=strnlen(id,65); if(!n||n>64)return 0;
     for(size_t i=0;i<n;i++) { unsigned char c=(unsigned char)id[i];

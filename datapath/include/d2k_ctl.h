@@ -72,11 +72,12 @@
 /* v14: HTTP_PORTAL carries execution, plan/trial identity, monotonic request
  * start and the replayable GET path (no query); zero context is not proof. */
 /* v15: APPLIED/REFUSED append the immutable process-local execution binding. */
-#define D2K_CTL_PROTO_VERSION 15
+/* v16: execution snapshots include a random plan-table lifetime epoch. */
+#include "../../runtime/d2k_protocol.h"
 
 /* Execution ID u64 BE, binding generation u64 BE, kind/family/shape/temporary.
- * Process-local identity only; not sufficient for cross-restart live proof. */
-#define D2K_CTL_EXECUTION_LEN 20u
+ * Followed by the 16-byte table epoch. Unknown identity is not live proof. */
+#define D2K_CTL_EXECUTION_LEN 36u
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */

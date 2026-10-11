@@ -41,7 +41,7 @@
 static uint8_t g_scratch[D2K_CTL_FRAME_MAX + HDR];
 
 /* Absence is unknown, a truncated extension is malformed. This context is
- * process-local and cannot by itself establish live/application success. */
+ * still cannot by itself establish live/application success. */
 static int execution_context(d2k_ev *out, const uint8_t *p, size_t n) {
     if (!n) return 0;
     if (n != D2K_CTL_EXECUTION_LEN || p[16] > D2K_BIND_FLOW ||
@@ -56,6 +56,7 @@ static int execution_context(d2k_ev *out, const uint8_t *p, size_t n) {
     out->execution_binding.family = p[17];
     out->execution_binding.shape = p[18];
     out->execution_binding.temporary = p[19];
+    memcpy(out->execution_binding.epoch, p+20, sizeof out->execution_binding.epoch);
     return 0;
 }
 

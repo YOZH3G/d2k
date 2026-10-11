@@ -1,5 +1,6 @@
 /* plans.c — таблица планов по целям. */
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "d2k_plans.h"
@@ -75,6 +76,7 @@ typedef struct {
 struct d2k_plantab {
     uint64_t revision;
     uint64_t next_binding;
+    uint8_t epoch[16];
     /* Сколько раз запись НАШЛАСЬ, но не подошла по форме приветствия. */
     size_t   shape_misses;
     entry *v;
@@ -87,7 +89,7 @@ struct d2k_plantab {
     size_t suffix_used, bypass_used;
 };
 
-/* One counter per table; the session epoch namespaces it across restarts.
+/* One counter per table; its random epoch namespaces it across restarts.
  * Exhaustion leaves identity unknown rather than reusing an old generation. */
 static void bind_context(d2k_plantab *t, d2k_plan *p, uint8_t kind,
                          uint8_t family, uint8_t shape, int temporary) {
@@ -115,6 +117,14 @@ d2k_plantab *d2k_plantab_new(size_t cap) {
         return NULL;
     }
     t->cap = cap;
+    /* Failure must not fabricate an identity from clocks, addresses or PIDs.
+       Packet execution remains available, but evidence has unknown identity. */
+    FILE *entropy = fopen("/dev/urandom", "rb");
+    if (entropy) {
+        if (fread(t->epoch, 1, sizeof t->epoch, entropy) != sizeof t->epoch)
+            memset(t->epoch, 0, sizeof t->epoch);
+        fclose(entropy);
+    }
     return t;
 }
 
@@ -1172,8 +1182,11 @@ int d2k_plantab_binding(const d2k_plantab *t, const d2k_plan *p, d2k_binding_con
     if (!out) return 0;
     memset(out, 0, sizeof *out);
     if (!t || !p || p->binding_owner != t || !p->binding_generation) return 0;
+    const uint8_t unknown[16] = {0};
+    if (!memcmp(t->epoch, unknown, sizeof unknown)) return 0;
     out->generation = p->binding_generation;
     out->kind = p->binding_kind; out->family = p->binding_family;
     out->shape = p->binding_shape; out->temporary = p->binding_temporary;
+    memcpy(out->epoch, t->epoch, sizeof out->epoch);
     return 1;
 }

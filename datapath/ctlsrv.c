@@ -638,6 +638,8 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             body[n++] = e->binding.family;
             body[n++] = e->binding.shape;
             body[n++] = e->binding.temporary;
+            memcpy(body+n, e->binding.epoch, sizeof e->binding.epoch);
+            n += sizeof e->binding.epoch;
         }
         d2k_ctl_event(ctl, type, body, n);
     }

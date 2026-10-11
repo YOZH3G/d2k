@@ -91,6 +91,7 @@ typedef struct d2k_plantab d2k_plantab;
 typedef struct {
     uint64_t generation;
     uint8_t kind, family, shape, temporary;
+    uint8_t epoch[16]; /* random plan-table lifetime; zero means unknown */
 } d2k_binding_context;
 int d2k_plantab_binding(const d2k_plantab *, const d2k_plan *, d2k_binding_context *);
 

@@ -9,6 +9,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include "d2k_plans.h"
 
 static int fails;
@@ -58,6 +59,50 @@ static uint32_t addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 }
 
 int main(void) {
+    /* Entropy unavailable: keep packet plans usable, but do not invent proof. */
+    {
+        struct rlimit saved, closed;
+        int got = getrlimit(RLIMIT_NOFILE, &saved) == 0;
+        CHECK(got, "read descriptor limit");
+        if (got) {
+            closed = saved; closed.rlim_cur = 0;
+            int limited = setrlimit(RLIMIT_NOFILE, &closed) == 0;
+            CHECK(limited, "entropy failure fixture");
+            if (limited) {
+                d2k_plantab *tab = d2k_plantab_new(1);
+                int restored = setrlimit(RLIMIT_NOFILE, &saved) == 0;
+                CHECK(restored, "restore descriptor limit");
+                d2k_plan *plan = mkplan();
+                CHECK(!d2k_plantab_set_name_family(tab, (const uint8_t *)"unknown.test", 12,
+                      1, plan, D2K_PLAN_SHAPE_MODERN, 0, 4), "unknown identity plan install");
+                d2k_binding_context context;
+                memset(&context, 0xff, sizeof context);
+                const d2k_binding_context zero = {0};
+                CHECK(!d2k_plantab_binding(tab, plan, &context) &&
+                      !memcmp(&context, &zero, sizeof context), "entropy failure fabricated identity");
+                CHECK(d2k_plantab_find_target(tab, (const uint8_t *)"unknown.test", 12,
+                      NULL, 4, 2, D2K_PLAN_SHAPE_MODERN, 0) == plan,
+                      "identity failure disabled existing packet program");
+                d2k_plantab_free(tab);
+            }
+        }
+    }
+    /* A restarted table installs the same program first. Delayed evidence
+       from its predecessor must never identify this new installation. */
+    {
+        d2k_binding_context previous = {0}, current = {0};
+        for (int restart = 0; restart < 2; restart++) {
+            d2k_plantab *tab = d2k_plantab_new(1);
+            d2k_plan *plan = mkplan();
+            CHECK(!d2k_plantab_set_name_family(tab, (const uint8_t *)"restart.test", 12,
+                  1, plan, D2K_PLAN_SHAPE_MODERN, 0, 4), "restart fixture install");
+            CHECK(d2k_plantab_binding(tab, plan, &current), "restart fixture identity");
+            if (restart) CHECK(memcmp(&previous, &current, sizeof current),
+                               "restart reused complete installation identity");
+            previous = current;
+            d2k_plantab_free(tab);
+        }
+    }
     {
         /* Issue #2: a new ECH/GREASE member inherits the learned TLS 1.3
            suffix, while dedicated ECH families and exceptions keep priority. */

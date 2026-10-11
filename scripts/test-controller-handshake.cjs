@@ -81,7 +81,12 @@ async function trial(version, legacy = false, peerRelease = releaseId) {
   assert.match(header, /#define D2K_EV_PROTO\s+0x000A/);
   // Действующая версия — из заголовка, а не числом в тесте: тест с
   // зашитой «4» отвергал собственный датапат с версии 5.
-  const m = header.match(/#define D2K_CTL_PROTO_VERSION\s+(\d+)/);
+  const versionPath = process.env.D2K_VERSION_HEADER ||
+    path.resolve(path.dirname(headerPath), '../../runtime/d2k_protocol.h');
+  // Older release fixtures kept the definition in the event header.
+  const versionPattern = /#define D2K_CTL_PROTO_VERSION\s+(\d+)/;
+  const m = header.match(versionPattern) ||
+    fs.readFileSync(versionPath, 'utf8').match(versionPattern);
   assert.ok(m, 'D2K_CTL_PROTO_VERSION not found');
   VALID = Number(m[1]);
   await trial(null);

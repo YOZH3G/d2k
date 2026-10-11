@@ -14,7 +14,7 @@ DIRTY ?= 0
 
 all: d2kpanel
 
-d2kpanel: main.c server.h server.c ../runtime/d2k_runtime.h
+d2kpanel: main.c server.h server.c ../runtime/d2k_runtime.h ../runtime/d2k_protocol.h
 	$(CC) $(CFLAGS) -o $@ main.c server.c
 
 TARGET ?= aarch64-linux-musl
@@ -23,7 +23,7 @@ ARCH ?= arm64
 BUILDDIR ?= ../builds
 .PHONY: release
 d2kpanel-linux-arm64: release
-release: main.c server.h server.c ../runtime/d2k_runtime.h
+release: main.c server.h server.c ../runtime/d2k_runtime.h ../runtime/d2k_protocol.h
 	mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) -static -Wl,-S -Os -std=c11 -Wall -Wextra -Werror \
 		-D_POSIX_C_SOURCE=200809L -DD2K_RELEASE_ID='"$(RELEASE_ID)"' -DD2K_PANEL_VERSION='"$(VERSION)"' \
