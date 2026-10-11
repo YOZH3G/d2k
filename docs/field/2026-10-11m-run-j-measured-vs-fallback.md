@@ -84,3 +84,44 @@ SYN-ACK на зонд при живом прямом трафике браузе
 Непроверенное: прогон прода 65e7488 на тех же 19 в тот же день не делался;
 доля перебора на проде — по памяти владельца и отчётам 10.10, не по журналу
 того же дня.
+
+## Приложение: таблица `scripts/field-table.py` (база для сравнения)
+
+Сгенерировано командой ниже по журналу прогона j. Следующий прогон сравнивать
+с этой таблицей той же командой. Штрафы считаются на цель, не на протокол.
+Подтверждение зондом не равно живому успеху: колонка live = unknown.
+
+```
+scripts/field-table.py d2kc.log --sites rutracker.org rutracker.cc fost.club nnmclub.to lostfilm.tv kinozal.me bible-center.ru numista.com rua.gr enimerosi.com romfea.gr katzauction.com spzh.news spzh.eu flibusta.is facebook.com adguard.com mailsuite.com cloudflare.com fast-torrent.ru
+```
+
+| Цель | Протокол | Первое | Подтверждено зондом | Время | Путь | План | Поисков | Ед. зондов | QUIC-перебор (провал/всего, опытов) | Штрафов 10 мин (цель) | Исходы | live |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| adguard.com | quic | 10:31:17 | 10:43:54 | 12 мин 37 с | own-plan | plan-c89884b0 | — | — | 1/1, 51 | — | — | unknown |
+| adguard.com | tcp | 10:31:17 | 10:32:16 | 59 с | own-plan | plan-680fbe00 | — | — | — | — | — | unknown |
+| cloudflare.com | ? | 10:31:45 | — | — | direct:проходит как есть | — | — | — | — | — | — | unknown |
+| enimerosi.com | quic | 10:31:17 | 10:32:12 | 55 с | property | plan-e0d1dad8 | — | — | — | — | — | unknown |
+| facebook.com | quic | 10:31:17 | 10:44:23 | 13 мин 06 с | fallback | — | — | — | 3/4, 165 | — | — | unknown |
+| facebook.com | tcp | 10:31:17 | 10:32:05 | 48 с | own-plan | plan-02dfb78d | — | — | — | — | — | unknown |
+| fast-torrent.ru | http | 10:30:58 | 10:42:26 | 11 мин 28 с | property | fake-badsum-whole | — | — | — | — | — | unknown |
+| flibusta.is | tcp | 10:31:18 | 10:31:51 | 33 с | property | plan-02dfb78d | — | — | — | — | — | unknown |
+| fost.club | quic | 10:30:58 | — | — | failed | — | — | — | 1/1, 51 | 1 | — | unknown |
+| fost.club | tcp | 10:30:58 | 10:41:29 | 10 мин 31 с | own-plan | plan-680fbe00 | — | — | — | 1 | — | unknown |
+| katzauction.com | quic | 10:31:17 | 10:39:36 | 8 мин 19 с | own-plan | plan-c89884b0 | — | — | — | — | — | unknown |
+| kinozal.me | quic | 10:31:17 | — | — | failed | — | — | — | 1/1, 51 | — | — | unknown |
+| kinozal.me | tcp | 10:31:17 | 10:32:11 | 54 с | own-plan | plan-680fbe00 | — | — | — | — | — | unknown |
+| lostfilm.tv | quic | 10:31:17 | — | — | failed | — | — | — | 1/1, 51 | — | — | unknown |
+| lostfilm.tv | tcp | 10:31:17 | 10:32:29 | 72 с | own-plan | plan-680fbe00 | — | — | — | — | — | unknown |
+| mailsuite.com | ? | 10:31:17 | — | — | direct:проходит как есть | — | — | — | — | — | — | unknown |
+| nnmclub.to | quic | 10:30:58 | — | — | failed | — | — | — | 2/2, 93 | — | — | unknown |
+| nnmclub.to | tcp | 10:30:58 | 10:32:05 | 67 с | property | plan-680fbe00 | — | — | — | — | — | unknown |
+| romfea.gr | quic | 10:31:17 | 10:34:09 | 2 мин 52 с | own-plan | plan-e0d1dad8 | — | — | — | — | — | unknown |
+| rua.gr | quic | 10:31:17 | 10:34:09 | 2 мин 52 с | own-plan | plan-e0d1dad8 | — | — | — | — | — | unknown |
+| rutracker.cc | quic | 10:31:17 | — | — | failed | — | — | — | 1/1, 48 | — | — | unknown |
+| rutracker.cc | tcp | 10:31:17 | 10:33:00 | 103 с | property | plan-680fbe00 | — | — | — | — | — | unknown |
+| rutracker.org | quic | 10:30:58 | — | — | failed | — | — | — | 1/1, 51 | 1 | — | unknown |
+| rutracker.org | tcp | 10:30:58 | 10:41:49 | 10 мин 51 с | own-plan | plan-680fbe00 | — | — | — | 1 | — | unknown |
+| spzh.eu | quic | 10:31:17 | 10:33:26 | 2 мин 09 с | own-plan | plan-e0d1dad8 | — | — | — | — | — | unknown |
+
+Итого строк по пути: direct=2, failed=6, fallback=1, own-plan=11, property=5
+Время до подтверждения зондом: медиана 129 с, максимум 786 с, n=17
