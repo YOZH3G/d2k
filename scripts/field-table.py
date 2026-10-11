@@ -28,10 +28,12 @@ RE_HTTP = re.compile(r"^" + TS + r" HTTP (\S+?):")
 RE_PROTO = re.compile(r"^" + TS + r" по (\S+) \((TCP|QUIC)\)")
 RE_CONF = re.compile(r"\((TCP|QUIC)\) ПОДТВЕРЖДЕНО собственным зондом: (\S+) \(путь: ([^)]+)\)")
 RE_FB = re.compile(r"\(QUIC\) плечо (подобрано|не нашлось) за (\d+) опыт")
-RE_PENALTY = re.compile(r"результат неубедителен — повторный замер отложен")
+RE_PENALTY = re.compile(r"результат неубедителен — повторный замер отложен|новый поиск отложен на 10 мин")
 RE_DIRECT = re.compile(r"прямой замер не подтвердил блокировку \(([^:]+):")
 RE_HTTP_FOUND = re.compile(r"обход найден — «([^»]+)»")
 RE_SUMMARY = re.compile(r"итог поиска: (.*)")
+# Строка «итог поиска» не начинается с «по <цель>»: цель берётся из target=.
+RE_SUMMARY_TARGET = re.compile(r"^" + TS + r" итог поиска: search=\S+ target=(\S+)")
 RE_YIELD = re.compile(r"\(QUIC\) вопрос завершён: уступаю слот")
 
 PATH_CLASS = {
@@ -95,7 +97,7 @@ def main():
         return rows.setdefault((site, proto), new_row())
 
     for line in lines:
-        m = RE_PO.match(line) or RE_HTTP.match(line)
+        m = RE_PO.match(line) or RE_HTTP.match(line) or RE_SUMMARY_TARGET.match(line)
         if not m:
             continue
         t = secs(m)
@@ -171,6 +173,8 @@ def main():
         f0 = first.get(site)
         path = r["path"] or ("failed" if r["fb_failed"] and not r["confirmed"] else
                              ("direct:" + direct[site] if site in direct and not r["confirmed"] else "none"))
+        if r["confirmed"] is None and "failed" in r["outcomes"] and "probe-confirmed" not in r["outcomes"]:
+            path = "failed"
         count[path.split(":")[0]] = count.get(path.split(":")[0], 0) + 1
         fb = "%d/%d, %d" % (r["fb_failed"], r["fb_runs"], r["fb_trials"]) if r["fb_runs"] else "—"
         outs = ",".join(sorted(set(r["outcomes"]))) or "—"
