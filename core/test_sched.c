@@ -104,6 +104,7 @@ static int tcp_progress_notes;
 static int tcp_trace_lines;
 static int quic_progress_notes; /* задача 49: то же для QUIC */
 static int ver_snapshot_enabled, ver_snapshot_entered, ver_snapshot_release;
+static int ver_snapshot_repeat;
 
 static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
     d2k_voice_res r;
@@ -177,6 +178,10 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
     r.split_gap_us = 60000;
     if (tcp_found_arm) {
         r.have_arm = 1; r.arm.badsum = 1;
+        if (tcp_found_arm == 2) {
+            r.arm.badsum = 0; r.arm.oob = 1;
+            snprintf(r.arm_name, sizeof r.arm_name, "oob");
+        }
         snprintf(r.arm_path, sizeof r.arm_path, "перебор");
         r.arm_input.trigger_len = trigger.len;
         (void)d2k_hello_sni(trigger.bytes, trigger.len, &r.arm_input.sni_off, &r.arm_input.sni_len);
@@ -419,6 +424,7 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
         ver_snapshot_entered = 1;
         pthread_cond_broadcast(&snapshot_cv);
         while (!ver_snapshot_release) { pthread_cond_wait(&snapshot_cv, &snapshot_mu); }
+        if (ver_snapshot_repeat) ver_snapshot_entered = ver_snapshot_release = 0;
         pthread_mutex_unlock(&snapshot_mu);
     }
     return r;
@@ -12022,8 +12028,8 @@ measured_test:
        Поле 02.10.2026, edge-mqtt-fallback.facebook.com: «решает содержимое»,
        узнанная коробка с одним сохранённым планом. План не подошёл — и вместо
        приёма, найденного замером, планировщик прогнал запасной список донора
-       и fake-SNI-лестницу: 45 опытов. Донор после вердикта списка не
-       перебирает: находка — ОДНА стратегия, промах — ни одной. */
+       и fake-SNI-лестницу: 45 опытов. Измеренный приём проверяется первым;
+       поле fost 10.10 и §0.1 требуют страховки, если его применение не помогло. */
     {
         tcp_wait_until_stop = 0; tcp_block_until_stop = 0;
         ver_fail_first = 0; ver_unsupported = 0; ver_cloudflare_challenge = 0;
@@ -12031,8 +12037,8 @@ measured_test:
         vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0; vol_rx_tls_unavailable = 0;
         snapshot_enabled = 0;
         tcp_trace_lines = 1; /* поле 10.10.2026: трасса вопросов и в ветке узнанной коробки */
-        for (int mode = 0; mode < 5; mode++) {
-            /* 0 — замер нашёл приём (disorder у донора; здесь плечо badsum);
+        for (int mode = 0; mode < 8; mode++) {
+            /* 0 — измеренный OOB применён, но приложение не прошло;
                1 — замер владеет поиском и приёма не нашёл;
                2 — прежний провайдер без владения поиском: запасной список
                    законен, но RX-лестница без RX-обрыва — нет;
@@ -12041,7 +12047,10 @@ measured_test:
                    и «местный отказ» не случаются;
                4 — «решает содержимое» без владения поиском (nft-роутер без
                    сырого сокета, I1): после плана коробки — вопросы о
-                   свойствах, и только потом выведенные кандидаты. */
+                   свойствах, и только потом выведенные кандидаты;
+               5 — тот же OOB без APPLIED: опыта нет, не сетевой промах;
+               6 — OOB применён, но verifier упёрся в местный предел;
+               7 — измеренный OOB подтверждён, запасной поиск не нужен. */
             d2k_catalog c = {0};
             c.boxes = calloc(1, sizeof *c.boxes);
             CHECK(c.boxes != NULL, "t37: коробка не создалась");
@@ -12068,8 +12077,12 @@ measured_test:
                 "proto tcp tls\nsplit payload_start +7\norder forward\n");
             tcp_answer = mode == 2 ? D2K_V_PREFIX : D2K_V_OPAQUE;
             tcp_owns_search = mode != 2 && mode != 4;
-            tcp_found_arm = mode == 0 || mode == 3;
-            ver_answer = D2K_VER_HANDSHAKE;   /* ни один кандидат не помогает */
+            tcp_found_arm = mode == 0 || mode >= 5 ? 2 : mode == 3;
+            ver_snapshot_enabled = ver_snapshot_repeat = mode == 0 || mode >= 5;
+            ver_snapshot_entered = ver_snapshot_release = 0;
+            ver_local_limit = mode == 6;
+            ver_answer = mode == 7 ? D2K_VER_APPLICATION : D2K_VER_HANDSHAKE;
+            ver_fail_first = mode == 7; /* stored plan fails, measured OOB succeeds */
             d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
             saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
@@ -12086,10 +12099,21 @@ measured_test:
             d2k_ev h = ev_hello(6, cport, name); d2k_sched_event(s, &h);
             d2k_ev su = ev_suspect(6, cport); d2k_sched_event(s, &su);
             int used = 0;
-            for (int i = 0; i < 1500 && !said("отложен"); i++) {
+            for (int i = 0; i < 1500 && !said("отложен") &&
+                            !said("ПОДТВЕРЖДЕНО собственным зондом"); i++) {
                 spin(s, 120);
                 drain();
-                d2k_ev ap = ev_applied(6, cport); d2k_sched_event(s, &ap);
+                if (mode != 5) {
+                    d2k_ev ap = ev_applied(6, cport); d2k_sched_event(s, &ap);
+                }
+                if (ver_snapshot_repeat) {
+                    pthread_mutex_lock(&snapshot_mu);
+                    if (ver_snapshot_entered) {
+                        ver_snapshot_release = 1;
+                        pthread_cond_broadcast(&snapshot_cv);
+                    }
+                    pthread_mutex_unlock(&snapshot_mu);
+                }
                 spin(s, 5);
                 int u = live_probes_used(s);
                 if (u > used) used = u;
@@ -12114,8 +12138,9 @@ measured_test:
                       "t37: журнал не называет путь находки (полевая доля перебора, §0.1)");
                 CHECK(said("проверяю кандидаты из уже выполненного прямого замера"),
                       "t37: возврат к результату замера не назван");
-                CHECK(used == 2,
-                      "t37: найденный замером приём — второй и последний опыт; запасной список не перебирается");
+                CHECK(said("приём «oob» НАЙДЕН замером") && used > 2 &&
+                      said("измеренный кандидат не подтвердился на применённом потоке"),
+                      "t37: failed applied measured OOB stopped before fallback");
             } else if (mode == 1) {
                 /* Владеющий поиском замер ничего выразимого не нашёл: после
                    плана коробки — явный запасной список (решение
@@ -12146,6 +12171,14 @@ measured_test:
                 /* Плана из приёма не вышло — дальше явный запасной список. */
                 CHECK(said("запасного перебора") && used > 1,
                       "t37: без выразимого плана запасной список не испытан");
+            } else if (mode == 7) {
+                CHECK(ver_calls == 2 && said("ПОДТВЕРЖДЕНО собственным зондом") &&
+                      !said("измеренный кандидат не подтвердился на применённом потоке") &&
+                      !said("запасного перебора"),
+                      "t37: successful measured OOB started unnecessary fallback");
+            } else if (mode >= 5) {
+                CHECK(used == 2 && !said("измеренный кандидат не подтвердился на применённом потоке"),
+                      "t37: missing execution or local limit blamed on measured candidate");
             } else {
                 const char *box_at = strstr(saidbuf, "готовых планов узнанной коробки");
                 const char *ask_at = strstr(saidbuf, "готовые планы не помогли; вердикт: решает содержимое — "
@@ -12158,6 +12191,7 @@ measured_test:
             }
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_snapshot_enabled = ver_snapshot_repeat = ver_local_limit = ver_fail_first = 0;
         }
         tcp_answer = D2K_V_OPAQUE; tcp_owns_search = tcp_found_arm = 0;
         tcp_trace_lines = 0;

@@ -9462,6 +9462,20 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            прикладного обмена, и в каталог не идёт ничего (§10). */
                         say(s, "по %s план %zu: зонд не дошёл до приложения (%s) — беру следующего кандидата",
                             t->name, t->next_plan, t->ver.reason);
+                        /* A measured arm is still a candidate in this context.
+                           Only a completed, attributable experiment may unlock
+                           fallback: missing execution/local failure is not a
+                           failed network hypothesis. Keep cached plans first. */
+                        if (t->transport == 6 && t->search_owned && !t->owned_fallback &&
+                            t->own_first != 2 && t->next_plan > t->n_known &&
+                            t->arm_hash && t->arm_hash == fnv1a(t->plans[t->next_plan-1]) &&
+                            touched && !t->ver.local_limit &&
+                            s->dropped_seen == t->ver_dropped0 &&
+                            t->ver.level >= D2K_VER_TRANSPORT) {
+                            t->owned_fallback = 1;
+                            say(s, "по %s измеренный кандидат не подтвердился на применённом потоке — "
+                                   "после оставшихся кандидатов продолжу запасной перебор", t->name);
+                        }
                         /* Неуспех по НАШЕМУ пределу или нашей ошибке чтения (заголовки
                            длиннее предела, нет памяти) — не поведение линии и не
                            улика против плана семьи (задача 44, поле 03.10.2026:
