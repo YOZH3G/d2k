@@ -328,6 +328,7 @@ typedef struct {
     char host[256];
     uint8_t family;
     char key[40];          /* подтверждённый кандидат; "" — нет */
+    int64_t installed_ms; /* monotonic controller/datapath generation boundary */
     int revoked;          /* old key is only a hypothesis, not saved success */
     uint64_t seq;          /* порядок подтверждения: свежие — первыми */
     int64_t no_before_ms;  /* раньше этого новый поиск/перепроверка не начинается */
@@ -595,6 +596,7 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
         return;
     }
     snprintf(r->key, sizeof r->key, "%s", key);
+    r->installed_ms = now;
     r->revoked = 0;
     r->seq = ++hs->seq;
     r->wall = 0;
@@ -771,9 +773,9 @@ static void start_next(d2k_httpsearch *hs, int64_t now) {
 }
 
 int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t family,
-                                const uint8_t *addr, const uint8_t plan_id[16], int64_t now) {
+                                const uint8_t *addr, const uint8_t plan_id[16], int64_t request_ms, int64_t now) {
     if(!hs||!addr||!plan_id||!host_ok(host)||(family!=4&&family!=6))return 0;
-    rec *r=rec_find(hs,host,family);if(!r||!r->key[0]||r->revoked)return 0;
+    rec *r=rec_find(hs,host,family);if(!r||!r->key[0]||r->revoked||request_ms<=r->installed_ms)return 0;
     uint8_t expected[16];stable_id(r->key,expected);
     if(memcmp(expected,plan_id,16))return 0;
     r->revoked=1;r->no_before_ms=0;
@@ -931,7 +933,7 @@ void d2k_httpsearch_push_all(d2k_httpsearch *hs) {
         char text[2048];
         stable_id(r->key, id);
         if (d2k_hs_candidate_text(r->key, id, text, sizeof text) == 0) {
-            (void)hs->ops.set_plan(hs->ops.ctx, r->host, r->family, text);
+            if(hs->ops.set_plan(hs->ops.ctx, r->host, r->family, text)==0)r->installed_ms=mono_ms();
         }
     }
 }
@@ -998,7 +1000,7 @@ int d2k_httpsearch_load(d2k_httpsearch *hs, const char *path, size_t *n_loaded,
         char text[2048];
         stable_id(key, id);
         if (d2k_hs_candidate_text(key, id, text, sizeof text) == 0 && hs->ops.set_plan) {
-            (void)hs->ops.set_plan(hs->ops.ctx, r->host, r->family, text);
+            if(hs->ops.set_plan(hs->ops.ctx, r->host, r->family, text)==0)r->installed_ms=mono_ms();
         }
         if (n_loaded) { (*n_loaded)++; }
     }

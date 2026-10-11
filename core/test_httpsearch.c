@@ -612,14 +612,20 @@ static void test_bound_failure(void) {
     CHECK(textid!=NULL,"permanent id present");
     for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(textid[4+i*2])*16+hexval(textid[5+i*2]));
     id[0]^=1;
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,++now)&&!f.del_plan_n,"foreign plan failure cannot revoke own plan");
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,now+2)&&!f.del_plan_n,"foreign plan failure cannot revoke own plan");
     id[0]^=1;
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",6,IP,id,++now)&&!f.del_plan_n,"other family cannot revoke own plan");
-    CHECK(d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,++now)==1,"bound live portal must revoke confirmed success");
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",6,IP,id,now+1,now+2)&&!f.del_plan_n,"other family cannot revoke own plan");
+    CHECK(d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,now+2)==1,"bound live portal must revoke confirmed success");
     CHECK(f.del_plan_n==1&&!d2k_httpsearch_plan_of(hs,"bound.example",4)&&d2k_httpsearch_busy(hs),"revoked plan hidden and remeasurement started immediately");
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,++now)&&f.del_plan_n==1,"duplicate failure cannot delete again");
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,now+2)&&f.del_plan_n==1,"duplicate failure cannot delete again");
     base_injected(hs,&f,&now);
     CHECK(strstr(f.last_probe_plan,"split ")!=NULL,"revoked old plan remains first hypothesis");
+    int64_t old_request=now;
+    trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+    int deleted=f.del_plan_n;
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,old_request,now+1)&&f.del_plan_n==deleted,
+          "same-hash old request cannot revoke a newly confirmed generation");
+    CHECK(d2k_httpsearch_plan_of(hs,"bound.example",4)!=NULL,"new generation remains confirmed");
     d2k_httpsearch_free(hs);
 }
 
