@@ -106,6 +106,16 @@ test_httpsearch: $(HTTP_READ_OBJ) test_httpsearch.c httpsearch.c httpup_logic.c 
 test-httpsearch: test_httpsearch
 	./test_httpsearch
 
+TESTS += test_http_compare_failure
+check: test-http-compare-failure
+.PHONY: test-http-compare-failure
+httpsearch_compare_test.o: httpsearch.c include/d2k_httpsearch.h include/d2k_httpup.h $(HDR)
+	$(CC) $(CFLAGS) -Dd2k_plan_text_to_tlv=d2k_test_compare_tlv -c httpsearch.c -o $@
+test_http_compare_failure: $(HTTP_READ_OBJ) test_http_compare_failure.c test_httpsearch.c httpsearch_compare_test.o httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c include/d2k_httpsearch.h include/d2k_httpup.h $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_http_compare_failure.c httpsearch_compare_test.o httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
+test-http-compare-failure: test_http_compare_failure
+	./test_http_compare_failure
+
 # Есть ли у имени HTTPS — для перевода вставки провайдера на https (задача 51).
 TESTS += test_httpsprobe
 check: test-httpsprobe
@@ -612,6 +622,16 @@ SAN_EXTRA_SRC = httpsprobe.c httpup_logic.c
 # датаграммы теряются, и ответ «не доходит». Это свойство стенда, а не кода;
 # сам тест идёт в обычном check.
 SAN_SKIP = test_quicconn_fc
+SAN_SKIP += test_http_compare_failure
+
+.PHONY: san-http-compare-failure
+san: san-http-compare-failure
+san-http-compare-failure:
+	@set -eu; compare_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/d2k-http-compare-san.XXXXXX"); \
+		trap 'rm -rf "$$compare_dir"' EXIT HUP INT TERM; \
+		$(CC) $(SANFLAGS) -Dd2k_plan_text_to_tlv=d2k_test_compare_tlv -c httpsearch.c -o "$$compare_dir/httpsearch.o"; \
+		$(CC) $(SANFLAGS) -o "$$compare_dir/test" test_http_compare_failure.c "$$compare_dir/httpsearch.o" httpup_logic.c plantlv.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_SRC) -lpthread; \
+		"$$compare_dir/test"
 
 san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask san-measured san-httpsearch san-volume-context san-probe-plan
 	@set -e; for t in $(filter-out test_probe_plan test_measured test_httpsearch test_volume_context $(SAN_SKIP),$(TESTS)); do \

@@ -20,6 +20,7 @@
 #include "d2k_httpsearch.h"
 #include "d2k_httpup.h"
 #include "d2k_verify.h"
+#include "d2k_plantlv.h"
 
 uint16_t d2k_hs_probe_port = 80;
 int d2k_hs_probe_ms = 6000;
@@ -351,12 +352,27 @@ static void fresh_id(uint8_t id[16]) {
 
 /* --- поиск ------------------------------------------------------------------- */
 
+/* Program identity is the existing compiler's TLV with a neutral ID,
+   not a fresh trial hash or an alternate spelling of its candidate key.
+   A successful simplified probe cannot erase its owned live failure.
+   Preserve the failing address, but publication is currently NAME-wide:
+   success at another endpoint cannot authorize return to the failed one. */
+typedef struct {
+    char key[40];
+    uint8_t addr[16];
+    d2k_binding_context binding;
+    uint64_t execution;
+    int64_t request_ms;
+} live_failure;
+
 typedef struct {
     char host[256];
     uint8_t family;
     char key[40];          /* подтверждённый кандидат; "" — нет */
     char repeat_path[1024];
-    int repro_gap;
+    int repro_gap, evidence_lost;
+    live_failure *failures;
+    size_t n_failures;
     int64_t installed_ms; /* diagnostic timestamp, never installation identity */
     uint8_t install_id[16], pending_plan_id[16], installed_plan_id[16];
     d2k_binding_context binding;
@@ -389,7 +405,9 @@ struct d2k_httpsearch {
         int ok;            /* настоящих ответов подряд у текущего кандидата */
         int question, next_question;
         int split_no, checksum_no;
+        int split_conflict, checksum_conflict; /* not negative probe controls */
         int judged;        /* судимых испытаний: ответ сервера или вставка под планом */
+        size_t conflicts;  /* passing probes contradicted by owned live failures */
         uint32_t job_seq;  /* номер текущего запуска зонда */
         int fd;
         uint16_t sport;
@@ -455,6 +473,42 @@ static rec *rec_get(d2k_httpsearch *hs, const char *host, uint8_t family) {
     snprintf(r->host, sizeof r->host, "%s", host);
     r->family = family;
     return r;
+}
+
+/* -1 means unknown, including compiler allocation failure. It must never
+   be interpreted as evidence that a new program differs from a failed one. */
+static int same_program(const char *a,const char *b) {
+    if(!strcmp(a,b))return 1;
+    char text[2048],err[160];uint8_t left[2048],right[2048];size_t ln=0,rn=0;
+    if(d2k_hs_candidate_text(a,NULL,text,sizeof text) ||
+       d2k_plan_text_to_tlv(text,left,sizeof left,&ln,err,sizeof err) ||
+       d2k_hs_candidate_text(b,NULL,text,sizeof text) ||
+       d2k_plan_text_to_tlv(text,right,sizeof right,&rn,err,sizeof err))return -1;
+    return ln==rn && !memcmp(left,right,ln);
+}
+
+static const live_failure *failed_live(rec *r,const char *key,const uint8_t *addr) {
+    if(r)for(size_t i=0;i<r->n_failures;i++) {
+        const live_failure *f=&r->failures[i];
+        if(addr && memcmp(f->addr,addr,r->family==6?16:4))continue;
+        int same=same_program(f->key,key);
+        if(same<0) { r->evidence_lost=1;r->repro_gap=1;return NULL; }
+        if(same)return f;
+    }
+    return NULL;
+}
+static int remember_live_failure(rec *r,const uint8_t *addr,
+    const d2k_binding_context *binding,uint64_t execution,int64_t request_ms) {
+    if(failed_live(r,r->key,addr))return 0;
+    if(r->evidence_lost)return -1;
+    live_failure *v=realloc(r->failures,(r->n_failures+1)*sizeof *v);
+    if(!v)return -1;
+    r->failures=v;
+    live_failure *f=&v[r->n_failures++];memset(f,0,sizeof *f);
+    snprintf(f->key,sizeof f->key,"%s",r->key);
+    memcpy(f->addr,addr,r->family==6?16:4);f->binding=*binding;
+    f->execution=execution;f->request_ms=request_ms;
+    return 0;
 }
 
 int d2k_httpsearch_measured_poison(d2k_httpsearch *hs, const char *spec) {
@@ -548,6 +602,7 @@ void d2k_httpsearch_free(d2k_httpsearch *hs) {
     if (!hs) { return; }
     if (hs->cur.phase == PH_ACK || hs->cur.phase == PH_RUN) { drop_probe(hs); }
     drop_socket(hs);
+    for(size_t i=0;i<hs->n_recs;i++)free(hs->recs[i].failures);
     free(hs->recs);
     free(hs->q);
     free(hs);
@@ -623,6 +678,12 @@ static void all_failed(d2k_httpsearch *hs, int64_t now) {
         if (hs->ops.changed) { hs->ops.changed(hs->ops.ctx); }
     }
     if (r) { r->no_before_ms = now + D2K_HS_RETRY_MS; }
+    if(hs->cur.conflicts) {
+        say(hs,"HTTP %s: поиск завершён без принятого плана: %zu кандидатов прошли зонд, "
+               "но имеют живой отказ в области привязки имени; воспроизведение не объясняет живой поток",
+            hs->cur.host,hs->cur.conflicts);
+        finish(hs,now);return;
+    }
     say(hs, "HTTP %s: обход не найден — ни один вопрос не дал ответа сервера; "
             "следующая попытка не раньше чем через %lld мин", hs->cur.host,
         (long long)(D2K_HS_RETRY_MS / 60000));
@@ -674,6 +735,24 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
     char text[2048];
     stable_id(key, id);
     rec *r = rec_get(hs, hs->cur.host, hs->cur.family);
+    const live_failure *failure=failed_live(r,key,NULL);
+    if(r && r->evidence_lost) {
+        say(hs,"HTTP %s: сравнение программ неизвестно или история живых отказов утрачена — "
+               "зонд не разрешает публикацию, требуется воспроизведение живого контекста",hs->cur.host);
+        finish(hs,now);return;
+    }
+    if(failure) {
+        say(hs,"HTTP %s: «%s» — зонд прошёл, но живой отказ execution=%llu generation=%llu "
+               "не снят; привязка действует на всё имя, план не возвращаю, продолжаю вопросы",
+            hs->cur.host,key,(unsigned long long)failure->execution,
+            (unsigned long long)failure->binding.generation);
+        hs->cur.conflicts++;hs->cur.ok=0;hs->cur.idx++;
+        if(!strcmp(key,"split"))hs->cur.split_conflict=1;
+        if(!strcmp(key,"fake-badsum-whole"))hs->cur.checksum_conflict=1;
+        if(hs->cur.question==HQ_SPLIT)hs->cur.next_question=HQ_CHECKSUM;
+        else if(hs->cur.question==HQ_CHECKSUM)hs->cur.next_question=HQ_PRODUCT;
+        next_candidate(hs,now);return;
+    }
     if (d2k_hs_candidate_text(key, id, text, sizeof text) != 0 || !r ||
         install(hs,r,text,id,now) != 0) {
         say(hs, "HTTP %s: план «%s» подтверждён, но не поставлен датапату", hs->cur.host, key);
@@ -689,7 +768,9 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
     if (hs->ops.changed) { hs->ops.changed(hs->ops.ctx); }
     if(hs->cur.question>=HQ_SPLIT && hs->cur.question<=HQ_PRODUCT)
         say(hs,"HTTP %s: путь: свойство — %s; тот же запрос, APPLIED и два опыта с повтором keep-alive без вставки",
-            hs->cur.host,hs->cur.question==HQ_PRODUCT ? "разрез и checksum-приманка вместе после двух отрицательных контролей" :
+            hs->cur.host,hs->cur.question==HQ_PRODUCT ?
+            (hs->cur.split_no && hs->cur.checksum_no ? "разрез и checksum-приманка вместе после двух отрицательных контролей" :
+             "разрез и checksum-приманка вместе после живого отказа одиночного приёма; парные контроли зонда не доказаны") :
             hs->cur.question==HQ_CHECKSUM ? "checksum-приманка перед целым запросом" : "разрез имени");
     say(hs, "HTTP %s: обход найден — «%s», %d опыта подряд с двумя полными ответами keep-alive под пробным "
             "планом; отправлен на установку (HTTP), живая приёмка ещё не подтверждена", hs->cur.host, key, HS_CONFIRM);
@@ -746,8 +827,8 @@ static void next_candidate(d2k_httpsearch *hs, int64_t now) {
     drop_socket(hs);
     hs->cur.sport = 0;
     while(hs->cur.idx>=hs->cur.n_cands) {
-        if(hs->cur.next_question==HQ_SPLIT && hs->cur.split_no) hs->cur.next_question=HQ_CHECKSUM;
-        if(hs->cur.next_question==HQ_CHECKSUM && hs->cur.checksum_no) hs->cur.next_question=HQ_PRODUCT;
+        if(hs->cur.next_question==HQ_SPLIT && (hs->cur.split_no || hs->cur.split_conflict)) hs->cur.next_question=HQ_CHECKSUM;
+        if(hs->cur.next_question==HQ_CHECKSUM && (hs->cur.checksum_no || hs->cur.checksum_conflict)) hs->cur.next_question=HQ_PRODUCT;
         hs->cur.question=hs->cur.next_question;
         hs->cur.next_question=HQ_FALLBACK;
         switch(hs->cur.question) {
@@ -889,8 +970,9 @@ int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t f
     if(!addr)return 0;
     rec *r=live_owner(hs,host,family,plan_id,binding,execution_id,request_ms);
     if(!r)return 0;
+    if(remember_live_failure(r,addr,binding,execution_id,request_ms))r->evidence_lost=1;
     r->revoked=1;r->no_before_ms=0;
-    r->repro_gap=!hs_path_ok(path);
+    r->repro_gap=!hs_path_ok(path) || r->evidence_lost;
     r->repeat_path[0]=0;
     if(!r->repro_gap)snprintf(r->repeat_path,sizeof r->repeat_path,"%s",path);
     revoke_owned(hs,r);

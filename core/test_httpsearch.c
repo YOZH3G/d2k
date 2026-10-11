@@ -688,6 +688,118 @@ static void test_pending_revoke(void) {
     d2k_httpsearch_free(hs);
 }
 
+static void permanent_id(const fake *f,uint8_t id[16]) {
+    const char *p=strstr(f->last_plan,"\nid ");
+    CHECK(p!=NULL,"installed plan has identity");
+    memset(id,0,16);
+    if(p)for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(p[4+2*i])*16+hexval(p[5+2*i]));
+}
+
+static void test_live_failure_outweighs_probe(void) {
+    for(int family=4;family<=6;family+=2) {
+        fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);
+        int64_t now=1;uint8_t id[16],addr[16]={0};
+        if(family==4)memcpy(addr,IP,4);else inet_pton(AF_INET6,"2001:db8::80",addr);
+        d2k_httpsearch_portal(hs,"conflict.example",family,addr,now);base_injected(hs,&f,&now);
+        trial(hs,&f,&now,1,D2K_HS_INJECTED); /* split alone failed */
+        trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+        CHECK(d2k_httpsearch_plan_of(hs,"conflict.example",family) &&
+            !strcmp(d2k_httpsearch_plan_of(hs,"conflict.example",family),"fake-badsum-whole"),
+            "fixture selected measured checksum whole candidate");
+        permanent_id(&f,id);int installed=f.set_plan_n;
+        CHECK(d2k_httpsearch_bound_failure(hs,"conflict.example",family,addr,id,&f.binding,
+            501,now+1,"/False/",now+2),"exact live portal invalidates checksum candidate");
+        base_injected(hs,&f,&now);
+        trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+        CHECK(f.set_plan_n==installed && !d2k_httpsearch_plan_of(hs,"conflict.example",family),
+            "two probe successes cannot reinstall a candidate disproved on its live flow");
+        CHECK(d2k_httpsearch_busy(hs) && strstr(f.last_probe_plan,"split sni_middle") &&
+            !strstr(f.last_probe_plan,"fake "),"conflict continues to another measured question");
+        CHECK(strstr(f.said,"живой отказ") && strstr(f.said,"зонд"),"probe/live conflict is visible");
+        d2k_httpsearch_free(hs);
+    }
+}
+
+static void test_live_failure_history(void) {
+    fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);
+    int64_t now=1;uint8_t id[16];char failed[12][40];size_t nfailed=0;
+    d2k_httpsearch_portal(hs,"history.example",4,IP,now);base_injected(hs,&f,&now);
+    /* Every simplified probe passes. Each newly installed program is then
+       disproved by its exact live portal. Search must not cycle A -> B -> A. */
+    for(size_t round=0;round<8;round++) {
+        for(size_t attempts=0;d2k_httpsearch_busy(hs)&&attempts<32;attempts++)
+            trial(hs,&f,&now,1,D2K_HS_REAL);
+        CHECK(!d2k_httpsearch_busy(hs),"finite candidate set terminates each search");
+        const char *key=d2k_httpsearch_plan_of(hs,"history.example",4);
+        if(!key)break;
+        int duplicate=0;
+        for(size_t i=0;i<nfailed;i++)if(!strcmp(key,failed[i]))duplicate=1;
+        CHECK(!duplicate,"a different accepted candidate cannot erase older live failures");
+        snprintf(failed[nfailed++],sizeof failed[0],"%s",key);
+        permanent_id(&f,id);
+        CHECK(d2k_httpsearch_bound_failure(hs,"history.example",4,IP,id,&f.binding,
+            600+round,now+1,"/False/",now+2),"history failure belongs to actual current installation");
+        base_injected(hs,&f,&now);
+    }
+    CHECK(nfailed>=2 && !d2k_httpsearch_plan_of(hs,"history.example",4) &&
+          !d2k_httpsearch_busy(hs),"exhausted live-disproved programs remain unconfirmed");
+    int sets=f.set_plan_n;d2k_httpsearch_push_all(hs);
+    CHECK(f.set_plan_n==sets,"push_all cannot restore a live-disproved program");
+    /* A different address can be measured, but a NAME-wide installation
+       would also return this program to the old, disproved address. */
+    uint8_t other[16];memcpy(other,IP,16);other[3]++;
+    now+=3600000;d2k_httpsearch_portal(hs,"history.example",4,other,now);
+    base_injected(hs,&f,&now);trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+    CHECK(!d2k_httpsearch_plan_of(hs,"history.example",4) && f.set_plan_n==sets &&
+          d2k_httpsearch_busy(hs),
+          "another IP's probe cannot restore a failed program through a name-wide binding");
+    d2k_httpsearch_free(hs);
+}
+
+static void test_live_failure_alias(void) {
+    const char *keys[][2]={{"fake-badsum","fake:badsum"},
+                           {"fake:ttl=03+badsum","fake:ttl=3+badsum"}};
+    for(size_t k=0;k<sizeof keys/sizeof keys[0];k++) {
+        fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);
+        char path[]="/tmp/d2k-http-alias-XXXXXX",err[200];int fd=mkstemp(path);
+        CHECK(fd>=0,"alias fixture file");if(fd<0){d2k_httpsearch_free(hs);continue;}close(fd);
+        FILE *file=fopen(path,"w");CHECK(file!=NULL,"alias target fixture");
+        if(!file){unlink(path);d2k_httpsearch_free(hs);continue;}
+        fprintf(file,"d2k-http-plans 1\nalias-target.example 4 %s 1\n",keys[k][0]);fclose(file);
+        size_t loaded=0;
+        CHECK(!d2k_httpsearch_load(hs,path,&loaded,err,sizeof err)&&loaded==1,"load target candidate");
+        d2k_httpsearch_install_ack(hs,f.install_id,1,&f.binding);
+        uint8_t id[16];permanent_id(&f,id);d2k_binding_context owner=f.binding;
+        file=fopen(path,"w");CHECK(file!=NULL,"alias source fixture");
+        if(!file){unlink(path);d2k_httpsearch_free(hs);continue;}
+        fprintf(file,"d2k-http-plans 1\nalias-source.example 4 %s 2\n",keys[k][1]);fclose(file);
+        CHECK(!d2k_httpsearch_load(hs,path,&loaded,err,sizeof err)&&loaded==1,"load reusable alias candidate");
+        d2k_httpsearch_install_ack(hs,f.install_id,1,&f.binding);unlink(path);
+        int sets=f.set_plan_n;int64_t now=1;
+        CHECK(d2k_httpsearch_bound_failure(hs,"alias-target.example",4,IP,id,&owner,
+              800,now+1,"/False/",now+2),"alias fixture records owned live failure");
+        base_injected(hs,&f,&now);
+        /* Own program and the same program under another stored key. */
+#ifdef D2K_TEST_HTTP_COMPARE_FAILURE
+        compare_fault=1;
+#endif
+        for(int i=0;i<4;i++)trial(hs,&f,&now,1,D2K_HS_REAL);
+        CHECK(f.set_plan_n==sets && !d2k_httpsearch_plan_of(hs,"alias-target.example",4),
+              "alternate spelling cannot republish the same live-disproved program");
+#ifdef D2K_TEST_HTTP_COMPARE_FAILURE
+        compare_fault=0;
+        CHECK(!d2k_httpsearch_busy(hs) && strstr(f.said,"сравнение программ неизвестно"),
+              "compiler failure stops publication with an explicit unknown result");
+        d2k_httpsearch_push_all(hs);
+        d2k_httpsearch_portal(hs,"alias-target.example",4,IP,now+3600000);
+        CHECK(!d2k_httpsearch_busy(hs) && f.set_plan_n==sets+1 &&
+              !d2k_httpsearch_plan_of(hs,"alias-target.example",4),
+              "later compiler recovery cannot erase the evidence gap; only source name is pushed");
+#endif
+        d2k_httpsearch_free(hs);
+    }
+}
+
 static void test_bound_failure(void) {
     /* Writing SET_NAME is not an installation ACK. A portal from the old
        binding may start after that write and arrive after replacement. */
@@ -743,10 +855,16 @@ static void test_bound_failure(void) {
     int64_t old_request=now;
     d2k_binding_context old_binding=f.binding;
     trial(hs,&f,&now,1,D2K_HS_REAL);
+    CHECK(!d2k_httpsearch_plan_of(hs,"bound.example",4),"old live failure survives repeated probe success");
+    CHECK(strstr(f.last_probe_plan,"fake ") && !strstr(f.last_probe_plan,"split "),
+          "live-disproved split continues to measured checksum-whole question, not fallback");
+    trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+    CHECK(d2k_httpsearch_plan_of(hs,"bound.example",4)!=NULL,"different program may become a new candidate");
+    permanent_id(&f,id);old_binding=f.binding;
+    d2k_httpsearch_push_all(hs);d2k_httpsearch_install_ack(hs,f.install_id,1,&f.binding);
     int deleted=f.del_plan_n;
     CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,&old_binding,1,old_request,"/False/",now+1)&&f.del_plan_n==deleted,
           "same-hash old request cannot revoke a newly confirmed generation");
-    CHECK(d2k_httpsearch_plan_of(hs,"bound.example",4)!=NULL,"new generation remains confirmed");
     d2k_httpsearch_free(hs);
 }
 
@@ -856,6 +974,9 @@ int main(void) {
     test_failed_reinstall_keeps_owner();
     test_pending_revoke();
     test_bound_failure();
+    test_live_failure_outweighs_probe();
+    test_live_failure_history();
+    test_live_failure_alias();
     test_single_response_not_confirmation();
 #endif
     test_portal_properties();

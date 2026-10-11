@@ -254,6 +254,8 @@ static void live_trial_proof(d2k_ctl *ctl,d2k_ctlsrv *cx,int peer,int family) {
     d2k_httpsearch_free(hs);
 }
 
+static void live_conflict(d2k_ctl *,d2k_ctlsrv *,int,int,const char *);
+
 static void live_restore(int family) {
     char dir[128],path[180],sock[180],cat[180],log[180],err[300];
     snprintf(dir,sizeof dir,"/tmp/d2k-http-live-%ld-%d",(long)getpid(),family);
@@ -318,6 +320,7 @@ static void live_restore(int family) {
     const uint8_t unknown_trial[16]={0};
     CHECK(!memcmp(last_live_execution.trial_id,unknown_trial,16),"legacy execution retains unknown trial");
     live_trial_proof(ctl,&cx,peer,family);
+    live_conflict(ctl,&cx,peer,family,path);
     d2k_link_close(peer);d2k_ctl_close(ctl);d2k_session_free(s);
     unlink(path);unlink(cat);unlink(log);unlink(sock);rmdir(dir);
 }
@@ -520,6 +523,62 @@ static void live_split_identity(void) {
                 "split identity runtime gate detects changed fake bytes");
       }
     }
+}
+
+/* The failure comes from an applied two-request flow through the real
+   observer and control codec. Only subsequent probe replies are fixtures. */
+static void live_conflict(d2k_ctl *ctl,d2k_ctlsrv *cx,int peer,int family,const char *store) {
+    identity_peer=peer;char err[200];d2k_ev ev;
+    (void)d2k_ctl_poll(ctl,d2k_ctlsrv_command,cx);d2k_ctl_flush(ctl);
+    while(!d2k_link_next(peer,&ev,0,err,sizeof err)){}
+    fake f={0};d2k_hs_ops ops=ops_of(&f);ops.set_plan=identity_set;ops.del_plan=identity_del;
+    d2k_httpsearch *hs=d2k_httpsearch_new(&ops);size_t loaded=0;
+    CHECK(!d2k_httpsearch_load(hs,store,&loaded,err,sizeof err)&&loaded==1,"live conflict restore");
+    (void)identity_ack(ctl,cx,hs);
+    d2k_http80 *observer=d2k_http80_new();d2k_http80_res observed;
+    uint8_t pkt[4096],out[65536];d2k_result execution;size_t n;
+    n=live_packet(family,57500,10000,1,"",pkt);
+    d2k_session_set_hook(cx->sess,D2K_HOOK_POSTROUTING);
+    d2k_session_packet(cx->sess,pkt,n,1000000000,out,sizeof out,&execution);
+    split_observe(observer,pkt,n,1000000000,&observed);
+    n=live_direction_packet(family,57500,76542,10001,0x12,1,"",pkt);
+    split_observe(observer,pkt,n,1098000000,&observed);
+    uint32_t seq=10001,server_seq=76543;
+    for(unsigned request=0;request<2;request++) {
+        char req[256];snprintf(req,sizeof req,"GET /%s HTTP/1.1\r\nHost: %s\r\n\r\n",
+                              request?"False/":"",live_host);
+        uint64_t time=1100000000+request*200000000;
+        n=live_direction_packet(family,57500,seq,server_seq,0x18,0,req,pkt);
+        seq+=(uint32_t)strlen(req);
+        split_observe(observer,pkt,n,time,&observed);
+        d2k_session_packet(cx->sess,pkt,n,time,out,sizeof out,&execution);
+        CHECK(execution.applied && execution.n_out==1,"live conflict request emits its actual checksum fake");
+        for(size_t i=0;i<execution.n_out+1;i++)
+            d2k_session_sent(cx->sess,time+1,&execution.key,execution.execution_id);
+        d2k_http80_executed(observer,pkt,n,time+1,execution.execution_id,
+                           execution.plan_id,execution.trial_id,&execution.binding);
+        const char *reply=request?INJECT:"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+        n=live_direction_packet(family,57500,server_seq,seq,0x18,1,reply,pkt);
+        server_seq+=(uint32_t)strlen(reply);
+        split_observe(observer,pkt,n,time+98000000,&observed);
+        CHECK(observed.execution_id==execution.execution_id && observed.request_no==request+1,
+              "observer attributes each response to its real request execution");
+        CHECK(observed.response==(request?3:1),"first complete response then live portal");
+        d2k_ctlsrv_http80_event(ctl,&observed);d2k_ctl_flush(ctl);
+        CHECK(!d2k_link_next(peer,&ev,100,err,sizeof err),"live response crosses real Unix codec");
+        CHECK(d2k_httpsearch_control(hs,&ev,(int64_t)(time/1000000)+100)==1,
+              "controller accepts exact applied response evidence");
+    }
+    CHECK(!d2k_httpsearch_plan_of(hs,live_host,family)&&f.del_plan_n==1,"live portal revokes applied program");
+    (void)identity_ack(ctl,cx,hs);
+    int sets=f.set_plan_n;int64_t now=2000;
+    base_injected(hs,&f,&now);
+    trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+    CHECK(f.set_plan_n==sets && !d2k_httpsearch_plan_of(hs,live_host,family),
+          "simplified probes cannot erase actual observer/control live failure");
+    CHECK(!d2k_plantab_find_http(d2k_session_plans(cx->sess),(const uint8_t *)live_host,
+          strlen(live_host),(uint8_t)family,0,5),"disproved plan is absent from actual permanent table");
+    d2k_httpsearch_free(hs);d2k_http80_free(observer);
 }
 
 int main(int argc,char **argv) {

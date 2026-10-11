@@ -68,6 +68,15 @@ int main(int argc, char **argv) {
         for(int family=4;family<=6;family+=2)
             CHECK(same_execution(trial_text,permanent_text,family),"catalog runtime equality");
     }
+    const char *aliases[][2]={{"fake-badsum","fake:badsum"},
+                              {"fake:ttl=03+badsum","fake:ttl=3+badsum"}};
+    for(size_t k=0;k<sizeof aliases/sizeof aliases[0];k++) {
+        char left[2048],right[2048];
+        CHECK(!d2k_hs_candidate_text(aliases[k][0],NULL,left,sizeof left) &&
+              !d2k_hs_candidate_text(aliases[k][1],NULL,right,sizeof right),"alias programs compile");
+        for(int family=4;family<=6;family+=2)
+            CHECK(same_execution(left,right,family),"candidate aliases produce identical full runtime packets");
+    }
     for(int family=4;family<=6;family+=2)for(int answer=0;answer<3;answer++) {
         fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
         d2k_httpsearch_portal(hs,"portal-target.example",(uint8_t)family,IP,now);base_injected(hs,&f,&now);
@@ -79,6 +88,20 @@ int main(int argc, char **argv) {
         char altered[2048];snprintf(altered,sizeof altered,"%s",f.last_plan);
         alter_program(altered);
         CHECK(!same_execution(f.last_probe_plan,altered,family),"gate accepted changed runtime bytes");
+        char failed_key[40];snprintf(failed_key,sizeof failed_key,"%s",
+            d2k_httpsearch_plan_of(hs,"portal-target.example",(uint8_t)family));
+        uint8_t failed_id[16];permanent_id(&f,failed_id);
+        CHECK(d2k_httpsearch_bound_failure(hs,"portal-target.example",(uint8_t)family,
+              IP,failed_id,&f.binding,900,now+1,"/False/",now+2),"runtime candidate live failure");
+        base_injected(hs,&f,&now);
+        for(size_t attempt=0;d2k_httpsearch_busy(hs)&&attempt<16;attempt++)
+            trial(hs,&f,&now,1,D2K_HS_REAL);
+        const char *replacement=d2k_httpsearch_plan_of(hs,"portal-target.example",(uint8_t)family);
+        CHECK(f.set_plan_n==2 && replacement && strcmp(replacement,failed_key),
+              "live conflict selects a different measured program");
+        if(force_divergence)alter_program(f.last_plan);
+        CHECK(same_execution(f.last_probe_plan,f.last_plan,family),
+              "post-conflict selection keeps trial/permanent full runtime equality");
         d2k_httpsearch_free(hs);
     }
     if(fails){printf("HTTP runtime: FAIL %d\n",fails);return 1;}
