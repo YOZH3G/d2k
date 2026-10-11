@@ -2,9 +2,11 @@
 #include <string.h>
 #include "d2k_hold.h"
 #include "d2k_packet.h"
+#include "d2k_http80.h"
 
 typedef struct {
     size_t count;
+    int kind;
     uint64_t deadline, revision;
     d2k_hold_info head;
     uint32_t ids[D2K_HOLD_IDS];
@@ -88,6 +90,14 @@ size_t d2k_hold_verdicts(const uint32_t *ids, size_t count, uint32_t verdict,
     }
     return failed;
 }
+static int http_ready(const uint8_t *p,size_t n,size_t high) {
+    d2k_http_req req;
+    if(n!=high)return 0;
+    if(d2k_http_request(p,n,&req))return 1;
+    /* A complete header with no valid identity cannot become eligible. */
+    for(size_t i=3;i<n;i++)if(!memcmp(p+i-3,"\r\n\r\n",4))return -1;
+    return 0;
+}
 int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
                   uint64_t now, uint64_t revision, int allow_start,
                   uint32_t anchor, int have_anchor,
@@ -124,6 +134,7 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
         if (!vacant) { h->stats.full++; return 0; }
         s = vacant;
         s->head = v;
+        s->kind=allow_start;
         s->revision = revision;
         s->deadline = now + D2K_HOLD_WAIT_NS;
         h->stats.started++;
@@ -145,9 +156,12 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
     const uint8_t *hello;
     size_t hello_len;
     uint32_t hello_seq;
-    int rc = d2k_capture_feed(&h->capture, &v.key, s->deadline, now, v.seq,
-                              anchor, have_anchor,
-                              p + v.header, v.payload, &hello, &hello_len, &hello_seq);
+    int rc;
+    if(s->kind==D2K_HOLD_HTTP)
+        rc=d2k_capture_feed_ready(&h->capture,&v.key,s->deadline,now,v.seq,
+            anchor,have_anchor,p+v.header,v.payload,&hello,&hello_len,&hello_seq,http_ready);
+    else rc=d2k_capture_feed(&h->capture,&v.key,s->deadline,now,v.seq,
+            anchor,have_anchor,p+v.header,v.payload,&hello,&hello_len,&hello_seq);
     if (rc < 0) {
         release_slot(h, s, release, ctx);
         return 1;

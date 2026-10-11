@@ -144,6 +144,8 @@ int d2k_plantab_del_name_shaped(d2k_plantab *, const uint8_t *, size_t,
     uint8_t transport, uint8_t shape, uint8_t family);
 const d2k_plan *d2k_plantab_find_family(d2k_plantab *, const uint8_t *, size_t,
     uint32_t addr_be, uint64_t, uint8_t shape, uint16_t sport_be, uint8_t family);
+/* Prefilter only: an unknown HTTP Host still requires exact lookup after assembly. */
+int d2k_plantab_http_candidate(const d2k_plantab *,uint8_t,uint16_t);
 int d2k_plantab_stream_candidate_family(const d2k_plantab *, const uint8_t *,
     size_t, uint32_t addr_be, uint16_t sport_be, uint8_t family);
 int d2k_plantab_stream_candidate_target(const d2k_plantab *, const uint8_t *,

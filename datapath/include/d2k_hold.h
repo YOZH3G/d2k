@@ -5,6 +5,8 @@
 #ifndef D2K_HOLD_H
 #define D2K_HOLD_H
 #include "d2k_capture.h"
+#define D2K_HOLD_TLS 1
+#define D2K_HOLD_HTTP 2
 #define D2K_HOLD_SLOTS 16
 #define D2K_HOLD_IDS 8
 #define D2K_HOLD_PACKET 1600
@@ -35,11 +37,11 @@ d2k_hold *d2k_hold_new(void);
 void d2k_hold_free(d2k_hold *h); /* flush ALL first */
 /* 0 PASS (caller owns current ID), 1 WAIT/RELEASED (module consumed ID),
  * 2 READY (caller owns exactly batch.ids, including current ID).
- * allow_start is a conservative plan prefilter, NOT execution authority.
+ * allow_start is 0 or D2K_HOLD_TLS/HTTP: a prefilter, NOT execution authority.
  * Existing groups always consume tails even when allow_start is false.
  */
-/* anchor/have_anchor — известное начало потока (номер сразу за SYN). Нужны по
- * двум причинам сразу: сборщик кладёт куски по смещению от него (порядок
+/* anchor/have_anchor — известное начало входа плана: SYN+1 для TLS или
+ * доказанная граница HTTP-запроса. Нужны по двум причинам сразу: сборщик кладёт куски по смещению от него (порядок
  * прихода перестаёт значить что-либо), а собранный пакет берёт заголовок у
  * НАСТОЯЩЕЙ головы, а не у первого пришедшего. Без второго содержимое
  * собиралось верно, но уезжало с номером хвоста — верные байты на неверных

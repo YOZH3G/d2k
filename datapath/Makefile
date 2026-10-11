@@ -111,8 +111,8 @@ udp_hold.o: udp_hold.c $(HDR)
 udp_release.o: udp_release.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test_udp_hold: test_udp_hold.c udp_hold.o udp_release.o hold.o capture.o track.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_udp_hold.c udp_hold.o udp_release.o hold.o capture.o track.o $(LDFLAGS)
+test_udp_hold: test_udp_hold.c udp_hold.o udp_release.o hold.o capture.o track.o http80.o wire.o core_httpup_logic.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_udp_hold.c udp_hold.o udp_release.o hold.o capture.o track.o http80.o wire.o core_httpup_logic.o $(LDFLAGS)
 
 udp_path.o: udp_path.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -147,8 +147,8 @@ test-udp-release: test_udp_release
 test-udp-hold: test_udp_hold
 	./test_udp_hold
 
-test_hold: test_hold.c hold.o capture.o track.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_hold.c hold.o capture.o track.o $(LDFLAGS)
+test_hold: test_hold.c hold.o capture.o track.o http80.o wire.o core_httpup_logic.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_hold.c hold.o capture.o track.o http80.o wire.o core_httpup_logic.o $(LDFLAGS)
 
 .PHONY: test-hold
 test-hold: test_hold

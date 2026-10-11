@@ -401,6 +401,16 @@ static entry *find_name_port(d2k_plantab *t, const uint8_t *name, size_t len,
     return NULL;
 }
 
+int d2k_plantab_http_candidate(const d2k_plantab *t,uint8_t family,uint16_t sport) {
+    if(!t)return 0;
+    for(size_t i=0;i<t->used;i++) {
+        const entry *e=&t->v[i];
+        if(e->kind==KEY_NAME && e->family==family && e->shape==D2K_PLAN_SHAPE_HTTP &&
+           e->only_sport==sport && d2k_plan_proto(e->plan)==D2K_PLAN_PROTO_HTTP)return 1;
+    }
+    return 0;
+}
+
 const d2k_plan *d2k_plantab_find_http(d2k_plantab *t, const uint8_t *name, size_t len,
                                       uint8_t family, uint16_t sport_be, uint64_t now_ns) {
     if (!t || !name || !len) { return NULL; }

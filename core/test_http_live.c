@@ -4,6 +4,7 @@
 #include "test_httpsearch.c"
 #include "../datapath/include/d2k_session.h"
 #include "../datapath/include/d2k_wire.h"
+#include "../datapath/include/d2k_hold.h"
 #include "../datapath/test_nat_stub.h"
 #undef main
 #include <signal.h>
@@ -19,16 +20,25 @@ static int live_diverge;
 static d2k_result last_live_execution;
 static int identity_peer, identity_delete_fail;
 static const char live_host[]="portal-target.example";
-static size_t live_packet(int family,uint16_t port,uint32_t seq,int syn,const char *request,uint8_t *pkt) {
-    d2k_conn c={0};c.family=(uint8_t)family;c.ttl=61;c.window=32000;c.ack=76543;
+static size_t live_direction_packet(int family,uint16_t port,uint32_t seq,uint32_t ack,
+                                    int flags,int reverse,const char *request,uint8_t *pkt) {
+    d2k_conn c={0};c.family=(uint8_t)family;c.ttl=61;c.window=32000;c.ack=ack;
     c.src_port=htons(port);c.dst_port=htons(80);c.ip_id=123;
     inet_pton(AF_INET,"192.0.2.1",&c.src_ip);inet_pton(AF_INET,"198.51.100.2",&c.dst_ip);
     inet_pton(AF_INET6,"2001:db8::1",c.src_ip6);inet_pton(AF_INET6,"2001:db8::2",c.dst_ip6);
+    if(reverse) {
+        uint32_t ip=c.src_ip;c.src_ip=c.dst_ip;c.dst_ip=ip;
+        uint8_t ip6[16];memcpy(ip6,c.src_ip6,16);memcpy(c.src_ip6,c.dst_ip6,16);memcpy(c.dst_ip6,ip6,16);
+        c.src_port=htons(80);c.dst_port=htons(port);
+    }
     d2k_emit e={0};e.kind=D2K_EMIT_PAYLOAD;e.bytes=(const uint8_t *)request;e.len=strlen(request);e.seq=seq;
     size_t n=d2k_wire_build(&c,&e,pkt,4096),th=family==6?40:20;
-    if(syn) {pkt[th+13]=2;unsigned sum=((unsigned)pkt[th+16]<<8|pkt[th+17])+0x16u;
+    if(flags!=0x18) {pkt[th+13]=(uint8_t)flags;unsigned sum=((unsigned)pkt[th+16]<<8|pkt[th+17])+(0x18u-(unsigned)flags);
         sum=(sum&65535u)+(sum>>16);pkt[th+16]=(uint8_t)(sum>>8);pkt[th+17]=(uint8_t)sum;}
     CHECK(n&&d2k_wire_tcp_checksum_ok(pkt,n),"live packet is valid");return n;
+}
+static size_t live_packet(int family,uint16_t port,uint32_t seq,int syn,const char *request,uint8_t *pkt) {
+    return live_direction_packet(family,port,seq,76543,syn?2:0x18,0,request,pkt);
 }
 typedef struct { uint8_t bytes[12][4096]; d2k_test_packet packets[12]; size_t n; } live_trace;
 static void live_flow(d2k_session *s,int family,uint16_t port,const char *host,int want,int probe,live_trace *trace) {
@@ -382,10 +392,141 @@ static void live_segmented_headers(void) {
     }
 }
 
+static int split_released;
+static uint32_t split_released_id;
+static uint8_t split_released_bytes[4096];
+static size_t split_released_len;
+static void split_release(void *ctx,uint32_t id,const uint8_t *pkt,size_t n) {
+    split_released++;split_released_id=id;split_released_len=n;
+    if(n<=sizeof split_released_bytes)memcpy(split_released_bytes,pkt,n);
+    if(ctx) {
+        d2k_session_note_unassembled(ctx,pkt,n,1400000000);
+        d2k_session_observe_tcp(ctx,pkt,n,1400000000);
+    }
+}
+static void split_observe(d2k_http80 *h,const uint8_t *p,size_t n,uint64_t time,d2k_http80_res *r) {
+    uint8_t out[4096],rst[128];d2k_http80_packet(h,p,n,time,0,out,sizeof out,rst,sizeof rst,r);
+}
+static void live_split_identity(void) {
+    for(int family=4;family<=6;family+=2)for(int later=0;later<2;later++)for(int expiry=0;expiry<2;expiry++) {
+      live_trace traces[2]={0};
+      for(int probe=0;probe<2;probe++) {
+        d2k_session *s=d2k_session_new(128,128);d2k_hold *h=d2k_hold_new();d2k_plan *plan=NULL;
+        d2k_http80 *observer=d2k_http80_new();d2k_http80_res observed;
+        char text[4096],err[200];uint8_t tlv[8192],id[16]={1};size_t len=0;
+        CHECK(!d2k_hs_candidate_text("fake-badsum-whole",id,text,sizeof text),"split identity candidate");
+        CHECK(!d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&len,err,sizeof err),"split identity TLV");
+        CHECK(!d2k_plan_load(tlv,len,&plan,err,sizeof err),"split identity plan");
+        CHECK(!d2k_plantab_set_name_family(d2k_session_plans(s),(const uint8_t *)live_host,
+              strlen(live_host),1,plan,D2K_PLAN_SHAPE_HTTP,probe?htons(56500):0,(uint8_t)family),"split identity binding");
+        uint8_t pkt[4096],out[65536],original[2][4096];size_t original_len[2];d2k_result r;size_t n;
+        d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
+        n=live_packet(family,56500,10000,1,"",pkt);
+        if(probe)d2k_session_packet_probe(s,pkt,n,1000000000,out,sizeof out,&r);
+        else d2k_session_packet(s,pkt,n,1000000000,out,sizeof out,&r);
+        split_observe(observer,pkt,n,1000000000,&observed);
+        n=live_direction_packet(family,56500,76542,10001,0x12,1,"",pkt);
+        split_observe(observer,pkt,n,1098000000,&observed);
+        uint32_t seq=10001,server_seq=76543;
+        const char *answer="HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+        if(later) {
+            const char *first="GET / HTTP/1.1\r\nHost: portal-target.example\r\n\r\n";
+            n=live_packet(family,56500,seq,0,first,pkt);seq+=(uint32_t)strlen(first);
+            split_observe(observer,pkt,n,1100000000,&observed);
+            if(probe)d2k_session_packet_probe(s,pkt,n,1100000000,out,sizeof out,&r);
+            else d2k_session_packet(s,pkt,n,1100000000,out,sizeof out,&r);
+            CHECK(r.applied,"first complete request baseline");
+            for(size_t i=0;i<r.n_out+1;i++)d2k_session_sent(s,1100000001,&r.key,r.execution_id);
+            d2k_http80_executed(observer,pkt,n,1100000001,r.execution_id,r.plan_id,r.trial_id,&r.binding);
+            n=live_direction_packet(family,56500,server_seq,seq,0x18,1,answer,pkt);
+            split_observe(observer,pkt,n,1198000000,&observed);server_seq+=(uint32_t)strlen(answer);
+            CHECK(observed.response==1,"first full response keeps observer ready");
+        }
+        const char *parts[2]={later?"GE":"GET / HTTP/1.1\r\nHost: portal-",
+                              later?"T /False/ HTTP/1.1\r\nHost: portal-target.example\r\n\r\n":"target.example\r\n\r\n"};
+        split_released=0;uint64_t execution=0;d2k_binding_context binding={0};
+        for(int part=0;part<2;part++) {
+            uint32_t anchor=0;n=live_direction_packet(family,56500,seq,server_seq,0x18,0,parts[part],pkt);
+            memcpy(original[part],pkt,n);original_len[part]=n;
+            int anchored=d2k_session_stream_anchor(s,pkt,n,&anchor);
+            if(!part)CHECK(anchored && anchor==seq,"HTTP hold anchor is this request, not always SYN");
+            d2k_hold_batch batch;uint64_t time=1200000000+(uint64_t)part;
+            int candidate=d2k_session_hold_candidate(s,pkt,n);
+            int rc=d2k_hold_feed(h,(uint32_t)part+1,pkt,n,time,d2k_session_plan_revision(s),
+                candidate,anchor,anchored,split_release,NULL,&batch);
+            CHECK(rc==(part?2:1),"real hold retains head and assembles split request identity");
+            if(rc!=1) {
+                const uint8_t *view=rc==2?batch.packet:pkt;size_t view_len=rc==2?batch.len:n;
+                /* Same ordering as d2kd: WAIT is invisible to both consumers. */
+                split_observe(observer,view,view_len,time,&observed);
+                if(probe)d2k_session_packet_probe(s,view,view_len,time,out,sizeof out,&r);
+                else d2k_session_packet(s,view,view_len,time,out,sizeof out,&r);
+                if(part)CHECK(r.applied,"split request identity reaches actual plan executor");
+                if(rc==2) {
+                    CHECK(batch.count==2 && batch.ids[0]==1 && batch.ids[1]==2,"assembled view owns both original IDs");
+                    live_trace *trace=&traces[probe];
+                    for(size_t i=0;i<r.n_out;i++) {
+                        size_t at=trace->n++;memcpy(trace->bytes[at],out+r.out[i].off,r.out[i].len);
+                        trace->packets[at]=(d2k_test_packet){trace->bytes[at],r.out[i].len,r.out[i].delay_us};
+                    }
+                    CHECK(r.verdict==D2K_VERDICT_ACCEPT,"whole plan releases actual original segments");
+                    if(r.verdict==D2K_VERDICT_ACCEPT)for(size_t i=0;i<2;i++) {
+                        size_t at=trace->n++;memcpy(trace->bytes[at],original[i],original_len[i]);
+                        trace->packets[at]=(d2k_test_packet){trace->bytes[at],original_len[i],0};
+                    }
+                    for(size_t i=0;i<r.n_out+1;i++)d2k_session_sent(s,time+1,&r.key,r.execution_id);
+                    CHECK(!d2k_session_send_pending(s,&r.key,r.execution_id),"group execution completes");
+                    execution=r.execution_id;binding=r.binding;
+                    d2k_http80_executed(observer,view,view_len,time+1,execution,r.plan_id,r.trial_id,&binding);
+                }
+            }
+            seq+=(uint32_t)strlen(parts[part]);
+        }
+        n=live_direction_packet(family,56500,server_seq,seq,0x18,1,answer,pkt);
+        split_observe(observer,pkt,n,1298000000,&observed);
+        CHECK(execution && observed.response==1 && observed.execution_id==execution &&
+              observed.request_no==(uint64_t)later+1 && d2k_binding_equal(&observed.binding,&binding),
+              "assembled identity preserves this applied request's live response");
+        CHECK(!split_released,"no original escapes before split Host is classified");
+        /* A lost continuation or binding revision releases each real ID
+           exactly once and invalidates the next-request boundary. */
+        n=live_direction_packet(family,56500,seq,server_seq,0x18,0,"GE",pkt);
+        uint32_t anchor=0;d2k_hold_batch pending;
+        int anchored=d2k_session_stream_anchor(s,pkt,n,&anchor);
+        int mode=d2k_session_hold_candidate(s,pkt,n);
+        uint64_t revision=d2k_session_plan_revision(s);
+        CHECK(d2k_hold_feed(h,99,pkt,n,1400000000,revision,mode,anchor,anchored,
+              split_release,s,&pending)==1,"incomplete next request is owned");
+        d2k_hold_flush(h,expiry?1400000001:1400000000+D2K_HOLD_WAIT_NS,
+                       revision+(unsigned)expiry,0,split_release,s);
+        CHECK(split_released==1 && split_released_id==99 && split_released_len==n &&
+              !memcmp(split_released_bytes,pkt,n),"timeout/revision releases exact original once");
+        CHECK(!d2k_session_hold_candidate(s,pkt,n),"released head cannot restart HTTP hold");
+        n=live_direction_packet(family,56500,seq+2,server_seq,0x18,0,parts[1],pkt);
+        CHECK(!d2k_session_hold_candidate(s,pkt,n),"late tail cannot claim a released HTTP request");
+        if(probe)d2k_session_packet_probe(s,pkt,n,1600000000,out,sizeof out,&r);
+        else d2k_session_packet(s,pkt,n,1600000000,out,sizeof out,&r);
+        CHECK(!r.applied,"released incomplete request has no synthetic execution");
+        d2k_hold_flush(h,1700000000,revision,1,split_release,s);
+        CHECK(split_released==1,"flush does not duplicate a released ID");
+        d2k_hold_free(h);d2k_session_free(s);d2k_http80_free(observer);
+      }
+      CHECK(traces[0].n==3 && traces[1].n==3,"one fake and two actual originals, never the synthetic view");
+      CHECK(d2k_test_trace_equal(traces[0].packets,traces[0].n,traces[1].packets,traces[1].n),
+            "split HTTP identity trial and permanent full runtime packets match");
+      if(live_diverge && traces[0].n) {
+          traces[0].bytes[0][traces[0].packets[0].len-1]^=1;
+          CHECK(d2k_test_trace_equal(traces[0].packets,traces[0].n,traces[1].packets,traces[1].n),
+                "split identity runtime gate detects changed fake bytes");
+      }
+    }
+}
+
 int main(int argc,char **argv) {
     live_diverge=argc==2&&!strcmp(argv[1],"--diverge");
     D2K_TEST_NAT_NO_TABLE();
     live_restore(4);live_restore(6);
     live_segmented_headers();
+    live_split_identity();
     printf("HTTP live controller/control/Session: IPv4/6 full packets + lifecycle, %d failures\n",fails);return fails?1:0;
 }

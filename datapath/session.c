@@ -2348,7 +2348,7 @@ int d2k_session_stream_anchor(d2k_session *s, const uint8_t *p, size_t n,
     if (!s || !anchor || !d2k_hold_parse(p, n, &v)) { return 0; }
     d2k_flow *fl = d2k_track_find(s->flows, &v.key);
     if (!fl || !fl->saw_syn) { return 0; }
-    *anchor = fl->syn_seq + 1;
+    *anchor = fl->http_flow && fl->http_conn ? fl->http_next : fl->syn_seq + 1;
     return 1;
 }
 
@@ -2467,6 +2467,14 @@ void d2k_session_note_unassembled(d2k_session *s, const uint8_t *p, size_t n,
        про них одно. Потока может и не быть в таблице — тогда сказать нечего,
        и выдумывать ключ незачем. */
     if (!fl) { return; }
+    const uint8_t *tcp=p+v.ihl;
+    if(tcp[2]==0 && tcp[3]==80 && !fl->saw_hello &&
+       (fl->http_flow || (v.seq==fl->syn_seq+1 && v.payload &&
+                         p[v.header]>='A' && p[v.header]<='Z'))) {
+        fl->http_checked=1;fl->http_conn=fl->http_headers=0;
+        refuse(s,now_ns,&v.key,"HTTP: составной запрос отпущен — граница не доказана");
+        return;
+    }
     if (fl->noted_unassembled) { return; }
     fl->noted_unassembled = 1;
     /* ЧИСЛА — В ЛОГ, А НЕ В ЖУРНАЛ: журнал хранит УКАЗАТЕЛЬ на текст, не
@@ -2501,6 +2509,25 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
     if (!fl || !fl->saw_syn || !fl->dir_known || fl->init_low != v.src_low ||
         fl->damaged || fl->routed) {
         return 0;
+    }
+    const uint8_t *tcp=p+v.ihl;
+    /* A port is not a protocol. Before HTTP is known, only a plausible
+       method at the observed stream head may start HTTP collection. An
+       unknown tail retains the existing TLS eligibility/readiness path. */
+    if(tcp[2]==0 && tcp[3]==80 && !fl->saw_hello &&
+       (fl->http_flow || (v.seq==fl->syn_seq+1 &&
+                         p[v.header]>='A' && p[v.header]<='Z'))) {
+        uint32_t start;
+        if(!fl->http_checked)start=fl->syn_seq+1;
+        else if(fl->http_flow && fl->http_conn)start=fl->http_next;
+        else return 0;
+        uint32_t delta=v.seq-start;
+        if(delta>=D2K_CAPTURE_BYTES || v.payload>D2K_CAPTURE_BYTES-delta)return 0;
+        d2k_http_req req;
+        if(!delta && d2k_http_request(p+v.header,v.payload,&req))return 0;
+        if(!delta && (p[v.header]<'A' || p[v.header]>'Z'))return 0;
+        return d2k_plantab_http_candidate(s->plans,v.dst.family,
+            fl->controller_probe?v.sport_be:0)?D2K_HOLD_HTTP:0;
     }
     /* Поток открытого HTTP: следующие запросы — не хвост приветствия TLS. */
     if (fl->http_flow) { return 0; }

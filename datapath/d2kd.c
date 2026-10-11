@@ -1459,14 +1459,6 @@ int main(int argc, char **argv) {
                        их вставку не заменяем и о ней не сообщаем, иначе
                        собственный замер HTTP (шаг 4) мерил бы нашу же
                        замену. */
-                    d2k_http80_res http_observation={0};
-                    if (np.have_payload && !np.truncated &&
-                        !(probe_mark && np.have_mark && np.mark == probe_mark) &&
-                        http80_step(q, mode == MODE_APPLY ? raw : NULL, ctl, np.id,
-                                    np.payload, np.payload_len, t,
-                                    np.have_tstamp ? np.tstamp_ns : 0, &http_observation)) {
-                        continue;
-                    }
 
                     d2k_hold_batch batch;
                     memset(&batch, 0, sizeof batch);
@@ -1530,6 +1522,18 @@ int main(int argc, char **argv) {
                             np.payload_len = batch.len;
                         }
                     }
+
+                    /* Observe the same assembled request identity as Session.
+                       WAIT owns all originals; a synthetic view is never sent. */
+                    d2k_http80_res http_observation={0};
+                    if (np.have_payload && !np.truncated &&
+                        !(probe_mark && np.have_mark && np.mark == probe_mark) &&
+                        http80_step(q, mode == MODE_APPLY ? raw : NULL, ctl, np.id,
+                                    np.payload, np.payload_len, t,
+                                    np.have_tstamp ? np.tstamp_ns : 0, &http_observation)) {
+                        continue;
+                    }
+
 
                     uint32_t verdict = D2K_NF_ACCEPT;
                     d2k_result res;

@@ -2344,6 +2344,37 @@ int main(void) {
                 CHECK(r.applied && r.n_out > 0 && r.verdict == D2K_VERDICT_DROP,
                       "capture prevented whole-packet plan execution");
 
+                /* Port 80 does not turn TLS into HTTP, in either arrival order. */
+                for (int tail_first = 0; tail_first < 2; tail_first++) {
+                    d2k_hold *hp = d2k_hold_new();
+                    d2k_hold_batch bp;
+                    uint16_t port = (uint16_t)(47800 + tail_first);
+                    pn = build_pkt(part, port, 0x02, NULL, 0);
+                    wr16(part + 22, 80);
+                    d2k_session_packet(g, part, pn, 4, buf, sizeof buf, &r);
+                    for (int step = 0; step < 2; step++) {
+                        int tail = step ^ tail_first;
+                        pn = build_pkt(part, port, 0x18, whole + (tail ? HEAD1 : 0),
+                                       tail ? whole_len - HEAD1 : HEAD1);
+                        wr16(part + 22, 80); wr32(part + 24, 1001 + (tail ? HEAD1 : 0));
+                        int mode = d2k_session_hold_candidate(g, part, pn);
+                        if (!step) CHECK(mode == D2K_HOLD_TLS,
+                            "TLS on port 80 retains TLS readiness, including tail-first");
+                        int rc = d2k_hold_feed(hp, 100 + (uint32_t)step, part, pn, 5 + step,
+                            d2k_session_plan_revision(g), mode, 1001, 1, hold_release, g, &bp);
+                        CHECK(rc == (step ? 2 : 1), "split TLS on port 80 is assembled");
+                        if (rc == 2) {
+                            CHECK(bp.count == 2 && bp.len == 40 + whole_len &&
+                                  !memcmp(bp.packet + 40, whole, whole_len),
+                                  "TLS on port 80 preserves full assembled bytes");
+                            d2k_session_packet(g, bp.packet, bp.len, 8, buf, sizeof buf, &r);
+                            CHECK(r.applied, "assembled TLS on port 80 executes its TLS plan");
+                        }
+                    }
+                    d2k_hold_flush(hp, 9, d2k_session_plan_revision(g), 1, hold_release, g);
+                    d2k_hold_free(hp);
+                }
+
                 /* ХВОСТ ПРИВЕТСТВИЯ ПРИШЁЛ ПЕРВЫМ — ЕГО ТОЖЕ НАДО УДЕРЖАТЬ.
                  *
                  * Поле 17.09.2026, живая линия, зонд подтверждения d2k:

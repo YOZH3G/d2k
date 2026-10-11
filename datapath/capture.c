@@ -19,11 +19,11 @@ static int reject(d2k_capture *c, d2k_capture_slot *s) {
     return -1;
 }
 
-int d2k_capture_feed(d2k_capture *c, const d2k_key *key, uint64_t generation,
+int d2k_capture_feed_ready(d2k_capture *c, const d2k_key *key, uint64_t generation,
                      uint64_t now_ns, uint32_t seq, uint32_t anchor, int have_anchor,
                      const uint8_t *bytes,
                      size_t len, const uint8_t **hello, size_t *hello_len,
-                     uint32_t *hello_seq) {
+                     uint32_t *hello_seq, d2k_capture_ready ready) {
     *hello = NULL;
     *hello_len = 0;
     *hello_seq = 0;
@@ -95,26 +95,30 @@ int d2k_capture_feed(d2k_capture *c, const d2k_key *key, uint64_t generation,
     }
     size_t n = s->contiguous;
     const uint8_t *b = s->bytes;
-    /* ПОКА ЯКОРЬ ВРЕМЕННЫЙ, СУДИТЬ О ЗАГОЛОВКЕ НЕЧЕМ: в начале буфера лежит
-       не начало записи, а середина приветствия. Прежде проверки заголовка
-       шли и тут, и слот немедленно отвергался на первом же куске, пришедшем
-       раньше головы. Ждём голову. */
-    if ((n >= 2 && b[1] != 3) || (n >= 6 && b[5] != 1)) {
-        return reject(c, s);
-    }
-    if (n < 5) { return 0; }
-    size_t total = 5 + ((size_t)b[3] << 8) + b[4];
-    if (total < 9 || total > D2K_CAPTURE_BYTES || s->high > total) {
-        return reject(c, s);
-    }
-    if (n < 9) { return 0; }
-    size_t hs = ((size_t)b[6] << 16) | ((size_t)b[7] << 8) | b[8];
-    if (hs + 9 != total) { return reject(c, s); }
-    if (n != total) { return 0; }
+    int status=ready(b,n,s->high);
+    if(status<0)return reject(c,s);
+    if(!status)return 0;
     s->state = 3;
     c->completed++;
     *hello = b;
     *hello_len = n;
     *hello_seq = s->seq;
     return 1;
+}
+
+static int tls_ready(const uint8_t *b,size_t n,size_t high) {
+    if ((n >= 2 && b[1] != 3) || (n >= 6 && b[5] != 1))return -1;
+    if(n<5)return 0;
+    size_t total=5+((size_t)b[3]<<8)+b[4];
+    if(total<9 || total>D2K_CAPTURE_BYTES || high>total)return -1;
+    if(n<9)return 0;
+    size_t hs=((size_t)b[6]<<16)|((size_t)b[7]<<8)|b[8];
+    if(hs+9!=total)return -1;
+    return n==total;
+}
+int d2k_capture_feed(d2k_capture *c,const d2k_key *key,uint64_t generation,
+    uint64_t now,uint32_t seq,uint32_t anchor,int have_anchor,const uint8_t *bytes,
+    size_t len,const uint8_t **hello,size_t *hello_len,uint32_t *hello_seq) {
+    return d2k_capture_feed_ready(c,key,generation,now,seq,anchor,have_anchor,
+        bytes,len,hello,hello_len,hello_seq,tls_ready);
 }

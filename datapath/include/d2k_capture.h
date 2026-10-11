@@ -50,5 +50,11 @@ int d2k_capture_feed(d2k_capture *c, const d2k_key *key, uint64_t generation,
                      const uint8_t *bytes,
                      size_t len, const uint8_t **hello, size_t *hello_len,
                      uint32_t *hello_seq);
+/* Shared byte ownership/overlap engine; readiness is protocol-specific.
+ * Callback: 1 ready, 0 incomplete, -1 invalid. All held bytes must be covered. */
+typedef int (*d2k_capture_ready)(const uint8_t *,size_t,size_t);
+int d2k_capture_feed_ready(d2k_capture *,const d2k_key *,uint64_t,uint64_t,
+    uint32_t,uint32_t,int,const uint8_t *,size_t,const uint8_t **,size_t *,uint32_t *,
+    d2k_capture_ready);
 void d2k_capture_forget(d2k_capture *c, const d2k_key *key);
 #endif
