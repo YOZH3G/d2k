@@ -68,6 +68,43 @@ int d2k_volume_rx_partial(const d2k_ver_result *r) {
         (!r->body_has_length || r->body_expected > r->body_bytes));
 }
 
+/* ДВА ИЗМЕРЕНИЯ ГОВОРЯТ ОБ ОДНОМ. Оба оборваны, оба в ОДНОМ домене
+   (ciphertext либо HTTP-тело), и контекст домена совпал: согласованная версия
+   TLS для записи, HTTP framing для тела. Байты здесь не сравниваются — это
+   дело d2k_volume_rx_evidence, которое и держит допуск. */
+int d2k_volume_rx_pair_agrees(const d2k_ver_result *a, const d2k_ver_result *b) {
+    if (!a || !b || !d2k_volume_rx_partial(a) || !d2k_volume_rx_partial(b)) { return 0; }
+    if (rx_wire_partial(a) != rx_wire_partial(b)) { return 0; }
+    if (rx_wire_partial(a)) { return a->negotiated_tls == b->negotiated_tls; }
+    return a->body_has_length == b->body_has_length && a->body_chunked == b->body_chunked;
+}
+
+/* ОДНО ИЗМЕРЕНИЕ ОБОРВАЛОСЬ, ВТОРОЕ ДОШЛО ДО КОНЦА — РАСХОЖДЕНИЕ, А НЕ
+   ОПРОВЕРЖЕНИЕ. Поле 12.10.2026, www.tampermonkey.net: /style.css с VPS —
+   30182 байта, с линии — 15963, восемь прогонов подряд байт в байт, молча,
+   без RST и FIN сервера. RX-зонд при этом видел «identity-1 partial=15627;
+   identity-2 HTTP 200 body=22094 complete=1» и возвращался ни с чем: три
+   эпизода подряд печатали «позднее закрытие не подтвердилось парными
+   измерениями» и уходили в покой на десять минут.
+
+   Дошедший повтор — шум линии, и вердикт по нему не выносится так же, как не
+   выносится по одному обрыву (§«подозрение не равно блокировке»). Поэтому
+   заказывается ТРЕТИЙ identity-прогон, и пара считается сошедшейся только
+   если обрыв подтвердился на нём: вердикт всё равно стоит на ДВУХ обрывах.
+
+   Поводом служит именно противоречие, а не всякая несошедшаяся пара: ответ
+   завершился кодом 2xx и САМ прошёл измеряемую полосу, то есть сказал о
+   полосе «прошла». Пустое измерение (нет TCP, нет статуса) не противоречит
+   ничему, а завершённый ответ меньше полосы — непроверенный бюджет
+   (rx_short), и лишнего прогона ни то, ни другое не заказывает. */
+int d2k_volume_rx_needs_repeat(const d2k_ver_result *a, const d2k_ver_result *b) {
+    if (!a || !b) { return 0; }
+    if (!d2k_volume_rx_partial(a) || d2k_volume_rx_partial(b)) { return 0; }
+    return b->status >= 200 && b->status < 300 && b->body_complete &&
+           b->body_framing_valid &&
+           b->body_bytes >= (uint64_t)D2K_VOL_MIN_KB * 1024;
+}
+
 int d2k_volume_rx_evidence(const d2k_ver_result *a,
                            const d2k_ver_result *b,
                            const d2k_ver_result *gzip,
@@ -386,26 +423,53 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
              b.status, (unsigned long long)b.body_bytes, b.body_complete,
              b.negotiated_tls, (unsigned long long)b.rx_tls_wire_bytes, b.rx_tls_record_missing,
              b.reason);
-    if (!d2k_volume_rx_partial(&b) || rx_wire_partial(&a) != rx_wire_partial(&b) ||
-        (rx_wire_partial(&a) && a.negotiated_tls != b.negotiated_tls) ||
-        (!rx_wire_partial(&a) && (b.body_has_length != a.body_has_length ||
-                                  b.body_chunked != a.body_chunked))) {
-        d2k_verify_close(&a);
+    const char *settled_by_third = "";
+    if (!d2k_volume_rx_pair_agrees(&a, &b)) {
+        if (!d2k_volume_rx_needs_repeat(&a, &b)) {
+            d2k_verify_close(&a);
+            d2k_verify_close(&b);
+            return;
+        }
+        /* Повтор дошёл до конца, пройдя полосу: измерения РАСХОДЯТСЯ. Судит
+           третий identity-прогон того же домена — см. d2k_volume_rx_needs_repeat. */
+        nap_ms(RESPONSE_PROBE_GAP_MS);
+        d2k_ver_result c = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
+                                                      hello_wire, tls12, 0, mark, path);
+        int agreed = d2k_volume_rx_pair_agrees(&a, &c);
+        snprintf(res->rx_reason, sizeof res->rx_reason,
+                 "identity-1 partial=%llu wire=%llu; identity-2 HTTP %d body=%llu "
+                 "дошёл до конца; identity-3 HTTP %d body=%llu wire=%llu missing=%u: "
+                 "обрыв подтверждён=%d",
+                 (unsigned long long)a.body_bytes,
+                 (unsigned long long)a.rx_tls_wire_bytes, b.status,
+                 (unsigned long long)b.body_bytes, c.status,
+                 (unsigned long long)c.body_bytes,
+                 (unsigned long long)c.rx_tls_wire_bytes,
+                 c.rx_tls_record_missing, agreed);
         d2k_verify_close(&b);
-        return;
+        if (!agreed) {
+            d2k_verify_close(&a);
+            d2k_verify_close(&c);
+            return;
+        }
+        b = c;
+        /* Журнал обязан показывать, что пару решило ТРЕТЬЕ измерение, иначе
+           строку gzip-шага не отличить от сошедшейся с первого раза пары. */
+        settled_by_third = "; пару решил identity-3";
     }
     nap_ms(RESPONSE_PROBE_GAP_MS);
     d2k_ver_result gz = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
                                                    hello_wire, tls12, 1, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity %llu/%llu (пакетов %u/%u); gzip HTTP %d, тело %llu, complete=%d, "
-             "encoding=%d, пакетов %u; TLS RX wire=%llu/%llu/%llu missing=%u/%u/%u",
+             "encoding=%d, пакетов %u; TLS RX wire=%llu/%llu/%llu missing=%u/%u/%u%s",
              (unsigned long long)a.body_bytes, (unsigned long long)b.body_bytes,
              a.data_packets, b.data_packets,
              gz.status, (unsigned long long)gz.body_bytes, gz.body_complete, gz.body_encoding,
              gz.data_packets, (unsigned long long)a.rx_tls_wire_bytes,
              (unsigned long long)b.rx_tls_wire_bytes, (unsigned long long)gz.rx_tls_wire_bytes,
-             a.rx_tls_record_missing, b.rx_tls_record_missing, gz.rx_tls_record_missing);
+             a.rx_tls_record_missing, b.rx_tls_record_missing, gz.rx_tls_record_missing,
+             settled_by_third);
     (void)d2k_volume_rx_evidence(&a, &b, &gz, res);
     d2k_verify_close(&a);
     d2k_verify_close(&b);

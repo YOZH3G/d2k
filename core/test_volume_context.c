@@ -8,6 +8,11 @@ static const char *expected_path;
 static size_t expected_wire;
 static int mark_calls;
 static int repeat_missing, opaque_reply;
+/* Поле 12.10.2026, www.tampermonkey.net: /style.css обрывается на линии восемь
+   раз из восьми (15963 против 30182 с VPS), но ОДИН повтор зонда дошёл до
+   конца. Шум линии не опровергает обрыв; третий прогон решает. */
+static int noisy_second, third_also_full;
+static int expected_gzip_call = 2;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "volume-context:%d: %s\n", __LINE__, #c); failures++; } } while (0)
 
 static int mark_ok(int fd, uint32_t mark) {
@@ -47,7 +52,7 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
     (void)ip; (void)port; (void)ms;
     CHECK(strcmp(sni, "context.test") == 0 && legacy == expected_legacy &&
           wire == expected_wire && mark == 0x2f);
-    CHECK(encoding == (baseline_calls == 2));
+    CHECK(encoding == (baseline_calls == expected_gzip_call));
     d2k_ver_result r = {0};
     r.fd = -1; r.status = 200; r.body_has_length = 1;
     r.body_framing_valid = 1; r.body_expected = 96460;
@@ -55,6 +60,21 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
     if (encoding) {
         r.body_bytes = r.body_expected = 18000;
         r.body_complete = 1; r.body_encoding = 1;
+    }
+    if (noisy_second) {
+        memset(&r, 0, sizeof r); r.fd = -1;
+        r.status = 200; r.body_framing_valid = 1; r.body_chunked = 1;
+        if (encoding) {
+            r.body_bytes = r.body_expected = 6000;
+            r.body_complete = 1; r.body_encoding = 1;
+        } else if (baseline_calls == 1) {
+            r.body_bytes = r.body_expected = 22094; r.body_complete = 1;
+        } else {
+            r.body_bytes = baseline_calls == 0 ? 15627 : 15963;
+            if (third_also_full && baseline_calls == 2) {
+                r.body_complete = 1; r.body_expected = r.body_bytes;
+            }
+        }
     }
     if (opaque_reply) {
         if (!encoding) {
@@ -137,6 +157,31 @@ int main(void) {
         CHECK(!wire.rx_partial_bytes && wire.rx_partial_wire_bytes == 14005);
         CHECK(strstr(wire.rx_reason, "14005/14025/4500") != NULL);
     }
+    /* ПОЛЕ 12.10.2026, www.tampermonkey.net. /style.css: 30182 байта с VPS
+       против 15963 с линии, восемь прогонов байт в байт, без RST и FIN. Зонд
+       видел «identity-1 partial=15627; identity-2 HTTP 200 body=22094
+       complete=1» и возвращался ни с чем — три эпизода подряд ушли в покой на
+       десять минут. Дошедшее измерение расходится с оборванным, а не
+       опровергает его: третий identity-прогон подтверждает обрыв, и пара
+       считается сошедшейся на двух обрывах, не на одном. */
+    opaque_reply = 0; noisy_second = 1; expected_gzip_call = 3;
+    expected_legacy = 0; expected_wire = 1536; expected_path = NULL;
+    baseline_calls = 0;
+    d2k_vol_result noisy = {0};
+    probe_response_volume(&noisy, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 4);
+    CHECK(noisy.rx_cut && !noisy.rx_wire_basis && noisy.rx_at_kb == 15);
+    CHECK(noisy.rx_compressed_complete && noisy.rx_partial_bytes == 15627);
+    CHECK(strstr(noisy.rx_reason, "15627/15963") != NULL);
+    CHECK(strstr(noisy.rx_reason, "identity-3") != NULL);
+    /* Третий прогон тоже дошёл до конца: обрыв не воспроизвёлся, вердикта
+       НЕТ, и gzip-контроль не запрашивается — один обрыв ничего не доказывает. */
+    third_also_full = 1; baseline_calls = 0;
+    d2k_vol_result unconfirmed = {0};
+    probe_response_volume(&unconfirmed, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 3 && !unconfirmed.rx_cut);
+    CHECK(strstr(unconfirmed.rx_reason, "identity-3") != NULL);
+    noisy_second = third_also_full = 0; expected_gzip_call = 2;
     if (failures) return 1;
     puts("test_volume_context: OK"); return 0;
 }

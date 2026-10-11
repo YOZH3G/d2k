@@ -119,6 +119,19 @@ int d2k_volume_rx_evidence(const d2k_ver_result *identity_a,
 /* Suspicion only, never a blocking verdict without repeat + gzip control. */
 int d2k_volume_rx_partial(const d2k_ver_result *identity);
 
+/* Оба измерения оборваны в одном домене и в одном его контексте, то есть
+ * сопоставимы. Байты и допуск — дело d2k_volume_rx_evidence. */
+int d2k_volume_rx_pair_agrees(const d2k_ver_result *a, const d2k_ver_result *b);
+
+/* Первое измерение оборвано, второе ЗАВЕРШИЛОСЬ кодом 2xx, само пройдя
+ * измеряемую полосу: измерения расходятся, и нужен третий identity-прогон.
+ * Вердикт по-прежнему требует двух обрывов — третий прогон не ослабляет
+ * правило, а решает расхождение. Поле 12.10.2026, www.tampermonkey.net:
+ * /style.css рвётся 8 раз из 8 (15963 против 30182 с VPS), а один дошедший
+ * повтор зонда отправлял цель на покой. Пустое измерение и завершённый
+ * ответ меньше полосы повтора НЕ заказывают. */
+int d2k_volume_rx_needs_repeat(const d2k_ver_result *a, const d2k_ver_result *b);
+
 const char *d2k_vol_verdict_name(d2k_vol_verdict v);
 
 #endif /* D2K_VOLUME_H */

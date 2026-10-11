@@ -181,6 +181,66 @@ int main(void) {
     a.local_limit = 0; a.rx_tls_wire_bytes = 1000;
     CHECK(!d2k_volume_rx_partial(&a), "small partial record counted as volume cut");
 
+    /* ПОЛЕ 12.10.2026, www.tampermonkey.net. /style.css: 15963 байта с линии
+       против 30182 с VPS, восемь прогонов подряд байт в байт, молча — без RST
+       и FIN сервера. Один повтор зонда при этом дошёл до конца («identity-2
+       HTTP 200 body=22094 complete=1»), и пара «не сошлась»: три эпизода
+       подряд ушли в покой на десять минут. Дошедшее измерение РАСХОДИТСЯ с
+       оборванным, а не опровергает его, и расхождение решает третий
+       identity-прогон. Вердикт по-прежнему стоит на ДВУХ обрывах. */
+    d2k_ver_result p1 = identity_cut(15627, 0, 0, 1);
+    d2k_ver_result full = identity_cut(22094, 22094, 0, 1);
+    full.body_complete = 1;
+    CHECK(d2k_volume_rx_partial(&p1) && !d2k_volume_rx_partial(&full),
+          "обрыв и завершённый повтор того же ресурса не различены");
+    CHECK(!d2k_volume_rx_pair_agrees(&p1, &full),
+          "завершённый повтор принят за парный обрыв");
+    CHECK(d2k_volume_rx_needs_repeat(&p1, &full),
+          "дошедший повтор закрыл вопрос вместо третьего identity-прогона");
+    d2k_ver_result p3 = identity_cut(15963, 0, 0, 1);
+    CHECK(d2k_volume_rx_pair_agrees(&p1, &p3),
+          "третий прогон того же framing не признан парой первому обрыву");
+    CHECK(!d2k_volume_rx_needs_repeat(&p1, &p3),
+          "сошедшаяся пара обрывов заказала лишний прогон");
+    gz = identity_cut(6000, 6000, 1, 0);
+    gz.body_complete = 1; gz.body_encoding = 1;
+    memset(&out, 0, sizeof out);
+    CHECK(d2k_volume_rx_evidence(&p1, &p3, &gz, &out) && out.rx_cut &&
+          out.rx_at_kb == 15 && out.rx_compressed_complete,
+          "обрыв, подтверждённый третьим прогоном, не дал примету");
+    memset(&out, 0, sizeof out);
+    CHECK(!d2k_volume_rx_evidence(&p1, &full, &gz, &out) && !out.rx_cut,
+          "обрыв объявлен по ОДНОМУ измерению при завершённом втором");
+    /* Повод для третьего прогона — именно противоречие. Измерение, не
+       сказавшее ничего, и завершённый ответ МЕНЬШЕ измеряемой полосы о
+       полосе не говорят и прогона не заказывают. */
+    d2k_ver_result silent = {0};
+    CHECK(!d2k_volume_rx_needs_repeat(&p1, &silent),
+          "пустое измерение заказало третий прогон");
+    d2k_ver_result tiny = identity_cut(263, 263, 1, 0);
+    tiny.body_complete = 1;
+    CHECK(!d2k_volume_rx_needs_repeat(&p1, &tiny),
+          "непроверенный бюджет (ответ меньше полосы) заказал третий прогон");
+    d2k_ver_result denied = identity_cut(40000, 40000, 1, 0);
+    denied.body_complete = 1; denied.status = 403;
+    CHECK(!d2k_volume_rx_needs_repeat(&p1, &denied),
+          "отказ доступа 403 принят за ответ, прошедший полосу");
+    CHECK(!d2k_volume_rx_needs_repeat(&full, &p1),
+          "расхождение прочитано в обратном порядке: первое измерение не оборвано");
+    /* Домены не смешиваются: байты шифротекста и байты тела несопоставимы. */
+    d2k_ver_result wirecut = {0};
+    wirecut.level = D2K_VER_HANDSHAKE; wirecut.name_ok = 1;
+    wirecut.negotiated_tls = 0x0304; wirecut.rx_tls_wire_bytes = 15627;
+    wirecut.rx_tls_record_missing = 25;
+    CHECK(d2k_volume_rx_partial(&wirecut) && !d2k_volume_rx_pair_agrees(&p1, &wirecut),
+          "обрыв записи TLS склеен с обрывом HTTP-тела");
+    d2k_ver_result wire2 = wirecut; wire2.negotiated_tls = 0x0303;
+    CHECK(!d2k_volume_rx_pair_agrees(&wirecut, &wire2),
+          "разные согласованные версии TLS склеены в одну пару записи");
+    d2k_ver_result lenp = identity_cut(15627, 40000, 1, 0);
+    CHECK(!d2k_volume_rx_pair_agrees(&lenp, &p1),
+          "Content-Length и chunked склеены в одну пару");
+
     if (fails) {
         printf("test_volume: %d failure(s)\n", fails);
         return 1;
