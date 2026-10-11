@@ -8982,6 +8982,15 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             }
             if (t->transport == 6) { dead_clear(s, t); }
             t->addr_ack = 0;
+            /* A passing ClientHello says nothing about the framed response
+             * that was already cut in this same measurement. An unavailable
+             * repeat is not a paired volume verdict, nor a direct success. */
+            if (r.verdict == D2K_V_CLEAR && t->vol.rx_partial_bytes && !volume_proven) {
+                r.verdict = D2K_V_INCONCLUSIVE;
+                snprintf(r.reason, sizeof r.reason,
+                    "RX-тело оборвалось после %llu байт; повторный объёмный замер не завершён",
+                    (unsigned long long)t->vol.rx_partial_bytes);
+            }
             if (!verdict_proves_block(r.verdict) && !volume_proven && !t->ech_trial) {
                 say(s, "по %s прямой замер не подтвердил блокировку (%s: %s) — "
                        "подбор и применение обхода не запускаю",

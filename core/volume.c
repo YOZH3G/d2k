@@ -326,11 +326,13 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
         d2k_verify_close(&a);
         return;
     }
+    res->rx_partial_bytes = a.body_bytes;
     nap_ms(RESPONSE_PROBE_GAP_MS);
     d2k_ver_result b = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
                                                   hello_wire, tls12, 0, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
-             "identity-2 HTTP %d, тело %llu/%llu, complete=%d: %.90s",
+             "identity-1 partial=%llu/%llu; identity-2 HTTP %d, body=%llu/%llu, complete=%d: %.100s",
+             (unsigned long long)a.body_bytes, (unsigned long long)a.body_expected,
              b.status, (unsigned long long)b.body_bytes,
              (unsigned long long)b.body_expected, b.body_complete, b.reason);
     if (b.status < 200 || b.status >= 300 || b.body_complete || !b.body_framing_valid ||

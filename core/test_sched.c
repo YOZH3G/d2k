@@ -217,6 +217,7 @@ static int vol_at_kb = 20;
 static int vol_rx_at_kb = 24;
 static int vol_rx_tls_unavailable;
 static int vol_direct_complete;
+static uint64_t vol_partial_bytes;
 static int resource_fixture;
 static int resource_volume_calls, resource_verify_calls;
 
@@ -240,6 +241,7 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     r.rx_cut = vol_rx_cut;
     r.rx_tls_unavailable = vol_rx_tls_unavailable;
     r.rx_direct_complete = vol_direct_complete;
+    r.rx_partial_bytes = vol_partial_bytes;
     r.rx_at_kb = vol_rx_at_kb;
     r.rx_cut_packets = vol_rx_cut ? vol_rx_packets : 0;
     r.rx_expected_kb = 96;
@@ -1992,7 +1994,8 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--runtime-default-only")) return fails ? 1 : 0;
     d2k_sched_mark_fn saved_mark = d2k_sched_mark_hook;
     int voice_only = argc == 2 && strcmp(argv[1], "--voice-only") == 0;
-    int rx_only = argc == 2 && strcmp(argv[1], "--rx-volume-only") == 0;
+    int partial_only = argc == 2 && strcmp(argv[1], "--rx-partial-only") == 0;
+    int rx_only = partial_only || (argc == 2 && strcmp(argv[1], "--rx-volume-only") == 0);
     int rst_only = argc == 2 && strcmp(argv[1], "--rst-only") == 0;
     int admission_only = argc == 2 && strcmp(argv[1], "--admission-only") == 0;
     int question_only = argc == 2 && strcmp(argv[1], "--question-only") == 0;
@@ -8750,6 +8753,26 @@ lifecycle_test:
     }
 
 rx_volume_tests:
+    /* Field j: a framed 23KB partial followed by an unavailable repeat is
+       inconclusive, never proof that the target works without its plan. */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        vol_partial_bytes = 23900; vol_rx_cut = 0; vol_answer = D2K_VOL_UNREACHABLE;
+        tcp_answer = D2K_V_CLEAR; tcp_calls = 0;
+        d2k_ev h = ev_hello(6, 40379, "partial-rx.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40379); d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(tcp_calls == 1 && total_bindings(&c) == 0,
+              "unpaired RX cut must not invent a bypass");
+        CHECK(!said("напрямую проходит") && said("результат неубедителен"),
+              "partial RX body was incorrectly classified as direct success");
+        vol_partial_bytes = 0; vol_answer = D2K_VOL_PASSED;
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    if (partial_only) goto voice_only_done;
     /* A hint never launches its target. A subsequent live public TLS target
        measures and verifies the same resource, then persists its witness. */
     {

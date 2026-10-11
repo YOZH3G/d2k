@@ -7,6 +7,7 @@ static int expected_legacy;
 static const char *expected_path;
 static size_t expected_wire;
 static int mark_calls;
+static int repeat_missing;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "volume-context:%d: %s\n", __LINE__, #c); failures++; } } while (0)
 
 static int mark_ok(int fd, uint32_t mark) {
@@ -54,6 +55,10 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
     if (encoding) {
         r.body_bytes = r.body_expected = 18000;
         r.body_complete = 1; r.body_encoding = 1;
+    }
+    if (repeat_missing && baseline_calls == 1) {
+        memset(&r, 0, sizeof r); r.fd = -1;
+        snprintf(r.reason, sizeof r.reason, "incomplete TLS record");
     }
     baseline_calls++;
     return r;
@@ -103,6 +108,13 @@ int main(void) {
     }
     }
     CHECK(modern_calls == 4 && legacy_calls == 4 && mark_calls == 8);
+    baseline_calls = 0; repeat_missing = 1; expected_legacy = 0;
+    expected_wire = 1536; expected_path = NULL;
+    d2k_vol_result partial = {0};
+    probe_response_volume(&partial, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(!partial.rx_cut && !partial.rx_direct_complete && baseline_calls == 2);
+    CHECK(partial.rx_partial_bytes == 23900);
+    CHECK(strstr(partial.rx_reason, "23900") && strstr(partial.rx_reason, "identity-2"));
     if (failures) return 1;
     puts("test_volume_context: OK"); return 0;
 }

@@ -77,6 +77,7 @@ typedef struct {
     char     rx_reason[256]; /* отдельный исход GET, даже если TX не дошёл до TLS */
     int      rx_tls_unavailable; /* прямой GET не дошёл до TLS; RX-тела ещё не измерить */
     int      rx_direct_complete; /* identity response fully received with matching certificate */
+    uint64_t rx_partial_bytes; /* first framed partial RX body; not a paired verdict */
     d2k_resource resources[D2K_RESOURCE_COUNT];
     size_t n_resources;
 } d2k_vol_result;
