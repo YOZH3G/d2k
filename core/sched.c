@@ -970,6 +970,9 @@ typedef struct {
        Until that probe proves a repeatable identity cut with complete gzip,
        the ordinary classifier and candidate queue must remain untouched. */
     int        rx_volume_only;
+    /* Узкий RX-замер не состоялся (ответ короче полосы) и уже сменён обычным
+       полным замером. Одноразовый на эпизод; task_reset зануляет задачу. */
+    int        rx_short_full;
     int        rx_volume_candidate_pending; /* special candidate after a measured RX-volume cut */
     /* Очередь долита из запасного перебора (refill_from_fallback), а не
        выведена из замера: панель и журнал называют её своим именем (задача 37). */
@@ -8987,6 +8990,47 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 t->rx_volume_only = 0;
                 if (!t->vol.rx_cut) {
                     if (t->vol.rx_tls_unavailable && rx_saved_bootstrap(s, t, 0)) {
+                        moved++;
+                        continue;
+                    }
+                    /* БЮДЖЕТ НЕ ПРОВЕРЕН — НЕ ОТРИЦАТЕЛЬНОЕ ИЗМЕРЕНИЕ (поле
+                       12.10.2026, soundcloud). style.sndcdn.com и
+                       api-v2.soundcloud.com замерзали на 23–25 КБ в живых
+                       потоках браузера, а RX-зонд просил / и получал 403 с
+                       телом 263 байта и 401 с пустым телом. Ответы
+                       завершённые, поэтому обрыв «не воспроизвёлся», — но до
+                       полосы в 12 КБ зонд не дошёл на два порядка и про
+                       обрыв не сказал ничего. Прежде это печаталось как
+                       «не подтвердилось парными измерениями» и закрывало
+                       поиск отдыхом на десять минут: имя оставалось без
+                       плана, хотя коробка у него та же, что у соседних имён
+                       сайта, взятых обычным путём.
+
+                       Сужение «только повторяемый обрыв входящего ответа» не
+                       состоялось, значит его и нет: продолжаем ОБЫЧНЫМ полным
+                       замером, как у любой другой цели с подтверждённым
+                       подозрением. Один раз за эпизод: второй заход упёрся бы
+                       в тот же короткий ответ, а зануление задачи при сбросе
+                       снимает флаг вместе с эпизодом. */
+                    if (t->vol.rx_short && !t->rx_short_full && t->transport == 6) {
+                        t->rx_short_full = 1;
+                        say(s, "по %s бюджет объёма не проверен: ответ зонда завершён на "
+                               "%llu байт, меньше измеряемой полосы %d КБ — это не "
+                               "отрицательное измерение; продолжаю обычным полным замером",
+                            t->name, (unsigned long long)t->vol.rx_short_bytes,
+                            D2K_VOL_MIN_KB);
+                        search_report(s, t, now_ms, "unknown", "none");
+                        t->researched = 0;
+                        t->n_plans = 0;
+                        t->next_plan = 0;
+                        char short_name[sizeof t->name];
+                        snprintf(short_name, sizeof short_name, "%s", t->name);
+                        if (start_search(s, t)) { moved++; continue; }
+                        /* start_search уже сбросил задачу (task_reset): дальше
+                           разбирать нечего, см. повтор снимком ниже. */
+                        say(s, "по %s полный замер после непроверенного бюджета не "
+                               "запустился — задача снята, следующее подозрение начнёт "
+                               "поиск заново", short_name);
                         moved++;
                         continue;
                     }

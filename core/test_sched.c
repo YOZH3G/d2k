@@ -228,6 +228,8 @@ static int resource_volume_calls, resource_verify_calls;
 
 static int vol_rx_packets; /* задача 55: пакеты на обрыве identity */
 static int vol_rx_packet_only; /* gzip оборван на том же бюджете пакетов */
+static int vol_rx_short;              /* ответ завершён, но короче полосы */
+static uint64_t vol_rx_short_bytes;   /* его тело */
 static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
                                int plain, int tls12, size_t hello_wire,
                                uint32_t mark) {
@@ -245,6 +247,8 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     r.at_kb = vol_at_kb;
     r.rx_cut = vol_rx_cut; r.rx_wire_basis = vol_rx_wire_basis;
     r.rx_tls_unavailable = vol_rx_tls_unavailable;
+    r.rx_short = vol_rx_short;
+    r.rx_short_bytes = vol_rx_short_bytes;
     r.rx_direct_complete = vol_direct_complete;
     r.rx_partial_bytes = vol_partial_bytes;
     r.rx_partial_wire_bytes = vol_partial_wire_bytes;
@@ -3653,6 +3657,54 @@ int main(int argc, char **argv) {
         if (fails) fprintf(stderr, "%s\n", saidbuf);
         d2k_sched_free(s); d2k_catalog_free(&cr);
         vol_rx_cut = 0; vol_rx_packet_only = 0; vol_rx_packets = 0; vol_rx_at_kb = 24;
+    }
+
+    /* ПОЛЕ 12.10.2026, soundcloud: style.sndcdn.com и api-v2.soundcloud.com
+       замерзали на 23–25 КБ в живых потоках, а RX-зонд просил / и получал
+       завершённый 403 с телом 263 байта. Обрыв не воспроизвёлся потому, что
+       мерить было нечем, а не потому, что его нет: до полосы в 12 КБ ответ не
+       дошёл на два порядка. Такой исход не «не подтвердилось» и не отдых на
+       десять минут — узкое измерение не состоялось, и дальше идёт ОБЫЧНЫЙ
+       полный замер. */
+    {
+        d2k_catalog cs = {0};
+        d2k_sched *s = d2k_sched_new(&cs, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для короткого ответа зонда не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            vol_calls = tcp_calls = ver_calls = 0;
+            vol_answer = D2K_VOL_PASSED;
+            vol_rx_cut = 0;
+            vol_rx_short = 1; vol_rx_short_bytes = 263;
+            settle(s);
+            const char *name = "style.short-body.test";
+            for (uint16_t port = 41080; port <= 41081; port++) {
+                d2k_ev hh = ev_hello(6, port, name);
+                d2k_sched_event(s, &hh);
+                d2k_ev rr = ev_suspect(6, port);
+                rr.code = D2K_SUSPECT_RST_AFTER_APP;
+                d2k_sched_event(s, &rr);
+            }
+            settle(s); spin(s, 200);
+            CHECK(vol_calls >= 1, "короткий ответ: RX-пара позднего закрытия не началась");
+            CHECK(said("бюджет объёма не проверен"),
+                  "короткий ответ зонда не назван непроверенным бюджетом");
+            CHECK(!said("позднее закрытие не подтвердилось"),
+                  "непроверенный бюджет прочитан как отрицательное парное измерение");
+            CHECK(!said("повторный замер позднего обрыва отложен"),
+                  "за непроверенный бюджет цель получила отдых как за вердикт");
+            CHECK(tcp_calls >= 1,
+                  "после непроверенного бюджета обычный полный замер не начался");
+            /* Второй раз подряд в ту же ветку не уходим: ответ тот же. */
+            const char *again = strstr(saidbuf, "бюджет объёма не проверен");
+            CHECK(again && !strstr(again + 1, "бюджет объёма не проверен"),
+                  "полный замер после непроверенного бюджета запущен повторно");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cs);
+        vol_rx_short = 0; vol_rx_short_bytes = 0;
     }
 
     /* ЗАДАЧА 50. Повтор FIN без ответа на потоке БЕЗ плана (глухой обрыв

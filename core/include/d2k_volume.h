@@ -80,6 +80,13 @@ typedef struct {
     char     reason[160]; /* человеческая причина, заполняется всегда */
     char     rx_reason[256]; /* отдельный исход GET, даже если TX не дошёл до TLS */
     int      rx_tls_unavailable; /* прямой GET не дошёл до TLS; RX-тела ещё не измерить */
+    /* ОТВЕТ ЗОНДА ЗАВЕРШИЛСЯ, НЕ ДОЙДЯ ДО ИЗМЕРЯЕМОЙ ПОЛОСЫ: бюджет объёма
+     * НЕ ПРОВЕРЕН. Это D2K_VOL_SHORT в домене RX, то есть отсутствие
+     * измерения, а НЕ парное отрицательное измерение обрыва. Поле 12.10.2026,
+     * soundcloud: зонд просил / и получал 403 с телом 263 байта и 401 с
+     * пустым телом, complete=1, тогда как живые потоки замерзали на 23–25 КБ. */
+    int      rx_short;
+    uint64_t rx_short_bytes; /* тело того завершённого ответа, для журнала */
     int      rx_direct_complete; /* identity response fully received with matching certificate */
     uint64_t rx_partial_bytes; /* first framed partial RX body; not a paired verdict */
     uint64_t rx_partial_wire_bytes; /* first incomplete TLS record progress; separate domain */

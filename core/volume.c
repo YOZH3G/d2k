@@ -360,6 +360,16 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
              (unsigned long long)a.body_expected, a.body_complete, a.negotiated_tls,
              (unsigned long long)a.rx_tls_wire_bytes, a.rx_tls_record_missing, a.reason);
     if (!d2k_volume_rx_partial(&a)) {
+        /* ЗАВЕРШЁННЫЙ ОТВЕТ МЕНЬШЕ ПОЛОСЫ — БЮДЖЕТ НЕ ПРОВЕРЕН. Отличаем
+           «обрыв не воспроизвёлся» от «мерить было нечем»: ответ дошёл до
+           конца, но до D2K_VOL_MIN_KB ему не хватило объёма, поэтому про
+           обрыв он не говорит ничего. Страница отказа доступа (401/403) и
+           просто короткий документ попадают сюда одинаково. */
+        if (a.status > 0 && a.body_complete &&
+            a.body_bytes < (uint64_t)D2K_VOL_MIN_KB * 1024) {
+            res->rx_short = 1;
+            res->rx_short_bytes = a.body_bytes;
+        }
         d2k_verify_close(&a);
         return;
     }
