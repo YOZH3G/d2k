@@ -48,6 +48,17 @@
 #include <stdint.h>
 #include "d2k_resource.h"
 #include "d2k_http_reply.h"
+/* Shared HTTP framing reader; transport owns the connection and request. */
+typedef long (*d2k_http_read_fn)(void *, uint8_t *, size_t, int, char *, size_t);
+typedef struct {
+    int status, complete, connection_close, local_limit;
+    uint64_t body_bytes;
+    char location[2048];
+    d2k_http_reply_result reply;
+} d2k_http_read_result;
+void d2k_http_read_response(d2k_http_read_fn read, void *ctx, int wait_ms,
+                            d2k_http_read_result *result, char *err, size_t cap);
+
 #include "d2k_tls13core.h"
 
 /* Предел заголовков ответа, байт. Поле 03.10.2026: край Meta отдаёт ~8,4 КБ,

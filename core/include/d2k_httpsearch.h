@@ -37,7 +37,8 @@
  * правилу, что у датапата: строка статуса HTTP, не 30x на хост портала и не
  * раньше половины RTT соединения зонда. Плюс исполнение на проводе: событие
  * APPLIED с идентификатором именно этого плана. Без него кандидат не судим
- * (плана на проводе не было). Подтверждение — два успеха подряд, затем
+ * (плана на проводе не было). Подтверждение — два опыта подряд, в каждом два полных ответа
+ * на одной связи keep-alive, затем
  * постоянный план имени (SET_NAME, форма HTTP).
  *
  * Модуль переносим и не делает ввода-вывода сам: всё через d2k_hs_ops, а
@@ -45,6 +46,7 @@
  */
 #ifndef D2K_HTTPSEARCH_H
 #define D2K_HTTPSEARCH_H
+#define D2K_HS_KEEPALIVE_PROOF 1
 
 #include <stddef.h>
 #include <stdint.h>
@@ -86,13 +88,15 @@ typedef struct {
     char status[64];      /* строка статуса, если была */
     char why[160];
     uint32_t seq;         /* номер запуска (из d2k_hs_job) */
+    unsigned complete_responses; /* fully framed replies on this connection */
     int fd;               /* его сокет: опоздавший ответ закрывает его */
 } d2k_hs_result;
 
 /* Порт и срок зонда; тесты подставляют свои. */
 extern uint16_t d2k_hs_probe_port;
 extern int d2k_hs_probe_ms;
-/* Блокирующий зонд: connect, GET / с Host, первые байты ответа. Сокет
+/* Блокирующий зонд: connect, два GET / с Host на одной связи; полное HTTP framing.
+ * REAL сохраняет смысл ответа; complete_responses отдельно доказывает повтор. Сокет
  * НЕ закрывает: им владеет поиск (close_port после ответа). */
 void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r);
 
@@ -155,6 +159,10 @@ size_t d2k_hs_plan_poisons(const char *plan_text, char out[][64], size_t cap);
  * датапата, нет подтверждения), — не измерен: план не снимается, «обход не
  * найден» не говорится, повтор — через этот срок (ревью I-2). */
 #define D2K_HS_INCONCLUSIVE_MS (5ll * 60 * 1000)
+/* Caller must bind this failure to the current live execution/generation.
+ * Plan hash alone is insufficient; this function additionally checks own key. */
+int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t family,
+                                const uint8_t *addr, const uint8_t plan_id[16], int64_t now_ms);
 void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
                            const uint8_t *addr, int64_t now_ms);
 /* Подтверждение SET_NAME_PROBE (trial ID и признак успеха). */

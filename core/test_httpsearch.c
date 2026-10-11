@@ -146,6 +146,57 @@ static d2k_hs_answer probe_local(const char *answer, int close_only, char *statu
     return r.answer;
 }
 
+typedef struct { int fd; const char *first, *second; } ka_srv;
+static void *serve_keepalive(void *arg) {
+    ka_srv *v=arg; int c=accept(v->fd,NULL,NULL); if(c<0)return NULL;
+    struct timeval tv={1,0}; setsockopt(c,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    char buf[2048];
+    for(int i=0;i<2;i++) {
+        if(recv(c,buf,sizeof buf,0)<=0)break;
+        struct timespec ts={0,20000000};nanosleep(&ts,NULL);
+        const char *answer=i ? v->second : v->first;
+        if(!answer)break;
+        if(send(c,answer,strlen(answer),0)<0)break;
+        if(!v->second)break;
+    }
+    close(c);return NULL;
+}
+static d2k_hs_result keepalive_local(const char *first,const char *second) {
+    ka_srv v={socket(AF_INET,SOCK_STREAM,0),first,second};
+    struct sockaddr_in a={0};a.sin_family=AF_INET;a.sin_addr.s_addr=htonl(0x7f000001u);
+    socklen_t al=sizeof a; CHECK(!bind(v.fd,(struct sockaddr *)&a,sizeof a)&&!listen(v.fd,1),"keepalive listen");
+    getsockname(v.fd,(struct sockaddr *)&a,&al);d2k_hs_probe_port=ntohs(a.sin_port);d2k_hs_probe_ms=800;
+    pthread_t th;pthread_create(&th,NULL,serve_keepalive,&v);
+    d2k_hs_job job={0};job.fd=socket(AF_INET,SOCK_STREAM,0);job.family=4;job.addr[0]=127;job.addr[3]=1;
+    snprintf(job.host,sizeof job.host,"target.example");d2k_hs_result r;d2k_hs_probe_run(&job,&r);
+    close(job.fd);pthread_join(th,NULL);close(v.fd);
+    d2k_hs_probe_port=80;d2k_hs_probe_ms=6000;return r;
+}
+static void test_keepalive_portal(void) {
+    const char *complete="HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none";
+    d2k_hs_result r=keepalive_local(complete,INJECT);
+    CHECK(r.answer==D2K_HS_INJECTED,"first 200 then same-connection portal must reject candidate");
+#ifdef D2K_HS_KEEPALIVE_PROOF
+    CHECK(r.complete_responses==1,"portal is not a second complete success");
+#endif
+    r=keepalive_local(complete,complete);
+#ifdef D2K_HS_KEEPALIVE_PROOF
+    CHECK(r.answer==D2K_HS_REAL&&r.complete_responses==2,"two framed keepalive replies confirm the connection");
+#endif
+    r=keepalive_local("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n0\r\n\r\n",complete);
+#ifdef D2K_HS_KEEPALIVE_PROOF
+    CHECK(r.answer==D2K_HS_REAL&&r.complete_responses==2,"chunked first body is drained before second request");
+#endif
+    r=keepalive_local("HTTP/1.1 200 OK\r\nContent-Length: 30\r\n\r\nshort",NULL);
+#ifdef D2K_HS_KEEPALIVE_PROOF
+    CHECK(r.answer!=D2K_HS_REAL&&!r.complete_responses,"truncated body cannot confirm first response");
+#endif
+    r=keepalive_local("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n\r\none",NULL);
+#ifdef D2K_HS_KEEPALIVE_PROOF
+    CHECK(r.answer==D2K_HS_REAL&&r.complete_responses==1,"server close preserves single-response verdict without keepalive proof");
+#endif
+}
+
 static void test_probe(void) {
     d2k_hs_probe_ms = 800;
     char st[64];
@@ -232,6 +283,9 @@ static d2k_hs_result res(d2k_hs_answer a) {
     d2k_hs_result r;
     memset(&r, 0, sizeof r);
     r.answer = a; r.rtt_us = 98000; r.reply_us = a == D2K_HS_INJECTED ? 700 : 99000;
+#ifdef D2K_HS_KEEPALIVE_PROOF
+    r.complete_responses = a == D2K_HS_REAL ? 2 : 0;
+#endif
     return r;
 }
 
@@ -530,19 +584,58 @@ static void test_reused_property_answer(void) {
     d2k_httpsearch *hs=d2k_httpsearch_new(&ops); int64_t now=1;
     d2k_httpsearch_portal(hs,"saved.example",4,IP,now); base_injected(hs,&f,&now);
     trial(hs,&f,&now,1,D2K_HS_REAL); trial(hs,&f,&now,1,D2K_HS_REAL);
-    d2k_httpsearch_portal(hs,"saved.example",4,IP,now+=D2K_HS_RECHECK_MS+1);
+    d2k_httpsearch_portal(hs,"saved.example",4,IP,now+=1);
     base_injected(hs,&f,&now); trial(hs,&f,&now,1,D2K_HS_SILENT);
     CHECK(strstr(f.last_probe_plan,"badsum") && !strstr(f.last_probe_plan,"split "),
           "saved split NO must advance to checksum, not skip properties through dedup");
     d2k_httpsearch_free(hs);
 }
 
+#ifdef D2K_HS_KEEPALIVE_PROOF
+static void test_single_response_not_confirmation(void) {
+    fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
+    d2k_httpsearch_portal(hs,"short.example",4,IP,now);base_injected(hs,&f,&now);
+    for(int i=0;i<2;i++) {
+        d2k_httpsearch_ack(hs,f.trial,1,now+=10);d2k_httpsearch_applied(hs,f.plan_id);
+        d2k_hs_result r=res(D2K_HS_REAL);r.complete_responses=1;r.fd=f.job.fd;r.seq=f.job.seq;
+        d2k_httpsearch_result(hs,&r,now+=100);
+    }
+    CHECK(!f.set_plan_n,"two fresh single responses do not prove keepalive");
+    d2k_httpsearch_free(hs);
+}
+
+static void test_bound_failure(void) {
+    fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
+    d2k_httpsearch_portal(hs,"bound.example",4,IP,now);base_injected(hs,&f,&now);
+    trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+    uint8_t id[16];const char *textid=strstr(f.last_plan,"\nid ");
+    CHECK(textid!=NULL,"permanent id present");
+    for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(textid[4+i*2])*16+hexval(textid[5+i*2]));
+    id[0]^=1;
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,++now)&&!f.del_plan_n,"foreign plan failure cannot revoke own plan");
+    id[0]^=1;
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",6,IP,id,++now)&&!f.del_plan_n,"other family cannot revoke own plan");
+    CHECK(d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,++now)==1,"bound live portal must revoke confirmed success");
+    CHECK(f.del_plan_n==1&&!d2k_httpsearch_plan_of(hs,"bound.example",4)&&d2k_httpsearch_busy(hs),"revoked plan hidden and remeasurement started immediately");
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,++now)&&f.del_plan_n==1,"duplicate failure cannot delete again");
+    base_injected(hs,&f,&now);
+    CHECK(strstr(f.last_probe_plan,"split ")!=NULL,"revoked old plan remains first hypothesis");
+    d2k_httpsearch_free(hs);
+}
+
+#endif
+
 int main(void) {
+#ifdef D2K_HS_KEEPALIVE_PROOF
+    test_bound_failure();
+    test_single_response_not_confirmation();
+#endif
     test_portal_properties();
     test_reused_property_answer();
     test_judge();
     test_candidates();
     test_probe();
+    test_keepalive_portal();
     test_search();
     test_persist();
     test_inconclusive();

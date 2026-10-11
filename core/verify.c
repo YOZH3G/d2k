@@ -720,6 +720,15 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
     return code_out;
 }
 
+void d2k_http_read_response(d2k_http_read_fn rd, void *ctx, int wait_ms,
+                            d2k_http_read_result *r, char *err, size_t cap) {
+    memset(r, 0, sizeof *r);
+    r->status = read_status_rd(rd, ctx, wait_ms, NULL, &r->body_bytes,
+        NULL, &r->complete, NULL, NULL, NULL, NULL,
+        r->location, sizeof r->location, NULL, NULL, &r->reply,
+        &r->local_limit, &r->connection_close, err, cap);
+}
+
 d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
                                 int deadline_ms, size_t hello_wire) {
     return d2k_verify_probe_on(-1, ip, port, sni, deadline_ms, hello_wire);

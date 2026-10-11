@@ -28,7 +28,7 @@ static size_t live_packet(int family,uint16_t port,uint32_t seq,int syn,const ch
         sum=(sum&65535u)+(sum>>16);pkt[th+16]=(uint8_t)(sum>>8);pkt[th+17]=(uint8_t)sum;}
     CHECK(n&&d2k_wire_tcp_checksum_ok(pkt,n),"live packet is valid");return n;
 }
-typedef struct { uint8_t bytes[3][4096]; d2k_test_packet packets[3]; size_t n; } live_trace;
+typedef struct { uint8_t bytes[6][4096]; d2k_test_packet packets[6]; size_t n; } live_trace;
 static void live_flow(d2k_session *s,int family,uint16_t port,const char *host,int want,int probe,live_trace *trace) {
     uint8_t pkt[4096],out[65536];d2k_result r;
     size_t n=live_packet(family,port,10000,1,"",pkt);
@@ -36,7 +36,9 @@ static void live_flow(d2k_session *s,int family,uint16_t port,const char *host,i
     if(probe)d2k_session_packet_probe(s,pkt,n,1000000000,out,sizeof out,&r);
     else d2k_session_packet(s,pkt,n,1000000000,out,sizeof out,&r);
     char req[512];snprintf(req,sizeof req,"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: browser\r\n\r\n",host);
-    n=live_packet(family,port,10001,0,req,pkt);
+    if(trace)trace->n=0;
+    for(unsigned request=0;request<2;request++) {
+    n=live_packet(family,port,10001+(uint32_t)(request*strlen(req)),0,req,pkt);
     if(probe)d2k_session_packet_probe(s,pkt,n,1100000000,out,sizeof out,&r);
     else d2k_session_packet(s,pkt,n,1100000000,out,sizeof out,&r);
     if(!want){CHECK(!r.applied&&!r.n_out,"unbound live host unchanged");return;}
@@ -48,10 +50,10 @@ static void live_flow(d2k_session *s,int family,uint16_t port,const char *host,i
         CHECK(d2k_wire_tcp_checksum_ok(pkt,n),"whole passed request checksum valid");
     }
     if(trace) {
-        trace->n=0;
         for(size_t i=0;i<r.n_out&&i<2;i++) {
-            memcpy(trace->bytes[i],out+r.out[i].off,r.out[i].len);
-            trace->packets[i]=(d2k_test_packet){trace->bytes[i],r.out[i].len,r.out[i].delay_us};trace->n++;
+            size_t at=trace->n++;
+            memcpy(trace->bytes[at],out+r.out[i].off,r.out[i].len);
+            trace->packets[at]=(d2k_test_packet){trace->bytes[at],r.out[i].len,r.out[i].delay_us};
         }
         if(r.verdict==D2K_VERDICT_ACCEPT) {
             size_t i=trace->n++;memcpy(trace->bytes[i],pkt,n);
@@ -62,6 +64,7 @@ static void live_flow(d2k_session *s,int family,uint16_t port,const char *host,i
     CHECK(d2k_session_send_pending(s,&r.key,r.execution_id),"prepared output is not completed execution");
     for(size_t i=0;i<r.n_out+1;i++)d2k_session_sent(s,1200000000,&r.key,r.execution_id);
     CHECK(d2k_session_done(s)==done_before+1,"execution completes only after sends and verdict");
+    }
 }
 static void live_refusals(d2k_session *s,int family) {
     uint8_t pkt[4096],out[65536];d2k_result r;

@@ -18,6 +18,7 @@
 
 #include "d2k_httpsearch.h"
 #include "d2k_httpup.h"
+#include "d2k_verify.h"
 
 uint16_t d2k_hs_probe_port = 80;
 int d2k_hs_probe_ms = 6000;
@@ -28,7 +29,8 @@ int d2k_hs_probe_ms = 6000;
 /* Сколько ждать подтверждения датапата и события APPLIED после ответа. */
 #define HS_ACK_MS     3000
 #define HS_APPLIED_MS 500
-/* Подтверждение — два настоящих ответа подряд одним кандидатом. */
+/* Подтверждение — два опыта подряд; каждый проверяет два полных ответа
+   на одной TCP-связи. Одиночный ответ не доказывает keep-alive. */
 #define HS_CONFIRM    2
 
 static int64_t mono_ms(void) {
@@ -92,6 +94,29 @@ d2k_hs_answer d2k_hs_judge(const char *host, const char *head, size_t n,
 
 /* --- зонд -------------------------------------------------------------------- */
 
+typedef struct { int fd; int64_t first_us; struct timespec sent; char head[4096]; size_t used; } hs_reader;
+static long hs_read(void *ctx, uint8_t *buf, size_t cap, int wait_ms, char *err, size_t errcap) {
+    hs_reader *s=ctx; int64_t until=mono_ms()+wait_ms;
+    for(;;) {
+        int64_t left=until-mono_ms(); if(left<=0){snprintf(err,errcap,"HTTP read timeout");return -1;}
+        struct pollfd p={s->fd,POLLIN,0};int rc=poll(&p,1,(int)left);
+        if(rc<0&&errno==EINTR)continue;
+        if(rc<=0){snprintf(err,errcap,"HTTP read timeout/error");return -1;}
+        ssize_t n=recv(s->fd,buf,cap,0);
+        if(n<0&&(errno==EINTR||errno==EAGAIN))continue;
+        if(n<0){snprintf(err,errcap,"%s",strerror(errno));return -1;}
+        if(n>0&&!s->used) {
+            struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);
+            s->first_us=(int64_t)(t.tv_sec-s->sent.tv_sec)*1000000+(t.tv_nsec-s->sent.tv_nsec)/1000;
+        }
+        if(n>0&&s->used<sizeof s->head-1) {
+            size_t take=(size_t)n;if(take>sizeof s->head-1-s->used)take=sizeof s->head-1-s->used;
+            memcpy(s->head+s->used,buf,take);s->used+=take;s->head[s->used]=0;
+        }
+        return n;
+    }
+}
+
 void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
     memset(r, 0, sizeof *r);
     r->answer = D2K_HS_CONNECT_FAIL;
@@ -99,6 +124,9 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
     r->seq = job ? job->seq : 0;
     if (!job || job->fd < 0) { snprintf(r->why, sizeof r->why, "нет сокета"); return; }
     int fd = job->fd;
+#ifdef SO_NOSIGPIPE
+    int no_sigpipe=1; (void)setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&no_sigpipe,sizeof no_sigpipe);
+#endif
     struct sockaddr_storage ss;
     socklen_t sl;
     memset(&ss, 0, sizeof ss);
@@ -147,72 +175,43 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
     r->rtt_us = (int64_t)(c1.tv_sec - c0.tv_sec) * 1000000 + (c1.tv_nsec - c0.tv_nsec) / 1000;
 
     char req[512];
-    int rl = snprintf(req, sizeof req,
-                      "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
-                      "Accept: */*\r\nConnection: close\r\n\r\n", job->host);
-    if (rl <= 0 || (size_t)rl >= sizeof req) { r->answer = D2K_HS_GARBAGE; return; }
-    struct timespec s0;
-    clock_gettime(CLOCK_MONOTONIC, &s0);
-    size_t sent = 0;
-    while (sent < (size_t)rl) {
-        ssize_t w = send(fd, req + sent, (size_t)rl - sent, 0);
-        if (w > 0) { sent += (size_t)w; continue; }
-        if (w < 0 && (errno == EAGAIN || errno == EINTR)) {
-            struct pollfd p = {fd, POLLOUT, 0};
-            if (poll(&p, 1, (int)(deadline - mono_ms())) <= 0) { break; }
-            continue;
-        }
-        break;
-    }
-    char head[4096];
-    size_t n = 0;
-    int first = 0;
-    for (;;) {
-        int64_t left = deadline - mono_ms();
-        if (left <= 0) { break; }
-        struct pollfd p = {fd, POLLIN, 0};
-        int rc = poll(&p, 1, (int)left);
-        if (rc < 0 && errno == EINTR) { continue; }
-        if (rc <= 0) { break; }
-        ssize_t got = recv(fd, head + n, sizeof head - 1 - n, 0);
-        if (got < 0 && (errno == EAGAIN || errno == EINTR)) { continue; }
-        if (got < 0) {
-            if (!n) {
-                r->answer = errno == ECONNRESET ? D2K_HS_RESET : D2K_HS_CLOSED;
-                snprintf(r->why, sizeof r->why, "%s", strerror(errno));
-                return;
+    int rl=snprintf(req,sizeof req,"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",job->host);
+    if(rl<=0||(size_t)rl>=sizeof req){r->answer=D2K_HS_GARBAGE;return;}
+    for(unsigned request=0;request<2;request++) {
+        hs_reader reader={0};reader.fd=fd;clock_gettime(CLOCK_MONOTONIC,&reader.sent);
+        int64_t until=mono_ms()+d2k_hs_probe_ms;size_t sent=0;
+        while(sent<(size_t)rl) {
+            ssize_t n=send(fd,req+sent,(size_t)rl-sent,
+#ifdef MSG_NOSIGNAL
+                MSG_NOSIGNAL
+#else
+                0
+#endif
+            );
+            if(n>0){sent+=(size_t)n;continue;}
+            if(n<0&&(errno==EAGAIN||errno==EINTR)) {
+                int64_t left=until-mono_ms();if(left<=0)break;
+                struct pollfd p={fd,POLLOUT,0};if(poll(&p,1,(int)left)>0)continue;
             }
             break;
         }
-        if (got == 0) {
-            if (!n) { r->answer = D2K_HS_CLOSED; snprintf(r->why, sizeof r->why, "закрытие"); return; }
-            break;
+        if(sent!=(size_t)rl){r->answer=D2K_HS_CLOSED;snprintf(r->why,sizeof r->why,"HTTP request %u not sent",request+1);return;}
+        d2k_http_read_result response;
+        d2k_http_read_response(hs_read,&reader,d2k_hs_probe_ms,&response,r->why,sizeof r->why);
+        r->reply_us=reader.first_us;
+        if(!reader.used){r->answer=strstr(r->why,"timeout")?D2K_HS_SILENT:D2K_HS_CLOSED;return;}
+        r->answer=d2k_hs_judge(job->host,reader.head,reader.used,r->rtt_us,r->reply_us);
+        if(response.reply.outcome==D2K_HTTP_BLOCKED)r->answer=D2K_HS_INJECTED;
+        snprintf(r->status,sizeof r->status,"HTTP/1.1 %d",response.status);
+        const char *eol=strstr(reader.head,"\r\n");
+        if(eol){size_t n=(size_t)(eol-reader.head);if(n>=sizeof r->status)n=sizeof r->status-1;memcpy(r->status,reader.head,n);r->status[n]=0;}
+        if(r->answer!=D2K_HS_REAL)return;
+        if(!response.complete){r->answer=D2K_HS_GARBAGE;return;}
+        r->complete_responses++;
+        if(response.connection_close) {
+            snprintf(r->why,sizeof r->why,"server closed connection: keep-alive not confirmed");return;
         }
-        if (!first) {
-            struct timespec f;
-            clock_gettime(CLOCK_MONOTONIC, &f);
-            r->reply_us = (int64_t)(f.tv_sec - s0.tv_sec) * 1000000 + (f.tv_nsec - s0.tv_nsec) / 1000;
-            first = 1;
-        }
-        n += (size_t)got;
-        head[n] = '\0';
-        if (strstr(head, "\r\n\r\n") || n >= sizeof head - 1) { break; }
     }
-    if (!n) {
-        r->answer = D2K_HS_SILENT;
-        snprintf(r->why, sizeof r->why, "ответа нет %d мс", d2k_hs_probe_ms);
-        return;
-    }
-    head[n] = '\0';
-    r->answer = d2k_hs_judge(job->host, head, n, r->rtt_us, r->reply_us);
-    const char *eol = strstr(head, "\r\n");
-    size_t sl2 = eol ? (size_t)(eol - head) : n;
-    if (sl2 >= sizeof r->status) { sl2 = sizeof r->status - 1; }
-    for (size_t i = 0; i < sl2; i++) {
-        unsigned char c = (unsigned char)head[i];
-        r->status[i] = (char)(c >= 0x20 && c < 0x7f ? c : '.');
-    }
-    r->status[sl2] = '\0';
 }
 
 /* --- кандидаты --------------------------------------------------------------- */
@@ -329,6 +328,7 @@ typedef struct {
     char host[256];
     uint8_t family;
     char key[40];          /* подтверждённый кандидат; "" — нет */
+    int revoked;          /* old key is only a hypothesis, not saved success */
     uint64_t seq;          /* порядок подтверждения: свежие — первыми */
     int64_t no_before_ms;  /* раньше этого новый поиск/перепроверка не начинается */
     int64_t wall;          /* когда подтверждён (стенные часы, из файла) */
@@ -522,7 +522,7 @@ int d2k_httpsearch_busy(const d2k_httpsearch *hs) {
 
 const char *d2k_httpsearch_plan_of(const d2k_httpsearch *hs, const char *host, uint8_t family) {
     const rec *r = hs && host ? rec_find(hs, host, family) : NULL;
-    return r && r->key[0] ? r->key : NULL;
+    return r && r->key[0] && !r->revoked ? r->key : NULL;
 }
 
 static void start_next(d2k_httpsearch *hs, int64_t now);
@@ -563,12 +563,12 @@ static void all_failed(d2k_httpsearch *hs, int64_t now) {
         say(hs, "HTTP %s: поиск не измерен — ни один вопрос не дал исполненного опыта "
                 "(нет APPLIED, отказ или молчание датапата)%s; повтор не раньше чем через "
                 "%lld мин", hs->cur.host,
-            r && r->key[0] ? ", подтверждённый план оставлен" : "",
+            r && r->key[0] && !r->revoked ? ", подтверждённый план оставлен" : "",
             (long long)(D2K_HS_INCONCLUSIVE_MS / 60000));
         finish(hs, now);
         return;
     }
-    if (r && r->key[0]) {
+    if (r && r->key[0] && !r->revoked) {
         /* Перепроверка не подтвердила ни прежний план, ни другой: снимаем
            только свой постоянный план этого имени и формы HTTP. */
         if (hs->ops.del_plan) { hs->ops.del_plan(hs->ops.ctx, r->host, r->family); }
@@ -595,15 +595,16 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
         return;
     }
     snprintf(r->key, sizeof r->key, "%s", key);
+    r->revoked = 0;
     r->seq = ++hs->seq;
     r->wall = 0;
     r->no_before_ms = now + D2K_HS_RECHECK_MS;
     if (hs->ops.changed) { hs->ops.changed(hs->ops.ctx); }
     if(hs->cur.question>=HQ_SPLIT && hs->cur.question<=HQ_PRODUCT)
-        say(hs,"HTTP %s: путь: свойство — %s; тот же запрос, APPLIED и два ответа без вставки",
+        say(hs,"HTTP %s: путь: свойство — %s; тот же запрос, APPLIED и два опыта с повтором keep-alive без вставки",
             hs->cur.host,hs->cur.question==HQ_PRODUCT ? "разрез и checksum-приманка вместе после двух отрицательных контролей" :
             hs->cur.question==HQ_CHECKSUM ? "checksum-приманка перед целым запросом" : "разрез имени");
-    say(hs, "HTTP %s: обход найден — «%s», %d настоящих ответа сервера подряд под пробным "
+    say(hs, "HTTP %s: обход найден — «%s», %d опыта подряд с двумя полными ответами keep-alive под пробным "
             "планом; поставлен постоянным (форма HTTP)", hs->cur.host, key, HS_CONFIRM);
     finish(hs, now);
 }
@@ -621,8 +622,8 @@ static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now)
         next_candidate(hs, now);
         return;
     }
-    if (r->answer == D2K_HS_REAL || r->answer == D2K_HS_INJECTED) { hs->cur.judged++; }
-    if (r->answer == D2K_HS_REAL) {
+    if ((r->answer == D2K_HS_REAL && r->complete_responses >= 2) || r->answer == D2K_HS_INJECTED) { hs->cur.judged++; }
+    if (r->answer == D2K_HS_REAL && r->complete_responses >= 2) {
         hs->cur.ok++;
         say(hs, "HTTP %s: «%s» — ответ сервера (%s), RTT %lld мкс, ответ через %lld мкс",
             hs->cur.host, key, r->status, (long long)r->rtt_us, (long long)r->reply_us);
@@ -630,9 +631,11 @@ static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now)
         next_candidate(hs, now);     /* тот же кандидат ещё раз */
         return;
     }
+    if(r->answer==D2K_HS_REAL)
+        say(hs,"HTTP %s: одиночный ответ без подтверждения keep-alive — кандидат не подтверждён",hs->cur.host);
     say(hs, "HTTP %s: «%s» — %s%s%s", hs->cur.host, key, d2k_hs_answer_name(r->answer),
         r->why[0] ? ": " : "", r->why);
-    if(r->answer!=D2K_HS_CONNECT_FAIL && r->answer!=D2K_HS_NONE) {
+    if(r->answer!=D2K_HS_REAL && r->answer!=D2K_HS_CONNECT_FAIL && r->answer!=D2K_HS_NONE) {
         if(!strcmp(key,"split")) hs->cur.split_no=1;
         if(!strcmp(key,"fake-badsum-whole")) hs->cur.checksum_no=1;
         if(hs->cur.question==HQ_SPLIT) hs->cur.next_question=HQ_CHECKSUM;
@@ -704,7 +707,7 @@ static void build_cands(d2k_httpsearch *hs) {
         const rec *best = NULL;
         for (size_t i = 0; i < hs->n_recs; i++) {
             const rec *r = &hs->recs[i];
-            if (!r->key[0]) continue;
+            if (!r->key[0] || r->revoked) continue;
             int have = 0;
             for (size_t k = 0; k < hs->cur.n_cands; k++) { if (!strcmp(hs->cur.cands[k], r->key)) have = 1; }
             if (have) continue;
@@ -767,6 +770,20 @@ static void start_next(d2k_httpsearch *hs, int64_t now) {
     }
 }
 
+int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t family,
+                                const uint8_t *addr, const uint8_t plan_id[16], int64_t now) {
+    if(!hs||!addr||!plan_id||!host_ok(host)||(family!=4&&family!=6))return 0;
+    rec *r=rec_find(hs,host,family);if(!r||!r->key[0]||r->revoked)return 0;
+    uint8_t expected[16];stable_id(r->key,expected);
+    if(memcmp(expected,plan_id,16))return 0;
+    r->revoked=1;r->no_before_ms=0;
+    if(hs->ops.del_plan)hs->ops.del_plan(hs->ops.ctx,r->host,r->family);
+    if(hs->ops.changed)hs->ops.changed(hs->ops.ctx);
+    say(hs,"HTTP %s: связанная вставка под постоянным планом — успех отозван, нужна перепроверка",host);
+    d2k_httpsearch_portal(hs,host,family,addr,now);
+    return 1;
+}
+
 void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
                            const uint8_t *addr, int64_t now) {
     if (!hs || !addr || (family != 4 && family != 6) || !host_ok(host)) { return; }
@@ -777,7 +794,7 @@ void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
         if (hs->q[i].family == family && !strcasecmp(hs->q[i].host, host)) { return; }
     }
     rec *r = rec_find(hs, host, family);
-    if (r && now < r->no_before_ms) { return; }
+    if (r && (!r->key[0] || r->revoked) && now < r->no_before_ms) { return; }
     if (hs->cur.phase == PH_IDLE) {
         start(hs, host, family, addr, r && r->key[0], now);
         return;
@@ -909,7 +926,7 @@ void d2k_httpsearch_push_all(d2k_httpsearch *hs) {
     if (!hs || !hs->ops.set_plan) { return; }
     for (size_t i = 0; i < hs->n_recs; i++) {
         rec *r = &hs->recs[i];
-        if (!r->key[0]) { continue; }
+        if (!r->key[0] || r->revoked) { continue; }
         uint8_t id[16];
         char text[2048];
         stable_id(r->key, id);
@@ -932,7 +949,7 @@ int d2k_httpsearch_save(d2k_httpsearch *hs, const char *path, int64_t wall_s,
     fprintf(f, "d2k-http-plans 1\n");
     for (size_t i = 0; i < hs->n_recs; i++) {
         rec *r = &hs->recs[i];
-        if (!r->key[0]) { continue; }
+        if (!r->key[0] || r->revoked) { continue; }
         /* Время подтверждения — первое сохранение после него (ревью M-4):
            сохранение идёт сразу за подтверждением. */
         if (!r->wall) { r->wall = wall_s; }
