@@ -32,7 +32,7 @@ COREHDR  = $(CORE_DIR)/include/d2k_arm.h $(CORE_DIR)/include/d2k_quic.h $(CORE_D
 QUIC_FIXTURE_OBJ = core_quichello.o core_hello.o core_tls13core.o core_x25519.o
 
 # Переносимый датапат: собирается и проверяется на любой машине.
-SRC     = icmpguard.c http80.c addr.c plan_parse.c plan_apply.c tls.c capture.c hold.c udp_hold.c udp_release.c udp_path.c routemark.c wire.c wire_udp.c track.c session.c nat.c nl.c ctq.c sched.c journal.c plans.c ctl.c ctlsrv.c
+SRC     = icmpguard.c http80.c http_trace.c addr.c plan_parse.c plan_apply.c tls.c capture.c hold.c udp_hold.c udp_release.c udp_path.c routemark.c wire.c wire_udp.c track.c session.c nat.c nl.c ctq.c sched.c journal.c plans.c ctl.c ctlsrv.c
 # Системный слой: только Linux. На маке не собирается намеренно — подделывать
 # сокеты ядра ради сборки значило бы проверять подделку. Проверяется целью
 # cross, которая линкует ПОЛНУЮ службу под обе целевые арки: полная сборка
@@ -41,11 +41,11 @@ LINUXSRC = nfq.c raw.c routemark_nl.c
 DAEMON   = d2kd.c
 HDR     = include/d2k_icmpguard.h include/d2k_hold.h include/d2k_udp_hold.h include/d2k_udp_release.h include/d2k_udp_path.h include/d2k_routemark.h include/d2k_capture.h include/d2k_plan.h include/d2k_nat.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_ctq.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h include/d2k_http80.h plan_internal.h $(COREHDR)
 
-HDR += ../runtime/d2k_runtime.h
+HDR += ../runtime/d2k_runtime.h include/d2k_http_trace.h
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_icmpguard test_addr test_hold test_udp_hold test_udp_release test_udp_path test_routemark test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session test_ctq test_http80 test_http_hello
+TESTS   = test_icmpguard test_addr test_hold test_udp_hold test_udp_release test_udp_path test_routemark test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session test_ctq test_http80 test_http_hello test_http_trace
 
 .PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release test-udp-path test-routemark cross clean
 
@@ -205,6 +205,13 @@ test-http-hello: test_http_hello
 	./test_http_hello
 
 check: test-http-hello
+
+test_http_trace: test_http_trace.c http_trace.o http80.o wire.o core_httpup_logic.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_http_trace.c http_trace.o http80.o wire.o core_httpup_logic.o $(LDFLAGS)
+.PHONY: test-http-trace
+test-http-trace: test_http_trace
+	./test_http_trace
+check: test-http-trace
 
 core_quichello.o: $(CORE_DIR)/quichello.c $(COREHDR) $(CORE_DIR)/include/d2k_quichello.h $(CORE_DIR)/include/d2k_hello.h
 	$(CC) $(CFLAGS) -c -o $@ $<

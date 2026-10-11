@@ -48,6 +48,7 @@
 #include "d2k_routemark.h"
 #include "d2k_packet.h"
 #include "d2k_http80.h"
+#include "d2k_http_trace.h"
 #include "d2k_icmpguard.h"
 
 #define RECV_BUF   65536
@@ -1715,6 +1716,9 @@ int main(int argc, char **argv) {
                      * отправка такого выхода уже не даёт, поэтому проверяем
                      * ВСЕ посылки разом, а не по одной на ходу. */
                     int output_failed = 0;
+                    const size_t http_planned = res.n_out;
+                    const uint64_t http_sent_before = st.emitted_now;
+                    const uint64_t http_queued_before = st.deferred;
                     if (mode == MODE_APPLY && raw && res.applied) {
                         /* Предел КАЖДОЙ ПОСЫЛКИ по ЕЁ направлению, а не один
                            общий на план: общий не знает ни про туннель,
@@ -1960,6 +1964,26 @@ int main(int argc, char **argv) {
                         }
                     } else if (!delayed_originals && res.applied && mode == MODE_APPLY) {
                         d2k_session_sent(sess, t, &res.key, res.execution_id);
+                    }
+                    /* One live-request result after the actual raw sends and
+                       NFQUEUE verdict. PREPARED alone is never success. */
+                    if (!controller_probe && np.have_payload && !np.truncated) {
+                        d2k_http_trace_outcome outcome = {
+                            .apply = mode == MODE_APPLY,
+                            .output_failed = output_failed,
+                            .original_failed = original_failed,
+                            .original_pending = delayed_originals,
+                            .pending = res.applied && d2k_session_send_pending(sess, &res.key, res.execution_id),
+                            .hook = np.hook, .mark = np.have_mark ? np.mark : 0,
+                            .outdev = np.have_outdev ? np.outdev : 0, .verdict = verdict,
+                            .planned = http_planned,
+                            .sent = (size_t)(st.emitted_now - http_sent_before),
+                            .queued = (size_t)(st.deferred - http_queued_before)
+                        };
+                        char line[1600];
+                        if (d2k_http_trace(line, sizeof line, np.payload, np.payload_len, &res, &outcome)) {
+                            fprintf(stderr, "%s\n", line);
+                        }
                     }
                 }
             }
