@@ -805,15 +805,26 @@ d2kvoice-linux-arm64:
 TARGET ?= aarch64-linux-musl
 TARGET_FLAGS ?=
 ARCH ?= arm64
-.PHONY: release
+.PHONY: release check-release
 d2kc-linux-arm64: release
-release: hello_profiles.inc
+release: hello_profiles.inc tcp1620_whitelist.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -static -Wl,-S \
 		-o $(BUILDDIR)/d2kc-linux-$(ARCH) d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c \
 		crypto.c quic.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c \
 		volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c udpplan.c udpruntime.c -lpthread
 	@ls -l $(BUILDDIR)/d2kc-linux-$(ARCH)
+
+# Check the deployment recipe itself, not a separately maintained test link.
+# A private output directory preserves existing (possibly uncommitted) builds.
+check cross: check-release
+check-release:
+	@set -eu; \
+		release_check_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/d2k-release-check.XXXXXX"); \
+		trap 'rm -rf "$$release_check_dir"' EXIT HUP INT TERM; \
+		$(MAKE) release BUILDDIR="$$release_check_dir" TARGET=aarch64-linux-musl TARGET_FLAGS= ARCH=arm64; \
+		$(MAKE) release BUILDDIR="$$release_check_dir" TARGET=mipsel-linux-musleabi TARGET_FLAGS=-mcpu=mips32+soft_float ARCH=mipsel; \
+		echo "release: arm64 and mipsel deployment binaries linked"
 
 d2kask-aarch64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
