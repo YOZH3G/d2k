@@ -213,12 +213,12 @@ static int hs_del_probe(void *ctx, const char *host, uint8_t family, uint16_t sp
     return 0;
 }
 
-static int hs_set_plan(void *ctx, const char *host, uint8_t family, const char *text) {
+static int hs_set_plan(void *ctx, const char *host, uint8_t family, const char *text, const uint8_t token[16]) {
     (void)ctx;
     static char hex[8192];
     char err[200];
     if (hs_hex(text, hex, sizeof hex) != 0) { return -1; }
-    if (d2k_link_set_name_family(g_link_fd, host, 6, hex, D2K_LINK_SHAPE_HTTP, 0, family,
+    if (d2k_link_set_name_bound(g_link_fd, host, 6, hex, D2K_LINK_SHAPE_HTTP, family, token,
                                  err, sizeof err) != 0) {
         fprintf(stderr, "d2kc: %s\n", err);
         return -1;
@@ -226,10 +226,11 @@ static int hs_set_plan(void *ctx, const char *host, uint8_t family, const char *
     return 0;
 }
 
-static int hs_del_plan(void *ctx, const char *host, uint8_t family) {
+static int hs_del_plan(void *ctx, const char *host, uint8_t family, const d2k_binding_context *binding) {
     (void)ctx;
+    if(!binding || binding->family!=family || !d2k_binding_known(binding))return -1;
     char err[200];
-    if (d2k_link_del_name_family(g_link_fd, host, 6, D2K_LINK_SHAPE_HTTP, family,
+    if (d2k_link_del_name_bound(g_link_fd, host, 6, binding,
                                  err, sizeof err) != 0) {
         fprintf(stderr, "d2kc: %s\n", err);
         return -1;
@@ -662,20 +663,14 @@ int main(int argc, char **argv) {
                     case D2K_EV_APPLIED:  seen_applied++; break;
                     case D2K_EV_REFUSED:  seen_refused++; break;
                     case D2K_EV_HTTP_PORTAL:
-                        if (g_hs && ev.live_execution && ev.code == 0) {
-                            static const uint8_t no_trial[16];
-                            if (!memcmp(ev.trial_id, no_trial, sizeof no_trial)) {
-                                (void)d2k_httpsearch_bound_failure(g_hs, ev.name,
-                                    ev.family, ev.high_ip, ev.plan_id, ev.live_request_ms,
-                                    ev.live_http_path, now_ms());
-                            }
-                        }
+                        (void)d2k_httpsearch_control(g_hs,&ev,now_ms());
                         if (hp) { http_portal(hp, fd, &ev, now_ms()); }
                         break;
                     default: break;
                     }
                     /* Поиск HTTP: подтверждение своей пробы и исполнение
                        своего плана (сверка по trial ID и Plan ID). */
+                    if(ev.kind==D2K_EV_ACK)(void)d2k_httpsearch_control(g_hs,&ev,now_ms());
                     if (g_hs && ev.kind == D2K_EV_ACK && ev.code == D2K_CMD_SET_NAME_PROBE) {
                         d2k_httpsearch_ack(g_hs, ev.trial_id, ((ev.num >> 8) & 0xffu) == 1u, now_ms());
                     } else if (g_hs && ev.kind == D2K_EV_APPLIED) {

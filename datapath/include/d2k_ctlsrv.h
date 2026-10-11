@@ -51,6 +51,7 @@ typedef struct {
      * вытеснение считает минуты, не наносекунды. */
     uint64_t     now_ns;
     uint8_t      area_id[D2K_TRIAL_ID_LEN];
+    d2k_binding_context installed_binding;
     /* Имена с подтверждённым HTTPS (D2K_CMD_SET_HTTPS). NULL — команда
        отвергается. */
     d2k_http80  *http80;
@@ -81,5 +82,7 @@ void d2k_ctlsrv_command(void *ctx, uint16_t type, const uint8_t *body, size_t le
  * нового больше, чем вмещает кольцо, часть уже затёрта — и это видно по
  * разнице, а не пропадает молча. */
 void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen);
+
+void d2k_ctlsrv_http80_event(d2k_ctl *,const d2k_http80_res *);
 
 #endif /* D2K_CTLSRV_H */

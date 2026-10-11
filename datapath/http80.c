@@ -34,6 +34,7 @@ typedef struct {
     uint32_t request_seq;
     int next_known;
     int request_get;
+    d2k_binding_context binding;
     uint64_t execution_id;
     uint8_t plan_id[16], trial_id[16];
     char host[256];
@@ -224,7 +225,7 @@ static flow *make(d2k_http80 *h, uint8_t family, const uint8_t *client, uint16_t
 
 void d2k_http80_executed(d2k_http80 *h, const uint8_t *pkt, size_t len,
     uint64_t now, uint64_t execution_id,
-    const uint8_t plan_id[16], const uint8_t trial_id[16]) {
+    const uint8_t plan_id[16], const uint8_t trial_id[16], const d2k_binding_context *binding) {
     d2k_packet_view v;
     if (!h || !execution_id || !plan_id || !trial_id ||
         !d2k_packet_parse(pkt, len, &v) || v.protocol != 6) return;
@@ -234,6 +235,8 @@ void d2k_http80_executed(d2k_http80 *h, const uint8_t *pkt, size_t len,
                    v.dst.bytes, 80, now);
     if (!f || f->state != ST_REQUEST || f->request_seq != rd32(tcp + 4)) return;
     f->execution_id = execution_id;
+    memset(&f->binding,0,sizeof f->binding);
+    if(binding)f->binding=*binding;
     memcpy(f->plan_id, plan_id, 16);
     memcpy(f->trial_id, trial_id, 16);
 }
@@ -299,6 +302,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
                 f->request_seq = seq;
                 f->request_get = plen >= 4 && !memcmp(pay, "GET ", 4);
                 f->execution_id = 0;
+                memset(&f->binding,0,sizeof f->binding);
                 memset(f->plan_id, 0, sizeof f->plan_id);
                 memset(f->trial_id, 0, sizeof f->trial_id);
                 f->state = ST_REQUEST;
@@ -361,6 +365,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
     r->rtt_ns = rtt;
     r->reply_ns = dt;
     r->execution_id = f->execution_id;
+    r->binding=f->binding;
     r->request_ms = f->t_req / 1000000u;
     memcpy(r->plan_id, f->plan_id, sizeof r->plan_id);
     memcpy(r->trial_id, f->trial_id, sizeof r->trial_id);

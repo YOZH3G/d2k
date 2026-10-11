@@ -344,7 +344,9 @@ typedef struct {
     char key[40];          /* подтверждённый кандидат; "" — нет */
     char repeat_path[1024];
     int repro_gap;
-    int64_t installed_ms; /* monotonic controller/datapath generation boundary */
+    int64_t installed_ms; /* diagnostic timestamp, never installation identity */
+    uint8_t install_id[16], pending_plan_id[16], installed_plan_id[16];
+    d2k_binding_context binding;
     int revoked;          /* old key is only a hypothesis, not saved success */
     uint64_t seq;          /* порядок подтверждения: свежие — первыми */
     int64_t no_before_ms;  /* раньше этого новый поиск/перепроверка не начинается */
@@ -572,6 +574,13 @@ static int open_job(d2k_httpsearch *hs, d2k_hs_job *job) {
 
 static void next_candidate(d2k_httpsearch *hs, int64_t now);
 
+static void revoke_owned(d2k_httpsearch *hs,rec *r) {
+    /* Keep the snapshot even after a failed write or a lost delete ACK.
+       Repeating this conditional command cannot remove a replacement. */
+    if(d2k_binding_known(&r->binding) && hs->ops.del_plan)
+        (void)hs->ops.del_plan(hs->ops.ctx,r->host,r->family,&r->binding);
+}
+
 static void all_failed(d2k_httpsearch *hs, int64_t now) {
     rec *r = rec_get(hs, hs->cur.host, hs->cur.family);
     if (!hs->cur.judged) {
@@ -590,7 +599,8 @@ static void all_failed(d2k_httpsearch *hs, int64_t now) {
     if (r && r->key[0] && !r->revoked) {
         /* Перепроверка не подтвердила ни прежний план, ни другой: снимаем
            только свой постоянный план этого имени и формы HTTP. */
-        if (hs->ops.del_plan) { hs->ops.del_plan(hs->ops.ctx, r->host, r->family); }
+        r->revoked=1;
+        revoke_owned(hs,r);
         r->key[0] = '\0';
         if (hs->ops.changed) { hs->ops.changed(hs->ops.ctx); }
     }
@@ -601,6 +611,45 @@ static void all_failed(d2k_httpsearch *hs, int64_t now) {
     finish(hs, now);
 }
 
+static int install(d2k_httpsearch *hs,rec *r,const char *text,const uint8_t plan_id[16],int64_t now) {
+    uint8_t token[16];fresh_id(token);
+    if(!hs->ops.set_plan || hs->ops.set_plan(hs->ops.ctx,r->host,r->family,text,token))return -1;
+    static const uint8_t none[16];
+    if(memcmp(r->install_id,none,16)) {
+        /* An unobserved SET may already have replaced the last known plan.
+           A NACK of this newer command cannot restore that older identity. */
+        memset(&r->binding,0,sizeof r->binding);
+        memset(r->installed_plan_id,0,16);
+    }
+    memcpy(r->install_id,token,16);memcpy(r->pending_plan_id,plan_id,16);
+    r->installed_ms=now;return 0;
+}
+
+void d2k_httpsearch_install_ack(d2k_httpsearch *hs,const uint8_t token[16],int ok,
+    const d2k_binding_context *binding) {
+    static const uint8_t zero[16];
+    if(!hs || !token || !memcmp(token,zero,16))return;
+    for(size_t i=0;i<hs->n_recs;i++) {
+        rec *r=&hs->recs[i];
+        if(memcmp(r->install_id,token,16))continue;
+        memset(r->install_id,0,16);
+        if(ok) {
+            memset(&r->binding,0,sizeof r->binding);
+            memset(r->installed_plan_id,0,16);
+            if(d2k_binding_known(binding) && binding->kind==D2K_BIND_NAME &&
+               !binding->temporary && binding->family==r->family && binding->shape==D2K_PLAN_SHAPE_HTTP) {
+                r->binding=*binding;
+                memcpy(r->installed_plan_id,r->pending_plan_id,16);
+            }
+        }
+        memset(r->pending_plan_id,0,16);
+        if(!ok || !d2k_binding_known(&r->binding))
+            say(hs,"HTTP %s: новая установка не подтверждена известной привязкой — живая приёмка неизвестна",r->host);
+        if(r->revoked)revoke_owned(hs,r);
+        return;
+    }
+}
+
 static void confirmed(d2k_httpsearch *hs, int64_t now) {
     const char *key = hs->cur.cands[hs->cur.idx];
     uint8_t id[16];
@@ -608,7 +657,7 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
     stable_id(key, id);
     rec *r = rec_get(hs, hs->cur.host, hs->cur.family);
     if (d2k_hs_candidate_text(key, id, text, sizeof text) != 0 || !r ||
-        !hs->ops.set_plan || hs->ops.set_plan(hs->ops.ctx, hs->cur.host, hs->cur.family, text) != 0) {
+        install(hs,r,text,id,now) != 0) {
         say(hs, "HTTP %s: план «%s» подтверждён, но не поставлен датапату", hs->cur.host, key);
         finish(hs, now);
         return;
@@ -625,7 +674,7 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
             hs->cur.host,hs->cur.question==HQ_PRODUCT ? "разрез и checksum-приманка вместе после двух отрицательных контролей" :
             hs->cur.question==HQ_CHECKSUM ? "checksum-приманка перед целым запросом" : "разрез имени");
     say(hs, "HTTP %s: обход найден — «%s», %d опыта подряд с двумя полными ответами keep-alive под пробным "
-            "планом; поставлен постоянным (форма HTTP)", hs->cur.host, key, HS_CONFIRM);
+            "планом; отправлен на установку (HTTP), живая приёмка ещё не подтверждена", hs->cur.host, key, HS_CONFIRM);
     finish(hs, now);
 }
 
@@ -796,16 +845,16 @@ static void start_next(d2k_httpsearch *hs, int64_t now) {
 }
 
 int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t family,
-                                const uint8_t *addr, const uint8_t plan_id[16], int64_t request_ms, const char *path, int64_t now) {
-    if(!hs||!addr||!plan_id||!host_ok(host)||(family!=4&&family!=6))return 0;
-    rec *r=rec_find(hs,host,family);if(!r||!r->key[0]||r->revoked||request_ms<=r->installed_ms)return 0;
-    uint8_t expected[16];stable_id(r->key,expected);
-    if(memcmp(expected,plan_id,16))return 0;
+                                const uint8_t *addr, const uint8_t plan_id[16], const d2k_binding_context *binding, uint64_t execution_id, int64_t request_ms, const char *path, int64_t now) {
+    if(!hs||!addr||!plan_id||!execution_id||request_ms<=0||!host_ok(host)||(family!=4&&family!=6))return 0;
+    rec *r=rec_find(hs,host,family);if(!r||!r->key[0]||r->revoked||!d2k_binding_equal(&r->binding,binding))return 0;
+    static const uint8_t no_pending[16];
+    if(memcmp(r->install_id,no_pending,16) || memcmp(r->installed_plan_id,plan_id,16))return 0;
     r->revoked=1;r->no_before_ms=0;
     r->repro_gap=!hs_path_ok(path);
     r->repeat_path[0]=0;
     if(!r->repro_gap)snprintf(r->repeat_path,sizeof r->repeat_path,"%s",path);
-    if(hs->ops.del_plan)hs->ops.del_plan(hs->ops.ctx,r->host,r->family);
+    revoke_owned(hs,r);
     if(hs->ops.changed)hs->ops.changed(hs->ops.ctx);
     say(hs,"HTTP %s: связанная вставка под постоянным планом — успех отозван, нужна перепроверка",host);
     if(hs->cur.phase!=PH_IDLE&&hs->cur.family==family&&!strcasecmp(hs->cur.host,host)) {
@@ -813,6 +862,19 @@ int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t f
     }
     d2k_httpsearch_portal(hs,host,family,addr,now);
     return 1;
+}
+
+int d2k_httpsearch_control(d2k_httpsearch *hs,const d2k_ev *ev,int64_t now) {
+    if(!hs || !ev)return 0;
+    if(ev->kind==D2K_EV_ACK && ev->code==D2K_CMD_SET_NAME_BOUND)
+        d2k_httpsearch_install_ack(hs,ev->trial_id,((ev->num>>8)&0xffu)==1u,&ev->execution_binding);
+    if(ev->kind==D2K_EV_HTTP_PORTAL && !ev->code && ev->transport==6 && ev->high_port==80) {
+        static const uint8_t zero[16];
+        if(!memcmp(ev->trial_id,zero,16))
+            return d2k_httpsearch_bound_failure(hs,ev->name,ev->family,ev->high_ip,ev->plan_id,
+                &ev->execution_binding,ev->live_execution,ev->live_request_ms,ev->live_http_path,now);
+    }
+    return 0;
 }
 
 void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
@@ -961,12 +1023,13 @@ void d2k_httpsearch_push_all(d2k_httpsearch *hs) {
     if (!hs || !hs->ops.set_plan) { return; }
     for (size_t i = 0; i < hs->n_recs; i++) {
         rec *r = &hs->recs[i];
-        if (!r->key[0] || r->revoked) { continue; }
+        if(r->revoked) {revoke_owned(hs,r);continue;}
+        if (!r->key[0]) { continue; }
         uint8_t id[16];
         char text[2048];
         stable_id(r->key, id);
         if (d2k_hs_candidate_text(r->key, id, text, sizeof text) == 0) {
-            if(hs->ops.set_plan(hs->ops.ctx, r->host, r->family, text)==0)r->installed_ms=mono_ms();
+            (void)install(hs,r,text,id,mono_ms());
         }
     }
 }
@@ -1033,7 +1096,7 @@ int d2k_httpsearch_load(d2k_httpsearch *hs, const char *path, size_t *n_loaded,
         char text[2048];
         stable_id(key, id);
         if (d2k_hs_candidate_text(key, id, text, sizeof text) == 0 && hs->ops.set_plan) {
-            if(hs->ops.set_plan(hs->ops.ctx, r->host, r->family, text)==0)r->installed_ms=mono_ms();
+            (void)install(hs,r,text,id,mono_ms());
         }
         if (n_loaded) { (*n_loaded)++; }
     }

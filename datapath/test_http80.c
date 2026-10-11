@@ -435,7 +435,9 @@ static void test_keepalive_later(void) {
     uint32_t req_end = CISN + 1 + (uint32_t)strlen(GET);
     open_flow(h, &f, T, GET);
     uint8_t plan[16] = {0x42}, trial[16] = {0};
-    d2k_http80_executed(h, b, (v6 ? 60 : 40) + strlen(GET), T + 99 * MS, 71, plan, trial);
+    d2k_binding_context binding={.generation=41,.kind=D2K_BIND_NAME,
+        .family=(uint8_t)(v6?6:4),.shape=D2K_PLAN_SHAPE_HTTP,.epoch={0x81}};
+    d2k_http80_executed(h, b, (v6 ? 60 : 40) + strlen(GET), T + 99 * MS, 71, plan, trial, &binding);
     static const char OK200[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     size_t n = pkt(&f, 0, F_ACK | F_PSH, SISN + 1, req_end, OK200, b);
     PKT(h, b, n, T + 197 * MS, &r);
@@ -447,9 +449,11 @@ static void test_keepalive_later(void) {
     n = pkt(&f, 1, F_ACK | F_PSH, req_end, s2, GET, b);
     PKT(h, b, n, T + 300 * MS, &r);
     CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "second request passes unchanged");
-    if (bound) d2k_http80_executed(h, b, n, T + 300 * MS, 72, plan, trial);
+    binding.generation=42;
+    if (bound) d2k_http80_executed(h, b, n, T + 300 * MS, 72, plan, trial, &binding);
+    binding.generation=43;binding.epoch[0]=0x82;
     n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
-    d2k_http80_executed(h, b, n, T + 300 * MS, 999, plan, trial);
+    d2k_http80_executed(h, b, n, T + 300 * MS, 999, plan, trial, &binding);
     uint32_t req2_end = req_end + (uint32_t)strlen(GET);
     n = pkt(&f, 0, F_ACK | F_PSH | F_FIN, s2, req2_end, INJECT, b);
     PKT(h, b, n, T + 300 * MS + 500000ull, &r);
@@ -460,6 +464,8 @@ static void test_keepalive_later(void) {
     CHECK(r.execution_id == (bound ? 72u : 0u) &&
           (bound ? !memcmp(r.plan_id, plan, 16) : r.plan_id[0] == 0),
           "portal must identify the completed execution of this request");
+    CHECK(bound ? (r.binding.generation==42 && r.binding.epoch[0]==0x81) : !d2k_binding_known(&r.binding),
+          "portal keeps its request binding, not first request or newer mutable binding");
     PKT(h, b, n, T + 300 * MS + 600000ull, &r);
     CHECK(!r.injection && r.action == D2K_HTTP80_PASS, "portal retransmission is not new evidence");
     d2k_http80_stats st = d2k_http80_get_stats(h);

@@ -93,7 +93,20 @@ typedef struct {
     uint8_t kind, family, shape, temporary;
     uint8_t epoch[16]; /* random plan-table lifetime; zero means unknown */
 } d2k_binding_context;
+static inline int d2k_binding_known(const d2k_binding_context *b) {
+    if (!b || !b->generation || !b->kind) return 0;
+    for (unsigned i=0;i<16;i++) if (b->epoch[i]) return 1;
+    return 0;
+}
+static inline int d2k_binding_equal(const d2k_binding_context *a, const d2k_binding_context *b) {
+    if (!d2k_binding_known(a) || !d2k_binding_known(b) || a->generation!=b->generation ||
+        a->kind!=b->kind || a->family!=b->family || a->shape!=b->shape || a->temporary!=b->temporary) return 0;
+    for (unsigned i=0;i<16;i++) if (a->epoch[i]!=b->epoch[i]) return 0;
+    return 1;
+}
 int d2k_plantab_binding(const d2k_plantab *, const d2k_plan *, d2k_binding_context *);
+int d2k_plantab_del_name_bound(d2k_plantab *, const uint8_t *, size_t,
+    uint8_t transport, const d2k_binding_context *);
 
 int d2k_plantab_has_ech_target(const d2k_plantab *, const uint8_t *, size_t,
     const uint8_t *, uint8_t family, uint16_t sport_be);

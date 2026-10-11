@@ -83,7 +83,7 @@ int d2k_plan_fits(const d2k_plan *p, uint32_t limits, uint32_t maxlen,
 static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
     /* Место под ключ потока есть у всех событий одинаково: подтверждение не
        про поток, но общая раскладка проще и сборке, и разбору. Ключ нулевой. */
-    uint8_t body[D2K_KEY_WIRE_LEN + 4 + D2K_TRIAL_ID_LEN];
+    uint8_t body[D2K_KEY_WIRE_LEN + 4 + D2K_TRIAL_ID_LEN + D2K_CTL_BINDING_LEN];
     memset(body, 0, sizeof body);
     body[0] = 4;
     body[D2K_KEY_WIRE_LEN] = (uint8_t)(type >> 8);
@@ -98,8 +98,11 @@ static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
     if (cx->ctl) {
         size_t len = D2K_KEY_WIRE_LEN+4;
         if ((type >= D2K_CMD_SET_SUFFIX && type <= D2K_CMD_DEL_BYPASS) ||
-            type == D2K_CMD_SET_NAME_PROBE) {
+            type == D2K_CMD_SET_NAME_PROBE || type == D2K_CMD_SET_NAME_BOUND) {
             memcpy(body+len, cx->area_id, D2K_TRIAL_ID_LEN); len += D2K_TRIAL_ID_LEN;
+        }
+        if(type==D2K_CMD_SET_NAME_BOUND) {
+            d2k_ctl_binding_write(body+len,&cx->installed_binding); len+=D2K_CTL_BINDING_LEN;
         }
         d2k_ctl_event(cx->ctl, D2K_EV_ACK, body, len);
     }
@@ -185,13 +188,14 @@ static int read_probe_flow(const uint8_t *b, d2k_addr_probe_flow *flow) {
 void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len) {
     d2k_ctlsrv *cx = vctx;
     char why[200];
+    memset(&cx->installed_binding,0,sizeof cx->installed_binding);
     d2k_plantab *tab = d2k_session_plans(cx->sess);
 
     /* v8: SET_NAME_PROBE тоже несёт хвостом trial ID опыта. ACK возвращает
        его — и на отказ тоже: контроллер обязан отличить СВОЙ отказ
        исполнителя от чужого подтверждения (задача 19). */
     if ((type >= D2K_CMD_SET_SUFFIX && type <= D2K_CMD_DEL_BYPASS) ||
-        type == D2K_CMD_SET_NAME_PROBE) {
+        type == D2K_CMD_SET_NAME_PROBE || type == D2K_CMD_SET_NAME_BOUND) {
         memset(cx->area_id, 0, sizeof cx->area_id);
         if (len < D2K_TRIAL_ID_LEN) { ack(cx, type, 0, D2K_ACK_BAD_ARGS); return; }
         len -= D2K_TRIAL_ID_LEN;
@@ -199,6 +203,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
     }
 
     switch (type) {
+    case D2K_CMD_SET_NAME_BOUND:
     case D2K_CMD_SET_NAME:
     case D2K_CMD_SET_SUFFIX:
     case D2K_CMD_SET_NAME_PROBE:
@@ -242,7 +247,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         if (type == D2K_CMD_SET_SUFFIX) {
             rc = d2k_plantab_set_suffix_family(tab, b+1, b[0], cx->now_ns, p,
                 b[1u+b[0]], b[2u+b[0]]);
-        } else if (type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) {
+        } else if (type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_BOUND || type == D2K_CMD_SET_NAME_PROBE) {
             uint16_t sport_be = 0;
             if (type == D2K_CMD_SET_NAME_PROBE) {
                 memcpy(&sport_be, b + 3u + b[0], 2);
@@ -266,6 +271,8 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         } else if (rc != 0) {
             reason = D2K_ACK_BAD_ARGS;
         }
+        if(rc==0 && type==D2K_CMD_SET_NAME_BOUND)
+            (void)d2k_plantab_binding(tab,p,&cx->installed_binding);
         ack(cx, type, rc == 0, reason);
         return;
     }
@@ -369,6 +376,16 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             rc = d2k_plantab_del_bypass_family(tab, b+1, b[0], b[1u+b[0]], b[2u+b[0]], b[3u+b[0]]);
         ack(cx, type, rc >= 0, rc == -1 ? D2K_ACK_NO_ROOM : rc < 0 ? D2K_ACK_BAD_ARGS : D2K_ACK_OK);
         return;
+    }
+    case D2K_CMD_DEL_NAME_BOUND: {
+        d2k_binding_context expected={0};
+        if(len<2+D2K_CTL_BINDING_LEN || !b[0] || len!=2u+b[0]+D2K_CTL_BINDING_LEN ||
+           (b[1+b[0]]!=6 && b[1+b[0]]!=17) ||
+           d2k_ctl_binding_read(&expected,b+2+b[0],D2K_CTL_BINDING_LEN)) {
+            ack(cx,type,0,D2K_ACK_BAD_ARGS); return;
+        }
+        (void)d2k_plantab_del_name_bound(tab,b+1,b[0],b[1+b[0]],&expected);
+        ack(cx,type,1,D2K_ACK_OK); return;
     }
     case D2K_CMD_DEL_NAME:
         /* v9: длина имени, имя, транспорт, форма, family. Снимает ровно
@@ -632,15 +649,40 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             /* Snapshot from journal, never the current plan-table entry. */
             for (unsigned b = 0; b < 8; b++)
                 body[n++] = (uint8_t)(e->execution_id >> (56 - 8*b));
-            for (unsigned b = 0; b < 8; b++)
-                body[n++] = (uint8_t)(e->binding.generation >> (56 - 8*b));
-            body[n++] = e->binding.kind;
-            body[n++] = e->binding.family;
-            body[n++] = e->binding.shape;
-            body[n++] = e->binding.temporary;
-            memcpy(body+n, e->binding.epoch, sizeof e->binding.epoch);
-            n += sizeof e->binding.epoch;
+            d2k_ctl_binding_write(body+n,&e->binding);
+            n += D2K_CTL_BINDING_LEN;
         }
         d2k_ctl_event(ctl, type, body, n);
     }
+}
+
+/* The same request snapshot encoder is used by d2kd and socket regressions. */
+void d2k_ctlsrv_http80_event(d2k_ctl *ctl, const d2k_http80_res *r) {
+    if (!ctl) { return; }
+    uint8_t body[D2K_KEY_WIRE_LEN + 2 + 255 + 50 + D2K_HTTP80_TARGET_MAX + D2K_CTL_BINDING_LEN];
+    size_t hl = strlen(r->host);
+    if (hl > 255) { return; }
+    memset(body, 0, D2K_KEY_WIRE_LEN);
+    body[0] = r->family == 6 ? 6 : 4;
+    memcpy(body + 1, r->client, r->family == 6 ? 16 : 4);
+    memcpy(body + 17, r->server, r->family == 6 ? 16 : 4);
+    body[33] = (uint8_t)(r->client_port >> 8); body[34] = (uint8_t)r->client_port;
+    body[35] = (uint8_t)(r->server_port >> 8); body[36] = (uint8_t)r->server_port;
+    body[37] = 6;
+    body[D2K_KEY_WIRE_LEN] = r->answered ? 1 : 0;
+    body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)hl;
+    memcpy(body + D2K_KEY_WIRE_LEN + 2, r->host, hl);
+    size_t off = D2K_KEY_WIRE_LEN + 2 + hl;
+    for (size_t i = 0; i < 8; i++)
+        body[off + i] = (uint8_t)(r->execution_id >> (56 - i * 8));
+    memcpy(body + off + 8, r->plan_id, 16);
+    memcpy(body + off + 24, r->trial_id, 16);
+    for (size_t i = 0; i < 8; i++)
+        body[off + 40 + i] = (uint8_t)(r->request_ms >> (56 - i * 8));
+    size_t path_len = strlen(r->request_path);
+    body[off + 48] = (uint8_t)(path_len >> 8);
+    body[off + 49] = (uint8_t)path_len;
+    memcpy(body + off + 50, r->request_path, path_len);
+    d2k_ctl_binding_write(body+off+50+path_len,&r->binding);
+    d2k_ctl_event(ctl, D2K_EV_HTTP_PORTAL, body, off + 50 + path_len + D2K_CTL_BINDING_LEN);
 }

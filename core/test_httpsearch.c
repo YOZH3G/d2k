@@ -247,7 +247,9 @@ typedef struct {
     char last_probe_plan[2048], last_plan[2048], last_plan_host[256], said[8192];
     uint8_t trial[16], plan_id[16];
     d2k_hs_job job;
-    int fail_ack;
+    int fail_ack, hold_install_ack, unknown_delete;
+    uint8_t install_id[16];
+    d2k_binding_context binding;
 } fake;
 
 static int f_open(void *c, uint8_t fam, int *fd, uint16_t *sport) {
@@ -268,13 +270,16 @@ static int f_set_probe(void *c, const char *h, uint8_t fam, uint16_t sp, const c
 static int f_del_probe(void *c, const char *h, uint8_t fam, uint16_t sp) {
     (void)h; (void)fam; (void)sp; ((fake *)c)->del_probe_n++; return 0;
 }
-static int f_set_plan(void *c, const char *h, uint8_t fam, const char *text) {
-    fake *f = c; (void)fam; f->set_plan_n++;
+static int f_set_plan(void *c, const char *h, uint8_t fam, const char *text, const uint8_t token[16]) {
+    fake *f = c; f->set_plan_n++;
+    memcpy(f->install_id,token,16);
+    f->binding.generation++; f->binding.kind=D2K_BIND_NAME; f->binding.family=fam;
+    f->binding.shape=D2K_PLAN_SHAPE_HTTP; f->binding.epoch[0]=9;
     snprintf(f->last_plan, sizeof f->last_plan, "%s", text);
     snprintf(f->last_plan_host, sizeof f->last_plan_host, "%s", h);
     return 0;
 }
-static int f_del_plan(void *c, const char *h, uint8_t fam) { (void)h; (void)fam; ((fake *)c)->del_plan_n++; return 0; }
+static int f_del_plan(void *c, const char *h, uint8_t fam, const d2k_binding_context *binding) { (void)h; (void)fam; if(!d2k_binding_known(binding))((fake *)c)->unknown_delete++; ((fake *)c)->del_plan_n++; return 0; }
 static int f_start(void *c, const d2k_hs_job *j) { fake *f = c; f->start_n++; f->job = *j; return 0; }
 static void f_say(void *c, const char *line) {
     fake *f = c;
@@ -311,6 +316,7 @@ static void trial(d2k_httpsearch *hs, fake *f, int64_t *now, int applied, d2k_hs
     r.seq = f->job.seq;
     r.fd = f->job.fd;
     d2k_httpsearch_result(hs, &r, *now += 100);
+    if(!f->hold_install_ack)d2k_httpsearch_install_ack(hs,f->install_id,1,&f->binding);
 }
 
 static void test_search(void) {
@@ -614,7 +620,83 @@ static void test_single_response_not_confirmation(void) {
     d2k_httpsearch_free(hs);
 }
 
+static void test_failed_reinstall_keeps_owner(void) {
+    fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
+    d2k_httpsearch_portal(hs,"nack.example",4,IP,now);base_injected(hs,&f,&now);
+    trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+    d2k_binding_context installed=f.binding;uint8_t id[16];const char *s=strstr(f.last_plan,"\nid ");
+    CHECK(s!=NULL,"NACK owner fixture");
+    if(s)for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(s[4+2*i])*16+hexval(s[5+2*i]));
+    d2k_httpsearch_push_all(hs);
+    CHECK(!d2k_httpsearch_bound_failure(hs,"nack.example",4,IP,id,&installed,1,now+1,"",now+2),
+          "pending replacement cannot accept old binding failure");
+    d2k_httpsearch_install_ack(hs,f.install_id,0,&f.binding);
+    CHECK(d2k_httpsearch_bound_failure(hs,"nack.example",4,IP,id,&installed,1,now+1,"",now+2)==1,
+          "matched NACK must retain last ACKed installation ownership");
+    CHECK(f.del_plan_n==1&&!f.unknown_delete,"failed reinstall still permits own exact cleanup");
+    d2k_httpsearch_free(hs);
+    /* If an earlier SET was never ACKed, a later NACK cannot prove that
+       the original installation is still current. */
+    memset(&f,0,sizeof f);ops=ops_of(&f);hs=d2k_httpsearch_new(&ops);now=1;
+    d2k_httpsearch_portal(hs,"overlap.example",4,IP,now);base_injected(hs,&f,&now);
+    trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+    installed=f.binding;s=strstr(f.last_plan,"\nid ");
+    if(s)for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(s[4+2*i])*16+hexval(s[5+2*i]));
+    d2k_httpsearch_push_all(hs);d2k_httpsearch_push_all(hs);
+    d2k_httpsearch_install_ack(hs,f.install_id,0,&f.binding);
+    CHECK(!d2k_httpsearch_bound_failure(hs,"overlap.example",4,IP,id,&installed,1,now+1,"",now+2),
+          "NACK after unobserved replacement cannot resurrect stale ownership");
+    d2k_httpsearch_free(hs);
+}
+
+static void test_pending_revoke(void) {
+    fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
+    d2k_httpsearch_portal(hs,"pending-revoke.example",4,IP,now);base_injected(hs,&f,&now);
+    trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
+    f.hold_install_ack=1;d2k_httpsearch_push_all(hs);
+    uint8_t token[16];memcpy(token,f.install_id,16);
+    d2k_httpsearch_portal(hs,"pending-revoke.example",4,IP,now+=D2K_HS_RECHECK_MS+1);
+    base_injected(hs,&f,&now);
+    for(int i=0;i<20 && d2k_httpsearch_busy(hs);i++)trial(hs,&f,&now,1,D2K_HS_INJECTED);
+    CHECK(!d2k_httpsearch_busy(hs)&&!d2k_httpsearch_plan_of(hs,"pending-revoke.example",4),"pending revoke reaches judged failure");
+    CHECK(!f.unknown_delete,"cannot delete a pending installation without its binding");
+    int deleted=f.del_plan_n;
+    d2k_httpsearch_install_ack(hs,token,1,&f.binding);
+    CHECK(f.del_plan_n==deleted+1&&!f.unknown_delete,"late SET ACK must complete pending exact revocation");
+    d2k_httpsearch_free(hs);
+}
+
 static void test_bound_failure(void) {
+    /* Writing SET_NAME is not an installation ACK. A portal from the old
+       binding may start after that write and arrive after replacement. */
+    {
+        fake pending={0}; pending.hold_install_ack=1; d2k_hs_ops ops=ops_of(&pending);
+        d2k_httpsearch *hs=d2k_httpsearch_new(&ops); int64_t now=1;
+        d2k_httpsearch_portal(hs,"pending.example",4,IP,now);
+        base_injected(hs,&pending,&now);
+        trial(hs,&pending,&now,1,D2K_HS_REAL);
+        trial(hs,&pending,&now,1,D2K_HS_REAL);
+        uint8_t id[16]; const char *s=strstr(pending.last_plan,"\nid ");
+        CHECK(s!=NULL,"pending install fixture");
+        if(s) for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(s[4+2*i])*16+hexval(s[5+2*i]));
+        CHECK(s && !d2k_httpsearch_bound_failure(hs,"pending.example",4,IP,id,&pending.binding,1,
+              now+1,"/False/",now+2) && !pending.del_plan_n,
+              "unacknowledged replacement accepted old live failure");
+        uint8_t old_token[16];memcpy(old_token,pending.install_id,16);
+        d2k_httpsearch_push_all(hs);
+        d2k_httpsearch_install_ack(hs,old_token,0,&pending.binding);
+        d2k_httpsearch_install_ack(hs,old_token,1,&pending.binding);
+        CHECK(!d2k_httpsearch_bound_failure(hs,"pending.example",4,IP,id,&pending.binding,1,now+1,"",now+2),
+              "late ACK/NACK cannot bind or cancel a new pending install");
+        d2k_httpsearch_install_ack(hs,pending.install_id,0,&pending.binding);
+        CHECK(!d2k_httpsearch_bound_failure(hs,"pending.example",4,IP,id,&pending.binding,1,now+1,"",now+2),
+              "NACK cannot assign its supplied binding");
+        d2k_httpsearch_push_all(hs);
+        d2k_httpsearch_install_ack(hs,pending.install_id,1,&pending.binding);
+        CHECK(d2k_httpsearch_bound_failure(hs,"pending.example",4,IP,id,&pending.binding,1,now+1,"",now+2)==1,
+              "fresh own ACK enables exact live revocation");
+        d2k_httpsearch_free(hs);
+    }
     fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
     d2k_httpsearch_portal(hs,"bound.example",4,IP,now);base_injected(hs,&f,&now);
     trial(hs,&f,&now,1,D2K_HS_REAL);trial(hs,&f,&now,1,D2K_HS_REAL);
@@ -622,12 +704,12 @@ static void test_bound_failure(void) {
     CHECK(textid!=NULL,"permanent id present");
     for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(textid[4+i*2])*16+hexval(textid[5+i*2]));
     id[0]^=1;
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,"/False/",now+2)&&!f.del_plan_n,"foreign plan failure cannot revoke own plan");
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,&f.binding,1,now+1,"/False/",now+2)&&!f.del_plan_n,"foreign plan failure cannot revoke own plan");
     id[0]^=1;
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",6,IP,id,now+1,"/False/",now+2)&&!f.del_plan_n,"other family cannot revoke own plan");
-    CHECK(d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,"/False/",now+2)==1,"bound live portal must revoke confirmed success");
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",6,IP,id,&f.binding,1,now+1,"/False/",now+2)&&!f.del_plan_n,"other family cannot revoke own plan");
+    CHECK(d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,&f.binding,1,now+1,"/False/",now+2)==1,"bound live portal must revoke confirmed success");
     CHECK(f.del_plan_n==1&&!d2k_httpsearch_plan_of(hs,"bound.example",4)&&d2k_httpsearch_busy(hs),"revoked plan hidden and remeasurement started immediately");
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,now+1,"/False/",now+2)&&f.del_plan_n==1,"duplicate failure cannot delete again");
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,&f.binding,1,now+1,"/False/",now+2)&&f.del_plan_n==1,"duplicate failure cannot delete again");
     CHECK(!strcmp(f.job.repeat_path,"/False/"),"bound observed path must reach baseline probe");
     base_injected(hs,&f,&now);
     d2k_httpsearch_ack(hs,f.trial,1,now+=10);
@@ -637,9 +719,10 @@ static void test_bound_failure(void) {
     d2k_httpsearch_result(hs,&first,now+=100);
     CHECK(strstr(f.last_probe_plan,"split ")!=NULL,"revoked old plan remains first hypothesis");
     int64_t old_request=now;
+    d2k_binding_context old_binding=f.binding;
     trial(hs,&f,&now,1,D2K_HS_REAL);
     int deleted=f.del_plan_n;
-    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,old_request,"/False/",now+1)&&f.del_plan_n==deleted,
+    CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,&old_binding,1,old_request,"/False/",now+1)&&f.del_plan_n==deleted,
           "same-hash old request cannot revoke a newly confirmed generation");
     CHECK(d2k_httpsearch_plan_of(hs,"bound.example",4)!=NULL,"new generation remains confirmed");
     d2k_httpsearch_free(hs);
@@ -657,7 +740,7 @@ static void test_missing_repro_context(void) {
         uint8_t id[16];const char *idtext=strstr(f.last_plan,"\nid ");
         for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(idtext[4+2*i])*16+hexval(idtext[5+2*i]));
         int starts=f.start_n;
-        CHECK(d2k_httpsearch_bound_failure(hs,"context.example",4,IP,id,now+1,invalid[k],now+2)==1,"lost context still revokes success");
+        CHECK(d2k_httpsearch_bound_failure(hs,"context.example",4,IP,id,&f.binding,1,now+1,invalid[k],now+2)==1,"lost context still revokes success");
         d2k_httpsearch_portal(hs,"context.example",4,IP,now+3);
         CHECK(!d2k_httpsearch_plan_of(hs,"context.example",4)&&f.start_n==starts&&!d2k_httpsearch_busy(hs),"unsupported context cannot silently become GET /");
         CHECK(!strstr(f.said,"hidden")&&!strstr(f.said,"Injected:x"),"request values are not logged");
@@ -668,6 +751,8 @@ static void test_missing_repro_context(void) {
 int main(void) {
 #ifdef D2K_HS_KEEPALIVE_PROOF
     test_missing_repro_context();
+    test_failed_reinstall_keeps_owner();
+    test_pending_revoke();
     test_bound_failure();
     test_single_response_not_confirmation();
 #endif

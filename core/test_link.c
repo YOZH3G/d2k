@@ -220,6 +220,31 @@ static d2k_ev ev_with_seen(uint8_t seen_types) {
 }
 
 int main(void) {
+    {
+        int sv[2];d2k_ev ev;char err[160];
+        CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,sv),"bound ACK fixture socket");
+        uint8_t rest[4+16+28+1]={0};
+        rest[0]=D2K_CMD_SET_NAME_BOUND>>8;rest[1]=(uint8_t)D2K_CMD_SET_NAME_BOUND;
+        rest[2]=1;rest[4]=0x87;
+        for(unsigned i=0;i<8;i++)rest[20+i]=(uint8_t)(0x81+i);
+        rest[28]=D2K_BIND_NAME;rest[29]=6;rest[30]=D2K_PLAN_SHAPE_HTTP;
+        for(unsigned i=0;i<16;i++)rest[32+i]=(uint8_t)(0xf0+i);
+        send_synthetic(sv[0],D2K_EV_ACK,rest,48);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.trial_id[0]==0x87 &&
+              ev.execution_binding.generation==UINT64_C(0x8182838485868788) &&
+              ev.execution_binding.family==6 && !memcmp(ev.execution_binding.epoch,rest+32,16),
+              "permanent ACK loses command or binding identity");
+        for(size_t n=4;n<48;n++) {
+            send_synthetic(sv[0],D2K_EV_ACK,rest,n);
+            CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)==-1,"truncated permanent ACK accepted");
+        }
+        send_synthetic(sv[0],D2K_EV_ACK,rest,49);
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)==-1,"oversized permanent ACK accepted");
+        rest[29]=5;send_synthetic(sv[0],D2K_EV_ACK,rest,48);
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)==-1,"invalid ACK binding family accepted");
+        close(sv[0]);close(sv[1]);
+    }
+
     /* Independent wire fixture: high bytes, both fates, every truncated tail. */
     for (unsigned refused = 0; refused < 2; refused++) {
         int sv[2];

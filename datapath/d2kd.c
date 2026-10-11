@@ -650,36 +650,6 @@ static int http80_io_rst(void *c, const uint8_t *p, size_t n) {
     return 0;
 }
 
-/* Событие контроллеру: по нему он проверяет HTTPS имени (D2K_EV_HTTP_PORTAL). */
-static void http80_event(d2k_ctl *ctl, const d2k_http80_res *r) {
-    if (!ctl) { return; }
-    uint8_t body[D2K_KEY_WIRE_LEN + 2 + 255 + 50 + D2K_HTTP80_TARGET_MAX];
-    size_t hl = strlen(r->host);
-    if (hl > 255) { return; }
-    memset(body, 0, D2K_KEY_WIRE_LEN);
-    body[0] = r->family == 6 ? 6 : 4;
-    memcpy(body + 1, r->client, r->family == 6 ? 16 : 4);
-    memcpy(body + 17, r->server, r->family == 6 ? 16 : 4);
-    body[33] = (uint8_t)(r->client_port >> 8); body[34] = (uint8_t)r->client_port;
-    body[35] = (uint8_t)(r->server_port >> 8); body[36] = (uint8_t)r->server_port;
-    body[37] = 6;
-    body[D2K_KEY_WIRE_LEN] = r->answered ? 1 : 0;
-    body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)hl;
-    memcpy(body + D2K_KEY_WIRE_LEN + 2, r->host, hl);
-    size_t off = D2K_KEY_WIRE_LEN + 2 + hl;
-    for (size_t i = 0; i < 8; i++)
-        body[off + i] = (uint8_t)(r->execution_id >> (56 - i * 8));
-    memcpy(body + off + 8, r->plan_id, 16);
-    memcpy(body + off + 24, r->trial_id, 16);
-    for (size_t i = 0; i < 8; i++)
-        body[off + 40 + i] = (uint8_t)(r->request_ms >> (56 - i * 8));
-    size_t path_len = strlen(r->request_path);
-    body[off + 48] = (uint8_t)(path_len >> 8);
-    body[off + 49] = (uint8_t)path_len;
-    memcpy(body + off + 50, r->request_path, path_len);
-    d2k_ctl_event(ctl, D2K_EV_HTTP_PORTAL, body, off + 50 + path_len);
-}
-
 /* Пакет очереди глазами http80. 1 — пакет обработан здесь (вердикт уже
    отправлен), 0 — дальше обычным путём. Заменять и снимать — только в
    режиме apply с сырым сокетом: в наблюдении трафик не трогается. */
@@ -694,7 +664,7 @@ static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
                       rst, sizeof rst, &r);
     /* Событие — после исхода замены (ревью N1): признак «307 ушёл» в нём
        верный, и контроллер не повторяет SET_HTTPS зря. */
-    if (r.injection && (r.action != D2K_HTTP80_REPLACE || !raw)) { http80_event(ctl, &r); }
+    if (r.injection && (r.action != D2K_HTTP80_REPLACE || !raw)) { d2k_ctlsrv_http80_event(ctl, &r); }
     if (r.action == D2K_HTTP80_DROP && raw) {
         if (d2k_nfq_verdict(q, id, D2K_NF_DROP, err, sizeof err) != 0) {
             st.verdict_fail++;
@@ -716,7 +686,7 @@ static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
     http80_ctx x = {q, raw, id};
     d2k_http80_io io = {http80_io_payload, http80_io_accept, http80_io_rst, &x};
     int swapped = d2k_http80_swap(http80, &r, out, rst, &io);
-    http80_event(ctl, &r);
+    d2k_ctlsrv_http80_event(ctl, &r);
     if (swapped) {
         http80_log(&r, "замена: клиенту 307 на https, серверу RST");
     } else {
@@ -1995,7 +1965,7 @@ int main(int argc, char **argv) {
                         if (outcome.apply && res.applied && !outcome.output_failed &&
                             !outcome.original_failed && !outcome.original_pending && !outcome.pending) {
                             d2k_http80_executed(http80, np.payload, np.payload_len, t,
-                                res.execution_id, res.plan_id, res.trial_id);
+                                res.execution_id, res.plan_id, res.trial_id, &res.binding);
                         }
                         if (d2k_http_trace(line, sizeof line, np.payload, np.payload_len, &res, &outcome)) {
                             fprintf(stderr, "%s\n", line);

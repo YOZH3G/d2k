@@ -333,6 +333,9 @@ int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
  * его в D2K_EV_ACK (trial_id) и на успех, и на отказ — подтверждение
  * установки связывается со своим опытом, а не с любым ждущим (задача 19).
  * d2k_link_set_name_family с ненулевым портом шлёт нулевой trial ID. */
+int d2k_link_set_name_bound(int,const char *,uint8_t,const char *,uint8_t,uint8_t,
+    const uint8_t token[16],char *,size_t);
+int d2k_link_del_name_bound(int,const char *,uint8_t,const d2k_binding_context *,char *,size_t);
 int d2k_link_set_name_probe_trial(int fd, const char *name, uint8_t transport,
                                   const char *plan_text, uint8_t shape,
                                   uint16_t sport_be, uint8_t family,

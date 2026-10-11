@@ -78,6 +78,22 @@
 /* Execution ID u64 BE, binding generation u64 BE, kind/family/shape/temporary.
  * Followed by the 16-byte table epoch. Unknown identity is not live proof. */
 #define D2K_CTL_EXECUTION_LEN 36u
+/* v17: identified permanent SET/conditional DEL and request binding snapshots. */
+#define D2K_CTL_BINDING_LEN 28u
+static inline void d2k_ctl_binding_write(uint8_t *p, const d2k_binding_context *b) {
+    for(unsigned i=0;i<8;i++)p[i]=(uint8_t)(b->generation>>(56-8*i));
+    p[8]=b->kind;p[9]=b->family;p[10]=b->shape;p[11]=b->temporary;
+    for(unsigned i=0;i<16;i++)p[12+i]=b->epoch[i];
+}
+static inline int d2k_ctl_binding_read(d2k_binding_context *b,const uint8_t *p,size_t n) {
+    if(n!=D2K_CTL_BINDING_LEN || p[8]>D2K_BIND_FLOW ||
+       (p[9] && p[9]!=4 && p[9]!=6) || p[10]>D2K_PLAN_SHAPE_HTTP || p[11]>1)return -1;
+    b->generation=0;
+    for(unsigned i=0;i<8;i++)b->generation=(b->generation<<8)|p[i];
+    b->kind=p[8];b->family=p[9];b->shape=p[10];b->temporary=p[11];
+    for(unsigned i=0;i<16;i++)b->epoch[i]=p[12+i];
+    return 0;
+}
 
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */
@@ -202,6 +218,8 @@
  * шлёт измеренные бюджеты коробок каталога и полевой — для целей, чья
  * коробка не измерена. */
 #define D2K_CMD_SET_STALL_BUDGETS 0x0091
+#define D2K_CMD_SET_NAME_BOUND 0x0092 /* SET_NAME body + command id(16); ACK includes binding */
+#define D2K_CMD_DEL_NAME_BOUND 0x0093 /* length/name/transport + expected binding(28); stale no-op */
 
 /* Контроллер задаёт lease относительным временем, datapath сравнивает
  * абсолютный monotonic expires_ns. Ограничение не даёт аварийному disconnect

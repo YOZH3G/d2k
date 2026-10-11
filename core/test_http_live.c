@@ -16,6 +16,8 @@
 #include "../datapath/test_runtime_trace.h"
 
 static int live_diverge;
+static d2k_result last_live_execution;
+static int identity_peer, identity_delete_fail;
 static const char live_host[]="portal-target.example";
 static size_t live_packet(int family,uint16_t port,uint32_t seq,int syn,const char *request,uint8_t *pkt) {
     d2k_conn c={0};c.family=(uint8_t)family;c.ttl=61;c.window=32000;c.ack=76543;
@@ -67,6 +69,7 @@ static void live_flow(d2k_session *s,int family,uint16_t port,const char *host,i
     CHECK(d2k_session_send_pending(s,&r.key,r.execution_id),"prepared output is not completed execution");
     for(size_t i=0;i<r.n_out+1;i++)d2k_session_sent(s,1200000000,&r.key,r.execution_id);
     CHECK(d2k_session_done(s)==done_before+1,"execution completes only after sends and verdict");
+    last_live_execution=r;
     }
 }
 static void live_refusals(d2k_session *s,int family) {
@@ -92,6 +95,82 @@ static void live_refusals(d2k_session *s,int family) {
     n=live_packet(family,54002,10001,0,large,pkt);d2k_session_packet(s,pkt,n,2000000005,out,sizeof out,&r);
     CHECK(r.applied&&r.n_out==1&&r.verdict==D2K_VERDICT_ACCEPT,"complete Host with partial large Cookie still applies measured whole-plan");
 }
+static int identity_set(void *ctx,const char *host,uint8_t family,const char *text,const uint8_t token[16]) {
+    char hex[8192],err[200];
+    (void)f_set_plan(ctx,host,family,text,token);
+    if(d2k_plan_text_to_hex(text,hex,sizeof hex,err,sizeof err))return -1;
+    return d2k_link_set_name_bound(identity_peer,host,6,hex,D2K_LINK_SHAPE_HTTP,family,token,err,sizeof err);
+}
+static int identity_del(void *ctx,const char *host,uint8_t family,const d2k_binding_context *binding) {
+    char err[200];(void)family;((fake *)ctx)->del_plan_n++;
+    return d2k_link_del_name_bound(identity_delete_fail ? -1 : identity_peer,host,6,binding,err,sizeof err);
+}
+static d2k_ev identity_ack(d2k_ctl *ctl,d2k_ctlsrv *cx,d2k_httpsearch *hs) {
+    d2k_ev ev={0};char err[200];
+    CHECK(d2k_ctl_poll(ctl,d2k_ctlsrv_command,cx)>0,"actual identity command consumed");
+    d2k_ctl_flush(ctl);
+    CHECK(!d2k_link_next(identity_peer,&ev,100,err,sizeof err)&&ev.kind==D2K_EV_ACK,"actual identity ACK decoded");
+    (void)d2k_httpsearch_control(hs,&ev,10);
+    return ev;
+}
+static int identity_portal(d2k_ctl *ctl,d2k_httpsearch *hs,const d2k_result *execution,int family,int variant) {
+    d2k_http80_res portal={0};d2k_ev ev;char err[200];
+    portal.family=(uint8_t)family;portal.client_port=53010;portal.server_port=80;
+    snprintf(portal.host,sizeof portal.host,"%s",live_host);
+    portal.execution_id=execution->execution_id;portal.binding=execution->binding;
+    memcpy(portal.plan_id,execution->plan_id,16);
+    struct timespec now;clock_gettime(CLOCK_MONOTONIC,&now);
+    portal.request_ms=(uint64_t)now.tv_sec*1000+(uint64_t)now.tv_nsec/1000000+100;
+    /* Missing request path deliberately forbids starting any network probe. */
+    if(variant==1)portal.binding.epoch[0]^=1;
+    if(variant==2)memset(&portal.binding,0,sizeof portal.binding);
+    if(variant==3)portal.trial_id[0]=1;
+    d2k_ctlsrv_http80_event(ctl,&portal);d2k_ctl_flush(ctl);
+    CHECK(!d2k_link_next(identity_peer,&ev,100,err,sizeof err)&&ev.kind==D2K_EV_HTTP_PORTAL,"production HTTP event encoder/decoder");
+    CHECK(ev.live_execution==portal.execution_id &&
+          !memcmp(ev.execution_binding.epoch,portal.binding.epoch,16),"request snapshot survives socket");
+    return d2k_httpsearch_control(hs,&ev,(int64_t)portal.request_ms+1);
+}
+static void live_identity(d2k_ctl *ctl,d2k_ctlsrv *cx,int peer,int family,const char *store) {
+    identity_peer=peer;d2k_ev drained;char err[200];
+    d2k_ctl_flush(ctl);
+    while(!d2k_link_next(peer,&drained,0,err,sizeof err)){}
+    fake f={0};d2k_hs_ops ops=ops_of(&f);ops.set_plan=identity_set;ops.del_plan=identity_del;
+    d2k_httpsearch *hs=d2k_httpsearch_new(&ops);size_t loaded=0;
+    CHECK(!d2k_httpsearch_load(hs,store,&loaded,err,sizeof err)&&loaded==1,"identity restore fixture");
+    d2k_ev first=identity_ack(ctl,cx,hs);
+    CHECK(first.code==D2K_CMD_SET_NAME_BOUND && d2k_binding_known(&first.execution_binding) &&
+          !memcmp(first.trial_id,f.install_id,16),"ACK belongs to this installation command");
+    d2k_httpsearch_push_all(hs);
+    /* SET is written but unconsumed: a new request still executes old binding. */
+    live_flow(cx->sess,family,53010,live_host,1,0,NULL);
+    d2k_result old=last_live_execution;
+    CHECK(d2k_binding_equal(&old.binding,&first.execution_binding),"old flight fixture");
+    d2k_ev second=identity_ack(ctl,cx,hs);
+    CHECK(!d2k_binding_equal(&first.execution_binding,&second.execution_binding),"reinstall obtains different binding");
+    CHECK(!identity_portal(ctl,hs,&old,family,0)&&!f.del_plan_n,"late old portal cannot revoke replacement");
+    CHECK(!d2k_link_del_name_bound(peer,live_host,6,&old.binding,err,sizeof err),"stale conditional delete sent");
+    (void)identity_ack(ctl,cx,hs);
+    CHECK(d2k_plantab_find_http(d2k_session_plans(cx->sess),(const uint8_t *)live_host,strlen(live_host),(uint8_t)family,0,3)!=NULL,
+          "datapath atomically preserves replacement from stale delete");
+    live_flow(cx->sess,family,53011,live_host,1,0,NULL);
+    d2k_result current=last_live_execution;
+    CHECK(!identity_portal(ctl,hs,&current,family,1),"foreign table epoch cannot revoke");
+    CHECK(!identity_portal(ctl,hs,&current,family,2),"unknown binding cannot revoke");
+    CHECK(!identity_portal(ctl,hs,&current,family,3),"probe cannot revoke permanent binding");
+    /* Deliver the event over the live link, then fail only the delete callback. */
+    identity_delete_fail=1;
+    CHECK(identity_portal(ctl,hs,&current,family,0)==1&&f.del_plan_n==1,"matching live portal revokes its owner");
+    identity_delete_fail=0;
+    d2k_httpsearch_push_all(hs);
+    CHECK(f.del_plan_n==2,"resync retries exact failed revocation");
+    (void)identity_ack(ctl,cx,hs);
+    CHECK(!d2k_plantab_find_http(d2k_session_plans(cx->sess),(const uint8_t *)live_host,strlen(live_host),(uint8_t)family,0,4),"conditional live delete reaches actual table");
+    CHECK(!identity_portal(ctl,hs,&current,family,0)&&f.del_plan_n==2,"duplicate portal cannot delete again");
+    CHECK(!d2k_httpsearch_busy(hs),"missing replay context cannot launch network work");
+    d2k_httpsearch_free(hs);
+}
+
 static void live_restore(int family) {
     char dir[128],path[180],sock[180],cat[180],log[180],err[300];
     snprintf(dir,sizeof dir,"/tmp/d2k-http-live-%ld-%d",(long)getpid(),family);
@@ -146,6 +225,7 @@ static void live_restore(int family) {
     if(permanent.n){permanent.bytes[0][permanent.packets[0].len-1]^=1;
         CHECK(!d2k_test_trace_equal(measured.packets,measured.n,permanent.packets,permanent.n),"live gate rejects divergent packet");}
     live_refusals(s,family);
+    live_identity(ctl,&cx,peer,family,path);
     d2k_link_close(peer);d2k_ctl_close(ctl);d2k_session_free(s);
     unlink(path);unlink(cat);unlink(log);unlink(sock);rmdir(dir);
 }

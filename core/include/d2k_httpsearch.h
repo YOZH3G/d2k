@@ -50,6 +50,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "d2k_plans.h"
+#include "d2k_link.h"
 
 typedef enum {
     D2K_HS_NONE = 0,
@@ -125,8 +127,8 @@ typedef struct {
     int  (*set_probe)(void *ctx, const char *host, uint8_t family, uint16_t sport_be,
                       const char *plan_text, const uint8_t trial_id[16]);
     int  (*del_probe)(void *ctx, const char *host, uint8_t family, uint16_t sport_be);
-    int  (*set_plan)(void *ctx, const char *host, uint8_t family, const char *plan_text);
-    int  (*del_plan)(void *ctx, const char *host, uint8_t family);
+    int  (*set_plan)(void *ctx, const char *host, uint8_t family, const char *plan_text, const uint8_t install_id[16]);
+    int  (*del_plan)(void *ctx, const char *host, uint8_t family, const d2k_binding_context *);
     /* Запустить зонд; ответ — d2k_httpsearch_result. 0 — запущен. */
     int  (*start_probe)(void *ctx, const d2k_hs_job *job);
     void (*say)(void *ctx, const char *line);
@@ -160,12 +162,14 @@ size_t d2k_hs_plan_poisons(const char *plan_text, char out[][64], size_t cap);
  * датапата, нет подтверждения), — не измерен: план не снимается, «обход не
  * найден» не говорится, повтор — через этот срок (ревью I-2). */
 #define D2K_HS_INCONCLUSIVE_MS (5ll * 60 * 1000)
-/* Caller must bind this failure to the current live execution/generation.
- * Plan hash alone is insufficient; this function additionally checks own key. */
+/* Requires the current ACKed permanent binding and a completed request execution.
+ * Unknown/stale identity is ignored; plan hash and timestamps alone are not proof. */
 int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t family,
-                                const uint8_t *addr, const uint8_t plan_id[16], int64_t request_ms, const char *path, int64_t now_ms);
+                                const uint8_t *addr, const uint8_t plan_id[16], const d2k_binding_context *, uint64_t execution_id, int64_t request_ms, const char *path, int64_t now_ms);
 void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
                            const uint8_t *addr, int64_t now_ms);
+int d2k_httpsearch_control(d2k_httpsearch *, const d2k_ev *, int64_t now_ms);
+void d2k_httpsearch_install_ack(d2k_httpsearch *, const uint8_t install_id[16], int ok, const d2k_binding_context *);
 /* Подтверждение SET_NAME_PROBE (trial ID и признак успеха). */
 void d2k_httpsearch_ack(d2k_httpsearch *hs, const uint8_t trial_id[16], int ok, int64_t now_ms);
 /* Событие APPLIED: план с этим идентификатором исполнен на проводе. */

@@ -30,6 +30,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "d2k_plans.h"
 
 #define D2K_HTTP80_PASS    0   /* пакет идёт как шёл */
 #define D2K_HTTP80_DROP    1   /* снять: копия вставки, её FIN, поздний сервер */
@@ -57,6 +58,7 @@ typedef struct {
     uint16_t client_port, server_port;   /* хостовый порядок */
     uint64_t rtt_ns;       /* SYN → SYN/ACK этого потока */
     uint64_t reply_ns;     /* запрос → ответ */
+    d2k_binding_context binding;
     uint64_t execution_id; /* completed live request execution, else zero */
     uint64_t request_ms;   /* monotonic request start, generation boundary */
     uint8_t plan_id[16], trial_id[16];
@@ -105,7 +107,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
  * and request sequence must still match the observed request. */
 void d2k_http80_executed(d2k_http80 *h, const uint8_t *pkt, size_t len,
     uint64_t now_ns, uint64_t execution_id,
-    const uint8_t plan_id[16], const uint8_t trial_id[16]);
+    const uint8_t plan_id[16], const uint8_t trial_id[16], const d2k_binding_context *);
 
 /* Исполнение REPLACE (ревью I3) — обязательный второй шаг. Пока его не было,
  * поток ничьим не считается: ни RST, ни снятия копий. Порядок:

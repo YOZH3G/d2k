@@ -762,6 +762,22 @@ int d2k_plantab_del_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
     return n > 0;
 }
 
+int d2k_plantab_del_name_bound(d2k_plantab *t, const uint8_t *name, size_t len,
+    uint8_t transport, const d2k_binding_context *expected) {
+    if (!t || !name || !len || !d2k_binding_known(expected) ||
+        expected->kind!=D2K_BIND_NAME || expected->temporary ||
+        (transport!=6 && transport!=17)) return 0;
+    for (size_t i=0;i<t->used;i++) {
+        entry *e=&t->v[i]; d2k_binding_context current;
+        if(e->kind==KEY_NAME && !e->only_sport && name_eq(e->name,e->name_len,name,len) &&
+           probe_transport(e->plan,e->shape)==transport &&
+           d2k_plantab_binding(t,e->plan,&current) && d2k_binding_equal(&current,expected)) {
+            (void)drop(t,e); return 1;
+        }
+    }
+    return 0;
+}
+
 int d2k_plantab_del_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
                                uint8_t shape, uint16_t sport_be) {
     return d2k_plantab_del_name_probe_family(t, name, len, shape, sport_be, 4);

@@ -44,19 +44,9 @@ static uint8_t g_scratch[D2K_CTL_FRAME_MAX + HDR];
  * still cannot by itself establish live/application success. */
 static int execution_context(d2k_ev *out, const uint8_t *p, size_t n) {
     if (!n) return 0;
-    if (n != D2K_CTL_EXECUTION_LEN || p[16] > D2K_BIND_FLOW ||
-        (p[17] && p[17] != 4 && p[17] != 6) ||
-        p[18] > D2K_PLAN_SHAPE_HTTP || p[19] > 1) return -1;
-    for (unsigned b = 0; b < 8; b++) {
-        out->execution_id = (out->execution_id << 8) | p[b];
-        out->execution_binding.generation =
-            (out->execution_binding.generation << 8) | p[8+b];
-    }
-    out->execution_binding.kind = p[16];
-    out->execution_binding.family = p[17];
-    out->execution_binding.shape = p[18];
-    out->execution_binding.temporary = p[19];
-    memcpy(out->execution_binding.epoch, p+20, sizeof out->execution_binding.epoch);
+    if (n != D2K_CTL_EXECUTION_LEN ||
+        d2k_ctl_binding_read(&out->execution_binding,p+8,D2K_CTL_BINDING_LEN)) return -1;
+    for (unsigned b=0;b<8;b++) out->execution_id=(out->execution_id<<8)|p[b];
     return 0;
 }
 
@@ -328,7 +318,7 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
             }
             if (rlen >= off + 50) {
                 size_t path_len = (size_t)rest[off + 48] << 8 | rest[off + 49];
-                if (path_len >= sizeof out->live_http_path || rlen != off + 50 + path_len) {
+                if (path_len >= sizeof out->live_http_path || (rlen != off + 50 + path_len && rlen != off + 50 + path_len + D2K_CTL_BINDING_LEN)) {
                     say(err, errcap, "вставка HTTP с обрезанным контекстом запроса");
                     return -1;
                 }
@@ -340,6 +330,8 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
                     out->live_request_ms = (out->live_request_ms << 8) | rest[off + 40 + i];
                 memcpy(out->live_http_path, rest + off + 50, path_len);
                 out->live_http_path[path_len] = '\0';
+                if(rlen==off+50+path_len+D2K_CTL_BINDING_LEN &&
+                   d2k_ctl_binding_read(&out->execution_binding,rest+off+50+path_len,D2K_CTL_BINDING_LEN))return -1;
             }
         }
         break;
@@ -415,6 +407,9 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         if (rlen >= 4 + D2K_TRIAL_ID_LEN) {
             memcpy(out->trial_id, rest + 4, D2K_TRIAL_ID_LEN);
         }
+        if(out->code==D2K_CMD_SET_NAME_BOUND &&
+           (rlen!=4+D2K_TRIAL_ID_LEN+D2K_CTL_BINDING_LEN ||
+            d2k_ctl_binding_read(&out->execution_binding,rest+4+D2K_TRIAL_ID_LEN,D2K_CTL_BINDING_LEN))) return -1;
         break;
     case D2K_EV_APPLIED:
         /* Новый код подтверждения исполнения требует полный ID. Старый
@@ -547,7 +542,7 @@ static int send_name_plan(int fd, const char *name, uint8_t transport,
         return -1;
     }
     size_t extra = sport_be ? 2u : 0u;                  /* местный порт, если пробный */
-    size_t seq_len = (cmd == D2K_CMD_SET_SUFFIX || cmd == D2K_CMD_SET_NAME_PROBE)
+    size_t seq_len = (cmd == D2K_CMD_SET_SUFFIX || cmd == D2K_CMD_SET_NAME_PROBE || cmd == D2K_CMD_SET_NAME_BOUND)
                          ? D2K_TRIAL_ID_LEN : 0;
     size_t plan_cap = sizeof g_scratch - HDR - 3 - nl - extra - seq_len;
     if (hexlen / 2 > plan_cap) {
@@ -608,6 +603,26 @@ int d2k_link_set_name_family(int fd, const char *name, uint8_t transport,
     char *err, size_t errcap) {
     return send_name_plan(fd, name, transport, plan_text, shape, sport_be, family,
         err, errcap, sport_be ? D2K_CMD_SET_NAME_PROBE : D2K_CMD_SET_NAME, NULL);
+}
+
+int d2k_link_set_name_bound(int fd,const char *name,uint8_t transport,
+    const char *plan_text,uint8_t shape,uint8_t family,const uint8_t token[16],char *err,size_t cap) {
+    if(!token)return -1;
+    return send_name_plan(fd,name,transport,plan_text,shape,0,family,err,cap,D2K_CMD_SET_NAME_BOUND,token);
+}
+
+int d2k_link_del_name_bound(int fd,const char *name,uint8_t transport,
+    const d2k_binding_context *binding,char *err,size_t cap) {
+    if(fd<0 || !name || !*name || strlen(name)>255 || (transport!=6 && transport!=17) ||
+       !d2k_binding_known(binding) || binding->kind!=D2K_BIND_NAME || binding->temporary) return -1;
+    size_t nl=strlen(name),o=HDR;
+    g_scratch[o++]=(uint8_t)nl;memcpy(g_scratch+o,name,nl);o+=nl;
+    g_scratch[o++]=transport;d2k_ctl_binding_write(g_scratch+o,binding);o+=D2K_CTL_BINDING_LEN;
+    uint32_t n=(uint32_t)(o-4);
+    for(unsigned i=0;i<4;i++)g_scratch[i]=(uint8_t)(n>>(24-8*i));
+    g_scratch[4]=D2K_CMD_DEL_NAME_BOUND>>8;g_scratch[5]=(uint8_t)D2K_CMD_DEL_NAME_BOUND;
+    if(write_all(fd,g_scratch,o)) {say(err,cap,"conditional name delete failed: %s",strerror(errno));return -1;}
+    return 0;
 }
 
 int d2k_link_set_name_probe_trial(int fd, const char *name, uint8_t transport,

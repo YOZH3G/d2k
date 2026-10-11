@@ -43,6 +43,9 @@ JS-тест handshake читает новую версию отдельно от
 
 ## Что это ещё не закрывает
 
+Следующий описанный ниже шаг реализован в [HTTP live binding](2026-10-11-http-live-binding.md).
+Этот раздел фиксирует состояние на момент ff5decd.
+
 HTTP ACK установки пока возвращает корреляцию команды, но не контекст
 установленной привязки. `http80` сохраняет execution/plan/trial/request, но
 не binding; HTTP_PORTAL также не несёт его. `httpsearch_bound_failure`
