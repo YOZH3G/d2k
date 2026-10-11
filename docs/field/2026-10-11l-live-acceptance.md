@@ -249,3 +249,28 @@ d2k_track_new_connection делает его зелёным. Логи:
 приписать ответы нового соединения старому исполнению. Текущие тесты
 проверяют сохранность отчёта отправки, а не такую положительную приёмку.
 Это следующий локальный пункт; поле и 19/19 остаются неподтверждёнными.
+
+При подключении RX-критерия нельзя использовать EXCHANGE.num как число
+уникально полученных байтов: session.c увеличивает rev_payload_after_hello
+на длину каждой увиденной нагрузки без TCP sequence deduplication. Повторные
+передачи способны искусственно пройти порог. Положительная объёмная приёмка
+требует отдельного учёта прогресса TCP-потока; наружный TLS type 23 по-прежнему
+не доказывает успешное приложение. Для QUIC произвольный UDP EXCHANGE также
+не становится доказательством H3, а STUN/discovery — полноценного голоса.
+
+Итоговые проверки кода 9e5ad11 (последующая правка только этого отчёта):
+
+- `make -C core check`: exit0, `/tmp/d2k-binding-core-check.log`, включая
+  release arm64/mipsel в частном BUILDDIR. Probe-plan: 0 mismatches;
+  UDP: 198 full-packet cases, 53 questions, 0 failures; HTTP live и QUIC
+  actual first-send sink: 0 failures.
+- `make -C detect check`: exit0, `/tmp/d2k-binding-detect-check.log`.
+- `make -C datapath check cross`: exit0,
+  `/tmp/d2k-binding-syn-datapath-check.log`.
+- `git diff --check`: exit0. Dirty — только исходные бинарники владельца
+  builds/d2kc-linux-arm64 и builds/d2kd-linux-arm64. SHA256 сохранились:
+  `5a8b19aa4deaa891da0094e53704f870d4f7f3027c2c2ad0f3131394b7a40194`
+  и `179c59ee5fdfc5e51877daf39ea79bfa316edafdf8a0e2a4e0db80bd6e30301e`.
+
+Нового полевого свидетельства нет. Общая goal активна; положительная
+приёмка всех классов, два остатка поля, #14/#4/#12 не объявлены закрытыми.
