@@ -262,6 +262,17 @@ int main(void) {
         d2k_catalog_free(&c);
     }
 
+    {
+        d2k_cat_fp a = {0}, b = {0}; a.method = b.method = 2;
+        add_rx_volume(&a, 14); add_rx_volume(&b, 14);
+        strcpy(a.sig[0].kind, "rx-volume-wire");
+        CHECK(!d2k_fp_same(&a, &b), "ciphertext and body byte domains merged");
+        strcpy(b.sig[0].kind, "rx-volume-wire");
+        CHECK(d2k_fp_same(&a, &b), "same wire RX evidence did not match");
+        b.sig[0].volume = 40;
+        CHECK(!d2k_fp_same(&a, &b), "different wire RX cut sizes matched");
+    }
+
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }
     printf("узнавание: все проверки прошли\n");
     return 0;

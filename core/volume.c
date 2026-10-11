@@ -49,12 +49,23 @@
 #define READ_MIN_MS  1500
 #define READ_MAX_MS  12000
 
+/* A partial encrypted record is visible even before the first HTTP header.
+   This is suspicion, not a verdict. Unknown versions, replayed hellos and
+   local limits cannot establish the application record context. */
+static int rx_wire_partial(const d2k_ver_result *r) {
+    return r && r->level == D2K_VER_HANDSHAKE && r->name_ok == 1 &&
+        !r->status && !r->replay_proof && !r->local_limit &&
+        (r->negotiated_tls == 0x0303 || r->negotiated_tls == 0x0304) &&
+        r->rx_tls_record_missing &&
+        r->rx_tls_wire_bytes >= (uint64_t)D2K_VOL_MIN_KB * 1024;
+}
+
 int d2k_volume_rx_partial(const d2k_ver_result *r) {
-    return r && r->status >= 200 && r->status < 300 && !r->body_complete &&
+    return rx_wire_partial(r) || (r && r->status >= 200 && r->status < 300 && !r->body_complete &&
         r->body_encoding == 0 && r->body_framing_valid &&
         r->body_has_length != r->body_chunked &&
         r->body_bytes >= (uint64_t)D2K_VOL_MIN_KB * 1024 &&
-        (!r->body_has_length || r->body_expected > r->body_bytes);
+        (!r->body_has_length || r->body_expected > r->body_bytes));
 }
 
 int d2k_volume_rx_evidence(const d2k_ver_result *a,
@@ -63,6 +74,34 @@ int d2k_volume_rx_evidence(const d2k_ver_result *a,
                            d2k_vol_result *out) {
     const uint64_t min_bytes = (uint64_t)D2K_VOL_MIN_KB * 1024;
     if (!a || !b || !gzip || !out) { return 0; }
+    if (rx_wire_partial(a) || rx_wire_partial(b)) {
+        if (!rx_wire_partial(a) || !rx_wire_partial(b) ||
+            a->negotiated_tls != b->negotiated_tls ||
+            gzip->negotiated_tls != a->negotiated_tls ||
+            gzip->level != D2K_VER_APPLICATION || gzip->name_ok != 1 ||
+            gzip->local_limit || gzip->status < 200 || gzip->status >= 300 ||
+            !gzip->body_complete || !gzip->body_framing_valid ||
+            gzip->body_encoding != 1 || !gzip->body_bytes ||
+            !gzip->rx_tls_wire_bytes || gzip->rx_tls_record_missing ||
+            gzip->rx_tls_wire_bytes >= a->rx_tls_wire_bytes ||
+            gzip->rx_tls_wire_bytes >= b->rx_tls_wire_bytes) return 0;
+        uint64_t lo = a->rx_tls_wire_bytes < b->rx_tls_wire_bytes
+            ? a->rx_tls_wire_bytes : b->rx_tls_wire_bytes;
+        uint64_t hi = a->rx_tls_wire_bytes > b->rx_tls_wire_bytes
+            ? a->rx_tls_wire_bytes : b->rx_tls_wire_bytes;
+        if (hi - lo > (uint64_t)D2K_VOLUME_SLACK * 1024) return 0;
+        out->rx_cut = 1; out->rx_wire_basis = 1;
+        uint64_t kb = (lo + (hi - lo) / 2) / 1024;
+        out->rx_at_kb = kb > INT_MAX ? INT_MAX : (int)kb;
+        out->rx_expected_kb = 0; out->rx_compressed_complete = 1;
+        unsigned pa = a->data_packets, pb = b->data_packets;
+        unsigned pk = pa && pb ? (pa < pb ? pa : pb) : (pa ? pa : pb);
+        out->rx_cut_packets = pk > INT_MAX ? INT_MAX : (int)pk;
+        snprintf(out->reason, sizeof out->reason,
+            "TLS RX дважды оборвался внутри записи около %d КБ; меньший gzip завершился",
+            out->rx_at_kb);
+        return 1;
+    }
     if (a->status < 200 || a->status >= 300 || b->status < 200 || b->status >= 300 ||
         a->body_complete || b->body_complete || a->body_encoding != 0 ||
         !a->body_framing_valid || !b->body_framing_valid ||
@@ -99,7 +138,7 @@ int d2k_volume_rx_evidence(const d2k_ver_result *a,
         packet_budget = 1;
     }
 
-    out->rx_cut = 1;
+    out->rx_cut = 1; out->rx_wire_basis = 0;
     uint64_t midpoint = (a->body_bytes < b->body_bytes ? a->body_bytes : b->body_bytes)
                       + delta / 2;
     uint64_t cut_kb = midpoint / 1024;
@@ -316,29 +355,31 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
         res->n_resources = a.n_resources;
     }
     snprintf(res->rx_reason, sizeof res->rx_reason,
-             "identity-1 HTTP %d, тело %llu/%llu, complete=%d: %.90s",
+             "identity-1 HTTP %d, тело %llu/%llu, complete=%d, TLS=%04x wire=%llu missing=%u: %.60s",
              a.status, (unsigned long long)a.body_bytes,
-             (unsigned long long)a.body_expected, a.body_complete, a.reason);
-    if (a.status < 200 || a.status >= 300 || a.body_complete || !a.body_framing_valid ||
-        (!a.body_has_length && !a.body_chunked) || a.body_encoding != 0 ||
-        a.body_bytes < (uint64_t)D2K_VOL_MIN_KB * 1024 ||
-        (a.body_has_length && a.body_expected <= a.body_bytes)) {
+             (unsigned long long)a.body_expected, a.body_complete, a.negotiated_tls,
+             (unsigned long long)a.rx_tls_wire_bytes, a.rx_tls_record_missing, a.reason);
+    if (!d2k_volume_rx_partial(&a)) {
         d2k_verify_close(&a);
         return;
     }
-    res->rx_partial_bytes = a.body_bytes;
+    if (rx_wire_partial(&a)) res->rx_partial_wire_bytes = a.rx_tls_wire_bytes;
+    else res->rx_partial_bytes = a.body_bytes;
     nap_ms(RESPONSE_PROBE_GAP_MS);
     d2k_ver_result b = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
                                                   hello_wire, tls12, 0, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
-             "identity-1 partial=%llu/%llu; identity-2 HTTP %d, body=%llu/%llu, complete=%d: %.100s",
+             "identity-1 partial=%llu/%llu TLS=%04x wire=%llu missing=%u; "
+             "identity-2 HTTP %d body=%llu complete=%d TLS=%04x wire=%llu missing=%u: %.40s",
              (unsigned long long)a.body_bytes, (unsigned long long)a.body_expected,
-             b.status, (unsigned long long)b.body_bytes,
-             (unsigned long long)b.body_expected, b.body_complete, b.reason);
-    if (b.status < 200 || b.status >= 300 || b.body_complete || !b.body_framing_valid ||
-        b.body_has_length != a.body_has_length || b.body_chunked != a.body_chunked ||
-        b.body_encoding != 0 || b.body_bytes < (uint64_t)D2K_VOL_MIN_KB * 1024 ||
-        (b.body_has_length && b.body_expected <= b.body_bytes)) {
+             a.negotiated_tls, (unsigned long long)a.rx_tls_wire_bytes, a.rx_tls_record_missing,
+             b.status, (unsigned long long)b.body_bytes, b.body_complete,
+             b.negotiated_tls, (unsigned long long)b.rx_tls_wire_bytes, b.rx_tls_record_missing,
+             b.reason);
+    if (!d2k_volume_rx_partial(&b) || rx_wire_partial(&a) != rx_wire_partial(&b) ||
+        (rx_wire_partial(&a) && a.negotiated_tls != b.negotiated_tls) ||
+        (!rx_wire_partial(&a) && (b.body_has_length != a.body_has_length ||
+                                  b.body_chunked != a.body_chunked))) {
         d2k_verify_close(&a);
         d2k_verify_close(&b);
         return;
@@ -348,11 +389,13 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
                                                    hello_wire, tls12, 1, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity %llu/%llu (пакетов %u/%u); gzip HTTP %d, тело %llu, complete=%d, "
-             "encoding=%d, пакетов %u",
+             "encoding=%d, пакетов %u; TLS RX wire=%llu/%llu/%llu missing=%u/%u/%u",
              (unsigned long long)a.body_bytes, (unsigned long long)b.body_bytes,
              a.data_packets, b.data_packets,
              gz.status, (unsigned long long)gz.body_bytes, gz.body_complete, gz.body_encoding,
-             gz.data_packets);
+             gz.data_packets, (unsigned long long)a.rx_tls_wire_bytes,
+             (unsigned long long)b.rx_tls_wire_bytes, (unsigned long long)gz.rx_tls_wire_bytes,
+             a.rx_tls_record_missing, b.rx_tls_record_missing, gz.rx_tls_record_missing);
     (void)d2k_volume_rx_evidence(&a, &b, &gz, res);
     d2k_verify_close(&a);
     d2k_verify_close(&b);

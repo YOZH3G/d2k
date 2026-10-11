@@ -212,12 +212,12 @@ static int vol_calls;
 static volatile int vol_hold, vol_entered;
 static size_t vol_last_wire;
 static d2k_vol_verdict vol_answer = D2K_VOL_PASSED;
-static int vol_rx_cut;
+static int vol_rx_cut, vol_rx_wire_basis;
 static int vol_at_kb = 20;
 static int vol_rx_at_kb = 24;
 static int vol_rx_tls_unavailable;
 static int vol_direct_complete;
-static uint64_t vol_partial_bytes;
+static uint64_t vol_partial_bytes, vol_partial_wire_bytes;
 static int resource_fixture;
 static int resource_volume_calls, resource_verify_calls;
 
@@ -238,10 +238,11 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     memset(&r, 0, sizeof r);
     r.verdict = vol_answer;
     r.at_kb = vol_at_kb;
-    r.rx_cut = vol_rx_cut;
+    r.rx_cut = vol_rx_cut; r.rx_wire_basis = vol_rx_wire_basis;
     r.rx_tls_unavailable = vol_rx_tls_unavailable;
     r.rx_direct_complete = vol_direct_complete;
     r.rx_partial_bytes = vol_partial_bytes;
+    r.rx_partial_wire_bytes = vol_partial_wire_bytes;
     r.rx_at_kb = vol_rx_at_kb;
     r.rx_cut_packets = vol_rx_cut ? vol_rx_packets : 0;
     r.rx_expected_kb = 96;
@@ -8755,11 +8756,12 @@ lifecycle_test:
 rx_volume_tests:
     /* Field j: a framed 23KB partial followed by an unavailable repeat is
        inconclusive, never proof that the target works without its plan. */
-    {
+    for (int opaque = 0; opaque < 2; opaque++) {
         d2k_catalog c = {0};
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
-        vol_partial_bytes = 23900; vol_rx_cut = 0; vol_answer = D2K_VOL_UNREACHABLE;
+        vol_partial_bytes = opaque ? 0 : 23900;
+        vol_partial_wire_bytes = opaque ? 14005 : 0; vol_rx_cut = 0; vol_answer = D2K_VOL_UNREACHABLE;
         tcp_answer = D2K_V_CLEAR; tcp_calls = 0;
         d2k_ev h = ev_hello(6, 40379, "partial-rx.example");
         d2k_sched_event(s, &h);
@@ -8769,7 +8771,7 @@ rx_volume_tests:
               "unpaired RX cut must not invent a bypass");
         CHECK(!said("напрямую проходит") && said("результат неубедителен"),
               "partial RX body was incorrectly classified as direct success");
-        vol_partial_bytes = 0; vol_answer = D2K_VOL_PASSED;
+        vol_partial_bytes = vol_partial_wire_bytes = 0; vol_answer = D2K_VOL_PASSED;
         d2k_sched_free(s); d2k_catalog_free(&c);
     }
     if (partial_only) goto voice_only_done;
@@ -9060,7 +9062,8 @@ rx_volume_tests:
     /* Парный RX-замер тоже поднимает поиск без доменного списка и сохраняет
        направление/объём как отдельную примету; gzip completion — часть
        критерия, не просто статус заголовков. */
-    {
+    for (int wire_basis = 0; wire_basis < 2; wire_basis++) {
+        vol_rx_wire_basis = wire_basis;
         d2k_catalog cRx = {0};
         net_name_known(&cRx, "hcaptcha.com");
         d2k_sched *s = d2k_sched_new(&cRx, sv[0], 0x2d);
@@ -9084,14 +9087,14 @@ rx_volume_tests:
         d2k_sched_event(s, &su);
         settle(s);
         CHECK(tcp_calls == 1, "RX-обрыв измерен без предшествующей донорской классификации");
-        CHECK(said("identity-тело дважды оборвалось") && said("gzip завершился"),
+        CHECK(wire_basis || (said("identity-тело дважды оборвалось") && said("gzip завершился")),
               "причина RX-volume не раскрыла парный результат");
         CHECK(sent_contains_plan_payload("hcaptcha.com"),
               "RX-volume не приоритизировал fake-SNI/multisplit-кандидат");
         if (!sent_contains_plan_payload("hcaptcha.com")) { fprintf(stderr, "%s\n", saidbuf); }
         CHECK(ver_calls >= 1 && ver_budget_seen[0] == 26,
               "задача 55: кандидат испытан не с бюджетом из замера коробки (пакеты на обрыве identity)");
-        vol_rx_cut = 0; vol_rx_packets = 0;
+        vol_rx_cut = 0; vol_rx_packets = 0; vol_rx_wire_basis = 0;
         tcp_answer = rx_tcp_was;
         d2k_sched_free(s);
         d2k_catalog_free(&cRx);

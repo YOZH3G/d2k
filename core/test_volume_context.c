@@ -7,7 +7,7 @@ static int expected_legacy;
 static const char *expected_path;
 static size_t expected_wire;
 static int mark_calls;
-static int repeat_missing;
+static int repeat_missing, opaque_reply;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "volume-context:%d: %s\n", __LINE__, #c); failures++; } } while (0)
 
 static int mark_ok(int fd, uint32_t mark) {
@@ -55,6 +55,19 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
     if (encoding) {
         r.body_bytes = r.body_expected = 18000;
         r.body_complete = 1; r.body_encoding = 1;
+    }
+    if (opaque_reply) {
+        if (!encoding) {
+            memset(&r, 0, sizeof r); r.fd = -1;
+            r.level = D2K_VER_HANDSHAKE; r.name_ok = 1;
+            r.negotiated_tls = expected_legacy ? 0x0303 : 0x0304;
+            r.rx_tls_wire_bytes = 14005 + baseline_calls * 20;
+            r.rx_tls_record_missing = 2384 - baseline_calls * 20;
+        } else {
+            r.level = D2K_VER_APPLICATION; r.name_ok = 1;
+            r.negotiated_tls = expected_legacy ? 0x0303 : 0x0304;
+            r.body_expected = r.body_bytes = 4000; r.rx_tls_wire_bytes = 4500;
+        }
     }
     if (repeat_missing && baseline_calls == 1) {
         memset(&r, 0, sizeof r); r.fd = -1;
@@ -115,6 +128,15 @@ int main(void) {
     CHECK(!partial.rx_cut && !partial.rx_direct_complete && baseline_calls == 2);
     CHECK(partial.rx_partial_bytes == 23900);
     CHECK(strstr(partial.rx_reason, "23900") && strstr(partial.rx_reason, "identity-2"));
+    repeat_missing = 0; opaque_reply = 1;
+    for (int legacy = 0; legacy < 2; legacy++) {
+        expected_legacy = legacy; baseline_calls = 0;
+        d2k_vol_result wire = {0};
+        probe_response_volume(&wire, "127.0.0.1", 443, "context.test", legacy, 1536, 0x2f, NULL);
+        CHECK(baseline_calls == 3 && wire.rx_cut && wire.rx_wire_basis);
+        CHECK(!wire.rx_partial_bytes && wire.rx_partial_wire_bytes == 14005);
+        CHECK(strstr(wire.rx_reason, "14005/14025/4500") != NULL);
+    }
     if (failures) return 1;
     puts("test_volume_context: OK"); return 0;
 }

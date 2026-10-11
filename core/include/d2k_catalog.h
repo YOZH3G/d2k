@@ -77,7 +77,7 @@ typedef struct {
     uint8_t  tos;
     uint16_t ipid;
     char     kind[24];
-    int      volume;      /* килобайты, для kind=="volume" и "rx-volume" */
+    int      volume;      /* KiB for volume / rx-volume (body) / rx-volume-wire (TLS) */
     int      seen;        /* сколько раз примета встречена */
     /* Для "rx-volume": пакеты с данными обеих сторон на обрыве identity —
        бюджет потока коробки (задача 55). 0 — не посчитаны; в файл пишется
@@ -444,8 +444,8 @@ void d2k_catalog_free(d2k_catalog *c);
  *
  * Согласие по улике (по kind):
  *
- *   - kind == "volume" или "rx-volume": сравнивается только volume, в
- *     пределах D2K_VOLUME_SLACK. TX и RX хранятся разными видами сигнала:
+ *   - kind == "volume", "rx-volume" или "rx-volume-wire": volume сравнивается в
+ *     пределах D2K_VOLUME_SLACK. TX, RX body и RX TLS wire — разные виды сигнала:
  *     направление — часть измеренного поведения, их нельзя склеивать.
  *   - любой другой kind (в реальных данных на 2026-09-07 это "rst",
  *     "repeat", "silent"): ttl сравнивается в пределах D2K_TTL_SLACK, а

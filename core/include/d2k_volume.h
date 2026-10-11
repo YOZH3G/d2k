@@ -6,7 +6,10 @@
  * Content-Length/chunked framing обрываются на близком объёме, а контроль,
  * действительно полученный в gzip, завершается — либо (пакетный бюджет,
  * поле 04.10) gzip обрывается тоже, но на том же числе пакетов с данными.
- * Приметы tx-volume и rx-volume хранятся отдельно; действие из одной пробы не
+ * До HTTP-заголовков отдельно мерится незавершённая TLS-запись: два HTTP0
+ * с одинаковой согласованной версией, близким RX wire объёмом и меньшим
+ * полным gzip дают rx-volume-wire. Ciphertext и HTTP-body не смешиваются.
+ * Приметы tx-volume, rx-volume и rx-volume-wire хранятся отдельно; действие из одной пробы не
  * объявляется лечением другой, пока кандидат не подтвердит собственный зонд.
  *
  * ПОЧЕМУ ПРОБА, А НЕ НАБЛЮДЕНИЕ ЗА ЧУЖИМ ТРАФИКОМ. Наблюдение отвечает на
@@ -65,8 +68,9 @@ typedef enum {
 typedef struct {
     d2k_vol_verdict verdict;
     int      at_kb;       /* накопленный объём, на котором всё кончилось */
-    int      rx_cut;      /* пара identity/gzip доказала повторяемый обрыв тела ответа */
-    int      rx_at_kb;    /* входящее тело оборвалось около этого объёма */
+    int      rx_cut;      /* paired identity/gzip response cut, domain given by rx_wire_basis */
+    int      rx_at_kb;    /* body bytes, or TLS wire bytes iff rx_wire_basis */
+    int      rx_wire_basis; /* distinct rx-volume-wire signal, never compared to body size */
     int      rx_expected_kb; /* Content-Length, если известен */
     /* Пакеты с данными обеих сторон на обрыве identity (TCP_INFO) — бюджет
        потока коробки (задача 55); 0 — не посчитаны. */
@@ -78,6 +82,7 @@ typedef struct {
     int      rx_tls_unavailable; /* прямой GET не дошёл до TLS; RX-тела ещё не измерить */
     int      rx_direct_complete; /* identity response fully received with matching certificate */
     uint64_t rx_partial_bytes; /* first framed partial RX body; not a paired verdict */
+    uint64_t rx_partial_wire_bytes; /* first incomplete TLS record progress; separate domain */
     d2k_resource resources[D2K_RESOURCE_COUNT];
     size_t n_resources;
 } d2k_vol_result;

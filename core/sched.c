@@ -1504,10 +1504,14 @@ static d2k_cat_signal signal_of(const d2k_ev *ev) {
 /* Добавляет примету к отпечатку, схлопывая совпавшие. Допуск по TTL тот же,
    что в каталоге (D2K_TTL_SLACK): иначе задача накопит приметы, которые
    каталог потом сочтёт одной. Порт addSignal (controller.go). */
+static int is_rx_volume_kind(const char *kind) {
+    return !strcmp(kind, "rx-volume") || !strcmp(kind, "rx-volume-wire");
+}
+
 static void fp_add(d2k_cat_fp *fp, const d2k_cat_signal *sig) {
     for (size_t i = 0; i < fp->n_sig; i++) {
         d2k_cat_signal *x = &fp->sig[i];
-        if ((strcmp(x->kind, "volume") == 0 || strcmp(x->kind, "rx-volume") == 0) &&
+        if ((strcmp(x->kind, "volume") == 0 || is_rx_volume_kind(x->kind)) &&
             strcmp(x->kind, sig->kind) == 0) {
             int d = x->volume - sig->volume;
             if (d < 0) { d = -d; }
@@ -1555,7 +1559,7 @@ static int volume_bucket(int kb) {
 }
 
 static int is_volume_kind(const char *kind) {
-    return strcmp(kind, "volume") == 0 || strcmp(kind, "rx-volume") == 0;
+    return strcmp(kind, "volume") == 0 || is_rx_volume_kind(kind);
 }
 
 /* Совпадает ли у коробки корзина порога хоть по одной объёмной примете
@@ -1840,7 +1844,7 @@ typedef char d2k_stall_field_is_verify_field
 /* Измеренный бюджет потока коробки (rx-volume, задача 55) — 0, если нет. */
 static int box_stall_budget(const d2k_cat_box *b) {
     for (size_t i = 0; i < b->fp.n_sig; i++) {
-        if (!strcmp(b->fp.sig[i].kind, "rx-volume") && b->fp.sig[i].packets > 0 &&
+        if (is_rx_volume_kind(b->fp.sig[i].kind) && b->fp.sig[i].packets > 0 &&
             b->fp.sig[i].packets <= 0xffff) {
             return b->fp.sig[i].packets;
         }
@@ -2216,7 +2220,7 @@ static int worker_volume_cut(d2k_sched *s, task *t) {
     pthread_mutex_lock(&s->mu);
     memset(&t->res, 0, sizeof t->res);
     t->res.verdict = D2K_V_INCONCLUSIVE;
-    if (t->vol.rx_cut && !t->vol.rx_compressed_complete) {
+    if (t->vol.rx_cut && (!t->vol.rx_compressed_complete || t->vol.rx_wire_basis)) {
         /* Пакетный бюджет (поле 04.10, rua.gr): gzip оборван тоже, на том же
            числе пакетов — причину пишет сама проба. */
         snprintf(t->res.reason, sizeof t->res.reason, "%s", t->vol.reason);
@@ -2753,7 +2757,7 @@ static int quic_split_unfit(const d2k_sched *s, const task *t) {
    25 пакетов в 18 из 18 оборванных потоков (task-55-facts.md §1.2). */
 static unsigned task_budget(const d2k_sched *s, task *t) {
     for (size_t i = 0; i < t->fp.n_sig; i++) {
-        if (!strcmp(t->fp.sig[i].kind, "rx-volume") && t->fp.sig[i].packets > 0) {
+        if (is_rx_volume_kind(t->fp.sig[i].kind) && t->fp.sig[i].packets > 0) {
             snprintf(t->budget_src, sizeof t->budget_src, "замер этой цели (обрыв identity)");
             return t->budget_pk = (unsigned)t->fp.sig[i].packets;
         }
@@ -2766,7 +2770,7 @@ static unsigned task_budget(const d2k_sched *s, task *t) {
         const d2k_cat_box *b = &s->cat->boxes[bi];
         if (strcmp(b->id, t->box_id)) continue;
         for (size_t i = 0; i < b->fp.n_sig; i++) {
-            if (!strcmp(b->fp.sig[i].kind, "rx-volume") && b->fp.sig[i].packets > 0) {
+            if (is_rx_volume_kind(b->fp.sig[i].kind) && b->fp.sig[i].packets > 0) {
                 snprintf(t->budget_src, sizeof t->budget_src, "замер коробки %.40s", b->id);
                 return t->budget_pk = (unsigned)b->fp.sig[i].packets;
             }
@@ -2893,12 +2897,12 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
            в узнавание и имя коробки не входит, поэтому последний посчитанный
            замер обрыва identity той же корзины обновляет его и у заведённой. */
         for (size_t i = 0; i < fp->n_sig; i++) {
-            if (strcmp(fp->sig[i].kind, "rx-volume") || fp->sig[i].packets <= 0) continue;
+            if (!is_rx_volume_kind(fp->sig[i].kind) || fp->sig[i].packets <= 0) continue;
             for (size_t k = 0; k < b->fp.n_sig; k++) {
                 d2k_cat_signal *x = &b->fp.sig[k];
                 int d = x->volume - fp->sig[i].volume;
                 if (d < 0) d = -d;
-                if (!strcmp(x->kind, "rx-volume") && d <= D2K_VOLUME_SLACK &&
+                if (!strcmp(x->kind, fp->sig[i].kind) && d <= D2K_VOLUME_SLACK &&
                     x->packets != fp->sig[i].packets) {
                     x->packets = fp->sig[i].packets;
                     c->revision++;
@@ -4628,7 +4632,8 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
         if (t->vol.rx_cut) {
             d2k_cat_signal sig;
             memset(&sig, 0, sizeof sig);
-            snprintf(sig.kind, sizeof sig.kind, "rx-volume");
+            snprintf(sig.kind, sizeof sig.kind, "%s",
+                     t->vol.rx_wire_basis ? "rx-volume-wire" : "rx-volume");
             sig.volume = t->vol.rx_at_kb;
             sig.packets = t->vol.rx_cut_packets; /* бюджет потока коробки (задача 55) */
             sig.seen = 1;
@@ -4866,6 +4871,8 @@ static void signal_human(const d2k_cat_signal *sig, char *out, size_t cap) {
         snprintf(out, cap, "обрыв по объёму около %d КБ", sig->volume);
     } else if (strcmp(sig->kind, "rx-volume") == 0) {
         snprintf(out, cap, "identity-ответ стабильно оборвался около %d КБ", sig->volume);
+    } else if (strcmp(sig->kind, "rx-volume-wire") == 0) {
+        snprintf(out, cap, "TLS-запись дважды оборвалась около %d КБ RX; меньший gzip дошёл", sig->volume);
     } else if (strcmp(sig->kind, "silent") == 0) {
         snprintf(out, cap, "ответа на приветствие не было");
     } else if (strcmp(sig->kind, "repeat") == 0) {
@@ -8985,11 +8992,14 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             /* A passing ClientHello says nothing about the framed response
              * that was already cut in this same measurement. An unavailable
              * repeat is not a paired volume verdict, nor a direct success. */
-            if (r.verdict == D2K_V_CLEAR && t->vol.rx_partial_bytes && !volume_proven) {
+            if (r.verdict == D2K_V_CLEAR &&
+                (t->vol.rx_partial_bytes || t->vol.rx_partial_wire_bytes) && !volume_proven) {
                 r.verdict = D2K_V_INCONCLUSIVE;
                 snprintf(r.reason, sizeof r.reason,
-                    "RX-тело оборвалось после %llu байт; повторный объёмный замер не завершён",
-                    (unsigned long long)t->vol.rx_partial_bytes);
+                    "RX %s оборвался после %llu байт; повторный объёмный замер не завершён",
+                    t->vol.rx_partial_wire_bytes ? "TLS wire" : "HTTP body",
+                    (unsigned long long)(t->vol.rx_partial_wire_bytes
+                        ? t->vol.rx_partial_wire_bytes : t->vol.rx_partial_bytes));
             }
             if (!verdict_proves_block(r.verdict) && !volume_proven && !t->ech_trial) {
                 say(s, "по %s прямой замер не подтвердил блокировку (%s: %s) — "

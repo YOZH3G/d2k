@@ -146,6 +146,41 @@ int main(void) {
     CHECK(!d2k_volume_rx_evidence(&a, &b, &gz, &out) && !out.rx_cut,
           "несжатый «контроль» принят за пакетную примету");
 
+    /* A complete TLS handshake can be followed by 14 KiB of an unfinished
+       encrypted record: HTTP status/body remain zero, not the RX progress.
+       Two such cuts need a genuinely shorter, complete gzip control. */
+    a = (d2k_ver_result){0};
+    a.level = D2K_VER_HANDSHAKE; a.name_ok = 1; a.negotiated_tls = 0x0304;
+    a.rx_tls_wire_bytes = 14005; a.rx_tls_record_missing = 2384;
+    b = a; b.rx_tls_wire_bytes = 14105; b.rx_tls_record_missing = 2284;
+    gz = identity_cut(4000, 4000, 1, 0);
+    gz.level = D2K_VER_APPLICATION; gz.name_ok = 1; gz.negotiated_tls = 0x0304;
+    gz.body_complete = 1; gz.body_encoding = 1; gz.rx_tls_wire_bytes = 4500;
+    CHECK(d2k_volume_rx_partial(&a), "partial TLS ciphertext lost before HTTP headers");
+    memset(&out, 0, sizeof out);
+    CHECK(d2k_volume_rx_evidence(&a, &b, &gz, &out) && out.rx_cut &&
+          out.rx_at_kb == 13 && out.rx_wire_basis && strstr(out.reason, "TLS"),
+          "repeat incomplete TLS record + shorter full gzip not recognized");
+    b.negotiated_tls = 0x0303;
+    CHECK(!d2k_volume_rx_evidence(&a, &b, &gz, &out), "TLS versions mixed in wire evidence");
+    b.negotiated_tls = a.negotiated_tls;
+    b.rx_tls_record_missing = 0;
+    CHECK(!d2k_volume_rx_evidence(&a, &b, &gz, &out),
+          "full bad-tag record mistaken for a wire cut");
+    b = a; b.rx_tls_wire_bytes = 24005;
+    CHECK(!d2k_volume_rx_evidence(&a, &b, &gz, &out), "different wire cuts merged");
+    b = a; gz.rx_tls_wire_bytes = 15000;
+    CHECK(!d2k_volume_rx_evidence(&a, &b, &gz, &out), "larger control proves byte cutoff");
+    gz.rx_tls_wire_bytes = 4500; gz.body_complete = 0;
+    CHECK(!d2k_volume_rx_evidence(&a, &b, &gz, &out), "incomplete opaque control accepted");
+    gz.body_complete = 1; a.level = D2K_VER_TRANSPORT;
+    CHECK(!d2k_volume_rx_partial(&a) && !d2k_volume_rx_evidence(&a, &b, &gz, &out),
+          "handshake failure counted as application RX cut");
+    a.level = D2K_VER_HANDSHAKE; a.local_limit = 1;
+    CHECK(!d2k_volume_rx_partial(&a), "local limit counted as path evidence");
+    a.local_limit = 0; a.rx_tls_wire_bytes = 1000;
+    CHECK(!d2k_volume_rx_partial(&a), "small partial record counted as volume cut");
+
     if (fails) {
         printf("test_volume: %d failure(s)\n", fails);
         return 1;
