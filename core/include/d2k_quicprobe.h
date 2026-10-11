@@ -390,7 +390,8 @@ typedef enum {
     D2K_QA_FRAG,      /* потребовалась IP-фрагментация (см. reason) */
     D2K_QA_NOT_FOUND, /* честный отрицательный результат — см. reason (бюджет/пул/каталог) */
     D2K_QA_FLAKY,     /* измерению верить нельзя — расхождение повторов, см. reason */
-    D2K_QA_SPLIT      /* задача 40: ClientHello двумя кадрами CRYPTO (quicsplit 1) */
+    D2K_QA_SPLIT,     /* задача 40: ClientHello двумя кадрами CRYPTO (quicsplit 1) */
+    D2K_QA_UDPLEN     /* measured trailing UDP bytes, Initial packet unchanged */
 } d2k_quic_arm_kind;
 
 /* Чем собран результат подбора (задача 40, d2k_quic_strategy_arms). */
@@ -401,7 +402,8 @@ typedef enum {
     D2K_QS_LADDER,     /* ответа нет — запасной перебор askArms */
     D2K_QS_FAKE_SPLIT, /* partial fake response, then measured fake x CRYPTO split */
     D2K_QS_TTL_LIFETIME, /* limited-hop decoy changes post-handshake progress */
-    D2K_QS_FRAG        /* оба ответа «нет», IP-фрагментация (вопрос замера) прошла */
+    D2K_QS_FRAG,       /* оба ответа «нет», IP-фрагментация (вопрос замера) прошла */
+    D2K_QS_LENGTH
 } d2k_quic_strategy;
 
 /* ЧЕСТНЫЙ ЗАМЕР ПЛЕЧА (задача 39). Вопрос оригинала — «ответил ли сервер на
@@ -556,8 +558,8 @@ static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge3(int handshake, 
  * fakes + 2 candidates x 2 copy counts + 4 TTLs + fragment survival + 4
  * fragment shapes = 18 questions. The Run budget is derived from it. */
 #define D2K_QUIC_ARM_QUESTIONS_MAX 18u
-/* 18 резервных вопросов плюс до 7 опросов стратегии, включая произведение. */
-#define D2K_QUIC_ARM_STEPS 26
+/* 18 резервных вопросов плюс до 9 опросов стратегии, включая произведение. */
+#define D2K_QUIC_ARM_STEPS 28
 typedef struct {
     char label[192];
     char addr[D2K_QUIC_ADDR_LEN];
@@ -585,6 +587,7 @@ typedef struct {
     int               frag_kind; /* original fragment plan, separately from fake */
     int               ttl;     /* original: independent of copies */
     int               copies;  /* original compose defaults to 2 */
+    unsigned          udplen;  /* independent length question, no fake/split product */
     int               probes;  /* сколько опытов всего стоил подбор (та же честность, что r.probes у d2k_vres) */
     d2k_quic_arm_step  trace[D2K_QUIC_ARM_STEPS];
     size_t            n_trace;
@@ -609,11 +612,13 @@ typedef struct {
        результата. */
     int8_t            clearance;
     int8_t            split_crypto;
+    int8_t            longer;
     /* Вопрос задан (дошёл до провода хотя бы раз) — с любым исходом.
        Заданный до предела повторов вопрос в этом поиске второй раз не
        задаётся ни перебором, ни вопросником (круг 1). */
     int8_t            clearance_asked;
     int8_t            split_asked;
+    int8_t            longer_asked;
     d2k_quic_strategy strategy;
     /* ВХОД (финальное ревью core, I1): разрез CRYPTO этому клиенту
        неприменим — его ClientHello шире одной датаграммы (снимок клиента был

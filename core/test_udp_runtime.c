@@ -172,7 +172,8 @@ static d2k_tally oracle(const d2k_quic_arm_question *q,void *u,int *sent_out){
     if(strategy_mode){
         yes=(strategy_mode==1 && q->benign) || (strategy_mode==2 && q->split && !q->blob_len) ||
             (strategy_mode==3 && q->ttl==3 && q->copies==2) ||
-            (strategy_mode==4 && q->split && q->blob_len && q->copies==11);
+            (strategy_mode==4 && q->split && q->blob_len && q->copies==11) ||
+            (strategy_mode==5 && q->udplen==D2K_QUIC_LENGTH_INCREMENT);
         if(strategy_mode==4 && !q->split && q->copies==11 && q->blob_len==620){t.pass=2;t.fail=1;}
     }
     if(yes){t.pass=3;t.fail=0;if(!q->control)winner=*q;}return t;
@@ -202,7 +203,7 @@ int main(int argc,char **argv){
         gate(qtext,rtext,initial,len,chosen_frag,0);
         gate(qtext,rtext,longer,longer_len,chosen_frag,0);
     }
-    for(strategy_mode=1;strategy_mode<=4;strategy_mode++){
+    for(strategy_mode=1;strategy_mode<=5;strategy_mode++){
         d2k_quic_arm_context c={0};c.pool=pool;c.n_pool=1;c.marked=1;c.probe=oracle;c.data=data;
         c.need_complete=strategy_mode==3;c.budget_pk=strategy_mode==3?50:0;
         d2k_quic_arm a=d2k_quic_strategy_arms(&c);char qtext[16384],rtext[16384];
@@ -211,7 +212,7 @@ int main(int argc,char **argv){
         CHECK(!d2k_quic_compose_plan(&a,&p,rtext,sizeof rtext));
         gate(qtext,rtext,initial,len,0,0);gate(qtext,rtext,longer,longer_len,0,0);
     }
-    strategy_mode=5;
+    strategy_mode=6;
     d2k_quic_arm_context all_no={0};all_no.pool=pool;all_no.n_pool=1;all_no.marked=1;
     all_no.probe=oracle;all_no.data=data;all_no.need_complete=1;all_no.budget_pk=50;
     d2k_quic_arm negative=d2k_quic_strategy_arms(&all_no);

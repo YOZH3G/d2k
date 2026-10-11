@@ -45,12 +45,12 @@ static int append_hex(char *buf, size_t cap, size_t *pos,
  * another measured question; the compiler never invents their product. */
 #define QUIC_JUNK_LEN 16u
 #define QUIC_JUNK_REPEATS 1u
-#define QUIC_UDPLEN_INCREMENT 100u
+#define QUIC_UDPLEN_INCREMENT D2K_QUIC_LENGTH_INCREMENT
 
 static int quic_arm_found(const d2k_quic_arm *a) {
     return a && (a->kind == D2K_QA_BLOB || a->kind == D2K_QA_COPIES ||
                  a->kind == D2K_QA_TTL || a->kind == D2K_QA_FRAG ||
-                 a->kind == D2K_QA_SPLIT);
+                 a->kind == D2K_QA_SPLIT || a->kind == D2K_QA_UDPLEN);
 }
 
 /* Задача 40: разрез ClientHello на два кадра CRYPTO внутри того же Initial —
@@ -173,6 +173,12 @@ static int quic_plan_text(const d2k_quic_arm *arm, const uint8_t *blob, size_t b
 int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
                       char *buf, size_t cap) {
     if (!arm || !arm->original || !buf || cap == 0 || !quic_arm_found(arm)) { return -1; }
+    if(arm->kind==D2K_QA_UDPLEN) {
+        if(arm->udplen!=D2K_QUIC_LENGTH_INCREMENT || arm->len || blen ||
+           arm->ttl || arm->frag_kind || arm->copies)return -1;
+        return quic_plan_text(NULL,NULL,0,0,arm->udplen,buf,cap);
+    }
+    if(arm->udplen)return -1;
     if (arm->kind == D2K_QA_SPLIT && !arm->len) {
         return arm->original && !blen ? quic_split_plan_text(buf, cap) : -1;
     }
@@ -182,6 +188,7 @@ int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
 int d2k_quic_compose_plan(const d2k_quic_arm *arm, const d2k_quic_props *p,
                           char *buf, size_t cap) {
     if (!p || !buf || cap == 0) { return -1; }
+    if(arm && arm->udplen && arm->kind!=D2K_QA_UDPLEN)return -1;
     /* Метки опытов не подтверждены — верить нельзя ни плечу, ни свойствам
        того же прогона. */
     if (arm && arm->kind == D2K_QA_FLAKY) { return -1; }
@@ -241,6 +248,12 @@ int d2k_quic_question_plan(const d2k_quic_arm_question *q,char *text,size_t cap)
     if(!q || !text || !cap || q->blob_len>sizeof ((d2k_quic_arm *)0)->bytes ||
        (q->blob_len && !q->blob) || q->copies<0 || q->copies>255 ||
        q->ttl<0 || q->ttl>255 || (q->frag && (q->split || q->blob_len)))return -1;
+    if(q->udplen) {
+        if(q->udplen!=D2K_QUIC_LENGTH_INCREMENT || q->blob_len || q->split ||
+           q->ttl || q->frag || q->control || q->benign || q->copies>1)return -1;
+        d2k_quic_arm a={0};a.original=1;a.kind=D2K_QA_UDPLEN;a.udplen=q->udplen;
+        return d2k_quic_arm_plan(&a,NULL,0,text,cap);
+    }
     if(!q->blob_len && !q->split && !q->frag && !q->ttl)
         return snprintf(text,cap,"d2k-plan 1 1\nid 00000000000000000000000000000000\nproto udp quic\norder forward\n")>=(int)cap?-1:0;
     d2k_quic_arm a;memset(&a,0,sizeof a);a.original=1;

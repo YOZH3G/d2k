@@ -224,6 +224,7 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
     d2k_quic_arm r; memset(&r,0,sizeof r);
     r.kind=D2K_QA_NOT_FOUND; r.original=1; r.strategy=D2K_QS_NONE;
     r.clearance=D2K_PROP_UNKNOWN; r.split_crypto=D2K_PROP_UNKNOWN;
+    r.longer=D2K_PROP_UNKNOWN;
 
     int8_t ttl_asked=0;
     int8_t ttl_answer=D2K_PROP_UNKNOWN;
@@ -276,6 +277,19 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
                      "разрез ClientHello на два кадра CRYPTO проходит (остаточное разрешение: %s)",
                      prop_word(r.clearance));
         } else {
+            /* Length is an independent one-datagram question, not a fake
+               product. It used to run only after the entire fallback ladder
+               and without the data-stage criterion. */
+            d2k_quic_arm_question length={.udplen=D2K_QUIC_LENGTH_INCREMENT};
+            r.longer=strategy_ask(c,&r,&length,
+                "длина UDP: 100 нулевых байт после неизменённого Initial",&r.longer_asked);
+            if(r.longer==D2K_PROP_YES) {
+                r.kind=c->marked?D2K_QA_UDPLEN:D2K_QA_FLAKY;
+                r.strategy=D2K_QS_LENGTH;r.udplen=length.udplen;r.incomplete=0;
+                snprintf(r.reason,sizeof r.reason,
+                    "удлинение UDP на 100 байт: фильтр 3/3 и тот же этап данных прошли");
+                return r;
+            }
             /* Оба «нет» — вопросы IP-фрагментации задаются (круг 1); форма,
                что прошла, и есть план. Не прошла ни одна — перебор приманок
                askArms. Прежде (задача 40) он здесь не запускался: «нет» на
@@ -288,10 +302,13 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
                фальшивом Initial. */
             int both_no=r.clearance==D2K_PROP_NO && (r.split_crypto==D2K_PROP_NO || no_split);
             if(both_no) {
-                r.incomplete=0;
+                /* Definitive benign/split replies resolve their retries, but
+                   cannot resolve an unanswered independent length question. */
+                r.incomplete=r.longer==D2K_PROP_UNKNOWN ||
+                    (ttl_asked && ttl_answer==D2K_PROP_UNKNOWN);
                 ask_frag(c,&r);
                 if(r.frag_kind) {
-                    r.kind=D2K_QA_FRAG; r.strategy=D2K_QS_FRAG;
+                    r.kind=D2K_QA_FRAG; r.strategy=D2K_QS_FRAG; r.incomplete=0;
                     snprintf(r.reason,sizeof r.reason,
                              "разрешение не прошло, разрез CRYPTO %s; IP-фрагментация формы %d прошла "
                              "(приманки не перебирались)",
@@ -313,8 +330,8 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
             c->next=local.next; c->marked=local.marked;
             size_t head=r.n_trace;
             int probes=r.probes;
-            int8_t cl=r.clearance, sp=r.split_crypto;
-            int8_t cla=r.clearance_asked, spa=r.split_asked;
+            int8_t cl=r.clearance, sp=r.split_crypto, lng=r.longer;
+            int8_t cla=r.clearance_asked, spa=r.split_asked, lnga=r.longer_asked;
             int8_t fs=r.frag_survives;
             d2k_quic_arm_step steps[D2K_QUIC_ARM_STEPS];
             memcpy(steps,r.trace,head*sizeof steps[0]);
@@ -327,6 +344,7 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
             r.probes+=probes;
             r.clearance=cl; r.split_crypto=sp;
             r.clearance_asked=cla; r.split_asked=spa;
+            r.longer=lng;r.longer_asked=lnga;
             if(both_no) r.frag_survives=fs;
             r.strategy=l.strategy==D2K_QS_FAKE_SPLIT ? l.strategy : D2K_QS_LADDER;
             r.incomplete=r.incomplete||strategy_incomplete||take<l.n_trace;

@@ -746,10 +746,8 @@ static int qp_send_one(const char *addr, uint16_t port,
     if((prefix && prefix_len) || split || longer){
         char plan[16384];d2k_quic_arm_question q={0};
         q.blob=prefix;q.blob_len=prefix_len;q.ttl=prefix_ttl;q.copies=prefix_copies;q.split=split;
-        if(longer){
-            d2k_quic_props props={0};props.longer=D2K_PROP_YES;
-            rc=d2k_quic_compose_plan(NULL,&props,plan,sizeof plan);
-        }else rc=d2k_quic_question_plan(&q,plan,sizeof plan);
+        q.udplen=longer;
+        rc=d2k_quic_question_plan(&q,plan,sizeof plan);
         if(!rc)rc=d2k_udp_plan_send(fd,plan,msg.bytes,msg.len,mark);
     }else if(send(fd,msg.bytes,msg.len,0)!=(ssize_t)msg.len)rc=errno==ECONNREFUSED?-2:-1;
     if(rc){close(fd);return rc;}
@@ -1407,7 +1405,7 @@ static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
        the fragment-survival control keeps the donor's reply criterion. */
     return quic_ask_core(q->addr,port,prefix,prefix_len,ttl,copies,0,NULL,
         no_snapshot,wait_ms,mark,D2K_QUIC_REPEATS,NULL,NULL,sent_out,NULL,
-        neutral?qp_verify_aead:qp_verify_bound,fragment,neutral?NULL:sni,neutral,q->split,0);
+        neutral?qp_verify_aead:qp_verify_bound,fragment,neutral?NULL:sni,neutral,q->split,q->udplen);
 }
 d2k_quic_ask_arm_fn d2k_quic_ask_arm_hook=quic_ask_arm;
 
@@ -1951,7 +1949,8 @@ static const qp_question qp_list[] = {
    прямой зонд и повторный контроль (probe.go:322-355), вопросы стратегии с
    одним повтором каждый (D2K_QUIC_STRATEGY_ASKS_MAX, задача 40), вся
    лестница askArms (D2K_QUIC_ARM_QUESTIONS_MAX) и все вопросы таблицы выше.
-   Сейчас 2 + 4 + 18 + 7 = 31. Из этого числа — и только из него — выводится
+   Верхняя граница учитывает все повторяемые вопросы стратегии. Из этого
+   числа — и только из него — выводится
    бюджет. */
 #define QP_RUN_DYN_POLLS (2u + D2K_QUIC_STRATEGY_ASKS_MAX + D2K_QUIC_ARM_QUESTIONS_MAX + \
                           (unsigned)QP_N_QUESTIONS)
@@ -1990,7 +1989,7 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
                                size_t *next_addr, int residual_detected, uint16_t port,
                                const char *sni, d2k_hello trigger,
                                uint32_t wait_ms, uint32_t mark, int *all_marked,
-                               const qp_budget *start, int junk_asked, int frames_asked) {
+                               const qp_budget *start, int junk_asked, int frames_asked, int longer_asked) {
     /* Ровно 16 нулей — тот же мусор, что и у оригинала (questions.go:97), и
        ровно те байты, которые потом уйдут в строке стратегии
        (blob=0x000...0): слать случайное, а рекомендовать нули значило бы
@@ -2015,7 +2014,8 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
         if ((q->slot == offsetof(d2k_quic_props, junk_ahead) &&
              (junk_asked || *slot != D2K_PROP_UNKNOWN)) ||
             (q->slot == offsetof(d2k_quic_props, split_crypto) &&
-             (frames_asked || *slot != D2K_PROP_UNKNOWN))) {
+             (frames_asked || *slot != D2K_PROP_UNKNOWN)) ||
+            (q->slot == offsetof(d2k_quic_props, longer) && longer_asked)) {
             if (qi < D2K_QTRACE_MAX) {
                 d2k_quic_step *st = &r->qtrace[qi];
                 snprintf(st->label, sizeof st->label, "%s (стратегия)", q->label);
@@ -2662,6 +2662,8 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                                     r.qprops.junk_ahead = arm->clearance;
                                 if (arm->split_crypto != D2K_PROP_UNKNOWN)
                                     r.qprops.split_crypto = arm->split_crypto;
+                                if (arm->longer != D2K_PROP_UNKNOWN)
+                                    r.qprops.longer = arm->longer;
                             } else {
                                 arm->original = 1; arm->incomplete = 1;
                                 snprintf(arm->reason, sizeof arm->reason, "budget exhausted before askArms");
@@ -2681,7 +2683,8 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                                           port, sni, trigger, dyn_wait, mark,
                                           &all_marked, &start,
                                           arm ? arm->clearance_asked : 0,
-                                          arm ? arm->split_asked : 0);
+                                          arm ? arm->split_asked : 0,
+                                          arm ? arm->longer_asked : 0);
                     }
                 }
             }

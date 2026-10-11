@@ -4574,15 +4574,20 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
             if (arm_found && (t->arm.strategy == D2K_QS_CLEARANCE ||
                               t->arm.strategy == D2K_QS_SPLIT ||
                               t->arm.strategy == D2K_QS_FRAG ||
+                              t->arm.strategy == D2K_QS_LENGTH ||
                               t->arm.strategy == D2K_QS_TTL_LIFETIME ||
                               t->arm.strategy == D2K_QS_FAKE_SPLIT)) {
                 /* Задача 40: план собран из ответа вопроса, приманки не
                    перебирались. */
                 say(s, "по %s (QUIC) стратегия из замера за %d %s: %s",
                     t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
+                t->arm_hash=fnv1a(text);
+                snprintf(t->arm_path,sizeof t->arm_path,"свойство");
             } else if (arm_found) {
                 say(s, "по %s (QUIC) плечо подобрано за %d %s: %s",
                     t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
+                t->arm_hash=fnv1a(text);
+                snprintf(t->arm_path,sizeof t->arm_path,"перебор");
             } else {
                 say(s, "по %s (QUIC) плечо не подобрано (%s), план собран из свойств коробки",
                     t->name, t->arm.incomplete ? "поиск не завершён" : "перебор исчерпан");

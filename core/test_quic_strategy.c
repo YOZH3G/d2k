@@ -13,6 +13,8 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include "d2k_udpruntime.h"
+#include "d2k_compose.h"
 #include "d2k_quic_arms.h"
 
 static int fails, calls, data_calls;
@@ -30,6 +32,7 @@ static int fake_ok_blob = -1, fake_ok_copies;
 static d2k_quic_arm_question seen[64];
 
 static char next_answer(const d2k_quic_arm_question *q) {
+    if(q->udplen)return 'N'; /* Existing fixtures reject the new independent question. */
     if (q->split) return ans_split[i_split] ? ans_split[i_split++] : 'N';
     if (q->blob_len == D2K_QUIC_BENIGN_LEN && q->copies == 1 && !q->ttl && !q->frag &&
         !q->control && q->benign) return ans_clear[i_clear] ? ans_clear[i_clear++] : 'N';
@@ -140,7 +143,52 @@ static void test_fake_split(void) {
     CHECK(combo_calls==0 && r.kind==D2K_QA_NOT_FOUND);
 }
 
+static int length_mode,length_asks,length_data_calls,length_fallback;
+static d2k_tally length_probe(const d2k_quic_arm_question *q,void *u,int *sent) {
+    (void)u;char text[16384];*sent=3;
+    CHECK(!d2k_quic_question_plan(q,text,sizeof text));
+    int length=strstr(text,"\nudplen 100\n")!=NULL;
+    if(q->blob_len && !q->benign && !q->ttl)length_fallback++;
+    if(!length)return (d2k_tally){.fail=3,.marked=1};
+    length_asks++;
+    if(length_mode==2)return (d2k_tally){.pass=2,.fail=1,.marked=1};
+    if(length_mode==3){*sent=0;return (d2k_tally){.err=3,.fail=3,.marked=1};}
+    return (d2k_tally){.pass=3,.marked=1};
+}
+static d2k_quic_arm_data length_data(const d2k_quic_arm_question *q,void *u) {
+    (void)u;length_data_calls++;
+    CHECK(q->need_complete && q->budget_pk==25);
+    return (d2k_quic_arm_data){.verdict=length_mode==1?D2K_QAD_CUT:
+        length_mode==4?D2K_QAD_NOT_RUN:D2K_QAD_PASS};
+}
+static void test_length_before_fallback(void) {
+    for(length_mode=0;length_mode<5;length_mode++) {
+        length_asks=length_data_calls=length_fallback=0;
+        d2k_quic_arm_context c={.pool=pool,.n_pool=1,.marked=1,
+            .probe=length_probe,.data=length_data,.need_complete=1,.budget_pk=25};
+        d2k_quic_arm r=d2k_quic_strategy_arms(&c);
+        CHECK(length_asks==(length_mode>=2?2:1));
+        CHECK(length_data_calls==(length_mode==2 || length_mode==3?0:length_mode==4?2:1));
+        if(!length_mode) {
+            char text[16384]={0};d2k_quic_props p={0};
+            CHECK(r.kind!=D2K_QA_NOT_FOUND && r.strategy!=D2K_QS_LADDER);
+            CHECK(!length_fallback);
+            CHECK(!d2k_quic_compose_plan(&r,&p,text,sizeof text));
+            CHECK(strstr(text,"\nudplen 100\n") && !strstr(text,"fake "));
+            r.len=1;
+            CHECK(d2k_quic_compose_plan(&r,&p,text,sizeof text)!=0);
+            r.len=0;r.kind=D2K_QA_SPLIT;
+            CHECK(d2k_quic_compose_plan(&r,&p,text,sizeof text)!=0);
+        }else {
+            CHECK(r.kind==D2K_QA_NOT_FOUND && length_fallback>0);
+            CHECK(r.longer==(length_mode==1?D2K_PROP_NO:D2K_PROP_UNKNOWN));
+            CHECK(r.incomplete==(length_mode>=2));
+        }
+    }
+}
+
 int main(void) {
+    test_length_before_fallback();
     static const uint8_t zero16[16];
     marked_ok = 1;
 
@@ -175,7 +223,7 @@ int main(void) {
     CHECK(r.frag_survives == D2K_PROP_NO && !r.frag_kind);
     /* 3 вопроса стратегии; приманки ×1 без 0x00…0 (4), копии quic5 ×6/×11 и
        fake_default_quic ×6/×11 (4); после PASS TTL не задаётся. */
-    CHECK(calls == 3 + 8 && ladder_calls == 1 + 8 && r.n_trace == 11);
+    CHECK(calls == 4 + 8 && ladder_calls == 1 + 8 && r.n_trace == 12);
     {
         int controls = 0, benign = 0;
         for (int i = 0; i < calls && i < 64; i++) {
@@ -191,8 +239,8 @@ int main(void) {
           — после перебора, а не вместо него. */
     r = run("N", "N", 0, 1);
     CHECK(r.kind == D2K_QA_NOT_FOUND && !r.incomplete && r.strategy == D2K_QS_LADDER);
-    CHECK(calls == 3 + 12 && ladder_calls == 1 + 12 && data_calls == 0);
-    CHECK(seen[2].control && r.frag_survives == D2K_PROP_NO);
+    CHECK(calls == 4 + 12 && ladder_calls == 1 + 12 && data_calls == 0);
+    CHECK(seen[3].control && r.frag_survives == D2K_PROP_NO);
 
     /* 3а. Финальное ревью core, I1: клиенту разрез CRYPTO неприменим
           (ClientHello шире датаграммы). Вопрос о разрезе не задаётся даже
@@ -207,8 +255,8 @@ int main(void) {
         CHECK(r.kind != D2K_QA_SPLIT && r.strategy != D2K_QS_SPLIT);
         CHECK(i_split == 0 && !r.split_asked && r.split_crypto == D2K_PROP_UNKNOWN);
         for (int i = 0; i < calls && i < 64; i++) CHECK(!seen[i].split);
-        CHECK(r.kind == D2K_QA_NOT_FOUND && seen[1].control && strstr(r.reason, "неприменим"));
-        CHECK(r.strategy == D2K_QS_LADDER && calls == 2 + 12);
+        CHECK(r.kind == D2K_QA_NOT_FOUND && seen[2].control && strstr(r.reason, "неприменим"));
+        CHECK(r.strategy == D2K_QS_LADDER && calls == 3 + 12);
     }
 
     /* 3б. Оба «нет», фрагменты доживают и форма 3 проходит — план из ответа. */
@@ -216,12 +264,12 @@ int main(void) {
     r = run("N", "N", 0, 1);
     CHECK(r.kind == D2K_QA_FRAG && r.frag_kind == 3 && r.frag_survives == D2K_PROP_YES);
     CHECK(r.strategy == D2K_QS_FRAG && r.len == 0 && !r.incomplete);
-    CHECK(calls == 2 + 1 + 3 && ladder_calls == 4 && data_calls == 1);
+    CHECK(calls == 3 + 1 + 3 && ladder_calls == 4 && data_calls == 1);
     frag_ok_shape = 0;
 
     /* 4. Фильтр прошёл, а поток оборван — это решающее «нет», не повтор. */
     r = run("C", "C", 0, 1);
-    CHECK(r.kind == D2K_QA_NOT_FOUND && calls == 3 + 12 && data_calls == 2 && ladder_calls == 1 + 12);
+    CHECK(r.kind == D2K_QA_NOT_FOUND && calls == 4 + 12 && data_calls == 2 && ladder_calls == 1 + 12);
     CHECK(r.clearance == D2K_PROP_NO && r.split_crypto == D2K_PROP_NO);
 
     /* 5. Неустойчивый ответ — один повтор; решающий второй ответ принимается. */
@@ -236,10 +284,10 @@ int main(void) {
     /* Круг 1: вопрос, заданный до предела повторов, перебор не задаёт снова
        (0x00…0 ×1 — тот же вопрос). */
     CHECK(r.clearance_asked && r.split_asked);
-    CHECK(ladder_calls == 13 && calls == 3 + 13);
+    CHECK(ladder_calls == 13 && calls == 4 + 13);
     CHECK(r.strategy == D2K_QS_LADDER && r.kind == D2K_QA_NOT_FOUND);
-    CHECK(r.n_trace == 3 + 13 && r.n_trace <= D2K_QUIC_ARM_STEPS);
-    CHECK(r.probes == 3 * (3 + 13));
+    CHECK(r.n_trace == 4 + 13 && r.n_trace <= D2K_QUIC_ARM_STEPS);
+    CHECK(r.probes == 3 * (4 + 13));
     for (int i = 3; i < calls && i < 64; i++)
         CHECK(!(seen[i].blob_len == 16 && seen[i].copies == 1 && !seen[i].ttl));
 
@@ -247,7 +295,7 @@ int main(void) {
     ladder_pass = 1;
     r = run("EE", "EE", 0, 1);
     /* quic5 ×1 completes; later axes are unnecessary. */
-    CHECK(calls == 4 + 1 && r.strategy == D2K_QS_LADDER && r.kind == D2K_QA_COPIES);
+    CHECK(calls == 5 + 1 && r.strategy == D2K_QS_LADDER && r.kind == D2K_QA_COPIES);
     CHECK(r.clearance == D2K_PROP_UNKNOWN && r.split_crypto == D2K_PROP_UNKNOWN);
     ladder_pass = 0;
 
@@ -255,7 +303,7 @@ int main(void) {
            задаёт заново тот же вопрос (16 нулей ×1 перед Initial). */
     r = run("N", "EE", 0, 1);
     CHECK(r.clearance == D2K_PROP_NO && r.strategy == D2K_QS_LADDER);
-    CHECK(ladder_calls == 13 && calls == 3 + 13);
+    CHECK(ladder_calls == 13 && calls == 4 + 13);
     for (int i = 3; i < calls && i < 64; i++)
         CHECK(!(seen[i].blob_len == 16 && seen[i].copies == 1 && !seen[i].ttl));
 

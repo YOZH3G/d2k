@@ -68,9 +68,19 @@ static d2k_tally fragment(const char *ip,uint16_t port,int shape,d2k_hello h,uin
    'Y' — разрешение есть; 'N' — оба «нет». */
 static char strategy_mode='U';
 static int strategy_calls;
+static int length_pass,length_calls,length_diagnostics;
+static d2k_tally diagnostic_length(const char *ip,uint16_t port,const uint8_t *pre,size_t len,
+    d2k_hello msg,uint32_t wait,uint32_t mark,int n,uint32_t *rtt,int *ref,int *sent,uint8_t *ttl) {
+    length_diagnostics++;
+    return ask(ip,port,pre,len,msg,wait,mark,n,rtt,ref,sent,ttl);
+}
 static d2k_tally arm_probe(const d2k_quic_arm_question *q,const char *sni,
     uint16_t port,uint32_t wait,uint32_t mark,int *sent) {
     uint8_t initial[1500];size_t initial_len=0;
+    if(q->udplen) {
+        length_calls++;*sent=D2K_QUIC_REPEATS;
+        return (d2k_tally){.marked=1,.pass=length_pass?3:0,.fail=length_pass?0:3};
+    }
     if(q->benign || q->split) {
         d2k_tally t={0};t.marked=1;*sent=D2K_QUIC_REPEATS;strategy_calls++;
         CHECK(sni && !strcmp(sni,"target.example"));
@@ -102,6 +112,11 @@ static d2k_tally arm_probe(const d2k_quic_arm_question *q,const char *sni,
 /* Task 39: this test pins the ladder ORDER; the arm data stage (handshake
    plus application data) is stubbed as passed, and counted. */
 static int data_calls;
+static d2k_quic_arm_data data_failed(const d2k_quic_arm_question *q,const char *sni,
+    const char *path,uint16_t port,uint32_t wait,uint32_t mark) {
+    (void)q;(void)sni;(void)path;(void)port;(void)wait;(void)mark;data_calls++;
+    return (d2k_quic_arm_data){.verdict=D2K_QAD_CUT};
+}
 static char want_path[64];
 static d2k_quic_arm_data data_pass(const d2k_quic_arm_question *q,const char *sni,
     const char *path,uint16_t port,uint32_t wait,uint32_t mark) {
@@ -123,7 +138,7 @@ static d2k_quic_arm_data data_cut(const d2k_quic_arm_question *q,const char *sni
     const char *path,uint16_t port,uint32_t wait,uint32_t mark) {
     (void)path;(void)port;(void)wait;(void)mark;(void)sni;
     d2k_quic_arm_data d; memset(&d,0,sizeof d);
-    int plain=!q->blob && q->copies<=1 && !q->ttl && !q->frag && !q->benign && !q->split;
+    int plain=!q->blob && q->copies<=1 && !q->ttl && !q->frag && !q->benign && !q->split && !q->udplen;
     if(plain) {
         /* direct_seq: 1 — обрыв, 2 — ответ целиком; 0 — по direct_cut. */
         int v = direct_data_calls < 4 && direct_seq[direct_data_calls] ?
@@ -288,7 +303,7 @@ static void post_handshake_stall(void) {
 int main(void) {
     d2k_quic_arm_data_hook=data_pass;
     d2k_quic_allow_local=1; d2k_quic_resolve_hook=resolve;
-    d2k_quic_ask_hook=ask; d2k_quic_ask_longer_hook=ask; d2k_quic_ask_frames_hook=ask; d2k_quic_ask_control_hook=ask;
+    d2k_quic_ask_hook=ask; d2k_quic_ask_longer_hook=diagnostic_length; d2k_quic_ask_frames_hook=ask; d2k_quic_ask_control_hook=ask;
     d2k_quic_ask_copies_hook=copies; d2k_quic_ask_ttl_hook=copies;
     d2k_quic_ask_srcport_hook=srcport; d2k_quic_ask_split_hook=split;
     d2k_quic_fragment_hook=fragment;
@@ -333,6 +348,24 @@ int main(void) {
     CHECK(fragment_calls==0 && first_prefix==0);
     CHECK(r.qprops.junk_ahead==D2K_PROP_YES && r.qtrace[0].sent==0);
     CHECK(diagnostics_after_pass==0);
+    /* Length is decided before fake fallback and includes the data stage. */
+    memset(&arm,0,sizeof arm);
+    calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='N';
+    candidate_passed=diagnostics_after_pass=0;length_pass=1;length_calls=0;
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(arm.kind==D2K_QA_UDPLEN && arm.strategy==D2K_QS_LENGTH);
+    CHECK(length_calls==1 && data_calls==1 && !first_prefix && !fragment_calls);
+    CHECK(r.qprops.longer==D2K_PROP_YES && !diagnostics_after_pass);
+    memset(&arm,0,sizeof arm);calls=length_calls=length_diagnostics=0;
+    candidate_passed=0;arm_second_stalls=1;d2k_quic_arm_data_hook=data_failed;
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(arm.kind==D2K_QA_NOT_FOUND && arm.longer==D2K_PROP_NO);
+    CHECK(length_calls==1 && !length_diagnostics);
+    CHECK(r.qprops.longer==D2K_PROP_NO && r.qtrace[6].sent==0);
+    arm_second_stalls=0;d2k_quic_arm_data_hook=data_pass;
+    length_pass=0;
     /* Оба «нет», фрагменты проходят: план из ответа фрагментации. */
     memset(&arm,0,sizeof arm);
     calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='N';

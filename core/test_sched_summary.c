@@ -2,6 +2,7 @@
 #define pthread_create summary_thread_create
 #include "sched.c"
 #undef pthread_create
+#include "d2k_quic_arms.h"
 
 int summary_thread_create(pthread_t *thread, const pthread_attr_t *attr,
                           void *(*start)(void *), void *arg) {
@@ -40,6 +41,19 @@ int main(void) {
     CHECK(s != NULL);
     if (!s) return 1;
     d2k_sched_set_say(s, collect, NULL);
+    for(int ladder=0;ladder<2;ladder++) {
+        task *q=fixture(s);q->transport=17;q->arm.original=1;q->arm_ready=1;
+        q->arm.kind=ladder?D2K_QA_COPIES:D2K_QA_UDPLEN;
+        q->arm.strategy=ladder?D2K_QS_LADDER:D2K_QS_LENGTH;
+        if(ladder){q->arm.bytes[0]=0x40;q->arm.len=1;q->arm.copies=1;}
+        else q->arm.udplen=D2K_QUIC_LENGTH_INCREMENT;
+        d2k_vres result={.verdict=D2K_V_OPAQUE};
+        verdict_to_plans(s,q,&result);CHECK(q->n_plans==1);
+        q->next_plan=1;
+        CHECK(!strcmp(candidate_path(q),ladder?"перебор":"свойство"));
+        search_report(s,q,900,"probe-confirmed",NULL);
+        CHECK(strstr(rows,ladder?"path=fallback":"path=property"));
+    }
     task *t = fixture(s);
     /* Real launch → pthread_create failure → reset used to lose the report. */
     CHECK(launch_task(s, t) == 0);

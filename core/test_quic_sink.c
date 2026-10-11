@@ -33,6 +33,14 @@ int main(void){
         CHECK(sent_count==3 && sent[0].ttl==3 && sent[1].ttl==3 && sent[2].ttl==47);
         CHECK(sent[2].len==n && !memcmp(sent[2].bytes,initial,n));
         CHECK(current_ttl==47 && elapsed==0);
+        d2k_quic_arm_question length={.udplen=D2K_QUIC_LENGTH_INCREMENT};
+        a.q=&length;a.initial_out=0;sent_count=0;
+        CHECK(qp_arm_first_send(42,initial,n,&a)==1 && a.initial_out);
+        CHECK(sent_count==1 && sent[0].len==n+D2K_QUIC_LENGTH_INCREMENT);
+        CHECK(!memcmp(sent[0].bytes,initial,n));
+        const uint8_t zeros[D2K_QUIC_LENGTH_INCREMENT]={0};
+        CHECK(!memcmp(sent[0].bytes+n,zeros,sizeof zeros));
+        a.q=&q;
     }
     printf("QUIC actual first-send sink: %d failures\n",fails);return fails?1:0;
 }

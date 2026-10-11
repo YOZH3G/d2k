@@ -354,3 +354,5 @@ ACK/request/conditional-delete теперь несут и проверяют н�
 Продолжение общей приёмки кандидатов: [trial в раннем и позднем APPLIED](2026-10-11-scheduler-trial-proof.md).
 
 Продолжение HTTP: [граница сегментированных запросов и живая приёмка](2026-10-11-http-segmented-requests.md).
+
+Продолжение QUIC: [вопрос длины до запасного перебора](2026-10-11-quic-length-before-fallback.md).

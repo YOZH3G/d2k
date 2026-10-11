@@ -17,6 +17,7 @@ typedef struct {
        пуст. benign: blob — безобидная датаграмма вопроса «остаточное
        разрешение» (D2K_QUIC_BENIGN), а не приманка перебора. */
     int split, benign;
+    unsigned udplen; /* append after the intact Initial through the Plan executor */
     /* Задача 50, раунд 3: засчитывать только ответ целиком (поиск по обрыву
        после рукопожатия — сравнение с прямым запросом на том же пути). */
     int need_complete;
@@ -50,10 +51,11 @@ typedef struct {
 #define D2K_QUIC_BENIGN_LEN 16
 extern const uint8_t d2k_quic_benign[D2K_QUIC_BENIGN_LEN];
 
-/* Верхняя граница: benign/split/TTL — до двух опросов каждый;
+/* Верхняя граница: benign/split/TTL/length — до двух опросов каждый;
    адаптивное произведение fake×split — один опрос. Бюджет Run выводится
    из этой границы, без изменения критерия 3/3. */
-#define D2K_QUIC_STRATEGY_ASKS_MAX 7u
+#define D2K_QUIC_STRATEGY_ASKS_MAX 9u
+#define D2K_QUIC_LENGTH_INCREMENT 100u
 typedef d2k_tally (*d2k_quic_arm_probe_fn)(const d2k_quic_arm_question *, void *, int *);
 
 /* Порог и вердикты этапа данных — d2k_quicprobe.h (D2K_QUIC_ARM_DATA_BYTES). */
@@ -147,6 +149,8 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *ctx);
  *      strategy D2K_QS_CLEARANCE; дальше ничего не спрашивается.
  *   2. разрез ClientHello на два кадра CRYPTO. Да → kind D2K_QA_SPLIT,
  *      strategy D2K_QS_SPLIT.
+ *   3. +100 байт после Initial, его содержимое неизменно. Да после того же
+ *      этапа данных → kind D2K_QA_UDPLEN, strategy D2K_QS_LENGTH.
  * Оба решающих «нет» → вопросы IP-фрагментации; не прошла ни одна форма —
  * перебор приманок d2k_quic_original_arms без уже заданных вопросов
  * (strategy D2K_QS_LADDER; поле 04.10, rutracker.org: «нет» на оба вопроса
