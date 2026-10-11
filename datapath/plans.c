@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "d2k_plans.h"
+#include "plan_internal.h"
 
 enum { KEY_FREE = 0, KEY_NAME = 1, KEY_ADDR = 2 };
 
@@ -73,6 +74,7 @@ typedef struct {
  * наложение запрещено и почему). */
 struct d2k_plantab {
     uint64_t revision;
+    uint64_t next_binding;
     /* Сколько раз запись НАШЛАСЬ, но не подошла по форме приветствия. */
     size_t   shape_misses;
     entry *v;
@@ -84,6 +86,17 @@ struct d2k_plantab {
     area_entry bypasses[D2K_PLAN_BYPASS_MAX];
     size_t suffix_used, bypass_used;
 };
+
+/* One counter per table; the session epoch namespaces it across restarts.
+ * Exhaustion leaves identity unknown rather than reusing an old generation. */
+static void bind_context(d2k_plantab *t, d2k_plan *p, uint8_t kind,
+                         uint8_t family, uint8_t shape, int temporary) {
+    if (!p) return;
+    p->binding_owner = t;
+    p->binding_generation = t->next_binding == UINT64_MAX ? 0 : ++t->next_binding;
+    p->binding_kind = kind; p->binding_family = family;
+    p->binding_shape = shape; p->binding_temporary = temporary != 0;
+}
 
 d2k_plantab *d2k_plantab_new(size_t cap) {
     if (cap == 0) {
@@ -196,6 +209,7 @@ static int area_set(d2k_plantab *t, area_entry *v, size_t *used, size_t cap,
         e->transport = transport; e->shape = shape; e->family = family;
     }
     d2k_plan_free(e->plan); e->plan = p; t->revision++;
+    bind_context(t, p, D2K_BIND_SUFFIX, family, shape, 0);
     return 0;
 }
 
@@ -585,6 +599,7 @@ int d2k_plantab_set_name_family(d2k_plantab *t, const uint8_t *name, size_t len,
             e->last_used_ns = now_ns;
             d2k_plan_free(e->plan);
             e->plan = p;
+            bind_context(t, p, D2K_BIND_NAME, family, e->shape, 0);
             return 0;
         }
     }
@@ -610,6 +625,7 @@ int d2k_plantab_set_name_family(d2k_plantab *t, const uint8_t *name, size_t len,
        плана цели молча текла бы. */
     d2k_plan_free(e->plan);
     e->plan = p;
+    bind_context(t, p, D2K_BIND_NAME, family, e->shape, sport_be != 0);
     return 0;
 }
 
@@ -663,6 +679,7 @@ int d2k_plantab_set_addr_shaped(d2k_plantab *t, const uint8_t *addr, uint8_t fam
     e->last_used_ns = now_ns;
     d2k_plan_free(e->plan);
     e->plan = p;
+    bind_context(t, p, D2K_BIND_ADDR, family, shape, 0);
     return 0;
 }
 
@@ -849,6 +866,8 @@ int d2k_plantab_set_addr_probe(d2k_plantab *t,
         d2k_plan_free(p);
         return -2;
     }
+    uint8_t shape = d2k_plan_proto(p) == 2 ? D2K_PLAN_SHAPE_QUIC :
+                    d2k_plan_proto(p) == 3 ? D2K_PLAN_SHAPE_VOICE : D2K_PLAN_SHAPE_ANY;
     probe_entry *free_slot = NULL;
     for (size_t i = 0; i < t->cap; i++) {
         probe_entry *e = &t->probes[i];
@@ -868,6 +887,7 @@ int d2k_plantab_set_addr_probe(d2k_plantab *t,
         }
         d2k_plan_free(e->plan);
         e->plan = p;
+        bind_context(t, p, D2K_BIND_FLOW, flow->family ? flow->family : 4, shape, 1);
         e->expires_ns = expires_ns;
         t->revision++;
         return 0;
@@ -881,6 +901,7 @@ int d2k_plantab_set_addr_probe(d2k_plantab *t,
     memcpy(free_slot->trial_id, trial_id, D2K_TRIAL_ID_LEN);
     free_slot->expires_ns = expires_ns;
     free_slot->plan = p;
+    bind_context(t, p, D2K_BIND_FLOW, flow->family ? flow->family : 4, shape, 1);
     t->probe_used++;
     t->revision++;
     return 0;
@@ -1145,4 +1166,14 @@ size_t d2k_plantab_count(const d2k_plantab *t) {
 
 size_t d2k_plantab_capacity(const d2k_plantab *t) {
     return t ? t->cap : 0;
+}
+
+int d2k_plantab_binding(const d2k_plantab *t, const d2k_plan *p, d2k_binding_context *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    if (!t || !p || p->binding_owner != t || !p->binding_generation) return 0;
+    out->generation = p->binding_generation;
+    out->kind = p->binding_kind; out->family = p->binding_family;
+    out->shape = p->binding_shape; out->temporary = p->binding_temporary;
+    return 1;
 }

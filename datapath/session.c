@@ -308,6 +308,8 @@ static void plan_handed_off(d2k_session *s, d2k_result *out, d2k_flow *fl, const
     fl->udp_replan = 0;
     if (++s->next_execution == 0) { ++s->next_execution; }
     out->execution_id = fl->execution_id = s->next_execution;
+    (void)d2k_plantab_binding(s->plans, use, &out->binding);
+    fl->execution_binding = out->binding;
     memcpy(fl->execution_plan_id, out->plan_id, D2K_PLAN_ID_LEN);
     memcpy(fl->execution_trial_id, out->trial_id, D2K_TRIAL_ID_LEN);
 }
@@ -3076,9 +3078,9 @@ void d2k_session_sent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     if (fl->sends_done < 0xFF) { fl->sends_done++; }
     if (fl->sends_left == 0 && !fl->sends_failed) {
         s->done++;
-        d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_DONE,
+        d2k_journal_add_fate_bound(s->jrn, at_ns, k, D2K_JRN_PLAN_DONE,
                              D2K_REFUSE_NONE, fl->execution_plan_id,
-                             fl->execution_trial_id);
+                             fl->execution_trial_id, fl->execution_id, &fl->execution_binding);
     }
 }
 
@@ -3145,10 +3147,10 @@ int d2k_session_exec_failed(d2k_session *s, uint64_t at_ns, const d2k_key *k,
            вовсе. Один раз на попытку — события лосси по контракту. */
         if (!fl->damaged_told) {
             fl->damaged_told = 1;
-            d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_DAMAGED,
+            d2k_journal_add_fate_bound(s->jrn, at_ns, k, D2K_JRN_PLAN_DAMAGED,
                                  D2K_REFUSE_DAMAGED,
                                  plan_id ? plan_id : fl->execution_plan_id,
-                                 fl->execution_trial_id);
+                                 fl->execution_trial_id, fl->execution_id, &fl->execution_binding);
         }
         return 0;
     }
@@ -3185,9 +3187,9 @@ void d2k_session_unsent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     /* Устаревший отказ не относится к новой попытке с тем же ключом. */
     d2k_flow *fl = d2k_track_find(table_of(s, k), k);
     if (fl && execution != 0 && fl->execution_id == execution) {
-        d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_UNSENT, code,
+        d2k_journal_add_fate_bound(s->jrn, at_ns, k, D2K_JRN_PLAN_UNSENT, code,
                              plan_id ? plan_id : fl->execution_plan_id,
-                             fl->execution_trial_id);
+                             fl->execution_trial_id, fl->execution_id, &fl->execution_binding);
         fl->sends_left = 0;
         fl->sends_failed = 1;
     }

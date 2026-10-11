@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "d2k_plan.h"
+#include "d2k_plans.h"
 #include "d2k_quic.h"
 
 /* Ключ потока. Адреса и порты в сетевом порядке — ровно как в заголовке, без
@@ -347,6 +348,7 @@ struct d2k_flow {
        целиком: этот повтор получает план (задача 42). Сбрасывается новой
        попыткой. */
     uint8_t udp_replan;
+    d2k_binding_context execution_binding;
     uint64_t execution_id; /* distinguishes reuse of the same 5-tuple */
     uint8_t execution_plan_id[16];
     uint8_t execution_trial_id[16]; /* nonzero only for ephemeral address probe */

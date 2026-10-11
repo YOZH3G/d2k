@@ -848,6 +848,47 @@ int main(void) {
         d2k_plantab_free(t);
     }
 
+    /* Same serialized program, new installation: delayed evidence must not
+       identify it as the previous binding. Lookup/LRU and unrelated SETs do
+       not change the saved identity. Exercise each installation namespace. */
+    for (int kind = D2K_BIND_NAME; kind <= D2K_BIND_FLOW; kind++) {
+        for (uint8_t family = 4; family <= 6; family += 2) {
+            d2k_plantab *t = d2k_plantab_new(4), *other = d2k_plantab_new(4);
+            const uint8_t nm[] = "identity.test", ip[16] = {1,2,3,4};
+            const uint8_t trial[16] = {1};
+            d2k_addr_probe_flow f = {0};
+            f.family = family; f.transport = 17;
+            memcpy(f.src_ip4, ip, 4); memcpy(f.dst_ip4, ip, 4);
+            memcpy(f.src_ip6, ip, 16); memcpy(f.dst_ip6, ip, 16);
+            f.src_port_be = 1234; f.dst_port_be = 443;
+            d2k_binding_context saved = {0};
+            for (int install = 0; install < 2; install++) {
+                d2k_plan *p = kind == D2K_BIND_FLOW ? mkdeny() : mkplan(); int rc;
+                if (kind == D2K_BIND_NAME)
+                    rc = d2k_plantab_set_name_family(t,nm,sizeof nm-1,1,p,D2K_PLAN_SHAPE_MODERN,0,family);
+                else if (kind == D2K_BIND_ADDR)
+                    rc = d2k_plantab_set_addr_shaped(t,ip,family,1,p,D2K_PLAN_SHAPE_MODERN);
+                else if (kind == D2K_BIND_SUFFIX)
+                    rc = d2k_plantab_set_suffix_family(t,nm,sizeof nm-1,1,p,D2K_PLAN_SHAPE_MODERN,family);
+                else rc = d2k_plantab_set_addr_probe(t,&f,trial,1,100,p);
+                CHECK(rc == 0, "binding generation fixture install");
+                d2k_binding_context c = {0}, again = {0};
+                CHECK(d2k_plantab_binding(t,p,&c) && c.generation && c.kind == kind &&
+                      c.family == family && c.shape == (kind == D2K_BIND_FLOW ? D2K_PLAN_SHAPE_QUIC : D2K_PLAN_SHAPE_MODERN) &&
+                      c.temporary == (kind == D2K_BIND_FLOW), "installed binding context missing");
+                CHECK(!install || c.generation != saved.generation, "same-hash reinstall reused generation");
+                saved = c;
+                CHECK(!d2k_plantab_set_name_family(t,(const uint8_t *)"other.test",10,2,mkplan(),
+                      D2K_PLAN_SHAPE_MODERN,0,family), "unrelated install");
+                CHECK(d2k_plantab_binding(t,p,&again) && again.generation == c.generation,
+                      "unrelated table change altered this binding generation");
+                CHECK(!d2k_plantab_binding(other,p,&again) && !again.generation,
+                      "foreign table accepted binding identity");
+            }
+            d2k_plantab_free(t); d2k_plantab_free(other);
+        }
+    }
+
     if (fails) {
         printf("ПРОВАЛОВ: %d\n", fails);
         return 1;

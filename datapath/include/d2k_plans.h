@@ -81,6 +81,19 @@
 #define D2K_TARGET_NAME_MAX 255
 
 typedef struct d2k_plantab d2k_plantab;
+/* Runtime installation identity, never part of the serialized packet program.
+ * Snapshot while p is a live borrowed lookup result; the returned value survives
+ * replacement/deletion. A plan hash and the table-wide revision are not a binding. */
+#define D2K_BIND_NAME 1
+#define D2K_BIND_ADDR 2
+#define D2K_BIND_SUFFIX 3
+#define D2K_BIND_FLOW 4
+typedef struct {
+    uint64_t generation;
+    uint8_t kind, family, shape, temporary;
+} d2k_binding_context;
+int d2k_plantab_binding(const d2k_plantab *, const d2k_plan *, d2k_binding_context *);
+
 int d2k_plantab_has_ech_target(const d2k_plantab *, const uint8_t *, size_t,
     const uint8_t *, uint8_t family, uint16_t sport_be);
 

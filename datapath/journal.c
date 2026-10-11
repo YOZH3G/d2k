@@ -144,9 +144,10 @@ void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
     if (e && trial_id) { memcpy(e->trial_id, trial_id, D2K_TRIAL_ID_LEN); }
 }
 
-void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+void d2k_journal_add_fate_bound(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
                           uint8_t kind, uint8_t code, const uint8_t *plan_id,
-                          const uint8_t *trial_id) {
+                          const uint8_t *trial_id, uint64_t execution,
+                          const d2k_binding_context *binding) {
     d2k_jrn_entry *e = add_entry(j, at_ns, key, kind, code, 0, NULL, NULL, 0,
                                  (kind == D2K_JRN_PLAN_UNSENT ||
                                   kind == D2K_JRN_PLAN_DAMAGED) ? d2k_refuse_text(code)
@@ -158,6 +159,13 @@ void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
         memcpy(e->plan_id, plan_id, D2K_PLAN_ID_LEN);
     }
     if (e && trial_id) { memcpy(e->trial_id, trial_id, D2K_TRIAL_ID_LEN); }
+    if (e) { e->execution_id = execution; if (binding) e->binding = *binding; }
+}
+
+void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+                          uint8_t kind, uint8_t code, const uint8_t *plan_id,
+                          const uint8_t *trial_id) {
+    d2k_journal_add_fate_bound(j, at_ns, key, kind, code, plan_id, trial_id, 0, NULL);
 }
 
 size_t d2k_journal_count(const d2k_journal *j) {

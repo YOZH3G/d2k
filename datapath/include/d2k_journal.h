@@ -154,6 +154,8 @@ enum {
 
 typedef struct {
     uint64_t at_ns;
+    uint64_t execution_id;
+    d2k_binding_context binding;
     d2k_key  key;
     uint8_t  kind;
     /* Для D2K_JRN_SUSPECT — код причины подозрения (D2K_SUSPECT_*), для
@@ -256,6 +258,11 @@ void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
 void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
                           uint8_t kind, uint8_t code, const uint8_t *plan_id,
                           const uint8_t *trial_id);
+
+/* Copies the context selected by the execution, never today's table entry. */
+void d2k_journal_add_fate_bound(d2k_journal *, uint64_t, const d2k_key *,
+    uint8_t kind, uint8_t code, const uint8_t *plan_id, const uint8_t *trial_id,
+    uint64_t execution, const d2k_binding_context *);
 
 /* Записи от старой к новой. i от 0 до d2k_journal_count()-1. */
 size_t               d2k_journal_count(const d2k_journal *j);

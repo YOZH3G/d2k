@@ -97,6 +97,11 @@ struct d2k_seqovl {
 };
 
 struct d2k_plan {
+    /* Installation metadata only; not serialized, hashed or executed. The
+       table owns this object uniquely and snapshots it before replacement. */
+    const void *binding_owner;
+    uint64_t binding_generation;
+    uint8_t binding_kind, binding_family, binding_shape, binding_temporary;
     uint16_t schema;
     uint16_t minexec;
     uint8_t  id[D2K_PLAN_ID_LEN];

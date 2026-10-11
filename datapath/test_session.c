@@ -2118,7 +2118,8 @@ int main(void) {
         d2k_plan *gp = NULL;
         CHECK(d2k_plan_load(plan_with_send_id, sizeof plan_with_send_id, &gp,
                             err, sizeof err) == 0, "план для повторного ключа");
-        d2k_session_set_plan(g, gp);
+        CHECK(!d2k_plantab_set_name(d2k_session_plans(g),
+            (const uint8_t *)"hetzner.com", 11, 1, gp), "bound execution fixture");
         n = build_pkt(pkt, 46002, 0x18, hello, hlen);
         d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
         uint64_t old = r.execution_id;
@@ -2127,6 +2128,17 @@ int main(void) {
         d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
         n = build_pkt(pkt, 46002, 0x18, hello, hlen);
         d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        d2k_binding_context selected = r.binding;
+        CHECK(selected.generation && selected.kind == D2K_BIND_NAME,
+              "execution lost selected binding identity");
+        d2k_plan *replacement = NULL;
+        CHECK(!d2k_plan_load(plan_with_send_id, sizeof plan_with_send_id, &replacement,
+                            err, sizeof err), "same-hash replacement fixture");
+        CHECK(!d2k_plantab_set_name(d2k_session_plans(g),
+            (const uint8_t *)"hetzner.com", 11, 1201, replacement), "same-hash replace while sends pending");
+        d2k_binding_context current = {0};
+        CHECK(d2k_plantab_binding(d2k_session_plans(g), replacement, &current) &&
+              current.generation != selected.generation, "replacement has a new generation");
         CHECK(r.applied && r.execution_id != old, "повторный поток наследовал номер исполнения");
         CHECK(!d2k_session_send_pending(g, &key, old), "старый пакет разрешён к отправке");
         d2k_session_sent(g, 1300, &key, old);
@@ -2139,6 +2151,9 @@ int main(void) {
         d2k_session_sent(g, 1500, &r.key, r.execution_id);
         const d2k_jrn_entry *e = last_of_kind(g, D2K_JRN_PLAN_DONE);
         CHECK(e && memcmp(e->plan_id, want_send_id, 16) == 0, "DONE потерял ID плана");
+        CHECK(e && e->execution_id == r.execution_id &&
+              e->binding.generation == selected.generation && e->binding.generation != current.generation,
+              "late DONE borrowed the replacement binding instead of its snapshot");
         d2k_session_free(g);
     }
 

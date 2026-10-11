@@ -50,6 +50,7 @@ typedef enum {
 typedef struct {
     d2k_verdict verdict;
     uint64_t execution_id;
+    d2k_binding_context binding;
 
     /* Готовые пакеты на отправку, по одному на посылку. Буфер принадлежит
        вызывающему и передаётся снаружи: датапат не выделяет память на
