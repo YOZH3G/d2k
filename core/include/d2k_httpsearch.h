@@ -36,8 +36,8 @@
  * `GET / HTTP/1.1` с Host. Успех — НАСТОЯЩИЙ ОТВЕТ СЕРВЕРА по тому же
  * правилу, что у датапата: строка статуса HTTP, не 30x на хост портала и не
  * раньше половины RTT соединения зонда. Плюс исполнение на проводе: событие
- * APPLIED с идентификатором именно этого плана. Без него кандидат не судим
- * (плана на проводе не было). Подтверждение — два опыта подряд, в каждом два полных ответа
+ * APPLIED каждого запроса с точными trial, plan, binding и потоком сокета.
+ * Недостаток доказательства — кандидат не судим. Подтверждение — два опыта подряд, в каждом два полных ответа
  * на одной связи keep-alive, затем
  * постоянный план имени (SET_NAME, форма HTTP).
  *
@@ -92,6 +92,9 @@ typedef struct {
     char why[160];
     uint32_t seq;         /* номер запуска (из d2k_hs_job) */
     unsigned complete_responses; /* fully framed replies on this connection */
+    unsigned requests_sent;
+    uint8_t local_ip[16]; /* actual connected socket, not a guessed interface */
+    uint16_t local_port; /* host order */
     int fd;               /* его сокет: опоздавший ответ закрывает его */
 } d2k_hs_result;
 
@@ -172,8 +175,8 @@ int d2k_httpsearch_control(d2k_httpsearch *, const d2k_ev *, int64_t now_ms);
 void d2k_httpsearch_install_ack(d2k_httpsearch *, const uint8_t install_id[16], int ok, const d2k_binding_context *);
 /* Подтверждение SET_NAME_PROBE (trial ID и признак успеха). */
 void d2k_httpsearch_ack(d2k_httpsearch *hs, const uint8_t trial_id[16], int ok, int64_t now_ms);
-/* Событие APPLIED: план с этим идентификатором исполнен на проводе. */
-void d2k_httpsearch_applied(d2k_httpsearch *hs, const uint8_t plan_id[16]);
+/* Exact trial/flow/binding execution, deduplicated by execution ID. */
+int d2k_httpsearch_applied(d2k_httpsearch *hs, const d2k_ev *event);
 /* Ответ зонда. */
 void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now_ms);
 /* Сроки: подтверждения, ответа, события APPLIED. */

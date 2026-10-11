@@ -295,6 +295,7 @@ static void plan_handed_off(d2k_session *s, d2k_result *out, d2k_flow *fl, const
         memcpy(out->plan_id, id, D2K_PLAN_ID_LEN);
     }
     if (trial_id) { memcpy(out->trial_id, trial_id, D2K_TRIAL_ID_LEN); }
+    else { d2k_plantab_trial(s->plans,use,out->trial_id); }
     /* n_out не может превысить вместимость out[] (16): выше стоит явная
        проверка, отвергающая план целиком. */
     /* One completion for each raw send AND one for the original's NF verdict. */

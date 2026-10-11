@@ -105,6 +105,12 @@ static inline int d2k_binding_equal(const d2k_binding_context *a, const d2k_bind
     return 1;
 }
 int d2k_plantab_binding(const d2k_plantab *, const d2k_plan *, d2k_binding_context *);
+/* Name probe identity belongs to this installation, not to serialized plan bytes.
+ * A legacy all-zero token is accepted and remains unknown proof. */
+int d2k_plantab_set_name_trial(d2k_plantab *, const uint8_t *name, size_t len,
+    uint64_t now_ns, d2k_plan *, uint8_t shape, uint16_t sport_be, uint8_t family,
+    const uint8_t trial_id[D2K_TRIAL_ID_LEN]);
+void d2k_plantab_trial(const d2k_plantab *, const d2k_plan *, uint8_t out[D2K_TRIAL_ID_LEN]);
 int d2k_plantab_del_name_bound(d2k_plantab *, const uint8_t *, size_t,
     uint8_t transport, const d2k_binding_context *);
 

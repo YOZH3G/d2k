@@ -175,6 +175,75 @@ static void live_identity(d2k_ctl *ctl,d2k_ctlsrv *cx,int peer,int family,const 
     d2k_httpsearch_free(hs);
 }
 
+/* Proof travels through the production Session journal and Unix control codec.
+ * HTTP replies are fixtures here; the socket probe is exercised separately. */
+static int proof_set(void *ctx,const char *host,uint8_t family,uint16_t port,
+                     const char *text,const uint8_t trial_id[16]) {
+    char hex[8192],err[200];
+    f_set_probe(ctx,host,family,port,text,trial_id);
+    if(d2k_plan_text_to_hex(text,hex,sizeof hex,err,sizeof err))return -1;
+    return d2k_link_set_name_probe_trial(identity_peer,host,6,hex,D2K_LINK_SHAPE_HTTP,
+                                         port,family,trial_id,err,sizeof err);
+}
+static int proof_del(void *ctx,const char *host,uint8_t family,uint16_t port) {
+    char err[200];f_del_probe(ctx,host,family,port);
+    return d2k_link_del_name_probe_family(identity_peer,host,6,D2K_LINK_SHAPE_HTTP,
+                                         port,family,err,sizeof err);
+}
+static void live_trial_proof(d2k_ctl *ctl,d2k_ctlsrv *cx,int peer,int family) {
+    identity_peer=peer;
+    fake f={0};d2k_hs_ops ops=ops_of(&f);ops.set_probe=proof_set;ops.del_probe=proof_del;
+    d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
+    uint8_t server[16]={0},client[16]={0};
+    inet_pton(family==4?AF_INET:AF_INET6,family==4?"198.51.100.2":"2001:db8::2",server);
+    inet_pton(family==4?AF_INET:AF_INET6,family==4?"192.0.2.1":"2001:db8::1",client);
+    d2k_httpsearch_portal(hs,live_host,(uint8_t)family,server,now);base_injected(hs,&f,&now);
+    for(unsigned attempt=0;attempt<2;attempt++) {
+        d2k_ev ev={0};char err[200];int ack=0;
+        CHECK(d2k_ctl_poll(ctl,d2k_ctlsrv_command,cx)>0,"trial install consumed by actual server");
+        d2k_ctl_flush(ctl);
+        while(!d2k_link_next(peer,&ev,100,err,sizeof err)) {
+            if(ev.kind==D2K_EV_ACK&&ev.code==D2K_CMD_SET_NAME_PROBE&&
+               !memcmp(ev.trial_id,f.trial,16)) {ack=1;break;}
+        }
+        CHECK(ack,"actual trial installation ACK");
+        d2k_httpsearch_ack(hs,f.trial,1,++now);
+        uint64_t seen=d2k_journal_added(d2k_session_journal(cx->sess));
+        uint8_t pkt[4096],out[65536];d2k_result execution;
+        uint16_t port=ntohs(f.sport);
+        size_t n=live_packet(family,port,10000,1,"",pkt);
+        d2k_session_set_hook(cx->sess,D2K_HOOK_POSTROUTING);
+        d2k_session_packet_probe(cx->sess,pkt,n,3000000000,out,sizeof out,&execution);
+        uint32_t seq=10001;
+        for(unsigned request=0;request<2;request++) {
+            char req[512];snprintf(req,sizeof req,"GET /%s HTTP/1.1\r\nHost: %s\r\n\r\n",
+                                  request?"False/":"",live_host);
+            n=live_packet(family,port,seq,0,req,pkt);seq+=(uint32_t)strlen(req);
+            d2k_session_packet_probe(cx->sess,pkt,n,3100000000,out,sizeof out,&execution);
+            if(!execution.applied)fprintf(stderr,"trial %u request %u skipped: %s\n",attempt,request,execution.skipped?execution.skipped:"none");
+            CHECK(execution.applied&&execution.n_out,"actual trial request has planned output");
+            for(size_t i=0;i<execution.n_out+1;i++)
+                d2k_session_sent(cx->sess,3200000000,&execution.key,execution.execution_id);
+        }
+        d2k_ctlsrv_pump(ctl,cx->sess,&seen);d2k_ctl_flush(ctl);
+        d2k_ev applied[2];unsigned count=0;
+        while(count<2&&!d2k_link_next(peer,&ev,100,err,sizeof err)) {
+            if(ev.kind==D2K_EV_APPLIED&&!memcmp(ev.trial_id,f.trial,16))applied[count++]=ev;
+        }
+        CHECK(count==2,"both completions survive production journal/control path");
+        if(count!=2)break;
+        CHECK(d2k_httpsearch_control(hs,&applied[0],++now)==1,"first actual execution accepted");
+        CHECK(!d2k_httpsearch_control(hs,&applied[0],++now),"actual execution replay ignored");
+        d2k_hs_result reply=res(&f,D2K_HS_REAL);reply.seq=f.job.seq;reply.fd=f.job.fd;
+        memcpy(reply.local_ip,client,16);
+        d2k_httpsearch_result(hs,&reply,++now);
+        CHECK(!f.set_plan_n,"two replies without second execution cannot publish");
+        CHECK(d2k_httpsearch_control(hs,&applied[1],++now)==1,"late second actual execution accepted");
+    }
+    CHECK(f.set_plan_n==1,"two fully executed trials publish only after all completions");
+    d2k_httpsearch_free(hs);
+}
+
 static void live_restore(int family) {
     char dir[128],path[180],sock[180],cat[180],log[180],err[300];
     snprintf(dir,sizeof dir,"/tmp/d2k-http-live-%ld-%d",(long)getpid(),family);
@@ -230,6 +299,15 @@ static void live_restore(int family) {
         CHECK(!d2k_test_trace_equal(measured.packets,measured.n,permanent.packets,permanent.n),"live gate rejects divergent packet");}
     live_refusals(s,family);
     live_identity(ctl,&cx,peer,family,path);
+    /* Existing reserved-port callers have no trial token. Their installation
+       remains valid, but its completion must retain unknown trial identity. */
+    CHECK(!d2k_link_set_name_family(peer,live_host,6,trial_hex,D2K_LINK_SHAPE_HTTP,
+          htons(55001),(uint8_t)family,err,sizeof err),"legacy trial install command");
+    CHECK(d2k_ctl_poll(ctl,d2k_ctlsrv_command,&cx)>0,"legacy trial consumed");
+    live_flow(s,family,55001,live_host,1,1,NULL);
+    const uint8_t unknown_trial[16]={0};
+    CHECK(!memcmp(last_live_execution.trial_id,unknown_trial,16),"legacy execution retains unknown trial");
+    live_trial_proof(ctl,&cx,peer,family);
     d2k_link_close(peer);d2k_ctl_close(ctl);d2k_session_free(s);
     unlink(path);unlink(cat);unlink(log);unlink(sock);rmdir(dir);
 }

@@ -2,6 +2,7 @@
  * d2k_httpsearch.h. */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -186,6 +187,17 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
     }
     clock_gettime(CLOCK_MONOTONIC, &c1);
     r->rtt_us = (int64_t)(c1.tv_sec - c0.tv_sec) * 1000000 + (c1.tv_nsec - c0.tv_nsec) / 1000;
+    struct sockaddr_storage local; socklen_t local_len=sizeof local;
+    if(getsockname(fd,(struct sockaddr *)&local,&local_len)) {
+        snprintf(r->why,sizeof r->why,"local socket identity unavailable");return;
+    }
+    if(local.ss_family==AF_INET && job->family==4) {
+        const struct sockaddr_in *a=(const struct sockaddr_in *)&local;
+        memcpy(r->local_ip,&a->sin_addr,4);r->local_port=ntohs(a->sin_port);
+    } else if(local.ss_family==AF_INET6 && job->family==6) {
+        const struct sockaddr_in6 *a=(const struct sockaddr_in6 *)&local;
+        memcpy(r->local_ip,&a->sin6_addr,16);r->local_port=ntohs(a->sin6_port);
+    } else {snprintf(r->why,sizeof r->why,"unexpected local socket family");return;}
 
     char req[1536];
     for(unsigned request=0;request<2;request++) {
@@ -210,6 +222,7 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
             break;
         }
         if(sent!=(size_t)rl){r->answer=D2K_HS_CLOSED;snprintf(r->why,sizeof r->why,"HTTP request %u not sent",request+1);return;}
+        r->requests_sent++;
         d2k_http_read_result response;
         d2k_http_read_response(hs_read,&reader,d2k_hs_probe_ms,&response,r->why,sizeof r->why);
         r->reply_us=reader.first_us;
@@ -382,6 +395,10 @@ struct d2k_httpsearch {
         uint16_t sport;
         uint8_t trial[16], plan_id[16];
         int applied;
+        uint16_t proof_sport;
+        uint8_t proof_client[16];
+        uint64_t executions[2];
+        d2k_binding_context proof_binding;
         int64_t deadline;
         d2k_hs_result pending;
     } cur;
@@ -564,6 +581,7 @@ static int open_job(d2k_httpsearch *hs, d2k_hs_job *job) {
     }
     hs->cur.fd = fd;
     hs->cur.sport = sport;
+    hs->cur.proof_sport = ntohs(sport);
     job->fd = fd;
     job->family = hs->cur.family;
     memcpy(job->addr, hs->cur.addr, sizeof job->addr);
@@ -681,11 +699,20 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
 static void add_cand(d2k_httpsearch *, const char *);
 static void build_fallback(d2k_httpsearch *);
 
+static int trial_executed(const d2k_httpsearch *hs,const d2k_hs_result *r) {
+    return r->requests_sent>0 && r->requests_sent<=2 &&
+        r->complete_responses<=r->requests_sent &&
+        (unsigned)hs->cur.applied>=r->requests_sent &&
+        r->local_port==hs->cur.proof_sport &&
+        !memcmp(r->local_ip,hs->cur.proof_client,hs->cur.family==6?16:4);
+}
+
 static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now) {
     const char *key = hs->cur.cands[hs->cur.idx];
-    if (!hs->cur.applied) {
-        say(hs, "HTTP %s: «%s» — план не исполнен на проводе (нет APPLIED), кандидат не судим",
-            hs->cur.host, key);
+    if (!trial_executed(hs,r)) {
+        say(hs, "HTTP %s: «%s» — исполнение каждого запроса на потоке зонда не подтверждено "
+            "(APPLIED %d, отправлено запросов %u), кандидат не судим",
+            hs->cur.host, key,hs->cur.applied,r->requests_sent);
         hs->cur.ok = 0;
         hs->cur.idx++;
         next_candidate(hs, now);
@@ -738,6 +765,9 @@ static void next_candidate(d2k_httpsearch *hs, int64_t now) {
     fresh_id(hs->cur.plan_id);
     fresh_id(hs->cur.trial);
     hs->cur.applied = 0;
+    memset(hs->cur.executions,0,sizeof hs->cur.executions);
+    memset(&hs->cur.proof_binding,0,sizeof hs->cur.proof_binding);
+    memset(hs->cur.proof_client,0,sizeof hs->cur.proof_client);
     if (d2k_hs_candidate_text(key, hs->cur.plan_id, text, sizeof text) != 0 ||
         open_job(hs, &job) != 0) {
         say(hs, "HTTP %s: «%s» — сокет зонда не открылся, поиск остановлен", hs->cur.host, key);
@@ -875,6 +905,7 @@ int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t f
 
 int d2k_httpsearch_control(d2k_httpsearch *hs,const d2k_ev *ev,int64_t now) {
     if(!hs || !ev)return 0;
+    if(ev->kind==D2K_EV_APPLIED)return d2k_httpsearch_applied(hs,ev);
     if(ev->kind==D2K_EV_ACK && ev->code==D2K_CMD_SET_NAME_BOUND)
         d2k_httpsearch_install_ack(hs,ev->trial_id,((ev->num>>8)&0xffu)==1u,&ev->execution_binding);
     if(ev->kind==D2K_EV_HTTP_RESPONSE && (ev->code==1 || ev->code==2) &&
@@ -964,14 +995,31 @@ void d2k_httpsearch_ack(d2k_httpsearch *hs, const uint8_t trial[16], int ok, int
     hs->cur.deadline = now + (int64_t)d2k_hs_probe_ms * 3;
 }
 
-void d2k_httpsearch_applied(d2k_httpsearch *hs, const uint8_t plan_id[16]) {
-    if (!hs || (hs->cur.phase != PH_RUN && hs->cur.phase != PH_APPLIED) ||
-        memcmp(plan_id, hs->cur.plan_id, 16) != 0) { return; }
-    hs->cur.applied = 1;
-    if (hs->cur.phase == PH_APPLIED) {
+int d2k_httpsearch_applied(d2k_httpsearch *hs, const d2k_ev *ev) {
+    if (!hs || !ev || ev->kind!=D2K_EV_APPLIED ||
+        (hs->cur.phase != PH_RUN && hs->cur.phase != PH_APPLIED) ||
+        ev->transport!=6 || ev->family!=hs->cur.family || !ev->execution_id ||
+        memcmp(ev->plan_id,hs->cur.plan_id,16) || memcmp(ev->trial_id,hs->cur.trial,16) ||
+        !d2k_binding_known(&ev->execution_binding) ||
+        ev->execution_binding.kind!=D2K_BIND_NAME || !ev->execution_binding.temporary ||
+        ev->execution_binding.family!=hs->cur.family || ev->execution_binding.shape!=D2K_PLAN_SHAPE_HTTP) return 0;
+    size_t n=hs->cur.family==6?16:4;
+    const uint8_t *client=NULL;
+    if(ev->high_port==80 && ev->low_port==hs->cur.proof_sport && !memcmp(ev->high_ip,hs->cur.addr,n))client=ev->low_ip;
+    else if(ev->low_port==80 && ev->high_port==hs->cur.proof_sport && !memcmp(ev->low_ip,hs->cur.addr,n))client=ev->high_ip;
+    if(!client)return 0;
+    if(hs->cur.applied && (!d2k_binding_equal(&hs->cur.proof_binding,&ev->execution_binding) ||
+                           memcmp(client,hs->cur.proof_client,n)))return 0;
+    for(int i=0;i<hs->cur.applied;i++)if(hs->cur.executions[i]==ev->execution_id)return 0;
+    if(hs->cur.applied>=2)return 0;
+    hs->cur.proof_binding=ev->execution_binding;
+    memcpy(hs->cur.proof_client,client,n);
+    hs->cur.executions[hs->cur.applied++]=ev->execution_id;
+    if (hs->cur.phase == PH_APPLIED && trial_executed(hs,&hs->cur.pending)) {
         d2k_hs_result r = hs->cur.pending;
         judge_trial(hs, &r, hs->cur.deadline - HS_APPLIED_MS);
     }
+    return 1;
 }
 
 void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now) {
@@ -1004,7 +1052,7 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
     if (hs->cur.phase != PH_RUN) { return; }
     drop_socket(hs);
     drop_probe(hs);
-    if (hs->cur.applied) { judge_trial(hs, r, now); return; }
+    if (trial_executed(hs,r)) { judge_trial(hs, r, now); return; }
     hs->cur.pending = *r;
     hs->cur.phase = PH_APPLIED;
     hs->cur.deadline = now + HS_APPLIED_MS;

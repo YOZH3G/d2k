@@ -252,8 +252,12 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             if (type == D2K_CMD_SET_NAME_PROBE) {
                 memcpy(&sport_be, b + 3u + b[0], 2);
             }
-            rc = d2k_plantab_set_name_family(tab, b + 1, b[0], cx->now_ns, p,
-                                            b[1u + b[0]], sport_be, b[2u + b[0]]);
+            if (type == D2K_CMD_SET_NAME_PROBE)
+                rc = d2k_plantab_set_name_trial(tab,b+1,b[0],cx->now_ns,p,
+                    b[1u+b[0]],sport_be,b[2u+b[0]],cx->area_id);
+            else
+                rc = d2k_plantab_set_name_family(tab, b + 1, b[0], cx->now_ns, p,
+                                                b[1u + b[0]], sport_be, b[2u + b[0]]);
         } else {
             rc = d2k_plantab_set_addr_shaped(tab, b + 1, b[0], cx->now_ns, p, b[17]);
         }

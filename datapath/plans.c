@@ -98,6 +98,7 @@ static void bind_context(d2k_plantab *t, d2k_plan *p, uint8_t kind,
     p->binding_generation = t->next_binding == UINT64_MAX ? 0 : ++t->next_binding;
     p->binding_kind = kind; p->binding_family = family;
     p->binding_shape = shape; p->binding_temporary = temporary != 0;
+    memset(p->binding_trial_id,0,sizeof p->binding_trial_id);
 }
 
 d2k_plantab *d2k_plantab_new(size_t cap) {
@@ -1205,4 +1206,20 @@ int d2k_plantab_binding(const d2k_plantab *t, const d2k_plan *p, d2k_binding_con
     out->shape = p->binding_shape; out->temporary = p->binding_temporary;
     memcpy(out->epoch, t->epoch, sizeof out->epoch);
     return 1;
+}
+
+int d2k_plantab_set_name_trial(d2k_plantab *t, const uint8_t *name, size_t len,
+    uint64_t now_ns, d2k_plan *p, uint8_t shape, uint16_t sport_be, uint8_t family,
+    const uint8_t trial_id[D2K_TRIAL_ID_LEN]) {
+    /* Legacy callers carry an all-zero token: install, but never invent proof. */
+    if (!sport_be || !trial_id) { d2k_plan_free(p); return -2; }
+    int rc = d2k_plantab_set_name_family(t,name,len,now_ns,p,shape,sport_be,family);
+    if (!rc) memcpy(p->binding_trial_id,trial_id,D2K_TRIAL_ID_LEN);
+    return rc;
+}
+void d2k_plantab_trial(const d2k_plantab *t, const d2k_plan *p,
+                     uint8_t out[D2K_TRIAL_ID_LEN]) {
+    memset(out,0,D2K_TRIAL_ID_LEN);
+    if (t && p && p->binding_owner==t && p->binding_temporary)
+        memcpy(out,p->binding_trial_id,D2K_TRIAL_ID_LEN);
 }

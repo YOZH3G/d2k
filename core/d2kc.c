@@ -677,7 +677,7 @@ int main(int argc, char **argv) {
                     if (g_hs && ev.kind == D2K_EV_ACK && ev.code == D2K_CMD_SET_NAME_PROBE) {
                         d2k_httpsearch_ack(g_hs, ev.trial_id, ((ev.num >> 8) & 0xffu) == 1u, now_ms());
                     } else if (g_hs && ev.kind == D2K_EV_APPLIED) {
-                        d2k_httpsearch_applied(g_hs, ev.plan_id);
+                        (void)d2k_httpsearch_control(g_hs,&ev,now_ms());
                     }
                     switch (ev.kind) {
                     case D2K_EV_PROTO:

@@ -175,6 +175,10 @@ static d2k_hs_result keepalive_path(const char *first,const char *second,const c
     snprintf(job.host,sizeof job.host,"target.example");
     if(path)snprintf(job.repeat_path,sizeof job.repeat_path,"%s",path);
     d2k_hs_result r;d2k_hs_probe_run(&job,&r);
+    struct sockaddr_in local={0};socklen_t ll=sizeof local;
+    CHECK(!getsockname(job.fd,(struct sockaddr *)&local,&ll) &&
+        r.local_port==ntohs(local.sin_port) && !memcmp(r.local_ip,&local.sin_addr,4),
+        "probe returns its actual connected socket identity");
     close(job.fd);pthread_join(th,NULL);close(v.fd);
     if(path)CHECK(v.matched,"actual second socket request must retain observed path");
     d2k_hs_probe_port=80;d2k_hs_probe_ms=6000;return r;
@@ -294,9 +298,10 @@ static d2k_hs_ops ops_of(fake *f) {
     return o;
 }
 
-static d2k_hs_result res(d2k_hs_answer a) {
+static d2k_hs_result res(fake *f,d2k_hs_answer a) {
     d2k_hs_result r;
     memset(&r, 0, sizeof r);
+    r.requests_sent=2;r.local_ip[0]=127;r.local_ip[3]=1;r.local_port=ntohs(f->sport);
     r.answer = a; r.rtt_us = 98000; r.reply_us = a == D2K_HS_INJECTED ? 700 : 99000;
 #ifdef D2K_HS_KEEPALIVE_PROOF
     r.complete_responses = a == D2K_HS_REAL ? 2 : 0;
@@ -306,13 +311,29 @@ static d2k_hs_result res(d2k_hs_answer a) {
 
 static const uint8_t IP[16] = {37, 221, 67, 160};
 
+static d2k_ev applied_event(const fake *f,uint64_t execution) {
+    d2k_ev e={0};e.kind=D2K_EV_APPLIED;e.family=f->job.family;e.transport=6;
+    e.low_ip[0]=127;e.low_ip[3]=1;memcpy(e.high_ip,f->job.addr,16);
+    e.low_port=ntohs(f->sport);e.high_port=80;
+    memcpy(e.plan_id,f->plan_id,16);memcpy(e.trial_id,f->trial,16);
+    e.execution_id=execution;e.execution_binding.epoch[0]=7;e.execution_binding.generation=1;
+    e.execution_binding.family=e.family;e.execution_binding.kind=D2K_BIND_NAME;
+    e.execution_binding.shape=D2K_PLAN_SHAPE_HTTP;e.execution_binding.temporary=1;
+    return e;
+}
+static void applied_pair(d2k_httpsearch *hs,const fake *f) {
+    d2k_ev e=applied_event(f,1);
+    (void)d2k_httpsearch_control(hs,&e,0);
+    e.execution_id=2;(void)d2k_httpsearch_control(hs,&e,0);
+}
+
 /* Одно испытание: подтверждение, зонд, APPLIED (если applied), ответ. */
 static void trial(d2k_httpsearch *hs, fake *f, int64_t *now, int applied, d2k_hs_answer a) {
     int before = f->start_n;
     d2k_httpsearch_ack(hs, f->trial, 1, *now += 10);
     CHECK(f->start_n == before + 1 && f->job.fd >= 100, "после подтверждения зонд не запущен своим сокетом");
-    if (applied) { d2k_httpsearch_applied(hs, f->plan_id); }
-    d2k_hs_result r = res(a);
+    if (applied) { applied_pair(hs,f); }
+    d2k_hs_result r = res(f,a);
     r.seq = f->job.seq;
     r.fd = f->job.fd;
     d2k_httpsearch_result(hs, &r, *now += 100);
@@ -327,7 +348,7 @@ static void test_search(void) {
     int64_t now = 1000;
     d2k_httpsearch_portal(hs, "www.fast-torrent.ru", 4, IP, now);
     CHECK(f.start_n == 1 && f.set_probe_n == 0, "база: зонд без плана не запущен");
-    d2k_hs_result r = res(D2K_HS_INJECTED);
+    d2k_hs_result r = res(&f,D2K_HS_INJECTED);
     r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     /* Вопрос 1 — разрез Host. */
@@ -346,7 +367,8 @@ static void test_search(void) {
     CHECK(f.set_plan_n == 0 && f.set_probe_n == 2, "кандидат без исполнения судим до срока APPLIED");
     d2k_httpsearch_tick(hs, now += 1000);
     CHECK(f.set_plan_n == 0, "кандидат без исполнения на проводе подтверждён");
-    CHECK(strstr(f.said, "не исполнен") != NULL, "неисполнение не названо");
+    CHECK(strstr(f.said, "исполнение каждого запроса на потоке зонда не подтверждено") != NULL,
+          "missing execution proof remains unknown");
     /* Вопрос 3 — приманка с испорченной суммой. Отказ датапата — тоже не суд. */
     CHECK(f.set_probe_n == 3 && strstr(f.last_probe_plan, "badsum"), "третий вопрос — не приманка badsum");
     d2k_httpsearch_ack(hs, f.trial, 0, now += 10);
@@ -369,7 +391,7 @@ static void test_search(void) {
     /* Второе имя: сначала свой подтверждённый план. */
     int sp = f.set_probe_n;
     d2k_httpsearch_portal(hs, "rutracker.org", 4, IP, now += 1000);
-    r = res(D2K_HS_INJECTED);
+    r = res(&f,D2K_HS_INJECTED);
     r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     CHECK(f.set_probe_n == sp + 1 && strstr(f.last_probe_plan, "seqshift"),
@@ -381,7 +403,7 @@ static void test_search(void) {
     /* База без вставки — блокировка не воспроизводится, вопросов нет. */
     sp = f.set_probe_n;
     d2k_httpsearch_portal(hs, "free.example", 4, IP, now += 1000);
-    r = res(D2K_HS_REAL);
+    r = res(&f,D2K_HS_REAL);
     r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     CHECK(f.set_probe_n == sp && !d2k_httpsearch_busy(hs) && strstr(f.said, "не воспроизвод"),
@@ -389,7 +411,7 @@ static void test_search(void) {
     /* Вставка по имени с планом — перепроверка: план испытан первым. */
     sp = f.set_probe_n;
     d2k_httpsearch_portal(hs, "rutracker.org", 4, IP, now += D2K_HS_RECHECK_MS + 1);
-    r = res(D2K_HS_INJECTED);
+    r = res(&f,D2K_HS_INJECTED);
     r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     CHECK(f.set_probe_n == sp + 1 && strstr(f.last_probe_plan, "seqshift"), "перепроверка не начата своим планом");
@@ -403,7 +425,7 @@ static void test_search(void) {
 
     /* Сроки: нет подтверждения — проба снята, следующий кандидат. */
     d2k_httpsearch_portal(hs, "slow.example", 4, IP, now += 1000);
-    r = res(D2K_HS_INJECTED);
+    r = res(&f,D2K_HS_INJECTED);
     r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     int dp = f.del_probe_n, spn = f.set_probe_n;
@@ -415,7 +437,7 @@ static void test_search(void) {
 
 /* Ревью I-2: неизмеренный поиск не снимает план и не ставит часовую паузу. */
 static void base_injected(d2k_httpsearch *hs, fake *f, int64_t *now) {
-    d2k_hs_result r = res(D2K_HS_INJECTED);
+    d2k_hs_result r = res(f,D2K_HS_INJECTED);
     r.seq = f->job.seq; r.fd = f->job.fd;
     d2k_httpsearch_result(hs, &r, *now += 100);
 }
@@ -515,7 +537,7 @@ static void test_stale_result(void) {
     d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
     int64_t now = 1000;
     d2k_httpsearch_portal(hs, "d.example", 4, IP, now);
-    d2k_hs_result r = res(D2K_HS_INJECTED);
+    d2k_hs_result r = res(&f,D2K_HS_INJECTED);
     r.seq = f.job.seq + 7; r.fd = 999;
     int cl = f.close_n;
     d2k_httpsearch_result(hs, &r, now += 100);
@@ -533,7 +555,7 @@ static void test_persist(void) {
     d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
     int64_t now = 1000;
     d2k_httpsearch_portal(hs, "www.fast-torrent.ru", 6, IP, now);
-    d2k_hs_result r = res(D2K_HS_INJECTED);
+    d2k_hs_result r = res(&f,D2K_HS_INJECTED);
     r.seq = f.job.seq; r.fd = f.job.fd;
     d2k_httpsearch_result(hs, &r, now += 100);
     trial(hs, &f, &now, 1, D2K_HS_REAL);
@@ -581,7 +603,7 @@ static void test_portal_properties(void) {
     d2k_httpsearch *hs=d2k_httpsearch_new(&ops);
     int64_t now=1;
     d2k_httpsearch_portal(hs,"portal-target.example",4,IP,now);
-    d2k_hs_result r=res(D2K_HS_INJECTED); r.seq=f.job.seq; r.fd=f.job.fd;
+    d2k_hs_result r=res(&f,D2K_HS_INJECTED); r.seq=f.job.seq; r.fd=f.job.fd;
     d2k_httpsearch_result(hs,&r,++now);
     CHECK(strstr(f.last_probe_plan,"split sni_middle") && !strstr(f.last_probe_plan,"fake "),"property: split control");
     trial(hs,&f,&now,1,D2K_HS_SILENT);
@@ -612,8 +634,8 @@ static void test_single_response_not_confirmation(void) {
     fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
     d2k_httpsearch_portal(hs,"short.example",4,IP,now);base_injected(hs,&f,&now);
     for(int i=0;i<2;i++) {
-        d2k_httpsearch_ack(hs,f.trial,1,now+=10);d2k_httpsearch_applied(hs,f.plan_id);
-        d2k_hs_result r=res(D2K_HS_REAL);r.complete_responses=1;r.fd=f.job.fd;r.seq=f.job.seq;
+        d2k_httpsearch_ack(hs,f.trial,1,now+=10);applied_pair(hs,&f);
+        d2k_hs_result r=res(&f,D2K_HS_REAL);r.complete_responses=1;r.fd=f.job.fd;r.seq=f.job.seq;
         d2k_httpsearch_result(hs,&r,now+=100);
     }
     CHECK(!f.set_plan_n,"two fresh single responses do not prove keepalive");
@@ -715,7 +737,7 @@ static void test_bound_failure(void) {
     d2k_httpsearch_ack(hs,f.trial,1,now+=10);
     CHECK(!strcmp(f.job.repeat_path,"/False/"),"bound observed path must reach candidate probe");
     /* Finish this already started candidate before using the trial helper. */
-    d2k_httpsearch_applied(hs,f.plan_id);d2k_hs_result first=res(D2K_HS_REAL);first.fd=f.job.fd;first.seq=f.job.seq;
+    applied_pair(hs,&f);d2k_hs_result first=res(&f,D2K_HS_REAL);first.fd=f.job.fd;first.seq=f.job.seq;
     d2k_httpsearch_result(hs,&first,now+=100);
     CHECK(strstr(f.last_probe_plan,"split ")!=NULL,"revoked old plan remains first hypothesis");
     int64_t old_request=now;
@@ -748,7 +770,87 @@ static void test_missing_repro_context(void) {
     }
 }
 
+/* An APPLIED from just the first request is not proof for the second. */
+static void test_each_request_execution(void) {
+    fake f={0};d2k_hs_ops ops=ops_of(&f);
+    d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
+    d2k_httpsearch_portal(hs,"execution.example",4,IP,now);
+    base_injected(hs,&f,&now);
+    for(int i=0;i<2;i++) {
+        d2k_httpsearch_ack(hs,f.trial,1,now+=10);
+        d2k_ev e=applied_event(&f,1);(void)d2k_httpsearch_control(hs,&e,now);
+        d2k_hs_result r=res(&f,D2K_HS_REAL);r.fd=f.job.fd;r.seq=f.job.seq;
+        d2k_httpsearch_result(hs,&r,now+=100);
+        d2k_httpsearch_tick(hs,now+=501);
+    }
+    CHECK(!f.set_plan_n,"one request execution cannot confirm two-response trials");
+    d2k_httpsearch_free(hs);
+    /* A portal on the first request stops the probe: do not demand execution
+       of a second request that was never sent to classify this negative. */
+    memset(&f,0,sizeof f);ops=ops_of(&f);hs=d2k_httpsearch_new(&ops);now=1;
+    d2k_httpsearch_portal(hs,"execution.example",4,IP,now);base_injected(hs,&f,&now);
+    d2k_httpsearch_ack(hs,f.trial,1,++now);
+    d2k_ev first=applied_event(&f,1);(void)d2k_httpsearch_control(hs,&first,now);
+    d2k_hs_result portal=res(&f,D2K_HS_INJECTED);
+    portal.requests_sent=1;portal.fd=f.job.fd;portal.seq=f.job.seq;
+    d2k_httpsearch_result(hs,&portal,++now);
+    CHECK(f.set_probe_n==2&&strstr(f.last_probe_plan,"fake")&&!f.set_plan_n,
+          "first-request portal is measured negative without unsent second execution");
+    d2k_httpsearch_free(hs);
+}
+
+static void test_execution_identity(void) {
+    for(int family=4;family<=6;family+=2) for(int variant=0;variant<18;variant++) {
+        fake f={0};d2k_hs_ops ops=ops_of(&f);
+        d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
+        d2k_httpsearch_portal(hs,"identity.example",(uint8_t)family,IP,now);
+        base_injected(hs,&f,&now);
+        for(int attempt=0;attempt<2;attempt++) {
+            d2k_httpsearch_ack(hs,f.trial,1,now+=10);
+            d2k_ev e=applied_event(&f,1);
+            CHECK(d2k_httpsearch_control(hs,&e,now)==1,"first exact execution accepted");
+            e.execution_id=2;
+            switch(variant) {
+            case 0:e.trial_id[0]^=1;break;
+            case 1:e.plan_id[0]^=1;break;
+            case 2:e.low_port++;break;
+            case 3:e.high_ip[0]^=1;break;
+            case 4:e.transport=17;break;
+            case 5:e.family=(uint8_t)(family==4?6:4);break;
+            case 6:e.execution_id=0;break;
+            case 7:memset(e.execution_binding.epoch,0,16);break;
+            case 8:e.execution_binding.generation=0;break;
+            case 9:e.execution_binding.temporary=0;break;
+            case 10:e.execution_binding.kind=D2K_BIND_ADDR;break;
+            case 11:e.execution_binding.shape=D2K_PLAN_SHAPE_LEGACY;break;
+            case 12:e.execution_id=1;break; /* replay of first request */
+            case 13:e.execution_binding.generation++;break;
+            case 14:e.low_ip[0]^=1;break;
+            default:break;
+            }
+            d2k_hs_result r=res(&f,D2K_HS_REAL);r.fd=f.job.fd;r.seq=f.job.seq;
+            if(variant==15)r.local_ip[0]^=1;
+            if(variant==16)r.local_port++;
+            if(variant==17) { /* result/DEL_PROBE may precede the last APPLIED */
+                d2k_httpsearch_result(hs,&r,now+=100);
+                CHECK(!f.set_plan_n,"one execution still pending after result");
+                uint8_t ip[16];memcpy(ip,e.low_ip,16);memcpy(e.low_ip,e.high_ip,16);memcpy(e.high_ip,ip,16);
+                uint16_t port=e.low_port;e.low_port=e.high_port;e.high_port=port;
+                CHECK(d2k_httpsearch_control(hs,&e,now)==1,"late execution matches reversed canonical endpoints");
+            } else {
+                CHECK(d2k_httpsearch_control(hs,&e,now)==(variant>=15),"foreign or duplicate execution rejected");
+                d2k_httpsearch_result(hs,&r,now+=100);
+                d2k_httpsearch_tick(hs,now+=501);
+            }
+        }
+        CHECK(f.set_plan_n==(variant==17),"only two exact executions on actual probe socket confirm");
+        d2k_httpsearch_free(hs);
+    }
+}
+
 int main(void) {
+    test_execution_identity();
+    test_each_request_execution();
 #ifdef D2K_HS_KEEPALIVE_PROOF
     test_missing_repro_context();
     test_failed_reinstall_keeps_owner();
