@@ -252,6 +252,19 @@ static int budget_checks(void) {
             fprintf(stderr, "budget 404 cut=%d: budget %d pk %u req %u [%s]\n", cut, r.budget,
                     r.budget_packets, r.budget_requests, r.budget_note); fails++;
         }
+        /* ПОРОГ ОБЯЗАН БЫТЬ В СООБЩЕНИИ ЦЕЛИКОМ. Поле 12.10.2026: текст
+           кириллический, по два байта на символ, и при коротком буфере он
+           обрезался посреди слова — 30 с лишним строк отказа по
+           www.userscript.zone читались как «из нужных» без самого числа, и
+           отказ кандидата нечем было проверить по журналу. */
+        if (cut) {
+            char need[32];
+            snprintf(need, sizeof need, "из нужных %u", r.budget_need);
+            if (!strstr(r.budget_note, need)) {
+                fprintf(stderr, "budget note truncated, no \"%s\": [%s]\n",
+                        need, r.budget_note); fails++;
+            }
+        }
     }
     /* (3) Keep-alive не дают: Connection: close в ответе, либо сервер закрыл
        поток после первого ответа — «не применимо», уровень прежний. */
