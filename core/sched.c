@@ -950,6 +950,15 @@ typedef struct {
     char       vol_ip[INET6_ADDRSTRLEN];
     char       vol_path[512];
     char       measure_path[512]; /* selected before worker start, never guessed from ciphertext */
+    /* ВТОРОЙ УЖЕ НАБЛЮДАВШИЙСЯ ПУБЛИЧНЫЙ ПУТЬ ЭТОГО ИМЕНИ (задача 26): на него
+       уходит ОДИН повтор замера, когда по measure_path мерить было нечем
+       (завершённый ответ меньше измеряемой полосы). Хост, отдающий 403/401 на
+       любой путь, своих ресурсов не назовёт никогда — HTML-ссылки verify.c
+       собирает только из завершённого 2xx text/html, — поэтому путь берётся из
+       памяти планировщика, из уже виденного по этой цели. Пусто — другого
+       НАБЛЮДАВШЕГОСЯ пути нет, и выдумывать его нечем. Выбирается до пуска
+       потока, вместе с measure_path: память планировщика — не его дело. */
+    char       measure_alt[512];
     int        ech_offer;
     int        ech_trial; /* failed baseline permits hypotheses, not a DPI verdict */
     int        ech_grease;     /* ECH offer оказался GREASE: обычный путь по имени */
@@ -1181,7 +1190,10 @@ struct d2k_sched {
     struct { char key[300]; int64_t until_ms; } quiet[SCHED_QUIET_SLOTS];
     size_t       quiet_next;
     quic_deny_slot quic_deny[SCHED_QUIC_DENY_SLOTS];
-    struct { d2k_resource ref; int64_t expires_ms; } resources[8];
+    /* proven — обрыв на этом пути ИЗМЕРЕН (d2k_vol_result.measured_path), а не
+       только упомянут в чужом HTML: такой путь спрашивается первым и не
+       вытесняется упоминанием (задача 26). */
+    struct { d2k_resource ref; int64_t expires_ms; int proven; } resources[8];
     size_t resource_next;
     struct { char name[256]; uint8_t bytes[2048]; size_t len;
              uint8_t family; int64_t observed_ms; } ech_inputs[8];
@@ -2211,6 +2223,32 @@ static void worker_volume(d2k_sched *s, task *t, d2k_hello trig) {
                                      tls12, trig.len, s->measure_mark, t->measure_path)
             : d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80,
                                 tls12, trig.len, s->measure_mark);
+        /* МЕРИТЬ БЫЛО НЕЧЕМ, А САМ ЭТОТ ХОСТ ПУТИ НЕ НАЗОВЁТ. Завершённый
+           ответ меньше измеряемой полосы — не отрицание обрыва, а отсутствие
+           измерения (rx_short). Подсказку из ответа зонд уже спросил; у хоста,
+           который на любой путь отдаёт 403/401, её не будет никогда — ссылки
+           собираются только из завершённого 2xx text/html. Остаётся то, что
+           УЖЕ НАБЛЮДАЛОСЬ по этой цели (measure_alt, из памяти планировщика):
+           один повтор по названной причине, не перебор. */
+        if (!t->vol_measured.rx_cut && t->vol_measured.rx_short &&
+            t->measure_alt[0] && strcmp(t->measure_alt, t->measure_path)) {
+            say(s, "по %s по %s мерить было нечем (завершённый ответ %llu байт); "
+                   "повторяю замер по уже наблюдавшемуся %s",
+                t->name, t->measure_path[0] ? t->measure_path : "/",
+                (unsigned long long)t->vol_measured.rx_short_bytes, t->measure_alt);
+            d2k_vol_result alt = d2k_sched_vol_path_hook(t->ip, t->port, t->name,
+                t->port == 80, tls12, trig.len, s->measure_mark, t->measure_alt);
+            /* Повтор принимается только ДОКАЗАННЫМ обрывом: второй путь, тоже
+               ничего не измеривший, честного «бюджет не проверен» первого не
+               отменяет — та же дисциплина, что у повтора внутри зонда. */
+            if (alt.rx_cut) {
+                t->vol_measured = alt;
+                if (!t->vol_measured.measured_path[0]) {
+                    snprintf(t->vol_measured.measured_path,
+                             sizeof t->vol_measured.measured_path, "%s", t->measure_alt);
+                }
+            }
+        }
         t->vol_done = 1;
         t->vol_tls12 = tls12;
         t->vol_wire = trig.len;
@@ -2221,6 +2259,24 @@ static void worker_volume(d2k_sched *s, task *t, d2k_hello trig) {
             say(s, "по %s объёмный замер TLS %s, hello=%zu: TX %s; RX %s",
                 t->name, tls12 ? "1.2" : "1.3", trig.len,
                 t->vol_measured.reason, t->vol_measured.rx_reason);
+        }
+        /* ДАЛЬШЕ ВСЕ СПРАШИВАЮТ ПУТЬ, НА КОТОРОМ ОБРЫВ ДОКАЗАН. Зонд объёма
+           мог доказать его ПОВТОРОМ по другому публичному пути имени (поле
+           12.10.2026, style.sndcdn.com: на «/» завершённый 403 на 243 байта, а
+           /css/soehne-*.css режется). Если кандидат и привязка останутся на
+           «/», тот же короткий 403 придёт и под планом: доказанный обрыв не
+           станет подтверждённым решением, а следующий эпизод начнёт заново с
+           «/». Вход сохранённого замера переставляется туда же — результат
+           снят ИМЕННО с этого пути, и считать его снятым с «/» значит мерить
+           заново (vol_path, задача 30). */
+        if (t->vol_measured.measured_path[0] &&
+            strcmp(t->vol_measured.measured_path, t->measure_path)) {
+            say(s, "по %s обрыв доказан по %s, а не по «/» — тем же путём идут "
+                   "зонд кандидата и следующий замер",
+                t->name, t->vol_measured.measured_path);
+            snprintf(t->measure_path, sizeof t->measure_path, "%s",
+                     t->vol_measured.measured_path);
+            snprintf(t->vol_path, sizeof t->vol_path, "%s", t->measure_path);
         }
     }
     t->vol = t->vol_measured;
@@ -5689,10 +5745,43 @@ static void remember_resources(d2k_sched *s, const d2k_resource *refs, size_t n)
         size_t slot = 8;
         for (size_t j = 0; j < 8; j++)
             if (!strcmp(s->resources[j].ref.host, refs[i].host)) { slot = j; break; }
+        /* УПОМИНАНИЕ НЕ ВЫТЕСНЯЕТ ИЗМЕРЕННОЕ (задача 26). Слот у хоста один, и
+           прежде любая более поздняя HTML-ссылка затирала путь, на котором
+           обрыв уже ИЗМЕРЕН: следующий эпизод спрашивал упомянутый ресурс (у
+           CDN-хоста — тот же завершённый 403), и доказательство погибало.
+           Истёкшая отметка измерения своё место не держит. */
+        if (slot < 8 && s->resources[slot].proven &&
+            s->resources[slot].expires_ms > s->now_ms &&
+            strcmp(s->resources[slot].ref.path, refs[i].path)) continue;
         if (slot == 8) slot = s->resource_next++ % 8;
         s->resources[slot].ref = refs[i];
+        s->resources[slot].proven = 0;
         s->resources[slot].expires_ms = s->now_ms + 3600000;
     }
+}
+
+/* ПУТЬ ИЗМЕРЕННОГО ОБРЫВА ЖИВЁТ ДОЛЬШЕ ОДНОГО ЭПИЗОДА. В привязку путь
+ * попадает только вместе с подтверждением плана; пока план не подтверждён (или
+ * его ещё ищут), доказанный путь обязан дожить до следующего эпизода здесь,
+ * иначе тот снова попросит «/» и получит у CDN-хоста завершённый 403 на
+ * несколько сотен байт — то есть никакого измерения. Запоминается только
+ * ДОКАЗАННЫЙ обрыв (rx_cut) по имени цели и только путь, проходящий тот же
+ * строгий d2k_resource_path_ok. Адресная цель сюда не попадает: у неё нет
+ * имени, у которого можно спросить публичный ресурс. */
+static void remember_measured_path(d2k_sched *s, const task *t) {
+    if (t->by_addr || !t->name[0] || !t->vol.rx_cut ||
+        !d2k_resource_path_ok(t->vol.measured_path)) return;
+    d2k_resource measured;
+    memset(&measured, 0, sizeof measured);
+    snprintf(measured.host, sizeof measured.host, "%s", t->name);
+    snprintf(measured.path, sizeof measured.path, "%s", t->vol.measured_path);
+    size_t slot = 8;
+    for (size_t j = 0; j < 8; j++)
+        if (!strcmp(s->resources[j].ref.host, measured.host)) { slot = j; break; }
+    if (slot == 8) slot = s->resource_next++ % 8;
+    s->resources[slot].ref = measured;
+    s->resources[slot].proven = 1;
+    s->resources[slot].expires_ms = s->now_ms + 3600000;
 }
 
 static int public_resource_peer(const task *t) {
@@ -5724,15 +5813,40 @@ static void select_resource_path(d2k_sched *s, task *t) {
                 d2k_resource_path_ok(bd->probe_path) &&
                 (!best || best->confirmed < bd->confirmed)) best = bd;
         }
-    if (best) snprintf(t->measure_path, sizeof t->measure_path, "%s", best->probe_path);
-    else for (size_t j = 0; j < 8; j++)
-        if (s->resources[j].expires_ms > s->now_ms &&
-            !strcmp(s->resources[j].ref.host, t->name)) {
-            snprintf(t->measure_path, sizeof t->measure_path, "%s", s->resources[j].ref.path);
-            break;
-        }
-    if (t->measure_path[0]) say(s, "по %s RX и кандидат проверяются по публичному stylesheet %s, не по короткому /",
-                               t->name, t->measure_path);
+    /* ИЗМЕРЕННЫЙ ПУТЬ ПЕРЕД УПОМЯНУТЫМ (задача 26). В памяти лежат ресурсы
+       двух родов: путь, на котором обрыв ИЗМЕРЕН в прошлом эпизоде (proven), и
+       HTML-упоминание — просто ссылка из чужого документа. Снова начинать с
+       «/» или спрашивать упоминание, когда измеренный путь известен, значит
+       выбросить измерение; свидетель подтверждённой привязки идёт впереди
+       обоих — он привязан к плану, который на нём и подтверждали. */
+    const d2k_resource *proven = NULL, *mention = NULL;
+    for (size_t j = 0; j < 8; j++) {
+        if (s->resources[j].expires_ms <= s->now_ms ||
+            strcmp(s->resources[j].ref.host, t->name) ||
+            !d2k_resource_path_ok(s->resources[j].ref.path)) continue;
+        if (s->resources[j].proven) { if (!proven) proven = &s->resources[j].ref; }
+        else if (!mention) mention = &s->resources[j].ref;
+    }
+    const char *first = best ? best->probe_path
+                      : proven ? proven->path
+                      : mention ? mention->path : NULL;
+    if (!first) return;
+    snprintf(t->measure_path, sizeof t->measure_path, "%s", first);
+    /* Запас пересобирается вместе с основным путём: память могла с прошлого
+       раза измениться, и старый запас говорил бы о ней неправду. */
+    t->measure_alt[0] = '\0';
+    /* ЗАПАСНОЙ УЖЕ НАБЛЮДАВШИЙСЯ ПУТЬ (задача 26, п.4): если по первому мерить
+       будет нечем, повтор спросит его — и только его. Это не перебор: оба
+       пути реально наблюдались у этой цели, второго источника нет. */
+    if (proven && strcmp(proven->path, t->measure_path))
+        snprintf(t->measure_alt, sizeof t->measure_alt, "%s", proven->path);
+    else if (mention && strcmp(mention->path, t->measure_path))
+        snprintf(t->measure_alt, sizeof t->measure_alt, "%s", mention->path);
+    say(s, "по %s RX и кандидат проверяются по публичному stylesheet %s, не по короткому /",
+        t->name, t->measure_path);
+    if (t->measure_alt[0])
+        say(s, "по %s в запасе уже наблюдавшийся %s: по нему пойдёт повтор, если по "
+               "%s мерить будет нечем", t->name, t->measure_alt, t->measure_path);
 }
 
 /* Под s->mu. 1 — у имени ECH-конфигурация с этим public_name, 0 — свежий
@@ -9015,6 +9129,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 task_done(s, t); moved++; continue;
             }
             remember_resources(s, t->vol.resources, t->vol.n_resources);
+            remember_measured_path(s, t);
             /* ПРОГОН, ОСТАНОВЛЕННЫЙ РАДИ СНИМКА, — НЕ ВЕРДИКТ (задача 31).
                Поле 02.10.2026, i.ytimg.com: брошенный на первом зонде
                классификатор («о цели не сказано ничего») ушёл в разбор

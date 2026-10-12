@@ -236,6 +236,10 @@ static uint64_t vol_rx_short_bytes;   /* его тело */
    оборвалось, второе дошло целиком. Иначе повтор «переоткрывал» бы обрыв сам,
    и потеря доказательства в тесте была бы не видна. */
 static int vol_rx_cut_first_only;
+/* ЗАДАЧА 26: путь, НА КОТОРОМ зонд доказал обрыв. Повтор зонда уходит на
+   другой публичный путь имени (resource_retry_path), и наверх путь идёт полем
+   результата. Пусто — зонд путь не называл (мерил «/»). */
+static const char *vol_measured_path;
 static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
                                int plain, int tls12, size_t hello_wire,
                                uint32_t mark) {
@@ -267,6 +271,9 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
         r.n_resources = 1;
         strcpy(r.resources[0].host, "assets.example");
         strcpy(r.resources[0].path, "/public/app.min.css");
+    }
+    if (rx_cut && vol_measured_path) {
+        snprintf(r.measured_path, sizeof r.measured_path, "%s", vol_measured_path);
     }
     snprintf(r.reason, sizeof r.reason, "подменённая проба объёма");
     return r;
@@ -473,6 +480,23 @@ static d2k_vol_result stub_resource_volume(const char *ip, uint16_t port,
           "volume worker changed resource context");
     d2k_vol_result r = stub_vol(ip, port, name, plain, tls12, wire, mark);
     r.rx_cut = r.rx_compressed_complete = 1;
+    return r;
+}
+
+/* Зонд кандидата, который НЕ сверяет путь, а запоминает его: предмет задачи 26
+   — именно то, каким путём планировщик проверяет воздействие. */
+static int proven_ver_calls;
+static char proven_ver_path[512];
+static d2k_ver_result stub_proven_verify(int fd, const char *ip, uint16_t port,
+    const char *name, int deadline, size_t wire, int tls12, int encoding,
+    uint32_t mark, const char *path) {
+    (void)encoding; (void)mark;
+    proven_ver_calls++;
+    snprintf(proven_ver_path, sizeof proven_ver_path, "%s", path ? path : "");
+    d2k_ver_result r = stub_ver(fd, ip, port, 6, name, deadline, wire,
+                                tls12 ? D2K_SHAPE_LEGACY : D2K_SHAPE_MODERN);
+    r.body_complete = r.body_framing_valid = r.body_has_length = 1;
+    r.body_bytes = r.body_expected = 40000;
     return r;
 }
 
@@ -8982,6 +9006,64 @@ rx_volume_tests:
         d2k_sched_vol_path_hook = d2k_volume_probe_path;
         d2k_sched_path_ver_hook = d2k_verify_probe_path_on;
         vol_rx_cut = 0;
+    }
+    /* ЗАДАЧА 26: ИЗМЕРЕННЫЙ ПУТЬ ОБЪЁМА ДОХОДИТ ДО ПЛАНИРОВЩИКА. Поле
+       12.10.2026, style.sndcdn.com: на «/» хост отдаёт завершённый 403 на
+       несколько сотен байт, и обрыв зонд доказывает ПОВТОРОМ по другому
+       публичному пути имени. Если кандидата проверять по «/», тот же короткий
+       403 придёт и под планом: доказанный обрыв не превратится в
+       подтверждённое решение, а путь не попадёт в привязку и следующий эпизод
+       начнёт заново с «/». Подсказки от самого хоста здесь не было и быть не
+       может — путь приносит результат замера (d2k_vol_result.measured_path). */
+    {
+        d2k_catalog c = {0};
+        uint16_t saved = g_server_port; g_server_port = 443;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        d2k_sched_path_ver_hook = stub_proven_verify;
+        proven_ver_calls = 0; proven_ver_path[0] = '\0';
+        vol_measured_path = "/css/soehne-web.css";
+        vol_rx_cut = 1; vol_rx_packet_only = 0; vol_rx_packets = 0;
+        vol_rx_at_kb = 15; vol_answer = D2K_VOL_PASSED;
+        tcp_answer = D2K_V_CLEAR; tcp_calls = 0;
+        ver_calls = 0; ver_fail_first = 0; ver_answer = D2K_VER_APPLICATION;
+        ver_answer_port = 40390;
+        d2k_ev h = ev_hello(6, 40390, "proven.example"), sh;
+        inet_pton(AF_INET, "8.8.8.8", h.low_ip);
+        d2k_sched_event(s, &h);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
+              "proven-path TLS fixture");
+        d2k_sched_event(s, &sh);
+        d2k_ev su = h; su.kind = D2K_EV_SUSPECT; su.code = D2K_SUSPECT_FIN_RETRY;
+        d2k_sched_event(s, &su);
+        size_t installed = 0;
+        for (int i = 0; i < 2000 && !total_bindings(&c); i++) {
+            tick_once(s);
+            size_t n = sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+            if (n > installed) {
+                installed = n;
+                d2k_ev ap = ev_applied(6, 40390);
+                memcpy(ap.low_ip, h.low_ip, 4);
+                d2k_sched_event(s, &ap);
+            }
+        }
+        CHECK(proven_ver_calls >= 1 && !strcmp(proven_ver_path, "/css/soehne-web.css"),
+              "кандидат проверяется не по доказанному пути");
+        if (strcmp(proven_ver_path, "/css/soehne-web.css"))
+            fprintf(stderr, "зонд кандидата по пути \"%s\" (обращений по пути %d, "
+                            "обычным зондом %d)\n",
+                    proven_ver_path, proven_ver_calls, ver_calls);
+        CHECK(total_bindings(&c) == 1 &&
+              !strcmp(c.boxes[0].binds[0].probe_path, "/css/soehne-web.css"),
+              "доказанный путь не сохранён в привязке");
+        if (total_bindings(&c) == 1 &&
+            strcmp(c.boxes[0].binds[0].probe_path, "/css/soehne-web.css"))
+            fprintf(stderr, "привязка держит probe_path=\"%s\"\n",
+                    c.boxes[0].binds[0].probe_path);
+        d2k_sched_free(s); d2k_catalog_free(&c); g_server_port = saved;
+        d2k_sched_path_ver_hook = d2k_verify_probe_path_on;
+        vol_measured_path = NULL; vol_rx_cut = 0; vol_rx_at_kb = 24;
+        vol_answer = D2K_VOL_PASSED;
     }
     /* Задача 39, раунд 2: сохранённый путь подтверждённой QUIC-привязки
        читается обратно, когда HTML-подсказки TCP уже нет (новый

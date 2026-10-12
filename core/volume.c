@@ -513,6 +513,14 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
              a.rx_tls_record_missing, b.rx_tls_record_missing, gz.rx_tls_record_missing,
              settled_by_third);
     (void)d2k_volume_rx_evidence(&a, &b, &gz, res);
+    /* ПУТЬ ИЗМЕРЕНИЯ ИДЁТ НАВЕРХ ПОЛЕМ, А НЕ ТОЛЬКО СТРОКОЙ ЖУРНАЛА. Обрыв
+       доказан на том пути, который спрашивал ЭТОТ замер (у повтора он свой —
+       из подсказки): кандидата и следующий эпизод надо отправить туда же,
+       иначе «/» того же хоста отдаст короткий 403 и подтвердить план объёмом
+       будет нечем. Умолчательный «/» не называем — его знает вызывающий. */
+    if (res->rx_cut && path && path[0]) {
+        snprintf(res->measured_path, sizeof res->measured_path, "%s", path);
+    }
     d2k_verify_close(&a);
     d2k_verify_close(&b);
     d2k_verify_close(&gz);

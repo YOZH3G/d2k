@@ -179,6 +179,13 @@ int main(void) {
             : d2k_volume_probe(ip, port, "context.test", 0, legacy, expected_wire, 0x2f);
         CHECK(r.verdict == D2K_VOL_UNREACHABLE && r.rx_cut &&
               baseline_calls == 3 && r.rx_at_kb == 23);
+        /* Задача 26: доказанный обрыв обязан назвать свой путь наверх. Мерили
+           по названному ресурсу — он и в результате; мерили по «/» — поле
+           пусто, выдумывать «/» нечем. */
+        CHECK(resource ? !strcmp(r.measured_path, expected_path) : !r.measured_path[0]);
+        if (resource && strcmp(r.measured_path, expected_path))
+            fprintf(stderr, "measured_path=\"%s\", ожидался \"%s\"\n",
+                    r.measured_path, expected_path);
         close(fd);
     }
     }
@@ -251,6 +258,14 @@ int main(void) {
         CHECK(strstr(hinted.rx_reason, "/css/soehne-web.css") != NULL);
         CHECK(strstr(hinted.rx_reason, "15985/15968") != NULL);
         CHECK(strstr(hinted.rx_reason, "243") != NULL);
+        /* ЗАДАЧА 26: ПУТЬ ПОВТОРА — ЧАСТЬ ИЗМЕРЕНИЯ, А НЕ ТОЛЬКО ЖУРНАЛА.
+           Причина читается человеком; наверх путь обязан идти полем, иначе
+           кандидат проверяется по «/» (403, 243 байта) и доказанный обрыв не
+           превращается в подтверждённое решение. */
+        CHECK(!strcmp(hinted.measured_path, "/css/soehne-web.css"));
+        if (strcmp(hinted.measured_path, "/css/soehne-web.css"))
+            fprintf(stderr, "повтор доказал обрыв на /css/soehne-web.css, "
+                            "а measured_path=\"%s\"\n", hinted.measured_path);
         /* Подсказка завершённого ответа по-прежнему уходит планировщику. */
         CHECK(hinted.n_resources == (size_t)code);
     }
@@ -263,6 +278,9 @@ int main(void) {
     CHECK(baseline_calls == 2 && !lost.rx_cut && lost.rx_tls_unavailable);
     CHECK(lost.rx_short && lost.rx_short_bytes == 243);
     CHECK(strstr(lost.rx_reason, "/css/soehne-web.css") != NULL);
+    /* Повтор не измерил ничего — пути измерения нет: спрашивать кандидата по
+       этому пути было бы выдумкой, а не замером. */
+    CHECK(!lost.measured_path[0]);
     /* Подсказанный ресурс дошёл ЦЕЛИКОМ и сам прошёл полосу — это настоящее
        отрицательное измерение, и подменять его непроверенным бюджетом нельзя. */
     retry_outcome = 2; baseline_calls = 0; last_path = NULL;
@@ -270,6 +288,8 @@ int main(void) {
     probe_response_volume(&passed, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
     CHECK(baseline_calls == 2 && !passed.rx_cut && !passed.rx_short);
     CHECK(strstr(passed.rx_reason, "30182") != NULL);
+    /* Отрицательное измерение — тоже не обрыв: пути обрыва нет. */
+    CHECK(!passed.measured_path[0]);
     retry_outcome = 0;
     /* Подсказки нет — честный непроверенный бюджет остаётся как есть, без
        выдумок, и лишнего зонда не заказываем. */
