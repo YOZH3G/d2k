@@ -21,27 +21,6 @@ printf 'printf "executed:%%s\\n" "${D2K_REF:-unset}" >> "$RUN_MARKER"\n' > "$tar
 [ "${DOWNLOAD_FAIL:-0}" = 0 ] || exit 22
 EOF
 chmod +x "$WORK/bin/curl"
-export PATH="$WORK/bin:$PATH"
-for n in 1 2; do
-    command=$(awk -v wanted="$n" '/^```sh$/ {block++; if(block==wanted){getline; print; exit}}' "$ROOT/README.md")
-    [ -n "$command" ] || { echo 'missing documented command' >&2; exit 1; }
-    sh -n -c "$command"
-    rm -f "$RUN_MARKER"
-    if DOWNLOAD_FAIL=1 sh -c "$command"; then echo 'failed download returned success' >&2; exit 1; fi
-    [ ! -e "$RUN_MARKER" ] || { echo 'partial download was executed' >&2; exit 1; }
-    [ ! -e "$(cat "$CURL_TARGET")" ] || { echo 'failed download leaked temp file' >&2; exit 1; }
-    DOWNLOAD_FAIL=0 sh -c "$command"
-    [ -s "$RUN_MARKER" ]
-    [ ! -e "$(cat "$CURL_TARGET")" ]
-    if [ "$n" = 1 ]; then
-        [ "$(cat "$RUN_MARKER")" = executed:main ]
-        [ "$(cat "$CURL_URL")" = https://raw.githubusercontent.com/necronicle/d2k/main/scripts/install.sh ]
-    else
-        [ "$(cat "$CURL_URL")" = https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh ]
-    fi
-done
-# OpenWrt: в образе нет curl — команды через wget (uclient-fetch), с той же
-# защитой от частичной загрузки.
 cat > "$WORK/bin/wget" <<'EOF'
 #!/bin/sh
 while [ "$#" -gt 0 ]; do
@@ -56,25 +35,45 @@ printf 'printf "executed:%%s\\n" "${D2K_REF:-unset}" >> "$RUN_MARKER"\n' > "$tar
 [ "${DOWNLOAD_FAIL:-0}" = 0 ] || exit 1
 EOF
 chmod +x "$WORK/bin/wget"
-wget_blocks=$(awk '/^```sh$/ {getline; if ($0 ~ /wget /) print}' "$ROOT/README.md")
-[ "$(printf '%s\n' "$wget_blocks" | grep -c .)" -eq 2 ] || { echo 'expected two OpenWrt wget commands' >&2; exit 1; }
-n=0
-printf '%s\n' "$wget_blocks" | while IFS= read -r command; do
-    n=$((n + 1))
-    case "$command" in *curl*) echo 'OpenWrt command needs curl' >&2; exit 1 ;; esac
-    sh -n -c "$command"
-    rm -f "$RUN_MARKER"
-    if DOWNLOAD_FAIL=1 sh -c "$command"; then echo 'failed OpenWrt download returned success' >&2; exit 1; fi
-    [ ! -e "$RUN_MARKER" ] || { echo 'partial OpenWrt download was executed' >&2; exit 1; }
-    [ ! -e "$(cat "$CURL_TARGET")" ] || { echo 'failed OpenWrt download leaked temp file' >&2; exit 1; }
-    DOWNLOAD_FAIL=0 sh -c "$command"
-    [ -s "$RUN_MARKER" ]
-    [ ! -e "$(cat "$CURL_TARGET")" ]
-    if [ "$n" = 1 ]; then
-        [ "$(cat "$RUN_MARKER")" = executed:main ]
-        [ "$(cat "$CURL_URL")" = https://raw.githubusercontent.com/necronicle/d2k/main/scripts/install.sh ]
-    else
-        [ "$(cat "$CURL_URL")" = https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh ]
-    fi
+export PATH="$WORK/bin:$PATH"
+
+# КОМАНДЫ ИЩУТСЯ ПО СОДЕРЖИМОМУ, А НЕ ПО НОМЕРУ БЛОКА. Прежняя редакция брала
+# первый и второй блок ```sh и считала их curl-установкой и curl-удалением.
+# Это держалось на порядке разделов README и сломалось, как только установка
+# OpenWrt встала вторым блоком. Требование же не про порядок: КАЖДАЯ
+# документированная однострочная команда обязана запускаться, отвергать
+# неполную загрузку и убирать за собой временный файл. Теперь проверяются все
+# четыре — curl и wget, установка и удаление, — и порядок разделов свободен.
+block_for() {   # $1 — загрузчик (curl|wget), $2 — скрипт (install|uninstall)
+    awk -v tool="$1" -v want="$2" '
+        /^```sh$/ { getline; if ($0 ~ tool " " && $0 ~ "/" want "\\.sh") { print; exit } }
+    ' "$ROOT/README.md"
+}
+
+for tool in curl wget; do
+    for script in install uninstall; do
+        command=$(block_for "$tool" "$script")
+        [ -n "$command" ] || { echo "в README нет команды: $tool $script" >&2; exit 1; }
+        case "$command" in
+            *"$tool"*) ;;
+            *) echo "команда $tool $script использует не тот загрузчик" >&2; exit 1 ;;
+        esac
+        sh -n -c "$command"
+        rm -f "$RUN_MARKER"
+        if DOWNLOAD_FAIL=1 sh -c "$command"; then
+            echo "неудачная загрузка вернула успех: $tool $script" >&2; exit 1
+        fi
+        [ ! -e "$RUN_MARKER" ] || { echo "частичная загрузка исполнена: $tool $script" >&2; exit 1; }
+        [ ! -e "$(cat "$CURL_TARGET")" ] || { echo "неудачная загрузка оставила файл: $tool $script" >&2; exit 1; }
+        DOWNLOAD_FAIL=0 sh -c "$command"
+        [ -s "$RUN_MARKER" ]
+        [ ! -e "$(cat "$CURL_TARGET")" ]
+        [ "$(cat "$CURL_URL")" = "https://raw.githubusercontent.com/necronicle/d2k/main/scripts/$script.sh" ] \
+            || { echo "команда $tool $script тянет не тот адрес" >&2; exit 1; }
+        if [ "$script" = install ]; then
+            [ "$(cat "$RUN_MARKER")" = executed:main ] \
+                || { echo "установка $tool идёт не с ветки main" >&2; exit 1; }
+        fi
+    done
 done
-echo 'README install/uninstall (and OpenWrt wget): execution, failed-download safety and cleanup passed'
+echo 'README install/uninstall (curl и wget): запуск, защита от неполной загрузки и уборка прошли'

@@ -185,11 +185,17 @@ TLS 1.3, QUIC, ECH, IPv4 и IPv6 при этом не смешиваются. У
 
 ## Удаление
 
+Keenetic:
+
 ```sh
 (f=$(mktemp) && curl -fsSL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh -o "$f" && sh "$f"; r=$?; rm -f "$f"; exit "$r")
 ```
 
-На OpenWrt замените `curl -fsSL … -o "$f"` на `wget -q -T 120 -O "$f"`.
+OpenWrt:
+
+```sh
+(f=$(mktemp) && wget -q -T 120 -O "$f" https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh && sh "$f"; r=$?; rm -f "$f"; exit "$r")
+```
 
 Удаление снимает службы, панель, правила D2K, его DNS-записи Instagram,
 конфигурацию, подобранное и ключ Telegram.
