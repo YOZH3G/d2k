@@ -14,7 +14,7 @@ PROBE_IP=149.154.167.99
 
 failures=0
 while :; do
-    [ -x "$DIR/d2k-tg-firewall.sh" ] && "$DIR/d2k-tg-firewall.sh" heal >/dev/null 2>&1 || true
+    if [ -x "$DIR/d2k-tg-firewall.sh" ]; then "$DIR/d2k-tg-firewall.sh" heal >/dev/null 2>&1 || true; fi
     if curl --connect-timeout 8 --max-time 15 -sf -o /dev/null \
         --resolve "core.telegram.org:443:$PROBE_IP" "$PROBE_URL" 2>/dev/null; then
         failures=0

@@ -147,7 +147,7 @@ want 'jump in_rules'
 # Order inside out: exclusions before the first queue rule.
 first_queue=$(printf '%s\n' "$r" | grep -n 'queue num' | head -1 | cut -d: -f1)
 last_return=$(printf '%s\n' "$r" | sed -n '/chain out {/,/^	}/p' | grep -n 'return' | tail -1 | cut -d: -f1)
-[ -n "$last_return" ] && [ -n "$first_queue" ] || fail "cannot locate rules"
+if [ -z "$last_return" ] || [ -z "$first_queue" ]; then fail "cannot locate rules"; fi
 printf '%s\n' "$r" | sed -n '/chain out {/,/^	}/p' | awk '/queue num/{q=1} q && /return/{bad=1} END{exit bad}' \
     || fail "a RETURN after a queue rule in chain out"
 rst=$(table d2k_rst)

@@ -724,7 +724,7 @@ GCC ?= mipsel-unknown-linux-gnu-gcc
 # -I../detect/include — как у настоящего правила test_probe_plan ниже: один
 # тест ядра включает d2k_detect.h, и без этого пути чужой компилятор падает
 # на нём, не дойдя до самих предупреждений.
-gcc-warn: hello_profiles.inc
+gcc-warn: hello_profiles.inc tcp1620_whitelist.inc
 	@for f in $(SRC) d2kask.c $(TESTS:=.c); do \
 		$(GCC) $(CFLAGS) -I../detect/include -c -o /tmp/d2k-core-gccwarn.o $$f || exit 1; \
 	done
