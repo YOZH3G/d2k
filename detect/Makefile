@@ -15,6 +15,12 @@ LDLIBS  ?= -lpthread
 
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
+# Big-endian mips — своим gcc (на Ubuntu это пакет gcc-mips-linux-gnu), если он
+# есть; необязателен ровно как MIPSEL_CC. Порядок байт проверяется ещё и
+# zig-проходом ниже, который установленных цепочек не требует.
+MIPS_CC    ?= mips-unknown-linux-gnu-gcc
+# Та же тройка, что у выпуска (см. scripts/build-target.sh).
+MIPS_BE_ZIG ?= -target mips-linux-musleabi -mcpu=mips32+soft_float
 
 .DEFAULT_GOAL := all
 
@@ -106,12 +112,17 @@ cross:
 	    $(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /tmp/d2k-detect-cross.o $$f || exit 1; \
 	  done; \
 	  rm -f /tmp/d2k-detect-cross.o; \
+	  echo "cross: linux-mips (big-endian)"; \
+	  for f in $(SRC) $(BRIDGE) main.c; do \
+	    $(ZIG) cc $(MIPS_BE_ZIG) $(CFLAGS) -c -o /tmp/d2k-detect-mips.o $$f || exit 1; \
+	  done; \
+	  rm -f /tmp/d2k-detect-mips.o; \
 	else \
-	  echo "cross: zig не найден в $(ZIG) — aarch64 пропущен"; \
+	  echo "cross: zig не найден в $(ZIG) — aarch64 и big-endian mips пропущены"; \
 	fi
-	@# MIPS — настоящим кросс-компилятором, как и в core/: zig для mipsel-musl
-	@# заголовков libc не даёт, а подменять проверку на «собралось где-то ещё»
-	@# значит не проверить ничего.
+	@# MIPS — ещё и настоящими кросс-компиляторами, как в core/: это другой
+	@# компилятор с другими предупреждениями, и «собралось zig'ом» их не
+	@# заменяет. Оба необязательны: не нашлись — сказали и пошли дальше.
 	@if command -v $(MIPSEL_CC) >/dev/null 2>&1; then \
 	  echo "cross: linux-mipsel"; \
 	  for f in $(SRC) $(BRIDGE) main.c; do \
@@ -120,6 +131,15 @@ cross:
 	  rm -f /tmp/d2k-detect-mipsel.o; \
 	else \
 	  echo "cross: $(MIPSEL_CC) не найден — mipsel пропущен"; \
+	fi
+	@if command -v $(MIPS_CC) >/dev/null 2>&1; then \
+	  echo "cross: linux-mips gcc"; \
+	  for f in $(SRC) $(BRIDGE) main.c; do \
+	    $(MIPS_CC) $(CFLAGS) -c -o /tmp/d2k-detect-mips-gcc.o $$f || exit 1; \
+	  done; \
+	  rm -f /tmp/d2k-detect-mips-gcc.o; \
+	else \
+	  echo "cross: $(MIPS_CC) не найден — big-endian mips проверен zig-проходом выше"; \
 	fi
 
 clean:

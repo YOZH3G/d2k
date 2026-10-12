@@ -113,12 +113,22 @@ jobs:
       - name: Инструменты
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc gcc-aarch64-linux-gnu gcc-mipsel-linux-gnu
+          # gcc-mips-linux-gnu — big-endian mips (ath79/ar71xx). Без него обратный
+          # порядок байт не компилировался ни одним заданием CI, и ловушки вроде
+          # «pipe() != 0» (a8a1f31, 12.10.2026) было видно только на выпуске.
+          sudo apt-get install -y -qq gcc gcc-aarch64-linux-gnu gcc-mipsel-linux-gnu gcc-mips-linux-gnu
       - name: Тесты исполнителя планов
         run: make -C datapath check
 
       - name: Перенесённый Поиск по домену — дерево, адаптер и параллельные измерения
         run: make -C detect check
+
+      - name: Измеритель под оба порядка байт mips
+        # Сырой слой измерителя (raw.c) — Linux, и на маке он не компилируется
+        # вовсе: цель check его не видит. Имена цепочек здесь — Ubuntu'шные,
+        # поэтому передаются явно; zig в этом задании нет, и aarch64 цель
+        # пропустит сама, сказав об этом.
+        run: make -C detect cross MIPSEL_CC=mipsel-linux-gnu-gcc MIPS_CC=mips-linux-gnu-gcc
 
       - name: Датапат под целевые арки
         # Непереносимость обязана ловиться в тот день, когда её внесли, а не на
@@ -132,18 +142,18 @@ jobs:
         # оттуда — вместе с ТЕСТАМИ, которых в прежнем списке не было вовсе.
         run: |
           set -eu
-          for cc in gcc aarch64-linux-gnu-gcc mipsel-linux-gnu-gcc; do
+          for cc in gcc aarch64-linux-gnu-gcc mipsel-linux-gnu-gcc mips-linux-gnu-gcc; do
             echo "== $cc =="
             make -C datapath gcc-warn GCC="$cc"
           done
 
-      - name: Измеритель этапа 0 под три арки
+      - name: Измеритель этапа 0 под четыре арки
         # Инструмент замера, а не продуктовый датапат. Собирается здесь ради
         # того же: поймать непереносимость в день внесения.
         run: |
           set -eu
           cd spike/nfqview-c
-          for cc in gcc aarch64-linux-gnu-gcc mipsel-linux-gnu-gcc; do
+          for cc in gcc aarch64-linux-gnu-gcc mipsel-linux-gnu-gcc mips-linux-gnu-gcc; do
             echo "== $cc =="
             "$cc" -O2 -Wall -Wextra -Werror -c -o /tmp/nfqview-$cc.o nfqview.c
           done
@@ -155,6 +165,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: zig для линковки выпуска
+        # check ядра линкует настоящие бинарники выпуска (цель check-release) —
+        # arm64, mipsel и big-endian mips. Делает это zig, и по умолчанию
+        # Makefile ищет его по пути сборочной машины (/opt/homebrew/bin/zig):
+        # в CI этого пути нет, и check падал на нём, не доходя до линковки.
+        # Версия и хеш — те же, что в release.yml: проверять надо тем, чем
+        # выпускаем.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl --fail --proto '=https' --location --max-time 180 https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig16.tar.xz
+          echo '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig16.tar.xz' | sha256sum -c -
+          tar -xJf zig16.tar.xz
+          echo "ZIG=$RUNNER_TEMP/zig-x86_64-linux-0.16.0/zig" >> "$GITHUB_ENV"
       - name: Тесты оракула
         # SO_MARK есть только на Linux. ubuntu-latest даёт его нативному gcc
         # без кросс-цепочек — ровно то место, где эта ветка ядра (метка на

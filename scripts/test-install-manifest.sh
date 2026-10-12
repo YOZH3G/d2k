@@ -47,6 +47,50 @@ done
 grep -q 'install.sh fetch' "$LAB" || fail "lab-install.sh lacks its own staged-file preflight"
 echo "PASS: lab-install.sh stages every file install.sh fetches"
 
+# 4. The /tmp preflight must not promise less than install.sh actually downloads.
+#    Routers with 8/16 MiB of flash have a small tmpfs, and a number that
+#    silently fell behind builds/ would let the download start and then break
+#    in the middle — which is exactly what the preflight exists to prevent.
+need_kb=$(sed -n 's/^TMP_NEED_KB=\([0-9]\{1,\}\)$/\1/p' "$INSTALL")
+[ -n "$need_kb" ] || fail "install.sh has no TMP_NEED_KB download preflight"
+common_bytes=0
+arch_bins=
+for path in $fetched; do
+    case "$path" in
+        builds/*-linux-\$ARCH) arch_bins="$arch_bins ${path%-linux-\$ARCH}" ;;
+        *)
+            [ -f "$ROOT/$path" ] || fail "install.sh fetches $path, which is not in the tree"
+            common_bytes=$((common_bytes + $(wc -c < "$ROOT/$path"))) ;;
+    esac
+done
+# head -n 1: install.sh loops over the same faces twice (download, then install),
+# and counting the fonts twice would quietly inflate the measurement.
+for face in $(sed -n 's/^for face in \(.*\); do$/\1/p' "$INSTALL" | head -n 1); do
+    for path in "internal/web/assets/fonts/$face.woff2" "internal/web/assets/fonts/OFL-$face.txt"; do
+        [ -f "$ROOT/$path" ] || fail "install.sh fetches $path, which is not in the tree"
+        common_bytes=$((common_bytes + $(wc -c < "$ROOT/$path")))
+    done
+done
+[ -n "$arch_bins" ] || fail "install.sh fetches no per-architecture binary (layout changed?)"
+worst_kb=0
+worst_arch=
+for probe in "$ROOT"/builds/d2kc-linux-*; do
+    arch=${probe##*/d2kc-linux-}
+    bytes=$common_bytes
+    for bin in $arch_bins; do
+        file=$ROOT/$bin-linux-$arch
+        [ -f "$file" ] || { bytes=0; break; }
+        bytes=$((bytes + $(wc -c < "$file")))
+    done
+    [ "$bytes" -gt 0 ] || continue
+    kb=$(((bytes + 1023) / 1024))
+    [ "$kb" -le "$worst_kb" ] || { worst_kb=$kb; worst_arch=$arch; }
+done
+[ "$worst_kb" -gt 0 ] || fail "builds/ has no complete per-architecture set to measure"
+[ "$need_kb" -ge "$worst_kb" ] ||
+    fail "install.sh TMP_NEED_KB=$need_kb is below the largest download ($worst_arch: $worst_kb KiB)"
+echo "PASS: /tmp preflight ($need_kb KiB) covers the largest download ($worst_arch: $worst_kb KiB)"
+
 # shellcheck disable=SC2016
 for name in $(sed -n 's/^install_atomic "\$TMP\/[^"]*" "\$DIR\/\([^"]*\.sh\)"$/\1/p' "$INSTALL"); do
     grep -qF "\$DIR/$name" "$UNINSTALL" || fail "uninstall.sh does not remove \$DIR/$name"

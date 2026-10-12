@@ -197,6 +197,24 @@ fi
 # никто.
 TMP=$(mktemp -d /tmp/d2k-install.XXXXXX) || die "не создать временный каталог"
 
+# Место под саму загрузку — ДО неё. Комплект скачивается целиком в /tmp (на
+# роутере это tmpfs, то есть RAM) и только потом раскладывается: не хватило —
+# отказ до единого изменения, а не полусобранная система. Прежде установщик
+# мерил только /opt, и то ПОСЛЕ загрузки: на 8/16-МиБ роутере обрыв случался
+# уже внутри fetch, когда отказываться было поздно.
+#
+# Число — вес самого крупного комплекта: замер 12.10.2026 дал 8326 КиБ
+# (mips64el; mips и mipsel — 8109 и 8113 КиБ). Чтобы оно не разъехалось с
+# builds/, его сторожит scripts/test-install-manifest.sh: он считает тот же
+# комплект по самим строкам fetch и отвергает число ниже замера.
+TMP_NEED_KB=8700
+tmp_avail_kb=$(df -kP "$TMP" 2>/dev/null | awk 'NR == 2 { print $4 }')
+case "$tmp_avail_kb" in
+    ''|*[!0-9]*) say "не узнать свободное место в $TMP — продолжаю" ;;
+    *) [ "$tmp_avail_kb" -ge "$TMP_NEED_KB" ] ||
+           die "мало места для загрузки в $TMP: свободно $tmp_avail_kb КиБ, нужно $TMP_NEED_KB КиБ" ;;
+esac
+
 fetch() {
     # $1 — путь в репозитории, $2 — куда положить.
     #
@@ -219,21 +237,86 @@ fetch "scripts/architecture.sh" "$TMP/architecture.sh"
 fetch "scripts/check-cpu.sh" "$TMP/check-cpu.sh"
 SYS_ARCH=$(uname -m)
 # ABI пользовательского пространства: на OpenWrt — сама система (DISTRIB_ARCH
-# есть и в 24.10, и в 25.12; apk --print-arch даёт лишь «aarch64»), иначе —
-# Entware.
+# есть и в 24.10, и в 25.12), иначе — Entware (opkg). На части прошивок пусты
+# ОБА: DISTRIB_ARCH в /etc/openwrt_release не прописан, а opkg в OpenWrt 24+
+# заменён на apk. Тогда арку называет сам apk, а если и он молчит — заголовок
+# ELF любого системного бинарника. Без этой цепочки установка падала на
+# «неподдерживаемая архитектура», не сказав, что именно пробовали.
 ABI_ARCH=
+ABI_TRIED=
+ABI_FROM=
+abi_source() { ABI_TRIED="${ABI_TRIED:+$ABI_TRIED, }$1"; ABI_FROM=$1; }
 if [ -f "$OPENWRT_RELEASE" ]; then
+    abi_source "DISTRIB_ARCH в $OPENWRT_RELEASE"
     ABI_ARCH=$(sed -n "s/^DISTRIB_ARCH=[\"']\{0,1\}\([^\"']*\).*/\1/p" "$OPENWRT_RELEASE" | head -n 1)
 fi
 if [ -z "$ABI_ARCH" ] && command -v opkg >/dev/null 2>&1; then
+    abi_source "opkg print-architecture"
     ABI_ARCH=$(opkg print-architecture 2>/dev/null | awk '
         $1 == "arch" && $2 != "all" && $2 != "noarch" {
             if ($3 + 0 >= priority) { priority = $3 + 0; arch = $2 }
         } END { print arch }')
 fi
-ARCH=$(sh "$TMP/architecture.sh" "$SYS_ARCH" "$ABI_ARCH") || die "неподдерживаемая архитектура"
+if [ -z "$ABI_ARCH" ]; then
+    apk_bin=
+    if [ -x "$OPENWRT_APK" ]; then apk_bin=$OPENWRT_APK
+    elif command -v apk >/dev/null 2>&1; then apk_bin=apk
+    fi
+    if [ -n "$apk_bin" ]; then
+        abi_source "$apk_bin --print-arch"
+        ABI_ARCH=$("$apk_bin" --print-arch 2>/dev/null | head -n 1)
+    fi
+fi
+# Имя без порядка байт сборку не выбирает, а на mips он решает всё: «mips» от
+# apk может означать и big-endian ath79, и little-endian ramips. Такое имя
+# отбрасывается, и ABI читается из ELF ниже — он про порядок байт не врёт.
+case "$ABI_ARCH" in
+    mips|mips64) ABI_ARCH= ;;
+esac
+# Последний источник — сама система. В заголовке ELF нужны три поля:
+# e_ident[EI_CLASS] (байт 4: 1 — 32 бита, 2 — 64), e_ident[EI_DATA] (байт 5:
+# 1 — little-endian, 2 — big-endian) и e_machine (байты 18-19 в порядке
+# EI_DATA; 8 — MIPS, 183 — AArch64, 40 — ARM, 62 — x86-64, 3 — i386,
+# 243 — RISC-V, 21 — PPC64). od с -A/-N/-t есть в busybox (им уже пользуется
+# files/d2k-instagram-dns-scheduler.sh); xxd там нет.
+ABI_ELF_FILES=${D2K_ABI_ELF_FILES:-"/bin/busybox /bin/sh /bin/ash /usr/bin/env"}
+if [ -z "$ABI_ARCH" ]; then
+    abi_source "заголовок ELF ($ABI_ELF_FILES)"
+    for elf_cand in $ABI_ELF_FILES; do
+        [ -r "$elf_cand" ] || continue
+        elf_hdr=$(od -An -tx1 -N20 "$elf_cand" 2>/dev/null | tr -d ' \n')
+        [ "${#elf_hdr}" = 40 ] || continue
+        case "$elf_hdr" in 7f454c46*) ;; *) continue ;; esac
+        elf_class=$(printf '%s' "$elf_hdr" | cut -c9-10)
+        elf_data=$(printf '%s' "$elf_hdr" | cut -c11-12)
+        # e_machine приводится к старшему-первым, каким бы ни был EI_DATA.
+        case "$elf_data" in
+            01) elf_machine=$(printf '%s' "$elf_hdr" | cut -c39-40)$(printf '%s' "$elf_hdr" | cut -c37-38) ;;
+            02) elf_machine=$(printf '%s' "$elf_hdr" | cut -c37-38)$(printf '%s' "$elf_hdr" | cut -c39-40) ;;
+            *) continue ;;
+        esac
+        case "$elf_machine:$elf_data:$elf_class" in
+            0008:01:01) ABI_ARCH=mipsel ;;
+            0008:02:01) ABI_ARCH=mips ;;
+            0008:01:02) ABI_ARCH=mips64el ;;
+            00b7:01:02) ABI_ARCH=aarch64 ;;
+            0028:01:01) ABI_ARCH=arm ;;
+            003e:01:02) ABI_ARCH=x86_64 ;;
+            0003:01:01) ABI_ARCH=i686 ;;
+            00f3:01:02) ABI_ARCH=riscv64 ;;
+            0015:02:02) ABI_ARCH=ppc64 ;;
+            # big-endian mips64, 32-битный PPC и прочее: сборки нет, и врать
+            # про арку хуже, чем отказать внятно.
+            *) continue ;;
+        esac
+        say "ABI из заголовка ELF $elf_cand: $ABI_ARCH"
+        break
+    done
+fi
+ARCH=$(sh "$TMP/architecture.sh" "$SYS_ARCH" "$ABI_ARCH") ||
+    die "неподдерживаемая архитектура: uname=$SYS_ARCH, ABI=${ABI_ARCH:-не определён} (пробовали: ${ABI_TRIED:-ничего})"
 sh "$TMP/check-cpu.sh" "$ARCH" || die "CPU не соответствует требованиям сборки"
-say "архитектура: $SYS_ARCH / ${ABI_ARCH:-ABI не указан} -> $ARCH"
+say "архитектура: $SYS_ARCH / ${ABI_ARCH:-ABI не указан}${ABI_ARCH:+ (из $ABI_FROM)} -> $ARCH"
 say "загрузка"
 fetch "scripts/select-panel-ip.sh" "$TMP/select-panel-ip.sh"
 fetch "builds/d2kpanel-linux-$ARCH" "$TMP/d2kpanel"

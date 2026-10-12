@@ -13,6 +13,13 @@ LDFLAGS ?=
 # Кросс-компиляторы для проверки переносимости. Пути переопределяются извне.
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
+# Big-endian mips — своим gcc (на Ubuntu это пакет gcc-mips-linux-gnu), если он
+# в системе есть; на машине разработки его обычно нет, поэтому он
+# НЕОБЯЗАТЕЛЕН. Сам порядок байт при этом проверяется всегда: zig-проход в
+# цели cross установленных цепочек не требует.
+MIPS_CC    ?= mips-unknown-linux-gnu-gcc
+# Та же тройка, что у выпуска (см. scripts/build-target.sh).
+MIPS_BE_ZIG ?= -target mips-linux-musleabi -mcpu=mips32+soft_float
 
 # Разбор QUIC (задача 2 этой же вертикали) живёт в core/ — отдельной единице
 # сборки со своим Makefile. Датапату он нужен на каждом UDP-пакете в горячем
@@ -440,17 +447,36 @@ cross:
 	@for f in $(SRC) $(CORESRC); do \
 		echo "== $$f =="; \
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /tmp/d2k-a64.o $$f || exit 1; \
+		$(ZIG) cc $(MIPS_BE_ZIG) $(CFLAGS) -c -o /tmp/d2k-mips.o $$f || exit 1; \
 		$(MIPSEL_CC) $(CFLAGS) -c -o /tmp/d2k-mipsel.o $$f || exit 1; \
 	done
 	@echo "== d2kd целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2kd-a64 \
 		$(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) || exit 1
+	@$(ZIG) cc $(MIPS_BE_ZIG) $(CFLAGS) -o /tmp/d2kd-mips \
+		$(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2kd-mipsel $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) || exit 1
 	@echo "== planlab целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/planlab-a64 \
 		planlab.c plan_parse.c plan_apply.c $(CORESRC) || exit 1
+	@$(ZIG) cc $(MIPS_BE_ZIG) $(CFLAGS) -o /tmp/planlab-mips \
+		planlab.c plan_parse.c plan_apply.c $(CORESRC) || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/planlab-mipsel planlab.c plan_parse.c plan_apply.c $(CORESRC) || exit 1
-	@echo "переносимость: aarch64 и mipsel собираются, служба линкуется"
+	@# Big-endian mips НАСТОЯЩИМ gcc — отдельным блоком, потому что этой цепочки
+	@# на машине разработки обычно нет, и «не нашлась» не должна ронять
+	@# переносимость целиком (тот же приём, что в detect/Makefile). Порядок байт
+	@# уже проверен zig-проходами выше; gcc добавляет к ним свои предупреждения.
+	@if command -v $(MIPS_CC) >/dev/null 2>&1; then \
+	  echo "== big-endian mips: $(MIPS_CC) =="; \
+	  for f in $(SRC) $(CORESRC); do \
+	    $(MIPS_CC) $(CFLAGS) -c -o /tmp/d2k-mips-gcc.o $$f || exit 1; \
+	  done; \
+	  rm -f /tmp/d2k-mips-gcc.o; \
+	  $(MIPS_CC) $(CFLAGS) -o /tmp/d2kd-mips-gcc $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) || exit 1; \
+	else \
+	  echo "cross: $(MIPS_CC) не найден — big-endian mips проверен zig-проходом выше"; \
+	fi
+	@echo "переносимость: aarch64, mipsel и big-endian mips собираются, служба линкуется"
 
 # Служба ДЛЯ ЭТОЙ ЖЕ МАШИНЫ. Не удобство, а проверка: лаборатория установки
 # (scripts/lab-install.sh) ставит то, что собрала сама, а не то, что кто-то

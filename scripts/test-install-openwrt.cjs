@@ -42,6 +42,7 @@ exit 0`));
   // apk: installed set in APK_HAVE; add "installs" curl/openssl by dropping stubs.
   put(path.join(bin, 'apk'), sh(`printf '%s\\n' "$*" >> '${log('apk')}'
 case "$1" in
+  --print-arch) printf '%s\\n' "\${APK_ARCH-x86_64}" ;;
   info) shift; [ "$1" = -e ] && shift
         case " \${APK_HAVE:-} " in *" $1 "*) exit 0 ;; esac; exit 1 ;;
   add) [ "\${APK_ADD_RC:-0}" = 0 ] || exit "$APK_ADD_RC"
@@ -78,14 +79,21 @@ cp "$SRC/\${url#http://fixture.test/}" "$out"`));
 while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; --max-time|--connect-timeout) shift 2 ;; -*) shift ;; *) url=$1; shift ;; esac; done
 printf '%s\\n' "$url" >> '${log('curl')}'
 cp "$SRC/\${url#http://fixture.test/}" "$out"`));
+  // Two questions, two answers: the download preflight asks about the
+  // installer's own temporary directory (tmpfs on a router), the runtime
+  // preflight about /opt. One shared number could not tell them apart.
   put(path.join(bin, 'df'), sh(`echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
 avail=\${DF_AVAIL:-80020}
 [ ! -f '${path.join(tmp, 'df_avail')}' ] || avail=$(cat '${path.join(tmp, 'df_avail')}')
+case "$*" in *runtime-install.*) avail=\${DF_AVAIL_TMP:-80020} ;; esac
 echo "/dev/root 100692 18544 $avail 19% /"`));
 
   const src = path.join(tmp, 'source');
   const fixture = (name, contents, mode = 0o755) => put(path.join(src, name), contents, mode);
-  fixture('scripts/architecture.sh', sh('printf "arch %s %s\\n" "$1" "$2" >> "$CALLS"; printf "amd64\\n"'));
+  // Logs what the installer derived, and refuses an unnamed ABI the way the
+  // real script does: without $2 a bare uname picks no build on MIPS.
+  fixture('scripts/architecture.sh',
+    sh('printf "arch %s %s\\n" "$1" "$2" >> "$CALLS"; [ -n "$2" ] || exit 1; printf "amd64\\n"'));
   for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, sh('exit 0'));
   fixture('builds/d2kpanel-linux-amd64', sh('echo features=telegram-control'));
   fixture('builds/d2ktg-linux-amd64', sh('echo features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3'));
@@ -128,7 +136,7 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
     D2K_OPENWRT_APK: path.join(bin, 'apk'), D2K_OPENWRT_OPKG: path.join(tmp, 'no-opkg'), D2K_KEEP_STATE: '1',
   };
   const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
-  const reset = () => { for (const f of [calls, log('apk'), log('opkg'), log('nft'), log('wget')]) fs.rmSync(f, { force: true }); };
+  const reset = () => { for (const f of [calls, log('apk'), log('opkg'), log('nft'), log('wget'), log('curl')]) fs.rmSync(f, { force: true }); };
   function run(name, extra = {}) {
     return spawnSync('/bin/sh', [path.join(tmp, `${name}.sh`)], { env: { ...env, ...extra }, encoding: 'utf8', timeout: 20000 });
   }
@@ -157,6 +165,68 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   assert.doesNotMatch(read(log('apk')), /^add/m, 'installed packages must not be added again');
   assert.equal(read(log('wget')), '', 'with curl present the installer uses curl');
 
+  // 2b. Firmware that names no DISTRIB_ARCH and has no opkg: the ABI comes
+  //     from apk, and if apk is silent too, from a system binary's ELF header.
+  //     Both were empty on parts of the OpenWrt 24+ field, and the installer
+  //     died on "неподдерживаемая архитектура" without saying what it tried.
+  const releaseText = read(release);
+  put(release, "DISTRIB_ID='OpenWrt'\nDISTRIB_RELEASE='25.12.5'\n", 0o644);
+  reset();
+  ok(run('install', { APK_HAVE: have, APK_ARCH: 'mipsel_24kc' }));
+  assert.match(read(calls), /^arch \S+ mipsel_24kc$/m,
+    'without DISTRIB_ARCH the ABI must come from apk --print-arch');
+
+  // ELF headers built here, not taken from this machine: the check must read
+  // the same way on any host. Byte 4 is the class, byte 5 the endianness,
+  // bytes 18-19 e_machine in that endianness.
+  const elfHeader = (machine, data, cls) => {
+    const b = Buffer.alloc(64);
+    b.write('\x7fELF', 0, 'latin1');
+    b[4] = cls; b[5] = data; b[6] = 1;
+    if (data === 1) b.writeUInt16LE(machine, 18); else b.writeUInt16BE(machine, 18);
+    return b;
+  };
+  const elfDir = path.join(tmp, 'elf');
+  fs.mkdirSync(elfDir, { recursive: true });
+  const elfCases = [
+    ['mips-be', 8, 2, 1, 'mips'],
+    ['mips-le', 8, 1, 1, 'mipsel'],
+    ['mips64-le', 8, 1, 2, 'mips64el'],
+    ['aarch64', 183, 1, 2, 'aarch64'],
+    ['armv7', 40, 1, 1, 'arm'],
+    ['x86-64', 62, 1, 2, 'x86_64'],
+    ['i386', 3, 1, 1, 'i686'],
+    ['riscv64', 243, 1, 2, 'riscv64'],
+    ['ppc64', 21, 2, 2, 'ppc64'],
+  ];
+  for (const [name, machine, data, cls] of elfCases) {
+    fs.writeFileSync(path.join(elfDir, name), elfHeader(machine, data, cls), { mode: 0o755 });
+  }
+  // A shell script is not a system binary: it must be skipped, not guessed at.
+  put(path.join(elfDir, 'script'), sh('exit 0'));
+  const script = path.join(elfDir, 'script');
+  for (const [name, , , , expect] of elfCases) {
+    reset();
+    ok(run('install', { APK_HAVE: have, APK_ARCH: '', D2K_ABI_ELF_FILES: `${script} ${path.join(elfDir, name)}` }));
+    assert.match(read(calls), new RegExp(`^arch \\S+ ${expect}$`, 'm'),
+      `${name}: with a silent apk the ABI must be read out of the ELF header`);
+  }
+  // A bare "mips" names no endianness, and on MIPS that is the whole question:
+  // the ELF header must override it rather than pick a build by coin toss.
+  reset();
+  ok(run('install', { APK_HAVE: have, APK_ARCH: 'mips', D2K_ABI_ELF_FILES: path.join(elfDir, 'mips-be') }));
+  assert.match(read(calls), /^arch \S+ mips$/m, 'a bare "mips" must be resolved through the ELF header');
+  reset();
+  ok(run('install', { APK_HAVE: have, APK_ARCH: 'mips', D2K_ABI_ELF_FILES: path.join(elfDir, 'mips-le') }));
+  assert.match(read(calls), /^arch \S+ mipsel$/m, 'a bare "mips" on a little-endian box must become mipsel');
+  // Nothing names the ABI: the refusal says which sources were asked.
+  reset();
+  const blind = run('install', { APK_HAVE: have, APK_ARCH: '', D2K_ABI_ELF_FILES: script });
+  assert.notEqual(blind.status, 0, 'with no ABI from any source the installer must refuse');
+  assert.match(blind.stdout + blind.stderr, /пробовали:[^\n]*DISTRIB_ARCH[^\n]*--print-arch[^\n]*ELF/,
+    `the refusal must name every source tried: ${blind.stdout}${blind.stderr}`);
+  put(release, releaseText, 0o644);
+
   // 3-5. Refusals keep the working install: no stop, no replaced binary.
   const before = fs.readFileSync(d2kd);
   put(path.join(src, 'builds/d2kd-linux-amd64'), sh('# next release\nexit 0'));
@@ -174,6 +244,12 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   refuse({ APK_HAVE: have, NFT_CHECK_RC: '1' }, /nftables не принимает правила D2K/, 'kernel without nft queue');
   reset();
   refuse({ APK_HAVE: have, DF_AVAIL: '10' }, /мало места .* USB/, 'no room for the runtime');
+  // Room for the DOWNLOAD, in /tmp, before the first byte is fetched: the
+  // whole set (~8,3 МиБ) lands there first, and a router with 8/16 MiB of
+  // flash has a small tmpfs. Breaking inside fetch is too late to refuse.
+  refuse({ APK_HAVE: have, DF_AVAIL_TMP: '100' }, /мало места для загрузки/, 'no room in /tmp');
+  assert.equal(read(log('wget')) + read(log('curl')), '',
+    'the download preflight must refuse before anything is fetched');
   // Room is measured after the packages took theirs (ревью 07.10): 7005 KiB
   // free, packages take 7000 — the runtime no longer fits.
   reset();

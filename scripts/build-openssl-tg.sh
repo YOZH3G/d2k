@@ -33,6 +33,27 @@ fi
 }
 
 cd "$OBJ_DIR"
+# Размер d2ktg имеет значение: статический OpenSSL делает его тяжелее всех
+# остальных бинарников вместе, а у mips-роутера всего 8 или 16 МиБ флеша.
+# -ffunction-sections/-fdata-sections у самого OpenSSL плюс --gc-sections на
+# линковке ниже выбрасывают только то, на что никто не ссылается: ни один
+# алгоритм не выключен, провайдерские таблицы держат свои функции сами.
+# Замер 12.10.2026, big-endian mips: 5 953 012 -> 5 187 940 байт (-12,9 %).
+#
+# Что НЕ взято и почему (замерено тем же деревом и тем же способом):
+#   * -fno-asynchronous-unwind-tables -fno-unwind-tables -> 4 779 780 (-19,7 %);
+#   * плюс 33 опции no-* (deprecated, dsa, cms, ct, ocsp, ...) -> 4 064 552
+#     (-31,7 %). Обе снимают настоящие возможности, а не мёртвый код, и просят
+#     проверки живого рукопожатия, а не только линковки.
+#   * плюс снятие нераспределяемой секции .pdr (465 КиБ, на роутере её не
+#     читает никто) -> 3 659 800 (-38,5 %). Нужен llvm-objcopy: `zig objcopy`
+#     на обратном порядке байт отказывается ("ELF to ELF copying only supports
+#     native endian"), а objcopy из binutils выпускающей машины MIPS-целей не
+#     знает. Своего инструмента в выпускной цепочке пока нет.
+# Проверять изменения размера — scripts/check-router-builds.sh под QEMU
+# (openssl-link-smoke достаёт ED25519 из провайдера по умолчанию, то есть ровно
+# тот путь, который сборкой секций и можно было бы сломать).
+SIZE_CFLAGS='-ffunction-sections -fdata-sections'
 ASM_FLAGS=no-asm
 case "$ARCH" in arm64|amd64) ASM_FLAGS= ;; esac
 ATOMIC_FLAGS=
@@ -40,7 +61,7 @@ ATOMIC_FLAGS=
 # pthread-lock fallback rather than requiring a router-side libatomic.
 case "$ARCH" in mips|mipsel|x86) ATOMIC_FLAGS=-DBROKEN_CLANG_ATOMICS ;; esac
 # shellcheck disable=SC2086
-CC="$ZIG cc -target $TARGET $TARGET_FLAGS" \
+CC="$ZIG cc -target $TARGET $TARGET_FLAGS $SIZE_CFLAGS" \
 AR="$ZIG ar" RANLIB="$ZIG ranlib" \
     "$SRC_DIR/Configure" "$SSL_TARGET" no-shared no-tests no-apps no-docs no-legacy $ASM_FLAGS $ATOMIC_FLAGS \
     --prefix="$PREFIX" --openssldir=/opt/d2k/certs
@@ -52,7 +73,7 @@ LIBDIR="$PREFIX/lib"
 [ -d "$LIBDIR" ] || LIBDIR="$PREFIX/lib64"
 # TARGET_FLAGS is a controlled compiler option from build-target.sh.
 # shellcheck disable=SC2086
-"$ZIG" cc -target "$TARGET" $TARGET_FLAGS -static \
+"$ZIG" cc -target "$TARGET" $TARGET_FLAGS -static $SIZE_CFLAGS -Wl,--gc-sections \
     -I"$PREFIX/include" -L"$LIBDIR" \
     -o "$ROOT/build/telegram/openssl-link-smoke-$ARCH" "$SMOKE" \
     -lssl -lcrypto -ldl -pthread
@@ -63,7 +84,7 @@ file "$ROOT/build/telegram/openssl-link-smoke-$ARCH"
 # newly added module.
 # shellcheck disable=SC2086
 "$ZIG" cc -target "$TARGET" $TARGET_FLAGS -static -O2 -std=c11 \
-    -Wall -Wextra -Werror -pedantic -Wl,-S \
+    -Wall -Wextra -Werror -pedantic -Wl,-S $SIZE_CFLAGS -Wl,--gc-sections \
     -DD2K_RELEASE_ID="\"${RELEASE_ID:-dev}\"" \
     -I"$ROOT/telegram/include" -I"$PREFIX/include" \
     -o "$OUT/d2ktg-linux-$ARCH" "$ROOT"/telegram/src/*.c \

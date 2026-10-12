@@ -32,6 +32,18 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 # Кросс-компиляторы для проверки переносимости. Пути переопределяются извне.
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
+# Big-endian mips (ath79/ar71xx и прочие роутеры с 8/16 МиБ флеша) — своим gcc,
+# если он в системе есть; на Ubuntu это пакет gcc-mips-linux-gnu. На машине
+# разработки его обычно нет, поэтому он НЕОБЯЗАТЕЛЕН (цель сообщает и идёт
+# дальше, как в detect/Makefile), а сам порядок байт ловится zig-целями ниже:
+# они не зависят от установленных цепочек. Без хотя бы одной из них big-endian
+# не компилировался нигде, кроме release.yml, и ловушки вроде «pipe() != 0»
+# (a8a1f31, 12.10.2026) было видно только на выпуске.
+MIPS_CC    ?= mips-unknown-linux-gnu-gcc
+# Те же тройки, что у выпуска (см. scripts/build-target.sh): порядок байт и ABI
+# проверяются ровно те, что уедут на роутер.
+MIPS_BE_ZIG ?= -target mips-linux-musleabi -mcpu=mips32+soft_float
+MIPS_LE_ZIG ?= -target mipsel-linux-musleabi -mcpu=mips32+soft_float
 
 SRC     = stun.c net4.c voice.c voice_discovery.c meas.c verdict.c crypto.c quicwire.c tls13core.c quicconn.c h3.c quic.c quicprobe.c quicarms.c ipfrag.c props.c hello.c catalog.c match.c compose.c measured.c link.c plantlv.c x25519.c tls13.c tls12.c p256.c volume.c sched.c quichello.c verify.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
@@ -142,6 +154,29 @@ test_mips_pipe: test_mips_pipe.c httpsearch_mips_pipe.o httpsprobe_mips_pipe.o h
 	$(CC) $(CFLAGS) -o $@ test_mips_pipe.c httpsearch_mips_pipe.o httpsprobe_mips_pipe.o httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
 test-mips-pipe: test_mips_pipe
 	./test_mips_pipe
+
+# Та же проверка под ОБА порядка байт mips — компиляцией и линковкой, без
+# запуска: исполнять mips-бинарник на машине разработки нечем (qemu-user на
+# macOS нет), а подменённая обёртка pipe живёт в тесте, не в коробке. Ловит то,
+# что host-прогон поймать не может: непереносимость самого теста и двух его
+# объектников, из-за которой проверка ловушки молча выпала бы из выпуска.
+# Идёт и в check, и в cross — как check-release: порядок байт обязан
+# проверяться обычной локальной проверкой, а не только на выпуске.
+.PHONY: cross-mips-pipe
+check cross: cross-mips-pipe
+cross-mips-pipe: hello_profiles.inc
+	@set -eu; pipe_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/d2k-mips-pipe-cross.XXXXXX"); \
+		trap 'rm -rf "$$pipe_dir"' EXIT HUP INT TERM; \
+		for triple in "$(MIPS_BE_ZIG)" "$(MIPS_LE_ZIG)"; do \
+			echo "== test_mips_pipe: zig $$triple =="; \
+			$(ZIG) cc $$triple $(CFLAGS) -Dpipe=d2k_test_mips_pipe -c httpsearch.c -o "$$pipe_dir/httpsearch.o"; \
+			$(ZIG) cc $$triple $(CFLAGS) -Dpipe=d2k_test_mips_pipe -c httpsprobe.c -o "$$pipe_dir/httpsprobe.o"; \
+			$(ZIG) cc $$triple $(CFLAGS) -o "$$pipe_dir/test_mips_pipe" test_mips_pipe.c \
+				"$$pipe_dir/httpsearch.o" "$$pipe_dir/httpsprobe.o" httpup_logic.c plantlv.c \
+				quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c \
+				../datapath/wire.c $(HTTP_READ_SRC) -lpthread; \
+		done; \
+		echo "test_mips_pipe: оба порядка байт mips линкуются"
 TESTS += test_verify_http
 check: test-verify-http
 .PHONY: test-verify-http
@@ -702,6 +737,7 @@ cross: hello_profiles.inc
 	@for f in $(SRC) d2kask.c d2kvoice.c; do \
 		echo "== $$f =="; \
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /tmp/d2k-core-a64.o $$f || exit 1; \
+		$(ZIG) cc $(MIPS_BE_ZIG) $(CFLAGS) -c -o /tmp/d2k-core-mips.o $$f || exit 1; \
 		$(MIPSEL_CC) $(CFLAGS) -c -o /tmp/d2k-core-mipsel.o $$f || exit 1; \
 	done
 	@echo "== test_meas целиком =="
@@ -828,7 +864,21 @@ cross: hello_profiles.inc
 		test_d2kask.c hello.c link.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_d2kask-mipsel \
 		test_d2kask.c hello.c link.c -lpthread || exit 1
-	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
+	@# Big-endian mips НАСТОЯЩИМ gcc — отдельным блоком, а не в цикле выше:
+	@# на машине разработки этой цепочки обычно нет, и «не нашлась» не должна
+	@# ронять переносимость целиком (тот же приём, что в detect/Makefile).
+	@# Порядок байт при этом всё равно проверен: zig-проход в цикле выше и
+	@# линковка выпуска в check-release идут без всяких установленных gcc.
+	@if command -v $(MIPS_CC) >/dev/null 2>&1; then \
+	  echo "== big-endian mips: $(MIPS_CC) =="; \
+	  for f in $(SRC) d2kask.c d2kvoice.c; do \
+	    $(MIPS_CC) $(CFLAGS) -c -o /tmp/d2k-core-mips-gcc.o $$f || exit 1; \
+	  done; \
+	  rm -f /tmp/d2k-core-mips-gcc.o; \
+	else \
+	  echo "cross: $(MIPS_CC) не найден — big-endian mips проверен zig-проходом и check-release"; \
+	fi
+	@echo "переносимость: aarch64, mipsel и big-endian mips собираются, тесты линкуются"
 
 # Утилита для целевого устройства (задача 5в) — тот же приём, что
 # d2kd-linux-arm64 в datapath/Makefile: статическая musl, потому что на роутере
@@ -875,6 +925,12 @@ release: hello_profiles.inc tcp1620_whitelist.inc
 
 # Check the deployment recipe itself, not a separately maintained test link.
 # A private output directory preserves existing (possibly uncommitted) builds.
+#
+# Big-endian mips линкуется ЗДЕСЬ, а не только в release.yml: это единственное
+# место, где весь контроллер (вместе с sched.c, httpsearch.c и httpsprobe.c —
+# тремя носителями ловушки pipe) компилируется с обратным порядком байт в
+# обычном `make check`. До 12.10.2026 big-endian не собирался ни одной локальной
+# проверкой и ни одним заданием CI.
 check cross: check-release
 check-release:
 	@set -eu; \
@@ -882,7 +938,8 @@ check-release:
 		trap 'rm -rf "$$release_check_dir"' EXIT HUP INT TERM; \
 		$(MAKE) release BUILDDIR="$$release_check_dir" TARGET=aarch64-linux-musl TARGET_FLAGS= ARCH=arm64; \
 		$(MAKE) release BUILDDIR="$$release_check_dir" TARGET=mipsel-linux-musleabi TARGET_FLAGS=-mcpu=mips32+soft_float ARCH=mipsel; \
-		echo "release: arm64 and mipsel deployment binaries linked"
+		$(MAKE) release BUILDDIR="$$release_check_dir" TARGET=mips-linux-musleabi TARGET_FLAGS=-mcpu=mips32+soft_float ARCH=mips; \
+		echo "release: arm64, mipsel and big-endian mips deployment binaries linked"
 
 d2kask-aarch64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
