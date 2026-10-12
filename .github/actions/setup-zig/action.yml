@@ -1,0 +1,62 @@
+name: Set up Zig
+description: >-
+  Download the pinned Zig toolchains, verify their SHA-256 sums and cache them.
+  Exports ZIG (main toolchain) and ZIG_MIPS64EL (the toolchain MIPS64EL needs).
+
+inputs:
+  version:
+    description: Main Zig version.
+    required: true
+  sha256:
+    description: SHA-256 of the main Zig archive.
+    required: true
+  mips64el-version:
+    description: Zig version for MIPS64EL. Zig 0.16 does not link its full runtime.
+    required: true
+  mips64el-sha256:
+    description: SHA-256 of the MIPS64EL Zig archive.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Cache Zig
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.tool_cache }}/zig
+        key: zig-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ inputs.mips64el-version }}
+
+    - name: Download and verify Zig
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        V: ${{ inputs.version }}
+        S: ${{ inputs.sha256 }}
+        V14: ${{ inputs.mips64el-version }}
+        S14: ${{ inputs.mips64el-sha256 }}
+        DEST: ${{ runner.tool_cache }}/zig
+      run: |
+        set -euo pipefail
+        mkdir -p "$DEST"
+        cd "$DEST"
+        fetch() {
+          curl --fail --proto '=https' --location --retry 3 --max-time 300 \
+            "https://ziglang.org/download/$1/zig-x86_64-linux-$1.tar.xz" -o "zig-$1.tar.xz"
+          echo "$2  zig-$1.tar.xz" | sha256sum -c -
+          tar -xJf "zig-$1.tar.xz"
+          rm -f "zig-$1.tar.xz"
+        }
+        fetch "$V" "$S"
+        fetch "$V14" "$S14"
+
+    - name: Export Zig paths
+      shell: bash
+      env:
+        V: ${{ inputs.version }}
+        V14: ${{ inputs.mips64el-version }}
+        DEST: ${{ runner.tool_cache }}/zig
+      run: |
+        set -euo pipefail
+        echo "ZIG=$DEST/zig-x86_64-linux-$V/zig" >> "$GITHUB_ENV"
+        echo "ZIG_MIPS64EL=$DEST/zig-x86_64-linux-$V14/zig" >> "$GITHUB_ENV"

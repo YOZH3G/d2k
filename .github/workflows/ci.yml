@@ -1,203 +1,247 @@
 name: CI
 
-# Только автоматика d2k. Ничего из релизной машинерии z2k сюда не переносится
-# намеренно: по §7.1 документа продукт независим, и публикация в чужой
-# репозиторий не должна быть возможна даже по ошибке.
+# Pipeline order follows the usual industry rule: cheap checks first, and every
+# expensive stage waits for them (fail fast).
+#
+#   1. lint, warnings          — seconds; block everything below
+#   2. build (9 CPUs), unit    — the product compiles everywhere and its tests pass
+#   3. sanitizers, integration — slower; run only when stage 2 is green
+#   4. ci-ok                   — the single required status check
+#
+# Heavy release packaging (static OpenSSL for d2ktg on nine CPUs) is NOT here.
+# It belongs to release.yml. CI proves the code; the release builds the package.
 
 on:
   push:
     branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**', 'LICENSE']
   pull_request:
+    paths-ignore: ['**/*.md', 'docs/**', 'LICENSE']
   workflow_dispatch:
 
+# Least privilege: read the code, nothing else.
 permissions:
   contents: read
 
+# A newer push to the same ref makes the older run useless. Cancel it on pull
+# requests; on main every commit keeps its own verdict.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ZIG_VERSION: '0.16.0'
+  ZIG_SHA256: '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00'
+  ZIG_MIPS64EL_VERSION: '0.14.1'
+  ZIG_MIPS64EL_SHA256: '24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c'
+
 jobs:
-  panel:
-    name: C-панель — HTTP, CLI и безопасность
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Тесты C-панели и браузерного renderer
-        run: make -C panel test
-      - name: ASan и UBSan HTTP-handler
-        run: make -C panel san
+  # ── Stage 1: static checks ────────────────────────────────────────────────
 
-  telegram:
-    name: Telegram — GCC warnings and tests
+  lint:
+    name: Lint — shell scripts
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
-      - name: OpenSSL development headers
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
-      - name: GCC with Wall, Wextra and Werror
-        run: make -C telegram gcc-warn
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(find scripts files spike -type f -name '*.sh' -print0)
+          files+=(files/d2k-instagram-dns.sh files/d2k-update.sh files/d2k-openwrt-init files/d2k-tg-firewall.sh)
+          shellcheck -s sh "${files[@]}"
 
-  panel-browser:
-    name: Chrome — panel layout regression
+  warnings:
+    name: Warnings — second compiler (gcc -Werror)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    defaults:
-      run:
-        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install OpenSSL headers
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
+      - name: datapath
+        run: make -C datapath gcc-warn GCC=gcc
+      - name: core
+        run: make -C core gcc-warn GCC=gcc
+      - name: telegram
+        run: make -C telegram gcc-warn
+
+  # ── Stage 2: build and unit tests ─────────────────────────────────────────
+
+  build:
+    name: Build — ${{ matrix.arch }}
+    needs: [lint, warnings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [arm64, arm, mipsel, mips, mips64el, amd64, x86, ppc64, riscv64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          sha256: ${{ env.ZIG_SHA256 }}
+          mips64el-version: ${{ env.ZIG_MIPS64EL_VERSION }}
+          mips64el-sha256: ${{ env.ZIG_MIPS64EL_SHA256 }}
+      - name: Build d2kd, d2kc and d2kpanel
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          . scripts/build-target.sh
+          mkdir -p out
+          for component in datapath core panel; do
+            make -C "$component" release ARCH="$ARCH" TARGET="$TARGET" \
+              TARGET_FLAGS="$TARGET_FLAGS" ZIG="$BUILD_ZIG" BUILDDIR="$PWD/out" \
+              COMMIT="$GITHUB_SHA" BUILT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" DIRTY=0 \
+              RELEASE_ID=ci VERSION=ci
+          done
+          ls -l out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: d2k-${{ matrix.arch }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
+
+  unit:
+    name: Unit — ${{ matrix.component }}
+    needs: [lint, warnings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { component: datapath,     target: check }
+          - { component: core,         target: check }
+          - { component: detect,       target: check }
+          - { component: panel,        target: test }
+          - { component: telegram,     target: test }
+          - { component: relay-enroll, target: test }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install OpenSSL headers
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          sha256: ${{ env.ZIG_SHA256 }}
+          mips64el-version: ${{ env.ZIG_MIPS64EL_VERSION }}
+          mips64el-sha256: ${{ env.ZIG_MIPS64EL_SHA256 }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: make -C ${{ matrix.component }} ${{ matrix.target }}
+        run: make -C "${{ matrix.component }}" "${{ matrix.target }}"
+
+  # ── Stage 3: sanitizers and integration ───────────────────────────────────
+
+  sanitizers:
+    name: Sanitizers — ${{ matrix.component }}
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [datapath, core, panel]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ASan and UBSan
+        run: make -C "${{ matrix.component }}" san
+
+  integration-scripts:
+    name: Integration — installer, updater, firewall scripts
+    needs: [lint, warnings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq busybox
+      # Every scripts/test-* runs. A hand-picked list drifts away from the
+      # tree; discovery does not.
+      - name: Run every scripts/test-*
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for t in scripts/test-*.sh;  do echo "== $t ==";  sh "$t";   done
+          for t in scripts/test-*.cjs; do echo "== $t ==";  node "$t"; done
+
+  integration-install:
+    name: Integration — install, upgrade, uninstall (ARM64 container)
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Load netfilter modules on the host
+        # A container cannot load kernel modules; the installer requires them.
+        run: sudo modprobe -a nfnetlink_queue xt_NFQUEUE xt_connbytes xt_multiport xt_mark xt_connmark xt_conntrack xt_addrtype xt_comment ip6table_mangle
+      - name: Lifecycle in a disposable container
+        run: sh scripts/lab-install.sh
+
+  integration-panel:
+    name: Integration — panel in Chrome
+    needs: [lint, warnings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       D2K_CHROME_NO_SANDBOX: '1'
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-          package-manager-cache: false
-      - uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+      - uses: browser-actions/setup-chrome@39ce663831f86d2ea36cbda0a8143709cdfcc410 # v2.2.0
         id: chrome
         with:
           chrome-version: stable
-      - name: Build isolated C panel
+      - name: Build the panel
         run: make -C panel d2kpanel
-      - name: Chrome rendering, controls and layout
+      - name: Rendering, controls and layout
         env:
           CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
-          D2K_CAPTURE_DIR: ${{ runner.temp }}/panel-browser/fixed
-        run: |
-          mkdir -p "$D2K_CAPTURE_DIR"
-          node panel/test_browser.cjs 2>&1 | tee "$D2K_CAPTURE_DIR/browser.log"
-      - name: Save screenshots and browser logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: panel-chrome-layout
-          path: ${{ runner.temp }}/panel-browser
-          retention-days: 7
-          if-no-files-found: warn
-
-  shell:
-    name: Скрипты
-    # lab-install.sh ставит настоящий C runtime под ARM64: нужен ARM-раннер.
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v7
-      - name: shellcheck
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck busybox
-          find scripts spike -name '*.sh' -print0 | xargs -0 -r shellcheck -s sh
-          shellcheck -s sh files/d2k-instagram-dns.sh files/d2k-update.sh files/d2k-openwrt-init files/d2k-tg-firewall.sh
-      - name: Автообновление — подпись, установка, возврат
-        run: node scripts/test-update.cjs
-      - name: OpenWrt boot bridge and installer lifecycle
-        run: |
-          node scripts/test-openwrt-init.cjs
-          node scripts/test-runtime-install.cjs
-          node scripts/test-install-openwrt.cjs
-          sh scripts/test-architecture.sh
-          sh scripts/test-s99-nft.sh
-          sh scripts/test-tg-firewall-nft.sh
-          sh scripts/test-install-manifest.sh
-      - name: Instagram resolver DNS lifecycle
-        run: sh scripts/test-instagram-dns.sh
-      - name: Installer/uninstaller lifecycle in disposable container
-        # Контейнер не грузит модули ядра сам: netfilter-модули, которые
-        # установщик требует от роутера, загружаются на хосте раннера.
-        run: |
-          sudo modprobe -a nfnetlink_queue xt_NFQUEUE xt_connbytes xt_multiport xt_mark xt_connmark xt_conntrack xt_addrtype xt_comment ip6table_mangle
-          sh scripts/lab-install.sh
-
-  datapath:
-    name: Датапат на C — сборка под целевые арки
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Инструменты
-        run: |
-          sudo apt-get update -qq
-          # gcc-mips-linux-gnu — big-endian mips (ath79/ar71xx). Без него обратный
-          # порядок байт не компилировался ни одним заданием CI, и ловушки вроде
-          # «pipe() != 0» (a8a1f31, 12.10.2026) было видно только на выпуске.
-          sudo apt-get install -y -qq gcc gcc-aarch64-linux-gnu gcc-mipsel-linux-gnu gcc-mips-linux-gnu
-      - name: Тесты исполнителя планов
-        run: make -C datapath check
-
-      - name: Перенесённый Поиск по домену — дерево, адаптер и параллельные измерения
-        run: make -C detect check
-
-      - name: Измеритель под оба порядка байт mips
-        # Сырой слой измерителя (raw.c) — Linux, и на маке он не компилируется
-        # вовсе: цель check его не видит. Имена цепочек здесь — Ubuntu'шные,
-        # поэтому передаются явно; zig в этом задании нет, и aarch64 цель
-        # пропустит сама, сказав об этом.
-        run: make -C detect cross MIPSEL_CC=mipsel-linux-gnu-gcc MIPS_CC=mips-linux-gnu-gcc
-
-      - name: Датапат под целевые арки
-        # Непереносимость обязана ловиться в тот день, когда её внесли, а не на
-        # роутере. Запускать там нечего: ловим порядок байт, выравнивание и
-        # ширину типов.
-        #
-        # Список файлов НЕ перечисляется здесь. Перечисленный однажды, он
-        # молча разъехался с деревом: новые модули датапата в него не
-        # попадали и под целевые арки не проверялись месяцами существования
-        # репозитория. Список живёт в Makefile, и цель gcc-warn берёт его
-        # оттуда — вместе с ТЕСТАМИ, которых в прежнем списке не было вовсе.
-        run: |
-          set -eu
-          for cc in gcc aarch64-linux-gnu-gcc mipsel-linux-gnu-gcc mips-linux-gnu-gcc; do
-            echo "== $cc =="
-            make -C datapath gcc-warn GCC="$cc"
-          done
-
-      - name: Измеритель этапа 0 под четыре арки
-        # Инструмент замера, а не продуктовый датапат. Собирается здесь ради
-        # того же: поймать непереносимость в день внесения.
-        run: |
-          set -eu
-          cd spike/nfqview-c
-          for cc in gcc aarch64-linux-gnu-gcc mipsel-linux-gnu-gcc mips-linux-gnu-gcc; do
-            echo "== $cc =="
-            "$cc" -O2 -Wall -Wextra -Werror -c -o /tmp/nfqview-$cc.o nfqview.c
-          done
-
-  core:
-    # Отдельное задание, параллельно датапату: тесты ядра ждут настоящих
-    # сетевых таймаутов и идут ~15 минут, задерживать ими остальное незачем.
-    name: Ядро на C — тесты оракула
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: zig для линковки выпуска
-        # check ядра линкует настоящие бинарники выпуска (цель check-release) —
-        # arm64, mipsel и big-endian mips. Делает это zig, и по умолчанию
-        # Makefile ищет его по пути сборочной машины (/opt/homebrew/bin/zig):
-        # в CI этого пути нет, и check падал на нём, не доходя до линковки.
-        # Версия и хеш — те же, что в release.yml: проверять надо тем, чем
-        # выпускаем.
-        shell: bash
+          D2K_CAPTURE_DIR: ${{ runner.temp }}/panel-browser
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
-          curl --fail --proto '=https' --location --max-time 180 https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig16.tar.xz
-          echo '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig16.tar.xz' | sha256sum -c -
-          tar -xJf zig16.tar.xz
-          echo "ZIG=$RUNNER_TEMP/zig-x86_64-linux-0.16.0/zig" >> "$GITHUB_ENV"
-      - name: Тесты оракула
-        # SO_MARK есть только на Linux. ubuntu-latest даёт его нативному gcc
-        # без кросс-цепочек — ровно то место, где эта ветка ядра (метка на
-        # зонде) вообще компилируется и исполняется в CI: на маке разработки
-        # SO_MARK не определён, и локальный check его никогда не видит.
-        run: make -C core check
+          mkdir -p "$D2K_CAPTURE_DIR"
+          node panel/test_browser.cjs 2>&1 | tee "$D2K_CAPTURE_DIR/browser.log"
+      - name: Keep screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: panel-browser
+          path: ${{ runner.temp }}/panel-browser
+          retention-days: 7
 
-  sanitizers:
-    # «Не упало» и «не читало за буфером» — разные утверждения, а весь датапат
-    # состоит из разбора чужих байтов. Под санитайзерами тесты в 2–3 раза
-    # медленнее (~20 минут), поэтому они идут на main и по запросу, а не на
-    # каждом pull request.
-    name: Датапат и ядро под санитайзерами
-    if: github.event_name != 'pull_request'
+  # ── Stage 4: the single required check ────────────────────────────────────
+
+  ci-ok:
+    name: CI passed
+    # Branch protection requires THIS job only. Adding or renaming jobs above
+    # then needs no change in repository settings.
+    if: always()
+    needs: [lint, warnings, build, unit, sanitizers, integration-scripts, integration-install, integration-panel]
     runs-on: ubuntu-latest
+    timeout-minutes: 2
     steps:
-      - uses: actions/checkout@v7
-      - name: Датапат под санитайзерами
-        run: make -C datapath san
-      - name: Ядро под санитайзерами
-        run: make -C core san
+      # A skipped job counts as a failure: when build fails, the jobs that
+      # need it are skipped, and the gate must not turn green on that.
+      - name: Fail if any required job did not succeed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        run: exit 1
+      - name: All required jobs succeeded
+        run: echo "CI passed"
