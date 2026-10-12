@@ -7403,19 +7403,46 @@ static void budget_uncountable_note(d2k_sched *s, const task *t) {
                            : "ядро не отдаёт TCP_INFO data_segs (нужно Linux 4.6+)");
 }
 
+static int partial_finish(d2k_sched *s, task *t, int64_t now_ms);
+
 /* ОБРЫВ ПОСРЕДИ ПОВТОРОВ ПРИ ДОКАЗАННОМ ПРИМЕНЕНИИ (задача 55; ревью I-1,
    I-3). Ответ приложения был, план исполнился на потоке зонда, а поток не
    перенёс 2 × бюджет коробки — действие (a) поля 04.10. Кандидат не
    подтверждён, как при RX-обрыве под кандидатом; у привязок этого ключа с
    этим планом «пройден» сменяется на «оборван» — новая улика, не удаление:
-   установка больше не предпочитает план, только что измеренный режущимся. */
-static void budget_cut_reject(d2k_sched *s, task *t) {
+   установка больше не предпочитает план, только что измеренный режущимся.
+
+   ИСКЛЮЧЕНИЕ — ВТОРОЙ, ОБЪЁМНЫЙ БЛОК ТОЙ ЖЕ ЦЕЛИ (поле 12.10.2026,
+   www.userscript.zone). У цели ИЗМЕРЕН повторяемый обрыв входящего объёма
+   (vol.rx_cut: /style.css 21289 байт с VPS против 15968 с линии), и это
+   ОТДЕЛЬНЫЙ вопрос со своими планами и своим критерием. Кандидат доходил до
+   HTTP 200 — рукопожатие он снимал, — а поток встал посреди повторов, не
+   добрав 2 × 25 пакетов: 25 взято из ЧУЖОГО полевого замера (поле 04.10),
+   к этой цели требование 50 никто не мерил. Отказ по нему отвергал кандидата
+   за то, что проверялось НЕ ИМ: в поле так ушло 30 с лишним планов, 46
+   зондов и 273 с, а плана не установлено вовсе. Смешивать два блока в один
+   отказ нельзя — частичный результат записывается сразу (отметка «оборван»,
+   повторная проверка после отдыха), объёмный блок остаётся открытым. */
+static void budget_cut_reject(d2k_sched *s, task *t, int64_t now_ms) {
     char cut_id[40]; uint8_t cut_wire[D2K_PLAN_ID_LEN];
     plan_ident(t->plans[t->next_plan - 1], cut_id, sizeof cut_id, cut_wire);
+    /* Объёмный обрыв этой цели измерен — остановка потока принадлежит ему. */
+    int volume_block = t->transport == 6 && t->vol.rx_cut;
+    /* Строка о решении — короткая: числа бюджета печатает verify_confirm
+       («частичный обход: … после ~N пакетов, нужно M, бюджет B»), и повтор
+       их здесь обрезал бы её по 512 байт say (ровно это стоило полю 12.10
+       самого порога в budget_note). */
+    if (volume_block) {
+        say(s, "по %s под кандидатом %s приложение ответило %d, а поток встал посреди "
+               "повторов: у этой цели измерен обрыв входящего объёма около %d КБ — это он, "
+               "отдельный вопрос со своими планами, а не провал плана рукопожатия",
+            t->name, cut_id, t->ver.status, t->vol.rx_at_kb);
+    } else {
     say(s, "по %s под кандидатом %s (план %zu) поток оборван посреди повторов: "
            "HTTP %d, %s; бюджет %u пакетов (%s) — не подтверждаю, беру следующего",
         t->name, cut_id, t->next_plan, t->ver.status, t->ver.budget_note,
         t->budget_pk, t->budget_src);
+    }
     uint8_t shape = record_shape(t);
     for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
         d2k_cat_box *b = &s->cat->boxes[bi];
@@ -7451,6 +7478,17 @@ static void budget_cut_reject(d2k_sched *s, task *t) {
         snprintf(t->partial_box, sizeof t->partial_box, "%s", t->box_id);
         t->partial_ver = t->ver;
         t->partial_ver.fd = -1;
+    }
+    /* Объёмный блок измерен: перебирать планы дальше по ЭТОМУ отказу нечем —
+       каждый следующий кандидат получит тот же обрыв от того же блока, и
+       судить его будет то же неизмеренное число. Поиск кончается частичным
+       результатом; объёмный вопрос мерит свой замер, а не этот бюджет. */
+    if (volume_block) {
+        say(s, "по %s следующий кандидат получит тот же обрыв от того же блока, а "
+               "требование %u пакетов к этой цели не измерено (%s) — перебор по нему не "
+               "продолжаю, записываю частичный результат", t->name,
+            t->ver.budget_need, t->budget_src);
+        if (partial_finish(s, t, now_ms)) return;
     }
     /* Оборванный бюджетом приём ЗАМЕРА не кончает поиск (решение 04.10):
        замер владеет поиском и продолжить свой перебор с этого места не
@@ -9629,7 +9667,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 for (size_t k = 0; k < t->ver_seen; k++)
                     if (ev_matches_flow(&own, &t->ver_early[k])) { t->ver_ok = 1; break; }
                 if (t->ver_ok) {
-                    budget_cut_reject(s, t);
+                    budget_cut_reject(s, t, now_ms);
                 } else {
                     t->state = T_VERIFY_WAIT;
                     t->ver_until_ms = now_ms + SCHED_VERIFY_STEP_MS;
@@ -9796,7 +9834,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (t->ver_ok) {
                 int cut = t->ver.level == D2K_VER_APPLICATION && t->ver.budget == D2K_BUDGET_CUT;
                 if (cut && local_refusal_verdict(s, t) != 0) { /* наша неудача — не улика */ }
-                else if (cut) budget_cut_reject(s, t);
+                else if (cut) budget_cut_reject(s, t, now_ms);
                 else verify_confirm(s, t, now_ms);
                 moved++;
             } else if (now_ms >= t->ver_until_ms) {

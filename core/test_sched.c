@@ -13986,6 +13986,73 @@ own_first_test:
             tcp_owns_search = 0; tcp_answer = D2K_V_OPAQUE;
         }
 
+        /* ---- ПОЛЕ 12.10.2026, www.userscript.zone: У ЦЕЛИ ДВА БЛОКА ----
+           Режется большое приветствие (рукопожатие) И ОТДЕЛЬНО режется объём
+           ответа около 16 КБ — это измерено парной пробой (/style.css 21289
+           байт с VPS против 15968 с линии), то есть vol.rx_cut. Кандидат
+           доходит до HTTP 200 (рукопожатие он снимает), но поток встаёт
+           посреди повторов, не добрав 2 × 25 пакетов: 25 — из ЧУЖОГО
+           полевого замера (поле 04.10), к этой цели требование 50 не мерил
+           никто. В поле так отвергнуто 30 с лишним планов, 46 зондов, 273 с,
+           итог «плана не установлено». Остановка потока принадлежит ВТОРОМУ,
+           объёмному блоку: кандидат не выбрасывается, перебор не
+           запускается, результат записан частичным с отметкой «оборван». */
+        {
+            d2k_catalog c = {0};
+            net_name_known(&c, "hcaptcha.com"); /* без подбора белого имени */
+            tcp_owns_search = 0; tcp_found_arm = 0; tcp_answer = D2K_V_CLEAR;
+            vol_answer = D2K_VOL_PASSED; vol_rx_cut = 1; vol_rx_packets = 0;
+            vol_rx_at_kb = 15;
+            ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0; ver_fail_after = 0;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            ver_budget_status = 200;
+            ver_budget_n = 8;
+            for (int k = 0; k < ver_budget_n; k++) { ver_budget_seq[k] = D2K_BUDGET_CUT; }
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            spin(s, 5); drain(); forget_sent();
+            base_calls = tcp_calls = ver_calls = vol_calls = 0;
+            ver_answer_port = 42350;
+            d2k_ev h = ev_hello(6, 42350, "userscript.volume.cut"), shv;
+            d2k_sched_event(s, &h);
+            CHECK(tls_shape_event(&shv, h.name, D2K_SHAPE_MODERN) == 0,
+                  "vol-budget: снимок TLS 1.3 не собрался");
+            d2k_sched_event(s, &shv);
+            d2k_ev su = ev_suspect(6, 42350); d2k_sched_event(s, &su);
+            for (int i = 0; i < 400 && !said("ПОДТВЕРЖДЕНО") && !said("цель отдыхает"); i++) {
+                spin(s, 20);
+                d2k_ev ap = ev_applied(6, 42350); d2k_sched_event(s, &ap);
+                spin(s, 2);
+            }
+            CHECK(vol_calls >= 1 && ver_calls >= 1,
+                  "vol-budget: стенд — измеренный обрыв объёма не дошёл до испытания кандидата");
+            CHECK(ver_calls == 1,
+                  "vol-budget: за первым же кандидатом с прикладным ответом пошёл перебор планов, "
+                  "хотя обрыв объёма этой цели измерен");
+            CHECK(!said("не подтверждаю, беру следующего"),
+                  "vol-budget: кандидат отвергнут обрывом ВТОРОГО, объёмного блока");
+            CHECK(said("измерен обрыв входящего объёма") &&
+                  said("не провал плана рукопожатия"),
+                  "vol-budget: остановка потока не отнесена к измеренному объёмному обрыву");
+            CHECK(said("частичный обход") && said("ПОДТВЕРЖДЕНО"),
+                  "vol-budget: частичный результат не записан");
+            CHECK(!said("в запасном списке"),
+                  "vol-budget: запасной перебор открыт обрывом объёма");
+            const d2k_cat_binding *bd = binding_of(&c, h.name, 6);
+            CHECK(bd && bd->budget == D2K_CAT_BUDGET_CUT,
+                  "vol-budget: привязка частичного обхода без отметки «оборван»");
+            CHECK(!said("цель отдыхает"), "vol-budget: цель ушла в отдых без плана");
+            drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+            CHECK(sent_command_count(D2K_CMD_SET_NAME, NULL, 0) >= 1,
+                  "vol-budget: частичный обход не поставлен на провод");
+            if (fails || getenv("T55_SHOW")) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            ver_budget_n = 0; ver_budget_status = 200;
+            vol_rx_cut = 0; vol_rx_at_kb = 24; vol_rx_packets = 0;
+            tcp_answer = D2K_V_OPAQUE;
+        }
+
         d2k_sched_tcp_base_hook = saved_base;
         d2k_sched_rx_ver_hook = saved_rx;
         d2k_sched_rx_gzip_ver_hook = saved_gzip;
