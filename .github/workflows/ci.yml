@@ -11,7 +11,7 @@ name: CI
 #        integration  scripts, panel in Chrome; install lifecycle needs build
 #   3. ci-ok           — the single required status check
 #
-# Wall time is the slowest job of stage 2 (~7 minutes), not the sum of them.
+# Wall time is the slowest job of stage 2 (~7-8 minutes), not the sum.
 #
 # Heavy release packaging (static OpenSSL for d2ktg on nine CPUs) is NOT here.
 # It belongs to release.yml. CI proves the code; the release builds the package.
@@ -62,8 +62,10 @@ jobs:
           mapfile -d '' files < <(find scripts files spike -type f -name '*.sh' -print0)
           files+=(files/d2k-instagram-dns.sh files/d2k-update.sh files/d2k-openwrt-init files/d2k-tg-firewall.sh)
           shellcheck -s sh "${files[@]}"
-      - name: core shards cover all of check
-        run: sh scripts/ci-core-shard.sh verify
+      - name: core shards cover all of check and san
+        run: |
+          sh scripts/ci-core-shard.sh verify
+          sh scripts/ci-core-san-shard.sh verify
 
   warnings:
     name: Warnings — second compiler (gcc -Werror)
@@ -167,12 +169,20 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # core is split by measured weight (scripts/ci-core-san-shard.sh): one
+      # serial run took 22.4 minutes, the slowest shard takes ~7.
       matrix:
-        component: [datapath, core, panel]
+        include:
+          - { component: datapath,       run: 'make -C datapath san' }
+          - { component: panel,          run: 'make -C panel san' }
+          - { component: core-sched,     run: 'sh scripts/ci-core-san-shard.sh sched' }
+          - { component: core-compose,   run: 'sh scripts/ci-core-san-shard.sh compose' }
+          - { component: core-rest-1,    run: 'sh scripts/ci-core-san-shard.sh rest-1' }
+          - { component: core-rest-2,    run: 'sh scripts/ci-core-san-shard.sh rest-2' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: ASan and UBSan
-        run: make -C "${{ matrix.component }}" san
+      - name: ${{ matrix.run }}
+        run: ${{ matrix.run }}
 
   integration-scripts:
     name: Integration — installer, updater, firewall scripts

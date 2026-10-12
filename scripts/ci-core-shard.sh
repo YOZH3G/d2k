@@ -27,7 +27,8 @@ HEAVY="test-sched test-sched-modes test-compose test-measured"
 
 all_targets() {
     make -C "$ROOT/core" -pRrq check 2>/dev/null \
-        | sed -n 's/^check://p' | head -n 1 \
+        | sed -n 's/^check://p' \
+        | awk '{ if (NF > n) { n = NF; line = $0 } } END { print line }' \
         | tr -s ' \t' '\n' | grep -v '^$' | sort -u
 }
 

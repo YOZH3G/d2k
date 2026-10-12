@@ -702,8 +702,21 @@ san-http-compare-failure:
 		$(CC) $(SANFLAGS) -o "$$compare_dir/test" test_http_compare_failure.c "$$compare_dir/httpsearch.o" httpup_logic.c plantlv.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_SRC) -lpthread; \
 		"$$compare_dir/test"
 
-san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask san-measured san-httpsearch san-volume-context san-probe-plan
-	@set -e; for t in $(filter-out test_probe_plan test_measured test_httpsearch test_volume_context $(SAN_SKIP),$(TESTS)); do \
+# Цикл тестов под санитайзером — отдельной целью, чтобы CI мог делить его на
+# шарды по измеренному весу (scripts/ci-core-san-shard.sh): одним заходом он
+# шёл 21,5 минуты из 22,4. SAN_TESTS по умолчанию — все тесты, поэтому
+# локальный `make san` проверяет ровно то же, что и прежде.
+#
+# Проверка самой утилиты d2kask стоит ВНУТРИ цикла, сразу после test_d2kask:
+# ей нужен собранный в цикле /tmp/d2k-core-san-test_d2kask, и в шарде без
+# этого теста она бы падала. Прежде она шла после всего цикла.
+SAN_TESTS ?= $(TESTS)
+SAN_LOOP = $(filter-out test_probe_plan test_measured test_httpsearch test_volume_context $(SAN_SKIP),$(SAN_TESTS))
+.PHONY: san-loop san-list
+san-list:
+	@echo $(filter-out test_probe_plan test_measured test_httpsearch test_volume_context $(SAN_SKIP),$(TESTS))
+san-loop: hello_profiles.inc tcp1620_whitelist.inc ../datapath/ctlprobe ../datapath/planlab d2kask
+	@set -e; for t in $(SAN_LOOP); do \
 		echo "== $$t =="; \
 		srcs=$$(echo "$(SRC) $(SAN_EXTRA_SRC)" | tr ' ' '\n' | grep -v '^$$'); \
 		for inc in $$(grep -o '#include "[A-Za-z0-9_]*\.c"' $$t.c | sed 's/#include "//; s/"//'); do \
@@ -711,10 +724,14 @@ san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask san-meas
 		done; \
 		$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-$$t $$t.c $$srcs -lpthread ; \
 		/tmp/d2k-core-san-$$t; \
+		if [ "$$t" = test_d2kask ]; then \
+			echo "== d2kask (санитайзер самой утилиты, не только теста) =="; \
+			$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-d2kask d2kask.c compose.c measured.c hello.c meas.c link.c; \
+			D2KASK_BIN=/tmp/d2k-core-san-d2kask /tmp/d2k-core-san-test_d2kask; \
+		fi; \
 	done
-	@echo "== d2kask (санитайзер самой утилиты, не только теста) =="
-	@$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-d2kask d2kask.c compose.c measured.c hello.c meas.c link.c
-	@D2KASK_BIN=/tmp/d2k-core-san-d2kask /tmp/d2k-core-san-test_d2kask
+
+san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask san-measured san-httpsearch san-volume-context san-probe-plan san-loop
 	@echo "санитайзеры: все проверки прошли"
 
 # Тот же набор ЧУЖИМ компилятором. Локально собирает clang, CI — gcc, и они
