@@ -2,12 +2,35 @@
 #include "server.c"
 #include <assert.h>
 
+/* ЧТО ИМЕННО ОБЯЗАН ВЕРНУТЬ response() НА МЕСТО.
+ *
+ * Он снимает и возвращает O_NONBLOCK — и только его. Сравнивать ВСЁ слово
+ * флагов нельзя: на macOS сама запись в дескриптор поднимает бит 0x10000, без
+ * всякого fcntl. Замер 12.10.2026 (/tmp/bit.c, пять случаев):
+ *
+ *   просто запись                       до=0x00001 после=0x10001  ИЗМЕНИЛОСЬ
+ *   O_NONBLOCK туда-обратно, без записи  до=0x00001 после=0x00001  —
+ *   O_NONBLOCK, запись, возврат          до=0x00001 после=0x10001  ИЗМЕНИЛОСЬ
+ *   только poll                          до=0x00001 после=0x00001  —
+ *   poll + запись                        до=0x00001 после=0x10001  ИЗМЕНИЛОСЬ
+ *
+ * То же у socketpair (0x00002 → 0x10002), то есть дело не в канале. Тот же
+ * двоичный код на Linux (роутер, aarch64 musl) не меняет слово НИ В ОДНОМ из
+ * пяти случаев. В публичных заголовках macOS этот бит как флаг открытия не
+ * назван — он не наш, мы его не ставили и возвращать не обязаны.
+ *
+ * Требование от этого не ослабло, а стало точным: F_SETFL по POSIX меняет
+ * только O_APPEND, O_NONBLOCK и O_ASYNC, и ровно эти биты обязаны вернуться
+ * такими, какими были. Оставленный O_NONBLOCK или затёртый O_APPEND проверка
+ * ловит по-прежнему. */
+#define SETTABLE_FLAGS (O_APPEND | O_NONBLOCK | O_ASYNC)
+
 int main(void) {
     assert(d2k_panel_ignore_sigpipe() == 0);
     int fds[2]; assert(pipe(fds) == 0);
     int flags = fcntl(fds[1], F_GETFL); assert(flags >= 0);
     assert(response(fds[1], 200, "OK", "text/plain", "complete\n", 9) == 0);
-    assert(fcntl(fds[1], F_GETFL) == flags);
+    assert((fcntl(fds[1], F_GETFL) & SETTABLE_FLAGS) == (flags & SETTABLE_FLAGS));
     close(fds[1]);
     char small[2048]; ssize_t n = read(fds[0], small, sizeof small - 1);
     assert(n > 0); small[n] = '\0';
@@ -35,7 +58,10 @@ int main(void) {
     long long elapsed = monotonic_ms() - start;
     assert(rc == -1 && saved_errno == ETIMEDOUT);
     assert(elapsed >= D2K_PANEL_RESPONSE_TIMEOUT_MS && elapsed < 400);
-    assert(fcntl(fds[1], F_GETFL) == flags);
+    /* И на отказе тоже: прерванная по сроку посылка обязана вернуть
+       дескриптор в прежний режим, иначе следующий ответ уйдёт неблокирующим
+       и оборвётся на первом же EAGAIN. */
+    assert((fcntl(fds[1], F_GETFL) & SETTABLE_FLAGS) == (flags & SETTABLE_FLAGS));
     free(body); close(fds[1]);
     assert(kill(child, SIGTERM) == 0); assert(waitpid(child, NULL, 0) == child);
     puts("HTTP responses: complete response accepted; slow reader total deadline enforced PASS");
