@@ -238,6 +238,7 @@
     stop: "M7 7h10v10H7z",
     restart: "M20 11.5a8 8 0 1 1-2.3-5.6M20 4.5v5h-5",
     reapply: "M4 7h11M4 12h16M4 17h9M17 15l3 2-3 2",
+    erase: "M5 7h14M9 7V5h6v2M7 7l1 12h8l1-12M10.5 10.5v6M13.5 10.5v6",
     check: "M5 12.5l4.5 4.5L19 7.5",
     cross: "M6.5 6.5l11 11M17.5 6.5l-11 11",
     dash: "M6 12h12",
@@ -636,7 +637,11 @@
           buttons.push(this.button("stop", "Остановить движок?", "stop", "confirm", busy));
           buttons.push(this.button("cancel", "Отмена", null, "ghost", false));
         } else {
-          buttons.push(this.button("reapply", "Восстановить правила", "reapply", "ghost", busy, "Правила"));
+          /* «Очистить подобранное» стоит там, где прежде была «Восстановить
+             правила»: правила и без кнопки ставит сторож (S99d2k heal каждые
+             60 с), а снять найденное замером руками было нечем. Вариант
+             danger, и нажатие само ничего не делает — спрашивает диалог. */
+          buttons.push(this.button("clear-found", "Очистить подобранное", "erase", "danger", busy, "Очистить"));
           buttons.push(this.button("restart", "Перезапустить", "restart", null, busy));
           buttons.push(this.button("stop", "Остановить", "stop", "danger", busy));
         }
@@ -695,8 +700,56 @@
   };
 
   var ENDPOINTS = {
-    start: "start", stop: "stop", restart: "restart", reapply: "reapply",
+    start: "start", stop: "stop", restart: "restart", "clear-found": "clear-found",
     "telegram-enable": "telegram-enable", "telegram-disable": "telegram-disable"
+  };
+
+  /* ОПЕРАЦИИ, КОТОРЫЕ СПРАШИВАЮТ ДИАЛОГОМ.
+     Второго нажатия кнопки (приём «Остановить движок?») здесь мало: то
+     нажатие защищает от промаха, а здесь надо сказать, ЧТО именно исчезнет и
+     что обратно это не вернуть. В подпись кнопки такой текст не влезает. */
+  var CONFIRM = {
+    "clear-found": {
+      title: "Очистить подобранное?",
+      text: "Это сотрёт всё, что движок подобрал замером: подтверждённые планы, "
+          + "привязки имён к адресам и каталог коробок. Восстановить нельзя — "
+          + "подбор начнётся с нуля, и на каждый сайт его придётся пройти заново. "
+          + "Точно очищаем?",
+      yes: "Очистить"
+    }
+  };
+
+  /* Спрашивает и зовёт done() только на согласие. Нативный <dialog> даёт Esc,
+     ::backdrop и ловушку фокуса; где его нет — обычный confirm(), потому что
+     необратимая операция обязана спросить ХОТЬ ЧЕМ-ТО, а не пройти молча. */
+  App.prototype.ask = function (what, done) {
+    var doc = this.doc, dlg = this.$("ask");
+    if (!dlg || typeof dlg.showModal !== "function") {
+      if (this.win.confirm(what.title + "\n\n" + what.text)) done();
+      return;
+    }
+    var title = this.$("ask-title"), text = this.$("ask-text");
+    if (title) title.textContent = what.title;
+    if (text) text.textContent = what.text;
+    var yes = dlg.querySelector('[data-ask="yes"]');
+    var no = dlg.querySelector('[data-ask="no"]');
+    if (yes) yes.replaceChildren(doc.createTextNode(what.yes));
+    var agreed = false;
+    function close() { agreed = false; dlg.close(); }
+    function accept() { agreed = true; dlg.close(); }
+    /* Слушатели снимаются на закрытии: диалог один на все операции, и
+       оставленный слушатель применил бы прошлое согласие к новой. */
+    function onClose() {
+      if (yes) yes.removeEventListener("click", accept);
+      if (no) no.removeEventListener("click", close);
+      dlg.removeEventListener("close", onClose);
+      if (agreed) done();
+    }
+    if (yes) yes.addEventListener("click", accept);
+    if (no) no.addEventListener("click", close);
+    dlg.addEventListener("close", onClose);
+    dlg.showModal();
+    if (no && no.focus) no.focus();   /* фокус на отказе, не на необратимом */
   };
 
   /* Неудавшаяся команда — короткое покачивание её кнопки рядом с текстом ошибки. */
@@ -706,9 +759,14 @@
     if (b) Motion.g.fromTo(b, { x: 0 }, { x: 7, duration: 0.6, ease: global.CustomWiggle ? "d2kShake" : "power1.inOut", clearProps: "transform" });
   };
 
-  App.prototype.act = function (action) {
+  App.prototype.act = function (action, confirmed) {
     var self = this;
     if (action === "cancel") { this.armed = null; this.renderActions(); return; }
+    if (CONFIRM[action] && !confirmed) {
+      if (this.pending) return;
+      this.ask(CONFIRM[action], function () { self.act(action, true); });
+      return;
+    }
     if (action === "stop" && this.armed !== "stop") {
       this.armed = "stop";
       this.renderActions();

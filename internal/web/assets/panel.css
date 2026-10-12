@@ -1077,3 +1077,30 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
 @media (prefers-reduced-motion: reduce) {
   .update-notes::details-content, .update-transfer progress::-webkit-progress-value, .upd-knob, .upd-knob::after { transition: none; }
 }
+
+/* ─── Диалог необратимой операции ───
+   Нативный <dialog>: ::backdrop, Esc и ловушка фокуса достаются от браузера,
+   а не переписываются своим кодом. Ширина ограничена длиной строки, а не
+   экраном: предупреждение читают, а не просматривают. */
+.ask {
+  border: 1px solid var(--ink); border-radius: 2px; padding: 0;
+  background: var(--paper); color: var(--ink);
+  max-width: 34rem; width: calc(100% - 32px);
+  box-shadow: 0 18px 44px rgba(23, 22, 15, 0.22);
+}
+.ask::backdrop { background: rgba(23, 22, 15, 0.46); }
+.ask h2 { margin: 0; padding: 20px 24px 0; font-size: 1.25rem; line-height: 1.25; }
+.ask p { margin: 10px 0 0; padding: 0 24px; color: var(--ink-2); line-height: 1.5; }
+.ask-actions {
+  display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end;
+  padding: 20px 24px 20px; margin-top: 18px;
+  border-top: 1px solid var(--rule);
+}
+@media (max-width: 480px) {
+  /* Узкий экран: кнопки в столбец, отказ СВЕРХУ — чтобы необратимое не
+     нажималось вслепую по верхней кнопке. Направление column, а не
+     column-reverse: в разметке отказ идёт первым (проверено браузером —
+     reverse ставил «Очистить» наверх, ровно наоборот замыслу). */
+  .ask-actions { flex-direction: column; }
+  .ask-actions .btn { width: 100%; justify-content: center; }
+}

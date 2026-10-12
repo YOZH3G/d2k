@@ -419,6 +419,11 @@ static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
         { "/api/control/stop", "engine-stop", "Остановка движка" },
         { "/api/control/restart", "engine-restart", "Перезапуск движка" },
         { "/api/control/reapply", "reapply", "Восстановление правил" },
+        /* Необратимая операция. Подтверждение спрашивает панель диалогом
+           (internal/web/assets/panel.js, CONFIRM): здесь его проверять нечем —
+           POST приходит один и тот же, подтверждён он или нет. Защита та же,
+           что у остальных команд: control_enabled и единый источник. */
+        { "/api/control/clear-found", "clear-found", "Очистка подобранного" },
         { "/api/control/telegram-enable", "telegram-enable", "Включение Telegram-туннеля" },
         { "/api/control/telegram-disable", "telegram-disable", "Отключение Telegram-туннеля" },
         { "/api/control/update-check", "update-check", "Проверка обновлений" },

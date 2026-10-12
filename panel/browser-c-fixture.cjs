@@ -38,7 +38,12 @@ module.exports=async function(visualFixture){
   }
   const status=await(await fetch(url+'api/status')).json();
   if(!status.knowledge.linked)throw Error('Isolated C fixture is not linked');
-  return {url,close,telegram:status=>fs.writeFileSync(tgStatus,status+'\n'),waitFor:async(command)=>{
+  /* seen — проверка «команды НЕ было». waitFor для этого не годится: он
+     ждёт появления и падает по тайм-ауту, то есть отрицание им стоит три
+     секунды и читается как поломка. */
+  return {url,close,telegram:status=>fs.writeFileSync(tgStatus,status+'\n'),
+   seen:(command)=>fs.existsSync(log)&&fs.readFileSync(log,'utf8').split('\n').includes(command),
+   waitFor:async(command)=>{
    for(let i=0;i<60;i++){
     if(fs.existsSync(log)&&fs.readFileSync(log,'utf8').split('\n').includes(command))return;
     await new Promise(r=>setTimeout(r,50));

@@ -195,9 +195,28 @@ async function main(){
   await evaluate('document.querySelector("[data-control=stop]").click()');
   assert.equal(await evaluate('document.querySelector("[data-control=stop]").textContent'),'Остановить движок?','stop needs an explicit second press');
   await evaluate('document.querySelector("[data-control=cancel]").click()');
-  for(const [action,command,presses] of [['stop','engine-stop',2],['start','engine-start',1],['restart','engine-restart',1],['reapply','reapply',1],['telegram-disable','telegram-disable',1],['telegram-enable','telegram-enable',1]]){
+
+  // ОЧИСТКА ПОДОБРАННОГО СПРАШИВАЕТ ДИАЛОГОМ, И ОТКАЗ ЕЁ ОТМЕНЯЕТ.
+  // Одно нажатие не должно доходить до службы: операция необратима, а текст
+  // предупреждения обязан быть на экране и называть, что именно исчезнет.
+  await until('!!document.querySelector("[data-control=clear-found]:not([disabled])")','clear-found control must be offered');
+  await evaluate('document.querySelector("[data-control=clear-found]").click()');
+  assert.equal(await evaluate('document.querySelector("#ask").open'),true,'clearing must ask in a dialog');
+  const askText=await evaluate('document.querySelector("#ask-text").textContent');
+  for(const must of ['Восстановить нельзя','подтверждённые планы','Точно очищаем?'])
+   assert.ok(askText.includes(must),'the warning must say "'+must+'", got: '+askText);
+  assert.equal(await evaluate('document.activeElement.dataset.ask'),'no','focus must start on the refusal, not on the irreversible button');
+  await evaluate('document.querySelector("#ask [data-ask=no]").click()');
+  assert.equal(await evaluate('document.querySelector("#ask").open'),false,'refusing must close the dialog');
+  assert.equal(panel.seen('clear-found'),false,'a refused confirmation must not reach the service');
+
+  for(const [action,command,presses] of [['stop','engine-stop',2],['start','engine-start',1],['restart','engine-restart',1],['clear-found','clear-found',1],['telegram-disable','telegram-disable',1],['telegram-enable','telegram-enable',1]]){
    await until('!!document.querySelector("[data-control='+action+']:not([disabled])")',action+' control must become available');
    for(let i=0;i<presses;i++)await evaluate('document.querySelector("[data-control='+action+']").click()');
+   if(action==='clear-found'){
+    assert.equal(await evaluate('document.querySelector("#ask").open'),true,'clearing must ask every time, not only once');
+    await evaluate('document.querySelector("#ask [data-ask=yes]").click()');
+   }
    await panel.waitFor(command);
    if(action==='stop'){
     await until('/остановлен/.test(document.querySelector("#now-title").textContent)','stopped engine must be stated');

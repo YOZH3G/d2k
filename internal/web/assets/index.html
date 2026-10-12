@@ -135,5 +135,18 @@
       <footer class="colophon" id="colophon"></footer>
     </main>
   </div>
+
+  <!-- Необратимую операцию подтверждает ДИАЛОГ, а не второе нажатие кнопки:
+       предупреждение обязано быть прочитано целиком, а в подпись кнопки оно
+       не влезает. Текст ставит panel.js (CONFIRM), разметка пустая — иначе
+       предупреждение о несуществующей операции мелькнуло бы без JS. -->
+  <dialog class="ask" id="ask" aria-labelledby="ask-title" aria-describedby="ask-text">
+    <h2 id="ask-title"></h2>
+    <p id="ask-text"></p>
+    <div class="ask-actions">
+      <button type="button" class="btn" data-ask="no">Отмена</button>
+      <button type="button" class="btn" data-variant="confirm" data-ask="yes"></button>
+    </div>
+  </dialog>
 </body>
 </html>

@@ -1307,6 +1307,37 @@ reapply() {
     say "правила поставлены заново"
 }
 
+# ОЧИСТИТЬ ПОДОБРАННОЕ. Необратимо: это всё, что движок нашёл замером —
+# подтверждённые планы, привязки имён к адресам, каталог коробок. Подбор
+# после этого начинается с нуля.
+#
+# Движок обязательно останавливается, и это не перестраховка: каталог ведёт
+# контроллер в памяти и пишет его на диск при сохранении, так что удаление
+# файла под работающим контроллером вернуло бы каталог обратно через минуту.
+# Поднимается он назад только если работал ДО очистки: своей волей служба
+# движок не запускает.
+#
+# Файлы перечислены теми же именами, что и в снимках бандлов развёртывания
+# (before.tar): http-plans.txt и https-cache.txt существуют не всегда.
+clear_found() {
+    was_running=no
+    if running "$DP_PID" || running "$CT_PID"; then
+        was_running=yes
+        engine_stop || die "движок не остановился — подобранное не тронуто"
+    fi
+    removed=0
+    for f in catalog.json http-plans.txt https-cache.txt; do
+        if [ -e "$STATE_DIR/$f" ]; then rm -f "$STATE_DIR/$f" && removed=$((removed+1)); fi
+    done
+    if [ -d "$STATE_DIR/measurements" ]; then
+        rm -rf "$STATE_DIR/measurements" && removed=$((removed+1))
+    fi
+    say "подобранное очищено: снято $removed файлов состояния"
+    if [ "$was_running" = yes ]; then
+        start_engine || die "подобранное очищено, но движок не поднялся"
+    fi
+}
+
 case "$1" in
     start)   start ;;
     heal) if running "$DP_PID"; then fw_installed || reapply; ppe_ensure; fi
@@ -1338,11 +1369,12 @@ case "$1" in
     telegram-reapply) telegram_reapply ;;
     status)  status ;;
     reapply) reapply ;;
+    clear-found) clear_found ;;
     ppe-ensure) ppe_ensure ;;
     ppe-remove) d2k_ppe_remove ;;
     ppe-status)
         command -v d2k_ppe_status >/dev/null 2>&1 || die "нет $PPE_LIB"
         d2k_ppe_status "$2"
         ;;
-    *) echo "использование: $0 {start|stop|restart|engine-start|engine-stop|engine-restart|status|reapply|ppe-ensure|ppe-status [адрес]}" >&2; exit 2 ;;
+    *) echo "использование: $0 {start|stop|restart|engine-start|engine-stop|engine-restart|status|reapply|clear-found|ppe-ensure|ppe-status [адрес]}" >&2; exit 2 ;;
 esac
