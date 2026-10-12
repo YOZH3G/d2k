@@ -11,21 +11,30 @@
  * 3/5/8/12, подтверждение единогласием на отдельном IP, приманка, выведенная
  * из снимка, вместо собственных приманок оригинала).
  *
- * Остаётся то, что про транспорт и про план, и проверяется в три стороны:
+ * Тем же заходом удалён мёртвый отправитель фрагментации
+ * (d2k_quic_ask_frag_hook) и его сборщик двух фрагментов
+ * d2k_quic_build_frag2: вызывающих у хука не было ни одного, то есть ни одна
+ * собранная им пара никогда не уходила на провод. Проверка его байтов стояла
+ * прежде первой частью этого файла; НИЧЕГО из неё не потеряно — всё то же
+ * утверждает core/test_ipfrag.c о ЖИВОМ сборщике (d2k_udpfrag_build_ex,
+ * которым шлют quicprobe.c, udpruntime.c и datapath/session.c): IHL и версия
+ * (f[0]==0x45), total length против реальной длины посылки, TTL, общий
+ * Identification у всех фрагментов, MF на всех кроме последнего, точные
+ * смещения, верная сумма IP-заголовка и верная сумма UDP по псевдозаголовку
+ * — обе СВОИМ кодом теста. Сверх того он проверяет то, чего у удалённого не
+ * было вовсе: все четыре боевые формы, тройную нарезку с наложениями,
+ * обратный порядок, отказ при id==0 и отсутствие частичного вывода при
+ * недостаточной ёмкости, и то же на IPv6.
  *
- * 1. СБОРКА ФРАГМЕНТОВ (d2k_quic_build_frag2) — чистая проверка байтов:
- *    контрольная сумма IP-заголовка каждого фрагмента и совпадение
- *    восстановленной пересборки с исходной датаграммой. Сумма считается
- *    СВОИМ кодом теста, а не переиспользованием проверяемой функции — иначе
- *    тест сверяет модуль с самим собой (тот же принцип, что для BADSUM в
- *    задаче 3, d2k_quicprobe.h).
- * 2. РЕАЛЬНЫЙ TTL НА ПРОВОДЕ (loopback, IP_RECVTTL) — то, что реально можно
+ * Остаётся то, что про транспорт и про план, и проверяется в две стороны:
+ *
+ * 1. РЕАЛЬНЫЙ TTL НА ПРОВОДЕ (loopback, IP_RECVTTL) — то, что реально можно
  *    проверить без цензора на пути: приманка действительно уходит с
  *    запрошенным TTL, а сам триггер — обычным. Смерть приманки НЕ ДО сервера
  *    этот стенд доказать не может (на loopback нет промежуточных прыжков) —
  *    и не должен. Рядом — ICMP «порт недоступен» на боевое плечо: вопрос
  *    задан, ответа нет, а не «не измерено».
- * 3. ПЕРЕВОД ИЗМЕРЕННОГО В ПЛАН (d2k_quic_arm_plan, d2k_quic_compose_plan,
+ * 2. ПЕРЕВОД ИЗМЕРЕННОГО В ПЛАН (d2k_quic_arm_plan, d2k_quic_compose_plan,
  *    d2k_voice_plan, d2k_quic_delay_plan) — текст плана, его грамматика и
  *    отказ на невыразимом плече.
  */
@@ -46,6 +55,8 @@
 #include "d2k_plan.h"
 #include "d2k_quicprobe.h"
 #include "d2k_quic_arms.h"
+/* d2k_quic_hello_rename — тот же вывод приманки, что у планировщика. */
+#include "d2k_quichello.h"
 /* d2k_quic_is_initial — им проверяется, что снятые приманки доехали в бинарник
    именно приветствиями, а не чем попало (см. test_blob_catalogue_is_captured). */
 #include "d2k_quic.h"
@@ -64,131 +75,16 @@ static int fails;
         }                                          \
     } while (0)
 
-/* Имя, которым подставляется выведенная приманка (d2k_quic_decoy_from_trigger).
-   Боевой подбор берёт собственные приманки оригинала, а не вывод из снимка;
-   здесь имя нужно ровно затем, чтобы проверить сам вывод и перевод в план. */
+/* Имя, которым подставляется выведенная приманка. Вывод делает тот же
+   d2k_quic_hello_rename, которым выводит приманку планировщик (sched.c,
+   SCHED_DECOY) — обёртки d2k_quic_decoy_from_trigger над ним больше нет:
+   боевых вызывающих у неё не было, а проверять надо пересборку, а не
+   обёртку. Боевой подбор берёт собственные приманки оригинала, а не вывод из
+   снимка; здесь имя нужно ровно затем, чтобы проверить сам вывод и перевод в
+   план. */
 #define TEST_DECOY_SNI "disk.rzd.ru"
 /* Триггер — настоящий Initial: из него выводится приманка. */
 #define g_trig_bytes d2k_test_v1_initial
-
-/* =========================================================================
- * Часть 1: сборка фрагментов — чистая проверка байтов, без сокетов.
- * ========================================================================= */
-
-/* Тот же алгоритм RFC 1071, но СВОЙ, тестовый — модуль не должен проверять
-   себя своей же арифметикой (см. шапку файла и BADSUM в d2k_quicprobe.h). */
-static uint16_t test_ip_checksum(const uint8_t *hdr, size_t len) {
-    uint32_t sum = 0;
-    for (size_t i = 0; i + 1 < len; i += 2) {
-        sum += ((uint32_t)hdr[i] << 8) | hdr[i + 1];
-    }
-    if (len & 1) {
-        sum += (uint32_t)hdr[len - 1] << 8;
-    }
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    return (uint16_t)~sum;
-}
-
-static void test_frag_builder_correctness(void) {
-    uint8_t payload[64];
-    for (size_t i = 0; i < sizeof payload; i++) {
-        payload[i] = (uint8_t)(0x30 + i);
-    }
-    uint32_t src = htonl(0x0A060601u); /* 10.6.6.1 */
-    uint32_t dst = htonl(0x0A060602u); /* 10.6.6.2 */
-    uint8_t f1[D2K_QUIC_FRAG_MAX], f2[D2K_QUIC_FRAG_MAX];
-    size_t f1len = 0, f2len = 0;
-
-    size_t total = d2k_quic_build_frag2(payload, sizeof payload, src, dst, 55000, 443, 0xBEEF, 64, f1,
-                                         &f1len, f2, &f2len);
-
-    CHECK(total > 0, "сборка двух фрагментов из корректного входа обязана удаться");
-    CHECK(f1len >= 20 && f2len >= 20, "у каждого фрагмента обязан быть хотя бы IP-заголовок");
-
-    /* IHL занимает младшие 4 бита первого байта, в 32-битных словах. */
-    size_t ihl1 = (size_t)(f1[0] & 0x0F) * 4;
-    size_t ihl2 = (size_t)(f2[0] & 0x0F) * 4;
-    CHECK(ihl1 == 20 && ihl2 == 20, "без опций IP-заголовок обязан быть ровно 20 байт");
-
-    uint16_t totlen1 = (uint16_t)((f1[2] << 8) | f1[3]);
-    uint16_t totlen2 = (uint16_t)((f2[2] << 8) | f2[3]);
-    CHECK(totlen1 == f1len, "поле total length первого фрагмента обязано совпадать с реальной длиной посылки");
-    CHECK(totlen2 == f2len, "то же для второго фрагмента");
-
-    CHECK(f1[8] == 64 && f2[8] == 64, "TTL фрагментов обязан быть тем, что попросили строить (обычный, не укороченный — это другое плечо)");
-
-    uint16_t id1 = (uint16_t)((f1[4] << 8) | f1[5]);
-    uint16_t id2 = (uint16_t)((f2[4] << 8) | f2[5]);
-    CHECK(id1 == 0xBEEF && id2 == 0xBEEF, "оба фрагмента одной датаграммы обязаны нести один Identification");
-
-    uint16_t flagsoff1 = (uint16_t)((f1[6] << 8) | f1[7]);
-    uint16_t flagsoff2 = (uint16_t)((f2[6] << 8) | f2[7]);
-    CHECK((flagsoff1 & 0x2000) != 0, "первый фрагмент обязан нести MF=1 — данные ещё не кончились");
-    CHECK((flagsoff1 & 0x1FFF) == 0, "первый фрагмент начинается с нулевого смещения");
-    CHECK((flagsoff2 & 0x2000) == 0, "второй (последний) фрагмент обязан нести MF=0");
-    size_t frag_offset_bytes = (size_t)(flagsoff2 & 0x1FFF) * 8;
-    CHECK(frag_offset_bytes > 0 && (frag_offset_bytes % 8) == 0,
-          "смещение второго фрагмента обязано быть кратно 8 байтам (RFC 791 §3.2)");
-
-    uint16_t csum1 = (uint16_t)((f1[10] << 8) | f1[11]);
-    uint16_t csum2 = (uint16_t)((f2[10] << 8) | f2[11]);
-    uint8_t hdr1_zeroed[20], hdr2_zeroed[20];
-    memcpy(hdr1_zeroed, f1, 20);
-    memcpy(hdr2_zeroed, f2, 20);
-    hdr1_zeroed[10] = hdr1_zeroed[11] = 0;
-    hdr2_zeroed[10] = hdr2_zeroed[11] = 0;
-    CHECK(csum1 == test_ip_checksum(hdr1_zeroed, 20), "контрольная сумма IP-заголовка первого фрагмента обязана быть верной");
-    CHECK(csum2 == test_ip_checksum(hdr2_zeroed, 20), "то же для второго фрагмента");
-
-    /* Пересборка: первый фрагмент несёт UDP-заголовок (8 байт) + начало
-       данных; второй — хвост данных, БЕЗ собственного UDP-заголовка (он
-       есть только в одной копии на всю датаграмму, RFC 791). */
-    uint8_t reassembled[64 + 8];
-    size_t r = 0;
-    memcpy(reassembled + r, f1 + ihl1 + 8, f1len - ihl1 - 8);
-    r += f1len - ihl1 - 8;
-    memcpy(reassembled + r, f2 + ihl2, f2len - ihl2);
-    r += f2len - ihl2;
-    CHECK(r == sizeof payload, "пересобранная длина обязана совпасть с исходным UDP-payload");
-    CHECK(r == sizeof payload && memcmp(reassembled, payload, sizeof payload) == 0,
-          "пересобранные байты обязаны побайтно совпасть с тем, что просили отправить");
-
-    /* Контрольная сумма UDP (RFC 768) — СВОИМ кодом теста, не переиспользуя
-       udp_checksum из props.c (та же причина, что и для IP выше): псевдо-
-       заголовок(12) + UDP-заголовок с обнулённой суммой(8) + данные. */
-    uint8_t udp_hdr[8];
-    memcpy(udp_hdr, f1 + ihl1, 8);
-    uint16_t claimed_udp_csum = (uint16_t)((udp_hdr[6] << 8) | udp_hdr[7]);
-    udp_hdr[6] = udp_hdr[7] = 0;
-    uint8_t pseudo_and_hdr[12 + 8];
-    memcpy(pseudo_and_hdr, &src, 4);
-    memcpy(pseudo_and_hdr + 4, &dst, 4);
-    pseudo_and_hdr[8] = 0;
-    pseudo_and_hdr[9] = 17; /* IPPROTO_UDP */
-    uint16_t udp_len = (uint16_t)(8 + sizeof payload);
-    pseudo_and_hdr[10] = (uint8_t)(udp_len >> 8);
-    pseudo_and_hdr[11] = (uint8_t)(udp_len & 0xFF);
-    memcpy(pseudo_and_hdr + 12, udp_hdr, 8);
-    uint32_t usum = 0;
-    for (size_t i = 0; i + 1 < sizeof pseudo_and_hdr; i += 2) {
-        usum += ((uint32_t)pseudo_and_hdr[i] << 8) | pseudo_and_hdr[i + 1];
-    }
-    for (size_t i = 0; i + 1 < sizeof payload; i += 2) {
-        usum += ((uint32_t)reassembled[i] << 8) | reassembled[i + 1];
-    }
-    while (usum >> 16) {
-        usum = (usum & 0xFFFFu) + (usum >> 16);
-    }
-    uint16_t computed_udp_csum = (uint16_t)~usum;
-    if (computed_udp_csum == 0) {
-        computed_udp_csum = 0xFFFFu;
-    }
-    CHECK(claimed_udp_csum == computed_udp_csum,
-          "контрольная сумма UDP в собранном заголовке обязана быть настоящей (RFC 768), не нулём и не мусором");
-    (void)total;
-}
 
 /* =========================================================================
  * Часть 2: реальный TTL на проводе (127.0.0.1, IP_RECVTTL) — без цензора на
@@ -360,7 +256,7 @@ static void test_arm_to_plan(void) {
     static uint8_t decoy[2048];
     size_t blen = 0;
     d2k_hello trg = {g_trig_bytes, sizeof g_trig_bytes};
-    CHECK(d2k_quic_decoy_from_trigger(trg, TEST_DECOY_SNI, decoy, sizeof decoy, &blen) == 0,
+    CHECK(d2k_quic_hello_rename(trg.bytes, trg.len, TEST_DECOY_SNI, decoy, sizeof decoy, &blen) == 0,
           "приманка не вывелась из снятого приветствия");
     const uint8_t *blob = decoy;
 
@@ -415,7 +311,7 @@ static void test_decoy_is_derived(void) {
     size_t olen = 0;
     char sni[256];
 
-    CHECK(d2k_quic_decoy_from_trigger(trg, TEST_DECOY_SNI, out, sizeof out, &olen) == 0,
+    CHECK(d2k_quic_hello_rename(trg.bytes, trg.len, TEST_DECOY_SNI, out, sizeof out, &olen) == 0,
           "приманка не вывелась из снятого приветствия");
     CHECK(olen > 0 && d2k_quic_is_initial(out, olen),
           "выведенная приманка не Initial — коробка такому не поверит");
@@ -438,7 +334,7 @@ static void test_decoy_is_derived(void) {
     {
         d2k_hello empty = {NULL, 0};
         size_t n = 1;
-        CHECK(d2k_quic_decoy_from_trigger(empty, TEST_DECOY_SNI, out, sizeof out, &n) != 0,
+        CHECK(d2k_quic_hello_rename(empty.bytes, empty.len, TEST_DECOY_SNI, out, sizeof out, &n) != 0,
               "приманка «вывелась» из пустого снимка");
     }
 
@@ -699,7 +595,6 @@ static void quic_strategy_compose_checks(void) {
 int main(void) {
     quic_props_compose_checks();
     quic_strategy_compose_checks();
-    test_frag_builder_correctness();
     test_real_ttl_hook_on_wire();
     test_real_arm_icmp_is_measured_silence();
 

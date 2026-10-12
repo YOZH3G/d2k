@@ -151,7 +151,7 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
     }
     /* 2. Single copies failed: quic5 then fake_default_quic with repeats. */
     const int candidates[2]={0,3};
-    const int repeats[]={6,11};
+    const int repeats[]={D2K_QUIC_COPIES_A,D2K_QUIC_COPIES_B};
     for(int i=0;i<2;i++) for(size_t j=0;j<2;j++) {
         if(ask(c,&r,candidates[i],repeats[j],0,0,0,&measured)) {
             chosen=candidates[i]; r.copies=repeats[j]; goto selected;
@@ -159,21 +159,29 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
         /* Field e/f: fake_default x11 gets bound replies but not a usable
            connection. Plain split failed. Ask their product only on this
            measured contrast, never launch a Cartesian sweep. */
-        if(c && c->split_failed && !c->no_split && candidates[i]==3 && repeats[j]==11 &&
+        if(c && c->split_failed && !c->no_split && candidates[i]==3 && repeats[j]==D2K_QUIC_COPIES_B &&
            r.n_trace && r.trace[r.n_trace-1].answered>0 &&
            ((r.trace[r.n_trace-1].answered<D2K_QUIC_REPEATS && !r.trace[r.n_trace-1].not_measured) ||
             r.trace[r.n_trace-1].data==D2K_QAD_CUT ||
             r.trace[r.n_trace-1].data==D2K_QAD_NO_HANDSHAKE)) {
-            d2k_quic_arm_question q={.copies=11,.split=1};
+            d2k_quic_arm_question q={.copies=D2K_QUIC_COPIES_B,.split=1};
             const char *name;
+            char label[160]; /* кириллица — 2 байта на знак; с запасом под %d */
             q.blob=d2k_quic_original_blob(3,&q.blob_len,&name);
-            if(ask_q(c,&r,&q,"частичный ответ на приманку: fake_default ×11 вместе с разрезом CRYPTO",
-                     &measured,NULL)) {
+            /* Число копий печатается ИЗ константы, а не повторяется цифрой в
+               тексте: иначе правка лестницы молча оставила бы в журнале
+               неверное число — читающий поле сверяет вопрос по этой строке. */
+            snprintf(label,sizeof label,
+                     "частичный ответ на приманку: fake_default ×%d вместе с разрезом CRYPTO",
+                     D2K_QUIC_COPIES_B);
+            if(ask_q(c,&r,&q,label,&measured,NULL)) {
                 r.kind=c->marked?D2K_QA_SPLIT:D2K_QA_FLAKY;
-                r.strategy=D2K_QS_FAKE_SPLIT; r.copies=11; r.len=q.blob_len;
+                r.strategy=D2K_QS_FAKE_SPLIT; r.copies=D2K_QUIC_COPIES_B; r.len=q.blob_len;
                 memcpy(r.bytes,q.blob,q.blob_len);
                 snprintf(r.blob_name,sizeof r.blob_name,"%s",name);
-                snprintf(r.reason,sizeof r.reason,"приманка ×11 и разрез вместе: фильтр 3/3 и этап данных прошли");
+                snprintf(r.reason,sizeof r.reason,
+                         "приманка ×%d и разрез вместе: фильтр 3/3 и этап данных прошли",
+                         D2K_QUIC_COPIES_B);
                 return r;
             }
         }
