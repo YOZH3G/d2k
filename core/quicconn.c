@@ -94,6 +94,7 @@ typedef struct {
        номер пакета законен. */
     uint64_t    largest_acked;
     int         have_acked;
+    uint64_t    rx_pkts;    /* принято пакетов этого уровня, с повторами */
     crypto_rx   crypto;
 } level;
 
@@ -793,6 +794,14 @@ static int recv_dgram(d2k_qc *c, int wait_ms, char *err, size_t errcap) {
         if (!L->have_rx || pn > L->largest_rx) { L->largest_rx = pn; }
         L->have_rx = 1;
         L->ack_due = 1;
+        /* ПАКЕТЫ ЭТОГО УРОВНЯ, ВКЛЮЧАЯ ПОВТОРЫ. Нужны одному вызывающему и по
+           одной причине: когда рукопожатие не сложилось, по ним видно ФОРМУ
+           отказа. Сервер, получивший наш ACK уровня Initial, идёт дальше и
+           присылает полёт Handshake; сервер, нашего ACK не получивший, упирается
+           в предел троекратного усиления и повторяет свой Initial. Значит
+           «Initial пришёл несколько раз, Handshake не пришёл ни разу» — это
+           измеренное «наши пакеты до сервера не доходят», а не «не успели». */
+        L->rx_pkts++;
         any = 1;
         if (frames_in(c, lvl, plain, plen, err, errcap) != 0) { return -1; }
         off += h.packet_len;
@@ -1185,7 +1194,37 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
         }
     }
 
-    say(err, errcap, "%s", c->closed ? err : "рукопожатие не завершилось за отведённое время");
+    /* ФОРМА ОТКАЗА НАЗЫВАЕТСЯ ИЗМЕРЕНИЕМ, А НЕ НЕХВАТКОЙ ВРЕМЕНИ (задача 34).
+     * Поле 12.10c: nnmclub.to не завершает рукопожатие 4 раза из 4, а контроль
+     * katzauction.com на адресе из той же /24 того же CDN проходит 2 из 2 —
+     * значит дело не во времени и не в маршруте. Прежний единственный текст
+     * «не завершилось за отведённое время» эту разницу скрывал.
+     *
+     * Различаются три формы по тому, что ПРИШЛО, а не по догадке:
+     *   Handshake не пришёл ни разу, Initial приходил НЕСКОЛЬКО раз — сервер
+     *     упирается в предел троекратного усиления, то есть нашего ACK он не
+     *     получил: наши пакеты до него не доходят;
+     *   Handshake не пришёл, Initial пришёл один раз — сервер замолчал после
+     *     первого ответа, направление не названо;
+     *   Handshake пришёл — полёт есть, но Finished из него не собрался, и это
+     *     уже вопрос к разбору, а не к линии.
+     * Текст короткий и цифры в конце: вызывающий печатает его через «%.120s»,
+     * кириллица идёт по два байта. */
+    if (!c->closed) {
+        uint64_t ini = c->lv[D2K_QW_LEVEL_INITIAL].rx_pkts;
+        uint64_t hs = c->lv[D2K_QW_LEVEL_HANDSHAKE].rx_pkts;
+        size_t hs_crypto = c->lv[D2K_QW_LEVEL_HANDSHAKE].crypto.high;
+        if (hs == 0 && ini >= 2) {
+            say(err, errcap, "наши пакеты до сервера не доходят: он повторяет Initial ×%llu, "
+                             "Handshake не пришёл", (unsigned long long)ini);
+        } else if (hs == 0) {
+            say(err, errcap, "сервер замолчал после Initial ×%llu, Handshake не пришёл",
+                (unsigned long long)ini);
+        } else {
+            say(err, errcap, "полёт Handshake пришёл (%llu пак., CRYPTO %zu Б), "
+                             "Finished не собрался", (unsigned long long)hs, hs_crypto);
+        }
+    }
     d2k_qc_close(c);
     return -1;
 }
