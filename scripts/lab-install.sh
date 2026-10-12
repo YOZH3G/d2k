@@ -28,7 +28,19 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Контейнер ниже работает от root и пишет прямо в $WORK. На Linux такой
+# каталог остаётся за root, и пользователь раннера удалить его не может —
+# уборка падала с «Permission denied» уже ПОСЛЕ того, как все шесть проверок
+# прошли, и красила зелёный прогон в красный. Тем же образом файлы сперва
+# возвращаются вызвавшему пользователю. Docker Desktop на macOS сопоставляет
+# владельца сам, поэтому локально этого не было видно.
+cleanup() {
+    if [ -d "$WORK" ] && command -v docker >/dev/null 2>&1; then
+        docker run --rm -v "$WORK:/w" gcc:14 chown -R "$(id -u):$(id -g)" /w >/dev/null 2>&1 || true
+    fi
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
 tar -C "$ROOT" -cf - --exclude='.git' --exclude='*.o' --exclude='state' \
     --exclude='./build' --exclude='./.impeccable' --exclude='./spike' . | tar -C "$WORK" -xf -
 

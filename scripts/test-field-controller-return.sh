@@ -17,8 +17,12 @@ grep -F -- 'iptables -t mangle -I INPUT -m connmark --mark $CTL_MARK' "$SCRIPT" 
     exit 1
 }
 
+# Свойство, а не буквальная строка: в правило позже вставили фильтр
+# направления (-m conntrack --ctdir ORIGINAL), и сверка строки молча
+# устарела, хотя исходящий ClientHello зонда по-прежнему шёл в очередь.
+# Проверяются обязательные части ОДНОГО правила, в их порядке.
 # shellcheck disable=SC2016
-grep -F -- 'iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS -m mark --mark $CTL_MARK' "$SCRIPT" >/dev/null || {
+grep -E -- 'iptables -t mangle -I POSTROUTING -p tcp .*--dport \$PORTS .*-m mark --mark \$CTL_MARK .*-j NFQUEUE' "$SCRIPT" >/dev/null || {
     echo "FAIL: исходящий ClientHello локального зонда отсекается фильтром LAN-клиента" >&2
     exit 1
 }

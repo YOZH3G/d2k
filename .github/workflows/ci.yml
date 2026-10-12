@@ -171,14 +171,28 @@ jobs:
           node-version: '24'
       - name: Install tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq busybox
+      # Integration tests run against built code, not source. The controller
+      # handshake test starts the real core/d2kc.
+      - name: Build the controller
+        run: make -C core d2kc
       # Every scripts/test-* runs. A hand-picked list drifts away from the
-      # tree; discovery does not.
+      # tree; discovery does not. All tests run even after a failure, and
+      # every failure is named at the end: stopping at the first one hides the
+      # rest behind another push.
       - name: Run every scripts/test-*
         run: |
-          set -euo pipefail
+          set -uo pipefail
           shopt -s nullglob
-          for t in scripts/test-*.sh;  do echo "== $t ==";  sh "$t";   done
-          for t in scripts/test-*.cjs; do echo "== $t ==";  node "$t"; done
+          failed=()
+          for t in scripts/test-*.sh scripts/test-*.cjs; do
+            echo "::group::$t"
+            case "$t" in *.cjs) node "$t" ;; *) sh "$t" ;; esac || failed+=("$t")
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf '::error::failed: %s\n' "${failed[@]}"
+            exit 1
+          fi
 
   integration-install:
     name: Integration — install, upgrade, uninstall (ARM64 container)
