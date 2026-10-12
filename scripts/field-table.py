@@ -36,6 +36,24 @@ RE_SUMMARY = re.compile(r"итог поиска: (.*)")
 RE_SUMMARY_TARGET = re.compile(r"^" + TS + r" итог поиска: search=\S+ target=(\S+)")
 RE_YIELD = re.compile(r"\(QUIC\) вопрос завершён: уступаю слот")
 
+# ЧТО ЗАМЕР УСПЕЛ СКАЗАТЬ О ЦЕЛИ (12.10.2026). Мерило прогона — не «открылось
+# 19 из 19», а «19 из 19 ЗАМЕРОМ, перебора нуль»: каждая цель, ушедшая в
+# перебор, это отчёт о том, чего классификатор ещё не знает. Чтобы отчёт был
+# читаемым, таблица печатает измеренные признаки класса «отказ после первого
+# пакета» (core/quicprobe.c): направление обрыва, ответ контроля коротким
+# ответом и на чём сошлись числа остановки. Пусто — замер об этом не сказал
+# ничего, и это первое, что надо разбирать.
+MEASURED_TAGS = [
+    (re.compile(r"наши пакеты (?:до сервера )?не доходят|наше исходящее заглушено"),
+     "исходящее-заглушено"),
+    (re.compile(r"короткий ответ тоже встал"), "режется-поток"),
+    (re.compile(r"короткий ответ дошёл, сошлись и байты, и пакеты"), "байты+пакеты"),
+    (re.compile(r"короткий ответ дошёл, сошлись байты"), "байты"),
+    (re.compile(r"короткий ответ дошёл, сошлись пакеты"), "пакеты"),
+    (re.compile(r"короткий ответ дошёл, не сошлись"), "величина-не-повторяется"),
+    (re.compile(r"сервер молчит: два PING без ответа"), "тишина-обе-стороны"),
+]
+
 PATH_CLASS = {
     "свойство": "property",
     "вывод из замера": "property",
@@ -65,7 +83,7 @@ def dur(a, b):
 def new_row():
     return {"first": None, "confirmed": None, "plan": None, "path": None,
             "searches": 0, "probe_units": 0, "fb_runs": 0, "fb_failed": 0,
-            "fb_trials": 0, "outcomes": [], "yields": 0}
+            "fb_trials": 0, "outcomes": [], "yields": 0, "measured": []}
 
 
 def site_of(name, sites):
@@ -112,6 +130,15 @@ def main():
         is_http = line[9:13] == "HTTP"
         pm = RE_PROTO.match(line)
         proto = "http" if is_http else (pm.group(5).lower() if pm else None)
+
+        # Признаки замера собираются со ВСЕХ строк цели: они приходят и в
+        # причине вердикта, и в трассе шага плеча, и строка при этом может
+        # нести ещё и подтверждение — поэтому не continue.
+        for rx, tag in MEASURED_TAGS:
+            if rx.search(line):
+                r = row(site, proto or "quic")
+                if tag not in r["measured"]:
+                    r["measured"].append(tag)
 
         c = RE_CONF.search(line)
         if c:
@@ -166,8 +193,8 @@ def main():
 
     print("| Цель | Протокол | Первое | Подтверждено зондом | Время | Путь | План |"
           " Поисков | Ед. зондов | QUIC-перебор (провал/всего, опытов) |"
-          " Штрафов 10 мин (цель) | Исходы | live |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+          " Штрафов 10 мин (цель) | Замер сказал | Исходы | live |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     count = {}
     for (site, proto), r in sorted(rows.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         f0 = first.get(site)
@@ -178,14 +205,27 @@ def main():
         count[path.split(":")[0]] = count.get(path.split(":")[0], 0) + 1
         fb = "%d/%d, %d" % (r["fb_failed"], r["fb_runs"], r["fb_trials"]) if r["fb_runs"] else "—"
         outs = ",".join(sorted(set(r["outcomes"]))) or "—"
-        print("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | unknown |" % (
+        print("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | unknown |" % (
             site, proto, hms(f0) if f0 is not None else "—",
             hms(r["confirmed"]) if r["confirmed"] is not None else "—",
             dur(f0, r["confirmed"]), path, r["plan"] or "—",
             r["searches"] or "—", r["probe_units"] or "—", fb,
-            penalty.get(site, 0) or "—", outs))
+            penalty.get(site, 0) or "—", ",".join(r["measured"]) or "—", outs))
     print()
     print("Итого строк по пути: " + ", ".join("%s=%d" % kv for kv in sorted(count.items())))
+    # ДОЛГ КЛАССИФИКАТОРА, НАЗВАННЫЙ ЧИСЛОМ. Цель, взятая перебором или не
+    # взятая вовсе, и есть то, чего замер не смог; рядом печатается, что он
+    # всё-таки успел измерить, — с этого и начинается следующий разбор.
+    debt = [(s, p, r) for (s, p), r in sorted(rows.items())
+            if (r["path"] or "") .startswith("fallback") or r["path"] in (None, "none")
+            or (r["confirmed"] is None)]
+    if debt:
+        print()
+        print("Долг замера (%d из %d строк) — цели, которые замер не закрыл:" % (len(debt), len(rows)))
+        for s, p, r in debt:
+            print("  %s (%s): замер сказал %s; исходы %s" % (
+                s, p, ",".join(r["measured"]) or "ничего",
+                ",".join(sorted(set(r["outcomes"]))) or "—"))
     conf = [(first[s], r["confirmed"]) for (s, _), r in rows.items()
             if r["confirmed"] is not None and s in first]
     if conf:

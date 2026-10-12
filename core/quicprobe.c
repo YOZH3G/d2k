@@ -155,6 +155,8 @@
 #include "d2k_h3.h"
 #include "d2k_meas.h"
 #include "d2k_resource.h"
+#include "d2k_volume.h"  /* D2K_VOLUME_PACKET_SLACK — один допуск с TCP-веткой */
+#include "d2k_catalog.h"  /* D2K_VOLUME_SLACK — тот же допуск по байтам */
 
 /* ---------------------------------------------------------------------
  * Умолчание и тестовый шов. См. шапку d2k_quicprobe.h про то, почему
@@ -2599,17 +2601,104 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                            адресе (остаточной блокировки рукопожатия нет, её
                            вопрос здесь не задаётся). */
                         r.verdict = D2K_V_OPAQUE;
-                        /* Направление называется ОТДЕЛЬНЫМ полем, а не надеждой
-                           на то, что оно уцелеет в усечённом до 100 байт
-                           тексте (кириллица по два байта — ловушка 9193228), и
-                           только когда ОБА повтора измерили его одинаково. */
-                        reason_set(&r, "Initial проходит (%d/%d), ответ на свой запрос HTTP/3 "
-                                       "встаёт после рукопожатия дважды из двух (%llu и %llu байт%s: %.100s)",
+                        /* ЧТО ИМЕННО НАЗНАЧИЛО ОСТАНОВКУ: РАЗМЕР ИЛИ САМ ПОТОК
+                           (задача 27).
+                           Про ЧЕТВЁРКУ отвечать нечем и не нужно: у каждого
+                           опыта этапа данных свой местный порт (см. шапку
+                           test_quic_arm_data.c), значит два повтора встали на
+                           ДВУХ РАЗНЫХ четвёрках, и остаточное состояние
+                           прошлой тут ни при чём — это ответ без нового зонда.
+                           Чего два одинаковых повтора сказать не могут —
+                           зависит ли остановка от размера ответа. Поэтому
+                           задаётся контроль, который ОБЯЗАН дойти: заведомо
+                           отсутствующий путь того же имени (короткое тело 404)
+                           на свежей четвёрке, один полный ответ без
+                           воспроизведения по бюджету. Путь со случайным
+                           хвостом, чтобы не наткнуться на настоящий ресурс.
+                           Перепроверка перед снятием запрета (data_cut 2)
+                           контроля не спрашивает: ей нужен один ответ
+                           «встаёт ли ещё», и лишний зонд там незачем. */
+                        if (data_cut != 2 && budget_left(&start)) {
+                            uint8_t rnd[4];
+                            char cpath[32];
+                            static const char hex[] = "0123456789abcdef";
+                            if (d2k_t13_random(rnd, sizeof rnd) == 0) {
+                                size_t o = 0;
+                                cpath[o++] = '/'; cpath[o++] = 'd'; cpath[o++] = '2';
+                                cpath[o++] = 'k'; cpath[o++] = '-';
+                                for (size_t i = 0; i < sizeof rnd; i++) {
+                                    cpath[o++] = hex[rnd[i] >> 4];
+                                    cpath[o++] = hex[rnd[i] & 0x0f];
+                                }
+                                cpath[o] = '\0';
+                                d2k_quic_arm_question cq = dq;
+                                cq.label = "контроль: короткий ответ";
+                                cq.budget_pk = 0;
+                                cq.need_complete = 1;
+                                d2k_quic_arm_data cc = d2k_quic_arm_data_hook(&cq, sni, cpath,
+                                                                             port, dyn_wait, mark);
+                                r.probes += 1;
+                                qp_progress("контроль: короткий ответ", 1);
+                                if (cc.verdict == D2K_QAD_PASS) {
+                                    r.qprops.flow_cut_any_size = D2K_PROP_NO;
+                                } else if (cc.verdict == D2K_QAD_CUT) {
+                                    r.qprops.flow_cut_any_size = D2K_PROP_YES;
+                                }
+                                /* NOT_RUN и «рукопожатия нет» ответом не
+                                   считаются: вопрос остаётся НЕ ЗАДАННЫМ. */
+                            }
+                        }
+                        /* Измеренные признаки называются ОТДЕЛЬНЫМИ строками
+                           фиксированного размера, а не надеждой на то, что они
+                           уцелеют в усечённом тексте (кириллица по два байта —
+                           ловушка 9193228; массив, а не указатель, чтобы
+                           компилятор мог проверить границу). Направление —
+                           только когда ОБА повтора измерили его одинаково.
+                           ЧИСЛА ОСТАНОВКИ — ОБА ПОВТОРА И В ДВУХ ВИДАХ: байты
+                           и датаграммы. На чём они сошлись, решают ТЕ ЖЕ
+                           допуски, что у TCP-ветки (задача 28), и только если
+                           короткий ответ дошёл: иначе величина ни при чём. */
+                        if (r.qprops.flow_cut_any_size == D2K_PROP_NO) {
+                            uint64_t blo = dd.app_bytes < dd2.app_bytes ? dd.app_bytes : dd2.app_bytes;
+                            uint64_t bhi = dd.app_bytes > dd2.app_bytes ? dd.app_bytes : dd2.app_bytes;
+                            uint64_t plo = dd.packets < dd2.packets ? dd.packets : dd2.packets;
+                            uint64_t phi = dd.packets > dd2.packets ? dd.packets : dd2.packets;
+                            r.qprops.stop_by_bytes =
+                                bhi - blo <= (uint64_t)D2K_VOLUME_SLACK * 1024
+                                    ? D2K_PROP_YES : D2K_PROP_NO;
+                            r.qprops.stop_by_packets =
+                                phi - plo <= (uint64_t)D2K_VOLUME_PACKET_SLACK
+                                    ? D2K_PROP_YES : D2K_PROP_NO;
+                        }
+                        char ow[64], ctl[112];
+                        snprintf(ow, sizeof ow, "%s",
+                                 dd.oneway && dd2.oneway ? ", наши пакеты не доходят" : "");
+                        if (r.qprops.flow_cut_any_size == D2K_PROP_YES) {
+                            snprintf(ctl, sizeof ctl, "; короткий ответ тоже встал");
+                        } else if (r.qprops.flow_cut_any_size == D2K_PROP_NO) {
+                            /* Сошлось и там и там — короткий ответ эти два
+                               объяснения не различает, и выбирать нельзя. */
+                            snprintf(ctl, sizeof ctl, "; короткий ответ дошёл, %s",
+                                     r.qprops.stop_by_bytes == D2K_PROP_YES &&
+                                     r.qprops.stop_by_packets == D2K_PROP_YES
+                                         ? "сошлись и байты, и пакеты"
+                                     : r.qprops.stop_by_bytes == D2K_PROP_YES ? "сошлись байты"
+                                     : r.qprops.stop_by_packets == D2K_PROP_YES ? "сошлись пакеты"
+                                                                 : "не сошлись ни байты, ни пакеты");
+                        } else {
+                            ctl[0] = '\0';
+                        }
+                        /* Подробная причина самого этапа (dd.reason) здесь уже
+                           не нужна: байты и датаграммы обоих повторов названы
+                           числом, а направление — отдельным признаком. */
+                        reason_set(&r, "Initial %d/%d, свой запрос HTTP/3 встал после рукопожатия "
+                                       "дважды: %llu и %llu байт, %llu и %llu датаграмм%s%s",
                                    base.pass, D2K_QUIC_REPEATS,
                                    (unsigned long long)dd.app_bytes,
                                    (unsigned long long)dd2.app_bytes,
-                                   dd.oneway && dd2.oneway ? ", наши пакеты до сервера не доходят" : "",
-                                   dd.reason);
+                                   (unsigned long long)dd.packets,
+                                   (unsigned long long)dd2.packets,
+                                   ow, ctl);
                         d2k_quic_arm_context context = {.pool=pool, .n_pool=n_pool,
                             .next=next_addr, .residual=0, .marked=all_marked,
                             .can_ask=arm_budget_left, .limit_user=&start,

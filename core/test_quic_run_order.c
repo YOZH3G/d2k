@@ -134,20 +134,41 @@ static d2k_quic_arm_data data_pass(const d2k_quic_arm_question *q,const char *sn
    рукопожатия: сам по себе ответ встаёт, плечо с воздействием проходит. */
 static int direct_data_calls, direct_cut, direct_seq[4], arm_need_complete = -1;
 static unsigned direct_budget, arm_budget_seen;
+/* Задача 27: контроль «заведомо короткий ответ». Отличается от прямых
+   повторов тем, что воспроизведения по бюджету не просит (budget_pk == 0), и
+   спрашивает свой путь со случайным хвостом. */
+static int ctl_calls, ctl_verdict = D2K_QAD_PASS;
+static char ctl_path[64];
+static uint64_t direct_bytes[2], direct_pkts[2];
 static d2k_quic_arm_data data_cut(const d2k_quic_arm_question *q,const char *sni,
     const char *path,uint16_t port,uint32_t wait,uint32_t mark) {
-    (void)path;(void)port;(void)wait;(void)mark;(void)sni;
+    (void)port;(void)wait;(void)mark;(void)sni;
     d2k_quic_arm_data d; memset(&d,0,sizeof d);
     int plain=!q->blob && q->copies<=1 && !q->ttl && !q->frag && !q->benign && !q->split && !q->udplen;
+    if(plain && q->budget_pk==0) {
+        ctl_calls++;
+        snprintf(ctl_path,sizeof ctl_path,"%s",path?path:"");
+        CHECK(q->need_complete==1);
+        d.verdict=(d2k_quic_arm_data_verdict)ctl_verdict;
+        d.app_bytes=ctl_verdict==D2K_QAD_PASS?263:0;
+        return d;
+    }
     if(plain) {
         /* direct_seq: 1 — обрыв, 2 — ответ целиком; 0 — по direct_cut. */
         int v = direct_data_calls < 4 && direct_seq[direct_data_calls] ?
                 direct_seq[direct_data_calls] : (direct_cut ? 1 : 2);
         CHECK(q->need_complete == 1);
         direct_budget = q->budget_pk;
-        direct_data_calls++;
         d.verdict=v==1?D2K_QAD_CUT:D2K_QAD_PASS;
         d.app_bytes=v==1?1169:D2K_QUIC_ARM_DATA_BYTES;
+        /* Задача 28: числа остановки задаёт тест, когда ему нужно проверить,
+           на чём сошлась пара. Ноль — как прежде, оба повтора одинаковы. */
+        if(direct_data_calls<2 && (direct_bytes[direct_data_calls] ||
+                                   direct_pkts[direct_data_calls])) {
+            if(direct_bytes[direct_data_calls]) d.app_bytes=direct_bytes[direct_data_calls];
+            d.packets=direct_pkts[direct_data_calls];
+        }
+        direct_data_calls++;
     } else {
         arm_need_complete = q->need_complete;
         arm_budget_seen = q->budget_pk;
@@ -292,6 +313,70 @@ static void post_handshake_stall(void) {
        плечи обязаны пройти тот же бюджет. Воспроизведение — выход. */
     CHECK(direct_budget==D2K_QUIC_BOX_BUDGET_PKTS && arm_budget_seen==D2K_QUIC_BOX_BUDGET_PKTS);
     CHECK(arm.data_cut_seen==1);
+    /* ЗАДАЧА 27: ЧТО НАЗНАЧИЛО ОСТАНОВКУ — РАЗМЕР ИЛИ САМ ПОТОК. Два повтора
+       встали на двух РАЗНЫХ четвёрках (у каждого опыта свой местный порт), то
+       есть про четвёрку вопрос уже отвечен без нового зонда. Чего они не
+       говорят — зависит ли остановка от размера; это и спрашивает контроль:
+       заведомо отсутствующий путь того же имени, один полный ответ. */
+    CHECK(ctl_calls==1 && !strncmp(ctl_path,"/d2k-",5) && strlen(ctl_path)==13);
+    CHECK(r.qprops.flow_cut_any_size==D2K_PROP_NO);
+    CHECK(strstr(r.reason,"короткий ответ дошёл")!=NULL);
+    /* Оба повтора вернули одни и те же числа — сошлось и там, и там, и
+       выбрать одно объяснение нельзя. */
+    CHECK(r.qprops.stop_by_bytes==D2K_PROP_YES && r.qprops.stop_by_packets==D2K_PROP_YES);
+    CHECK(strstr(r.reason,"и байты, и пакеты")!=NULL);
+    /* Числа остановки печатаются в ДВУХ видах: решать, который повторяется,
+       здесь нечем (парная дисциплина — задача 28), но поле обязано их видеть. */
+    CHECK(strstr(r.reason,"байт")!=NULL && strstr(r.reason,"датаграмм")!=NULL);
+    /* Контроль тоже встал: режется сам поток, объёмные числа ничего не значат. */
+    memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
+    ctl_calls=0; ctl_verdict=D2K_QAD_CUT;
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(r.verdict==D2K_V_OPAQUE && ctl_calls==1);
+    CHECK(r.qprops.flow_cut_any_size==D2K_PROP_YES);
+    CHECK(strstr(r.reason,"короткий ответ тоже встал")!=NULL);
+    /* Контроль не измерился — вопрос НЕ ЗАДАН, а не отвечен отрицательно. */
+    memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
+    ctl_calls=0; ctl_verdict=D2K_QAD_NOT_RUN;
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+    CHECK(r.verdict==D2K_V_OPAQUE && ctl_calls==1);
+    CHECK(r.qprops.flow_cut_any_size==D2K_PROP_UNKNOWN);
+    CHECK(strstr(r.reason,"короткий ответ")==NULL);
+    /* Вопрос не задан — на чём сошлась пара, тоже не спрашивается: величина
+       ни при чём, пока не доказано, что короткий ответ доходит. */
+    CHECK(r.qprops.stop_by_bytes==D2K_PROP_UNKNOWN &&
+          r.qprops.stop_by_packets==D2K_PROP_UNKNOWN);
+    ctl_verdict=D2K_QAD_PASS;
+    /* ЗАДАЧА 28: НА ЧЁМ ОСТАНОВКА ПОВТОРЯЕТСЯ. Допуски — те же, что у
+       TCP-ветки: D2K_VOLUME_SLACK килобайт по байтам, D2K_VOLUME_PACKET_SLACK
+       по пакетам. Три различимых случая. */
+    struct { uint64_t b0,b1,p0,p1; int8_t by,pk; const char *tag; } basis[] = {
+        /* байты сошлись (в пределах 4 КиБ), пакеты разъехались */
+        { 16000, 17000, 20, 40, D2K_PROP_YES, D2K_PROP_NO,  "сошлись байты" },
+        /* пакеты сошлись (в пределах 3), байты разъехались */
+        { 5000, 60000, 25, 26, D2K_PROP_NO,  D2K_PROP_YES, "сошлись пакеты" },
+        /* не сошлось ничего: остановка по величине не повторяется */
+        { 1000, 90000, 10, 90, D2K_PROP_NO,  D2K_PROP_NO,  "ни байты, ни пакеты" },
+    };
+    for(size_t i=0;i<sizeof basis/sizeof basis[0];i++) {
+        memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0;
+        data_calls=direct_data_calls=0; ctl_calls=0;
+        direct_bytes[0]=basis[i].b0; direct_bytes[1]=basis[i].b1;
+        direct_pkts[0]=basis[i].p0;  direct_pkts[1]=basis[i].p1;
+        r=d2k_quic_run("127.0.0.1",443,"target.example",
+            (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        CHECK(r.verdict==D2K_V_OPAQUE && ctl_calls==1);
+        CHECK(r.qprops.stop_by_bytes==basis[i].by);
+        CHECK(r.qprops.stop_by_packets==basis[i].pk);
+        CHECK(strstr(r.reason,basis[i].tag)!=NULL);
+        if(r.qprops.stop_by_bytes!=basis[i].by||r.qprops.stop_by_packets!=basis[i].pk||
+           !strstr(r.reason,basis[i].tag))
+            fprintf(stderr,"основа %zu: байты %d пакеты %d [%s]\n",i,
+                    r.qprops.stop_by_bytes,r.qprops.stop_by_packets,r.reason);
+    }
+    direct_bytes[0]=direct_bytes[1]=direct_pkts[0]=direct_pkts[1]=0;
     /* Бюджет коробки из замера доходит до своего запроса и переживает прогон. */
     memset(&arm,0,sizeof arm); arm.data_cut=1; arm.budget_pk=17;
     calls=0; data_calls=direct_data_calls=0; direct_budget=0;
@@ -311,10 +396,13 @@ static void post_handshake_stall(void) {
        запросы, плечи не меряются. Прежде вход сводился к 0/1, и ветка
        «2» была мёртвой — перепроверка мерила плечи. */
     memset(&arm,0,sizeof arm); arm.data_cut=2; calls=0; data_calls=direct_data_calls=0;
+    ctl_calls=0;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE && direct_data_calls==2 && data_calls==0);
     CHECK(arm.data_cut==2 && arm.data_cut_seen==1);
+    /* Перепроверке контроль не нужен: ей нужен один ответ «встаёт ли ещё». */
+    CHECK(ctl_calls==0);
     /* Признак есть, но ответ приходит целиком: не воспроизвелось — CLEAR,
        плечи не меряются. */
     memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
