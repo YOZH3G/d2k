@@ -155,6 +155,20 @@ static void scenario(int selected) {
     q->state=T_FREE;s->tasks[2].state=T_FREE;d2k_sched_free(s);d2k_catalog_free(&cat);
 }
 int main(void){
+    /* ГЕРМЕТИЧНО: лимит слотов здесь обязан остаться 2. Планировщик на каждом
+       тике пересчитывает его по РЕАЛЬНЫМ CPU и памяти машины (AIMD в
+       measure_limit_update). На macOS /proc нет, ресурсы «неизвестны», и
+       лимит стоит на SCHED_DEFAULT_ACTIVE_MEASUREMENTS = 2. На Linux-раннере
+       CI ресурсы читаются по-настоящему, свободного процессора много, и тик
+       поднимал лимит до 3 — у припаркованного QUIC появлялся слот, и
+       утверждение «поиск остался припаркованным» падало в каждом прогоне
+       (12.10.2026: и в обычной сборке, и под ASan). Тест проверяет порядок
+       уступки слота, а не реакцию на нагрузку — её проверяет test_sched
+       своими заглушками. */
+    d2k_sched_cpu_hook = NULL;
+    d2k_sched_mem_hook = NULL;
+    d2k_sched_ct_hook = NULL;
+
     for(int i=0;i<6;i++)scenario(i);
     printf("QUIC question yield: %d failures\n",fails);return fails?1:0;
 }
