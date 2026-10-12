@@ -370,12 +370,13 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
  * которого вызывающего позвали), остальное — из d2k_quic_resolve_hook, с
  * отбросом дублей (иначе "свежий" адрес мог бы совпасть с уже использованным,
  * и ротация/подтверждение на нём были бы фиктивными). Общее между деревом
- * вопросов (d2k_quic_classify выше) и подбором плеча (задача 6,
- * d2k_quic_pick_arm ниже) — сама сборка пула не имеет отношения ни к порядку
- * вопросов, ни к порядку плеч; дублировать те же двадцать строк ради второго
- * вызывающего значило бы завести именно тот риск расхождения, из-за которого
- * в проекте уже отмечены другие копии (см. вспомогательные функции разбора в
- * этом же файле выше). ip уже проверен вызывающим (длина и inet_pton) — здесь
+ * вопросов (d2k_quic_classify выше) и прогоном плеч (d2k_quic_run, чей пул
+ * достаётся лестнице quicarms.c) — сама сборка пула не имеет отношения ни к
+ * порядку вопросов, ни к порядку плеч; дублировать те же двадцать строк ради
+ * второго вызывающего значило бы завести именно тот риск расхождения,
+ * из-за которого в проекте уже отмечены другие копии (см. вспомогательные
+ * функции разбора в этом же файле выше).
+ * ip уже проверен вызывающим (длина и inet_pton) — здесь
  * повторно не проверяется. Возвращает итоговое число адресов в пуле
  * (не больше cap). */
 size_t d2k_quic_build_pool(const char *ip, const char *sni, char pool[][D2K_QUIC_ADDR_LEN], size_t cap);
@@ -384,9 +385,10 @@ size_t d2k_quic_build_pool(const char *ip, const char *sni, char pool[][D2K_QUIC
  * (task 40): residual clearance and CRYPTO split questions first; the
  * original askArms ladder (intrinsic fakes, copies 6/11, TTL 3/5/8/12, then
  * exact fragment questions) runs only when those answers are unmeasurable.
- * The old d2k_quic_pick_arm remains only for legacy transport regression
- * tests; its separate-IP confirmation and derived fake are NOT the runtime
- * algorithm. An observed fake is a candidate, not application success. */
+ * That ladder is the ONLY arm search: the old d2k_quic_pick_arm, with its
+ * separate-IP confirmation, snapshot-derived fake and 1..255 TTL sweep, had
+ * no production caller and has been removed; nothing outside quicarms.c
+ * decides arms. An observed fake is a candidate, not application success. */
 typedef enum {
     D2K_QA_BLOB,      /* одиночной фальшивки достаточно (ttl не значим) */
     D2K_QA_COPIES,    /* потребовалось НЕСКОЛЬКО копий приманки (см. copies) */
@@ -754,11 +756,6 @@ d2k_vres d2k_quic_run_seeded(const char *ip, uint16_t port, const char *sni,
     d2k_hello trigger, d2k_hello control, uint32_t mark, d2k_quic_arm *arm,
     const d2k_base_seed *seed);
 
-/* decoy_sni — имя, которым подставляется приманка. Приходит СНАРУЖИ, а не
- * выдумывается здесь: имя приманки — свойство подбора планов целиком (у
- * TCP-ветки оно то же самое), и второе его определение разошлось бы молча. */
-d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni,
-                                const char *decoy_sni, d2k_hello trigger, uint32_t mark);
 /* Legacy snapshot-derived fake helper. Not a substitute for the original
  * instrument's intrinsic fake bytes and not used by scheduler arm search. */
 int d2k_quic_decoy_from_trigger(d2k_hello trigger, const char *decoy_sni,

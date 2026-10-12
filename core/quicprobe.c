@@ -242,8 +242,7 @@ uint32_t d2k_quic_budget_s = D2K_QUIC_BUDGET_DERIVED;
  * задаче 6 (props.c) нужно знать тот же предел, чтобы завести пул того же
  * размера для d2k_quic_build_pool; значение и обоснование там же. */
 
-/* Общая сборка пула для d2k_quic_classify и d2k_quic_pick_arm (задача 6) —
- * см. её контракт в d2k_quicprobe.h. Вынесена сюда (не статическая), а не
+/* Сборка пула адресов цели. Вынесена сюда (не статическая), а не
  * продублирована в props.c, по той же причине, что qp_parse_hdr не дублирует
  * quic.c целиком, а берёт из него только согласие в вопросе "это Initial":
  * расходиться может НАБОР полей, которые нужны разным вызывающим, но не
@@ -1795,9 +1794,9 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
 
 /* Задача 6: как quic_ask (умолчание d2k_quic_ask_hook), но с TTL приманки —
    см. doc-комментарий d2k_quic_ask_ttl_fn в d2k_quicprobe.h. rtt/refused не
-   нужны ни одному вызывающему d2k_quic_pick_arm (RTT там берётся из уже
-   пройденного d2k_quic_classify, refused — различие, нужное только базовой
-   живости дерева вопросов). */
+   нужны вызывающим этот крючок: RTT берётся из уже пройденного
+   d2k_quic_classify, а refused — различие, нужное только базовой живости
+   дерева вопросов. */
 static d2k_tally quic_ask_ttl(const char *addr, uint16_t port, const uint8_t *prefix, size_t prefix_len,
                                int prefix_ttl, d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                int repeats, int *sent_out) {
@@ -2353,8 +2352,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
     /* Пул адресов: ip — первый и гарантированный (это ровно тот адрес, для
        которого нас позвали), остальное — из резолвера, с отбросом дублей
        (иначе "свежий" адрес мог бы совпасть с уже использованным, и ротация
-       была бы фиктивной). Сборка общая с d2k_quic_pick_arm (задача 6) — см.
-       d2k_quic_build_pool. */
+       была бы фиктивной). Сама сборка — d2k_quic_build_pool. */
     char pool[D2K_QUIC_MAX_ADDRS][D2K_QUIC_ADDR_LEN];
     size_t n_pool = d2k_quic_build_pool(ip, sni, pool, D2K_QUIC_MAX_ADDRS);
     size_t next_addr = 1; /* pool[0] занят базовой живостью/прямым зондом/шагом 2 — см. шапку файла */

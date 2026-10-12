@@ -1,26 +1,33 @@
-/* test_quic_arms.c — задача 6: подбор исполнимого плеча QUIC из измеренного.
+/* test_quic_arms.c — транспорт и перевод в план для плеч QUIC.
  *
- * Проверяется в ТРИ РАЗНЫЕ СТОРОНЫ, той же дисциплиной, что и test_quicprobe.c
- * (см. его шапку):
+ * ЛЕСТНИЦА ПЛЕЧ ПРОВЕРЯЕТСЯ НЕ ЗДЕСЬ. Боевой порядок вопросов
+ * (d2k_quic_strategy_arms -> d2k_quic_original_arms, quicarms.c) держат
+ * test_quic_strategy.c, test_quic_original_arms.c и сквозной
+ * test_quic_run_order.c: там он проверяется точными счётчиками вопросов и
+ * опытов, на том же проводе и с тем же этапом данных, что в поле. Прежде в
+ * этом файле стояли ещё двенадцать проверок устаревшего d2k_quic_pick_arm —
+ * вместе с самой функцией они удалены: боевых вызывающих у неё не было, а
+ * утверждала она отменённое (развёртка TTL 1..255 вместо четырёх значений
+ * 3/5/8/12, подтверждение единогласием на отдельном IP, приманка, выведенная
+ * из снимка, вместо собственных приманок оригинала).
  *
- * 1. ДИСЦИПЛИНА ЛЕСТНИЦЫ ЦЕНЫ (порядок блоб -> TTL -> фрагментация, единогласие
- *    на подтверждении, честный "не задано" при исчерпании бюджета/пула адресов,
- *    метка) — через подмену d2k_quic_ask_hook/d2k_quic_ask_ttl_hook/
- *    d2k_quic_ask_frag_hook/d2k_quic_resolve_hook. Без сети и без раздумий о
- *    том, помогает ли конкретный блоб конкретной коробке, — это вопрос
- *    измерения на линии, не этого теста (см. предупреждение в
- *    d2k_quicprobe.h у d2k_quic_pick_arm).
- * 2. СБОРКА ФРАГМЕНТОВ (d2k_quic_build_frag2) — чистая проверка байтов:
+ * Остаётся то, что про транспорт и про план, и проверяется в три стороны:
+ *
+ * 1. СБОРКА ФРАГМЕНТОВ (d2k_quic_build_frag2) — чистая проверка байтов:
  *    контрольная сумма IP-заголовка каждого фрагмента и совпадение
  *    восстановленной пересборки с исходной датаграммой. Сумма считается
  *    СВОИМ кодом теста, а не переиспользованием проверяемой функции — иначе
  *    тест сверяет модуль с самим собой (тот же принцип, что для BADSUM в
  *    задаче 3, d2k_quicprobe.h).
- * 3. РЕАЛЬНЫЙ TTL НА ПРОВОДЕ (loopback, IP_RECVTTL) — то, что реально можно
+ * 2. РЕАЛЬНЫЙ TTL НА ПРОВОДЕ (loopback, IP_RECVTTL) — то, что реально можно
  *    проверить без цензора на пути: приманка действительно уходит с
  *    запрошенным TTL, а сам триггер — обычным. Смерть приманки НЕ ДО сервера
  *    этот стенд доказать не может (на loopback нет промежуточных прыжков) —
- *    и не должен: см. предупреждение в комментарии у d2k_quic_pick_arm.
+ *    и не должен. Рядом — ICMP «порт недоступен» на боевое плечо: вопрос
+ *    задан, ответа нет, а не «не измерено».
+ * 3. ПЕРЕВОД ИЗМЕРЕННОГО В ПЛАН (d2k_quic_arm_plan, d2k_quic_compose_plan,
+ *    d2k_voice_plan, d2k_quic_delay_plan) — текст плана, его грамматика и
+ *    отказ на невыразимом плече.
  */
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE /* IP_TTL/IP_RECVTTL/INADDR_LOOPBACK на macOS — тот же приём, что в props.c */
@@ -57,450 +64,15 @@ static int fails;
         }                                          \
     } while (0)
 
-/* =========================================================================
- * Часть 1: дисциплина лестницы цены — моки трёх оракулов и резолвера.
- * ========================================================================= */
-
-static d2k_quic_ask_fn real_ask_hook;
-static d2k_quic_ask_ttl_fn real_ask_ttl_hook;
-static d2k_quic_ask_copies_fn real_ask_copies_hook;
-static d2k_quic_ask_frag_fn real_ask_frag_hook;
-static d2k_quic_resolve_fn real_resolve_hook;
-
-/* -- мок d2k_quic_ask_hook (одиночная фальшивка без TTL / подтверждение) -- */
-static int g_ask_calls;
-static char g_ask_last_addr[D2K_QUIC_ADDR_LEN];
-static int g_ask_repeats_log[8];
-/* Повторы ПОСЛЕДНЕГО обращения. Отдельно от лога на восемь ячеек: каталог
-   приманок вырос, и подтверждение давно уезжает за его пределы — лог ловил
-   бы чужую ячейку и молчал об этом. */
-static int g_ask_last_repeats;
-static uint32_t g_ask_mark_seen;
-static int g_ask_pass_single;    /* 1 — одиночная приманка проходит */
-static int g_ask_confirm_ok = 1; /* единогласие на подтверждении (repeats>1) */
-
-/* Приманка у подбора одна и ВЫВЕДЕННАЯ. Мок не сверяет её с каталогом —
-   каталога нет, — а проверяет, что ему дали именно выведенную: настоящий
-   Initial, в котором стоит имя приманки, а не имя цели. */
+/* Имя, которым подставляется выведенная приманка (d2k_quic_decoy_from_trigger).
+   Боевой подбор берёт собственные приманки оригинала, а не вывод из снимка;
+   здесь имя нужно ровно затем, чтобы проверить сам вывод и перевод в план. */
 #define TEST_DECOY_SNI "disk.rzd.ru"
-static int decoy_is_derived(const uint8_t *prefix, size_t prefix_len) {
-    char sni[256];
-    if (!prefix || prefix_len == 0) { return 0; }
-    if (!d2k_quic_is_initial(prefix, prefix_len)) { return 0; }
-    if (d2k_quic_sni(prefix, prefix_len, sni, sizeof sni) != 0) { return 0; }
-    return strcmp(sni, TEST_DECOY_SNI) == 0;
-}
-
-static d2k_tally mock_ask(const char *addr, uint16_t port, const uint8_t *prefix, size_t prefix_len,
-                           d2k_hello msg, uint32_t wait_ms, uint32_t mark, int repeats,
-                           uint32_t *rtt_ms_out, int *refused_out, int *sent_out,
-                           uint8_t *ttl_in_out) {
-    (void)port;
-    (void)msg;
-    (void)wait_ms;
-    if (ttl_in_out) { *ttl_in_out = 0; } /* мок сокетов не трогает: TTL взять неоткуда */
-    g_ask_mark_seen = mark;
-    if (addr) {
-        strncpy(g_ask_last_addr, addr, sizeof g_ask_last_addr - 1);
-    }
-    g_ask_last_repeats = repeats;
-    if (g_ask_calls < 8) {
-        g_ask_repeats_log[g_ask_calls] = repeats;
-    }
-    g_ask_calls++;
-    if (rtt_ms_out) {
-        *rtt_ms_out = 0;
-    }
-    if (refused_out) {
-        *refused_out = 0;
-    }
-    d2k_tally t;
-    memset(&t, 0, sizeof t);
-    t.marked = 1;
-    if (g_ask_pass_single && decoy_is_derived(prefix, prefix_len)) {
-        if (repeats <= 1) {
-            t.pass = 1;
-        } else {
-            t.pass = g_ask_confirm_ok ? repeats : repeats - 1;
-            t.fail = repeats - t.pass;
-        }
-    } else {
-        t.fail = repeats;
-    }
-    if (sent_out) {
-        *sent_out = repeats;
-    }
-    return t;
-}
-
-/* -- мок d2k_quic_ask_copies_hook (несколько копий приманки) -- */
-static int g_cop_calls;
-static int g_cop_pass_at = -1;   /* число копий, при котором коробка поддаётся; -1 — никогда */
-static int g_cop_log[8];
-
-static d2k_tally mock_ask_copies(const char *addr, uint16_t port, const uint8_t *prefix,
-                                  size_t prefix_len, int copies, d2k_hello msg,
-                                  uint32_t wait_ms, uint32_t mark, int repeats, int *sent_out) {
-    (void)addr; (void)port; (void)msg; (void)wait_ms; (void)mark;
-    if (g_cop_calls < 8) { g_cop_log[g_cop_calls] = copies; }
-    g_cop_calls++;
-    d2k_tally t;
-    memset(&t, 0, sizeof t);
-    t.marked = 1;
-    if (copies == g_cop_pass_at && decoy_is_derived(prefix, prefix_len)) {
-        t.pass = repeats <= 1 ? 1 : repeats;
-    } else {
-        t.fail = repeats <= 1 ? 1 : repeats;
-    }
-    if (sent_out) { *sent_out = repeats <= 1 ? 1 : repeats; }
-    return t;
-}
-
-/* -- мок d2k_quic_ask_ttl_hook (приманка с укороченным TTL) -- */
-static int g_ttl_calls;
-static int g_ttl_log[300];
-static int g_ttl_pass_at = -1; /* -1 — ни один TTL не помогает */
-static int g_ttl_confirm_ok = 1;
-
-static d2k_tally mock_ask_ttl(const char *addr, uint16_t port, const uint8_t *prefix, size_t prefix_len,
-                               int prefix_ttl, d2k_hello msg, uint32_t wait_ms, uint32_t mark,
-                               int repeats, int *sent_out) {
-    (void)addr;
-    (void)port;
-    (void)prefix;
-    (void)prefix_len;
-    (void)msg;
-    (void)wait_ms;
-    (void)mark;
-    if (g_ttl_calls < 300) {
-        g_ttl_log[g_ttl_calls] = prefix_ttl;
-    }
-    g_ttl_calls++;
-    d2k_tally t;
-    memset(&t, 0, sizeof t);
-    t.marked = 1;
-    if (prefix_ttl == g_ttl_pass_at) {
-        if (repeats <= 1) {
-            t.pass = 1;
-        } else {
-            t.pass = g_ttl_confirm_ok ? repeats : repeats - 1;
-            t.fail = repeats - t.pass;
-        }
-    } else {
-        t.fail = repeats;
-    }
-    if (sent_out) {
-        *sent_out = repeats;
-    }
-    return t;
-}
-
-/* -- мок d2k_quic_ask_frag_hook (фрагментация) -- */
-static int g_frag_calls;
-static int g_frag_works = 0;
-static int g_frag_confirm_ok = 1;
-
-/* ВЫЖИВАЮТ ЛИ ФРАГМЕНТЫ НА КАНАЛЕ ВООБЩЕ. Мок отличает этот зонд от боевого
-   по имени внутри: проверка выживаемости идёт на ЗАВЕДОМО ОТВЕЧАЮЩЕМ имени
-   (имени приманки), а плечо — на имени цели. Отличать по счётчику вызовов
-   было бы хуже: тест перестал бы ловить перестановку зондов местами. */
-static int g_frag_survive_calls;
-static int g_frag_survives = 1;
-
-static d2k_tally mock_ask_frag(const char *addr, uint16_t port, d2k_hello msg, uint32_t wait_ms,
-                                uint32_t mark, int repeats, int *sent_out) {
-    (void)addr;
-    (void)port;
-    (void)wait_ms;
-    (void)mark;
-    if (decoy_is_derived(msg.bytes, msg.len)) {
-        g_frag_survive_calls++;
-        d2k_tally st;
-        memset(&st, 0, sizeof st);
-        st.marked = 1;
-        if (g_frag_survives) { st.pass = repeats; } else { st.fail = repeats; }
-        if (sent_out) { *sent_out = repeats; }
-        return st;
-    }
-    g_frag_calls++;
-    d2k_tally t;
-    memset(&t, 0, sizeof t);
-    t.marked = 1;
-    if (g_frag_works) {
-        if (repeats <= 1) {
-            t.pass = 1;
-        } else {
-            t.pass = g_frag_confirm_ok ? repeats : repeats - 1;
-            t.fail = repeats - t.pass;
-        }
-    } else {
-        t.fail = repeats;
-    }
-    if (sent_out) {
-        *sent_out = repeats;
-    }
-    return t;
-}
-
-/* -- мок резолвера: детерминированный пул для проверки "свежий адрес" -- */
-static size_t g_resolve_n = 3;
-static size_t mock_resolve(const char *sni, char out[][D2K_QUIC_ADDR_LEN], size_t cap) {
-    (void)sni;
-    static const char *addrs[] = {"10.6.6.2", "10.6.6.3", "10.6.6.4"};
-    size_t n = g_resolve_n;
-    if (n > sizeof addrs / sizeof addrs[0]) {
-        n = sizeof addrs / sizeof addrs[0];
-    }
-    if (n > cap) {
-        n = cap;
-    }
-    for (size_t i = 0; i < n; i++) {
-        strncpy(out[i], addrs[i], D2K_QUIC_ADDR_LEN - 1);
-    }
-    return n;
-}
-
-static void mocks_reset(void) {
-    g_ask_calls = 0;
-    g_ask_last_repeats = 0;
-    memset(g_ask_last_addr, 0, sizeof g_ask_last_addr);
-    memset(g_ask_repeats_log, 0, sizeof g_ask_repeats_log);
-    g_ask_mark_seen = 0;
-    g_ask_pass_single = 0;
-    g_ask_confirm_ok = 1;
-    g_cop_calls = 0;
-    memset(g_cop_log, 0, sizeof g_cop_log);
-    g_cop_pass_at = -1;
-    g_ttl_calls = 0;
-    memset(g_ttl_log, 0, sizeof g_ttl_log);
-    g_ttl_pass_at = -1;
-    g_ttl_confirm_ok = 1;
-    g_frag_calls = 0;
-    g_frag_survive_calls = 0;
-    g_frag_survives = 1;
-    g_frag_works = 0;
-    g_frag_confirm_ok = 1;
-    g_resolve_n = 3;
-    d2k_quic_budget_s = 120;
-}
-
 /* Триггер — настоящий Initial: из него выводится приманка. */
 #define g_trig_bytes d2k_test_v1_initial
 
-static void test_ladder_blob_wins(void) {
-    mocks_reset();
-    g_ask_pass_single = 1;
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 7);
-
-    CHECK(a.kind == D2K_QA_BLOB, "плечо приманки должно победить, когда одиночная приманка проходит");
-    CHECK(g_ttl_calls == 0, "TTL дороже блоба — не должен спрашиваться, если блоб уже победил");
-    CHECK(g_frag_calls == 0, "фрагментация дороже всех — не должна спрашиваться, если блоб победил");
-    /* Приманка ОДНА: один разведочный опыт плюс одно подтверждение
-       единогласием — два обращения, и никакого перебора. */
-    CHECK(g_ask_calls == 2, "ожидались одна одиночная попытка и одно подтверждение");
-    CHECK(g_ask_last_repeats == D2K_QUIC_REPEATS,
-          "подтверждение обязано идти повторами, не одиночно");
-    CHECK(strcmp(g_ask_last_addr, "1.2.3.4") != 0,
-          "подтверждение обязано уйти на СВЕЖИЙ адрес, а не на тот, где велась разведка");
-    CHECK(g_ask_mark_seen == 7, "метка обязана дойти до оракула без изменений");
-}
-
-static void test_ladder_ttl_wins_when_no_blob_helps(void) {
-    mocks_reset();
-    g_ask_pass_single = 0;
-    g_ttl_pass_at = 5;
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-
-    CHECK(a.kind == D2K_QA_TTL, "если ни один блоб без TTL не помог, а TTL=5 помогает — плечо TTL");
-    CHECK(a.ttl == 5, "выбранный TTL обязан быть измеренным значением развёртки, не любым другим");
-    CHECK(g_ask_calls == 1, "до развёртки TTL обязана быть ровно одна одиночная попытка приманкой");
-    /* 5 разведочных шагов развёртки (1,2,3,4,5, останов на первом успехе) +
-       1 подтверждение повторами на найденном TTL=5. */
-    CHECK(g_ttl_calls == 6, "развёртка обязана идти С НАЧАЛА (1,2,3,4,5) и остановиться на первом успехе, плюс одно подтверждение");
-    for (int i = 0; i < 5; i++) {
-        char buf[128];
-        snprintf(buf, sizeof buf, "шаг развёртки %d обязан пробовать TTL=%d, а не перепрыгивать", i, i + 1);
-        CHECK(g_ttl_log[i] == i + 1, buf);
-    }
-    CHECK(g_ttl_log[5] == 5, "подтверждение обязано идти на ТОМ ЖЕ TTL, что и разведка, не на любом другом");
-    CHECK(g_frag_calls == 0, "фрагментация не нужна, если развёртка TTL уже нашла рабочее значение");
-}
-
-/* ЧИСЛО КОПИЙ — отдельная ось, и она идёт ДО развёртки TTL: две точки против
-   двухсот пятидесяти пяти. Донор ставит её так же (arms.go:117-150), и замер
-   12.09 показал, зачем: instagram берётся ТОЛЬКО одиннадцатью копиями quic5,
-   одиночные копии всех блобов дают 0/3. */
-static void test_ladder_copies_before_ttl(void) {
-    mocks_reset();
-    g_ask_pass_single = 0;          /* одиночной копией не берётся ни один блоб */
-    g_ttl_pass_at = 5;             /* TTL помог бы, но до него дойти не должно */
-    g_cop_pass_at = D2K_QUIC_COPIES_A;
-    
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-
-    CHECK(a.kind == D2K_QA_COPIES,
-          "плечо с числом копий не названо своим видом — воздействие выдано за одиночную приманку");
-    CHECK(a.copies == D2K_QUIC_COPIES_A,
-          "число копий в результате не то, которым коробка поддалась");
-
-    CHECK(g_cop_log[0] == D2K_QUIC_COPIES_A,
-          "лестница копий обязана начинаться с меньшей точки");
-    CHECK(g_ttl_calls == 0,
-          "развёртка TTL пошла раньше лестницы копий — дорогая ось обогнала дешёвую");
-}
-
-/* Вторая точка лестницы достигается, если первой не хватило. */
-static void test_ladder_copies_second_point(void) {
-    mocks_reset();
-    g_ask_pass_single = 0;
-    g_ttl_pass_at = -1;
-    g_cop_pass_at = D2K_QUIC_COPIES_B;
-    
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-
-    CHECK(a.kind == D2K_QA_COPIES, "вторая точка лестницы не сработала");
-    CHECK(a.copies == D2K_QUIC_COPIES_B, "число копий не совпало со второй точкой");
-
-}
-
-static void test_ladder_frag_is_last_resort(void) {
-    mocks_reset();
-    g_ask_pass_single = 0;
-    g_ttl_pass_at = -1; /* ни один TTL до потолка протокола (255) не помогает */
-    g_frag_works = 1;
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-
-    CHECK(a.kind == D2K_QA_FRAG, "если ни блоб, ни TTL не помогли — последнее и самое дорогое средство: фрагментация");
-    CHECK(g_ttl_calls == 255, "развёртка обязана дойти до предела поля TTL (RFC 791 §3.1, 8 бит), не остановиться раньше без причины");
-    CHECK(g_frag_calls == 2, "один одиночный зонд фрагментацией + одно подтверждение повторами");
-}
-
-/* --- ФРАГМЕНТЫ НЕ ЖИВУТ НА КАНАЛЕ: СЕМЕЙСТВО НЕ ПРЕДЛАГАТЬ -------------
- *
- * Условие корректности, а не осторожность. Если фрагменты режет CGNAT или
- * сама коробка, «не помогло» будет значить «приём убивает трафик», а не
- * «коробка собирает». Выдать такое плечо человеку — тихо сломать ему сеть, и
- * он даже не свяжет одно с другим.
- *
- * Поэтому выживаемость меряется ПЕРВОЙ и на ЗАВЕДОМО ОТВЕЧАЮЩЕМ имени: если
- * фрагментированная датаграмма не доходит даже с ним, дело не в коробке. */
-static void test_frag_not_offered_when_fragments_die(void) {
-    mocks_reset();
-    g_ask_pass_single = 0;
-    g_ttl_pass_at = -1;
-    g_frag_survives = 0;  /* фрагменты режет сам канал */
-    g_frag_works = 1;     /* и «помогли» бы, если бы дошли */
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-
-    CHECK(g_frag_survive_calls > 0, "выживаемость фрагментов не проверялась вовсе");
-    CHECK(a.kind != D2K_QA_FRAG,
-          "фрагментация предложена на канале, где фрагменты не доживают, — это не обход, а потеря трафика");
-    CHECK(g_frag_calls == 0, "боевой зонд фрагментацией ушёл, хотя канал её не пропускает");
-    CHECK(a.frag_survives == D2K_PROP_NO, "свойство «фрагменты доходят» не записано");
-    CHECK(strstr(a.reason, "фрагмент") != NULL,
-          "причина обязана назвать канал, а не выдать молчание за «приём не помог»");
-}
-
-/* Выживаемость ПРОВЕРЕНА и подтверждена — плечо предлагается как раньше, и
-   свойство записано. Обратная половина той же проверки: без неё «не
-   предлагать никогда» тоже прошло бы. */
-static void test_frag_offered_when_fragments_live(void) {
-    mocks_reset();
-    g_ask_pass_single = 0;
-    g_ttl_pass_at = -1;
-    g_frag_survives = 1;
-    g_frag_works = 1;
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-
-    CHECK(a.kind == D2K_QA_FRAG, "фрагменты доходят и плечо помогает — оно обязано быть предложено");
-    CHECK(a.frag_survives == D2K_PROP_YES, "свойство «фрагменты доходят» не записано");
-}
-
-static void test_nothing_works_is_honest_not_found(void) {
-    mocks_reset();
-    g_ask_pass_single = 0;
-    g_ttl_pass_at = -1;
-    g_frag_works = 0;
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-
-    CHECK(a.kind == D2K_QA_NOT_FOUND, "если весь каталог исчерпан без единого прохода — честный отрицательный результат");
-    CHECK(a.probes > 0, "отрицательный результат обязан отчитаться, сколько опытов он стоил");
-}
-
-static void test_confirm_disagreement_is_flaky_not_escalation(void) {
-    mocks_reset();
-    g_ask_pass_single = 1;
-    g_ask_confirm_ok = 0; /* одиночная попытка прошла, повторы разошлись */
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-
-    CHECK(a.kind == D2K_QA_FLAKY, "расхождение на подтверждении — FLAKY, а не округление в удобную сторону");
-    CHECK(g_ttl_calls == 0, "разошедшееся подтверждение НЕ повод пробовать более дорогое плечо вместо честного FLAKY");
-    CHECK(g_frag_calls == 0, "то же для фрагментации");
-}
-
-static void test_confirm_needs_fresh_address_honestly(void) {
-    mocks_reset();
-    g_ask_pass_single = 1;
-    g_resolve_n = 0; /* пул исчерпан — кроме исходного ip, свежих адресов нет */
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-
-    CHECK(a.kind == D2K_QA_NOT_FOUND,
-          "разведка нашла блоб, но подтвердить не на чем (пул адресов пуст) — незадан, а не удача");
-    /* Разведка останавливается на прошедшем блобе; ВАЖНО здесь другое: сколько
-       бы попыток ни было, подтверждения СРЕДИ НИХ быть не должно (см. следующую
-       проверку) — тратить опыт на заведомо провальное подтверждение (пул
-       пуст) незачем. */
-    CHECK(g_ask_calls == 1, "разведка обязана уложиться в одну попытку: приманка одна");
-    CHECK(g_ask_repeats_log[0] == 1,
-          "подтверждение НЕ ДОЛЖНО тайком уйти на разведанный (потенциально уже отравленный) адрес — "
-          "единственный вызов обязан остаться одиночной разведкой (repeats=1), не превратиться в "
-          "подтверждение");
-}
-
-static void test_budget_exhausted_is_honest(void) {
-    mocks_reset();
-    g_ask_pass_single = 0;
-    d2k_quic_budget_s = 0; /* исчерпан ДО первого же опыта */
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-
-    CHECK(a.kind == D2K_QA_NOT_FOUND, "бюджет 0 — честный отказ, не притворство, что что-то измерили");
-    CHECK(g_ask_calls == 0, "при нулевом бюджете не должно уйти ни одного опыта");
-    CHECK(strstr(a.reason, "бюджет") != NULL, "причина обязана называть бюджет по имени, а не молчать");
-    d2k_quic_budget_s = 120;
-}
-
-static void test_structural_guard_rejects_bad_input(void) {
-    mocks_reset();
-    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_hello empty = {NULL, 0};
-
-    d2k_quic_arm a1 = d2k_quic_pick_arm("999.999.999.999", 443, "example.com", TEST_DECOY_SNI, trig, 0);
-    CHECK(a1.kind == D2K_QA_FLAKY, "адрес, не разбирающийся как IPv4, — структурно непригодный вход");
-    CHECK(g_ask_calls == 0, "структурно непригодный вход не тратит ни одного опыта");
-
-    mocks_reset();
-    d2k_quic_arm a2 = d2k_quic_pick_arm("1.2.3.4", 443, NULL, TEST_DECOY_SNI, trig, 0);
-    CHECK(a2.kind == D2K_QA_FLAKY, "отсутствие имени — тоже структурно непригодный вход");
-
-    mocks_reset();
-    d2k_quic_arm a3 = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, empty, 0);
-    CHECK(a3.kind == D2K_QA_FLAKY, "отсутствие снимка триггера — измерять нечем");
-    CHECK(g_ask_calls == 0, "без снимка триггера не отправляется ни один опыт");
-}
-
 /* =========================================================================
- * Часть 2: сборка фрагментов — чистая проверка байтов, без сокетов.
+ * Часть 1: сборка фрагментов — чистая проверка байтов, без сокетов.
  * ========================================================================= */
 
 /* Тот же алгоритм RFC 1071, но СВОЙ, тестовый — модуль не должен проверять
@@ -619,7 +191,7 @@ static void test_frag_builder_correctness(void) {
 }
 
 /* =========================================================================
- * Часть 3: реальный TTL на проводе (127.0.0.1, IP_RECVTTL) — без цензора на
+ * Часть 2: реальный TTL на проводе (127.0.0.1, IP_RECVTTL) — без цензора на
  * пути это не доказывает, что приманка умирает ДО сервера (промежуточных
  * прыжков на loopback нет); проверяет ровно то, что проверяемо: приманка
  * реально уходит с запрошенным TTL, а триггер — обычным, и что после отправки
@@ -1127,50 +699,13 @@ static void quic_strategy_compose_checks(void) {
 int main(void) {
     quic_props_compose_checks();
     quic_strategy_compose_checks();
-    /* Сохраняем боевые крючки — они же используются другими тестами при
-       линковке в один процесс (см. Makefile: test_quic_arms собирает
-       quicprobe.o целиком) — подмена обязана быть временной. */
-    real_ask_hook = d2k_quic_ask_hook;
-    real_ask_ttl_hook = d2k_quic_ask_ttl_hook;
-    real_ask_copies_hook = d2k_quic_ask_copies_hook;
-    real_ask_frag_hook = d2k_quic_ask_frag_hook;
-    real_resolve_hook = d2k_quic_resolve_hook;
-    /* mocks_reset/бюджетный тест ставят явные секунды — вернуть выведенный. */
-    uint32_t real_budget_s = d2k_quic_budget_s;
-
-    d2k_quic_resolve_hook = mock_resolve;
-
-    d2k_quic_ask_hook = mock_ask;
-    d2k_quic_ask_ttl_hook = mock_ask_ttl;
-    d2k_quic_ask_copies_hook = mock_ask_copies;
-    d2k_quic_ask_frag_hook = mock_ask_frag;
-
-    test_ladder_blob_wins();
-    test_ladder_ttl_wins_when_no_blob_helps();
-    test_ladder_copies_before_ttl();
-    test_decoy_is_derived();
-    test_ladder_copies_second_point();
-    test_ladder_frag_is_last_resort();
-    test_frag_not_offered_when_fragments_die();
-    test_frag_offered_when_fragments_live();
-    test_nothing_works_is_honest_not_found();
-    test_confirm_disagreement_is_flaky_not_escalation();
-    test_confirm_needs_fresh_address_honestly();
-    test_budget_exhausted_is_honest();
-    test_structural_guard_rejects_bad_input();
-
-    d2k_quic_ask_hook = real_ask_hook;
-    d2k_quic_ask_ttl_hook = real_ask_ttl_hook;
-    d2k_quic_ask_frag_hook = real_ask_frag_hook;
-    d2k_quic_resolve_hook = real_resolve_hook;
-    d2k_quic_budget_s = real_budget_s;
-    CHECK(d2k_quic_budget_s == D2K_QUIC_BUDGET_DERIVED,
-          "тест не вернул выведенный бюджет после явных секунд");
-
     test_frag_builder_correctness();
     test_real_ttl_hook_on_wire();
     test_real_arm_icmp_is_measured_silence();
 
+    /* Вывод приманки из снятого приветствия: сам он от удалённого подбора не
+       зависит, а в план (test_arm_to_plan) его байты попадают. */
+    test_decoy_is_derived();
     test_arm_to_plan();
     test_voice_plan();
     test_quic_delay_plan();
