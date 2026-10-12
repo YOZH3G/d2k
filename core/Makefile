@@ -721,9 +721,12 @@ san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask san-meas
 # расходятся в предупреждениях (см. датапат). Компиляция без запуска: тут
 # важны предупреждения, а исполняются те же тесты обычной целью check.
 GCC ?= mipsel-unknown-linux-gnu-gcc
+# -I../detect/include — как у настоящего правила test_probe_plan ниже: один
+# тест ядра включает d2k_detect.h, и без этого пути чужой компилятор падает
+# на нём, не дойдя до самих предупреждений.
 gcc-warn: hello_profiles.inc
 	@for f in $(SRC) d2kask.c $(TESTS:=.c); do \
-		$(GCC) $(CFLAGS) -c -o /tmp/d2k-core-gccwarn.o $$f || exit 1; \
+		$(GCC) $(CFLAGS) -I../detect/include -c -o /tmp/d2k-core-gccwarn.o $$f || exit 1; \
 	done
 	@echo "чужой компилятор: предупреждений нет"
 

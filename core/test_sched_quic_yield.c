@@ -1,4 +1,8 @@
 /* Production scheduler + real QUIC question loop; no network sockets. */
+/* nanosleep ниже объявлена только при этом макросе: под -std=c99 без него
+   чужой компилятор отказывает (gcc-warn), а местный clang молчит — тот же
+   приём, что в test_quic_arms.c и test_quicprobe.c. */
+#define _POSIX_C_SOURCE 200809L
 #include <pthread.h>
 int yield_spawn(pthread_t *,const pthread_attr_t *,void *(*)(void *),void *);
 #define pthread_create yield_spawn
