@@ -69,6 +69,20 @@ static size_t count_journal_kind(const d2k_session *s, int kind) {
     return c;
 }
 
+/* Встречалась ли запись такого вида С ТАКИМ КОДОМ. Вид без кода у обмена
+   ничего не говорит: весь смысл D2K_JRN_EXCHANGE для UDP лежит в коде
+   (D2K_UDP_PROOF_*), и «обмен был» без него читается как успех, которым он
+   не является. */
+static int journal_code_seen(const d2k_session *s, int kind, uint8_t code) {
+    const d2k_journal *j = d2k_session_journal(s);
+    size_t n = d2k_journal_count(j);
+    for (size_t i = 0; i < n; i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e && e->kind == kind && e->code == code) { return 1; }
+    }
+    return 0;
+}
+
 /* Почти тот же план, что в test_session.c: одна фальшивка перед куском, две
  * копии с паузой 78 мс. Скопирован, а не разделён с тем файлом, по той же
  * причине, по которой в датапате уже не делят между модулями три строки
@@ -1783,7 +1797,14 @@ static void test_quic_post_handshake_stall(void) {
  * из счётчиков не видны вовсе: после `connbytes 0:8` очередь этих пакетов не
  * получает. Признака, который был бы и измеренным, и безопасным для §0, в
  * нынешних наблюдаемых датапата нет — это записано как результат, а не как
- * недоделка. */
+ * недоделка.
+ *
+ * ЧТО СДЕЛАНО ВМЕСТО КАДАНСА (задача 36, 12.10.2026). Единственное, что
+ * датапат об этом классе сказать может, — не каданс, а ОТСУТСТВИЕ УЛИК на
+ * истечении записи: см. test_quic_no_proof_ask ниже. Кадансовые проверки
+ * этого теста поэтому остаются зелёными и остаются в силе: подозрения по
+ * счётчикам по-прежнему нет ни в одном из 16 случаев, и когда кто-нибудь всё
+ * же найдёт безопасный кадансовый признак, упадёт именно проверка 1. */
 static void test_quic_oneway_block(void) {
     const uint64_t S = 1000000000ull;
 
@@ -1935,11 +1956,220 @@ static void test_quic_deny(void) {
     d2k_session_free(s);
 }
 
+/* --- QUIC: УЛИКИ УСПЕХА НЕТ — ЭТО ПОВОД СПРОСИТЬ (задача 36, 12.10.2026) ---
+ *
+ * Кадансового признака одностороннего блока в счётчиках conntrack нет и быть
+ * не может (см. шапку test_quic_oneway_block выше: три кандидата отвергнуты
+ * числами). Датапат не видит, доходят ли НАШИ пакеты, а именно это отличает
+ * повтор полёта сервера от ответа.
+ *
+ * Зато датапат может назвать ОТСУТСТВИЕ УЛИК, и это не эвристика, а факт о
+ * самой записи: поток QUIC показал приветствие с именем (D2K_JRN_HELLO_SNI),
+ * обратная сторона ответила (D2K_JRN_EXCHANGE), но код обмена так и остался
+ * D2K_UDP_PROOF_NONE — «произвольный UDP-ответ», который §4 ТЗ прямо
+ * запрещает считать доказательством QUIC, — и запись дожила до конца своего
+ * срока без единого подозрения. Браузер начал рукопожатие к имени и ничем не
+ * подтвердил, что оно состоялось.
+ *
+ * НО СОБЫТИЯ ПО ЭТОМУ ПОВОДУ НЕТ, И ЭТО РЕШЕНИЕ. Такая же запись остаётся от
+ * здоровой страницы по h3: прикладного доказательства у QUIC не существует
+ * вовсе (D2K_UDP_PROOF_* знает только голос Дискорда и STUN), поэтому калитка
+ * на этих наблюдаемых не отличала бы заглушённый поток от работающего и
+ * запускала бы подбор на рабочем трафике. Подробности, цена и названный
+ * кандидат в доказательство — в самой проверке ниже. */
+static void test_quic_no_proof_ask(void) {
+    const uint64_t S = 1000000000ull;
+    const uint64_t IDLE = 120 * S;   /* ровно то, что ставит d2kd (--idle 120) */
+
+    /* 1. ЗАКРЕПЛЁННЫЙ ОТКАЗ: СОБЫТИЯ НЕТ, И ЭТО РЕШЕНИЕ, А НЕ НЕДОДЕЛКА.
+       Поток QUIC с именем, обратная сторона ответила, прикладного
+       доказательства нет — и на истечении записи подозрения НЕ возникает.
+       Так и должно остаться, пока у QUIC не появится СВОЕГО доказательства.
+
+       Почему. Калитка «истёк без улик» строилась на моём допущении, что у
+       здорового потока улика есть по определению. Для QUIC это НЕВЕРНО:
+       D2K_UDP_PROOF_* знает только голос Дискорда и STUN, а после приветствия
+       датапат в QUIC не смотрит и не может — `connbytes 0:8` не отдаёт очереди
+       остальные пакеты. Значит отлично открывшаяся страница по h3 оставляет
+       ТОЧНО ТАКУЮ ЖЕ запись, как заглушённая: имя прочитано, обмен записан,
+       кода доказательства нет. Калитка на этих наблюдаемых сработала бы на
+       КАЖДОМ потоке h3, то есть запустила бы подбор на рабочем трафике —
+       прямой запрет §0 ТЗ, и тот самый класс ошибки, из-за которого каталог
+       проекта однажды пришлось выбросить целиком.
+
+       Что нужно, чтобы калитка стала честной: доказательство выхода за
+       рукопожатие у самого QUIC. Кандидат назван — короткий заголовок 1-RTT от
+       СЕРВЕРА (до завершения рукопожатия он прийти не может), — но он требует
+       полевой проверки, попадает ли первый такой пакет в окно `connbytes 0:8`.
+       Без замера это была бы выдумка.
+
+       Эта проверка упадёт, когда доказательство появится и калитка
+       заработает, — и тогда её надо переписать, а не удалить. */
+    {
+        d2k_session *s = stall_flow(50420, 2);
+        CHECK(count_journal_kind(s, D2K_JRN_HELLO_SNI) == 1,
+              "стенд не записал приветствие с именем");
+        CHECK(count_journal_kind(s, D2K_JRN_EXCHANGE) == 1,
+              "стенд не записал обмен");
+        CHECK(d2k_session_expire(s, 200 * S, IDLE) == 1,
+              "запись QUIC не истекла через 120 с молчания");
+        CHECK(d2k_session_suspects(s) == 0,
+              "появилось подозрение по отсутствию улик: оно сработало бы и на "
+              "здоровом h3, то есть на рабочем трафике (§0)");
+        d2k_session_free(s);
+    }
+
+    /* 2. §0 ТЗ: УЛИКА ЕСТЬ — СОБЫТИЯ НЕТ НИКОГДА. Прикладное доказательство
+       любого вида, кроме D2K_UDP_PROOF_NONE: ответ IP Discovery с тем же SSRC
+       и ответ STUN с тем же transaction ID. Оба — потоки с именем класса
+       голоса, оба отвечены, оба истекают по тому же сроку. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t pkt[256], buf[4096], disc[74], reply[74];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 64420, 50004, disc, build_ip_discovery(disc, 0x4242));
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1 * S, buf, sizeof buf, &r);
+        build_ip_discovery_response(reply, 0x4242);
+        n = build_udp_pkt(pkt, 64420, 50004, reply, sizeof reply);
+        swap_udp_ends(pkt);
+        d2k_session_set_hook(s, D2K_HOOK_FORWARD);
+        d2k_session_packet(s, pkt, n, 2 * S, buf, sizeof buf, &r);
+        CHECK(journal_code_seen(s, D2K_JRN_EXCHANGE, D2K_UDP_PROOF_VOICE_DISCOVERY),
+              "стенд не получил прикладного доказательства голоса");
+        CHECK(d2k_session_expire(s, 200 * S, IDLE) == 1, "голосовая запись не истекла");
+        CHECK(d2k_session_suspects(s) == 0,
+              "поток с прикладным доказательством дал событие об отсутствии улик");
+        d2k_session_free(s);
+    }
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t req[32], resp[32], pkt[256], buf[4096];
+        uint8_t txid[12] = {3,1,4,1,5,9,2,6,5,3,5,8};
+        d2k_result r;
+        size_t rn = build_stun_binding(req, 0x0001, txid);
+        size_t n = build_udp_pkt(pkt, 64421, 50004, req, rn);
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1 * S, buf, sizeof buf, &r);
+        size_t sn = build_stun_binding(resp, 0x0101, txid);
+        n = build_udp_rev_pkt(pkt, 64421, resp, sn);
+        wr16(pkt + 20, 50004);
+        d2k_session_set_hook(s, D2K_HOOK_FORWARD);
+        d2k_session_packet(s, pkt, n, 2 * S, buf, sizeof buf, &r);
+        CHECK(journal_code_seen(s, D2K_JRN_EXCHANGE, D2K_UDP_PROOF_STUN),
+              "стенд не получил прикладного доказательства STUN");
+        CHECK(d2k_session_expire(s, 200 * S, IDLE) == 1, "запись STUN не истекла");
+        CHECK(d2k_session_suspects(s) == 0,
+              "поток с доказательством STUN дал событие об отсутствии улик");
+        d2k_session_free(s);
+    }
+
+    /* 3. ГОЛОС И STUN БЕЗ ОТВЕТА — ТОЖЕ НЕ ЭТОТ КЛАСС. Событие названо про
+       QUIC, и голосовой поток в него не попадает даже тогда, когда улики у
+       него нет: у разговора свой путь подтверждения (§4 ТЗ), и выдать его
+       тишину за вопрос по QUIC значило бы подменить протокол. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t pkt[256], buf[4096], disc[74];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 64422, 50004, disc, build_ip_discovery(disc, 0x77));
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1 * S, buf, sizeof buf, &r);
+        uint8_t any[8] = {0};
+        n = build_udp_pkt(pkt, 64422, 50004, any, sizeof any);
+        swap_udp_ends(pkt);
+        d2k_session_set_hook(s, D2K_HOOK_FORWARD);
+        d2k_session_packet(s, pkt, n, 2 * S, buf, sizeof buf, &r);
+        CHECK(journal_code_seen(s, D2K_JRN_EXCHANGE, D2K_UDP_PROOF_NONE),
+              "стенд не получил обмена без доказательства");
+        d2k_session_expire(s, 200 * S, IDLE);
+        CHECK(d2k_session_suspects(s) == 0,
+              "голосовой поток без улики выдан за вопрос по QUIC");
+        d2k_session_free(s);
+    }
+
+    /* 4. ОТВЕТА НЕ БЫЛО ВОВСЕ — это не этот класс, а молчание рукопожатия, и
+       у него свой детектор (sweep_udp_one). Истечение не вправе объявлять
+       молчанием всякий забытый UDP-поток: это обошло бы условие про повтор
+       клиента через заднюю дверь (см. d2k_session_expire). */
+    {
+        d2k_session *s = stall_flow(50421, 0);
+        CHECK(count_journal_kind(s, D2K_JRN_EXCHANGE) == 0, "стенд получил обмен");
+        CHECK(d2k_session_expire(s, 200 * S, IDLE) == 1, "запись не истекла");
+        CHECK(d2k_session_suspects(s) == 0,
+              "забытый UDP-поток без ответа объявлен вопросом по QUIC");
+        d2k_session_free(s);
+    }
+
+    /* 5. ПОДОЗРЕНИЕ УЖЕ БЫЛО — второго события по тому же потоку нет: три
+       улики об одном соединении выглядели бы как три соединения. Поток
+       доводится до D2K_SUSPECT_QUIC_STALL счётчиками, а потом истекает. */
+    {
+        d2k_session *s = stall_flow(50411, 8);
+        uint64_t orig = 12, reply = 14;
+        for (uint64_t t = 2; t <= 10; t++) {
+            if (t % 4 == 0) { reply += 2; }
+            orig += 1;
+            ct_write(50411, orig, reply, 1);
+            d2k_session_sweep(s, t * S);
+        }
+        CHECK(last_suspect_code(s) == D2K_SUSPECT_QUIC_STALL,
+              "стенд не довёл поток до подозрения об обрыве");
+        CHECK(d2k_session_expire(s, 200 * S, IDLE) == 1, "запись не истекла");
+        CHECK(d2k_session_suspects(s) == 1,
+              "истечение добавило второе событие к уже подозреваемому потоку");
+        CHECK(last_suspect_code(s) == D2K_SUSPECT_QUIC_STALL,
+              "истечение перебило уже сказанное подозрение");
+        d2k_session_free(s);
+    }
+
+    /* 6. ЗОНД КОНТРОЛЛЕРА — не улика о живом трафике ни в какую сторону. */
+    {
+        const uint8_t any[40] = {0x40};
+        d2k_session *s = d2k_session_new(64, 64);
+        uint8_t pkt[1300], buf[4096];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 50422, 443, v1_initial, sizeof v1_initial);
+        d2k_session_packet_probe(s, pkt, n, 1 * S, buf, sizeof buf, &r);
+        n = build_udp_rev_pkt(pkt, 50422, any, sizeof any);
+        d2k_session_packet(s, pkt, n, 1 * S + 50000000ull, buf, sizeof buf, &r);
+        CHECK(d2k_session_expire(s, 200 * S, IDLE) == 1, "запись зонда не истекла");
+        CHECK(d2k_session_suspects(s) == 0, "зонд контроллера дал событие о себе");
+        d2k_session_free(s);
+    }
+
+    /* 7. МОЛЧАНИЕ, УСТРОЕННОЕ НАМИ (quicdeny), вопросом не становится: своей
+       же работы датапат коробке не приписывает. */
+    {
+        char err[160];
+        d2k_plan *p = NULL;
+        CHECK(d2k_plan_load(plan_deny, sizeof plan_deny, &p, err, sizeof err) == 0 && p,
+              "план quicdeny не разобрался");
+        d2k_session *s = d2k_session_new(64, 64);
+        CHECK(d2k_plantab_set_name_family(d2k_session_plans(s),
+                                          (const uint8_t *)"example.com", 11,
+                                          1, p, D2K_PLAN_SHAPE_QUIC, 0, 4) == 0,
+              "quicdeny не встал на имя");
+        uint8_t pkt[1300], buf[4096];
+        d2k_result r;
+        const uint8_t any[40] = {0x40};
+        size_t n = build_udp_rev_pkt(pkt, 50423, any, sizeof any);
+        d2k_session_packet(s, pkt, n, 1 * S, buf, sizeof buf, &r);
+        n = build_udp_pkt(pkt, 50423, 443, v1_initial, sizeof v1_initial);
+        d2k_session_packet(s, pkt, n, 2 * S, buf, sizeof buf, &r);
+        d2k_session_expire(s, 200 * S, IDLE);
+        CHECK(d2k_session_suspects(s) == 0,
+              "молчание, устроенное quicdeny, стало вопросом по QUIC");
+        d2k_session_free(s);
+    }
+}
+
 int main(void) {
     D2K_TEST_NAT_NO_TABLE();
     test_quic_deny();
     test_quic_post_handshake_stall();
     test_quic_oneway_block();
+    test_quic_no_proof_ask();
     {
         d2k_session *s = d2k_session_new(32, 32);
         uint8_t pkt[1400], out[8192]; char err[128]; d2k_plan *p = NULL;
