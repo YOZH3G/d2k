@@ -361,6 +361,16 @@ static int dial_marked_mode(const char *host, const char *port, int timeout_ms,
     return -1;
 }
 
+/* Правило «наш срок или ответ линии» — одно на все места. Шапка у
+   объявления в d2k_detect.h. */
+int d2k_dial_deadline_err(const char *err)
+{
+    if (!err || !err[0]) {
+        return 0;
+    }
+    return strncmp(err, "dial tcp ", 9) == 0 && strstr(err, ": i/o timeout") != NULL;
+}
+
 static int dial_marked(const char *host, const char *port, int timeout_ms,
                        uint32_t mark, char *err, size_t errcap)
 {
@@ -612,7 +622,7 @@ static d2k_tally measure(const char *host, const char *port, const d2k_trigger *
 
     if (opt->seed_whole && ncuts == 0 && strcmp(name, "whole") == 0 &&
         opt->seed_repeats == opt->repeats &&
-        !(strncmp(opt->seed_err,"dial tcp ",9)==0 && strstr(opt->seed_err,": i/o timeout"))) {
+        !d2k_dial_deadline_err(opt->seed_err)) {
         /* База уже спрошена этим же триггером (см. d2k_opts.seed_whole). */
         t.pass = opt->seed_pass;
         t.fail = opt->seed_fail;
@@ -1147,9 +1157,36 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     /* 1. БАЗА. Триггер целиком, одной записью. Если проходит — блокировки по
      * содержимому нет, и всё остальное дерево не имеет смысла. */
     base = measure(host, port, tr, opt, "whole", NULL, 0, opt->write_gap_ms, res, 0);
+    if (base.has_err && base.pass == 0 && d2k_dial_deadline_err(base.err)) {
+        /* ОДИН ПЕРЕСПРОС ПО НАЗВАННОЙ ПРИЧИНЕ, А НЕ ПЕРЕБОР СРОКОВ. Истёк
+           НАШ срок — значит опыта не было; прежде чем говорить о цели хоть
+           что-нибудь, спрашиваем ещё раз с удвоенным сроком. Число не
+           выдумано и не подогнано: поле 12.10.2026, flibusta.is — установка
+           соединения с роутера заняла 3,1 с, 0 с и 7,16 с в трёх попытках
+           подряд, то есть успех лежит ЗА нашими 6000 мс, но внутри их
+           удвоения. Повтор один: если и его не хватило, цель отвечает
+           медленнее любого разумного срока, и это надо называть, а не
+           продолжать удваивать (§«искусственных бюджетов не вводить»). */
+        d2k_opts slow = *opt;
+        slow.timeout_ms = opt->timeout_ms > 0 ? opt->timeout_ms * 2 : 12000;
+        slow.seed_whole = 0;
+        base = measure(host, port, tr, &slow, "whole", NULL, 0, slow.write_gap_ms, res, 0);
+    }
     if (base.has_err && base.pass == 0) {
-        res->verdict = D2K_DV_UNREACHABLE;
-        snprintf(res->reason, sizeof(res->reason), "нет TCP до цели: %s", base.err);
+        if (d2k_dial_deadline_err(base.err)) {
+            /* НАШ срок, а не слова о линии: замер не состоялся, и называть
+               это «до цели нет транспорта» нельзя — тот вердикт означает
+               «кандидатов нет», и планы по цели перестают строиться вовсе
+               (core/sched.c). Поле 12.10: цель отвечала за 7,16 с при нашем
+               сроке 6 с, и 218 поисков подряд закончились ничем. */
+            res->verdict = D2K_DV_FLAKY;
+            snprintf(res->reason, sizeof(res->reason),
+                     "наш срок на подключение %d мс истёк — замер не состоялся: %.160s",
+                     opt->timeout_ms, base.err);
+        } else {
+            res->verdict = D2K_DV_UNREACHABLE;
+            snprintf(res->reason, sizeof(res->reason), "нет TCP до цели: %s", base.err);
+        }
         goto done;
     }
     if (base.pass == opt->repeats) {

@@ -426,6 +426,48 @@ static void test_unreachable_target(void)
     }
 }
 
+/* НАШ ИСТЁКШИЙ СРОК — НЕ «ДО ЦЕЛИ НЕТ ТРАНСПОРТА» (задача 19).
+ *
+ * Поле 12.10.2026, flibusta.is: с роутера `curl` отдаёт 200 с адреса
+ * 179.43.150.83, а установка соединения занимает 3,1 с (отказ), 0 с (отказ) и
+ * 7,16 с (успех) в трёх попытках подряд. Срок зонда — 6000 мс, поэтому замер
+ * не состаивался НИ РАЗУ: поиск 218 раз подряд писал «до цели нет транспорта»
+ * и уходил на десять минут. Слова неверные: транспорт есть, не хватило НАШЕГО
+ * срока. Вердикт при этом попадал в корзину, где «кандидатов нет и это не
+ * бедность перебора» (core/sched.c около 4601), то есть планы не строились
+ * вовсе.
+ *
+ * Отказ сети (ECONNREFUSED у теста выше) — другое дело: это ОТВЕТ, и он
+ * остаётся unreachable. Здесь же очередь приёма заполнена, SYN отбрасывается
+ * ядром, и подключение именно ВИСНЕТ — ровно то, что в поле. */
+static void test_our_dial_deadline_is_not_unreachable(void)
+{
+    /* Правило проверяется ЧИСТО, без сокета, и вот почему. Нужен ВИСНУЩИЙ
+       connect, то есть молчание в ответ на SYN. Заполненная очередь приёма на
+       macOS даёт не молчание, а RST («Connection reset by peer»), и это ОТВЕТ
+       линии — для него unreachable как раз верен. Стенд, который на этой
+       машине не воспроизводит нужное явление, доказывал бы не то; поэтому
+       правило вынесено отдельной функцией и спрашивается напрямую. */
+    if (!d2k_dial_deadline_err("dial tcp 179.43.150.83:443: i/o timeout")) {
+        fail("истёкший срок подключения не узнан как НАШ");
+    }
+    if (d2k_dial_deadline_err("dial tcp 127.0.0.1:1: Connection refused")) {
+        fail("отказ порта принят за наш срок — это ОТВЕТ линии");
+    }
+    if (d2k_dial_deadline_err("dial tcp 127.0.0.1:1: Connection reset by peer")) {
+        fail("сброс принят за наш срок — это ОТВЕТ линии");
+    }
+    if (d2k_dial_deadline_err("dial tcp: Name or service not known")) {
+        fail("отказ разрешения имени принят за наш срок");
+    }
+    if (d2k_dial_deadline_err("") || d2k_dial_deadline_err(NULL)) {
+        fail("пустая ошибка принята за наш срок");
+    }
+    /* И ОТВЕТ ЛИНИИ ПО-ПРЕЖНЕМУ unreachable: 127.0.0.1:1 отвечает отказом
+       порта, то есть говорит о линии, а не о нашем времени. Эту границу
+       держит отдельная проверка выше (test_unreachable_target). */
+}
+
 static void test_reassembling_box_with_control_stays_opaque(void)
 {
     d2k_opts opt;
@@ -753,6 +795,7 @@ int main(void)
     test_clear_target_stops_early();
     test_clear_tls_without_sni_says_unchecked();
     test_unreachable_target();
+    test_our_dial_deadline_is_not_unreachable();
     test_reassembling_box_with_control_stays_opaque();
     test_address_block_is_not_called_opaque();
     test_address_needs_vouched_control();
