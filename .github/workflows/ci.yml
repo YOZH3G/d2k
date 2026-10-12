@@ -3,10 +3,15 @@ name: CI
 # Pipeline order follows the usual industry rule: cheap checks first, and every
 # expensive stage waits for them (fail fast).
 #
-#   1. lint, warnings          — seconds; block everything below
-#   2. build (9 CPUs), unit    — the product compiles everywhere and its tests pass
-#   3. sanitizers, integration — slower; run only when stage 2 is green
-#   4. ci-ok                   — the single required status check
+#   1. lint, warnings  — seconds; nothing below starts until they pass
+#   2. in parallel:
+#        build        nine CPUs
+#        unit         components; core split into shards by measured weight
+#        sanitizers   ASan + UBSan
+#        integration  scripts, panel in Chrome; install lifecycle needs build
+#   3. ci-ok           — the single required status check
+#
+# Wall time is the slowest job of stage 2 (~7 minutes), not the sum of them.
 #
 # Heavy release packaging (static OpenSSL for d2ktg on nine CPUs) is NOT here.
 # It belongs to release.yml. CI proves the code; the release builds the package.
@@ -23,11 +28,12 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same ref makes the older run useless. Cancel it on pull
-# requests; on main every commit keeps its own verdict.
+# A newer push to the same ref makes the older run useless: only the head
+# commit is released or merged. Cancel the stale run instead of queueing the
+# new one behind it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 defaults:
   run:
@@ -56,6 +62,8 @@ jobs:
           mapfile -d '' files < <(find scripts files spike -type f -name '*.sh' -print0)
           files+=(files/d2k-instagram-dns.sh files/d2k-update.sh files/d2k-openwrt-init files/d2k-tg-firewall.sh)
           shellcheck -s sh "${files[@]}"
+      - name: core shards cover all of check
+        run: sh scripts/ci-core-shard.sh verify
 
   warnings:
     name: Warnings — second compiler (gcc -Werror)
@@ -119,14 +127,19 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # core is split into shards by measured weight (scripts/ci-core-shard.sh):
+      # one serial run took 18.8 minutes, the slowest shard takes ~6.5.
       matrix:
         include:
-          - { component: datapath,     target: check }
-          - { component: core,         target: check }
-          - { component: detect,       target: check }
-          - { component: panel,        target: test }
-          - { component: telegram,     target: test }
-          - { component: relay-enroll, target: test }
+          - { component: datapath,     run: 'make -C datapath check' }
+          - { component: core-sched,   run: 'sh scripts/ci-core-shard.sh sched' }
+          - { component: core-modes,   run: 'sh scripts/ci-core-shard.sh sched-modes' }
+          - { component: core-compose, run: 'sh scripts/ci-core-shard.sh compose-measured' }
+          - { component: core-rest,    run: 'sh scripts/ci-core-shard.sh rest' }
+          - { component: detect,       run: 'make -C detect check' }
+          - { component: panel,        run: 'make -C panel test' }
+          - { component: telegram,     run: 'make -C telegram test' }
+          - { component: relay-enroll, run: 'make -C relay-enroll test' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install OpenSSL headers
@@ -140,14 +153,16 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-      - name: make -C ${{ matrix.component }} ${{ matrix.target }}
-        run: make -C "${{ matrix.component }}" "${{ matrix.target }}"
+      - name: ${{ matrix.run }}
+        run: ${{ matrix.run }}
 
   # ── Stage 3: sanitizers and integration ───────────────────────────────────
 
   sanitizers:
     name: Sanitizers — ${{ matrix.component }}
-    needs: unit
+    # Same test level as unit, so it runs beside unit, not after it: both are
+    # gated by the cheap stage 1 checks. Wall time is max(unit, san), not sum.
+    needs: [lint, warnings]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
