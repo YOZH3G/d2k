@@ -9,10 +9,24 @@
  * же минуту не открывал).
  *
  * Что он даёт по каждому имени: статус документа, протокол (h3 / h2 /
- * http/1.1) и АДРЕС сервера. Адрес печатается не для красоты: 12.10 я вывел
- * семейство адреса из предпочтений браузера вместо того, чтобы его измерить, и
- * построил на этом неверный полевой вывод (docs/field/2026-10-12d — отзыв).
- * Chrome выбирает адрес сам, и догадка здесь обходится дорого.
+ * http/1.1), АДРЕС сервера и заголовок alt-svc документа. Адрес печатается не
+ * для красоты: 12.10 я вывел семейство адреса из предпочтений браузера вместо
+ * того, чтобы его измерить, и построил на этом неверный полевой вывод
+ * (docs/field/2026-10-12d — отзыв). Chrome выбирает адрес сам, и догадка здесь
+ * обходится дорого.
+ *
+ * ALT-SVC — ОПРОВЕРГАТЕЛЬ, а не повод спрашивать. Он берётся из
+ * `Network.responseReceived` → `response.headers` (проверено 12.10: по
+ * www.cloudflare.com приходит `h3=":443"; ma=86400`, по www.google.com
+ * `h3=":443"; ma=2592000,h3-29=...`, по flibusta.is заголовка нет вовсе).
+ * Нет h3 — значит браузер по QUIC сюда не пойдёт, и записанный на это имя долг
+ * по QUIC беспредметен (scripts/field-table.py --no-h3). Обратное НЕВЕРНО:
+ * «h3 объявлен» не повод заводить поиск по QUIC — рабочий прямой трафик не
+ * запускает подбор (§0 ТЗ).
+ * Факт скоропортящийся и внешний: живёт ma секунд и может появиться позже;
+ * приходит ВНУТРИ TLS, то есть его читает браузер или свой зонд, а датапат его
+ * не видит; и может называть другой порт (`h3=":8443"`) — тогда QUIC не
+ * беспредметен, он просто не на 443.
  *
  * НЕ headless: §«Поле и UI — только браузерами». Профиль временный, чтобы не
  * трогать профиль владельца.
@@ -38,7 +52,11 @@ const PORT = 9222;
 const sites = process.argv.slice(2);
 
 async function targets() {
-    const r = await fetch(`http://127.0.0.1:${PORT}/json/list`);
+    /* `localhost`, а не 127.0.0.1: 12.10 Chrome на этом маке открыл порт
+       отладки ТОЛЬКО на [::1] (lsof: TCP [::1]:9222 LISTEN, curl на 127.0.0.1
+       — отказ), и скрипт падал на fetch ещё до первого имени. Это про
+       локальную петлю инструмента и ничего не говорит про поле. */
+    const r = await fetch(`http://localhost:${PORT}/json/list`);
     return r.json();
 }
 
@@ -57,9 +75,17 @@ function send(ws, method, params) {
     return my;
 }
 
+/* Заголовки в CDP приходят как есть от сервера, регистр имени произвольный. */
+function header(headers, name) {
+    for (const k of Object.keys(headers || {}))
+        if (k.toLowerCase() === name) return headers[k];
+    return null;
+}
+
 async function visit(ws, url, waitMs) {
     const seen = new Map();   /* url -> protocol */
     let docProto = null, docStatus = null, loaded = false, err = null, docIp = null;
+    let docAltSvc = null;
     const onMsg = (ev) => {
         const m = JSON.parse(ev.data);
         if (m.method === 'Network.responseReceived') {
@@ -71,6 +97,9 @@ async function visit(ws, url, waitMs) {
                    БРАУЗЕРА: Chrome выбирает его сам (Happy Eyeballs), и
                    догадка здесь однажды стоила мне неверного вывода. */
                 docIp = m.params.response.remoteIPAddress || '?';
+                /* ТОТ ЖЕ ПРИНЦИП ДЛЯ ALT-SVC: читается из ответа, не выводится
+                   из имени. Пусто = заголовка в ЭТОМ ответе не было. */
+                docAltSvc = header(m.params.response.headers, 'alt-svc');
             }
         } else if (m.method === 'Network.loadingFailed' && m.params.type === 'Document') {
             err = m.params.errorText;
@@ -88,7 +117,7 @@ async function visit(ws, url, waitMs) {
     const counts = {};
     for (const p of seen.values()) counts[p] = (counts[p] || 0) + 1;
     return { docProto, docStatus, err, loaded, counts, n: seen.size, docIp,
-             ms: Date.now() - t0 };
+             docAltSvc, ms: Date.now() - t0 };
 }
 
 const list = await targets();
@@ -109,6 +138,12 @@ for (const s of sites) {
     const fmt = (v) => `${v.docProto || '—'}/${v.docStatus ?? (v.err || 'нет')}` +
         ` ${fam(v.docIp)} ${v.docIp || ''} зап.${v.n}` +
         ` [${Object.entries(v.counts).map(([k, n]) => k + '×' + n).join(' ')}]`;
-    console.log(`${s.padEnd(22)} 1-й: ${fmt(a)}\n${' '.repeat(22)} 2-й: ${fmt(b)}`);
+    /* alt-svc печатается ОТДЕЛЬНОЙ строкой и по обоим заходам: «нет» в первом
+       ответе и «есть» во втором — это разные вещи, а не шум. Пустое поле
+       означает только «в этом ответе заголовка не было» — на момент чтения. */
+    const alt = (v) => v.docAltSvc || (v.docProto ? 'НЕТ' : '—');
+    const both = a.docAltSvc === b.docAltSvc ? alt(a) : `${alt(a)} → ${alt(b)}`;
+    console.log(`${s.padEnd(22)} 1-й: ${fmt(a)}\n${' '.repeat(22)} 2-й: ${fmt(b)}` +
+        `\n${' '.repeat(22)} alt-svc: ${both}`);
 }
 ws.close();
