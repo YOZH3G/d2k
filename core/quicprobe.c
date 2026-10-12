@@ -1540,6 +1540,15 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
     (void)d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 400, err, sizeof err);
     size_t rn = d2k_h3_request(sni, path, buf, sizeof buf);
     if (rn == 0 || d2k_qc_stream_send(c, 0, buf, rn, 1, err, sizeof err) != 0) {
+        /* ВЕРДИКТ СТАВИТСЯ ЯВНО, а не остаётся нулём от memset вызывающего.
+           Первый запрос не ушёл — опыта не было: ни обрыва, ни прохода. То,
+           что D2K_QAD_NOT_RUN равен нулю, сегодня верно и молча нас спасало,
+           но полагаться на совпадение значения с «обнулённой структурой»
+           нельзя: ровно так «не задан» однажды и превращается в «задан и
+           отвечен». Среди причин, которые тут бывают, есть и предел потоков
+           СЕРВЕРА (d2k_qc_stream_send, задача 29) — замер на таком сервере не
+           состоится, и назвать это обрывом было бы ложью. */
+        d.verdict = D2K_QAD_NOT_RUN;
         snprintf(d.reason, sizeof d.reason, "запрос не ушёл: %.120s", err);
         { *out = d; return; }
     }

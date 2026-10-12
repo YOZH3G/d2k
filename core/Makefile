@@ -1031,6 +1031,18 @@ test-quicconn-fc: test_quicconn_fc
 check: test-quicconn-fc
 TESTS += test_quicconn_fc
 
+# Задача 29: предел потоков, объявленный СЕРВЕРОМ (транспортные параметры и
+# MAX_STREAMS), обязан останавливать нас самих. Включает quicconn.c ради связи
+# с ключами без живого сервера — как test_quicconn_fc.
+test_quicconn_streams: test_quicconn_streams.c quicconn.c quicwire.o compose.o measured.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quicconn_streams.c quicwire.o compose.o measured.o hello.o meas.o link.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+
+.PHONY: test-quicconn-streams
+test-quicconn-streams: test_quicconn_streams
+	./test_quicconn_streams
+check: test-quicconn-streams
+TESTS += test_quicconn_streams
+
 # Поле 04.10 (rua.gr): воспроизведение обрыва своим запросом мерится бюджетом
 # коробки. Включает quicconn.c ради связи с ключами без живого сервера.
 REPRO_OBJS = props.o quicarms.o quicprobe.o ipfrag.o net4.o quichello.o hello.o tls13core.o x25519.o quic.o quicwire.o crypto.o meas.o h3.o compose.o measured.o link.o

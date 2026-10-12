@@ -178,6 +178,27 @@ struct d2k_qc {
        потока пакетами, и проверки «хватило на бюджет» считают так же. */
     uint64_t tx_dgrams, rx_dgrams;
 
+    /* ПРЕДЕЛЫ, ОБЪЯВЛЕННЫЕ СЕРВЕРОМ (задача 29): его транспортные параметры
+       из EncryptedExtensions и кадры MAX_STREAMS / MAX_DATA. Индекс 0 —
+       двунаправленные потоки, 1 — однонаправленные.
+
+       ЗАЧЕМ. Воспроизведение обрыва по бюджету коробки открывает поток на
+       каждый запрос и в поле доходило до потока 68, ничего не зная о том,
+       сколько их разрешил сервер. Сервер с низким initial_max_streams_bidi
+       обязан закрыть связь кодом STREAM_LIMIT_ERROR (0x04) либо промолчать:
+       ложным ОБРЫВОМ это не станет (оба исхода дают «не измерено»), но ЗАМЕР
+       НЕ СОСТОИТСЯ и будет выглядеть нехваткой времени.
+
+       Признак *_set отдельно от значения, потому что ноль — законный предел:
+       «сервер не сказал» и «сервер разрешил нисколько» — разные вещи, и
+       выдумывать за него число нельзя. */
+    uint64_t peer_streams[2];
+    int      peer_streams_set[2];
+    uint64_t peer_sdata[2];      /* initial_max_stream_data для НАШИХ потоков */
+    int      peer_sdata_set[2];
+    uint64_t peer_max_data;
+    int      peer_max_data_set;
+
     uint8_t  local_addr[16];
     uint8_t  family;
     uint16_t local_port;
@@ -375,6 +396,76 @@ static size_t tp_build(const d2k_qc *c, uint8_t *out, size_t cap) {
     return o + 4;
 }
 
+/* ПАРАМЕТРЫ СЕРВЕРА — то, чего здесь не было вовсе: свои мы объявляли, а его
+ * не читали ни разу. Содержимое расширения — подряд идущие тройки varint
+ * «идентификатор, длина, значение» (RFC 9000 §18).
+ *
+ * Берём ровно те пределы, которые ограничивают НАС: сколько потоков мы вправе
+ * открыть (0x08, 0x09) и сколько байт в них послать (0x04, 0x06, 0x07).
+ * Остальное пропускается ПО ДЛИНЕ, а не по догадке о смысле: неизвестные
+ * параметры сервер вправе присылать и делает это (RFC 9000 §18.1 отводит под
+ * это целый ряд идентификаторов 31N+27 — ровно чтобы их пропускали), а
+ * пропуск не по длине сдвинул бы разбор и съел бы те самые пределы.
+ *
+ * Параметр, которого НЕТ, нулём здесь не становится: предел остаётся
+ * неизвестным, ограничивать нечем, и число за сервер не выдумывается. */
+static void tp_server_parse(d2k_qc *c, const uint8_t *p, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        uint64_t id = 0, len = 0;
+        size_t w = 0;
+        if (d2k_qw_varint_read(p + i, n - i, &id, &w) != 0) { return; }
+        i += w;
+        if (d2k_qw_varint_read(p + i, n - i, &len, &w) != 0) { return; }
+        i += w;
+        if (len > n - i) { return; }
+        /* Целочисленный параметр — ровно varint длиной в своё поле. Значение
+           иной длины (идентификаторы связи, адрес, токен сброса) числом не
+           считаем. */
+        uint64_t v = 0;
+        size_t vw = 0;
+        int num = d2k_qw_varint_read(p + i, (size_t)len, &v, &vw) == 0 &&
+                  vw == (size_t)len;
+        switch (id) {
+        case 0x04: if (num) { c->peer_max_data = v; c->peer_max_data_set = 1; } break;
+        case 0x06: if (num) { c->peer_sdata[0] = v; c->peer_sdata_set[0] = 1; } break;
+        case 0x07: if (num) { c->peer_sdata[1] = v; c->peer_sdata_set[1] = 1; } break;
+        case 0x08: if (num) { c->peer_streams[0] = v; c->peer_streams_set[0] = 1; } break;
+        case 0x09: if (num) { c->peer_streams[1] = v; c->peer_streams_set[1] = 1; } break;
+        default: break;
+        }
+        i += (size_t)len;
+    }
+    if (getenv("D2K_QC_TRACE")) {
+        fprintf(stderr, "[параметры сервера] потоки дву %llu/%d одно %llu/%d "
+                        "данные связи %llu/%d потока %llu/%d\n",
+                (unsigned long long)c->peer_streams[0], c->peer_streams_set[0],
+                (unsigned long long)c->peer_streams[1], c->peer_streams_set[1],
+                (unsigned long long)c->peer_max_data, c->peer_max_data_set,
+                (unsigned long long)c->peer_sdata[0], c->peer_sdata_set[0]);
+    }
+}
+
+/* Расширения EncryptedExtensions сервера: ищет среди них
+ * quic_transport_parameters (0x0039). Второго разбора TLS тут нет — само
+ * сообщение выделено из флайта общим ядром (d2k_t13_flight_next), и остаётся
+ * только список расширений: два байта общей длины, затем тип и длина по два
+ * байта у каждого. */
+static void tp_server_ee(d2k_qc *c, const uint8_t *body, size_t blen) {
+    if (blen < 2) { return; }
+    size_t total = (size_t)body[0] << 8 | body[1];
+    if (total > blen - 2) { return; }
+    size_t p = 2, end = 2 + total;
+    while (end - p >= 4) {
+        unsigned et = (unsigned)body[p] << 8 | body[p + 1];
+        size_t el = (size_t)body[p + 2] << 8 | body[p + 3];
+        p += 4;
+        if (el > end - p) { return; }
+        if (et == 0x0039) { tp_server_parse(c, body + p, el); }
+        p += el;
+    }
+}
+
 /* --- разбор кадров --------------------------------------------------------- */
 
 /* Разбирает кадры расшифрованного пакета уровня lvl.
@@ -467,10 +558,30 @@ static int frames_in(d2k_qc *c, d2k_qw_level lvl, const uint8_t *p, size_t n,
             i += 16;
             break;
         }
-        case FR_RETIRE_CONN_ID:
         case FR_MAX_DATA:
         case FR_MAX_STREAMS_BIDI:
-        case FR_MAX_STREAMS_UNI:
+        case FR_MAX_STREAMS_UNI: {
+            uint64_t x = 0;
+            if (d2k_qw_varint_read(p + i, n - i, &x, &w) != 0) { return -1; } i += w;
+            /* ПРЕДЕЛ, КОТОРЫЙ СЕРВЕР РАСШИРЯЕТ ПО ХОДУ СВЯЗИ: потоки он
+               разрешает по мере закрытия прежних. Прежде эти кадры просто
+               пропускались по длине — объявленное число не доходило до нас
+               вовсе, и открывать следующий поток мы шли наугад. Сужать предел
+               кадры не вправе (RFC 9000 §19.9, §19.11): меньшее значение —
+               повтор или перестановка датаграмм, а не отзыв разрешения. */
+            if (t == FR_MAX_DATA) {
+                if (!c->peer_max_data_set || x > c->peer_max_data) { c->peer_max_data = x; }
+                c->peer_max_data_set = 1;
+            } else {
+                int uni = (t == FR_MAX_STREAMS_UNI);
+                if (!c->peer_streams_set[uni] || x > c->peer_streams[uni]) {
+                    c->peer_streams[uni] = x;
+                }
+                c->peer_streams_set[uni] = 1;
+            }
+            break;
+        }
+        case FR_RETIRE_CONN_ID:
         case FR_DATA_BLOCKED:
         case FR_STREAMS_BLOCKED_BIDI:
         case FR_STREAMS_BLOCKED_UNI: {
@@ -1012,6 +1123,10 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
                 memcpy(c->transcript + c->tr_len, body - 4, msg_len);
                 c->tr_len += msg_len;
                 cr->taken = off;
+                /* Пределы сервера приезжают ЗДЕСЬ, в его EncryptedExtensions,
+                   и больше нигде: дальше о них говорят только кадры
+                   MAX_STREAMS / MAX_DATA (задача 29). */
+                if (mt == D2K_T13_ENCRYPTED_EXT) { tp_server_ee(c, body, blen); }
                 if (mt == D2K_T13_CERTIFICATE && o->sni && o->sni[0]) {
                     c->peer_name = d2k_t13_cert_name_ok(body, blen, o->sni);
                 }
@@ -1079,6 +1194,47 @@ int d2k_qc_stream_send(d2k_qc *c, uint64_t stream_id, const uint8_t *data, size_
                        int fin, char *err, size_t errcap) {
     if (!c || !c->lv[D2K_QW_LEVEL_APP].tx.have) {
         say(err, errcap, "прикладных ключей нет"); return -1;
+    }
+    /* ПРЕДЕЛ, ОБЪЯВЛЕННЫЙ СЕРВЕРОМ (задача 29). Поток с номером выше
+       разрешённого — не неудача на проводе: сервер обязан закрыть связь кодом
+       STREAM_LIMIT_ERROR (0x04) либо промолчать, и замер на нём не состоится.
+       Поэтому причина называет ПРЕДЕЛ ПОТОКОВ СЕРВЕРА, а не сеть: выше этот
+       текст попадает в журнал как причина «не измерено», и назвать её сетью
+       значило бы потерять настоящую. Проверка стоит ПЕРЕД учётом потока
+       ответа: отказ не вправе сбрасывать состояние уже идущего опыта. */
+    if ((stream_id & 0x01) == 0) {        /* поток открываем мы */
+        int uni = (stream_id & 0x02) != 0;
+        /* RFC 9000 §2.1, §4.6: предел задан ЧИСЛОМ потоков, а номер потока —
+           это 4 × (счёт − 1) + тип. */
+        uint64_t count = (stream_id >> 2) + 1;
+        /* ТЕКСТ КОРОТКИЙ, ВАЖНЫМ ВПЕРЁД И С ЦИФРАМИ В КОНЦЕ. Вызывающие
+           печатают его через «%.60s» и «%.80s», кириллица идёт по два байта, и
+           длинная причина теряет при усечении ровно то, ради чего написана.
+           Цифры стоят в конце: при обычных числах текст влезает в 60 байт
+           целиком, а при огромных обрежется хвост цифр, а не половина буквы и
+           не само слово «предел». Двунаправленный поток от
+           однонаправленного различать здесь незачем: это уже сказано
+           приставкой вызывающего — «управляющий поток не ушёл» против
+           «запрос HTTP/3 не ушёл». */
+        if (c->peer_streams_set[uni] && count > c->peer_streams[uni]) {
+            say(err, errcap, "предел потоков сервера: %llu, наш %llu",
+                (unsigned long long)c->peer_streams[uni],
+                (unsigned long long)count);
+            return -1;
+        }
+        if (c->peer_sdata_set[uni] && n > c->peer_sdata[uni]) {
+            say(err, errcap, "предел данных потока сервера: %llu, наш %zu",
+                (unsigned long long)c->peer_sdata[uni], n);
+            return -1;
+        }
+    }
+    /* Счёт посланного за всю связь мы не ведём: смысл проверки — назвать
+       предел, когда в него не влезает ОДНА посылка. Соврать про сумму было бы
+       хуже, чем не проверять её вовсе. */
+    if (c->peer_max_data_set && n > c->peer_max_data) {
+        say(err, errcap, "предел данных связи сервера: %llu, наш %zu",
+            (unsigned long long)c->peer_max_data, n);
+        return -1;
     }
     /* Поток, открытый КЛИЕНТОМ и двунаправленный (номер кратен четырём), —
        это наш вопрос, и ответ придёт по нему же. Запоминаем его, чтобы не
