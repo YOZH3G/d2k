@@ -8,6 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+/* struct timeval для SO_RCVTIMEO: у musl её объявляет только sys/time.h, а
+   sys/socket.h даёт неполное объявление. Без этого цель cross-runtime-gates
+   не собирается под aarch64-linux-musl (проверено 12.10.2026) — то есть
+   кросс-гейт, который ловит ошибки формата, молча стоял красным. */
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
