@@ -1562,8 +1562,12 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
        измерено». Общий предел — четыре срока или три RTO с запасом, что
        больше: обрыву нужно RTO тишины и два PING без ответа. */
     d2k_qstall st;
-    d2k_qstall_init(&st, d2k_qc_rtt_ms(c), start, d2k_qc_rx_wire_bytes(c));
-    int stalled = 0, budget = 0, req_failed = 0;
+    {
+        uint64_t prog0 = 0;
+        d2k_qc_app_progress(c, &prog0, NULL);
+        d2k_qstall_init(&st, d2k_qc_rtt_ms(c), start, prog0, d2k_qc_rx_wire_bytes(c));
+    }
+    int stalled = 0, budget = 0, req_failed = 0, oneway = 0;
     uint64_t tx0 = 0, rx0 = 0, pk = 0, done_bytes = 0;
     d2k_qc_dgrams(c, &tx0, &rx0);
     int64_t limit = (int64_t)(4u * step);
@@ -1579,7 +1583,9 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
        не замолчит (PING без ответа — обрыв воспроизведён). Срок ожидания
        отсчитывается от каждого запроса заново. */
     int repeat = budget_pk > 0;
-    unsigned need = 2u * (budget_pk ? budget_pk : D2K_QUIC_BOX_BUDGET_PKTS);
+    d2k_qbudget bg;
+    d2k_qbudget_init(&bg, budget_pk);
+    unsigned need = bg.need;
     unsigned requests = 1;
     uint64_t req_sid = 0;
     int64_t req_at = start;
@@ -1587,14 +1593,22 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
                       (need_complete || bytes < D2K_QUIC_ARM_DATA_BYTES || !status))) {
         int64_t now = qp_now_ms();
         if (now - req_at >= limit) break;
-        int act = d2k_qstall_step(&st, now, d2k_qc_rx_wire_bytes(c));
+        /* РАЗНЫЕ байты ответа за весь этап: внутри одного запроса их даёт
+           app_progress, а при переходе на следующий поток счёт продолжается с
+           done_bytes — иначе величина не монотонна и «ответ вырос» нечем
+           проверить (повторы при этом не считаются ни там, ни тут). */
+        uint64_t prog = 0, acked = 0;
+        d2k_qc_app_progress(c, &prog, NULL);
+        prog += done_bytes;
+        int have_ack = d2k_qc_outbound(c, NULL, &acked);
+        int act = d2k_qstall_step(&st, now, prog, d2k_qc_rx_wire_bytes(c), have_ack, acked);
         if (act == D2K_QSTALL_STALLED) { stalled = 1; break; }
+        if (act == D2K_QSTALL_ONEWAY) { stalled = 1; oneway = 1; break; }
         {
             uint64_t tx = 0, rx = 0;
             d2k_qc_dgrams(c, &tx, &rx);
             pk = (tx - tx0) + (rx - rx0);
-            if (d2k_quic_budget_ok_n(tx - tx0, rx - rx0, status, now, st.last_rx_ms, st.rto_ms,
-                                     budget_pk)) {
+            if (d2k_qbudget_ok(&bg, pk, prog, status, now, st.last_prog_ms, st.rto_ms)) {
                 budget = 1;
                 break;
             }
@@ -1618,7 +1632,13 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
             status = 0;
             continue;
         }
-        if (act == D2K_QSTALL_PROBE) { (void)d2k_qc_ping(c, err, sizeof err); }
+        if (act == D2K_QSTALL_PROBE && d2k_qc_ping(c, err, sizeof err) == 0) {
+            /* Номер пакета с PING: подтверждение сличается с ним, а не с
+               фактом прихода чего-нибудь (см. d2k_qstall). */
+            uint64_t pn = 0;
+            (void)d2k_qc_outbound(c, &pn, NULL);
+            d2k_qstall_sent(&st, pn);
+        }
         long n = d2k_qc_stream_recv(c, &sid, buf, sizeof buf, 200, err, sizeof err);
         if (n < 0) { closed = 1; }
         if (n > 0 && head_len < D2K_VERIFY_HEADER_LIMIT) {
@@ -1654,6 +1674,20 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
        бюджет, пройденный при живом сервере. */
     d.verdict = d2k_quic_arm_data_judge3(1, status, bytes, repeat ? 0 : complete, stalled,
                                          repeat ? 1 : need_complete, head_full, budget);
+    d.oneway = oneway;
+    /* «Сервер жив» вправе утверждать только подтверждение НАШЕГО пакета.
+       Прежде этот текст печатался всегда, когда сокет не закрылся, и при
+       заглушённом исходящем направлении уверял, что сервер отвечает на PING,
+       которого он не получал. */
+    /* Массив, а не указатель: причина целиком не влезает в reason, и
+       неограниченный «%s» прячет от компилятора вопрос «а хвост уцелеет?» —
+       mipsel-gcc ловит это как -Werror=format-truncation, и правильно ловит
+       (ловушка 9193228: кириллица по два байта съедала САМ вердикт). */
+    int ack_seen = d2k_qc_outbound(c, NULL, NULL);
+    char alive[64];
+    snprintf(alive, sizeof alive, "%s", closed ? "закрыл связь"
+                                      : ack_seen ? "жив, наши пакеты доходят"
+                                                 : "наши пакеты до него не доходят");
     if (repeat && req_failed) {
         d.verdict = D2K_QAD_NOT_RUN;
         snprintf(d.reason, sizeof d.reason,
@@ -1672,7 +1706,7 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
     } else if (repeat && d.verdict == D2K_QAD_NOT_RUN && !head_full) {
         snprintf(d.reason, sizeof d.reason,
                  "сервер %s, но %u-й запрос за %lld мс не довёл связь до %u датаграмм (%llu, HTTP %d)"
-                 " — не обрыв, не измерено%s%.60s", closed ? "закрыл связь" : "жив (отвечает на PING)",
+                 " — не обрыв, не измерено%s%.60s", alive,
                  requests, (long long)limit, need, (unsigned long long)pk, status,
                  closed ? ": " : "", closed ? err : "");
     } else if (d.verdict == D2K_QAD_NOT_RUN && head_full && status <= 0) {
@@ -1681,8 +1715,8 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
                  D2K_VERIFY_HEADER_LIMIT);
     } else if (d.verdict == D2K_QAD_NOT_RUN) {
         snprintf(d.reason, sizeof d.reason,
-                 "сервер жив (отвечает на PING), но ответ за %lld мс не %s (HTTP %d, %llu байт) — "
-                 "не обрыв, не измерено", (long long)limit,
+                 "сервер %s, но ответ за %lld мс не %s (HTTP %d, %llu байт) — "
+                 "не обрыв, не измерено", alive, (long long)limit,
                  need_complete ? "пришёл целиком" : "донёс порог", status,
                  (unsigned long long)bytes);
     } else if (d.verdict == D2K_QAD_PASS) {
@@ -1699,8 +1733,18 @@ void d2k_quic_data_stage(d2k_qc *c, const char *sni, const char *path, int need_
     }
     if (d.verdict == D2K_QAD_CUT && stalled) {
         size_t rl = strlen(d.reason);
-        snprintf(d.reason + rl, sizeof d.reason - rl,
-                 "; сервер молчит: два PING без ответа (RTO %lld мс)", (long long)st.rto_ms);
+        if (oneway) {
+            /* ИЗМЕРЕНО НАПРАВЛЕНИЕ: наше исходящее заглушено. Ответ на такой
+               обрыв — свежая четвёрка или безобидная датаграмма впереди, а не
+               другая форма приветствия. */
+            snprintf(d.reason + rl, sizeof d.reason - rl,
+                     "; наши пакеты до сервера не доходят: он шлёт (%llu байт на проводе), "
+                     "а два PING не подтвердил (RTO %lld мс)",
+                     (unsigned long long)st.wire_seen, (long long)st.rto_ms);
+        } else {
+            snprintf(d.reason + rl, sizeof d.reason - rl,
+                     "; сервер молчит: два PING без ответа (RTO %lld мс)", (long long)st.rto_ms);
+        }
     }
     *out = d;
 }
@@ -2555,11 +2599,17 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                            адресе (остаточной блокировки рукопожатия нет, её
                            вопрос здесь не задаётся). */
                         r.verdict = D2K_V_OPAQUE;
+                        /* Направление называется ОТДЕЛЬНЫМ полем, а не надеждой
+                           на то, что оно уцелеет в усечённом до 100 байт
+                           тексте (кириллица по два байта — ловушка 9193228), и
+                           только когда ОБА повтора измерили его одинаково. */
                         reason_set(&r, "Initial проходит (%d/%d), ответ на свой запрос HTTP/3 "
-                                       "встаёт после рукопожатия дважды из двух (%llu и %llu байт: %.100s)",
+                                       "встаёт после рукопожатия дважды из двух (%llu и %llu байт%s: %.100s)",
                                    base.pass, D2K_QUIC_REPEATS,
                                    (unsigned long long)dd.app_bytes,
-                                   (unsigned long long)dd2.app_bytes, dd.reason);
+                                   (unsigned long long)dd2.app_bytes,
+                                   dd.oneway && dd2.oneway ? ", наши пакеты до сервера не доходят" : "",
+                                   dd.reason);
                         d2k_quic_arm_context context = {.pool=pool, .n_pool=n_pool,
                             .next=next_addr, .residual=0, .marked=all_marked,
                             .can_ask=arm_budget_left, .limit_user=&start,

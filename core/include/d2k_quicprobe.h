@@ -482,43 +482,102 @@ static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge_limited(
  * коробка рвёт сразу за рукопожатием нашего клиента. Поэтому «начались
  * данные ответа» обрыву НЕ нужно: медленный первый байт отличается от
  * обрыва ответом сервера на PING, а не наличием данных. */
+/* ДВА РАЗНЫХ ФАКТА, КОТОРЫЕ ПРЕЖДЕ СЧИТАЛИСЬ ОДНИМ (12.10.2026).
+ *
+ * Прежняя редакция считала PING отвеченным, если выросли ВХОДЯЩИЕ БАЙТЫ. Но
+ * оба известных цензора QUIC роняют пакеты только в ИСХОДЯЩЕМ направлении
+ * (Россия: FOCI 2026(2) §3 — in-path, остаточная блокировка 420 с по
+ * четвёрке, любой пакет сбрасывает таймер; Китай: USENIX Security 25 — то же
+ * одностороннее дропанье, 180 с), а сервер при этом продолжает повторять свой
+ * последний полёт по таймеру PTO (RFC 9002 §6.2). Входящие байты и датаграммы
+ * РАСТУТ, ответ не растёт ни на байт, и по прежнему правилу «встал» не
+ * наступал никогда: стенд повторов выдавал «сервер ответил на каждый, 32 547
+ * из 50 датаграмм» на связи, где сервер не получил от нас НИ ОДНОГО пакета.
+ *
+ * Поэтому различаются три величины:
+ *   prog  — РАЗНЫЕ байты ответа (повторы не считаются): идёт ли поток;
+ *   wire  — все входящие байты: шлёт ли сервер что-нибудь вообще;
+ *   ack   — подтверждение НАШЕГО номера пакета: доходят ли наши пакеты.
+ * Только третья величина отвечает на вопрос о нашем направлении, и только её
+ * вправе засчитывать PING. Исход «сервер шлёт, наших пакетов не подтверждает»
+ * — отдельный, измеренный: D2K_QSTALL_ONEWAY. */
 typedef struct {
     int64_t rto_ms;
-    int64_t last_rx_ms;   /* когда последний раз пришла датаграмма */
+    int64_t last_prog_ms; /* когда последний раз выросли РАЗНЫЕ байты ответа */
     int64_t probe_ms;     /* когда ушёл PING, на который ждём ответ; 0 — нет */
-    uint64_t rx_seen;
+    uint64_t prog_seen;
+    uint64_t wire_seen;
+    uint64_t wire_at_probe; /* входящие байты на момент первого PING без ответа */
+    uint64_t probe_pn;      /* номер пакета с этим PING */
+    int probe_pn_set;
     int unanswered;
 } d2k_qstall;
 
 #define D2K_QSTALL_GOING   0
-#define D2K_QSTALL_PROBE   1  /* послать PING сейчас */
+#define D2K_QSTALL_PROBE   1  /* послать PING сейчас и назвать его номер */
 #define D2K_QSTALL_STALLED 2
+#define D2K_QSTALL_ONEWAY  3  /* сервер шлёт, наших пакетов не подтверждает */
 
 static inline void d2k_qstall_init(d2k_qstall *st, int64_t rtt_ms, int64_t now_ms,
-                                   uint64_t rx_bytes) {
+                                   uint64_t prog_bytes, uint64_t wire_bytes) {
     st->rto_ms = 3 * (rtt_ms > 0 ? rtt_ms : 0);
     if (st->rto_ms < 1000) st->rto_ms = 1000;
-    st->last_rx_ms = now_ms;
+    st->last_prog_ms = now_ms;
     st->probe_ms = 0;
-    st->rx_seen = rx_bytes;
+    st->prog_seen = prog_bytes;
+    st->wire_seen = wire_bytes;
+    st->wire_at_probe = wire_bytes;
+    st->probe_pn = 0;
+    st->probe_pn_set = 0;
     st->unanswered = 0;
 }
 
-static inline int d2k_qstall_step(d2k_qstall *st, int64_t now_ms, uint64_t rx_bytes) {
-    if (rx_bytes != st->rx_seen) {
-        st->rx_seen = rx_bytes;
-        st->last_rx_ms = now_ms;
+/* Номер пакета, которым ушёл запрошенный PING. Без него подтверждение нечем
+ * сличать, и шаг ведёт себя так, будто PING не ушёл: вопрос НЕ ЗАДАН, а не
+ * «задан и не отвечен». */
+static inline void d2k_qstall_sent(d2k_qstall *st, uint64_t pn) {
+    st->probe_pn = pn;
+    st->probe_pn_set = 1;
+}
+
+static inline int d2k_qstall_step(d2k_qstall *st, int64_t now_ms, uint64_t prog_bytes,
+                                  uint64_t wire_bytes, int have_ack, uint64_t acked_pn) {
+    if (wire_bytes != st->wire_seen) { st->wire_seen = wire_bytes; }
+    if (prog_bytes != st->prog_seen) {
+        st->prog_seen = prog_bytes;
+        st->last_prog_ms = now_ms;
         st->probe_ms = 0;
+        st->probe_pn_set = 0;
         st->unanswered = 0;
         return D2K_QSTALL_GOING;
     }
     if (st->probe_ms == 0) {
-        if (now_ms - st->last_rx_ms >= st->rto_ms) { st->probe_ms = now_ms; return D2K_QSTALL_PROBE; }
+        if (now_ms - st->last_prog_ms >= st->rto_ms) {
+            st->probe_ms = now_ms;
+            st->probe_pn_set = 0;
+            st->wire_at_probe = st->wire_seen;
+            return D2K_QSTALL_PROBE;
+        }
+        return D2K_QSTALL_GOING;
+    }
+    /* Подтверждение нашего пакета — и только оно — закрывает вопрос. */
+    if (st->probe_pn_set && have_ack && acked_pn >= st->probe_pn) {
+        st->probe_ms = 0;
+        st->probe_pn_set = 0;
+        st->unanswered = 0;
         return D2K_QSTALL_GOING;
     }
     if (now_ms - st->probe_ms < st->rto_ms) return D2K_QSTALL_GOING;
-    if (++st->unanswered >= 2) return D2K_QSTALL_STALLED;
+    if (!st->probe_pn_set) {
+        /* PING не ушёл: спрашиваем снова, но неотвеченным это не считаем. */
+        st->probe_ms = now_ms;
+        return D2K_QSTALL_PROBE;
+    }
+    if (++st->unanswered >= 2) {
+        return st->wire_seen != st->wire_at_probe ? D2K_QSTALL_ONEWAY : D2K_QSTALL_STALLED;
+    }
     st->probe_ms = now_ms;
+    st->probe_pn_set = 0;
     return D2K_QSTALL_PROBE;
 }
 
@@ -530,19 +589,51 @@ static inline int d2k_qstall_step(d2k_qstall *st, int64_t now_ms, uint64_t rx_by
 /* БЮДЖЕТ КОРОБКИ (задача 50, раунд 4; то же правило берёт задача 55 для
  * подтверждений). Коробка рвёт поток после бюджета пакетов: у QUIC 04.10 —
  * 14–17 пакетов сервера. Поток, который пронёс вдвое больше пакетов в обе
- * стороны, а сервер всё ещё шлёт (датаграмма от него моложе RTO), бюджет
- * прошёл — обход большого ресурса засчитывается, не дожидаясь конца ответа. */
+ * стороны, а ОТВЕТ всё ещё растёт (разные байты моложе RTO), бюджет прошёл —
+ * обход большого ресурса засчитывается, не дожидаясь конца ответа.
+ *
+ * last_prog_ms — ИМЕННО РОСТ ОТВЕТА, а не приход датаграмм (правка 12.10.2026).
+ * Прежде здесь стоял возраст последней входящей датаграммы, и при заглушённом
+ * исходящем направлении (см. d2k_qstall) бюджет «проходили» одни повторы
+ * сервера: 32 547 датаграмм при нулевом росте ответа объявлялись обходом. */
 #define D2K_QUIC_BOX_BUDGET_PKTS 25u
-static inline int d2k_quic_budget_ok_n(uint64_t tx_pkts, uint64_t rx_pkts, int status,
-                                       int64_t now_ms, int64_t last_rx_ms, int64_t rto_ms,
-                                       unsigned budget_pk) {
-    if (!budget_pk) budget_pk = D2K_QUIC_BOX_BUDGET_PKTS;
-    return status > 0 && tx_pkts + rx_pkts >= 2u * (uint64_t)budget_pk &&
-           now_ms - last_rx_ms < rto_ms;
+
+/* ПОРОГ ПЕРЕЙДЁН — ЭТО ЕЩЁ НЕ ПРОЙДЕН (правка 12.10.2026). Прежнее правило
+ * требовало только числа датаграмм и свежей входящей датаграммы, и штормом
+ * повторов сервера порог брался за миллисекунды при нулевом росте ответа:
+ * стенд выдавал «51 839 из 50 датаграмм, сервер ответил на каждый» на связи,
+ * где сервер не получил от нас ни одного пакета. Поэтому бюджет считается
+ * пройденным, только если ПОСЛЕ порога ответ ВЫРОС — то есть поток не просто
+ * пронёс пакеты, а продолжает доставлять данные. */
+typedef struct {
+    unsigned need;      /* 2 × бюджет датаграмм */
+    uint64_t prog_mark; /* разные байты ответа на момент перехода порога */
+    int marked;
+} d2k_qbudget;
+
+static inline void d2k_qbudget_init(d2k_qbudget *b, unsigned budget_pk) {
+    b->need = 2u * (budget_pk ? budget_pk : D2K_QUIC_BOX_BUDGET_PKTS);
+    b->prog_mark = 0;
+    b->marked = 0;
 }
-static inline int d2k_quic_budget_ok(uint64_t tx_pkts, uint64_t rx_pkts, int status,
-                                     int64_t now_ms, int64_t last_rx_ms, int64_t rto_ms) {
-    return d2k_quic_budget_ok_n(tx_pkts, rx_pkts, status, now_ms, last_rx_ms, rto_ms, 0);
+
+/* pkts — датаграммы связи в обе стороны после первого запроса; prog — РАЗНЫЕ
+ * байты ответа (повторы не считаются); last_prog_ms — когда они выросли в
+ * последний раз. Возвращает 1 только при пройденном бюджете на работающем
+ * потоке. */
+static inline int d2k_qbudget_ok(d2k_qbudget *b, uint64_t pkts, uint64_t prog, int status,
+                                 int64_t now_ms, int64_t last_prog_ms, int64_t rto_ms) {
+    if (pkts < (uint64_t)b->need) { return 0; }
+    if (!b->marked) { b->marked = 1; b->prog_mark = prog; }
+    return status > 0 && prog > b->prog_mark && now_ms - last_prog_ms < rto_ms;
+}
+
+/* ТО ЖЕ ПРАВИЛО БЕЗ ОГОВОРКИ О СВЕЖЕСТИ — для вызывающего, который сам
+ * ограничивает ожидание каждого ответа сроком (core/verify.c, budget_quic:
+ * там на каждый ответ отведён deadline, и второй таймер завёл бы второе
+ * правило о том же). Порог, отметка и требование роста ответа — те же. */
+static inline int d2k_qbudget_grew(d2k_qbudget *b, uint64_t pkts, uint64_t prog, int status) {
+    return d2k_qbudget_ok(b, pkts, prog, status, 0, 0, 1);
 }
 
 static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge3(int handshake, int status,

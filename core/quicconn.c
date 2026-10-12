@@ -87,6 +87,13 @@ typedef struct {
     uint64_t    largest_rx; /* наибольший принятый (для восстановления номера) */
     int         have_rx;    /* принимали ли хоть один пакет этого уровня */
     int         ack_due;    /* пришло что-то, требующее подтверждения */
+    /* НАИБОЛЬШИЙ НОМЕР НАШЕГО ПАКЕТА, ПОДТВЕРЖДЁННЫЙ СЕРВЕРОМ. Это
+       единственное доказательство того, что наши пакеты до него ДОХОДЯТ:
+       входящие датаграммы его не дают — сервер шлёт их и когда наше
+       направление заглушено (повтор по PTO). have_acked, потому что нулевой
+       номер пакета законен. */
+    uint64_t    largest_acked;
+    int         have_acked;
     crypto_rx   crypto;
 } level;
 
@@ -403,6 +410,13 @@ static int frames_in(d2k_qc *c, d2k_qw_level lvl, const uint8_t *p, size_t n,
                 for (int e = 0; e < 3; e++) {
                     uint64_t x = 0;
                     if (d2k_qw_varint_read(p + i, n - i, &x, &w) != 0) { return -1; } i += w;
+                }
+            }
+            {
+                level *La = &c->lv[lvl];
+                if (!La->have_acked || largest > La->largest_acked) {
+                    La->largest_acked = largest;
+                    La->have_acked = 1;
                 }
             }
             break;
@@ -1173,6 +1187,17 @@ int64_t d2k_qc_rtt_ms(const d2k_qc *c) { return c ? c->rtt_ms : 0; }
 void d2k_qc_dgrams(const d2k_qc *c, uint64_t *tx, uint64_t *rx) {
     if (tx) *tx = c ? c->tx_dgrams : 0;
     if (rx) *rx = c ? c->rx_dgrams : 0;
+}
+
+int d2k_qc_outbound(const d2k_qc *c, uint64_t *sent_pn, uint64_t *acked_pn) {
+    if (!c) { return 0; }
+    const level *L = &c->lv[D2K_QW_LEVEL_APP];
+    /* next_pn — СЛЕДУЮЩИЙ свой номер, поэтому последний отправленный на один
+       меньше; до первой отправки его нет вовсе. */
+    if (sent_pn) { *sent_pn = L->next_pn ? L->next_pn - 1 : 0; }
+    if (!L->have_acked) { return 0; }
+    if (acked_pn) { *acked_pn = L->largest_acked; }
+    return 1;
 }
 
 int d2k_qc_ping(d2k_qc *c, char *err, size_t errcap) {

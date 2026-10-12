@@ -174,6 +174,13 @@ typedef struct {
     uint8_t frame[64]; size_t flen;
     unsigned dg; long pk, cut_at;
     int close_after, answered, closed;
+    /* ЗАГЛУШЕНО ИСХОДЯЩЕЕ НАПРАВЛЕНИЕ (12.10.2026). После oneway_after
+       отвеченных запросов сервер больше не получает от нас ничего и не
+       отвечает, но продолжает повторять свой последний полёт по таймеру PTO:
+       счётчик датаграмм связи РАСТЁТ, ответ не растёт ни на байт. Такова
+       измеренная форма обоих известных цензоров QUIC (FOCI 2026(2) §3,
+       USENIX Sec 25: дропанье только в исходящую сторону). */
+    int oneway_after;
     unsigned left, sent; int fin; uint64_t bytes; uint64_t last_sid;
 } q_srv;
 static int q_request(void *ctx, uint64_t sid, char *err, size_t errcap) {
@@ -190,6 +197,14 @@ static int q_request(void *ctx, uint64_t sid, char *err, size_t errcap) {
 static long q_recv(void *ctx, uint8_t *buf, size_t cap, char *err, size_t errcap) {
     q_srv *q = ctx; (void)errcap;
     if (q->closed) { snprintf(err, errcap, "сервер закрыл соединение кодом 0"); return -1; }
+    /* Заглушение начинается ПОСРЕДИ ответа: заголовки уже прошли (sent >= 1),
+       то есть код ответа известен и «сервер ответил» уже правда — а дальше
+       поток встал, и растут только повторы. На границе запроса тот же блок
+       распознаётся и так («сервер замолчал посреди повторов»), а здесь — нет. */
+    if (q->oneway_after && q->answered >= q->oneway_after && q->sent >= 1) {
+        q->pk++;      /* повтор полёта: датаграмма есть, новых байт ответа нет */
+        return 0;
+    }
     if (!q->left || (q->cut_at && q->pk >= q->cut_at)) return 0;
     q->pk++; q->left--;
     size_t n;
@@ -381,6 +396,25 @@ static int budget_checks(void) {
         budget_quic(&io, 50, D2K_BUDGET_FIELD_PACKETS, &r);
         if (r.budget != D2K_BUDGET_NOT_APPLICABLE) {
             fprintf(stderr, "budget quic close: budget %d [%s]\n", r.budget, r.budget_note); fails++;
+        }
+    }
+    /* (7) ЗАГЛУШЕНО ИСХОДЯЩЕЕ НАПРАВЛЕНИЕ. Счётчик датаграмм связи растёт от
+       повторов полёта сервера, ответ не растёт ни на байт. Бюджет пройденным
+       НЕ СЧИТАЕТСЯ: иначе будет поставлен план, который ничего не делает —
+       это дороже вранья в диагностике. */
+    {
+        q_srv q; memset(&q, 0, sizeof q);
+        q.flen = h3_headers_frame(q.frame, 3);
+        q.dg = 3; q.pk = 9; q.fin = 1; q.bytes = 1800; q.answered = 1; q.oneway_after = 2;
+        quic_budget_io io = { q_request, q_recv, q_progress, q_packets, &q };
+        d2k_ver_result r = {0};
+        r.level = D2K_VER_APPLICATION; r.status = 200;
+        budget_quic(&io, 50, D2K_BUDGET_FIELD_PACKETS, &r);
+        /* Направление здесь не называется: у этого интерфейса нет
+           подтверждений наших пакетов, он видит только остановку ответа. */
+        if (r.budget != D2K_BUDGET_CUT) {
+            fprintf(stderr, "budget quic oneway: budget %d pk %u/%u req %u [%s]\n", r.budget,
+                    r.budget_packets, r.budget_need, r.budget_requests, r.budget_note); fails++;
         }
     }
     return fails;
@@ -648,6 +682,6 @@ int main(void) {
     }
     fails += budget_checks();
     if (fails) return 1;
-    puts("Production HTTP reader: 76 fragments + 4 stylesheet + 4 ECH + long-header (TCP 4+limit, H3 3) + 6 failure-reason + 14 flow-budget (TCP 11, QUIC 3) checks passed without sockets");
+    puts("Production HTTP reader: 76 fragments + 4 stylesheet + 4 ECH + long-header (TCP 4+limit, H3 3) + 6 failure-reason + 15 flow-budget (TCP 11, QUIC 4) checks passed without sockets");
     return 0;
 }

@@ -165,38 +165,65 @@ static d2k_quic_arm_data data_cut(const d2k_quic_arm_question *q,const char *sni
    требующими подтверждения (PING), а не медленный первый байт. */
 static void stall_machine(void) {
     d2k_qstall st;
-    /* Медленный первый байт: сервер подтверждает PING, данных ещё нет. */
-    d2k_qstall_init(&st, 50, 0, 1000);
-    int stalled = 0, pings = 0;
-    uint64_t rx = 1000;
+    /* Медленный первый байт: сервер ПОДТВЕРЖДАЕТ наш PING, данных ещё нет.
+       Подтверждение моделируется номером пакета, а не приходом байт: прежняя
+       редакция этой проверки прибавляла 40 байт «ACK на PING», и правило
+       «вырос приём — значит ответил» было записано прямо в модели. */
+    d2k_qstall_init(&st, 50, 0, 1000, 5000);
+    int stalled = 0, pings = 0, oneway = 0;
+    uint64_t prog = 1000, wire = 5000, acked = 0, pn = 0;
+    int have_ack = 0;
     for (int64_t t = 0; t <= 6000; t += 50) {
-        if (t >= 4000) rx += 1200;                  /* ответ пошёл на 4-й секунде */
-        int a = d2k_qstall_step(&st, t, rx);
-        if (a == D2K_QSTALL_PROBE) { pings++; rx += 40; } /* ACK на PING через RTT */
+        if (t >= 4000) { prog += 1200; wire += 1200; }  /* ответ пошёл на 4-й секунде */
+        int a = d2k_qstall_step(&st, t, prog, wire, have_ack, acked);
+        if (a == D2K_QSTALL_PROBE) {
+            pings++;
+            d2k_qstall_sent(&st, ++pn);
+            acked = pn; have_ack = 1; wire += 40;      /* сервер подтвердил его */
+        }
         if (a == D2K_QSTALL_STALLED) stalled = 1;
+        if (a == D2K_QSTALL_ONEWAY) oneway = 1;
     }
-    CHECK(!stalled && pings >= 2);
-    /* Один потерянный пакет: секунда тишины, PING, сервер жив — поток идёт. */
-    d2k_qstall_init(&st, 50, 0, 1000);
-    rx = 1000; stalled = 0;
+    CHECK(!stalled && !oneway && pings >= 2);
+    /* Один потерянный пакет: секунда без роста ответа, PING, сервер
+       подтверждает — поток идёт. */
+    d2k_qstall_init(&st, 50, 0, 1000, 5000);
+    prog = 1000; wire = 5000; stalled = 0; oneway = 0; acked = 0; pn = 0; have_ack = 0;
     for (int64_t t = 0; t <= 6000; t += 50) {
-        if (t < 500 || t >= 1500) rx += 1200;
-        if (d2k_qstall_step(&st, t, rx) == D2K_QSTALL_STALLED) stalled = 1;
+        if (t < 500 || t >= 1500) { prog += 1200; wire += 1200; }
+        int a = d2k_qstall_step(&st, t, prog, wire, have_ack, acked);
+        if (a == D2K_QSTALL_PROBE) { d2k_qstall_sent(&st, ++pn); acked = pn; have_ack = 1; }
+        if (a == D2K_QSTALL_STALLED) stalled = 1;
+        if (a == D2K_QSTALL_ONEWAY) oneway = 1;
     }
-    CHECK(!stalled);
+    CHECK(!stalled && !oneway);
     /* Настоящий обрыв: данные шли, затем ни одного пакета, два PING без ответа. */
-    d2k_qstall_init(&st, 50, 0, 1000);
-    rx = 1000; stalled = 0; pings = 0;
+    d2k_qstall_init(&st, 50, 0, 1000, 5000);
+    prog = 1000; wire = 5000; stalled = 0; pings = 0; pn = 0;
     int64_t at = -1;
     for (int64_t t = 0; t <= 6000 && at < 0; t += 50) {
-        if (t < 300) rx += 1200;
-        int a = d2k_qstall_step(&st, t, rx);
-        if (a == D2K_QSTALL_PROBE) pings++;
+        if (t < 300) { prog += 1200; wire += 1200; }
+        int a = d2k_qstall_step(&st, t, prog, wire, 0, 0);
+        if (a == D2K_QSTALL_PROBE) { pings++; d2k_qstall_sent(&st, ++pn); }
         if (a == D2K_QSTALL_STALLED) at = t;
     }
     CHECK(at >= 3000 && at <= 3400 && pings == 2);
+    /* ЗАГЛУШЕНО ИСХОДЯЩЕЕ НАПРАВЛЕНИЕ: ответ не растёт, а датаграммы сервера
+       идут (повтор его последнего полёта по PTO) и наш PING не подтверждён.
+       Прежнее правило в этом случае не объявляло обрыв НИКОГДА. */
+    d2k_qstall_init(&st, 50, 0, 1000, 5000);
+    prog = 1000; wire = 5000; stalled = 0; oneway = 0; pings = 0; pn = 0;
+    int64_t ow_at = -1;
+    for (int64_t t = 0; t <= 6000 && ow_at < 0; t += 50) {
+        wire += 1200;                                  /* сервер шлёт без остановки */
+        int a = d2k_qstall_step(&st, t, prog, wire, 0, 0);
+        if (a == D2K_QSTALL_PROBE) { pings++; d2k_qstall_sent(&st, ++pn); }
+        if (a == D2K_QSTALL_STALLED) stalled = 1;
+        if (a == D2K_QSTALL_ONEWAY) ow_at = t;
+    }
+    CHECK(ow_at >= 3000 && ow_at <= 3400 && pings == 2 && !stalled);
     /* RTO растёт с измеренным RTT: 3×500 мс. */
-    d2k_qstall_init(&st, 500, 0, 1000);
+    d2k_qstall_init(&st, 500, 0, 1000, 5000);
     CHECK(st.rto_ms == 1500);
 
     /* Вердикт этапа данных (раунд 3). */
@@ -216,10 +243,20 @@ static void stall_machine(void) {
     CHECK(d2k_quic_arm_data_judge3(1, 0, 0, 0, 0, 1, 0, 1) == D2K_QAD_NOT_RUN);
     CHECK(d2k_quic_arm_data_judge3(1, 200, 9000, 0, 1, 1, 0, 0) == D2K_QAD_CUT);
     CHECK(D2K_QUIC_BOX_BUDGET_PKTS == 25);
-    CHECK(d2k_quic_budget_ok(30, 20, 200, 5000, 4900, 1000) == 1);    /* 50 пакетов, сервер шлёт */
-    CHECK(d2k_quic_budget_ok(30, 19, 200, 5000, 4900, 1000) == 0);    /* 49 — мало */
-    CHECK(d2k_quic_budget_ok(30, 20, 0, 5000, 4900, 1000) == 0);      /* нет ответа HTTP */
-    CHECK(d2k_quic_budget_ok(30, 20, 200, 5000, 3900, 1000) == 0);    /* сервер замолчал RTO */
+    /* Бюджет коробки: порог перейдён — ещё не пройден, нужен РОСТ ответа
+       после порога. Шторм повторов при нулевом росте обходом не считается. */
+    d2k_qbudget bg;
+    d2k_qbudget_init(&bg, 0);
+    CHECK(bg.need == 50);
+    CHECK(d2k_qbudget_ok(&bg, 49, 9000, 200, 5000, 4900, 1000) == 0);  /* 49 — мало */
+    CHECK(d2k_qbudget_ok(&bg, 50, 9000, 200, 5000, 4900, 1000) == 0);  /* порог только что перейдён */
+    CHECK(d2k_qbudget_ok(&bg, 52, 9000, 200, 5000, 4900, 1000) == 0);  /* ответ не вырос */
+    CHECK(d2k_qbudget_ok(&bg, 52, 9600, 200, 5000, 4900, 1000) == 1);  /* вырос — пройден */
+    CHECK(d2k_qbudget_ok(&bg, 52, 9600, 0, 5000, 4900, 1000) == 0);    /* нет ответа HTTP */
+    CHECK(d2k_qbudget_ok(&bg, 52, 9600, 200, 5000, 3900, 1000) == 0);  /* ответ не растёт RTO */
+    /* Шторм повторов: датаграмм сколько угодно, ответ не вырос ни на байт. */
+    d2k_qbudget_init(&bg, 25);
+    CHECK(d2k_qbudget_ok(&bg, 842229, 513, 200, 5000, 4990, 1000) == 0);
 }
 
 static void post_handshake_stall(void) {

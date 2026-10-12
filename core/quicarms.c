@@ -84,7 +84,18 @@ static int ask_q(d2k_quic_arm_context *c, d2k_quic_arm *r, d2k_quic_arm_question
         c->spent(c->limit_user,ms>0?(uint32_t)ms:0u);
     }
     step->data=(int)d.verdict; step->data_bytes=d.app_bytes;
-    snprintf(step->data_note,sizeof step->data_note,"%s",d.note);
+    /* Измеренное направление обрыва идёт в трассу шага: иначе единственный
+       измеряемый признак этого класса в журнале не виден вовсе (d.reason
+       сюда не попадает). Направление стоит ПЕРВЫМ и граница заметки задана
+       явно: буферы одного размера, и «%s%s» и усекло бы хвост, и дало бы
+       -Werror=format-truncation у mipsel-gcc (поймано cross-runtime-gates). */
+    if (d.oneway) {
+        static const char head[] = "наше исходящее заглушено; ";
+        snprintf(step->data_note,sizeof step->data_note,"%s%.*s",head,
+                 (int)(sizeof step->data_note - sizeof head),d.note);
+    } else {
+        snprintf(step->data_note,sizeof step->data_note,"%s",d.note);
+    }
     if(d.verdict==D2K_QAD_PASS) return 1;
     if(d.verdict==D2K_QAD_NOT_RUN) {
         r->incomplete=1; step->not_measured=3; *measured=0; if(retry) *retry=1;

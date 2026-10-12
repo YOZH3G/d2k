@@ -32,7 +32,15 @@ enum {
     M_ONE_BIG_CUT,       /* один ответ без FIN: 15 пакетов, тишина */
     M_SECOND_451,       /* a later response explicitly refuses access */
     M_NO_HEADERS,        /* first response is valid; later streams contain only DATA */
-    M_ALIVE_NO_ANSWER    /* первый ответ целиком, дальше только подтверждает PING */
+    M_ALIVE_NO_ANSWER,   /* первый ответ целиком, дальше только подтверждает PING */
+    /* ОДНОСТОРОННЕЕ ЗАГЛУШЕНИЕ ИСХОДЯЩЕГО НАПРАВЛЕНИЯ. Первый ответ приходит
+       целиком, затем НАШИ пакеты до сервера не доходят: он не отвечает на
+       запросы, не подтверждает PING, но продолжает повторять свой последний
+       полёт (PTO, RFC 9002 §6.2) — датаграммы идут, новых байт ответа нет.
+       Измеренная форма обоих известных цензоров QUIC: TSPU роняет пакеты
+       in-path и держит остаточную блокировку 420 с по четвёрке, GFW — 180 с,
+       оба ТОЛЬКО в исходящем направлении (FOCI 2026(2) §3; USENIX Sec 25). */
+    M_ONEWAY
 };
 
 typedef struct {
@@ -43,6 +51,9 @@ typedef struct {
     int responses;  /* ответов на запросы */
     int requests;   /* запросов клиента (потоки 4k с FIN) */
     int pings;      /* PING клиента */
+    int oneway_on;  /* исходящее направление клиента заглушено */
+    int dropped;    /* пакетов клиента отброшено «коробкой» */
+    uint64_t oneway_sid;
 } stand;
 
 static void keys(d2k_qc *c) {
@@ -116,6 +127,18 @@ static void srv_request(stand *st, uint64_t sid) {
         break;
     case M_MANY:
         if (st->responses < 200 && srv_stream(st, sid, 0, 1, 200, 1) > 0) st->responses++;
+        break;
+    case M_ONEWAY:
+        if (st->requests == 1) {
+            int a = srv_stream(st, sid, 0, 1, 0, 0);
+            if (a > 0 && srv_stream(st, sid, (uint64_t)a, 0, 500, 1) > 0) st->responses++;
+        } else if (st->requests == 2) {
+            /* Заголовки второго ответа успели пройти, дальше исходящее
+               направление заглушено: ответ встал ниже порога, а датаграммы
+               сервера продолжают идти. */
+            st->oneway_sid = sid;
+            if (srv_stream(st, sid, 0, 1, 0, 0) > 0) st->oneway_on = 1;
+        }
         break;
     case M_ALIVE_NO_ANSWER:
     case M_CUT_LATER:
@@ -208,6 +231,17 @@ static void *srv_run(void *arg) {
             continue;
         if (!L->have_rx || pn > L->largest_rx) L->largest_rx = pn;
         L->have_rx = 1;
+        if (st->oneway_on) {
+            /* «Коробка» роняет пакет клиента по дороге к серверу. Сервер его
+               НЕ ВИДИТ: ни ответа, ни подтверждения. Повтор последнего полёта
+               по таймеру PTO идёт как ни в чём не бывало — для клиента это
+               выглядит живым сервером, хотя до него уже ничего не доходит. */
+            st->dropped++;
+            for (int k = 0; k < 15; k++) {
+                if (srv_stream(st, st->oneway_sid, 0, 1, 0, 0) <= 0) break;
+            }
+            continue;
+        }
         srv_frames(st, plain, plen);
     }
     return NULL;
@@ -309,6 +343,22 @@ int main(void) {
     d = run(M_NO_HEADERS, 25, &st);
     CHECK(d.verdict != D2K_QAD_PASS && st.requests == 2,
           "second stream without HEADERS cannot inherit the first HTTP status");
+
+    /* ОДНОСТОРОННЕЕ ЗАГЛУШЕНИЕ. Сервер шлёт датаграммы без остановки, но ни
+       одного нашего пакета не подтверждает: наши пакеты до него не доходят.
+       Прежде это засчитывалось обходом — поток «пронёс 2 × бюджет датаграмм
+       при живом сервере», хотя датаграммы были повторами одного и того же
+       полёта, а ответ не вырос ни на байт. */
+    d = run(M_ONEWAY, 25, &st);
+    CHECK(d.verdict == D2K_QAD_CUT,
+          "сервер шлёт, наших пакетов не подтверждает: обрыв, а не пройденный бюджет");
+    CHECK(d.oneway == 1, "направление обрыва измерено: заглушено наше исходящее");
+    CHECK(st.dropped >= 2, "клиент продолжал спрашивать, его пакеты роняла «коробка»");
+    /* Тишина в обе стороны направления не называет: обрыв остаётся обрывом,
+       но выдумывать для него направление нельзя. */
+    d = run(M_ONE_BIG_CUT, 25, &st);
+    CHECK(d.verdict == D2K_QAD_CUT && d.oneway == 0,
+          "обрыв тишиной: направление не измерено и не выдумано");
 
     /* Без запрошенного воспроизведения — прежнее правило: один полный ответ засчитан. */
     d = run(M_CUT_LATER, 0, &st);

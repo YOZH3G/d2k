@@ -1536,11 +1536,25 @@ typedef struct {
 
 static void budget_quic(const quic_budget_io *io, int deadline_ms, unsigned budget,
                         d2k_ver_result *r) {
-    unsigned need = budget * 2;
+    /* ПОРОГ ПЕРЕЙДЁН — ЕЩЁ НЕ ПРОЙДЕН: одно правило с этапом данных поиска
+       (d2k_qbudget, core/include/d2k_quicprobe.h). Прежде здесь хватало числа
+       датаграмм, и при заглушённом исходящем направлении бюджет «проходил»
+       одними повторами полёта сервера — то есть ПОДТВЕРЖДАЛСЯ план, который
+       ничего не делает. Оба известных цензора QUIC роняют пакеты только в
+       исходящую сторону (FOCI 2026(2) §3; USENIX Sec 25), поэтому входящие
+       датаграммы живостью связи не являются. */
+    d2k_qbudget bg;
+    d2k_qbudget_init(&bg, budget);
+    unsigned need = bg.need;
     r->budget_need = need;
     r->budget_requests = 1;
     uint64_t sid = 0;
     long asked_at = -1;
+    /* РАЗНЫЕ байты ответа за всю проверку: io->progress считает их внутри
+       одного потока, поэтому при переходе на следующий запрос счёт
+       продолжается с done — иначе величина не монотонна и «ответ вырос»
+       нечем проверить. */
+    uint64_t done = 0;
     char err[160];
     err[0] = '\0';
     int wait = deadline_ms > 0 ? deadline_ms : 5000;
@@ -1552,20 +1566,23 @@ static void budget_quic(const quic_budget_io *io, int deadline_ms, unsigned budg
             return;
         }
         r->budget_packets = (unsigned)pk;
-        if ((unsigned long)pk >= need) {
+        uint64_t bytes = 0;
+        int complete = 0;
+        io->progress(io->ctx, &bytes, &complete);
+        if (d2k_qbudget_grew(&bg, (uint64_t)pk, done + bytes, r->status ? r->status : 200)) {
             budget_say(r, D2K_BUDGET_PASSED, "связь перенесла %ld датаграмм из нужных %u за %u "
                        "запросов HTTP/3, сервер ответил на каждый", pk, need, r->budget_requests);
             return;
         }
-        uint64_t bytes = 0;
-        int complete = 0;
-        io->progress(io->ctx, &bytes, &complete);
         if (complete) {
             if (asked_at >= 0 && pk <= asked_at) {
                 budget_say(r, D2K_BUDGET_NOT_APPLICABLE, "счётчик датаграмм не растёт (%ld) — бюджет не проверен", pk);
                 return;
             }
             asked_at = pk;
+            /* Ответ дошёл целиком: его байты уходят в общий счёт, дальше
+               io->progress считает со нуля по новому потоку. */
+            done += bytes;
             sid += 4;
             r->budget_requests++;
             if (io->request(io->ctx, sid, err, sizeof err) != 0) {
@@ -1613,7 +1630,17 @@ static void budget_quic(const quic_budget_io *io, int deadline_ms, unsigned budg
                            "датаграмм из %u — бюджет не проверен: %.60s", r->budget_packets, need, err);
                 return;
             }
-            if (n > 0 || io->packets(io->ctx) != pk) moved = 1;
+            /* ДВИНУЛСЯ ОТВЕТ, А НЕ СЧЁТЧИК ДАТАГРАММ. Прежде здесь годилось
+               любое изменение числа датаграмм связи, и повтор полёта сервера
+               при заглушённом исходящем направлении выдавал «ответ идёт»
+               бесконечно — ожидание не истекало, и выше объявлялся пройденный
+               бюджет. Чужие датаграммы (управляющий поток сервера, таблицы
+               QPACK) ответом тоже не являются, поэтому мера одна: РАЗНЫЕ
+               байты ответа. */
+            uint64_t grew = 0;
+            int done_now = 0;
+            io->progress(io->ctx, &grew, &done_now);
+            if (n > 0 || grew != bytes || done_now != complete) moved = 1;
         }
         if (!moved) {
             budget_say(r, D2K_BUDGET_CUT, "сервер замолчал посреди ответа на %u-й запрос HTTP/3, "
