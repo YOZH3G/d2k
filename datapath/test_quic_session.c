@@ -1658,6 +1658,47 @@ static d2k_session *quic_flow_first_byte(uint16_t cport, int rev, uint8_t first)
     return s;
 }
 
+/* Одна обратная датаграмма со СКЛЕЙКОЙ: сперва пакет с длинным заголовком
+   (Handshake), следом — короткий. Так и шлёт настоящий сервер: замер
+   12.10.2026 (netlog Chrome, scripts/quic-proof-margin.py) показал
+   «HAND#9 + S#10» в одной датаграмме у r2---sn-...gvt1.com,
+   «HAND#6 + S#7» у ad.doubleclick.net и googleads.g.doubleclick.net.
+   Склейка разрешена RFC 9000 §12.2, а короткий заголовок не несёт поля
+   длины, поэтому он обязан быть ПОСЛЕДНИМ — значит пройти датаграмму
+   насквозь можно по полям Length длинных пакетов, не расшифровывая. */
+static size_t build_coalesced_hand_then_short(uint8_t *o, size_t cap) {
+    const size_t body = 24;             /* номер пакета + нагрузка + тег AEAD */
+    if (cap < 8 + body + 21) { return 0; }
+    size_t i = 0;
+    o[i++] = 0xE0;                      /* длинный, фикс. бит, тип Handshake */
+    o[i++] = 0x00; o[i++] = 0x00; o[i++] = 0x00; o[i++] = 0x01;  /* версия 1 */
+    o[i++] = 0x00;                      /* длина DCID */
+    o[i++] = 0x00;                      /* длина SCID */
+    o[i++] = (uint8_t)body;             /* Length одним байтом varint (<64) */
+    memset(o + i, 0xAA, body);
+    i += body;
+    o[i++] = 0x40;                      /* короткий заголовок: 0x80 снят, 0x40 стоит */
+    memset(o + i, 0xBB, 20);
+    i += 20;
+    return i;
+}
+
+/* Поток с одной обратной датаграммой, собранной вызывающим. */
+static d2k_session *quic_flow_rev_payload(uint16_t cport, const uint8_t *pay,
+                                          size_t paylen) {
+    const uint64_t S = 1000000000ull;
+    d2k_session *s = d2k_session_new(64, 64);
+    if (!s) return NULL;
+    d2k_session_set_ct_query(s, fake_ct_query, NULL);
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    size_t n = build_udp_pkt(pkt, cport, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 1 * S, buf, sizeof buf, &r);
+    n = build_udp_rev_pkt(pkt, cport, pay, paylen);
+    d2k_session_packet(s, pkt, n, 1 * S + 50000000ull, buf, sizeof buf, &r);
+    return s;
+}
+
 static d2k_session *stall_flow(uint16_t cport, int rev) {
     const uint64_t S = 1000000000ull;
     d2k_session *s = d2k_session_new(64, 64);
@@ -2051,6 +2092,41 @@ static void test_quic_no_proof_ask(void) {
         CHECK(d2k_session_expire(s, 200 * S, IDLE) == 1, "запись не истекла");
         CHECK(d2k_session_suspects(s) == 0,
               "одного короткого заголовка не хватило для доказательства");
+        d2k_session_free(s);
+    }
+    {
+        /* СКЛЕЙКА. Доказательство пришло ВНУТРИ окна, но не первым пакетом
+           датаграммы. Прежняя редакция читала один байт по смещению нагрузки
+           и такую датаграмму доказательством не считала — замер 12.10.2026
+           (scripts/quic-proof-margin.py) нашёл эту форму у ТРЁХ сеансов из
+           трёх, у которых доказательство выглядело запоздавшим: у
+           gvt1.com короткий заголовок лежал в обратной датаграмме НОМЕР 8,
+           то есть в окне, и был пропущен нами, а не сервером. */
+        uint8_t pay[128];
+        size_t len = build_coalesced_hand_then_short(pay, sizeof pay);
+        CHECK(len > 0, "стенд не собрал склеенную датаграмму");
+        d2k_session *s = quic_flow_rev_payload(50423, pay, len);
+        CHECK(d2k_session_expire(s, 200 * S, IDLE) == 1, "запись не истекла");
+        CHECK(d2k_session_suspects(s) == 0,
+              "короткий заголовок за склейкой не засчитан доказательством: "
+              "здоровый h3 даёт повод спросить (§0)");
+        d2k_session_free(s);
+    }
+    {
+        /* ОКНО ИСЧЕРПАНО — «доказательства нет» НИЧЕГО НЕ ЗНАЧИТ. Очередь
+           отдаёт датапату только первые D2K_HELLO_WINDOW обратных датаграмм
+           (files/S99d2k:386, --connbytes 0:8 --connbytes-dir reply). Замер
+           12.10.2026: у здоровых сеансов рукопожатие занимало до ОДИННАДЦАТИ
+           обратных датаграмм (ad.doubleclick.net — короткий заголовок в
+           девятой, googleads — в двенадцатой; сервер шлёт цепочку
+           сертификатов четырьмя Initial по 1250 Б). Досмотреть такой поток
+           датапат не может, и молчать обязан: иначе это подбор на рабочем
+           трафике. */
+        d2k_session *s = quic_flow_first_byte(50424, 8, 0xc3);
+        CHECK(d2k_session_expire(s, 200 * S, IDLE) == 1, "запись не истекла");
+        CHECK(d2k_session_suspects(s) == 0,
+              "окно обратных датаграмм исчерпано, а датапат всё равно "
+              "назвал поток без доказательства — это догадка, не замер");
         d2k_session_free(s);
     }
 
