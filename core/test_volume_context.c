@@ -12,6 +12,16 @@ static int repeat_missing, opaque_reply;
    раз из восьми (15963 против 30182 с VPS), но ОДИН повтор зонда дошёл до
    конца. Шум линии не опровергает обрыв; третий прогон решает. */
 static int noisy_second, third_also_full;
+/* Поле 12.10.2026, CDN-хосты soundcloud: на единственный «/» style.sndcdn.com
+   отдаёт завершённый 403 с телом 243 байта (то же и с VPS — так отвечает сам
+   сервер), api-v2.soundcloud.com — 401 с пустым телом. До измеряемой полосы
+   12 КБ таким ответам не хватает двух порядков, а НАСТОЯЩИЙ ресурс того же
+   имени режется: /css/soehne-*.css — 301328 байт с VPS против 15985 с линии. */
+static int short_then_hint, hint_status;
+/* Что отдаёт подсказанный ресурс: 0 — обрыв, 1 — нет TLS, 2 — завершённый
+   ответ ВЫШЕ полосы (настоящее отрицательное измерение). */
+static int retry_outcome;
+static const char *hint_host, *hint_for_path, *cut_path, *last_path;
 static int expected_gzip_call = 2;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "volume-context:%d: %s\n", __LINE__, #c); failures++; } } while (0)
 
@@ -93,6 +103,35 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
         memset(&r, 0, sizeof r); r.fd = -1;
         snprintf(r.reason, sizeof r.reason, "incomplete TLS record");
     }
+    if (short_then_hint) {
+        /* Обрыв отдаёт только подсказанный ресурс (cut_path); на любом другом
+           пути — завершённый ответ на два порядка меньше полосы. */
+        int cut = cut_path && last_path && !strcmp(last_path, cut_path);
+        memset(&r, 0, sizeof r); r.fd = -1;
+        r.level = D2K_VER_APPLICATION; r.name_ok = 1; r.body_framing_valid = 1;
+        r.status = 200;
+        if (!cut) {
+            r.status = hint_status; r.body_has_length = 1; r.body_complete = 1;
+            r.body_bytes = r.body_expected = 243;
+            if (hint_host) {
+                snprintf(r.resources[0].host, sizeof r.resources[0].host, "%s", hint_host);
+                snprintf(r.resources[0].path, sizeof r.resources[0].path, "%s", hint_for_path);
+                r.n_resources = 1;
+            }
+        } else if (retry_outcome == 1) {
+            r.status = 0; r.level = D2K_VER_TRANSPORT; r.body_framing_valid = 0;
+            snprintf(r.reason, sizeof r.reason, "нет TLS: сброс");
+        } else if (retry_outcome == 2) {
+            r.body_has_length = 1; r.body_complete = 1;
+            r.body_bytes = r.body_expected = 30182;
+        } else if (encoding) {
+            r.body_chunked = 1; r.body_encoding = 1; r.body_complete = 1;
+            r.body_bytes = r.body_expected = 6000;
+        } else {
+            r.body_chunked = 1;
+            r.body_bytes = baseline_calls == 1 ? 15985 : 15968;
+        }
+    }
     baseline_calls++;
     return r;
 }
@@ -101,7 +140,11 @@ void d2k_verify_close(d2k_ver_result *r) { CHECK(r->fd == -1); }
 d2k_ver_result d2k_verify_probe_path_on(int fd, const char *ip, uint16_t port,
     const char *sni, int ms, size_t wire, int legacy, int encoding,
     uint32_t mark, const char *path) {
-    CHECK(fd == -1 && (expected_path ? path && !strcmp(path, expected_path) : !path));
+    /* В опыте с подсказкой путь меняется по ходу замера, и сверять его с
+       одним ожидаемым нельзя: он сам и есть предмет проверки (last_path). */
+    CHECK(fd == -1 && (short_then_hint ||
+          (expected_path ? path && !strcmp(path, expected_path) : !path)));
+    last_path = path;
     return d2k_verify_probe_baseline(ip, port, sni, ms, wire, legacy, encoding, mark);
 }
 
@@ -182,6 +225,72 @@ int main(void) {
     CHECK(baseline_calls == 3 && !unconfirmed.rx_cut);
     CHECK(strstr(unconfirmed.rx_reason, "identity-3") != NULL);
     noisy_second = third_also_full = 0; expected_gzip_call = 2;
+    /* ПОЛЕ 12.10.2026, style.sndcdn.com и api-v2.soundcloud.com. Зонд объёма
+       просит единственный «/», а эти хосты отдают на него страницу отказа
+       доступа: завершённый 403 с телом 243 байта и 401 с пустым телом (то же
+       самое и с VPS — честное поведение сервера). До измеряемой полосы 12 КБ
+       зонд не доходит на два порядка, и класс остаётся НЕизмеренным, хотя
+       настоящие ресурсы тех же имён режутся: /css/soehne-*.css — 301328 байт
+       с VPS против 15985 с линии (три прогона, зависание на таймаут).
+       Публичный путь ресурса приходит вместе с тем же ответом — по нему и
+       мерим, ОДИН раз и по названной причине «мерить было нечем». */
+    short_then_hint = 1; expected_gzip_call = 3;
+    hint_host = "context.test"; hint_for_path = "/css/soehne-web.css";
+    cut_path = hint_for_path;
+    for (int code = 0; code < 2; code++) {
+        /* Страница отказа доступа и просто короткий документ — один случай:
+           ответ завершён и меньше полосы, мерить по нему нечего. */
+        hint_status = code ? 200 : 403;
+        baseline_calls = 0; last_path = NULL;
+        d2k_vol_result hinted = {0};
+        probe_response_volume(&hinted, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+        CHECK(baseline_calls == 4);
+        CHECK(hinted.rx_cut && !hinted.rx_wire_basis && hinted.rx_at_kb == 15);
+        CHECK(hinted.rx_compressed_complete && hinted.rx_partial_bytes == 15985);
+        CHECK(!hinted.rx_short && !hinted.rx_short_bytes);
+        CHECK(strstr(hinted.rx_reason, "/css/soehne-web.css") != NULL);
+        CHECK(strstr(hinted.rx_reason, "15985/15968") != NULL);
+        CHECK(strstr(hinted.rx_reason, "243") != NULL);
+        /* Подсказка завершённого ответа по-прежнему уходит планировщику. */
+        CHECK(hinted.n_resources == (size_t)code);
+    }
+    /* Повтор не дошёл до TLS — он не сказал ничего, и непроверенный бюджет
+       первого ответа остаётся в силе: ложного «обрыв не воспроизвёлся» здесь
+       быть не должно. */
+    retry_outcome = 1; baseline_calls = 0; last_path = NULL; hint_status = 403;
+    d2k_vol_result lost = {0};
+    probe_response_volume(&lost, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 2 && !lost.rx_cut && lost.rx_tls_unavailable);
+    CHECK(lost.rx_short && lost.rx_short_bytes == 243);
+    CHECK(strstr(lost.rx_reason, "/css/soehne-web.css") != NULL);
+    /* Подсказанный ресурс дошёл ЦЕЛИКОМ и сам прошёл полосу — это настоящее
+       отрицательное измерение, и подменять его непроверенным бюджетом нельзя. */
+    retry_outcome = 2; baseline_calls = 0; last_path = NULL;
+    d2k_vol_result passed = {0};
+    probe_response_volume(&passed, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 2 && !passed.rx_cut && !passed.rx_short);
+    CHECK(strstr(passed.rx_reason, "30182") != NULL);
+    retry_outcome = 0;
+    /* Подсказки нет — честный непроверенный бюджет остаётся как есть, без
+       выдумок, и лишнего зонда не заказываем. */
+    hint_host = NULL; hint_status = 403; baseline_calls = 0; last_path = NULL;
+    d2k_vol_result bare = {0};
+    probe_response_volume(&bare, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 1 && !bare.rx_cut);
+    CHECK(bare.rx_short && bare.rx_short_bytes == 243);
+    CHECK(strstr(bare.rx_reason, "повтор") == NULL);
+    /* Подсказка на ЧУЖОЕ имя — это другая цель: адрес и SNI у зонда свои, и
+       спросили бы мы чужой путь не у того сервера. */
+    hint_host = "other.cdn"; baseline_calls = 0; last_path = NULL;
+    d2k_vol_result foreign = {0};
+    probe_response_volume(&foreign, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 1 && !foreign.rx_cut && foreign.rx_short);
+    /* Подсказка совпала с уже измеренным путём — повторять нечего. */
+    hint_host = "context.test"; cut_path = NULL; baseline_calls = 0; last_path = NULL;
+    d2k_vol_result same = {0};
+    probe_response_volume(&same, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, hint_for_path);
+    CHECK(baseline_calls == 1 && !same.rx_cut && same.rx_short);
+    short_then_hint = 0; hint_host = NULL; expected_gzip_call = 2;
     if (failures) return 1;
     puts("test_volume_context: OK"); return 0;
 }

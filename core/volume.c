@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp — имя подсказки против предъявляемого SNI */
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -371,17 +372,53 @@ static int drain_head_plain(int fd, int wait_ms, char *reason, size_t cap) {
     }
 }
 
+/* ДРУГОЙ ПУБЛИЧНЫЙ ПУТЬ ТОГО ЖЕ ИМЕНИ, КОГДА МЕРИТЬ БЫЛО НЕЧЕМ.
+   Поле 12.10.2026: на «/» style.sndcdn.com отдаёт завершённый 403 с телом 243
+   байта, api-v2.soundcloud.com — 401 с пустым телом (то же и с VPS: так
+   отвечает сам сервер, это не блок), а НАСТОЯЩИЙ ресурс того же имени
+   режется — /css/soehne-*.css: 301328 байт с VPS против 15985 с линии.
+
+   РАЗМЕР РЕСУРСА ЗАРАНЕЕ НЕИЗВЕСТЕН: подсказка даёт только путь, поэтому
+   «обещает объём больше полосы» по ней заявить нельзя — объём выясняет само
+   измерение. Условие повтора — не обещанный объём, а то, что мерить было
+   нечем: ответ ЗАВЕРШЁН и меньше полосы, то есть про обрыв не сказал ничего.
+
+   Имя подсказки обязано совпасть с предъявляемым SNI: адрес и имя у зонда
+   свои, и чужой хост мы спросили бы не у того сервера; цель из подсказки не
+   выдумывается. Путь проверяет тот же строгий d2k_resource_path_ok — только
+   публичный .css, без запросов и токенов. Путь, который только что мерили,
+   пропускаем: повторять его нечем. */
+static int resource_retry_path(const d2k_ver_result *a, const char *sni,
+                               const char *path, char *out, size_t cap) {
+    size_t n = a->n_resources > D2K_RESOURCE_COUNT ? D2K_RESOURCE_COUNT : a->n_resources;
+    for (size_t i = 0; i < n; i++) {
+        const d2k_resource *r = &a->resources[i];
+        if (!r->host[0] || strcasecmp(r->host, sni) != 0) { continue; }
+        if (!d2k_resource_path_ok(r->path)) { continue; }
+        if (path && !strcmp(path, r->path)) { continue; }
+        if (strlen(r->path) >= cap) { continue; }
+        snprintf(out, cap, "%s", r->path);
+        return 1;
+    }
+    return 0;
+}
+
 /* Входящее измерение — другой вопрос, чем лестница исходящих HEAD выше.
    Ищем воспроизводимую асимметрию: два identity-ответа с одним framing видом
    обрываются на близком объёме, а gzip-представление той же страницы доходит
    до конца. Chunked ответы допустимы: у них полного размера заранее нет.
    Ответ без Content-Length и без chunked framing не классифицируем — там
    локальный timeout нельзя отличить от конца/медленной отдачи. Все сокеты
-   помечены measure_mark и не проходят через пробуемый план. */
-static void probe_response_volume(d2k_vol_result *res, const char *ip,
-                                  uint16_t port, const char *sni, int tls12,
-                                  size_t hello_wire, uint32_t mark, const char *path) {
-    if (!res || !ip || !sni || !sni[0] || port == 80) { return; }
+   помечены measure_mark и не проходят через пробуемый план.
+
+   Возвращает 1, только если мерить было нечем (ответ завершён и меньше
+   полосы) И тот же ответ назвал другой публичный путь этого имени: он
+   копируется в retry. Повтором распоряжается probe_response_volume. */
+static int measure_response_volume(d2k_vol_result *res, const char *ip,
+                                   uint16_t port, const char *sni, int tls12,
+                                   size_t hello_wire, uint32_t mark, const char *path,
+                                   char *retry, size_t retry_cap) {
+    if (!res || !ip || !sni || !sni[0] || port == 80) { return 0; }
     d2k_ver_result a = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
                                                   hello_wire, tls12, 0, mark, path);
     res->rx_tls_unavailable = a.level == D2K_VER_TRANSPORT && a.status == 0;
@@ -406,9 +443,14 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
             a.body_bytes < (uint64_t)D2K_VOL_MIN_KB * 1024) {
             res->rx_short = 1;
             res->rx_short_bytes = a.body_bytes;
+            if (retry && retry_cap &&
+                resource_retry_path(&a, sni, path, retry, retry_cap)) {
+                d2k_verify_close(&a);
+                return 1;
+            }
         }
         d2k_verify_close(&a);
-        return;
+        return 0;
     }
     if (rx_wire_partial(&a)) res->rx_partial_wire_bytes = a.rx_tls_wire_bytes;
     else res->rx_partial_bytes = a.body_bytes;
@@ -428,7 +470,7 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
         if (!d2k_volume_rx_needs_repeat(&a, &b)) {
             d2k_verify_close(&a);
             d2k_verify_close(&b);
-            return;
+            return 0;
         }
         /* Повтор дошёл до конца, пройдя полосу: измерения РАСХОДЯТСЯ. Судит
            третий identity-прогон того же домена — см. d2k_volume_rx_needs_repeat. */
@@ -450,7 +492,7 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
         if (!agreed) {
             d2k_verify_close(&a);
             d2k_verify_close(&c);
-            return;
+            return 0;
         }
         b = c;
         /* Журнал обязан показывать, что пару решило ТРЕТЬЕ измерение, иначе
@@ -474,6 +516,45 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     d2k_verify_close(&a);
     d2k_verify_close(&b);
     d2k_verify_close(&gz);
+    return 0;
+}
+
+/* ОДИН ПОВТОР ПО НАЗВАННОЙ ПРИЧИНЕ: на первом пути мерить было нечем. Не
+   лестница — повторное измерение само либо входит в полосу, либо честно
+   возвращает тот же непроверенный бюджет; третий путь спрашивать не о чем,
+   это был бы перебор вместо замера. */
+static void probe_response_volume(d2k_vol_result *res, const char *ip,
+                                  uint16_t port, const char *sni, int tls12,
+                                  size_t hello_wire, uint32_t mark, const char *path) {
+    char retry[sizeof ((d2k_resource *)0)->path];
+    retry[0] = '\0';
+    if (!measure_response_volume(res, ip, port, sni, tls12, hello_wire, mark, path,
+                                 retry, sizeof retry)) { return; }
+    uint64_t was = res->rx_short_bytes;
+    res->rx_short = 0;
+    res->rx_short_bytes = 0;
+    nap_ms(RESPONSE_PROBE_GAP_MS);
+    (void)measure_response_volume(res, ip, port, sni, tls12, hello_wire, mark, retry,
+                                  NULL, 0);
+    /* ПОВТОР НЕ ДОШЁЛ ДО TLS — БЮДЖЕТ ТАК И НЕ ПРОВЕРЕН. Непроверенный
+       бюджет первого ответа остаётся в силе: он сказал правду о себе, а
+       повтор не сказал ничего. Без этого один неудавшийся повтор отменял бы
+       честный rx_short и возвращался ложным «обрыв не воспроизвёлся».
+       Завершённый ответ повтора ВЫШЕ полосы — наоборот, настоящее
+       отрицательное измерение: его не подменяем. */
+    if (res->rx_tls_unavailable && !res->rx_cut && !res->rx_short) {
+        res->rx_short = 1;
+        res->rx_short_bytes = was;
+    }
+    /* Журнал обязан называть путь повтора: иначе обрыв прочитают как обрыв
+       на «/», которого там не было. Причина складывается в два приёма и с
+       явными границами — целиком она в буфер не влезает (gcc ловит это как
+       format-truncation, цель cross). */
+    char lead[104], measured[sizeof res->rx_reason];
+    snprintf(lead, sizeof lead, "повтор по %.40s (было %llu байт)",
+             retry, (unsigned long long)was);
+    snprintf(measured, sizeof measured, "%s", res->rx_reason);
+    snprintf(res->rx_reason, sizeof res->rx_reason, "%.102s: %.150s", lead, measured);
 }
 
 d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *sni,
