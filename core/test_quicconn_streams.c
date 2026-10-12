@@ -34,6 +34,28 @@ static void keys(d2k_qc *c) {
     assert(d2k_qw_keys_from_secret(c->version, secret, &c->lv[D2K_QW_LEVEL_APP].rx) == 0);
 }
 
+/* Приёмник для клиентов, которым нужно только УСПЕШНО ОТПРАВИТЬ. Привязан и
+   НЕ подключён, поэтому берёт датаграммы от любого клиента.
+
+   Общий серверный сокет s подключён к ПЕРВОМУ клиенту. На Linux датаграмма
+   другого клиента на этот адрес вызывает ICMP «порт недоступен», и СЛЕДУЮЩАЯ
+   отправка того клиента падает с ECONNREFUSED. CI 12.10.2026 показал ровно
+   это: «поток 4 не ушёл: датаграмма не ушла: Connection refused» — поток 0
+   ушёл, поток 4 получил ошибку от ответа на поток 0. macOS такую ошибку
+   клиенту не сообщает, поэтому на машине разработки тест проходил. Пределы
+   потоков здесь ни при чём: тест проверяет их отдельными утверждениями. */
+static int mk_sink(struct sockaddr_in *out) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(fd >= 0);
+    memset(out, 0, sizeof *out);
+    out->sin_family = AF_INET;
+    out->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(fd, (struct sockaddr *)out, sizeof *out) == 0);
+    socklen_t l = sizeof *out;
+    assert(getsockname(fd, (struct sockaddr *)out, &l) == 0);
+    return fd;
+}
+
 /* Связь с прикладными ключами и сокетом на сервер: рукопожатия нет, а всё
    остальное — настоящее. */
 static d2k_qc *mk_client(const struct sockaddr_in *srv_addr) {
@@ -201,7 +223,9 @@ int main(void) {
     t += tp_put_int(tp + t, sizeof tp - t, 0x09, 1);       /* streams_uni */
     size_t ee_len = ee_build(ee, sizeof ee, tp, t);
 
-    d2k_qc *c2 = mk_client(&a);
+    struct sockaddr_in a_c2;
+    int sink_c2 = mk_sink(&a_c2);
+    d2k_qc *c2 = mk_client(&a_c2);
     tp_server_ee(c2, ee, ee_len);
     printf("     разобрано: потоки дву %llu уста %d, одно %llu, данные связи %llu, потока %llu\n",
            (unsigned long long)c2->peer_streams[0], c2->peer_streams_set[0],
@@ -245,7 +269,9 @@ int main(void) {
     t2 += tp_put_int(tp + t2, sizeof tp - t2, 0x06, 100000);   /* данные потока */
     t2 += tp_put_int(tp + t2, sizeof tp - t2, 0x08, 50);
     ee_len = ee_build(ee, sizeof ee, tp, t2);
-    d2k_qc *c3 = mk_client(&a);
+    struct sockaddr_in a_c3;
+    int sink_c3 = mk_sink(&a_c3);
+    d2k_qc *c3 = mk_client(&a_c3);
     tp_server_ee(c3, ee, ee_len);
     CHECK(ask_n(c3, 0, 900, err, sizeof err) == 0, "900 байт при пределе связи 1000 ушли");
     rc = ask_n(c3, 4, 1200, err, sizeof err);
@@ -255,7 +281,9 @@ int main(void) {
 
     /* --- 6. Параметров нет вовсе: число за сервер не выдумывается --------- */
     ee_len = ee_build(ee, sizeof ee, NULL, 0);
-    d2k_qc *c4 = mk_client(&a);
+    struct sockaddr_in a_c4;
+    int sink_c4 = mk_sink(&a_c4);
+    d2k_qc *c4 = mk_client(&a_c4);
     tp_server_ee(c4, ee, ee_len);
     CHECK(!c4->peer_streams_set[0] && !c4->peer_streams_set[1] &&
           !c4->peer_max_data_set && !c4->peer_sdata_set[0],
@@ -267,6 +295,9 @@ int main(void) {
     d2k_qc_close(c2);
     d2k_qc_close(c3);
     d2k_qc_close(c4);
+    close(sink_c2);
+    close(sink_c3);
+    close(sink_c4);
     free(srv);
     close(s);
     if (!fails) puts("QUIC: предел потоков и данных сервера соблюдается");

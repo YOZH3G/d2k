@@ -107,6 +107,19 @@ static void scenario(int selected) {
                 struct timespec nap={0,1000000};nanosleep(&nap,NULL);
             }
             pthread_mutex_lock(&test_mu);CHECK(probes==1);pthread_mutex_unlock(&test_mu);
+            /* Wait until the worker really sits in the yield wait before the
+               clock jumps. Ten fixed 1 ms naps were enough on a laptop and not
+               under ASan on a CI runner (12.10.2026): the tick below met a
+               worker still moving and line "state==T_ASKING && quic_parked"
+               failed once. Same bounded wait as modes 3 and 5 already use. */
+            {
+                int waiting=0;
+                for(int k=0;k<1000 && !waiting;k++){
+                    pthread_mutex_lock(&s->mu);waiting=q->quic_yield_waiting;pthread_mutex_unlock(&s->mu);
+                    if(!waiting){struct timespec nap={0,1000000};nanosleep(&nap,NULL);}
+                }
+                CHECK(waiting);
+            }
             CHECK(q->quic_parked);
             if(mode==0){
                 now_ms+=SCHED_TASK_LIFE_MS+100;
