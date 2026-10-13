@@ -3,6 +3,7 @@
 #include "sched.c"
 #undef pthread_create
 #include "d2k_quic_arms.h"
+#include "d2k_plantlv.h"
 
 int summary_thread_create(pthread_t *thread, const pthread_attr_t *attr,
                           void *(*start)(void *), void *arg) {
@@ -234,6 +235,69 @@ int main(void) {
         d2k_sched_vol_hook = d2k_volume_probe;
         vol_cut_path = NULL;
     }
+    /* ЗАЩИТА ОТ ВБРОШЕННОГО СБРОСА ПРОСИТСЯ ПО ИЗМЕРЕННОМУ ПОВОДУ.
+     * Поле 13.10.2026, forum.ru-board.com: рукопожатие снято, план применён
+     * ко всем 133 потокам, сервер ответил всем, и коробка вбросила сброс в
+     * 132 — TTL 127 против 55–57 у сервера, каждый В ОКНО. Строку
+     * `guard rst_alien` не выдавал ни один сборщик, и реализованная в
+     * датапате защита не включалась никогда. */
+    {
+        char text[512];
+        task probe;
+        memset(&probe, 0, sizeof probe);
+        probe.transport = 6;
+        probe.trigger_code = D2K_SUSPECT_RST;
+        CHECK(rst_guard_wanted(&probe));
+        probe.trigger_code = D2K_SUSPECT_RST_AFTER_APP;
+        CHECK(rst_guard_wanted(&probe));
+        probe.trigger_code = D2K_SUSPECT_RST_CUT;
+        CHECK(rst_guard_wanted(&probe));
+        /* Тишина и объём поводом не являются. */
+        probe.trigger_code = D2K_SUSPECT_SILENT;
+        CHECK(!rst_guard_wanted(&probe));
+        /* QUIC — другой транспорт: там нет TCP-сброса. */
+        probe.trigger_code = D2K_SUSPECT_RST; probe.transport = 17;
+        CHECK(!rst_guard_wanted(&probe));
+
+        snprintf(text, sizeof text, "d2k-plan 1 5\nproto tcp tls\n");
+        CHECK(plan_arm_rst_guard(text, sizeof text) == 1);
+        CHECK(strstr(text, "guard rst_alien\n") != NULL);
+        /* Второй раз не дописывается. */
+        CHECK(plan_arm_rst_guard(text, sizeof text) == 0);
+        /* Текст остаётся годным планом: защита уезжает в провод записью. */
+        uint8_t tlv[D2K_PLAN_TLV_MAX]; size_t tlv_len = 0; char err[200];
+        CHECK(d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tlv_len, err, sizeof err) == 0);
+        int found = 0;
+        for (size_t at = 12; at + 4 <= tlv_len;) {
+            unsigned rec = ((unsigned)tlv[at] << 8) | tlv[at + 1];
+            size_t sz = ((size_t)tlv[at + 2] << 8) | tlv[at + 3];
+            at += 4;
+            if (sz > tlv_len - at) { break; }
+            if (rec == 0x0104 && sz == 1 && tlv[at] == 1) { found = 1; }
+            at += sz;
+        }
+        CHECK(found);
+        /* ПОВОД ДЛЯ КЛИЕНТСКИХ ПРИВЯЗОК — ИЗМЕРЕННАЯ ПРИМЕТА КОРОБКИ.
+         * Зонд судит по своему триггеру, а привязка в каталоге живёт дольше
+         * задачи: её повод — примета «rst» в отпечатке коробки, записанная
+         * тем же замером. */
+        d2k_cat_box box;
+        memset(&box, 0, sizeof box);
+        CHECK(!box_injects_rst(&box));
+        box.fp.n_sig = 2;
+        snprintf(box.fp.sig[0].kind, sizeof box.fp.sig[0].kind, "%s", "volume");
+        snprintf(box.fp.sig[1].kind, sizeof box.fp.sig[1].kind, "%s", "silent");
+        CHECK(!box_injects_rst(&box));
+        snprintf(box.fp.sig[1].kind, sizeof box.fp.sig[1].kind, "%s", "rst");
+        CHECK(box_injects_rst(&box));
+        CHECK(!box_injects_rst(NULL));
+
+        /* Не поместилась — план идёт как был, а не теряется. */
+        char tight[40];
+        snprintf(tight, sizeof tight, "d2k-plan 1 5\nproto tcp tls\n");
+        CHECK(plan_arm_rst_guard(tight, strlen(tight) + 4) == 0);
+    }
+
     d2k_sched_free(s);
     d2k_catalog_free(&cat);
     if (fails) fprintf(stderr, "summary: %d failures\n", fails);
