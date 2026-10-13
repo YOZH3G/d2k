@@ -271,12 +271,33 @@ static uint16_t rd16(const uint8_t *p) {
 /* Отказ по плану в журнал. Отдельной функцией, чтобы каждая точка отказа
    писала одинаково: журнал, в котором половина отказов не отмечена, хуже
    отсутствующего — он выглядит полным. */
-static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
-                   const char *why) {
+/* ОТКАЗ ПРИМЕНИТЬ ПЛАН. code — D2K_REFUSE_*: ноль значит «плана для цели
+   нет» (обычное состояние транзитного потока), D2K_REFUSE_NOT_APPLIED —
+   найденный план отвергнут исполнителем.
+ *
+ * О ЗОНДОВОМ ПОТОКЕ МОЛЧИМ ТОЛЬКО ПРИ НУЛЕ. Прежде молчали всегда, и
+ * контроллер не мог узнать, что его зонд ушёл голым: он видел лишь
+ * отсутствие применения и после одного повтора судил кандидата (поле
+ * 13.10.2026, forum.ru-board.com — см. D2K_REFUSE_NOT_APPLIED). Для своего
+ * зонда отказ исполнителя и есть результат опыта, а молчать о нулевом
+ * по-прежнему нужно: план просто не успел доехать, и это ждёт сам
+ * контроллер. */
+static void refuse_coded(d2k_session *s, uint64_t at_ns, const d2k_key *k,
+                         const char *why, uint8_t code, const d2k_plan *use) {
     d2k_flow *fl = k ? d2k_track_find(k->proto == 17 ? s->uflows : s->flows, k)
                      : NULL;
-    if (fl && fl->controller_probe) { return; }
-    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_PLAN_REFUSED, 0, 0, NULL, NULL, 0, why);
+    if (fl && fl->controller_probe && code == D2K_REFUSE_NONE) { return; }
+    uint8_t trial[D2K_TRIAL_ID_LEN];
+    memset(trial, 0, sizeof trial);
+    if (use) { d2k_plantab_trial(s->plans, use, trial); }
+    d2k_journal_add_refused(s->jrn, at_ns, k, code,
+                            use ? d2k_plan_id(use) : NULL,
+                            use ? trial : NULL, why);
+}
+
+static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
+                   const char *why) {
+    refuse_coded(s, at_ns, k, why, D2K_REFUSE_NONE, NULL);
 }
 
 /* План построен и передан на отправку. Ключ потока и идентификатор плана
@@ -1146,7 +1167,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     memset(&acts, 0, sizeof acts);
     if (d2k_plan_apply(use, fl, &in, &acts) != 0) {
         out->skipped = acts.refuse_why ? acts.refuse_why : "план неприменим к этому пакету";
-        refuse(s, now_ns, &key, out->skipped);
+        refuse_coded(s, now_ns, &key, out->skipped, D2K_REFUSE_NOT_APPLIED, use);
         d2k_actions_free(&acts);
         return;
     }
@@ -2197,9 +2218,18 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     memset(&acts, 0, sizeof acts);
     if (d2k_plan_apply(use, fl, &in, &acts) != 0) {
         /* Неприменим — пропускаем как есть. Отказ исполнителя это результат, а
-           не сбой: якорь может быть невычислим для конкретного пакета. */
-        out->skipped = "план неприменим к этому пакету";
-        if (!http_hello) { refuse(s, now_ns, &key, out->skipped); }
+           не сбой: якорь может быть невычислим для конкретного пакета.
+           ПРИЧИНА ИСПОЛНИТЕЛЯ — ДОСЛОВНО. Обобщённый текст уходил и в журнал,
+           и контроллеру, и по нему нельзя было отличить «коробка срезала» от
+           «мы сами не применили план» (поле 13.10.2026, forum.ru-board.com:
+           10 таких отказов за 15 минут, зонд уходил голым, рабочий приём
+           выброшен). Запасной текст остаётся на случай отказа без причины. */
+        out->skipped = acts.refuse_why ? acts.refuse_why
+                                       : "план неприменим к этому пакету";
+        if (!http_hello) {
+            refuse_coded(s, now_ns, &key, out->skipped,
+                         D2K_REFUSE_NOT_APPLIED, use);
+        }
         d2k_actions_free(&acts);
         return 0;
     }

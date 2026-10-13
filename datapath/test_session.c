@@ -1690,6 +1690,65 @@ int main(void) {
         }
     }
 
+    /* --- ОТКАЗ ИСПОЛНИТЕЛЯ НА ПОТОКЕ СВОЕГО ЗОНДА ВИДЕН КОНТРОЛЛЕРУ -------
+     * Поле 13.10.2026, forum.ru-board.com. Пробная запись стоит под портом
+     * зонда, план найден, но исполнитель его отвергает (здесь — приветствие
+     * с несходящимися объявленными длинами, план считает от имени). Зонд
+     * уходит голым, коробка срезает его как без обхода, и контроллер обязан
+     * узнать, что плана на проводе НЕ БЫЛО: иначе наш отказ записывается в
+     * вину кандидату. Прежде refuse() молчал о любом зондовом потоке, и
+     * такого события не появлялось вовсе (в поле 10 отказов за 15 минут — ни
+     * одного события), а контроллер после одного повтора судил кандидата.
+     *
+     * Код обязан быть D2K_REFUSE_NOT_APPLIED, а не ноль: ноль значит «плана
+     * для цели нет», случается на каждом транзитном потоке, и контроллер его
+     * намеренно пропускает (on_refused). Запись GRANDFATHER — чтобы в опыте
+     * проверялся отказ исполнителя, а не подбор формы. */
+    {
+        static const uint8_t anchored_plan[] = {
+            'D','2','K','P', 0,1, 0,5, 0,0, 0,5,
+            0,2, 0,2, 6,1,                 /* TCP/TLS */
+            1,10, 0,0,                     /* input tls-sni */
+            1,0, 0,4, 0,5, 0,0,            /* split sni_middle */
+            1,8, 0,4, 0,0,5,120,           /* segment 1400 */
+            1,9, 0,1, 1                    /* detect-tcp-v1 */
+        };
+        const uint8_t *nm = (const uint8_t *)"hetzner.com";
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *ap = NULL;
+        CHECK(g && d2k_plan_load(anchored_plan, sizeof anchored_plan, &ap,
+                                 err, sizeof err) == 0 && ap,
+              "отказ зонда: план с якорем по имени не разобран");
+        uint16_t pport = 43040;
+        CHECK(ap && d2k_plantab_set_name_probe(d2k_session_plans(g), nm, 11, 1, ap,
+                  D2K_PLAN_SHAPE_GRANDFATHER, htons16(pport)) == 0,
+              "отказ зонда: пробная запись не встала");
+        uint8_t bad[2048];
+        memcpy(bad, hello, hlen);
+        /* Объявленная длина записи больше объявленной длины рукопожатия:
+           имя читается, а исполнитель такой вход не берёт. */
+        bad[3] = (uint8_t)((hlen - 5 + 7) >> 8);
+        bad[4] = (uint8_t)(hlen - 5 + 7);
+        n = build_pkt(pkt, pport, 0x02, NULL, 0);
+        d2k_session_packet_probe(g, pkt, n, 1000, buf, sizeof buf, &r);
+        n = build_pkt(pkt, pport, 0x18, bad, hlen);
+        d2k_session_packet_probe(g, pkt, n, 1100, buf, sizeof buf, &r);
+        CHECK(r.applied == 0 && r.n_out == 0,
+              "отказ зонда: план всё-таки применился — проверять нечего");
+        CHECK(r.skipped != NULL && strstr(r.skipped, "не сходятся") != NULL,
+              "отказ зонда: причина отказа не названа дословно");
+        const d2k_journal *jr = d2k_session_journal(g);
+        size_t jn = d2k_journal_count(jr), coded = 0;
+        for (size_t i = 0; i < jn; i++) {
+            const d2k_jrn_entry *e = d2k_journal_at(jr, i);
+            if (e && e->kind == D2K_JRN_PLAN_REFUSED &&
+                e->code == D2K_REFUSE_NOT_APPLIED) { coded++; }
+        }
+        CHECK(coded == 1,
+              "отказ исполнителя на потоке зонда не уехал контроллеру с кодом");
+        d2k_session_free(g);
+    }
+
     /* --- постквантовое приветствие в двух сегментах -------------------------
      * Поле 13.10.2026, forum.ru-board.com: план подтверждён собственным
      * зондом на TLS 1.3, а к браузеру не применялся. Приветствие 1541 байт,

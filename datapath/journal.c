@@ -59,6 +59,8 @@ const char *d2k_refuse_text(uint8_t code) {
     case D2K_REFUSE_QUEUE:    return "очередь отложенной отправки не приняла посылку";
     case D2K_REFUSE_TOO_LONG: return "посылка длиннее того, что унесёт способ отправки";
     case D2K_REFUSE_DAMAGED:  return "поток испорчен недоисполнением плана";
+    case D2K_REFUSE_NOT_APPLIED:
+        return "исполнитель отверг план на этом пакете (причина — в записи)";
     default:                  return "отказ без кода";
     }
 }
@@ -141,6 +143,15 @@ void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
            которой проходит имя выше, испортила бы его молча. */
         memcpy(e->plan_id, plan_id, D2K_PLAN_ID_LEN);
     }
+    if (e && trial_id) { memcpy(e->trial_id, trial_id, D2K_TRIAL_ID_LEN); }
+}
+
+void d2k_journal_add_refused(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+                             uint8_t code, const uint8_t *plan_id,
+                             const uint8_t *trial_id, const char *note) {
+    d2k_jrn_entry *e = add_entry(j, at_ns, key, D2K_JRN_PLAN_REFUSED, code, 0,
+                                 NULL, NULL, 0, note);
+    if (e && plan_id) { memcpy(e->plan_id, plan_id, D2K_PLAN_ID_LEN); }
     if (e && trial_id) { memcpy(e->trial_id, trial_id, D2K_TRIAL_ID_LEN); }
 }
 

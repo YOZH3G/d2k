@@ -95,6 +95,62 @@ static void test_tls_fake_modifiers(void) {
     in.is_tls13=0;
     CHECK(d2k_plan_apply(p,&flow,&in,&a)!=0,
           "TLS modifiers reject non-TLS-1.3 input");
+    CHECK(a.refuse_why && strstr(a.refuse_why, "TLS 1.3"),
+          "отказ по форме назван: правка просит TLS 1.3");
+    d2k_plan_free(p);
+}
+
+/* ПРИЧИНА ОТКАЗА — НЕ УКРАШЕНИЕ ЖУРНАЛА. Поле 13.10.2026,
+   forum.ru-board.com: исполнитель отказал 10 раз за 15 минут обобщённым
+   «план неприменим к этому пакету», зонд ушёл голым, коробка его срезала, и
+   контроллер записал НАШ отказ в вину кандидату — рабочий приём (плотная
+   серия с битой суммой, три ServerHello на проводе) был выброшен. Отличить
+   «коробка срезала» от «мы сами не применили» можно только по названной
+   причине, поэтому молчащий отказ здесь — провал теста. */
+static void test_refusal_names_reason(void) {
+    uint8_t plan[256];
+    size_t plan_len = tls_fake_plan(plan);
+    d2k_plan *p = NULL; char err[160];
+    if (d2k_plan_load(plan, plan_len, &p, err, sizeof err) != 0 || !p) {
+        CHECK(0, "план причин не разобран");
+        return;
+    }
+    uint8_t hello[87] = {0};
+    hello[0]=0x16;hello[1]=3;hello[2]=1;hello[3]=0;hello[4]=82;
+    hello[5]=1;hello[6]=0;hello[7]=0;hello[8]=78;hello[9]=3;hello[10]=3;
+    for (size_t i=0;i<32;i++) hello[11+i]=(uint8_t)(0x10+i);
+    hello[43]=32;
+    for (size_t i=0;i<32;i++) hello[44+i]=(uint8_t)(0xc0+i);
+    hello[76]=0;hello[77]=2;hello[78]=0x13;hello[79]=1;
+    hello[80]=1;hello[81]=0;hello[82]=0;hello[83]=0;
+    uint8_t junk[64];
+    memset(junk, 0xab, sizeof junk);
+
+    struct { const char *what; d2k_pkt in; } cases[] = {
+        /* нагрузки нет */
+        { "пустая нагрузка", (d2k_pkt){0} },
+        /* не ClientHello: правка приветствия не соберётся */
+        { "не приветствие", (d2k_pkt){ .payload = junk, .payload_len = sizeof junk,
+                                       .is_tls13 = 1, .seq = 1 } },
+        /* форма не та */
+        { "форма не TLS 1.3", (d2k_pkt){ .payload = hello, .payload_len = sizeof hello,
+                                         .is_tls13 = 0, .seq = 1 } },
+        /* план не для запроса HTTP */
+        { "запрос HTTP", (d2k_pkt){ .payload = hello, .payload_len = sizeof hello,
+                                    .is_tls13 = 1, .is_http = 1, .seq = 1 } },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        d2k_actions a = {0};
+        int rc = d2k_plan_apply(p, NULL, &cases[i].in, &a);
+        CHECK(rc != 0, cases[i].what);
+        CHECK(a.refuse_why != NULL && a.refuse_why[0] != '\0',
+              "отказ исполнителя обязан называть причину");
+        if (rc != 0 && !a.refuse_why) {
+            printf("  молчащий отказ: %s\n", cases[i].what);
+        }
+        CHECK(a.n == 0, "при отказе посылок нет");
+        d2k_actions_free(&a);
+    }
     d2k_plan_free(p);
 }
 
@@ -574,6 +630,7 @@ int main(void) {
     d2k_pkt in;
 
     test_tls_fake_modifiers();
+    test_refusal_names_reason();
     test_udplen();
     test_quicsplit();
     test_own_after_fakes();

@@ -23,19 +23,22 @@
 
 /* Разрешение якоря. Невычислимый якорь — ОТКАЗ, а не нулевое смещение:
  * молчаливый ноль исполнил бы не тот план, который измеряли. */
-static int anchor_offset(const d2k_pkt *in, uint16_t anchor, size_t *out) {
+static int anchor_offset(const d2k_pkt *in, uint16_t anchor, size_t *out,
+                         const char **why) {
     switch (anchor) {
     case ANCHOR_PAYLOAD_START:
         *out = 0;
         return 0;
     case ANCHOR_SNI_START:
         if (!in->have_sni) {
+            *why = "якорь «начало имени»: имени в этом пакете нет";
             return -1;
         }
         *out = in->sni_off;
         return 0;
     case ANCHOR_SNI_END:
         if (!in->have_sni) {
+            *why = "якорь «конец имени»: имени в этом пакете нет";
             return -1;
         }
         *out = in->sni_off + in->sni_len;
@@ -52,6 +55,7 @@ static int anchor_offset(const d2k_pkt *in, uint16_t anchor, size_t *out) {
            середине домена второго уровня, а не на n/2
            (z2k-detect/internal/classify/raw_linux.go:667-690). */
         if (!in->have_sni) {
+            *why = "якорь «середина имени»: имени в этом пакете нет";
             return -1;
         }
         /* Зажимы дословно донорские: без них короткое имя даёт вырожденный
@@ -67,8 +71,10 @@ static int anchor_offset(const d2k_pkt *in, uint16_t anchor, size_t *out) {
     case ANCHOR_RECORD_END:
         /* Границу записи TLS обязан передать протокольный модуль. Пока он не
            написан, честный ответ — отказ, а не догадка о длине. */
+        *why = "якорь «конец записи TLS» не поддержан исполнителем";
         return -1;
     default:
+        *why = "якорь плана не известен исполнителю";
         return -1;
     }
 }
@@ -82,11 +88,11 @@ static int cmp_size(const void *a, const void *b) {
  * очищены от повторов и краёв. Порядок именно возрастающий, а не порядок
  * записей: иначе перестановка записей в плане меняла бы куски. */
 static int split_points(const d2k_plan *p, const d2k_pkt *in,
-                        size_t *pts, size_t *n_out) {
+                        size_t *pts, size_t *n_out, const char **why) {
     size_t n = 0;
     for (size_t i = 0; i < p->n_splits; i++) {
         size_t base;
-        if (anchor_offset(in, p->splits[i].anchor, &base) != 0) {
+        if (anchor_offset(in, p->splits[i].anchor, &base, why) != 0) {
             return -1;
         }
         long v = (long)base + p->splits[i].offset;
@@ -112,15 +118,24 @@ static int split_points(const d2k_plan *p, const d2k_pkt *in,
 }
 
 static int tls_ch_layout(const uint8_t *b, size_t n, int allow_prefix, size_t *rnd_off,
-                         size_t *sid_off, size_t *sid_len) {
-    if (!b || n < 44 || b[0] != 0x16 || b[1] != 3 || b[5] != 1) { return -1; }
+                         size_t *sid_off, size_t *sid_len, const char **why) {
+    if (!b || n < 44 || b[0] != 0x16 || b[1] != 3 || b[5] != 1) {
+        *why = "правка приветствия: это не ClientHello или он короче 44 байт";
+        return -1;
+    }
     size_t rec_len = ((size_t)b[3] << 8) | b[4];
     size_t hs_len = ((size_t)b[6] << 16) | ((size_t)b[7] << 8) | b[8];
     if (rec_len + 5 != hs_len + 9 || n > rec_len + 5 ||
-        (!allow_prefix && (hs_len > n - 9 || rec_len > n - 5))) { return -1; }
+        (!allow_prefix && (hs_len > n - 9 || rec_len > n - 5))) {
+        *why = "правка приветствия: объявленные длины записи и рукопожатия не сходятся";
+        return -1;
+    }
     size_t len_off = 43;
     size_t sl = b[len_off];
-    if (sl > 32 || sl > n - (len_off + 1)) { return -1; }
+    if (sl > 32 || sl > n - (len_off + 1)) {
+        *why = "правка приветствия: длина session id выходит за пришедшие байты";
+        return -1;
+    }
     *rnd_off = 11; *sid_off = len_off + 1; *sid_len = sl;
     return 0;
 }
@@ -144,7 +159,7 @@ static void wr24(uint8_t *b, size_t off, size_t v) {
 
 static int fake_tls_bytes(const d2k_plan *p, const struct d2k_fake *f,
                           const struct d2k_payload *pl, const d2k_pkt *in,
-                          uint8_t **owned) {
+                          uint8_t **owned, const char **why) {
     size_t fake_rnd, fake_sid, fake_sid_len;
     size_t real_rnd, real_sid, real_sid_len;
     *owned = NULL;
@@ -152,21 +167,25 @@ static int fake_tls_bytes(const d2k_plan *p, const struct d2k_fake *f,
        and session-ID fields have the same layout; unequal SID lengths are
        handled below without resizing the template. Keep the older native
        modifier profile's input contract unchanged. */
-    if ((!in->is_tls13 && p->wire_profile != D2K_WIRE_TCP_TEMPLATE) ||
-        tls_ch_layout(in->payload, in->payload_len,
+    if (!in->is_tls13 && p->wire_profile != D2K_WIRE_TCP_TEMPLATE) {
+        *why = "правка приветствия просит TLS 1.3, а у этого пакета форма другая";
+        return -1;
+    }
+    if (tls_ch_layout(in->payload, in->payload_len,
             p->wire_profile == D2K_WIRE_TCP_TEMPLATE,
-            &real_rnd, &real_sid, &real_sid_len) != 0 ||
+            &real_rnd, &real_sid, &real_sid_len, why) != 0 ||
         tls_ch_layout(pl->bytes, pl->len, 0, &fake_rnd, &fake_sid,
-                      &fake_sid_len) != 0) { return -1; }
+                      &fake_sid_len, why) != 0) { return -1; }
     if (p->wire_profile == D2K_WIRE_TCP_TEMPLATE) {
         /* Original TLSMod: randomize fake random/SID, then duplicate SID only
          * when lengths match. It does not resize fake_default_tls. */
         uint8_t *b = malloc(pl->len);
-        if (!b) return -1;
+        if (!b) { *why = "нет памяти на правку приветствия"; return -1; }
         memcpy(b, pl->bytes, pl->len);
         if ((f->tls_mod & D2K_TLS_MOD_RND) &&
             (random_bytes(b + fake_rnd, 32) != 0 ||
              random_bytes(b + fake_sid, fake_sid_len) != 0)) {
+            *why = "случайные байты не прочитаны (/dev/urandom)";
             free(b); return -1;
         }
         if ((f->tls_mod & D2K_TLS_MOD_DUPSID) && fake_sid_len == real_sid_len)
@@ -177,10 +196,13 @@ static int fake_tls_bytes(const d2k_plan *p, const struct d2k_fake *f,
     size_t out_len = pl->len;
     if (f->tls_mod & D2K_TLS_MOD_DUPSID) {
         out_len = pl->len - fake_sid_len + real_sid_len;
-        if (out_len > 65540 || out_len < 9 || out_len - 5 > 65535 || out_len - 9 > 0xffffff) { return -1; }
+        if (out_len > 65540 || out_len < 9 || out_len - 5 > 65535 || out_len - 9 > 0xffffff) {
+            *why = "правка приветствия: копия session id не влезает в запись TLS";
+            return -1;
+        }
     }
     uint8_t *b = malloc(out_len);
-    if (!b) { return -1; }
+    if (!b) { *why = "нет памяти на правку приветствия"; return -1; }
     if (f->tls_mod & D2K_TLS_MOD_DUPSID) {
         memcpy(b, pl->bytes, fake_sid);
         memcpy(b + fake_sid, in->payload + real_sid, real_sid_len);
@@ -193,6 +215,7 @@ static int fake_tls_bytes(const d2k_plan *p, const struct d2k_fake *f,
         memcpy(b, pl->bytes, pl->len);
     }
     if ((f->tls_mod & D2K_TLS_MOD_RND) && random_bytes(b + fake_rnd, 32) != 0) {
+        *why = "случайные байты не прочитаны (/dev/urandom)";
         free(b); return -1;
     }
     (void)p;
@@ -201,10 +224,11 @@ static int fake_tls_bytes(const d2k_plan *p, const struct d2k_fake *f,
 }
 
 static int emit_fake(d2k_emit *e, const d2k_plan *p, const struct d2k_fake *f,
-                     const d2k_pkt *in, uint32_t seq, uint32_t delay) {
+                     const d2k_pkt *in, uint32_t seq, uint32_t delay,
+                     const char **why) {
     const struct d2k_payload *pl = d2k_find_payload(p, f->payload_id);
     const struct d2k_poison *po = f->poison_id ? d2k_find_poison(p, f->poison_id) : NULL;
-    if (!pl) { return -1; }
+    if (!pl) { *why = "фальшивка плана ссылается на нагрузку, которой нет"; return -1; }
     memset(e, 0, sizeof *e);
     e->kind = D2K_EMIT_FAKE;
     e->delay_us = delay;
@@ -212,7 +236,7 @@ static int emit_fake(d2k_emit *e, const d2k_plan *p, const struct d2k_fake *f,
     e->bytes = pl->bytes;
     e->len = pl->len;
     if (f->tls_mod) {
-        if (fake_tls_bytes(p, f, pl, in, &e->owned_bytes) != 0) { return -1; }
+        if (fake_tls_bytes(p, f, pl, in, &e->owned_bytes, why) != 0) { return -1; }
         e->bytes = e->owned_bytes;
     }
     if (po) {
@@ -305,12 +329,22 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         return -1;
     }
     memset(out, 0, sizeof *out);
+    /* ПРИЧИНА ОТКАЗА НАЗЫВАЕТСЯ ВСЕГДА. Отказ исполнителя и вердикт коробки
+       на проводе выглядят одинаково: зонд уходит голым и его срезают. Пока 36
+       из 37 путей отказа молчали, обобщённое «план неприменим к этому пакету»
+       в журнале датапата (10 раз за 15 минут, поле 13.10.2026,
+       forum.ru-board.com) не давало отличить одно от другого, и контроллер
+       записывал НАШ отказ в вину кандидату. */
     if (!in->payload || in->payload_len == 0) {
+        out->refuse_why = "в пакете нет полезной нагрузки";
         return -1;
     }
     /* HTTP-план — только запросу HTTP, прочий план — только не ему (шаг 4
        задачи 51): якоря «sni_*» у них считаются от разного. */
     if ((p->proto == D2K_PLAN_PROTO_HTTP) != (in->is_http != 0)) {
+        out->refuse_why = p->proto == D2K_PLAN_PROTO_HTTP
+            ? "план открытого HTTP, а пакет — не запрос HTTP"
+            : "пакет — запрос HTTP, а план объявлен не для него";
         return -1;
     }
     if (p->qdeny) {
@@ -321,6 +355,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     }
     if (in->is_http && (p->input_tls || p->input_len || p->oob_enabled || p->ipfrag ||
                         p->udplen || p->qsplit)) {
+        out->refuse_why = "приёмы этого плана к запросу HTTP не применяются";
         return -1;
     }
     if (p->input_tls) {
@@ -331,7 +366,12 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         size_t n = in->payload_len;
         if (n < 9 || n > D2K_ARM_TRIGGER_MAX || b[0] != 0x16 || b[1] != 3 || b[5] != 1 ||
             !in->have_sni || in->sni_len <= 1 || !in->sni_off ||
-            in->sni_off > n || in->sni_len > n - in->sni_off) { return -1; }
+            in->sni_off > n || in->sni_len > n - in->sni_off) {
+            out->refuse_why = !in->have_sni
+                ? "план считает от имени, а имени в этом пакете нет"
+                : "план считает от имени, а разметка имени негодна";
+            return -1;
+        }
         /* ЗАПИСЬ ЦЕЛИКОМ ИЛИ ЕЁ НАЧАЛО — ВХОД В ОБОИХ СЛУЧАЯХ.
          *
          * Приветствие длиннее сегмента — обычное дело: 1534 байта при MSS
@@ -351,13 +391,20 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
          * (input_len ниже), по-прежнему требуют своего входа до байта. */
         size_t rec_total = 5u + ((size_t)b[3] << 8) + b[4];
         size_t hs_total = 9u + ((size_t)b[6] << 16) + ((size_t)b[7] << 8) + b[8];
-        if (rec_total != hs_total || n > rec_total) { return -1; }
+        if (rec_total != hs_total || n > rec_total) {
+            out->refuse_why = "приветствие негодно: длины записи и рукопожатия "
+                              "не сходятся или пришло больше объявленного";
+            return -1;
+        }
     }
     if (p->input_len &&
         (in->payload_len != p->input_len ||
          (in->have_sni ? in->sni_len : 0) != p->input_sni_len ||
          (p->input_sni_len && in->sni_off != p->input_sni_off))) {
-        return -1; /* not the input for which fixed measured bytes were built */
+        /* not the input for which fixed measured bytes were built */
+        out->refuse_why = "байты плана собраны под другой вход: длина "
+                          "приветствия, длина или место имени не те, что мерили";
+        return -1;
     }
 
     d2k_emit *v = NULL;
@@ -365,10 +412,15 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     int owns_payload = 1;
     if (p->oob_enabled) {
         size_t mid = 0;
-        if (anchor_offset(in, p->oob_anchor, &mid) != 0 ||
-            mid == 0 || mid >= in->payload_len) { return -1; }
+        if (anchor_offset(in, p->oob_anchor, &mid, &out->refuse_why) != 0) {
+            return -1;
+        }
+        if (mid == 0 || mid >= in->payload_len) {
+            out->refuse_why = "место срочного байта вне нагрузки этого пакета";
+            return -1;
+        }
         v = calloc(3, sizeof *v);
-        if (!v) { return -1; }
+        if (!v) { out->refuse_why = "нет памяти на посылки плана"; return -1; }
         v[0].kind = D2K_EMIT_PAYLOAD;
         v[0].seq = in->seq;
         v[0].bytes = in->payload;
@@ -398,11 +450,12 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     if (p->n_splits) {
         pts = calloc(p->n_splits, sizeof *pts);
         if (!pts) {
+            out->refuse_why = "нет памяти на разрезы плана";
             return -1;
         }
-        if (split_points(p, in, pts, &n_pts) != 0) {
+        if (split_points(p, in, pts, &n_pts, &out->refuse_why) != 0) {
             free(pts);
-            return -1; /* невычислимый якорь */
+            return -1; /* невычислимый якорь — причина уже названа */
         }
     }
 
@@ -427,7 +480,8 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     }
     if (p->udplen && in->payload_len + (size_t)p->udplen > 65535u - 8u) {
         free(pts);
-        return -1; /* удлинённая нагрузка не помещается в одну UDP-датаграмму */
+        out->refuse_why = "удлинённая нагрузка не помещается в одну UDP-датаграмму";
+        return -1;
     }
 
     /* Верхняя оценка числа посылок: копии фальшивок плюс куски. Считаем
@@ -468,6 +522,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     v = calloc(max_emits, sizeof *v);
     if (!v) {
         free(pts);
+        out->refuse_why = "нет памяти на посылки плана";
         return -1;
     }
     n = 0;
@@ -480,7 +535,8 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         uint8_t reps = p->fakes[i].repeats ? p->fakes[i].repeats : 1;
         for (uint8_t r = 0; r < reps; r++) {
             if (emit_fake(&v[n], p, &p->fakes[i], in, in->seq,
-                          r == 0 ? 0 : p->fakes[i].gap_us) != 0) {
+                          r == 0 ? 0 : p->fakes[i].gap_us,
+                          &out->refuse_why) != 0) {
                 free(pts); emit_vec_free(v, n); return -1;
             }
             if (r && p->wire_profile == D2K_WIRE_TCP_TEMPLATE && v[n].owned_bytes) {
@@ -552,7 +608,10 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
                    отмена обязана отпустить его нетронутым. Разрезов при
                    udplen нет (plan_parse.c), кусок один и он весь пакет. */
                 uint8_t *grown = malloc(e->len + p->udplen);
-                if (!grown) { free(pts); emit_vec_free(v, n); return -1; }
+                if (!grown) {
+                    out->refuse_why = "нет памяти на удлинение датаграммы";
+                    free(pts); emit_vec_free(v, n); return -1;
+                }
                 memcpy(grown, e->bytes, e->len);
                 memset(grown + e->len, 0, p->udplen);
                 e->owned_bytes = grown;
@@ -581,7 +640,8 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
                     for (uint8_t r = 0; r < reps; r++) {
                         if (emit_fake(&v[n], p, &p->fakes[k], in,
                                       in->seq + (uint32_t)start,
-                                      r == 0 ? 0 : p->fakes[k].gap_us) != 0) {
+                                      r == 0 ? 0 : p->fakes[k].gap_us,
+                                      &out->refuse_why) != 0) {
                             free(pts); emit_vec_free(v, n); return -1;
                         }
                         n++;
@@ -700,11 +760,17 @@ finalize:
                 limit = in->segment_cap;
             }
             size_t chunks = limit && bytes ? (bytes - 1) / limit + 1 : 1;
-            if (chunks > 65536 || count > 65536 - chunks) { emit_vec_free(v, n); return -1; }
+            if (chunks > 65536 || count > 65536 - chunks) {
+                out->refuse_why = "нарезка на сегменты даёт слишком много посылок";
+                emit_vec_free(v, n); return -1;
+            }
             count += chunks;
         }
         d2k_emit *split = calloc(count, sizeof *split);
-        if (!split) { emit_vec_free(v, n); return -1; }
+        if (!split) {
+            out->refuse_why = "нет памяти на нарезку посылок";
+            emit_vec_free(v, n); return -1;
+        }
         size_t k = 0;
         for (size_t i = 0; i < n; i++) {
             size_t limit = p->segment_size;
