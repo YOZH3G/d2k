@@ -1215,7 +1215,6 @@ libd2k_udp.a: $(UDP_ENGINE_SRC) $(UDP_ENGINE_HDR)
 	@mkdir -p .udp-engine
 	@for src in $(UDP_ENGINE_SRC); do $(CC) $(CFLAGS) -c $$src -o .udp-engine/$$(basename $$src .c).o || exit 1; done
 	ar rcs $@ $(UDP_ENGINE_OBJ)
-$(TESTS) d2kask d2kc d2kvoice: libd2k_udp.a
 LDFLAGS += libd2k_udp.a
 
 UDP_SESSION_SRC = httpup_logic.c ../datapath/http80.c ../datapath/hold.c ../datapath/capture.c ../datapath/nat.c ../datapath/ctq.c ../datapath/nl.c ../datapath/track.c ../datapath/tls.c ../datapath/journal.c ../datapath/plans.c ../core/stun.c
@@ -1318,3 +1317,13 @@ san: san-sched-quic-yield
 san-sched-quic-yield: hello_profiles.inc tcp1620_whitelist.inc
 	$(CC) $(SANFLAGS) -o /tmp/d2k-san-sched-quic-yield test_sched_quic_yield.c $(sort $(filter-out sched.c,$(SCHED_TEST_OBJ:.o=.c)) $(UDP_ENGINE_SRC)) -lpthread
 	/tmp/d2k-san-sched-quic-yield
+
+# В САМОМ КОНЦЕ, И ЭТО ВАЖНО. LDFLAGS выше несёт libd2k_udp.a в каждую
+# линковку с $(TEST_LDFLAGS), значит каждая такая цель обязана от неё
+# зависеть. Прежде объявление стояло в середине файла: в позиции цели
+# $(TESTS) раскрывается сразу, и тесты, добавленные ниже, зависимость не
+# получали; а три цели вне TESTS (test_tls12, test_d2kc_proto,
+# test_ip6frag_send_live) не получали её вовсе. Последовательная сборка этого
+# не замечала — библиотека успевала собраться раньше. `make -j` падал за
+# секунду: «no such file or directory: libd2k_udp.a».
+$(TESTS) d2kask d2kc d2kvoice test_tls12 test_d2kc_proto test_ip6frag_send_live: libd2k_udp.a

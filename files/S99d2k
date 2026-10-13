@@ -1,4 +1,7 @@
 #!/bin/sh
+# shellcheck disable=SC3043
+# `local` нет в строгом POSIX, но он есть во ВСЕХ оболочках, где этот
+# скрипт работает: BusyBox ash (Keenetic Entware, OpenWrt) и dash.
 # d2k — служба обхода DPI для Keenetic.
 #
 # BusyBox ash. Никаких башизмов: на роутере другого шелла нет.
@@ -1266,19 +1269,19 @@ stop() {
 
 status() {
     echo "$NAME"
-    running "$DP_PID" && echo "  датапат: работает (pid $(cat $DP_PID))" \
+    running "$DP_PID" && echo "  датапат: работает (pid $(cat "$DP_PID"))" \
                       || echo "  датапат: не работает"
-    running "$CT_PID" && echo "  контроллер: работает (pid $(cat $CT_PID))" \
+    running "$CT_PID" && echo "  контроллер: работает (pid $(cat "$CT_PID"))" \
                       || echo "  контроллер: не работает"
-    running "$PN_PID" && echo "  панель: работает (pid $(cat $PN_PID))" \
+    running "$PN_PID" && echo "  панель: работает (pid $(cat "$PN_PID"))" \
                       || echo "  панель: не работает"
-    running "$TG_PID" && echo "  Telegram tunnel: работает (pid $(cat $TG_PID))" \
+    running "$TG_PID" && echo "  Telegram tunnel: работает (pid $(cat "$TG_PID"))" \
                        || echo "  Telegram tunnel: не работает (enabled=${TG_ENABLED:-0})"
-    running "$DNS_SCHED_PID" && echo "  Instagram DNS: суточное обновление запланировано (pid $(cat $DNS_SCHED_PID))" \
+    running "$DNS_SCHED_PID" && echo "  Instagram DNS: суточное обновление запланировано (pid $(cat "$DNS_SCHED_PID"))" \
                               || echo "  Instagram DNS: планировщик не работает"
     running "$UPD_PID" && echo "  автообновление: ночная проверка запланирована (pid $(cat "$UPD_PID"))" \
                        || echo "  автообновление: не запланировано"
-    running "$HL_PID" && echo "  сторож правил: работает (pid $(cat $HL_PID))" \
+    running "$HL_PID" && echo "  сторож правил: работает (pid $(cat "$HL_PID"))" \
                       || echo "  сторож правил: не работает"
     fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
     [ ! -f "$FW_V4ONLY" ] || echo "  IPv6: не обслуживается — нет ip6tables mangle, работа только по IPv4"

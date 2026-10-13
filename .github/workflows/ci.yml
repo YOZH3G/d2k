@@ -56,12 +56,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      # One list for CI and scripts/check.sh, kept in scripts/lint-shell.sh.
+      # It also covers the extensionless scripts in files/ (S99d2k and the
+      # rest), which a *.sh glob misses.
       - name: shellcheck
-        run: |
-          set -euo pipefail
-          mapfile -d '' files < <(find scripts files spike -type f -name '*.sh' -print0)
-          files+=(files/d2k-instagram-dns.sh files/d2k-update.sh files/d2k-openwrt-init files/d2k-tg-firewall.sh)
-          shellcheck -s sh "${files[@]}"
+        run: sh scripts/lint-shell.sh
       - name: core shards cover all of check and san
         run: |
           sh scripts/ci-core-shard.sh verify
