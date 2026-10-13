@@ -143,6 +143,10 @@ jobs:
           PUBLIC_KEY_HEX: ${{ vars.D2K_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
+          if [ -z "$PRIVATE_KEY" ]; then
+            echo "::error::D2K_ED25519_PRIVATE_KEY is empty: the d2k-signing environment secret did not reach this job (called from ci.yml without 'secrets: inherit'?)"
+            exit 1
+          fi
           out="$RUNNER_TEMP/release"
           # Artifacts do not keep the file mode; the archives must.
           chmod 0755 "$RUNNER_TEMP"/builds/*
