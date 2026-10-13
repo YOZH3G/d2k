@@ -98,6 +98,7 @@ mkdir -p "$TMP/proc/4242"
 echo d2kc > "$TMP/proc/4242/comm"
 echo "4242 (d2kc) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 0 0" > "$TMP/proc/4242/stat"
 echo 99999 > "$TMP/run/d2kc.pid"   # номер мёртвого процесса
+# shellcheck disable=SC2016  # $RUN раскрывает ВНУТРЕННЯЯ оболочка, не эта
 S99_SNIPPET='wait_running "$RUN/d2kc.pid" d2kc' s99 >/dev/null 2>&1 \
     || fail "живой процесс по имени не признан живым"
 [ "$(cat "$TMP/run/d2kc.pid")" = "4242" ] \
@@ -105,6 +106,7 @@ S99_SNIPPET='wait_running "$RUN/d2kc.pid" d2kc' s99 >/dev/null 2>&1 \
 # Процесса нет вовсе — отказ, а не выдумка.
 rm -rf "$TMP/proc/4242"
 echo 99999 > "$TMP/run/d2kc.pid"
+# shellcheck disable=SC2016  # то же: раскрытие во внутренней оболочке
 if S99_SNIPPET='wait_running "$RUN/d2kc.pid" d2kc' s99 >/dev/null 2>&1; then
     fail "wait_running признал живым то, чего нет"
 fi
