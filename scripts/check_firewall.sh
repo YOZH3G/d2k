@@ -176,7 +176,7 @@ COUNT_OUT=$(iptables -t mangle -S D2K_OUT | wc -l)
 # -N, 2 loopback, broadcast + multicast, 2 marks, 2 DNS, TCP/UDP queue, late
 # RST/FIN, HTTP keep-alive, voice UDP. (The old 11 predates the voice and
 # late-close rules.)
-[ "$COUNT_OUT" -eq 15 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 15 включая -N)"
+[ "$COUNT_OUT" -eq 16 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 16 включая -N)"
 
 echo "== пустые цепочки с сохранёнными переходами — НЕ работающий firewall =="
 iptables -t mangle -F D2K_OUT
@@ -256,7 +256,7 @@ if fw_installed; then fail "потеря IPv6 ответов не обнаруж
 fw_up
 fw_installed || fail "IPv6 не восстановлен"
 COUNT6=$(ip6tables -t mangle -S D2K_OUT | wc -l)
-[ "$COUNT6" -eq 14 ] || fail "IPv6 дубли после восстановления (строк: $COUNT6, ждали 14: как IPv4, но одно multicast-исключение)"
+[ "$COUNT6" -eq 15 ] || fail "IPv6 дубли после восстановления (строк: $COUNT6, ждали 15: как IPv4, но одно multicast-исключение)"
 
 echo "== fw_down =="
 fw_down

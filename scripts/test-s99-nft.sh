@@ -150,6 +150,14 @@ last_return=$(printf '%s\n' "$r" | sed -n '/chain out {/,/^	}/p' | grep -n 'retu
 if [ -z "$last_return" ] || [ -z "$first_queue" ]; then fail "cannot locate rules"; fi
 printf '%s\n' "$r" | sed -n '/chain out {/,/^	}/p' | awk '/queue num/{q=1} q && /return/{bad=1} END{exit bad}' \
     || fail "a RETURN after a queue rule in chain out"
+# Issue #23: a port-forwarded connection (DNAT) never enters the queue, in
+# either direction; the exclusion comes before the first queue rule.
+for c in out in_rules; do
+    printf '%s\n' "$r" | sed -n "/chain $c {/,/^	}/p" | awk '
+        /ct status dnat return/ { if (!q) seen = 1 }
+        /queue num/ { q = 1 }
+        END { exit !seen }' || fail "chain $c: no 'ct status dnat return' before the first queue rule"
+done
 rst=$(table d2k_rst)
 # Ключ — кортеж зонда (порт . цель . порт цели), не один порт (ревью 07.10).
 printf '%s\n' "$rst" | grep -qF 'set rst4 { type inet_service . ipv4_addr . inet_service; flags timeout; }' || fail "inet d2k_rst rst4 set"

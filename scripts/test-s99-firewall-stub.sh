@@ -145,6 +145,29 @@ S99_SNIPPET='fw_down' s99
 ! rules ip6tables mangle | grep -q icmp || fail "fw_down left the IPv6 ICMP rule"
 ok "time-exceeded ICMP is queued with bypass in both families and removed on stop"
 
+# --- Проброс портов (issue #23, Keenetic) ------------------------------------
+# Соединение С WAN на проброшенный порт идёт по conntrack в направлении
+# ORIGINAL и проходит POSTROUTING: правило D2K_OUT «--ctdir ORIGINAL» брало
+# его как исходящее из LAN, и проброс на NAS переставал работать. Такие
+# соединения несут признак DNAT в обоих направлениях. Исключение — в обеих
+# цепочках, раньше любого правила очереди; сторож замечает его пропажу.
+rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
+S99_SNIPPET='fw_up && fw_installed' s99 || fail "fw_up with the DNAT exclusion failed"
+for tool in iptables ip6tables; do
+    for ch in D2K_OUT D2K_IN; do
+        rules "$tool" mangle | grep -- "-A $ch " | awk -v ch="$ch" '
+            $0 == "-A " ch " -m conntrack --ctstate DNAT -j RETURN" { if (!q) seen = 1 }
+            /NFQUEUE/ { q = 1 }
+            END { exit !seen }' \
+            || fail "$tool $ch: no DNAT RETURN before the first queue rule (port forwards get queued)"
+    done
+    FW_STATE="$TMP/fw" "$TMP/bin/$tool" -t mangle -D D2K_OUT -m conntrack --ctstate DNAT -j RETURN
+    if S99_SNIPPET='fw_installed' s99; then fail "$tool: a lost DNAT exclusion went unnoticed"; fi
+    S99_SNIPPET='fw_up' s99 || fail "$tool: fw_up did not restore the DNAT exclusion"
+done
+S99_SNIPPET='fw_down' s99
+ok "port-forwarded (DNAT) connections never enter the queue, in both directions"
+
 # A working ip6tables whose rule fails half-way is still a real error: both
 # families roll back, as before.
 rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"

@@ -342,6 +342,20 @@ fw_family_up() (
         "$fw_tool" -t mangle -A "$CHAIN_IN" -p "$proto" -m multiport --sports "$DNS_PORTS" \
             -j RETURN || return 1
     done
+    # ПРОБРОС ПОРТОВ — НЕ НАШ ТРАФИК (issue #23, Keenetic + NAS). Соединение,
+    # которое открыл узел С WAN на проброшенный порт, для conntrack идёт в
+    # направлении ORIGINAL и проходит POSTROUTING. Правило очереди ниже
+    # («--ctdir ORIGINAL», все порты) брало его как исходящее из LAN, а ответы
+    # NAS — как ответы сервера, и проброс переставал работать. После
+    # engine-stop работал. У такого соединения есть признак DNAT, и он стоит в
+    # ОБОИХ направлениях. Под него же попадают сопоставления UPnP (входящие
+    # пиры торрент-клиента). Исходящий трафик LAN признака DNAT не несёт: его
+    # NAT — SNAT. Перехват Telegram (REDIRECT на d2ktg) уходит в INPUT, и
+    # правила очереди его не брали и раньше. --ctstate DNAT есть в
+    # iptables 1.4.21 (в отличие от --ctstatus DNAT, который issue пробовал).
+    for chain in "$CHAIN_OUT" "$CHAIN_IN"; do
+        "$fw_tool" -t mangle -A "$chain" -m conntrack --ctstate DNAT -j RETURN || return 1
+    done
 
     # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
     # останавливать его (§10). Это касается и UDP-правил ниже в той же мере,
@@ -601,6 +615,7 @@ table inet $NFT_TABLE {
 		meta mark $MARK return
 		meta mark $MEASURE_MARK return
 		meta l4proto { tcp, udp } th dport { $dns } return
+		ct status dnat return
 		meta l4proto tcp ct direction original th dport { $ports } ct original packets $win $q
 		meta l4proto tcp ct direction original th dport { $ports } ct original packets $late tcp flags & rst == rst $q
 		meta l4proto tcp ct direction original th dport { $ports } ct original packets $late tcp flags & fin == fin $q
@@ -614,6 +629,7 @@ table inet $NFT_TABLE {
 		ip6 saddr ::1 return
 		ip6 daddr ::1 return
 		meta l4proto { tcp, udp } th sport { $dns } return
+		ct status dnat return
 		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $late tcp flags & rst == rst $q
 		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $late tcp flags & fin == fin $q
 		meta l4proto tcp ct direction reply th sport { $(nft_list "$HTTP_KEEPALIVE_PORTS") } ct reply packets $late $q
@@ -830,6 +846,9 @@ fw_family_installed() (
             -j RETURN 2>/dev/null || return 1
         "$fw_tool" -t mangle -C "$CHAIN_IN" -p "$proto" -m multiport --sports "$DNS_PORTS" \
             -j RETURN 2>/dev/null || return 1
+    done
+    for chain in "$CHAIN_OUT" "$CHAIN_IN"; do
+        "$fw_tool" -t mangle -C "$chain" -m conntrack --ctstate DNAT -j RETURN 2>/dev/null || return 1
     done
     for proto in tcp udp; do
         "$fw_tool" -t mangle -C "$CHAIN_OUT" -p "$proto" -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
