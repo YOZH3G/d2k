@@ -89,6 +89,26 @@ s99() {
 }
 rules() { FW_STATE="$TMP/fw" "$TMP/bin/$1" -t "$2" -S 2>/dev/null; }
 
+# --- ПРИЧИНА ОТКАЗА ЗАПУСКА — ИЗ ЖУРНАЛА УПАВШЕГО ---------------------------
+# Поле 13.10.2026: у пользователя служба сказала «контроллер завершился сразу
+# после запуска» и замолчала, хотя причина лежала в его же журнале строкой
+# ниже. Диагноз пришлось воспроизводить под QEMU вместо того, чтобы прочитать.
+mkdir -p "$TMP/log"
+printf 'd2kc: каталога нет — начинаю с пустого\nd2kc: связь с датапатом: No such file or directory\n' \
+    > "$TMP/log/d2kc.log"
+out=$(S99_SNIPPET='die_with_log "контроллер завершился сразу после запуска" "'"$TMP"'/log/d2kc.log"' \
+    s99 2>&1) && fail "die_with_log вернул успех"
+printf '%s\n' "$out" | grep -q 'контроллер завершился сразу после запуска' \
+    || fail "die_with_log не назвал сам отказ: $out"
+printf '%s\n' "$out" | grep -q 'связь с датапатом' \
+    || fail "die_with_log не показал причину из журнала: $out"
+: > "$TMP/log/empty.log"
+out=$(S99_SNIPPET='die_with_log "движок не встал" "'"$TMP"'/log/empty.log"' s99 2>&1) \
+    && fail "die_with_log на пустом журнале вернул успех"
+printf '%s\n' "$out" | grep -q 'журнал .* пуст' \
+    || fail "пустой журнал не назван пустым: $out"
+ok "отказ запуска печатает причину из журнала упавшего"
+
 # --- I4: ip6tables mangle unusable → IPv4-only, with a clear warning --------
 S99_SNIPPET='fw_up && fw_installed' s99 || fail "baseline fw_up failed"
 rules ip6tables mangle | grep -q -- '-N D2K_OUT' || fail "baseline did not set up IPv6"

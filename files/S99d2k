@@ -214,6 +214,25 @@ legacy_http_stop() {
 say() { echo "$NAME: $*"; }
 die() { echo "$NAME: $*" >&2; exit 1; }
 
+# ПРИЧИНА ОТКАЗА — ИЗ ЖУРНАЛА ТОГО, КТО УПАЛ.
+#
+# Служба говорила «контроллер завершился сразу после запуска» и молчала о
+# том, почему. Причина при этом записана: контроллер пишет её своим последним
+# действием. Поле 13.10.2026 (установка пользователя на OpenWrt mipsel):
+# пришлось воспроизводить запуск под QEMU, чтобы узнать строку, которая у
+# человека лежала в файле. Теперь последние строки журнала печатаются рядом с
+# отказом — ни одного лишнего запроса к человеку.
+die_with_log() {
+    _msg=$1; _log=$2
+    if [ -s "$_log" ]; then
+        echo "$NAME: $_msg" >&2
+        echo "$NAME: последние строки $_log:" >&2
+        tail -n 8 "$_log" 2>/dev/null | sed "s/^/$NAME:   /" >&2
+        exit 1
+    fi
+    die "$_msg (журнал $_log пуст)"
+}
+
 running() {
     # Жив ли процесс, чей pid записан. Не «есть файл», а именно жив: файл
     # переживает SIGKILL, процесс — нет.
@@ -1062,7 +1081,7 @@ start_engine() {
         --queue "$QUEUE_NUM" --mode "$dpmode" --mark "$MARK" \
         --probe-mark "$PROBE_MARK" --udp-reverse-hook \
         --flows "$FLOWS" --control "$SOCK" --stats "$legacy_stats" \
-        "$@" --log "$LOG/d2kd.log" || die "датапат не запустился"
+        "$@" --log "$LOG/d2kd.log" || die_with_log "датапат не запустился" "$LOG/d2kd.log"
 
     # Ждём привязки очереди, а не спим наугад: правила, поставленные до
     # привязки, отправляют пакеты в никуда.
@@ -1094,10 +1113,10 @@ start_engine() {
     spawn_daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
         --control "$SOCK" --catalog "$DIR/state/catalog.json" --live "$LIVE" --mark "$PROBE_MARK" \
         --measure-mark "$MEASURE_MARK" \
-        "$@" --log "$LOG/d2kc.log" || { engine_stop; die "контроллер не запустился"; }
+        "$@" --log "$LOG/d2kc.log" || { engine_stop; die_with_log "контроллер не запустился" "$LOG/d2kc.log"; }
     if ! running "$CT_PID"; then
         engine_stop
-        die "контроллер завершился сразу после запуска"
+        die_with_log "контроллер завершился сразу после запуска" "$LOG/d2kc.log"
     fi
 
     WATCHLOOP="while :; do
