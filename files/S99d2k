@@ -713,7 +713,7 @@ rst_rules_down() {
         printf '%s\n' "$rules" | sed -n \
             's/^-A OUTPUT -p tcp \(-m tcp \)\{0,1\}--sport \([0-9][0-9]*\) --tcp-flags RST RST -m comment --comment "\{0,1\}d2k-rst:\([1-9][0-9]*\)"\{0,1\} -j DROP *$/\2 \3/p' |
         while read -r port owner; do
-            [ "$port" -ge 30000 ] && [ "$port" -le 54999 ] || continue
+            if ! { [ "$port" -ge 30000 ] && [ "$port" -le 54999 ]; }; then continue; fi
             rst_owner_removable "$owner" "$1" || continue
             "$fw_tool" -w -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST \
                 -m comment --comment "d2k-rst:$owner" -j DROP 2>/dev/null ||
@@ -1035,7 +1035,7 @@ start_engine() {
     dpmode=observe
     [ "$MODE" = "apply" ] && dpmode=apply
     [ "$PROBE_MARK" != "$MARK" ] || die "PROBE_MARK должен отличаться от MARK"
-    [ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$PROBE_MARK" ] || die "MEASURE_MARK должен отличаться от MARK и PROBE_MARK"
+    if ! { [ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$PROBE_MARK" ]; }; then die "MEASURE_MARK должен отличаться от MARK и PROBE_MARK"; fi
 
     set -- --health-file "$RUNTIME_DIR/d2kd.health"
     legacy_stats=${STATS_SEC:-900}
@@ -1165,7 +1165,7 @@ telegram_start() {
     prepare_runtime
     start_log_maintenance
     if running "$TG_PID"; then
-        [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" heal || true
+        if [ -x "$TG_FIREWALL" ]; then "$TG_FIREWALL" heal || true; fi
         return 0
     fi
     stop_pidfile "$TG_PID" || return 1
@@ -1197,14 +1197,14 @@ telegram_start() {
 telegram_stop() {
     stop_pidfile "$TG_WD_PID" || return 1
     stop_pidfile "$TG_PID" || return 1
-    [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" stop || true
+    if [ -x "$TG_FIREWALL" ]; then "$TG_FIREWALL" stop || true; fi
     write_telegram_status stopped
     say "Telegram tunnel остановлен"
 }
 
 telegram_restart() {
     stop_pidfile "$TG_PID" || return 1
-    [ -x "$TG_FIREWALL" ] && "$TG_FIREWALL" stop || true
+    if [ -x "$TG_FIREWALL" ]; then "$TG_FIREWALL" stop || true; fi
     [ "${TG_ENABLED:-0}" = 1 ] || { write_telegram_status stopped; return 0; }
     telegram_start
 }
