@@ -621,6 +621,106 @@ static void test_quicsplit(void) {
     d2k_plan_free(p);
 }
 
+/* ИЗМЕРЕННЫЙ ВХОД И СЕГМЕНТ ПРОВОДА. Поле 13.10.2026, forum.ru-board.com:
+   приём найден замером (плотная серия с битой суммой, три ServerHello), а
+   план из него пришпилен к длине приветствия 1541 байт. Датапат видит ТОЛЬКО
+   первый сегмент (1452 при MSS 1452), и равенство длин не выполняется никогда
+   — исполнитель отказывал, зонд уходил голым, приём выбрасывался. Журнал
+   датапата назвал это дословно: «байты плана собраны под другой вход».
+
+   Приставка годится, если это ТО ЖЕ приветствие и программа на ней та же:
+   объявленная длина записи совпадает с измеренной, имя на том же месте и той
+   же длины, и каждый ЧИСЛОВОЙ разрез плана лежит внутри пришедшего. Разрез
+   за приставкой — отказ: иначе исполнилась бы другая программа, чем мерили
+   (split_points молча пропускает разрез вне нагрузки). */
+static size_t pinned_plan(uint8_t *b, unsigned total, unsigned sni_off,
+                          unsigned sni_len, unsigned split_at) {
+    size_t n = 0;
+    b[n++]='D';b[n++]='2';b[n++]='K';b[n++]='P';
+    put16(b,&n,1); put16(b,&n,5); put16(b,&n,0); put16(b,&n,5);
+    uint8_t proto[2]={6,1}; putrec(b,&n,0x0002,proto,2);
+    uint8_t inp[12]={(uint8_t)(total>>24),(uint8_t)(total>>16),(uint8_t)(total>>8),(uint8_t)total,
+                     (uint8_t)(sni_off>>24),(uint8_t)(sni_off>>16),(uint8_t)(sni_off>>8),(uint8_t)sni_off,
+                     (uint8_t)(sni_len>>24),(uint8_t)(sni_len>>16),(uint8_t)(sni_len>>8),(uint8_t)sni_len};
+    putrec(b,&n,0x0106,inp,12);
+    uint8_t sp[4]={0,0,(uint8_t)(split_at>>8),(uint8_t)split_at};
+    putrec(b,&n,0x0100,sp,4);
+    uint8_t wire[1]={1}; putrec(b,&n,0x0109,wire,1);
+    uint8_t order[1]={0}; putrec(b,&n,0x0103,order,1);
+    return n;
+}
+
+static void test_pinned_input_prefix(void) {
+    /* Приветствие 1541 байт: запись объявляет 1536, рукопожатие 1532. */
+    static uint8_t hello[1541];
+    memset(hello, 0x5a, sizeof hello);
+    hello[0]=0x16; hello[1]=3; hello[2]=1;
+    hello[3]=(uint8_t)((sizeof hello - 5) >> 8); hello[4]=(uint8_t)(sizeof hello - 5);
+    hello[5]=1;
+    hello[6]=(uint8_t)((sizeof hello - 9) >> 16);
+    hello[7]=(uint8_t)((sizeof hello - 9) >> 8);
+    hello[8]=(uint8_t)(sizeof hello - 9);
+    const unsigned SNI_OFF = 97, SNI_LEN = 18, SEG = 1452;
+    uint8_t plan[256]; char err[160];
+
+    /* Разрез 770 (n/2 у замера) лежит внутри первого сегмента. */
+    size_t pl = pinned_plan(plan, (unsigned)sizeof hello, SNI_OFF, SNI_LEN, 770);
+    d2k_plan *p = NULL;
+    CHECK(d2k_plan_load(plan, pl, &p, err, sizeof err) == 0 && p,
+          "пришпиленный план не разобран");
+    if (!p) { return; }
+    d2k_pkt in; memset(&in, 0, sizeof in);
+    in.payload = hello; in.payload_len = SEG; in.seq = 1;
+    in.have_sni = 1; in.sni_off = SNI_OFF; in.sni_len = SNI_LEN; in.is_tls13 = 1;
+    d2k_actions a = {0};
+    CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0,
+          "приставка того же приветствия отвергнута — приём недоступен проводу");
+    if (a.n) { CHECK(a.n >= 2, "разрез внутри приставки не исполнен"); }
+    d2k_actions_free(&a);
+
+    /* Целое приветствие — как прежде. */
+    in.payload_len = sizeof hello;
+    d2k_actions whole = {0};
+    CHECK(d2k_plan_apply(p, NULL, &in, &whole) == 0, "целый вход отвергнут");
+    d2k_actions_free(&whole);
+
+    /* КОНТРОЛЬ: имя не на том месте — это другой вход, отказ с причиной. */
+    in.payload_len = SEG; in.sni_off = SNI_OFF + 1;
+    d2k_actions moved = {0};
+    CHECK(d2k_plan_apply(p, NULL, &in, &moved) != 0 &&
+          moved.refuse_why && strstr(moved.refuse_why, "другой вход"),
+          "сдвинутое имя принято за измеренный вход");
+    d2k_actions_free(&moved);
+    in.sni_off = SNI_OFF;
+
+    /* КОНТРОЛЬ: чужая длина записи — другое приветствие. */
+    static uint8_t other[1541];
+    memcpy(other, hello, sizeof other);
+    other[3] = (uint8_t)((1400 - 5) >> 8); other[4] = (uint8_t)(1400 - 5);
+    other[6] = 0; other[7] = (uint8_t)((1400 - 9) >> 8); other[8] = (uint8_t)(1400 - 9);
+    in.payload = other;
+    d2k_actions diff = {0};
+    CHECK(d2k_plan_apply(p, NULL, &in, &diff) != 0 &&
+          diff.refuse_why && strstr(diff.refuse_why, "другой вход"),
+          "другое приветствие принято за измеренный вход");
+    d2k_actions_free(&diff);
+    in.payload = hello;
+    d2k_plan_free(p);
+
+    /* КОНТРОЛЬ: разрез ЗА приставкой — программа была бы другой. */
+    pl = pinned_plan(plan, (unsigned)sizeof hello, SNI_OFF, SNI_LEN, 1500);
+    d2k_plan *q = NULL;
+    CHECK(d2k_plan_load(plan, pl, &q, err, sizeof err) == 0 && q, "план с поздним разрезом");
+    if (q) {
+        d2k_actions late = {0};
+        CHECK(d2k_plan_apply(q, NULL, &in, &late) != 0 &&
+              late.refuse_why && strstr(late.refuse_why, "разрез") != NULL,
+              "разрез за пришедшими байтами исполнен молча другой программой");
+        d2k_actions_free(&late);
+        d2k_plan_free(q);
+    }
+}
+
 int main(void) {
     d2k_plan *p = NULL;
     char err[160];
@@ -631,6 +731,7 @@ int main(void) {
 
     test_tls_fake_modifiers();
     test_refusal_names_reason();
+    test_pinned_input_prefix();
     test_udplen();
     test_quicsplit();
     test_own_after_fakes();
