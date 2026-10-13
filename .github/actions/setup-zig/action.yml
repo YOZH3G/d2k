@@ -16,12 +16,20 @@ inputs:
   mips64el-sha256:
     description: SHA-256 of the MIPS64EL Zig archive.
     required: true
+  cache:
+    description: >-
+      'false' always downloads and verifies. The release passes it: a cache
+      hit skips the SHA-256 check, and a job that signs must not build with a
+      toolchain another run left behind (cache poisoning).
+    required: false
+    default: 'true'
 
 runs:
   using: composite
   steps:
     - name: Cache Zig
       id: cache
+      if: inputs.cache == 'true'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.tool_cache }}/zig
@@ -56,7 +64,12 @@ runs:
         V: ${{ inputs.version }}
         V14: ${{ inputs.mips64el-version }}
         DEST: ${{ runner.tool_cache }}/zig
-      run: |
+      # The values written to GITHUB_ENV are version numbers our own workflows
+      # pass as constants; anything else is refused before the write.
+      run: | # zizmor: ignore[github-env]
         set -euo pipefail
+        for v in "$V" "$V14"; do
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad Zig version: $v"; exit 1; }
+        done
         echo "ZIG=$DEST/zig-x86_64-linux-$V/zig" >> "$GITHUB_ENV"
         echo "ZIG_MIPS64EL=$DEST/zig-x86_64-linux-$V14/zig" >> "$GITHUB_ENV"

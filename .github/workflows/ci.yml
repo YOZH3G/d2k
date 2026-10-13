@@ -10,11 +10,13 @@ name: CI
 #        sanitizers   ASan + UBSan
 #        integration  scripts, panel in Chrome; install lifecycle needs build
 #   3. ci-ok           — the single required status check
+#   4. release         — push to main only, after ci-ok: release.yml decides
+#                        whether there is a fix or a feature to ship
 #
 # Wall time is the slowest job of stage 2 (~7-8 minutes), not the sum.
 #
-# Heavy release packaging (static OpenSSL for d2ktg on nine CPUs) is NOT here.
-# It belongs to release.yml. CI proves the code; the release builds the package.
+# Heavy release packaging (static OpenSSL for d2ktg on nine CPUs) lives in
+# release.yml. CI proves the code; the release builds and signs the package.
 
 on:
   push:
@@ -54,6 +56,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       # One list for CI and scripts/check.sh, kept in scripts/lint-shell.sh.
@@ -72,6 +76,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install OpenSSL headers
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
       - name: datapath
@@ -94,6 +100,8 @@ jobs:
         arch: [arm64, arm, mipsel, mips, mips64el, amd64, x86, ppc64, riscv64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-zig
         with:
           version: ${{ env.ZIG_VERSION }}
@@ -143,6 +151,8 @@ jobs:
           - { component: relay-enroll, run: 'make -C relay-enroll test' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install OpenSSL headers
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
       - uses: ./.github/actions/setup-zig
@@ -180,6 +190,8 @@ jobs:
           - { component: core-rest-2,    run: 'sh scripts/ci-core-san-shard.sh rest-2' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: ${{ matrix.run }}
         run: ${{ matrix.run }}
 
@@ -190,6 +202,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
@@ -225,6 +239,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Load netfilter modules on the host
         # A container cannot load kernel modules; the installer requires them.
         run: sudo modprobe -a nfnetlink_queue xt_NFQUEUE xt_connbytes xt_multiport xt_mark xt_connmark xt_conntrack xt_addrtype xt_comment ip6table_mangle
@@ -240,6 +256,8 @@ jobs:
       D2K_CHROME_NO_SANDBOX: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
@@ -283,3 +301,18 @@ jobs:
         run: exit 1
       - name: All required jobs succeeded
         run: echo "CI passed"
+
+  # ── Continuous delivery ───────────────────────────────────────────────────
+
+  release:
+    name: Release
+    # Only a green push to main ships; a pull request never does. A newer push
+    # cancels this run with the rest of CI (concurrency above): its own run
+    # releases the newer head, and publish itself refuses a commit main has left.
+    needs: ci-ok
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    # No secrets passed: the signing key is a secret of the d2k-signing
+    # environment, and only the publish job inside release.yml enters it.
+    uses: ./.github/workflows/release.yml
