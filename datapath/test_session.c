@@ -1690,6 +1690,68 @@ int main(void) {
         }
     }
 
+    /* --- постквантовое приветствие в двух сегментах -------------------------
+     * Поле 13.10.2026, forum.ru-board.com: план подтверждён собственным
+     * зондом на TLS 1.3, а к браузеру не применялся. Приветствие 1541 байт,
+     * key_share с X25519MLKEM768, supported_versions за ним — во втором
+     * сегменте. По первому сегменту форма была «неизвестна», и привязка
+     * TLS 1.3 отказывала по форме. key_share есть только в TLS 1.3 — по нему
+     * форма известна уже в первом сегменте, и план применяется к нему.
+     * Контроль: на месте key_share набивка — признака нет, форма неизвестна,
+     * отказ по форме как прежде (не догадываемся).                         */
+    {
+        const uint8_t *nm = (const uint8_t *)"hetzner.com";
+        for (int with_key_share = 1; with_key_share >= 0; with_key_share--) {
+            uint8_t pq[2048];
+            size_t b = 0, e0;
+            pq[b++] = 0x16; pq[b++] = 0x03; pq[b++] = 0x01; b += 2;
+            pq[b++] = 0x01; b += 3;
+            pq[b++] = 0x03; pq[b++] = 0x03;
+            for (int i = 0; i < 32; i++) { pq[b++] = (uint8_t)i; }
+            pq[b++] = 0;
+            pq[b++] = 0x00; pq[b++] = 0x02; pq[b++] = 0x13; pq[b++] = 0x01;
+            pq[b++] = 0x01; pq[b++] = 0x00;
+            e0 = b; b += 2;
+            const uint8_t sni[] = {0,0,0,16, 0,14, 0, 0,11, 'h','e','t','z','n','e','r','.','c','o','m'};
+            memcpy(pq + b, sni, sizeof sni); b += sizeof sni;
+            /* key_share (51) или набивка (21) той же длины: 1258 байт. */
+            pq[b++] = 0x00; pq[b++] = with_key_share ? 0x33 : 0x15;
+            pq[b++] = (uint8_t)(1258 >> 8); pq[b++] = (uint8_t)1258;
+            memset(pq + b, 0, 1258);
+            if (with_key_share) {
+                pq[b] = (uint8_t)(1256 >> 8); pq[b + 1] = (uint8_t)1256;
+                pq[b + 2] = 0x11; pq[b + 3] = 0xec; pq[b + 4] = 0x04; pq[b + 5] = 0xc0;
+            }
+            b += 1258;
+            const uint8_t sv[] = {0,0x2b,0,3, 2,3,4};
+            memcpy(pq + b, sv, sizeof sv); b += sizeof sv;
+            wr16(pq + e0, (uint16_t)(b - e0 - 2));
+            wr16(pq + 3, (uint16_t)(b - 5));
+            pq[6] = 0; wr16(pq + 7, (uint16_t)(b - 9));
+
+            d2k_session *g = d2k_session_new(64, 64);
+            d2k_plan *modern = NULL;
+            d2k_plan_load(plan_bytes, sizeof plan_bytes, &modern, err, sizeof err);
+            CHECK(modern && d2k_plantab_set_name_family(d2k_session_plans(g), nm, 11, 1,
+                      modern, D2K_PLAN_SHAPE_MODERN, 0, 4) == 0, "PQ: план TLS 1.3");
+            /* Первый сегмент: обрыв посреди тела key_share. */
+            n = build_pkt(pkt, (uint16_t)(43020 + with_key_share), 0x18, pq, 600);
+            d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+            if (with_key_share) {
+                CHECK(r.n_out > 0 && d2k_session_applied(g) == 1,
+                      "PQ: план TLS 1.3 не применён к приветствию с key_share в первом сегменте");
+                CHECK(d2k_plantab_shape_misses(d2k_session_plans(g)) == 0,
+                      "PQ: приветствие с key_share посчитано отказом по форме");
+            } else {
+                CHECK(r.n_out == 0 && d2k_session_applied(g) == 0,
+                      "PQ-контроль: без признака TLS 1.3 применён план TLS 1.3");
+                CHECK(d2k_plantab_shape_misses(d2k_session_plans(g)) >= 1,
+                      "PQ-контроль: отказ по форме не посчитан");
+            }
+            d2k_session_free(g);
+        }
+    }
+
     /* --- SYN-ACK обогнал SYN: направление всё равно верное -----------------
      * Два направления приходят из ДВУХ правил firewall, и порядок между ними
      * не гарантирован. Раньше такой поток получал направления наоборот, и

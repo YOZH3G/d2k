@@ -166,9 +166,92 @@ static size_t build_hello_padded(uint8_t *out, const char *sni, size_t pad) {
     return o;
 }
 
+/* Приветствие с постквантовым key_share, как у Chrome и Safari с
+   X25519MLKEM768: server_name, key_share 1250 байт, затем supported_versions
+   (или иное расширение) — уже за границей первого сегмента. Chrome
+   перемешивает порядок расширений, так что supported_versions за key_share —
+   штатный случай. sv_has13 — есть ли 0x0304 в supported_versions. */
+static size_t build_hello_pq(uint8_t *out, const char *sni, int sv_has13) {
+    uint8_t body[4096];
+    size_t b = 0;
+    body[b++] = 0x03; body[b++] = 0x03;
+    for (int i = 0; i < 32; i++) { body[b++] = (uint8_t)i; }
+    body[b++] = 0;
+    body[b++] = 0x00; body[b++] = 0x02; body[b++] = 0x13; body[b++] = 0x01;
+    body[b++] = 0x01; body[b++] = 0x00;
+    uint8_t ext[4096];
+    size_t e = 0, nl = strlen(sni);
+    ext[e++] = 0x00; ext[e++] = 0x00;
+    ext[e++] = 0x00; ext[e++] = (uint8_t)(5 + nl);
+    ext[e++] = 0x00; ext[e++] = (uint8_t)(3 + nl);
+    ext[e++] = 0x00;
+    ext[e++] = 0x00; ext[e++] = (uint8_t)nl;
+    memcpy(ext + e, sni, nl); e += nl;
+    /* key_share (51): список 1256 байт — группа 0x11ec, ключ 1216 байт,
+       группа x25519, ключ 32 байта (RFC 8446 §4.2.8). */
+    ext[e++] = 0x00; ext[e++] = 0x33;
+    ext[e++] = (uint8_t)(1258 >> 8); ext[e++] = (uint8_t)1258;
+    ext[e++] = (uint8_t)(1256 >> 8); ext[e++] = (uint8_t)1256;
+    ext[e++] = 0x11; ext[e++] = 0xec; ext[e++] = 0x04; ext[e++] = 0xc0;
+    memset(ext + e, 0xab, 1216); e += 1216;
+    ext[e++] = 0x00; ext[e++] = 0x1d; ext[e++] = 0x00; ext[e++] = 0x20;
+    memset(ext + e, 0xcd, 32); e += 32;
+    /* supported_versions (43) последним. */
+    ext[e++] = 0x00; ext[e++] = 0x2b;
+    ext[e++] = 0x00; ext[e++] = 0x03;
+    ext[e++] = 0x02; ext[e++] = 0x03; ext[e++] = sv_has13 ? 0x04 : 0x03;
+    body[b++] = (uint8_t)(e >> 8); body[b++] = (uint8_t)e;
+    memcpy(body + b, ext, e); b += e;
+    size_t o = 0;
+    out[o++] = 0x16; out[o++] = 0x03; out[o++] = 0x01;
+    out[o++] = (uint8_t)((b + 4) >> 8); out[o++] = (uint8_t)(b + 4);
+    out[o++] = 0x01;
+    out[o++] = (uint8_t)(b >> 16); out[o++] = (uint8_t)(b >> 8); out[o++] = (uint8_t)b;
+    memcpy(out + o, body, b); o += b;
+    return o;
+}
+
+/* forum.ru-board.com, поле 13.10.2026: план подтверждён собственным зондом
+   (TLS 1.3), но к потокам браузера не применялся. Приветствие 1541 байт,
+   supported_versions — во втором сегменте; разбор первого давал «формы
+   нет», и привязка TLS 1.3 отказывала по форме (счётчик датапата «отказов
+   по форме приветствия» рос). key_share есть только в TLS 1.3: найденный в
+   первом сегменте, он и есть признак, а не догадка. */
+static void check_pq_hello_split(void) {
+    uint8_t big[4096];
+    size_t n = build_hello_pq(big, "forum.ru-board.com", 1);
+    d2k_tls_info info;
+    /* Два обрыва: внутри тела key_share (его заголовок уже прочитан) и сразу
+       за ним, перед supported_versions. */
+    const size_t cuts[2] = { 600, n - 5 };
+    for (int c = 0; c < 2; c++) {
+        memset(&info, 0, sizeof info);
+        d2k_tls_parse(big, cuts[c], &info);
+        CHECK(info.is_client_hello && info.have_sni, "PQ-приветствие не узнано по первому сегменту");
+        CHECK(info.exts_truncated, "блок расширений PQ-приветствия не объявлен оборванным");
+        CHECK(info.is_tls13,
+              "key_share в первом сегменте не признан признаком TLS 1.3 — "
+              "подтверждённый план TLS 1.3 не применится к браузеру");
+    }
+
+    /* Целиком — то же самое, по supported_versions. */
+    memset(&info, 0, sizeof info);
+    d2k_tls_parse(big, n, &info);
+    CHECK(info.is_tls13 && !info.exts_truncated, "целое PQ-приветствие не TLS 1.3");
+
+    /* Прочитанный целиком supported_versions главнее: без 0x0304 это не
+       TLS 1.3, что бы ни лежало рядом. */
+    n = build_hello_pq(big, "forum.ru-board.com", 0);
+    memset(&info, 0, sizeof info);
+    d2k_tls_parse(big, n, &info);
+    CHECK(!info.is_tls13, "supported_versions без TLS 1.3 перебит key_share");
+}
+
 int main(void) {
     uint8_t buf[1024];
     d2k_tls_info info;
+
+    check_pq_hello_split();
 
     /* --- нормальный ClientHello --------------------------------------- */
     size_t n = build_hello(buf, "hetzner.com", 1);

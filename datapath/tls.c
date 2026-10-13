@@ -24,6 +24,7 @@
 #define EXT_SERVER_NAME 0x0000
 #define EXT_SUPPORTED_VERSIONS 0x002b
 #define TLS13_VERSION   0x0304
+#define EXT_KEY_SHARE   0x0033
 #define SNI_HOST_NAME   0x00
 
 static uint16_t rd16(const uint8_t *p) {
@@ -85,14 +86,32 @@ static int has_ech_offer(const uint8_t *b, size_t off, size_t end) {
     return 0;
 }
 
-static int has_tls13(const uint8_t *b, size_t exts_off, size_t exts_end) {
+/* Предлагает ли клиент TLS 1.3. Прочитанный целиком supported_versions —
+   ответ сам по себе. На ОБОРВАННОМ блоке его может не быть, потому что он
+   уехал во второй сегмент. Тогда признак — key_share: это расширение есть
+   только в TLS 1.3 (RFC 8446 §4.2.8), и клиент TLS 1.3 шлёт его всегда.
+   Хватает его заголовка, тело может уходить за обрыв.
+
+   Поле 13.10.2026, forum.ru-board.com: приветствие браузера 1541 байт,
+   key_share с X25519MLKEM768 ~1250 байт, Chrome перемешивает порядок
+   расширений, и supported_versions оказывался за key_share во втором
+   сегменте. «Формы нет» по первому сегменту, привязка TLS 1.3 отказывала по
+   форме, и подтверждённый план к браузеру не применялся. Такой key_share
+   длиннее остатка приветствия, поэтому начинается он всегда в первом
+   сегменте.
+
+   На ЦЕЛОМ блоке без supported_versions key_share не в счёт: это
+   TLS 1.2 (RFC 8446 §4.2.1), как и было. */
+static int has_tls13(const uint8_t *b, size_t exts_off, size_t exts_end, int truncated) {
     size_t off = exts_off;
+    int key_share = 0;
     while (off + 4 <= exts_end) {
         uint16_t type = rd16(b + off);
         size_t elen = rd16(b + off + 2);
         off += 4;
+        if (type == EXT_KEY_SHARE) { key_share = 1; }
         if (off + elen > exts_end) {
-            return 0;
+            break;
         }
         if (type == EXT_SUPPORTED_VERSIONS) {
             if (elen < 1) { return 0; }
@@ -106,7 +125,7 @@ static int has_tls13(const uint8_t *b, size_t exts_off, size_t exts_end) {
         }
         off += elen;
     }
-    return 0;
+    return truncated && key_share;
 }
 
 static int find_sni(const uint8_t *b, size_t exts_off, size_t exts_end,
@@ -329,7 +348,7 @@ int d2k_tls_parse(const uint8_t *b, size_t len, d2k_tls_info *out) {
        supported_versions обычно лежит ДО набивки, то есть в первом же
        сегменте, и молчаливый отказ классифицировать оставил бы без обхода
        ровно того клиента, ради которого всё делается. */
-    out->is_tls13 = has_tls13(b, off, exts_end);
+    out->is_tls13 = has_tls13(b, off, exts_end, out->exts_truncated);
     out->ech_offer = has_ech_offer(b, off, exts_end);
 
     size_t so = 0, sl = 0;
