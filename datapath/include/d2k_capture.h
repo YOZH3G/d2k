@@ -1,14 +1,31 @@
 /* Observation only: bounded TCP ClientHello capture, never packet retention.
  * Starts at an observed record head (even one byte); tails may arrive out of
  * order AFTER that head. No guessing of a head from an arbitrary stream tail.
- * One TLS record containing exactly one ClientHello, at most 2048 bytes.
+ * One TLS record containing exactly one ClientHello, at most D2K_CAPTURE_BYTES.
  * Resource limits are capture limits, NOT evidence of blocking.
  */
 #ifndef D2K_CAPTURE_H
 #define D2K_CAPTURE_H
 #include "d2k_track.h"
 
-#define D2K_CAPTURE_BYTES 2048
+/* ПОТОЛОК СНИМКА — ПО ЗАМЕРУ ЖИВЫХ ПРИВЕТСТВИЙ, А НЕ ПО ПРИВЫЧКЕ.
+ *
+ * Прежние 2048 байт были сняты с приветствий прошлого поколения. Поле
+ * 13.10.2026, forum.ru-board.com: Chrome шлёт 2118-2214 байт —
+ * постквантовый key_share плюс перемешанный порядок расширений, — и у части
+ * соединений имя уезжает в самый хвост (в снятом приветствии 2182 байта имя
+ * на смещении 2129, то есть во ВТОРОМ сегменте). Снимок такое приветствие
+ * отвергал целиком («total > D2K_CAPTURE_BYTES» в capture.c), сборка головы с
+ * хвостом не состоялась, имени датапат не узнал, плана не поставил — а
+ * коробка после своей пересборки имя видит и глушит поток молча. В браузере
+ * это ERR_TIMED_OUT на картинках: из 23 потоков к цели план получили 5, у
+ * остальных 18 не было ни ответа, ни сброса.
+ *
+ * 4096 — удвоенный измеренный максимум (2214), ближайшая степень двойки.
+ * Цена: слот снимка держит bytes[] плюс карту present[] (1/8), и при 64
+ * слотах это 147 КиБ против 288 КиБ. Предел записи TLS (16384) сюда не
+ * берётся: это был бы бюджет «на всякий случай», а не по замеру. */
+#define D2K_CAPTURE_BYTES 4096
 #define D2K_CAPTURE_SLOTS 64
 #define D2K_CAPTURE_WINDOW 64
 #define D2K_CAPTURE_TTL_NS UINT64_C(5000000000)

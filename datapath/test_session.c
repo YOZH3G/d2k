@@ -1690,6 +1690,109 @@ int main(void) {
         }
     }
 
+    /* --- ПРИВЕТСТВИЕ КРУПНЕЕ ПРЕЖНЕГО БУФЕРА СБОРКИ, ИМЯ В ХВОСТЕ ---------
+     * Поле 13.10.2026, forum.ru-board.com. Chrome шлёт приветствие 2118-2214
+     * байт (постквантовый key_share плюс перемешанный порядок расширений), и
+     * у части соединений имя уезжает в самый хвост: в снятом приветствии 2182
+     * байта имя лежит на смещении 2129, то есть во ВТОРОМ сегменте. Датапат
+     * обязан собрать голову с хвостом — иначе имени он не узнает, плана не
+     * поставит, а коробка после СВОЕЙ пересборки имя видит и глушит поток
+     * молча (в браузере это ERR_TIMED_OUT на картинках: из 23 потоков план
+     * получили 5, у остальных 18 не было ни ответа, ни сброса).
+     *
+     * Упиралось это в потолок снимка: приветствие длиннее него отвергалось
+     * целиком (capture.c, «total > D2K_CAPTURE_BYTES»), и сборка не
+     * начиналась вовсе. */
+    {
+        const char *bnm = "hetzner.com";
+        static uint8_t big[8192];
+        size_t blen = 0, bo;
+        {   /* Приветствие с НАБИВКОЙ ПЕРЕД ИМЕНЕМ: имя — последнее расширение. */
+            static uint8_t body[8192];
+            size_t b = 0, e = 0;
+            static uint8_t ext[8192];
+            body[b++] = 0x03; body[b++] = 0x03;
+            for (int i = 0; i < 32; i++) { body[b++] = (uint8_t)i; }
+            body[b++] = 0;
+            body[b++] = 0x00; body[b++] = 0x02; body[b++] = 0x13; body[b++] = 0x01;
+            body[b++] = 0x01; body[b++] = 0x00;
+            const size_t pad = 2048;                 /* набивка впереди имени */
+            ext[e++] = 0x00; ext[e++] = 0x15;
+            ext[e++] = (uint8_t)(pad >> 8); ext[e++] = (uint8_t)pad;
+            memset(ext + e, 0, pad); e += pad;
+            size_t nl = strlen(bnm);
+            ext[e++] = 0x00; ext[e++] = 0x00;
+            ext[e++] = 0x00; ext[e++] = (uint8_t)(5 + nl);
+            ext[e++] = 0x00; ext[e++] = (uint8_t)(3 + nl);
+            ext[e++] = 0x00;
+            ext[e++] = 0x00; ext[e++] = (uint8_t)nl;
+            memcpy(ext + e, bnm, nl); e += nl;
+            body[b++] = (uint8_t)(e >> 8); body[b++] = (uint8_t)e;
+            memcpy(body + b, ext, e); b += e;
+            bo = 0;
+            big[bo++] = 0x16; big[bo++] = 0x03; big[bo++] = 0x01;
+            big[bo++] = (uint8_t)((b + 4) >> 8); big[bo++] = (uint8_t)(b + 4);
+            big[bo++] = 0x01;
+            big[bo++] = (uint8_t)(b >> 16); big[bo++] = (uint8_t)(b >> 8); big[bo++] = (uint8_t)b;
+            memcpy(big + bo, body, b); bo += b;
+            blen = bo;
+        }
+        const size_t SEG = 1452;
+        CHECK(blen > 2048 && blen < sizeof big,
+              "крупное приветствие не той длины");
+        /* Имя обязано лежать ЗА первым сегментом — иначе опыт не про то. */
+        {
+            size_t at = 0, i;
+            for (i = 0; i + strlen(bnm) <= blen; i++) {
+                if (!memcmp(big + i, bnm, strlen(bnm))) { at = i; break; }
+            }
+            CHECK(at > SEG, "имя попало в первый сегмент — опыт не про это");
+        }
+        /* План с входом по имени: такой и ставится цели в поле. */
+        static const uint8_t named_plan[] = {
+            'D','2','K','P', 0,1, 0,5, 0,0, 0,5,
+            0,2, 0,2, 6,1,                 /* TCP/TLS */
+            1,10, 0,0,                     /* input tls-sni */
+            1,0, 0,4, 0,5, 0,0,            /* split sni_middle */
+            1,8, 0,4, 0,0,5,120,           /* segment 1400 */
+            1,9, 0,1, 1                    /* detect-tcp-v1 */
+        };
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_hold *bh = d2k_hold_new();
+        d2k_plan *bp = NULL;
+        CHECK(g && bh && d2k_plan_load(named_plan, sizeof named_plan, &bp,
+                                       err, sizeof err) == 0,
+              "крупное приветствие: план не разобран");
+        CHECK(bp && d2k_plantab_set_name_family(d2k_session_plans(g),
+                  (const uint8_t *)bnm, 11, 1, bp,
+                  D2K_PLAN_SHAPE_GRANDFATHER, 0, 4) == 0,
+              "крупное приветствие: привязка не встала");
+        static uint8_t bpkt[8192], bbuf[65536];
+        size_t bn = build_pkt(bpkt, 43060, 0x02, NULL, 0);
+        d2k_session_packet(g, bpkt, bn, 1000, bbuf, sizeof bbuf, &r);
+        bn = build_pkt(bpkt, 43060, 0x10, big, SEG);
+        wr32(bpkt + 24, 1001);
+        int allow = d2k_session_hold_candidate(g, bpkt, bn);
+        CHECK(allow, "крупное приветствие: голову удержать не разрешили");
+        d2k_hold_batch bb;
+        memset(&bb, 0, sizeof bb);
+        CHECK(d2k_hold_feed(bh, 200, bpkt, bn, 2000, d2k_session_plan_revision(g),
+                            allow, 1001, 1, hold_release, g, &bb) == 1,
+              "крупное приветствие: голова не удержана — потолок снимка мал");
+        bn = build_pkt(bpkt, 43060, 0x18, big + SEG, blen - SEG);
+        wr32(bpkt + 24, 1001 + (uint32_t)SEG);
+        CHECK(d2k_hold_feed(bh, 201, bpkt, bn, 2100, d2k_session_plan_revision(g),
+                            0, 1001, 1, hold_release, g, &bb) == 2 && bb.count == 2,
+              "крупное приветствие: хвост не присоединился к голове");
+        if (bb.count == 2) {
+            d2k_session_packet(g, bb.packet, bb.len, 2200, bbuf, sizeof bbuf, &r);
+            CHECK(r.applied == 1 && r.n_out > 0,
+                  "крупное приветствие: собрано, а план не применён");
+        }
+        d2k_hold_free(bh);
+        d2k_session_free(g);
+    }
+
     /* --- ОТКАЗ ИСПОЛНИТЕЛЯ НА ПОТОКЕ СВОЕГО ЗОНДА ВИДЕН КОНТРОЛЛЕРУ -------
      * Поле 13.10.2026, forum.ru-board.com. Пробная запись стоит под портом
      * зонда, план найден, но исполнитель его отвергает (здесь — приветствие
