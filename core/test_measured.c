@@ -54,9 +54,16 @@ static void expect_send(unsigned kind, uint32_t seq, const uint8_t *pre, size_t 
     }
 }
 
-static void reference(const d2k_arm *a, const d2k_arm_input *in, const uint8_t *tr) {
+/* built — вход, ПО КОТОРОМУ план собран: его длина задаёт байты, которые
+   план несёт сам (тело приманки, приставка перекрытия). in — живой вход: от
+   него считаются только якоря. У параметрического плана это РАЗНЫЕ входы, и
+   путать их нельзя: приманка не пересобирается под каждое приветствие
+   («captured strategy data»), а разрез идёт по имени ЭТОГО приветствия. */
+static void reference_built(const d2k_arm *a, const d2k_arm_input *in,
+                            const uint8_t *tr, const d2k_arm_input *built) {
     uint8_t fake[4096], overlap[2048];
     size_t n = in->trigger_len;
+    size_t bn = built->trigger_len;
     unsigned reps = a->repeats ? a->repeats : 1;
     count = 0;
     unsigned flags = (a->badsum ? D2K_POISON_BADSUM : 0) | (a->md5 ? D2K_POISON_MD5 : 0) |
@@ -64,11 +71,11 @@ static void reference(const d2k_arm *a, const d2k_arm_input *in, const uint8_t *
     /* Как у сырого зонда (d2k_poison_has_fake): метка времени — тоже подделка. */
     int has_fake = !a->between && (a->badsum || a->md5 || a->ttl || a->seq_out || a->tcpts);
     if (has_fake) {
-        memset(fake, 15, n * 2);
-        size_t cp = in->decoy_len < n * 2 ? in->decoy_len : n * 2;
-        memcpy(fake, in->decoy, cp);
+        memset(fake, 15, bn * 2);
+        size_t cp = built->decoy_len < bn * 2 ? built->decoy_len : bn * 2;
+        memcpy(fake, built->decoy, cp);
         for (unsigned i = 0; i < reps; i++) {
-            expect_send(D2K_EMIT_FAKE, BASE, NULL, 0, fake, n * 2, flags,
+            expect_send(D2K_EMIT_FAKE, BASE, NULL, 0, fake, bn * 2, flags,
                         a->ttl, a->seq_out ? -66000 : 0, i ? a->gap_ms * 1000 : 0);
         }
     }
@@ -91,9 +98,9 @@ static void reference(const d2k_arm *a, const d2k_arm_input *in, const uint8_t *
         expect_send(D2K_EMIT_PAYLOAD, BASE, NULL, 0, tr, cut, 0, 0, 0, 0);
         return;
     }
-    size_t ov = a->seqovl_hello ? in->decoy_len : a->seqovl;
+    size_t ov = a->seqovl_hello ? built->decoy_len : a->seqovl;
     memset(overlap, 15, ov);
-    memcpy(overlap, in->decoy, in->decoy_len < ov ? in->decoy_len : ov);
+    memcpy(overlap, built->decoy, built->decoy_len < ov ? built->decoy_len : ov);
     if (a->disorder) {
         size_t mid = in->sni_off && in->sni_len > 1 ? in->sni_off + in->sni_len / 2 : n / 2;
         if (mid < 2) { mid = 2; } if (mid >= n) { mid = n - 1; }
@@ -105,6 +112,10 @@ static void reference(const d2k_arm *a, const d2k_arm_input *in, const uint8_t *
         expect_send(D2K_EMIT_PAYLOAD, BASE - (uint32_t)ov, overlap, ov, tr, n,
                     0, 0, 0, has_fake ? 15000 : 0);
     }
+}
+
+static void reference(const d2k_arm *a, const d2k_arm_input *in, const uint8_t *tr) {
+    reference_built(a, in, tr, in);
 }
 
 static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
@@ -222,7 +233,7 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
             pkt.payload_len = other.trigger_len;
             pkt.sni_off = other.sni_off; pkt.sni_len = other.sni_len;
             CHECK(d2k_plan_apply(p, NULL, &pkt, &out) == 0);
-            reference(&a, &other, tr);
+            reference_built(&a, &other, tr, &in);
             CHECK(out.n == count && out.fate == D2K_ORIG_DROP);
             for (size_t i = 0; i < out.n && i < count; i++) {
                 const d2k_emit *e = &out.v[i]; const expected_send *x = &expected[i];
