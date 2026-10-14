@@ -2699,6 +2699,10 @@ static void *worker_run(void *vp) {
                        (t->rx_volume_only || t->family_reuse == 1);
     int volume_after = t->transport == 6 && !t->skip_volume_once && !t->ech_offer &&
                        !volume_first;
+    /* Обрыв ответа, доказанный прошлым прогоном этой задачи и не
+       переспрашиваемый (повтор снимком, «отвеченное не переспрашивается»). */
+    int volume_carried = t->transport == 6 && t->skip_volume_once &&
+                         (t->vol.verdict == D2K_VOL_CUT || t->vol.rx_cut);
     if (volume_first) {
         worker_volume(s, t, trig);
         if (worker_volume_cut(s, t)) { return NULL; }
@@ -2839,6 +2843,17 @@ static void *worker_run(void *vp) {
             memset(&t->vol, 0, sizeof t->vol);
             t->vol.rx_tls_unavailable = r.verdict == D2K_V_OPAQUE;
         }
+    } else if (volume_carried && r.verdict == D2K_V_CLEAR && !t->stop) {
+        /* ПРОШЕДШЕЕ РУКОПОЖАТИЕ НЕ ОТМЕНЯЕТ ДОКАЗАННЫЙ ОБРЫВ. Повтор байтами
+           клиента спросил то, что от них зависит, — рукопожатие, — и оно
+           прошло; ответ всё так же режется около тех же КБ. Голый CLEAR
+           verdict_to_plans читает как «кандидатов нет» и до лестницы обрыва
+           (белое имя, fake-SNI + split) не доходит: поле 14.10.2026,
+           fast.com — «кандидатов 0», отдых на десять минут. Вердикт —
+           тот же, что дал бы обрыв, измеренный этим прогоном. Если же
+           рукопожатие байтами клиента НЕ прошло, остаётся его вердикт:
+           блок на рукопожатии и есть ответ. */
+        if (worker_volume_cut(s, t)) { return NULL; }
     }
 
     pthread_mutex_lock(&s->mu);
@@ -8729,7 +8744,17 @@ static void own_first_continue(d2k_sched *s, task *t) {
     t->rx_phase = 0;
     t->ask_probes += t->probes; /* на карточке зонды не пропадают (задача 49) */
     t->probes = 0;
-    if (t->transport == 6) memset(&t->vol, 0, sizeof t->vol);
+    /* ЗАБЫТЬ ОБЪЁМ МОЖНО, ТОЛЬКО ЕСЛИ ПОЛНЫЙ ПРОГОН СПРОСИТ ЕГО ЗАНОВО.
+       Повтор снимком с доказанным обрывом ответа ставит skip_volume_once
+       («отвеченное не переспрашивается»), и тогда t->vol — единственная
+       запись доказательства этого эпизода. Поле 14.10.2026, fast.com: обрыв
+       около 15 КБ доказан парой при полном gzip (эталон с VPS 26326 байт,
+       с роутера 16384), повтор байтами клиента начался с базового вопроса,
+       база прошла 3 из 3 — и стёртый здесь объём превратил доказанный блок
+       в «триггер проходит как есть — обходить нечего»; лестница белого
+       имени, которую открывает t->vol.rx_cut, не началась. */
+    if (t->transport == 6 && !(t->skip_volume_once && t->vol.rx_cut))
+        memset(&t->vol, 0, sizeof t->vol);
     memset(&t->res, 0, sizeof t->res);
     int f = t->family == 6;
     if (t->transport == 6 && !t->trig_snapped && !t->reasked && s->tcp_shape_len[f] > 0 &&

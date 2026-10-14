@@ -6489,6 +6489,80 @@ shape_test:
         tcp_answer = D2K_V_OPAQUE;
     }
 
+    /* ТО ЖЕ, НО С БАЗОВЫМ ВОПРОСОМ ДОНОРА — КАК В БОЕВОМ d2kc.
+       Поле 14.10.2026, fast.com: эталон с VPS 26326 байт, с роутера 16384.
+       Объёмный замер заготовкой доказал обрыв около 15 КБ при полном
+       gzip-контроле, снимок клиента (318 байт) пришёл позже старта, повтор
+       байтами клиента назначен — и тот повтор снова начался с базового
+       вопроса (задача 32). База рукопожатия прошла 3 из 3, own_first_continue
+       забыл объём, а полный прогон его не переспросил (отвеченное не
+       переспрашивается): «прямой замер не подтвердил блокировку — триггер
+       проходит как есть», покой на десять минут, до лестницы белого имени
+       дело не дошло. Проверка выше шла без базового вопроса, поэтому этого
+       сочетания не видела. */
+    {
+        /* Свой подтверждённый план той же формы у другой цели — в поле он
+           есть всегда, и только он включает базовый вопрос (own_first_plans). */
+        d2k_catalog empty = {0};
+        char own_pid[40];
+        own_box(&empty, "box-own-modern", own_pid, 2, 3, "other.own", 6, D2K_SHAPE_MODERN, 4,
+                1790000000, 0);
+        d2k_sched_tcp_fn saved_base = d2k_sched_tcp_base_hook;
+        d2k_sched_tcp_base_hook = stub_base;
+        base_calls = 0; base_blocked_answer = 0; base_wait_until_stop = 0;
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = ver_calls = 0; vol_entered = 0;
+        vol_last_wire = 0; tcp_last_wire = 0;
+        vol_answer = D2K_VOL_PASSED;
+        vol_rx_cut = 1; vol_rx_cut_first_only = 1; vol_rx_at_kb = 15;
+        vol_rx_packet_only = 0; vol_rx_packets = 0; vol_rx_wire_basis = 0;
+        vol_rx_short = 0; vol_rx_short_bytes = 0; vol_rx_tls_unavailable = 0;
+        vol_partial_bytes = vol_partial_wire_bytes = 0; vol_direct_complete = 0;
+        tcp_answer = D2K_V_CLEAR;
+        vol_hold = 1;
+        const char *name = "late.rst.snap.cut.base.example";
+        d2k_ev h1 = ev_hello(6, 41162, name);
+        d2k_sched_event(s, &h1);
+        d2k_ev r1 = ev_suspect(6, 41162); r1.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &r1);
+        d2k_ev h2 = ev_hello(6, 41163, name);
+        d2k_sched_event(s, &h2);
+        d2k_ev r2 = ev_suspect(6, 41163); r2.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &r2);
+        spin(s, 30);
+        for (int i = 0; i < 2000 && !vol_entered; i++) usleep(1000);
+        CHECK(vol_entered, "task31/rx-cut+base: RX-пара позднего закрытия не началась");
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, name,
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31/rx-cut+base: снимок");
+        d2k_sched_event(s, &sh);
+        vol_hold = 0;
+        spin(s, 200);
+        const char *restart = strstr(saidbuf, "повторяю поиск его байтами");
+        CHECK(restart != NULL,
+              "task31/rx-cut+base: повтор байтами клиента не назначен — условие не воспроизведено");
+        CHECK(said("подтверждён повторяемый обрыв входящего ответа"),
+              "task31/rx-cut+base: обрыв не доказан — условие не воспроизведено");
+        CHECK(base_calls >= 1 && said("базовый вопрос донора не подтвердил блокировку рукопожатия"),
+              "task31/rx-cut+base: базовый вопрос не задан — условие не воспроизведено");
+        CHECK(vol_calls == 1,
+              "task31/rx-cut+base: отвеченный вопрос объёма переспрошен");
+        CHECK(!said("прямой замер не подтвердил блокировку") &&
+              !said("напрямую проходит") && !said("результат неубедителен"),
+              "task31/rx-cut+base: базовый вопрос стёр доказанный обрыв — эпизод кончился отрицательным вердиктом");
+        /* И не просто «не отрицание»: доказанный обрыв обязан довести до
+           своей лестницы — той, где подбирается белое имя сети. */
+        CHECK(said("белое имя сети не известно") || said("fake-SNI + split-лестницу"),
+              "task31/rx-cut+base: доказанный обрыв не довёл до лестницы белого имени");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        d2k_sched_tcp_base_hook = saved_base;
+        base_calls = 0; base_blocked_answer = 1;
+        vol_hold = 0; vol_rx_cut = 0; vol_rx_cut_first_only = 0; vol_rx_at_kb = 24;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
     /* ЗАДАЧА 31, QUIC: Initial клиента этой цели пришёл во время прогона,
        затем общую ячейку quic_shape заняло соседнее имя. Перемер обязан
        идти Initial клиента цели (он хранится у задачи), без покоя до
