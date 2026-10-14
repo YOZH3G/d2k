@@ -8,13 +8,34 @@
 # Что здесь НЕ делается и почему:
 #   * ничего не берётся у z2k при неудаче загрузки — подмена артефактов
 #     чужого продукта своими это не запасной путь, а сюрприз;
-#   * автообновление (d2k-update.sh) ставит только ПОДПИСАННЫЙ выпуск: его
-#     архив — это тот же установщик с файлами, запущенный с D2K_LOCAL.
+#   * неподписанный комплект не ставится. И ручная установка, и ночное
+#     обновление (d2k-update.sh) берут один архив выпуска и запускают его
+#     собственный установщик с D2K_LOCAL.
 set -eu
 
 REPO=${D2K_REPO:-necronicle/d2k}
 REF=${D2K_REF:-main}
 BASE=${D2K_BASE:-https://raw.githubusercontent.com/$REPO/$REF}
+
+# Откуда берётся комплект. Источник ОДИН и тот же у ручной установки и у
+# ночного обновления — подписанный выпуск:
+#
+#   release  выпуск GitHub: latest.json с хешами архивов, подпись Ed25519
+#            закреплённым здесь ключом, архив своей арки. По умолчанию.
+#   local    уже распакованный комплект ($D2K_LOCAL): так ставит
+#            files/d2k-update.sh, лаборатория и сам выпускной путь ниже.
+#   ref      файлы ветки по raw.githubusercontent, бинарники из builds/.
+#            Путь разработчика: подписи нет, а builds/ в ветке обновляет
+#            человек. Ручная установка им НЕ идёт — ровно из-за этого она
+#            ставила движок от 12.10 под страницы панели от 13.10.
+SOURCE=${D2K_SOURCE:-release}
+[ -z "${D2K_LOCAL:-}" ] || SOURCE=local
+# Те же адреса и тот же ключ, что у files/d2k-update.sh: выпуск, которому
+# верит ночное обновление, и выпуск, который ставит рука, — один файл.
+# Совпадение ключа с переменной репозитория сторожит .github/workflows/release.yml.
+LATEST=${D2K_UPDATE_LATEST:-https://github.com/$REPO/releases/latest/download}
+DOWNLOAD=${D2K_UPDATE_DOWNLOAD:-https://github.com/$REPO/releases/download}
+KEY=${D2K_UPDATE_KEY:-MCowBQYDK2VwAyEAqZkq/DsxeFJ1MCEEyFa7yzm80XiWf+cHPR1JsybbMPQ=}
 
 DIR=/opt/d2k
 SBIN=/opt/sbin
@@ -120,6 +141,37 @@ openwrt_add_cmd() {
     esac
 }
 
+# Пакеты OpenWrt: модули ядра для правил, ca-bundle, curl и openssl.
+#
+# Вызывается дважды, делает дело один раз. Установке выпуска openssl нужен
+# ДО загрузки — им проверяется подпись, — а установке из каталога или ветки
+# он нужен только в конце, и там порядок не менялся: отказ пакетов оставляет
+# работающую прежнюю версию.
+OPENWRT_PKGS_DONE=
+openwrt_packages() {
+    [ "$FW" = nft ] || return 0
+    [ -z "$OPENWRT_PKGS_DONE" ] || return 0
+    OPENWRT_PKGS_DONE=1
+    OPENWRT_NEED="kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle"
+    command -v curl >/dev/null 2>&1 || OPENWRT_NEED="$OPENWRT_NEED curl"
+    command -v openssl >/dev/null 2>&1 || OPENWRT_NEED="$OPENWRT_NEED openssl-util"
+    pkgs_missing=
+    for p in $OPENWRT_NEED; do
+        openwrt_has "$p" || pkgs_missing="$pkgs_missing $p"
+    done
+    if [ -n "$pkgs_missing" ]; then
+        say "OpenWrt: ставлю пакеты:$pkgs_missing"
+        # shellcheck disable=SC2086  # список пакетов, нарочно словами
+        pkgs_cmd=$(openwrt_add_cmd $pkgs_missing)
+        # shellcheck disable=SC2086  # список пакетов, нарочно словами
+        openwrt_add $pkgs_missing ||
+            die "пакеты не поставились — проверьте интернет и место, затем: $pkgs_cmd"
+    fi
+    for t in curl openssl; do
+        command -v "$t" >/dev/null 2>&1 || die "нет $t и после установки пакетов"
+    done
+}
+
 # --- что нужно от системы ------------------------------------------------
 if [ "$FW" = nft ]; then
     # curl и openssl может ещё не быть: их ставит штатный менеджер ниже, после
@@ -203,34 +255,58 @@ TMP=$(mktemp -d /tmp/d2k-install.XXXXXX) || die "не создать време�
 # мерил только /opt, и то ПОСЛЕ загрузки: на 8/16-МиБ роутере обрыв случался
 # уже внутри fetch, когда отказываться было поздно.
 #
-# Число — вес самого крупного комплекта: замер 12.10.2026 дал 8326 КиБ
-# (mips64el; mips и mipsel — 8109 и 8113 КиБ). Чтобы оно не разъехалось с
-# builds/, его сторожит scripts/test-install-manifest.sh: он считает тот же
-# комплект по самим строкам fetch и отвергает число ниже замера.
+# Числа — замер, не оценка. Раскладка комплекта: 7635 КиБ на самой тяжёлой
+# арке (mips64el; mips и mipsel — 7470 и 7477), с запасом 8700.
 TMP_NEED_KB=8700
+# Установка выпуска держит в /tmp больше: распакованный архив (7752 КиБ,
+# замер 14.10.2026 на том же mips64el) и поверх него раскладку комплекта,
+# которую делает установщик ИЗ архива. Сам .tar.gz (2764 КиБ) удаляется
+# сразу после распаковки, поэтому пик — архив плюс раскладка, а не все три.
+TMP_RELEASE_NEED_KB=17600
+# Оба числа сторожит scripts/test-install-manifest.sh: он измеряет и
+# раскладку, и дерево выпуска и отвергает число ниже замера.
+need_kb=$TMP_NEED_KB
+[ "$SOURCE" != release ] || need_kb=$TMP_RELEASE_NEED_KB
 tmp_avail_kb=$(df -kP "$TMP" 2>/dev/null | awk 'NR == 2 { print $4 }')
 case "$tmp_avail_kb" in
     ''|*[!0-9]*) say "не узнать свободное место в $TMP — продолжаю" ;;
-    *) [ "$tmp_avail_kb" -ge "$TMP_NEED_KB" ] ||
-           die "мало места для загрузки в $TMP: свободно $tmp_avail_kb КиБ, нужно $TMP_NEED_KB КиБ" ;;
+    *) [ "$tmp_avail_kb" -ge "$need_kb" ] ||
+           die "мало места для загрузки в $TMP: свободно $tmp_avail_kb КиБ, нужно $need_kb КиБ" ;;
 esac
 
-fetch() {
-    # $1 — путь в репозитории, $2 — куда положить.
-    #
-    # D2K_LOCAL берёт файлы из каталога вместо сети. Нужен для проверки
-    # установки С ЧИСТОГО СОСТОЯНИЯ до того, как появятся опубликованные
-    # сборки: обещать рабочую установку, ни разу её не пройдя, нельзя (§9).
-    if [ -n "${D2K_LOCAL:-}" ]; then
-        cp "$D2K_LOCAL/$1" "$2" || die "нет $D2K_LOCAL/$1"
-    elif command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 120 -o "$2" "$BASE/$1" || die "не скачать $1"
+# $1 — адрес, $2 — куда положить, $3 — предел в секундах.
+fetch_url() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --proto '=https' --max-time "${3:-120}" -o "$2" "$1" ||
+            die "не скачать $1"
     else
         # OpenWrt без curl: wget образа (uclient-fetch, HTTPS с ca-bundle);
-        # curl поставит ниже штатный менеджер.
-        wget -q -T 120 -O "$2" "$BASE/$1" || die "не скачать $1"
+        # curl ставит штатный менеджер (openwrt_tools) до первой загрузки.
+        wget -q -T "${3:-120}" -O "$2" "$1" || die "не скачать $1"
     fi
     [ -s "$2" ] || die "$1 оказался пустым"
+}
+# sha256 файла. На OpenWrt есть sha256sum из busybox, на Keenetic — openssl;
+# требовать оба сразу незачем.
+sum256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        openssl dgst -sha256 -r "$1" | cut -d' ' -f1
+    fi
+}
+fetch() {
+    # $1 — путь в комплекте (он же путь в репозитории), $2 — куда положить.
+    #
+    # D2K_LOCAL берёт файлы из каталога вместо сети: так идёт установка из
+    # архива выпуска и проверка С ЧИСТОГО СОСТОЯНИЯ в лаборатории — обещать
+    # рабочую установку, ни разу её не пройдя, нельзя (§9).
+    if [ -n "${D2K_LOCAL:-}" ]; then
+        cp "$D2K_LOCAL/$1" "$2" || die "нет $D2K_LOCAL/$1"
+        [ -s "$2" ] || die "$1 оказался пустым"
+    else
+        fetch_url "$BASE/$1" "$2"
+    fi
 }
 
 fetch "scripts/architecture.sh" "$TMP/architecture.sh"
@@ -317,6 +393,52 @@ ARCH=$(sh "$TMP/architecture.sh" "$SYS_ARCH" "$ABI_ARCH") ||
     die "неподдерживаемая архитектура: uname=$SYS_ARCH, ABI=${ABI_ARCH:-не определён} (пробовали: ${ABI_TRIED:-ничего})"
 sh "$TMP/check-cpu.sh" "$ARCH" || die "CPU не соответствует требованиям сборки"
 say "архитектура: $SYS_ARCH / ${ABI_ARCH:-ABI не указан}${ABI_ARCH:+ (из $ABI_FROM)} -> $ARCH"
+
+# --- выпуск --------------------------------------------------------------
+#
+# Ручная установка ставит ПОДПИСАННЫЙ выпуск — тот же архив и тем же
+# установщиком, что ночное обновление. Раньше она брала бинарники из builds/
+# ветки main, а их обновлял человек: 13.10.2026 это давало движок от 12.10
+# под страницы панели и службу от 13.10, и проверка версий в самом
+# установщике однажды отвергла бы такой комплект целиком.
+#
+# Проверяется подпись перечня, затем sha256 архива из подписанного перечня.
+# Не сошлось — ничего не установлено: прежняя версия остаётся работать.
+if [ "$SOURCE" = release ]; then
+    # На OpenWrt openssl и curl может не быть вовсе — ставятся до проверки.
+    openwrt_packages
+    say "выпуск: беру сведения"
+    fetch_url "$LATEST/latest.json" "$TMP/latest.json"
+    fetch_url "$LATEST/latest.json.sig" "$TMP/latest.json.sig"
+    printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$KEY" > "$TMP/key.pem"
+    [ "$(wc -c < "$TMP/latest.json.sig" | tr -d ' ')" = 64 ] ||
+        die "подпись выпуска не того размера — ничего не установлено"
+    openssl pkeyutl -verify -pubin -inkey "$TMP/key.pem" -rawin \
+            -in "$TMP/latest.json" -sigfile "$TMP/latest.json.sig" >/dev/null 2>&1 ||
+        die "подпись выпуска не сошлась — ничего не установлено"
+    # Те же выражения, что в files/d2k-update.sh: один формат, одно чтение.
+    rid=$(sed -n 's/.*"release_id":"\([A-Za-z0-9][A-Za-z0-9._-]*\)".*/\1/p' "$TMP/latest.json")
+    [ -n "$rid" ] || die "в сведениях о выпуске нет номера"
+    want=$(sed -n "s/.*\"$ARCH\":{\"sha256\":\"\([0-9a-f]\{64\}\)\".*/\1/p" "$TMP/latest.json")
+    [ -n "$want" ] || die "в выпуске $rid нет сборки для $ARCH"
+    say "выпуск $rid: загрузка комплекта $ARCH"
+    fetch_url "$DOWNLOAD/$rid/d2k-$ARCH.tar.gz" "$TMP/release.tar.gz" 600
+    [ "$(sum256 "$TMP/release.tar.gz")" = "$want" ] ||
+        die "архив выпуска $rid не совпал с подписанным хешем — ничего не установлено"
+    mkdir "$TMP/release" || die "не создать $TMP/release"
+    tar -xzf "$TMP/release.tar.gz" -C "$TMP/release" ||
+        die "архив выпуска $rid не распаковался"
+    # Архив больше не нужен: в /tmp роутера это RAM, и держать его рядом с
+    # распакованным деревом незачем.
+    rm -f "$TMP/release.tar.gz"
+    [ -s "$TMP/release/scripts/install.sh" ] || die "в архиве выпуска $rid нет установщика"
+    say "выпуск $rid: подпись сошлась, ставлю его установщиком"
+    # Ставит установщик ИЗ архива: на роутер попадает только подписанное, и
+    # комплект раскладывает тот же код, что при ночном обновлении.
+    D2K_LOCAL="$TMP/release" D2K_RELEASE_ID="$rid" D2K_SOURCE=local \
+        sh "$TMP/release/scripts/install.sh" || exit $?
+    exit 0
+fi
 say "загрузка"
 fetch "scripts/select-panel-ip.sh" "$TMP/select-panel-ip.sh"
 fetch "builds/d2kpanel-linux-$ARCH" "$TMP/d2kpanel"
@@ -393,24 +515,7 @@ say "проверено: $("$TMP/d2kpanel" --version | head -1)"
 #
 # Всё до остановки прежней версии: отказ здесь оставляет работающую установку.
 if [ "$FW" = nft ]; then
-    OPENWRT_NEED="kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle"
-    command -v curl >/dev/null 2>&1 || OPENWRT_NEED="$OPENWRT_NEED curl"
-    command -v openssl >/dev/null 2>&1 || OPENWRT_NEED="$OPENWRT_NEED openssl-util"
-    pkgs_missing=
-    for p in $OPENWRT_NEED; do
-        openwrt_has "$p" || pkgs_missing="$pkgs_missing $p"
-    done
-    if [ -n "$pkgs_missing" ]; then
-        say "OpenWrt: ставлю пакеты:$pkgs_missing"
-        # shellcheck disable=SC2086  # список пакетов, нарочно словами
-        pkgs_cmd=$(openwrt_add_cmd $pkgs_missing)
-        # shellcheck disable=SC2086  # список пакетов, нарочно словами
-        openwrt_add $pkgs_missing ||
-            die "пакеты не поставились — проверьте интернет и место, затем: $pkgs_cmd"
-    fi
-    for t in curl openssl; do
-        command -v "$t" >/dev/null 2>&1 || die "нет $t и после установки пакетов"
-    done
+    openwrt_packages
     # Место под свои файлы — ПОСЛЕ пакетов: без USB /opt — каталог той же
     # корневой ФС (флеш), и пакеты (~7 МБ) берут из того же места (ревью
     # 07.10). Нехватку на сами пакеты отвергает менеджер. Нужно: новое минус

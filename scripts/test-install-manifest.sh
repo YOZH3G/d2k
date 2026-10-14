@@ -91,6 +91,32 @@ done
     fail "install.sh TMP_NEED_KB=$need_kb is below the largest download ($worst_arch: $worst_kb KiB)"
 echo "PASS: /tmp preflight ($need_kb KiB) covers the largest download ($worst_arch: $worst_kb KiB)"
 
+# 5. The same question for the install the user actually gets: the signed
+#    release. It holds more in /tmp than a file-by-file download — the
+#    unpacked tree, and on top of it the set the archive's own installer
+#    stages — so one number could not answer for both. Measured here on the
+#    real archive, built by the same script the release workflow runs.
+release_need_kb=$(sed -n 's/^TMP_RELEASE_NEED_KB=\([0-9]\{1,\}\)$/\1/p' "$INSTALL")
+[ -n "$release_need_kb" ] || fail "install.sh has no TMP_RELEASE_NEED_KB download preflight"
+stage=$(mktemp -d "${TMPDIR:-/tmp}/d2k-manifest.XXXXXX") || fail "no temporary directory"
+trap 'rm -rf "$stage"' EXIT HUP INT TERM
+RELEASE_ID=d2k-manifest-test ARCHES=$worst_arch \
+    sh "$ROOT/scripts/package-release.sh" "$ROOT/builds" "$stage/out" >/dev/null ||
+    fail "package-release.sh cannot package $worst_arch"
+mkdir "$stage/tree" || fail "no room to unpack"
+tar -xzf "$stage/out/d2k-$worst_arch.tar.gz" -C "$stage/tree" || fail "release archive does not unpack"
+tree_kb=$(du -sk "$stage/tree" | awk '{ print $1 }')
+gz_kb=$(du -k "$stage/out/d2k-$worst_arch.tar.gz" | awk '{ print $1 }')
+# Два пика: архив рядом с распакованным деревом, затем дерево рядом с
+# раскладкой (установщик удаляет архив до того, как начнёт раскладывать).
+peak_kb=$((tree_kb + need_kb))
+[ "$peak_kb" -ge $((gz_kb + tree_kb)) ] || peak_kb=$((gz_kb + tree_kb))
+[ "$release_need_kb" -ge "$peak_kb" ] ||
+    fail "install.sh TMP_RELEASE_NEED_KB=$release_need_kb is below the release install ($worst_arch: archive $gz_kb KiB, tree $tree_kb KiB, staged $need_kb KiB, peak $peak_kb KiB)"
+echo "PASS: release preflight ($release_need_kb KiB) covers the release install ($worst_arch: peak $peak_kb KiB)"
+rm -rf "$stage"
+trap - EXIT HUP INT TERM
+
 # shellcheck disable=SC2016
 for name in $(sed -n 's/^install_atomic "\$TMP\/[^"]*" "\$DIR\/\([^"]*\.sh\)"$/\1/p' "$INSTALL"); do
     grep -qF "\$DIR/$name" "$UNINSTALL" || fail "uninstall.sh does not remove \$DIR/$name"

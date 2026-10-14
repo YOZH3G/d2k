@@ -126,6 +126,10 @@ mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets" "$REL/script
 cp scripts/select-panel-ip.sh scripts/architecture.sh scripts/check-cpu.sh "$REL/scripts/"
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
+# d2ktg берётся готовым из builds/ — единственный бинарник, который там
+# остался в git. Его собирают со статическим OpenSSL, это минуты на арку, а
+# лаборатория проверяет установку, не сам туннель. Остальные три собираются
+# выше нативно; на роутер все четыре идут только подписанным выпуском.
 cp builds/d2ktg-linux-arm64 "$REL/builds/d2ktg-linux-$ARCH"
 make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel

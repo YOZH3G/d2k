@@ -155,9 +155,15 @@ jobs:
           trap 'rm -f "$key"' EXIT
           (umask 077; printf '%s\n' "$PRIVATE_KEY" > "$key")
           openssl pkeyutl -sign -inkey "$key" -rawin -in "$out/latest.json" -out "$out/latest.json.sig"
-          # Verify with the same public key that files/d2k-update.sh pins.
+          # Verify with the same public key that the two scripts which
+          # install a release pin: files/d2k-update.sh at night and
+          # scripts/install.sh by hand. A key only one of them trusts would
+          # leave half the routers unable to install anything.
           pub=$(python3 -c 'import base64,os; print(base64.b64encode(bytes.fromhex("302a300506032b6570032100"+os.environ["PUBLIC_KEY_HEX"])).decode())')
-          grep -qF "$pub" files/d2k-update.sh
+          for pinned in files/d2k-update.sh scripts/install.sh; do
+            grep -qF "$pub" "$pinned" ||
+              { echo "::error::$pinned pins a signing key other than D2K_SIGNING_PUBLIC_KEY"; exit 1; }
+          done
           printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$pub" > "$RUNNER_TEMP/public.pem"
           openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/public.pem" -rawin \
             -in "$out/latest.json" -sigfile "$out/latest.json.sig"
