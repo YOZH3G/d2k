@@ -9595,6 +9595,42 @@ rx_volume_tests:
         d2k_catalog_free(&cLateConfirmed);
     }
 
+    /* ПОВТОР ПРОВЕРКИ КАНДИДАТА ИЗ ЗАМЕРА (поле 14.10.2026, fost.club): вечером
+       часть соединений к адресу идёт маршрутом, где коробка снимает имя. Одна
+       неудачная проверка выведенного плана открывала запасной список; теперь
+       тот же кандидат проверяется ещё раз и подтверждается. */
+    {
+        d2k_catalog c = {0};
+        d2k_verdict old_tcp = tcp_answer;
+        d2k_ver_level old_ver = ver_answer;
+        tcp_answer = D2K_V_PREFIX; tcp_found_arm = 1; tcp_owns_search = 1;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 1; ver_calls = 0;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        ver_answer_port = 40611;
+        d2k_ev h = ev_hello(6, 40611, "arm-retry.test"); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40611); d2k_sched_event(s, &su);
+        int installed = 0;
+        for (int i = 0; i < 20000 && !said("итог поиска"); i++) {
+            tick_once(s);
+            int n = sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+            if (n > installed) {
+                installed = n;
+                d2k_ev ap = ev_applied(6, 40611);
+                d2k_sched_event(s, &ap);
+            }
+            if (i % 400 == 399) skip_ahead(s, 6000);
+        }
+        CHECK(said("проверяю его ещё раз"),
+              "arm-retry: выведенный план после одной неудачной проверки не проверен повторно");
+        CHECK(said("ПОДТВЕРЖДЕНО") && !said("из запасного перебора"),
+              "arm-retry: одна неудачная проверка выведенного плана открыла запасной список");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        tcp_found_arm = 0; tcp_owns_search = 0; ver_fail_first = 0;
+        tcp_answer = old_tcp; ver_answer = old_ver;
+    }
+
     /* ЗАМЕРЕННЫЙ ОБРЫВ — ТОЛЬКО ЛЕСТНИЦА SNI (владелец, 14.10.2026). Поле,
        www.jetadmin.io: две ступени RX-лестницы, затем четыре порции запасного
        перебора в той же задаче — доливом в refill_from_fallback. Обрыв

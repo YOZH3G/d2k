@@ -248,6 +248,17 @@
  * рабочий план — поиска целиком и цели без обхода (поле 17.09, discord.com). */
 #define SCHED_BARE_RETRIES 1
 
+/* ПОВТОР ПРОВЕРКИ КАНДИДАТА ИЗ ЗАМЕРА (поле 14.10.2026, fost.club с роутера).
+ * Вечером провайдер ведёт часть соединений к одному адресу по маршруту, где
+ * коробка снимает сегмент с именем (TTL SYN-ACK 53–54), остальные проходят
+ * всегда; с VPS — 20/20, ночью — 84/84. Вопрос о свойствах отвечает
+ * большинством (detect/props.c), а проверка своим зондом была одной попыткой
+ * и выбрасывала выведенный из замера план, если зонд попал на тот маршрут.
+ * Удача проверки — ответ приложения под нашим планом, ложного «да» повтор
+ * дать не может; он стоит только зонда. Поэтому — до двух повторов и только
+ * кандидату, которого вывел замер этого поиска. */
+#define SCHED_ARM_VERIFY_RETRIES 2
+
 /* СКОЛЬКО ЖДАТЬ, ПОКА ДАТАПАТ ПРИМЕТ ПРОБНЫЙ ПЛАН.
  *
  * План уходит записью в управляющий сокет, а датапат читает её своим циклом.
@@ -837,6 +848,9 @@ typedef struct {
        сбрасывал бы сам себя: он идёт через переустановку плана, а она — тот
        же путь, что и установка следующего кандидата. */
     size_t     ver_retry_for;
+    /* Повторы проверки кандидата из замера (SCHED_ARM_VERIFY_RETRIES); счёт —
+       по тому же кандидату, что и ver_bare_retries. */
+    int        ver_arm_retries;
     /* Пока датапат не принял пробный план, испытывать нечего: зонд уйдёт
        голым. trial_until_ms — предел ожидания, дальше идём как есть. */
     int64_t    trial_until_ms;
@@ -10045,6 +10059,24 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            порт и поставит ТОТ ЖЕ план под него. */
                         if (t->next_plan > 0) { t->next_plan--; }
                         t->state = T_PLANNING;
+                    } else if (t->transport == 6 && touched && !t->ver.local_limit &&
+                               t->next_plan > 0 && t->next_plan > t->n_known &&
+                               t->arm_hash && t->arm_hash == fnv1a(t->plans[t->next_plan - 1]) &&
+                               s->dropped_seen == t->ver_dropped0 &&
+                               t->ver.level >= D2K_VER_TRANSPORT &&
+                               t->ver_arm_retries < SCHED_ARM_VERIFY_RETRIES &&
+                               t->probes < sched_probe_cap(t)) {
+                        t->ver_arm_retries++;
+                        say(s, "по %s план %zu из замера: зонд не дошёл до приложения (%s) — "
+                               "проверяю его ещё раз (%d из %d): маршрут к адресу бывает разный",
+                            t->name, t->next_plan, t->ver.reason, t->ver_arm_retries,
+                            SCHED_ARM_VERIFY_RETRIES);
+                        trial_retire(s, t);
+                        ver_close(t);
+                        t->ver_seen = 0;
+                        t->ver_ok = 0;
+                        if (t->next_plan > 0) { t->next_plan--; }
+                        t->state = T_PLANNING;
                     } else {
                         /* Транспорт, рукопожатие и даже «сервер что-то ответил» —
                            не доказательство (§4.2 и шапка d2k_verify.h). Кандидат
@@ -10465,6 +10497,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (t->ver_retry_for != t->next_plan) {
                 t->ver_retry_for = t->next_plan;
                 t->ver_bare_retries = 0;
+                t->ver_arm_retries = 0;
             }
             /* СНАЧАЛА ПЛАН ДОЛЖЕН ДОЙТИ, ПОТОМ ЗОНД — см. SCHED_TRIAL_SETTLE_MS. */
             t->trial_acked = 0;
