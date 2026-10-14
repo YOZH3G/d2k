@@ -117,6 +117,27 @@ static int save_atomic(const d2k_catalog *cat, const char *path,
 
 /* Печать планировщика. Со временем по стенным часам, а не монотонным: строку
    читает человек, и ему нужно сопоставить её с тем, что он делал. */
+/* ПАМЯТЬ КОНТРОЛЛЕРА — В ТОЙ ЖЕ СВОДКЕ (задача 60). Поле 14.10.2026, Netis N6
+   (mipsel, OpenWrt 25.12.5): d2kc 10,6 МБ сразу после перезапуска и 29,1 МБ
+   через 1 д 9 ч, а датапат и туннель стояли на месте. Свою память d2kc не
+   называл, и отличить заполнение ограниченных кэшей от утечки было не по
+   чему. Теперь сводка несёт RSS, его пик, объём данных и число потоков, а
+   рядом — размер каталога: рост памяти вместе с каталогом и без него —
+   разные истории. Вне Linux /proc нет — память не печатается. */
+static void self_mem(long *rss, long *hwm, long *data, long *thr) {
+    *rss = *hwm = *data = *thr = -1;
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) { return; }
+    char l[128];
+    while (fgets(l, sizeof l, f)) {
+        if (!strncmp(l, "VmRSS:", 6)) { *rss = strtol(l + 6, NULL, 10); }
+        else if (!strncmp(l, "VmHWM:", 6)) { *hwm = strtol(l + 6, NULL, 10); }
+        else if (!strncmp(l, "VmData:", 7)) { *data = strtol(l + 7, NULL, 10); }
+        else if (!strncmp(l, "Threads:", 8)) { *thr = strtol(l + 8, NULL, 10); }
+    }
+    fclose(f);
+}
+
 static void sched_say(void *ctx, const char *line) {
     (void)ctx;
     time_t now = time(NULL);
@@ -753,12 +774,26 @@ int main(int argc, char **argv) {
         }
 
         if (t - last_report >= REPORT_EVERY_MS) {
-            char line[300];
+            size_t n_binds = 0, n_plans = 0;
+            for (size_t b = 0; b < cat.n_boxes; b++) {
+                n_binds += cat.boxes[b].n_binds;
+                n_plans += cat.boxes[b].n_plans;
+            }
+            long rss, hwm, data, thr;
+            self_mem(&rss, &hwm, &data, &thr);
+            char mem[160] = "";
+            if (rss >= 0) {
+                snprintf(mem, sizeof mem, "; память: RSS %ld КиБ (пик %ld), данные %ld КиБ, потоков %ld",
+                         rss, hwm, data, thr);
+            }
+            char line[600];
             snprintf(line, sizeof line,
                      "событий %lu (приветствий %lu, подозрений %lu, обменов %lu, "
-                     "применений %lu, отказов %lu), поисков идёт %zu",
+                     "применений %lu, отказов %lu), поисков идёт %zu; каталог: коробок %zu, "
+                     "привязок %zu, планов %zu%s",
                      seen_events, seen_hello, seen_suspect, seen_exchange,
-                     seen_applied, seen_refused, d2k_sched_active(s));
+                     seen_applied, seen_refused, d2k_sched_active(s),
+                     cat.n_boxes, n_binds, n_plans, mem);
             sched_say(NULL, line);
             last_report = t;
         }
