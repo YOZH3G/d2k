@@ -64,6 +64,7 @@ static uint16_t ports[WORKERS][PORTS_PER_WORKER];
 static uint8_t incoming[2][128];
 static size_t incoming_len[2];
 static unsigned incoming_noise;
+static int reorder_first;
 static uint8_t incoming_src[2][16];
 static uint8_t outgoing[512][4096];
 static size_t outgoing_len[512];
@@ -211,6 +212,13 @@ ssize_t raw_test_recvfrom(int fd, void *buf, size_t len, int flags,
         }
         return (ssize_t)n;
     }
+    if (fd == 0 && reorder_first) {
+        /* Later server data arrives before the start of the reply. */
+        reorder_first = 0;
+        if (incoming_len[1] > len) { return -1; }
+        memcpy(buf, incoming[1], incoming_len[1]);
+        return (ssize_t)incoming_len[1];
+    }
     if (fd < 0 || fd > 1 || incoming_len[fd] > len) { return -1; }
     memcpy(buf, incoming[fd], incoming_len[fd]);
     if (incoming_noise) {
@@ -303,6 +311,37 @@ static void test_unrelated_packets_do_not_extend_deadline(void)
     CHECK(raw_read_payload(&c, 5, NULL, result, sizeof result, &result_len) == -1);
     CHECK(result_len == 0);
     incoming_noise = 0;
+    free(c.buffers);
+}
+
+/* Поле 14.10.2026, fost.club: сервер ответил полностью (4874 байта), но
+ * сегмент 1441:2881 пришёл раньше 1:1441, и зонд взял его за начало ответа:
+ * TLS-записи там нет — «нет» и сброс. Начало ответа — сегмент с номером,
+ * следующим за SYN сервера (c->ack), а не первый пришедший. */
+static void test_reordered_reply_reads_from_stream_start(void)
+{
+    raw_conn c = {0};
+    d2k_poison p = {0};
+    uint8_t start[] = {0x16, 0x03, 0x03, 0x00, 0x7a}, later[] = {0x41, 0x42, 0x43};
+    uint8_t result[16];
+    size_t result_len = 0;
+    c.family = 4; c.recv_fd = 0; c.sport = 35000; c.dport = 443;
+    c.src[0] = 192; c.dst[0] = 198;
+    c.ack = 1001;
+    c.buffers = malloc(sizeof *c.buffers);
+    CHECK(c.buffers != NULL);
+    if (!c.buffers) return;
+    incoming_len[0] = build_ipv4_tcp(incoming[0], sizeof incoming[0],
+        c.dst, c.src, c.dport, c.sport, 1001, 2, TCP_ACK,
+        start, sizeof start, &p, NULL, 0);
+    incoming_len[1] = build_ipv4_tcp(incoming[1], sizeof incoming[1],
+        c.dst, c.src, c.dport, c.sport, 1001 + 1440, 2, TCP_ACK,
+        later, sizeof later, &p, NULL, 0);
+    reorder_first = 1;
+    CHECK(raw_read_payload(&c, 1000, NULL, result, sizeof result, &result_len) == 0);
+    CHECK(result_len == sizeof start && result[0] == 0x16);
+    reorder_first = 0;
+    incoming_len[1] = 0;
     free(c.buffers);
 }
 
@@ -984,6 +1023,7 @@ int main(void)
     test_checksum_matches_original();
     test_receive_is_owned_by_connection();
     test_unrelated_packets_do_not_extend_deadline();
+    test_reordered_reply_reads_from_stream_start();
     test_datapath_matches_raw_headers();
     test_disorder_pos2_emits_exact_reverse_segments();
     test_dial_survives_missing_rst_rule();

@@ -943,6 +943,16 @@ static int raw_read_payload(raw_conn *c, int timeout_ms, const d2k_detect_stop *
             return -1; /* RST */
         }
         if (plen > 0) {
+            /* НАЧАЛО ОТВЕТА — СЕГМЕНТ С НОМЕРОМ c->ack, а не первый пришедший
+               (поле 14.10.2026, fost.club: 1441:2881 пришёл раньше 1:1441, и
+               полный ответ сервера засчитался «нет»). Более поздние данные
+               ждут своего начала; повтор уже полученного обрезается до
+               непрочитанного. */
+            if ((int32_t)(seq - c->ack) > 0) continue;
+            uint32_t skip = c->ack - seq;
+            if (skip >= plen) continue;
+            pay += skip;
+            plen -= skip;
             size_t k = plen < cap ? plen : cap;
             memcpy(out, pay, k);
             *outlen = k;
