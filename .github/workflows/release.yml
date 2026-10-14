@@ -137,6 +137,13 @@ jobs:
           pattern: release-*
           path: ${{ runner.temp }}/builds
           merge-multiple: true
+      # The /tmp preflight numbers in scripts/install.sh are measured on the
+      # real per-architecture set. A checkout does not carry one, so this is
+      # the gate of record: the binaries here are the ones about to be
+      # published, and a number that fell behind them stops the release
+      # instead of breaking an install in the middle of a download.
+      - name: The /tmp preflights still cover what is about to be published
+        run: D2K_BUILDS="$RUNNER_TEMP/builds" sh scripts/test-install-manifest.sh
       - name: Archives, latest.json and signature
         env:
           PRIVATE_KEY: ${{ secrets.D2K_ED25519_PRIVATE_KEY }}
