@@ -218,7 +218,8 @@ static void progress_seen(void *ctx, const d2k_obs *o)
  * трасса дерева дальше измерителя не шла, и промах вопроса «метка времени»
  * на rutracker.org пришлось выводить из порядка дерева. Копируются только
  * наблюдения «свойство:*»: база, разрез и гипотезы перебора — не вопросы о
- * свойствах. Исход: все повторы прошли — YES, промах — NO, локальная ошибка
+ * свойствах. Исход: большинство повторов прошло — YES (props.c,
+ * d2k_prop_majority), иначе — NO, локальная ошибка
  * зонда — UNKNOWN (сети зонд не достиг). Ярлык режется только по границе
  * символа UTF-8 (r-73.1). */
 static void trace_questions(const d2k_result *res, int repeats, d2k_vres *out)
@@ -244,7 +245,7 @@ static void trace_questions(const d2k_result *res, int repeats, d2k_vres *out)
         st->sent = (uint8_t)(o->pass + o->fail > 255 ? 255 : o->pass + o->fail);
         st->answered = (uint8_t)(o->pass > 255 ? 255 : o->pass);
         st->outcome = o->err[0] ? D2K_PROP_UNKNOWN
-                    : (repeats > 0 && o->pass == repeats) ? D2K_PROP_YES : D2K_PROP_NO;
+                    : d2k_prop_majority(o->pass, repeats) ? D2K_PROP_YES : D2K_PROP_NO;
     }
 }
 

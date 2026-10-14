@@ -291,26 +291,35 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         snprintf(label, sizeof(label), "свойство:%s", pp[i].label);
         obs = d2k_trace_add(res, label);
         obs->delay_ms = p.gap_ms;
-        /* Ответ засчитывается только при единогласии, поэтому первый же
-         * провал решает вопрос: остальные повторы исход изменить не могут, и
-         * гнать их — по таймауту каждый при тихом сбросе — значит тратить
-         * время цели впустую. Проход же требует все повторы, как и раньше. */
+        /* ОТВЕТ — БОЛЬШИНСТВОМ ПОВТОРОВ (поле 14.10.2026, fost.club с роутера,
+         * d2k-detect с меткой замера): «ECH-приветствие под меткой» к одному
+         * адресу дало 3/3, 0/1, 2/3, 1/2 — приём срабатывает в ~2 попытках из
+         * 3 при любой приманке, и тот же план (680fbe00) через датапат сайт
+         * открывал весь день. Прежнее единогласие с выходом на первом провале
+         * делало из такого приёма «нет» в ~7 случаях из 10. Вопросы о свойствах
+         * задаются при режущейся базе (0/N), так что проход приёма — эффект
+         * приёма, а не случайность сервера. Повторы кончаются, как только исход
+         * решён: большинство набрано или уже недостижимо. */
         for (j = 0; j < opt->repeats; j++) {
             int rc = d2k_raw_probe_poison_family(ip4, family, port, tr, &p, opt->timeout_ms, opt->mark,
                                           &opt->cancel, err, sizeof(err));
             res->probes++;
             done++;
             d2k_raw_note_rc(res, family, rc);
-            if (rc <= 0) {
-                local_err = rc < 0;
+            if (rc < 0) {
+                local_err = 1;
                 /* Локальная ошибка — в трассу: иначе «0/3» читается как
                  * ответ сети, а сети зонд не достиг (поле 10.10.2026). */
-                if (local_err && obs->err[0] == '\0') {
+                if (obs->err[0] == '\0') {
                     snprintf(obs->err, sizeof(obs->err), "%s", err);
                 }
                 break;
             }
-            pass++;
+            if (rc > 0) { pass++; }
+            if (d2k_prop_majority(pass, opt->repeats) ||
+                !d2k_prop_majority(pass + (opt->repeats - done), opt->repeats)) {
+                break;
+            }
         }
         if (!local_err && res->nanswered < D2K_ANSWERED_MAX) {
             res->answered[res->nanswered++] = p;
@@ -318,7 +327,7 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         obs->pass = pass;
         obs->fail = done - pass;
         if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
-        got = pass == opt->repeats;
+        got = d2k_prop_majority(pass, opt->repeats);
         /* A local compile/apply/send refusal is not an answer from the box. */
         if (!local_err) apply_set(&res->props, pp[i].set, got);
         /* Находку, которую план не выражает (фильтр дерева, d2k_opts.accept),

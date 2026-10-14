@@ -422,6 +422,13 @@ int d2k_raw_probe_handshake_family(const uint8_t *ip, uint8_t family, uint16_t p
 int d2k_raw_probe_poison_family(const uint8_t *ip, uint8_t family, uint16_t port,
     const d2k_trigger *tr, const d2k_poison *p, int timeout_ms, uint32_t mark,
     const d2k_detect_stop *cancel, char *err, size_t errcap);
+/* Ответ вопроса о свойствах — большинством повторов (props.c): при N = 3 —
+ * два прохода, при N = 1 — один. Общий для измерителя и моста (bridge.c). */
+static inline int d2k_prop_majority(int pass, int repeats)
+{
+    return repeats > 0 && pass * 2 > repeats;
+}
+
 int d2k_run_properties_family(const uint8_t *ip, uint8_t family, uint16_t port,
     const d2k_trigger *tr, const d2k_opts *opt, d2k_result *res, d2k_poison *hit);
 /* Каждый сырой зонд отравления отдаёт сюда свой код возврата: счёт прогона

@@ -350,7 +350,7 @@ typedef struct { const char *name; int before; const char *sig; } golden;
 static const golden GOLD[] = {
 {"youtube", 18, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
 {"rutracker", 156, "poisonable|перебор|seqovl-16|--lua-desync=multisplit:payload=tls_client_hello:dir=out:pos=1:seqovl=16|0002100|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «seqovl-16», сервер выбрасывает"},
-{"flaky", 69, "poisonable|перебор|fakedsplit|--lua-desync=fakedsplit:payload=tls_client_hello:dir=out:pos=1:badsum|0012200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «fakedsplit», сервер выбрасывает"},
+{"flaky", 69, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
 {"prop-l7", 24, "poisonable|свойство|badsum+hello|--lua-desync=fake:payload=tls_client_hello:dir=out:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:badsum|0212200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «badsum+hello», сервер выбрасывает"},
 {"none-pass", 297, "opaque||-||0002200|0|u1|f0|разрез не помогает, контроль проходит, отравить буфер не удалось — содержимое важно, но чем брать, зондами не нашли"},
 {"selftest-fail", 12, "opaque||-||0000000|0|u0|f1|разрез не помогает, контроль проходит; сырые зонды НЕ РАБОТАЮТ (самопроверка не прошла) — про отравление вывода нет"},
@@ -383,16 +383,20 @@ static int after_count(const char *name)
        Порядок 10.10: syndata последний. Для этих сценариев число зондов
        неизменно: находки раньше прежнего места SYN либо все вопросы заданы.
        Снижение на один для MD5/seq/TS проверяется в test_props_fields. */
+    /* 14.10.2026: вопрос о свойствах отвечает БОЛЬШИНСТВОМ (props.c,
+       d2k_prop_majority): промах стоит два зонда вместо одного, проход —
+       два вместо трёх; «flaky» (приём через раз) берётся вопросом, а не
+       перебором. */
     static const struct { const char *n; int a; } A[] = {
-        {"youtube", 12}, {"rutracker", 54}, {"flaky", 30}, {"prop-l7", 14},
-        {"none-pass", 95}, {"selftest-fail", 10}, {"selftest-late", 14},
-        {"ctl-late", 13}, {"ctl-dead", 98}, {"ctl-dead-vouched", 98},
+        {"youtube", 12}, {"rutracker", 64}, {"flaky", 14}, {"prop-l7", 16},
+        {"none-pass", 105}, {"selftest-fail", 10}, {"selftest-late", 14},
+        {"ctl-late", 13}, {"ctl-dead", 108}, {"ctl-dead-vouched", 108},
         {"ctl-dead-hit", 15}, {"errors", 104},
         /* Задача 54: молчащий контроль добавляет ОДИН вопрос — нейтральный
          * байт; подтверждённый с первого раза, он стоит один зонд. Молчание
          * адреса стоит три (единогласие) и снимает весь перебор отравлений. */
-        {"addr-silent", 12}, {"addr-silent-late", 99},
-        {"addr-ack-unseen", 97}, {"addr-ack-err", 98}};
+        {"addr-silent", 12}, {"addr-silent-late", 109},
+        {"addr-ack-unseen", 107}, {"addr-ack-err", 108}};
     size_t i;
     for (i = 0; i < sizeof A / sizeof A[0]; i++) {
         if (strcmp(A[i].n, name) == 0) { return A[i].a; }
@@ -479,9 +483,9 @@ static void test_counts_per_question(void)
     o = find_obs(&r, "raw-selftest");
     CHECK(o && o->pass == 1 && o->fail == 0, "самопроверка: ждали 1 зонд до первого успеха");
     o = find_obs(&r, "свойство:перекрытие слева");
-    CHECK(o && o->pass == 0 && o->fail == 1, "(b) провал на первом повторе: ждали 1 зонд");
+    CHECK(o && o->pass == 0 && o->fail == 2, "(b) промах: два провала из трёх решают «нет»");
     o = find_obs(&r, "свойство:порядок сегментов");
-    CHECK(o && o->pass == 3 && o->fail == 0, "(c) проход: ждали все 3 повтора");
+    CHECK(o && o->pass == 2 && o->fail == 0, "(c) проход: два прохода из трёх решают «да»");
     o = find_obs(&r, "whole");
     CHECK(o && o->pass + o->fail == 3, "база: все повторы");
     o = find_obs(&r, "split");
@@ -583,9 +587,10 @@ static void test_syndata_after_misses(void)
     fresh_process();
     run(&syn, &r);
     CHECK(r.has_hit && r.hit.syn_data, "последний вопрос syndata не задан");
-    /* The fixture has no SNI: ten questions, nine misses and three positive
-     * syndata repeats, plus eight baseline/self-test probes = 20. */
-    CHECK(r.probes == 20, "syndata: зондов %d, ждали 20", r.probes);
+    /* The fixture has no SNI: ten questions, nine misses (two probes each
+     * under the majority rule) and two positive syndata repeats, plus eight
+     * baseline/self-test probes = 28. */
+    CHECK(r.probes == 28, "syndata: зондов %d, ждали 28", r.probes);
     CHECK(r.nanswered == 10 && r.answered[r.nanswered - 1].syn_data,
           "syndata не последний отвеченный вопрос");
     CHECK(r.props.inspects_syn == D2K_TRI_FALSE, "ответ SYN не записан");
@@ -602,19 +607,20 @@ static void test_props_fields(void)
     run(&md5, &r);
     CHECK(r.props.validates_md5 == D2K_TRI_FALSE, "MD5: проход не записан");
     CHECK(r.has_hit && !strcmp(r.hit.name, "md5"), "MD5: приём не стал находкой");
-    /* syndata moved to the end: these findings save its one failing probe.
-     * Before the reorder: MD5 17, seq 18, TS 19; now 16, 17, 18. */
-    CHECK(r.probes == 16, "MD5: зондов %d, ждали 16 (было 17)", r.probes);
+    /* syndata stays last and unasked after these findings. Under the
+     * majority rule each earlier miss costs two probes and the finding two:
+     * MD5 20, seq 22, TS 24. */
+    CHECK(r.probes == 20, "MD5: зондов %d, ждали 20", r.probes);
     CHECK(r.props.inspects_syn == D2K_TRI_UNSET, "SYN спросили до MD5");
     fresh_process();
     run(&seq, &r);
     CHECK(r.props.validates_seq_window == D2K_TRI_FALSE, "окно seq: проход не записан");
-    CHECK(r.probes == 17, "seq: зондов %d, ждали 17 (было 18)", r.probes);
+    CHECK(r.probes == 22, "seq: зондов %d, ждали 22", r.probes);
     CHECK(r.props.validates_md5 == D2K_TRI_UNSET, "MD5 записан без прохода");
     fresh_process();
     run(&ts, &r);
     CHECK(r.props.validates_timestamps == D2K_TRI_FALSE, "метка времени: проход не записан");
-    CHECK(r.probes == 18, "TS: зондов %d, ждали 18 (было 19)", r.probes);
+    CHECK(r.probes == 24, "TS: зондов %d, ждали 24", r.probes);
     CHECK(r.props.counts_duplicates == D2K_TRI_UNSET, "дубликаты записаны без прохода");
 }
 
