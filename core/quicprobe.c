@@ -1992,7 +1992,14 @@ static const qp_question qp_list[] = {
     { "мусор",      QK_JUNK,    D2K_QASK_PLAIN,           offsetof(d2k_quic_props, junk_ahead) },
     { "кадры",      QK_RESHAPE, D2K_QASK_SPLIT_CRYPTO,    offsetof(d2k_quic_props, split_crypto) },
     { "датаграммы", QK_SPLIT,   D2K_QASK_PLAIN,           offsetof(d2k_quic_props, split_datagrams) },
-    { "версия2",    QK_RESHAPE, D2K_QASK_VERSION2,        offsetof(d2k_quic_props, version2) },
+    /* «ВЕРСИЯ2» БОЛЬШЕ НЕ ЗАДАЁТСЯ (задача 57, поле 14.10.2026, spike/quicv2.c).
+       Ответ не давал ничего: Cloudflare Initial второй версии молча
+       отбрасывает (на смазочную версию отвечает Version Negotiation), так что
+       на его адресах «0/3» — сервер, а не коробка; коробка линии режет QUIC
+       по имени во всех версиях (fost.club на адрес Google: v1, v2, смазка —
+       0/3, www.google.com туда же — v2 3/3); а движок версию на живом пакете
+       переписать не может — она в связанных данных AEAD. Три зонда в каждом
+       проваленном поиске ради справки. Поле version2 остаётся неизмеренным. */
     { "бит",        QK_RESHAPE, D2K_QASK_CLEAR_FIXED_BIT, offsetof(d2k_quic_props, clear_fixed_bit) },
     { "низкийпорт", QK_SRCPORT, D2K_QASK_PLAIN,           offsetof(d2k_quic_props, low_source_port) },
     { "длина",      QK_RESHAPE, D2K_QASK_LONGER,          offsetof(d2k_quic_props, longer) }

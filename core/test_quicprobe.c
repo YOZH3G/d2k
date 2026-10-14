@@ -1166,13 +1166,14 @@ int main(int argc, char **argv) {
               "вопрос про мусор обязан реально измериться на закреплённом адресе, а не быть пропущен");
         CHECK(r.qprops.low_source_port == D2K_PROP_NO,
               "вопрос про низкий исходный порт обязан измериться: снимок ему не нужен");
-        /* Снимок у этого мока — не настоящий Initial, поэтому четыре вопроса
-           с пересборкой и пара датаграмм честно НЕ СОБИРАЮТСЯ и остаются
-           неизмеренными: несобравшийся зонд не измерение. */
+        /* Снимок у этого мока — не настоящий Initial, поэтому три вопроса
+           с пересборкой («кадры», «бит», «длина»; «версия2» снята задачей 57)
+           и пара датаграмм честно НЕ СОБИРАЮТСЯ и остаются неизмеренными:
+           несобравшийся зонд не измерение. */
         CHECK(r.qprops.split_crypto == D2K_PROP_UNKNOWN &&
               r.qprops.split_datagrams == D2K_PROP_UNKNOWN,
               "несобравшийся зонд обязан оставить свойство неизмеренным, а не «не помогает»");
-        CHECK(strstr(r.reason, "не задано 5 (не собралось)") != NULL,
+        CHECK(strstr(r.reason, "не задано 4 (не собралось)") != NULL,
               "несобранные вопросы обязаны быть названы прямо");
         CHECK(r.probes == 15, "3(база)+3(прямой)+3(шаг2)+3(мусор)+3(низкий порт) на pool[0]");
     }
@@ -1272,7 +1273,7 @@ int main(int argc, char **argv) {
         CHECK(r.verdict == D2K_V_OPAQUE, "большой снимок: контроль жив, решает содержимое");
         CHECK(r.qprops.longer != D2K_PROP_UNKNOWN,
               "большое приветствие потеряло вопрос «длина» — запасной Initial донора не задан");
-        CHECK(strcmp(r.qtrace[6].label, "длина") == 0 && r.qtrace[6].sent == D2K_QUIC_REPEATS,
+        CHECK(strcmp(r.qtrace[5].label, "длина") == 0 && r.qtrace[5].sent == D2K_QUIC_REPEATS,
               "runtime length retains the captured form");
         CHECK(strstr(r.reason, "«длина» задана PROFILE") == NULL,
               "runtime length must not claim a profile substitution");
@@ -1306,13 +1307,12 @@ int main(int argc, char **argv) {
         CHECK(r.verdict == D2K_V_OPAQUE, "контроль жив до и после — решает содержимое");
         CHECK(strstr(r.reason, "не собралось") == NULL,
               "на настоящем снимке не собраться не может ни один вопрос");
-        CHECK(strcmp(r.qtrace[6].label, "длина") == 0 && strstr(r.reason, "PROFILE") == NULL,
+        CHECK(strcmp(r.qtrace[5].label, "длина") == 0 && strstr(r.reason, "PROFILE") == NULL,
               "снимок помещается в 1300 — «длина» задаётся снимком, без PROFILE");
         CHECK(r.qprops.longer_profile == 0, "«длина» снимком помечена PROFILE");
         CHECK(r.qprops.junk_ahead != D2K_PROP_UNKNOWN &&
               r.qprops.split_crypto != D2K_PROP_UNKNOWN &&
               r.qprops.split_datagrams != D2K_PROP_UNKNOWN &&
-              r.qprops.version2 != D2K_PROP_UNKNOWN &&
               r.qprops.clear_fixed_bit != D2K_PROP_UNKNOWN &&
               r.qprops.low_source_port != D2K_PROP_UNKNOWN &&
               r.qprops.longer != D2K_PROP_UNKNOWN,
@@ -1322,8 +1322,18 @@ int main(int argc, char **argv) {
            развёрткой TTL. Незаданное обязано остаться неизмеренным. */
         CHECK(r.qprops.fake_ahead == D2K_PROP_UNKNOWN,
               "вопрос, который вопросник не задаёт, не имеет права получить значение");
-        CHECK(r.probes == 9 + 7 * D2K_QUIC_REPEATS,
-              "3(база)+3(прямой)+3(шаг2)+семь вопросов по три");
+        /* «ВЕРСИЯ2» НЕ ЗАДАЁТСЯ (задача 57, поле 14.10.2026). Cloudflare
+           Initial второй версии молча отбрасывает (на смазочную версию
+           отвечает Version Negotiation), коробка линии режет QUIC по имени во
+           всех версиях, а движок версию на живом пакете переписать не может —
+           ответ ничего не давал и стоил три зонда в каждом проваленном поиске. */
+        CHECK(r.qprops.version2 == D2K_PROP_UNKNOWN,
+              "вопрос «версия2» снова задаётся");
+        for (size_t qi = 0; qi < D2K_QTRACE_MAX; qi++)
+            CHECK(strcmp(r.qtrace[qi].label, "версия2") != 0,
+                  "в трассе вопрос «версия2», которого больше нет");
+        CHECK(r.probes == 9 + 6 * D2K_QUIC_REPEATS,
+              "3(база)+3(прямой)+3(шаг2)+шесть вопросов по три");
 
         /* ТРАССА: по строке на КАЖДЫЙ заданный вопрос, с числами. Из одних
            свойств «приём не сработал» неотличимо от «зонд не долетел по
@@ -1337,7 +1347,7 @@ int main(int argc, char **argv) {
             CHECK(r.qtrace[qi].answered <= r.qtrace[qi].sent,
                   "ответов больше, чем зондов");
         }
-        CHECK(lines == 7, "трасса обязана нести строку на каждый заданный вопрос");
+        CHECK(lines == 6, "трасса обязана нести строку на каждый заданный вопрос");
     }
 
     /* --- СЫРОЙ TTL ОТВЕТА: ФАКТ, А НЕ РАССТОЯНИЕ ------------------------

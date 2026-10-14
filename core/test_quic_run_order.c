@@ -488,7 +488,7 @@ int main(void) {
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
     CHECK(arm.kind==D2K_QA_NOT_FOUND && arm.longer==D2K_PROP_NO);
     CHECK(length_calls==1 && !length_diagnostics);
-    CHECK(r.qprops.longer==D2K_PROP_NO && r.qtrace[6].sent==0);
+    CHECK(r.qprops.longer==D2K_PROP_NO && r.qtrace[5].sent==0);
     arm_second_stalls=0;d2k_quic_arm_data_hook=data_pass;
     length_pass=0;
     /* Оба «нет», фрагменты проходят: план из ответа фрагментации. */
