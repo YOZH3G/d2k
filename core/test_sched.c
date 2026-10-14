@@ -3578,66 +3578,44 @@ int main(int argc, char **argv) {
         d2k_catalog_free(&c_promote);
     }
 
-    /* ЗАДАЧА 18. Поздний RST на здоровой цели не устраивает шторм замеров.
-       Датапат шлёт D2K_SUSPECT_RST_AFTER_APP на любой TLS-поток с app-data и
-       RST. Это низкоуверенное подозрение: замер начинается только после
-       второго такого RST по независимому flow key, а неподтверждённая
-       RX-volume-пара откладывает повтор обычным cooldown, а не двухминутным
-       отдыхом. */
+    /* ЗАДАЧА 18 (пересмотр 15.10.2026). Поздний RST меряется с ПЕРВОГО
+       сигнала: клиент с одним соединением (старые webOS-телевизоры, Safari с
+       одним HTTP/2) второго не даёт. Шторма замеров на здоровой цели нет по
+       другой причине: на здоровом сайте RX-пара кончается «не подтвердилось»,
+       и повтор держит отдых позднего закрытия, а не второй поток. */
     {
         d2k_catalog c18 = {0};
         d2k_sched *s = d2k_sched_new(&c18, sv[0], 0x2d);
-        CHECK(s != NULL, "планировщик для порога позднего RST не завёлся");
+        CHECK(s != NULL, "планировщик для позднего RST не завёлся");
         if (s) {
             saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
             vol_calls = tcp_calls = 0;
             vol_answer = D2K_VOL_PASSED;
             vol_rx_cut = 0;
+            settle(s);
             const char *name = "late-threshold.test";
             d2k_ev h = ev_hello(6, 41040, name);
             d2k_sched_event(s, &h);
             d2k_ev r = ev_suspect(6, 41040);
             r.code = D2K_SUSPECT_RST_AFTER_APP;
-            CHECK(d2k_sched_event(s, &r) == 0,
-                  "одиночный поздний RST сразу запустил замер");
-            settle(s);
-            CHECK(vol_calls == 0 && tcp_calls == 0,
-                  "одиночный поздний RST дошёл до сетевого измерения");
-            CHECK(said("жду второй независимый поток"),
-                  "ожидание второго позднего RST не отражено в журнале");
-            /* Тот же поток повторно — не независимый ключ. */
-            CHECK(d2k_sched_event(s, &r) == 0,
-                  "повтор позднего RST того же потока засчитан как независимый");
-            settle(s);
-            CHECK(vol_calls == 0, "повтор того же потока запустил замер");
-            /* Второй RST вне окна подтверждения не подтверждает первый. */
-            skip_ahead(s, 31000);
-            d2k_ev h2 = ev_hello(6, 41041, name);
-            d2k_sched_event(s, &h2);
-            d2k_ev r2 = ev_suspect(6, 41041);
-            r2.code = D2K_SUSPECT_RST_AFTER_APP;
-            CHECK(d2k_sched_event(s, &r2) == 0,
-                  "устаревший первый поздний RST подтвердил второй");
-            settle(s);
-            CHECK(vol_calls == 0, "поздний RST вне окна запустил замер");
-            /* Независимый поток в окне — подтверждение, замер начинается. */
-            d2k_ev h3 = ev_hello(6, 41042, name);
-            d2k_sched_event(s, &h3);
-            d2k_ev r3 = ev_suspect(6, 41042);
-            r3.code = D2K_SUSPECT_RST_AFTER_APP;
-            CHECK(d2k_sched_event(s, &r3) == 1,
-                  "второй поздний RST по независимому потоку не запустил замер");
+            CHECK(d2k_sched_event(s, &r) == 1,
+                  "одиночный поздний RST не запустил замер");
             settle(s);
             CHECK(vol_calls == 1 && tcp_calls == 0,
-                  "подтверждённый поздний RST не прошёл ровно одну RX-volume-пару");
+                  "одиночный поздний RST не прошёл ровно одну RX-volume-пару");
+            CHECK(said("не дожидаясь второго соединения"),
+                  "замер с первого позднего закрытия не отражён в журнале");
             CHECK(said("позднее закрытие не подтвердилось"),
                   "неподтверждённый поздний RST не отражён в журнале");
-
-            /* Двухминутный отдых прошёл, здоровый трафик продолжает рвать
-               соединения поздним RST — повторного замера быть не должно. */
+            /* Тот же поток повторно — замера нет. */
+            d2k_sched_event(s, &r);
+            settle(s);
+            CHECK(vol_calls == 1, "повтор того же потока запустил второй замер");
+            /* Здоровый трафик продолжает рвать соединения поздним RST —
+               в пределах отдыха повторного замера быть не должно. */
             skip_ahead(s, 3 * 60 * 1000);
-            for (uint16_t port = 41043; port <= 41044; port++) {
+            for (uint16_t port = 41043; port <= 41045; port++) {
                 d2k_ev hh = ev_hello(6, port, name);
                 d2k_sched_event(s, &hh);
                 d2k_ev rr = ev_suspect(6, port);
@@ -3646,9 +3624,9 @@ int main(int argc, char **argv) {
                 settle(s);
             }
             CHECK(vol_calls == 1,
-                  "неподтверждённый поздний RST повторил замер через два минуты");
+                  "неподтверждённый поздний RST повторил замер в пределах отдыха");
             CHECK(said("замер отложен после неподтверждённого прошлого замера"),
-                  "cooldown неподтверждённого позднего RST не отражён в журнале");
+                  "отдых неподтверждённого позднего RST не отражён в журнале");
             CHECK(bindings_of(&c18, name, 6) == 0,
                   "неподтверждённый поздний RST записал обход");
             d2k_sched_free(s);
@@ -3738,12 +3716,10 @@ int main(int argc, char **argv) {
         vol_rx_short = 0; vol_rx_short_bytes = 0;
     }
 
-    /* ЗАДАЧА 50. Повтор FIN без ответа на потоке БЕЗ плана (глухой обрыв
-       ответа Cloudflare, rua.gr 03.10) — тот же низкоуверенный сигнал
-       позднего закрытия, что поздний RST: одиночный не меряется, второй по
-       независимому потоку в окне запускает ровно одну RX-volume-пару, а не
-       полный поиск. Поздний RST и повтор FIN подтверждают друг друга: оба —
-       оборванный ответ той же цели. */
+    /* ЗАДАЧА 50 (пересмотр 15.10.2026). Повтор FIN без ответа на потоке БЕЗ
+       плана (глухой обрыв ответа) меряется с первого сигнала, ровно одной
+       RX-volume-парой, без полного поиска. Второй сигнал той же цели на
+       другом потоке второго замера не запускает. */
     {
         d2k_catalog c50 = {0};
         d2k_sched *s = d2k_sched_new(&c50, sv[0], 0x2d);
@@ -3761,32 +3737,17 @@ int main(int argc, char **argv) {
             d2k_ev f = ev_suspect(6, 41060);
             f.code = D2K_SUSPECT_FIN_RETRY;
             f.planned = D2K_LINK_PLANNED_NO;
-            CHECK(d2k_sched_event(s, &f) == 0,
-                  "одиночный повтор FIN без плана сразу запустил замер");
-            settle(s);
-            CHECK(vol_calls == 0 && tcp_calls == 0,
-                  "одиночный повтор FIN без плана дошёл до сетевого измерения");
-            CHECK(said("жду второй независимый поток"),
-                  "ожидание второго позднего закрытия не отражено в журнале");
-            CHECK(d2k_sched_event(s, &f) == 0,
-                  "повтор FIN того же потока засчитан как независимый");
-            settle(s);
-            CHECK(vol_calls == 0, "повтор того же потока запустил замер");
-            d2k_ev h2 = ev_hello(6, 41061, name);
-            d2k_sched_event(s, &h2);
-            d2k_ev f2 = ev_suspect(6, 41061);
-            f2.code = D2K_SUSPECT_FIN_RETRY;
-            f2.planned = D2K_LINK_PLANNED_NO;
-            CHECK(d2k_sched_event(s, &f2) == 1,
-                  "второй повтор FIN по независимому потоку не запустил замер");
+            CHECK(d2k_sched_event(s, &f) == 1,
+                  "одиночный повтор FIN без плана не запустил замер");
             settle(s);
             CHECK(vol_calls == 1 && tcp_calls == 0,
-                  "подтверждённый повтор FIN не прошёл ровно одну RX-volume-пару");
+                  "одиночный повтор FIN не прошёл ровно одну RX-volume-пару");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c50);
 
-        /* Смешанная пара: поздний RST, затем повтор FIN на другом потоке. */
+        /* Смешанная пара: поздний RST, затем повтор FIN на другом потоке —
+           один замер, не два. */
         c50 = (d2k_catalog){0};
         s = d2k_sched_new(&c50, sv[0], 0x2d);
         CHECK(s != NULL, "планировщик смешанной пары не завёлся");
@@ -3795,8 +3756,6 @@ int main(int argc, char **argv) {
             vol_calls = tcp_calls = 0;
             vol_answer = D2K_VOL_PASSED;
             vol_rx_cut = 0;
-            /* Часы планировщика ставит первый тик; без него первое
-               подозрение помечено нулём и окно истекло бы на settle(). */
             settle(s);
             const char *name = "silent-cut-mixed.test";
             d2k_ev h = ev_hello(6, 41062, name);
@@ -3810,11 +3769,10 @@ int main(int argc, char **argv) {
             d2k_ev f2 = ev_suspect(6, 41063);
             f2.code = D2K_SUSPECT_FIN_RETRY;
             f2.planned = D2K_LINK_PLANNED_NO;
-            CHECK(d2k_sched_event(s, &f2) == 1,
-                  "поздний RST и повтор FIN на независимых потоках не подтвердили друг друга");
+            d2k_sched_event(s, &f2);
             settle(s);
             CHECK(vol_calls == 1 && tcp_calls == 0,
-                  "смешанная пара позднего закрытия не прошла ровно одну RX-volume-пару");
+                  "смешанная пара позднего закрытия дала не ровно одну RX-volume-пару");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&c50);

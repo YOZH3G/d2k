@@ -1985,50 +1985,6 @@ static void stall_budgets_push(d2k_sched *s) {
         list, D2K_TCP_STALL_SLACK);
 }
 
-/* Порог позднего закрытия (поздний RST после app-data или повтор FIN без
-   ответа на потоке без плана): 1 — второе такое по независимому потоку в
-   окне, замер можно начинать; 0 — первое (или повтор того же потока), ждём. */
-static int late_rst_confirmed(d2k_sched *s, const char *name, const d2k_ev *ev) {
-    uint8_t family = ev->family ? ev->family : 4;
-    late_rst_pending *p = NULL;
-    for (size_t i = 0; i < SCHED_LATE_RST_SLOTS; i++) {
-        late_rst_pending *c = &s->late_rst[i];
-        if (c->used && c->transport == ev->transport && c->family == family &&
-            strcmp(c->name, name) == 0) { p = c; break; }
-    }
-    if (p && s->now_ms - p->seen_ms <= SCHED_LATE_RST_CONFIRM_MS) {
-        if (ev_matches_flow(ev, &p->flow)) { return 0; }
-        memset(p, 0, sizeof *p);
-        say(s, "по %s второе позднее закрытие (%s) на независимом потоке за %d с — "
-               "подтверждаю подозрение", name, late_close_what(ev->code),
-            SCHED_LATE_RST_CONFIRM_MS / 1000);
-        return 1;
-    }
-    if (!p) {
-        p = &s->late_rst[s->late_rst_next];
-        s->late_rst_next = (s->late_rst_next + 1) % SCHED_LATE_RST_SLOTS;
-    }
-    memset(p, 0, sizeof *p);
-    snprintf(p->name, sizeof p->name, "%s", name);
-    p->transport = ev->transport;
-    p->family = family;
-    memcpy(p->flow.a_ip, ev->low_ip, 16);
-    memcpy(p->flow.b_ip, ev->high_ip, 16);
-    p->flow.a_port = ev->low_port;
-    p->flow.b_port = ev->high_port;
-    p->flow.transport = ev->transport;
-    p->flow.family = family;
-    p->seen_ms = s->now_ms;
-    p->used = 1;
-    char quiet_key[300];
-    snprintf(quiet_key, sizeof quiet_key, "late %u %s", ev->transport, name);
-    say_quiet(s, quiet_key,
-        "по %s одиночное позднее закрытие (%s) — жду второй независимый поток до %d с; "
-           "замер пока не запускаю", name, late_close_what(ev->code),
-        SCHED_LATE_RST_CONFIRM_MS / 1000);
-    return 0;
-}
-
 static task *task_of(d2k_sched *s, const char *name, uint8_t transport, uint8_t family) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         if (s->tasks[i].state != T_FREE && s->tasks[i].transport == transport &&
@@ -7199,11 +7155,22 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         !tcp_stall_in_name_band(s, name, ev)) {
         return 0;
     }
-    const int late_close_needs_repeat = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
-        (ev->code == D2K_SUSPECT_FIN_RETRY && ev->planned == D2K_LINK_PLANNED_NO);
-    if (late_close_needs_repeat && (!t || t->state == T_WATCHING) &&
-        !late_rst_confirmed(s, name, ev)) {
-        return 0;
+    /* ПОЗДНЕЕ ЗАКРЫТИЕ — ЗАМЕР С ПЕРВОГО СИГНАЛА (владелец, 15.10.2026).
+       Прежде здесь ждали второго такого закрытия на независимом потоке за
+       30 с. Клиент с одним соединением (старые телевизоры на webOS тянут
+       YouTube одним запросом; Safari держит одно HTTP/2 на источник) второго
+       сигнала не даёт никогда, и обрыв объёма у него не мерился вовсе. Ворота
+       — сама RX-пара identity/gzip, как у «TCP встал на бюджете» выше: на
+       здоровом сайте замер кончается первым же завершённым ответом
+       (measure_response_volume), неподтверждённая пара даёт отдых позднего
+       закрытия на 10 мин, и шторма замеров на одном имени не будет. */
+    if ((ev->code == D2K_SUSPECT_RST_AFTER_APP ||
+         (ev->code == D2K_SUSPECT_FIN_RETRY && ev->planned == D2K_LINK_PLANNED_NO)) &&
+        (!t || t->state == T_WATCHING)) {
+        char quiet_key[300];
+        snprintf(quiet_key, sizeof quiet_key, "late %u %s", ev->transport, name);
+        say_quiet(s, quiet_key, "по %s позднее закрытие (%s) — проверяю обрыв ответа сам, "
+                  "не дожидаясь второго соединения", name, late_close_what(ev->code));
     }
     if (t) {
         if (t->state == T_QUEUED) {

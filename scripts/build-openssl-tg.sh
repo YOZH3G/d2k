@@ -53,7 +53,20 @@ cd "$OBJ_DIR"
 # Проверять изменения размера — scripts/check-router-builds.sh под QEMU
 # (openssl-link-smoke достаёт ED25519 из провайдера по умолчанию, то есть ровно
 # тот путь, который сборкой секций и можно было бы сломать).
-SIZE_CFLAGS='-ffunction-sections -fdata-sections'
+# 15.10.2026 (задача 53): mips-роутерам с 8/16 МиБ флеша d2ktg в 5,1 МБ —
+# больше половины комплекта. Сняты возможности, которых d2ktg не вызывает
+# (telegram/src: TLS-клиент от 1.2 с проверкой сертификата по имени/IP,
+# ED25519, SHA-1, SHA-256, HMAC, RAND) и которых рукопожатие с нашим реле не
+# касается. RSA и EC оставлены: на них подписаны цепочки Let's Encrypt.
+# Таблицы раскрутки не нужны: d2ktg — C без исключений, musl отменяет потоки
+# сигналами, а не раскруткой. Проверка — живое рукопожатие с реле (регистрация
+# и подключение d2ktg на роутере) и scripts/check-router-builds.sh под QEMU.
+SIZE_CFLAGS='-ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables'
+UNUSED_FEATURES='no-dsa no-cms no-ct no-ocsp no-srp no-comp no-engine no-dynamic-engine
+    no-dtls no-ssl3 no-idea no-rc2 no-rc4 no-rc5 no-des no-bf no-cast no-camellia no-aria
+    no-seed no-sm2 no-sm3 no-sm4 no-gost no-md4 no-mdc2 no-whirlpool no-ts no-rfc3779
+    no-cmp no-quic no-nextprotoneg no-srtp no-sctp no-ocb no-siphash no-scrypt'
+
 ASM_FLAGS=no-asm
 case "$ARCH" in arm64|amd64) ASM_FLAGS= ;; esac
 ATOMIC_FLAGS=
@@ -63,7 +76,7 @@ case "$ARCH" in mips|mipsel|x86) ATOMIC_FLAGS=-DBROKEN_CLANG_ATOMICS ;; esac
 # shellcheck disable=SC2086
 CC="$ZIG cc -target $TARGET $TARGET_FLAGS $SIZE_CFLAGS" \
 AR="$ZIG ar" RANLIB="$ZIG ranlib" \
-    "$SRC_DIR/Configure" "$SSL_TARGET" no-shared no-tests no-apps no-docs no-legacy $ASM_FLAGS $ATOMIC_FLAGS \
+    "$SRC_DIR/Configure" "$SSL_TARGET" no-shared no-tests no-apps no-docs no-legacy $UNUSED_FEATURES $ASM_FLAGS $ATOMIC_FLAGS \
     --prefix="$PREFIX" --openssldir=/opt/d2k/certs
 make -j "$JOBS" build_libs
 make install_sw
