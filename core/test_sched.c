@@ -9302,17 +9302,21 @@ rx_volume_tests:
                 d2k_sched_event(s, &ap);
             }
             if ((outcome == 0 && total_bindings(&c) == 2) ||
-                ((outcome == 1 || outcome == 3) && tcp_calls) ||
-                (outcome == 2 && ver_calls >= 3)) break;
+                (outcome != 0 && tcp_calls)) break;
         }
         CHECK(vol_calls == 1, "family retry repeats baseline unnecessarily");
         if (total_bindings(&c) != (outcome == 0 ? 2u : 1u) ||
-            tcp_calls != (outcome == 1 || outcome == 3 ? 1 : 0))
+            tcp_calls != (outcome != 0 ? 1 : 0))
             fprintf(stderr, "family outcome=%d tcp=%d ver=%d\n%s\n", outcome, tcp_calls, ver_calls, saidbuf);
         CHECK(total_bindings(&c) == (outcome == 0 ? 2u : 1u),
               "family success borrowed without own native proof");
-        CHECK(tcp_calls == (outcome == 1 || outcome == 3 ? 1 : 0),
+        /* Неприписанный успех (2) — тоже не доказательство: как и прочие
+           неудачи, он возвращает исходный замер, а не запасной список (поле
+           14.10.2026, www.bbc.com). */
+        CHECK(tcp_calls == (outcome != 0 ? 1 : 0),
               "family trial does not resume original search or bypasses healthy baseline");
+        CHECK(!said("из запасного перебора"),
+              "family trial opened the fallback list without a measurement");
         if (outcome == 0) {
             int native = 0;
             for (size_t bi = 0; bi < c.n_boxes; bi++)
@@ -9399,6 +9403,73 @@ rx_volume_tests:
         d2k_sched_rx_ver_hook = stub_ver;
         d2k_sched_rx_gzip_ver_hook = stub_ver;
         vol_rx_tls_unavailable = 0; vol_answer = D2K_VOL_PASSED;
+    }
+    /* Поле 14.10.2026, www.bbc.com: позднее закрытие, прямой RX-зонд получил
+       сброс до TLS, свой план цели не дошёл до приложения — и следующей
+       строкой «8 планов из запасного перебора донора», без единого вопроса
+       замера. Перебор — только когда замер доказал блок и выразить его
+       нечем; здесь замера не было, значит дальше идёт он. */
+    {
+        d2k_verdict old_tcp = tcp_answer;
+        d2k_ver_level old_ver = ver_answer;
+        d2k_catalog c = {0};
+        c.boxes = calloc(1, sizeof *c.boxes);
+        CHECK(c.boxes != NULL, "late bootstrap box allocation failed");
+        if (c.boxes) {
+            c.n_boxes = 1;
+            d2k_cat_box *b = c.boxes;
+            snprintf(b->id, sizeof b->id, "box-late-boot");
+            b->plans = calloc(1, sizeof *b->plans);
+            b->binds = calloc(1, sizeof *b->binds);
+            CHECK(b->plans && b->binds, "late bootstrap fixture allocation failed");
+            b->n_plans = b->n_binds = 1;
+            snprintf(b->plans[0].id, sizeof b->plans[0].id, "plan-late-boot");
+            snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "tls");
+            b->plans[0].enabled = 1;
+            b->plans[0].text = strdup("d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                "proto tcp tls\nsplit payload_start +2\norder forward\n");
+            d2k_cat_binding *bd = b->binds;
+            snprintf(bd->kind, sizeof bd->kind, "name");
+            snprintf(bd->target, sizeof bd->target, "late-boot-fails.test");
+            snprintf(bd->plan_id, sizeof bd->plan_id, "plan-late-boot");
+            bd->enabled = 1; bd->level = 3; bd->transport = 6;
+            bd->shape = D2K_SHAPE_MODERN; bd->family = 4;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0'; forget_sent();
+            d2k_sched_set_say(s, collect_say, NULL);
+            vol_calls = tcp_calls = 0;
+            vol_answer = D2K_VOL_UNREACHABLE; vol_rx_cut = 0;
+            vol_rx_tls_unavailable = 1; tcp_answer = D2K_V_CLEAR;
+            ver_answer = D2K_VER_TRANSPORT; ver_answer_port = 40251; ver_fail_first = 0;
+            d2k_ev h = ev_hello(6, 40251, "late-boot-fails.test"), sh;
+            d2k_sched_event(s, &h);
+            CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
+                  "late bootstrap shape fixture failed");
+            d2k_sched_event(s, &sh);
+            d2k_ev su = ev_suspect(6, 40251);
+            su.code = D2K_SUSPECT_FIN_RETRY;
+            d2k_sched_event(s, &su);
+            int installed = 0;
+            for (int i = 0; i < 4000 && tcp_calls == 0 && !said("из запасного перебора"); i++) {
+                tick_once(s);
+                int n = sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+                if (n > installed) {
+                    installed = n;
+                    d2k_ev ap = ev_applied(6, 40251);
+                    d2k_sched_event(s, &ap);
+                }
+            }
+            CHECK(said("без нового общего перебора"),
+                  "late bootstrap fixture did not reach the bootstrap plan");
+            CHECK(!said("из запасного перебора"),
+                  "позднее закрытие открыло запасной перебор без замера");
+            CHECK(tcp_calls >= 1,
+                  "после неудачи своего плана позднего закрытия не запущен полный замер");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c);
+        vol_rx_tls_unavailable = 0; vol_answer = D2K_VOL_PASSED;
+        tcp_answer = old_tcp; ver_answer = old_ver;
     }
     /* Парный RX-замер тоже поднимает поиск без доменного списка и сохраняет
        направление/объём как отдельную примету; gzip completion — часть

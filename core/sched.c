@@ -4226,6 +4226,11 @@ static int install_next(d2k_sched *s, task *t) {
     }
         /* Запасной перебор — последний этап оригинального инструмента. */
         if(t->family_fast==1 || t->own_first == 2) return -1;
+        /* Свой план позднего закрытия (rx_saved_bootstrap) — не замер. Его
+           неудача ведёт к полному замеру, а не к запасному списку: поле
+           14.10.2026, www.bbc.com — «8 планов из запасного перебора донора»
+           без единого вопроса замера. */
+        if (t->rx_bootstrap_only) return -1;
         /* ЗАМЕР УЖЕ СДЕЛАН И ЕГО КАНДИДАТЫ ЕЩЁ НЕ ИСПЫТАНЫ (задача 37).
            Очередь узнанной коробки кончилась, а результат прямого замера
            лежит в t->res: следующими идут ЕГО кандидаты (ветка «проверяю
@@ -10266,23 +10271,27 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     moved++; continue;
                 }
                 if (t->rx_bootstrap_only && !t->vol.rx_cut) {
-                    if (t->family_reuse == 2) {
-                        trial_retire(s, t);
-                        t->family_reuse = 3; t->rx_bootstrap_only = 0;
-                        t->exec_refused = t->exec_probed = 0;
-                        t->skip_volume_once = 1;
-                        t->n_plans = t->n_known = t->next_plan = 0;
-                        t->box_id[0] = '\0';
-                        t->state = T_ASKING;
+                    /* Прямой зонд не дошёл до TLS, свой план цели тоже — про
+                       коробку ещё не сказано ничего. Дальше полный замер
+                       донора, а не отказ и не запасной список (поле
+                       14.10.2026, www.bbc.com). */
+                    int other_family = t->family_reuse == 2;
+                    trial_retire(s, t);
+                    if (other_family) t->family_reuse = 3;
+                    t->rx_bootstrap_only = 0;
+                    t->exec_refused = t->exec_probed = 0;
+                    t->skip_volume_once = 1;
+                    t->n_plans = t->n_known = t->next_plan = 0;
+                    t->box_id[0] = '\0';
+                    t->state = T_ASKING;
+                    if (other_family)
                         say(s, "по %s план другого семейства не подтвердился; "
                                "продолжаю исходный поиск без повторения объёмной базы", t->name);
-                        if (start_worker(s, t, JOB_CLASSIFY) != 0) task_fail(s, t, now_ms);
-                        moved++; continue;
-                    }
-                    say(s, "по %s остаточный RX-блок не подтверждён; общий перебор не запускаю", t->name);
-                    task_fail(s, t, now_ms);
-                    moved++;
-                    continue;
+                    else
+                        say(s, "по %s свой план не подтвердился, а прямой зонд не дошёл до TLS; "
+                               "перебор не запускаю — продолжаю полным замером", t->name);
+                    if (start_worker(s, t, JOB_CLASSIFY) != 0) task_fail(s, t, now_ms);
+                    moved++; continue;
                 }
                 if (t->n_known > 0 && t->cached_measure_valid) {
                     d2k_vres measured = t->res;
