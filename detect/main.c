@@ -7,6 +7,10 @@
  */
 #include "d2k_detect.h"
 
+/* core/measured.c (SHARED_SRC): то же ECH-приветствие белого имени, что
+   планировщик кладёт в opt.white. */
+int d2k_white_decoy_hello(const char *name, uint8_t *out, size_t cap, size_t *len);
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -24,6 +28,8 @@ static void usage(void)
         "  --only ИМЯ         прогнать только эту гипотезу (для отладки зондов)\n"
         "  --skip ИМЯ         не пробовать эту гипотезу (можно повторять)\n"
         "  --control-sni ИМЯ  имя для контрольного зонда; сервер обязан его обслуживать\n"
+        "  --white ИМЯ        ECH-приманка вопроса «приветствие под меткой» — то же\n"
+        "                     белое имя, что даёт планировщик (net.name или hcaptcha.com)\n"
         "  --control-raw HEX  байты контрольного зонда шестнадцатеричной строкой.\n"
         "                     Нужен сверке: контроль — такой же ВХОД замера, как триггер,\n"
         "                     и гипотезы с приманкой берут длину перекрытия равной его длине\n"
@@ -278,6 +284,7 @@ int main(int argc, char **argv)
 
     signal(SIGPIPE, SIG_IGN); /* мёртвый пир — исход «убито», не выход 141 */
     const char *sni = NULL, *raw = NULL, *ctl_sni = NULL, *ctl_raw = NULL, *hello = "modern";
+    const char *white_name = NULL;
     int as_json = 0;
     int dump_trigger = 0;
     int progress = 0;
@@ -308,6 +315,7 @@ int main(int argc, char **argv)
             i++;
         }
         else if (strcmp(a, "--control-sni") == 0 && v)  { ctl_sni = v; i++; }
+        else if (strcmp(a, "--white") == 0 && v)        { white_name = v; i++; }
         else if (strcmp(a, "--control-raw") == 0 && v)  { ctl_raw = v; i++; }
         else if (strcmp(a, "--hello") == 0 && v)        { hello = v; i++; }
         else if (strcmp(a, "--no-raw") == 0)            { opt.no_raw = 1; }
@@ -411,6 +419,19 @@ int main(int argc, char **argv)
         }
     } else {
         (void)d2k_trigger_control("d2k", &opt.control, err, sizeof(err));
+    }
+
+    if (white_name) {
+        /* Тот же вход, что даёт планировщик (bridge_input): без него вопрос
+           «ECH-приветствие под меткой» утилитой не задавался вовсе. */
+        size_t wl = 0;
+        if (d2k_white_decoy_hello(white_name, opt.white.payload, sizeof opt.white.payload, &wl) != 0) {
+            fprintf(stderr, "classify: --white %s: приветствие не собралось\n", white_name);
+            return 2;
+        }
+        opt.white.len = wl;
+        opt.white.accept = D2K_ACCEPT_TLSRECORD;
+        snprintf(opt.white.name, sizeof opt.white.name, "white");
     }
 
     int64_t progress_t0 = d2k_now_ms();
