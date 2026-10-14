@@ -3847,6 +3847,12 @@ static size_t refill_from_fallback(d2k_sched *s, task *t) {
        RX-volume-профиль (verdict_to_plans), а не исчерпание очереди. */
     t->rx_volume_candidate_pending = t->vol.rx_cut && rx_ladder_pending(t);
     size_t ladder = added;
+    /* ЗАМЕРЕННЫЙ ОБРЫВ ОТВЕТА — ТОЛЬКО ЛЕСТНИЦА SNI. Обрыв меряется своим
+       вопросом, и перебирать для него можно только имя (белое имя сети,
+       fake-SNI + split); запасной список оригинала к обрыву отношения не
+       имеет. Поле 14.10.2026, www.jetadmin.io: две ступени лестницы, затем
+       четыре порции запасного перебора в той же задаче. */
+    if (t->transport == 6 && t->vol.rx_cut) cap = added;
     while (added < cap) {
         char text[sizeof t->plans[0]];
         if (d2k_fallback_plan(t->fb_next, sh, SCHED_DECOY, s->send_cap,
