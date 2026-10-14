@@ -42,6 +42,10 @@
  * (единственное подключение к датапату) и в комментарии у Run на Go-стороне.
  */
 #define _POSIX_C_SOURCE 200809L
+#if defined(__linux__)
+#define _DEFAULT_SOURCE   /* madvise: ячейка задачи отдаёт страницы (задача 60) */
+#include <sys/mman.h>
+#endif
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -3330,6 +3334,20 @@ static void task_reset(d2k_sched *s, task *t) {
        ловил это немедленной смертью по SIGPIPE. */
     if (t->probe_fd > 0) { close(t->probe_fd); }
     memset(t, 0, sizeof *t);
+#if defined(__linux__) && defined(MADV_DONTNEED)
+    /* ЯЧЕЙКА ОТДАЁТ ПАМЯТЬ (задача 60). memset выше касается всех ~114 КиБ
+       ячейки, и каждая хоть раз занятая ячейка оставалась в RSS навсегда —
+       до 7,3 МиБ на 64 ячейки: ровно «растёт до перезапуска» (жалоба
+       14.10.2026, Netis N6: d2kc 10,6 → 29,1 МБ за 1 д 9 ч). Целые страницы
+       внутри ячейки возвращаются ядру; частная анонимная память при следующем
+       касании приходит нулями — то же, что записал memset. */
+    {
+        uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+        uintptr_t a = ((uintptr_t)t + pg - 1) & ~(pg - 1);
+        uintptr_t b = ((uintptr_t)t + sizeof *t) & ~(pg - 1);
+        if (pg && b > a) { (void)madvise((void *)a, (size_t)(b - a), MADV_DONTNEED); }
+    }
+#endif
     t->prop_fd = -1;
     t->prop_q = -1;
     t->probe_fd = -1;   /* та же ловушка нуля, что у prop_fd */
