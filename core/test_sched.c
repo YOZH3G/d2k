@@ -5074,6 +5074,32 @@ admission_only_run:
         }
     }
 
+    /* --- своё имя-приманка — не цель ------------------------------------
+       Поле 14.10.2026: приветствия с disk.rzd.ru (приманка SCHED_DECOY) шли
+       через роутер от второго D2K за ним (его фальшивки и контроль), коробка
+       их не отвечала, датапат увидел «приветствие повторено», и контроллер
+       искал обход своей же приманки по адресам чужих целей. Приманку выбирают
+       как имя, которое проходит; поиск по ней ничего не открывает. */
+    {
+        static const char *const decoys[] = { "disk.rzd.ru", "DISK.RZD.RU" };
+        for (size_t i = 0; i < 2; i++) {
+            d2k_catalog empty = {0};
+            d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+            uint16_t port = (uint16_t)(40620 + i);
+            tcp_calls = quic_calls = 0;
+            d2k_ev h = ev_hello(i ? 17 : 6, port, decoys[i]);
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(i ? 17 : 6, port);
+            int rc = d2k_sched_event(s, &su);
+            CHECK(rc == 0, "своя приманка попала в очередь замеров");
+            settle(s);
+            CHECK(tcp_calls == 0 && quic_calls == 0,
+                  "своя приманка запустила сетевое измерение");
+            d2k_sched_free(s);
+            d2k_catalog_free(&empty);
+        }
+    }
+
     /* --- подозрение по TCP идёт в дерево вердиктов --------------------- */
     {
         tcp_calls = quic_calls = 0;
