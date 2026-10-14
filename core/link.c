@@ -402,6 +402,12 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         if (rlen >= 7) {
             out->server_hello = rest[6];
         }
+        /* ПРИМЕНЯЛСЯ ЛИ ПЛАН К ЭТОМУ ОБМЕНУ — тем же опциональным приёмом,
+           что server_hello: нет байта — ноль (D2K_LINK_PLANNED_UNKNOWN), и
+           гашения замера по неизвестному обмену не будет. */
+        if (rlen >= 8) {
+            out->planned = rest[7];
+        }
         break;
     case D2K_EV_SHAPE:
         if (rlen > sizeof out->shape) {

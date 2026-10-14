@@ -1677,6 +1677,12 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         memset(&det, 0, sizeof det);
         det.tos = fl->rev_types;   /* набор увиденных типов записей */
         det.server_hello = fl->rev_server_hello;
+        /* ПРИМЕНЯЛСЯ ЛИ ПЛАН — то же поле, что у подозрения (suspect_num).
+           Обмен на потоке БЕЗ плана значит, что имя завершает рукопожатие
+           само, и последующий RST/молчание по нему — не блок (поле
+           15.10.2026, медиа VK: часть соединений «обмен пошёл» без плана,
+           часть — «сброс в ответ на приветствие»). */
+        det.planned = fl->plan_done ? D2K_PLANNED_YES : D2K_PLANNED_NO;
         d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_EXCHANGE,
                         fl->rev_first_type, fl->rev_payload_after_hello,
                         &det, NULL, 0, NULL);

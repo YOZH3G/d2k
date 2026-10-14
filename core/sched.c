@@ -1153,6 +1153,19 @@ typedef struct {
     int64_t seen_ms;
 } late_rst_pending;
 
+/* ЧИСТОЕ РУКОПОЖАТИЕ БЕЗ ПЛАНА (поле 15.10.2026, медиа VK). Имя, которое
+   недавно завершило обмен с ответом сервера на потоке БЕЗ нашего плана,
+   работает само; RST/молчание по нему на рукопожатии — не блок, а штатный
+   сброс сервером лишних соединений. Гасит замер ТОЛЬКО на рукопожатии
+   (RST/SILENT/REPEAT); обрыв объёма и позднее закрытие мерятся как прежде. */
+typedef struct {
+    char name[256];
+    uint8_t transport, family, used;
+    int64_t seen_ms;
+} clean_hs_seen;
+#define SCHED_CLEAN_HS_SLOTS 16
+#define SCHED_CLEAN_HS_MS (60 * 1000)
+
 /* QUIC ДЛЯ ИМЕНИ НЕ ПРОПУСКАЕТСЯ (задача 50, раунд 2, требование 5c).
    Обрыв QUIC после рукопожатия воспроизведён своим запросом, обхода по QUIC
    поиск не нашёл: на имя ставится план quicdeny, и браузер уходит на TCP.
@@ -1206,6 +1219,8 @@ struct d2k_sched {
     dead_address    dead_addrs[SCHED_COOLDOWN_SLOTS];
     late_rst_pending late_rst[SCHED_LATE_RST_SLOTS];
     size_t       late_rst_next;
+    clean_hs_seen clean_hs[SCHED_CLEAN_HS_SLOTS];
+    size_t       clean_hs_next;
     int64_t      groups_expired_ms;   /* последняя чистка старых отказов семейств */
     /* Повторяемые объяснения, уже сказанные: ключ и срок молчания. */
     struct { char key[300]; int64_t until_ms; } quiet[SCHED_QUIET_SLOTS];
@@ -7021,6 +7036,8 @@ static int is_telegram_tunnel_domain(const char *name) {
     return strcasecmp(name + name_len - domain_len, domain) == 0;
 }
 
+static int clean_handshake_recent(d2k_sched *s, const char *name, uint8_t transport,
+                                  uint8_t family);
 static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     /* Имя копируется СРАЗУ, а не держится указателем в кольцо имён: и потому
        что кольцо переживает вытеснение (следующее приветствие может занять
@@ -7083,6 +7100,23 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
            ней искал обход своей же приманки по адресам чужих целей. */
         say_quiet(s, "decoy", "по %s замер не запускаю: это имя-приманка D2K, а не цель",
                   name);
+        return 0;
+    }
+    /* ИМЯ ЗАВЕРШИЛО РУКОПОЖАТИЕ БЕЗ ПЛАНА — НЕ БЛОК НА РУКОПОЖАТИИ (поле
+       15.10.2026, медиа VK: сервер сам сбрасывает лишние соединения, а
+       рядом те же имена завершают обмен без нашего плана). Гасим только
+       подозрения уровня рукопожатия (RST/повтор/молчание) и только если сам
+       поток подозрения шёл без плана: деградация подтверждённой цели (план
+       применён) и обрыв объёма/позднее закрытие сюда не попадают. */
+    if (ev->transport == 6 && ev->planned != D2K_LINK_PLANNED_YES &&
+        (ev->code == D2K_SUSPECT_RST || ev->code == D2K_SUSPECT_REPEAT ||
+         ev->code == D2K_SUSPECT_SILENT) &&
+        clean_handshake_recent(s, name, 6, ev->family ? ev->family : 4)) {
+        char quiet_key[300];
+        snprintf(quiet_key, sizeof quiet_key, "clean-hs %s", name);
+        say_quiet(s, quiet_key,
+            "по %s замер не запускаю: имя только что завершило рукопожатие без обхода "
+            "— сброс на другом соединении не блок", name);
         return 0;
     }
     int64_t cooldown_left_ms = 0;
@@ -8566,7 +8600,51 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
    internal/classify/trigger.go), и теперь так же принимают оба наших
    опросника (0009, U1). Для ПОСЛЕДУЮЩЕГО живого соединения наблюдение
    остаётся прежним: там вопрос другой. */
+/* Запоминаем имя, завершившее обмен с ответом сервера БЕЗ нашего плана. */
+static void note_clean_handshake(d2k_sched *s, const char *name, uint8_t transport,
+                                 uint8_t family) {
+    if (!name || !name[0]) return;
+    clean_hs_seen *slot = NULL;
+    for (size_t i = 0; i < SCHED_CLEAN_HS_SLOTS; i++) {
+        clean_hs_seen *c = &s->clean_hs[i];
+        if (c->used && c->transport == transport && c->family == family &&
+            strcmp(c->name, name) == 0) { slot = c; break; }
+    }
+    if (!slot) {
+        slot = &s->clean_hs[s->clean_hs_next];
+        s->clean_hs_next = (s->clean_hs_next + 1) % SCHED_CLEAN_HS_SLOTS;
+        memset(slot, 0, sizeof *slot);
+        snprintf(slot->name, sizeof slot->name, "%s", name);
+        slot->transport = transport;
+        slot->family = family;
+        slot->used = 1;
+    }
+    slot->seen_ms = s->now_ms;
+}
+
+/* Было ли у имени недавно чистое рукопожатие без плана. */
+static int clean_handshake_recent(d2k_sched *s, const char *name, uint8_t transport,
+                                  uint8_t family) {
+    for (size_t i = 0; i < SCHED_CLEAN_HS_SLOTS; i++) {
+        const clean_hs_seen *c = &s->clean_hs[i];
+        if (c->used && c->transport == transport && c->family == family &&
+            strcmp(c->name, name) == 0) {
+            return s->now_ms - c->seen_ms <= SCHED_CLEAN_HS_MS;
+        }
+    }
+    return 0;
+}
+
 static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
+    /* Обмен с ответом сервера на потоке без плана — имя работает само.
+       Запоминаем по имени (recall по ключу потока): по нему гасится замер
+       на рукопожатии (поле 15.10.2026, медиа VK). Только TCP и только с
+       разобранным ServerHello: это доказательство рукопожатия (§4.2). */
+    if (ev->transport == 6 && ev->server_hello &&
+        ev->planned == D2K_LINK_PLANNED_NO) {
+        const char *nm = recall(s, ev);
+        if (nm) note_clean_handshake(s, nm, 6, ev->family ? ev->family : 4);
+    }
     /* Наблюдение UDP-ответа по потоку с применённым приёмом. Раньше
        всех прочих разборов: у UDP нет типов записей TLS, и проверка на
        прикладные данные ниже отбросила бы его. */

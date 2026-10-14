@@ -5074,6 +5074,47 @@ admission_only_run:
         }
     }
 
+    /* --- имя с чистым рукопожатием без плана не идёт в замер по RST ------
+       Поле 15.10.2026, медиа VK: сервер сбрасывает лишние соединения, рядом
+       те же имена завершают обмен без плана. RST на рукопожатии гасится,
+       обрыв объёма (позднее закрытие) — нет. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_calls = quic_calls = 0;
+        const char *nm = "clean.media.test";
+        /* Поток A: обмен с ответом сервера без плана → чистое рукопожатие. */
+        d2k_ev hA = ev_hello(6, 40700, nm); d2k_sched_event(s, &hA);
+        d2k_ev xA = ev_exchange(6, 40700, 1); xA.planned = D2K_LINK_PLANNED_NO;
+        d2k_sched_event(s, &xA);
+        /* Поток B: RST на рукопожатии того же имени без плана → гасим. */
+        d2k_ev hB = ev_hello(6, 40701, nm); d2k_sched_event(s, &hB);
+        d2k_ev suB = ev_suspect(6, 40701); suB.code = D2K_SUSPECT_RST;
+        suB.planned = D2K_LINK_PLANNED_NO;
+        int rcB = d2k_sched_event(s, &suB);
+        CHECK(rcB == 0, "чистое рукопожатие: RST попал в очередь замеров");
+        settle(s);
+        CHECK(tcp_calls == 0 && quic_calls == 0,
+              "чистое рукопожатие: RST на рукопожатии запустил замер");
+        CHECK(said("завершило рукопожатие без обхода"),
+              "чистое рукопожатие: причина гашения не названа");
+        /* А обрыв объёма (позднее закрытие) по тому же имени гасить нельзя. */
+        tcp_calls = quic_calls = vol_calls = 0; saidbuf[0] = '\0';
+        d2k_ev sh;
+        CHECK(tls_shape_event(&sh, nm, D2K_SHAPE_MODERN) == 0, "clean-media shape");
+        d2k_sched_event(s, &sh);
+        prime_late_rst(s, nm, 40702);
+        d2k_ev suV = ev_suspect(6, 40703); suV.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_ev hV = ev_hello(6, 40703, nm); d2k_sched_event(s, &hV);
+        d2k_sched_event(s, &suV);
+        settle(s);
+        CHECK(vol_calls == 1,
+              "чистое рукопожатие ошибочно погасило обрыв объёма");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+    }
+
     /* --- своё имя-приманка — не цель ------------------------------------
        Поле 14.10.2026: приветствия с disk.rzd.ru (приманка SCHED_DECOY) шли
        через роутер от второго D2K за ним (его фальшивки и контроль), коробка
