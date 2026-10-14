@@ -50,16 +50,28 @@ try {
 echo "/dev/root 100692 18544 \${DF_AVAIL:-80020} 19% /"`));
   // Загрузчик: адрес → файл из source/, как отдал бы GitHub. Пишет в свой
   // журнал, чтобы было видно, чем и в каком порядке шла загрузка.
-  const fetcher = (name, outFlag) => sh(`out= url=
-while [ $# -gt 0 ]; do case "$1" in ${outFlag}) out=$2; shift 2 ;;
+  // Попытка через проводник (--proxy) пишется в свой журнал «<имя>-gate»;
+  // GATE_DOWN=1 роняет её, как недоступный VPS, — тогда следует прямая.
+  const fetcher = (name, outFlag) => sh(`out= url= proxy=
+while [ $# -gt 0 ]; do case "$1" in ${outFlag}) out=$2; shift 2 ;; --proxy) proxy=$2; shift 2 ;;
   --max-time|--connect-timeout|-T) shift 2 ;; -*) shift ;; *) url=$1; shift ;; esac; done
+if [ -n "$proxy" ]; then
+  printf '%s %s\\n' "$proxy" "$url" >> '${log(name + '-gate')}'
+  [ -z "\${GATE_DOWN:-}" ] || exit 7
+fi
 printf '%s\\n' "$url" >> '${log(name)}'
 cp "${src}/\${url#http://fixture.test/}" "$out" 2>/dev/null || exit 22`);
   put(path.join(tmp, 'curl-double'), fetcher('curl', '-o'));
   put(path.join(bin, 'wget'), fetcher('wget', '-O'));
   // apk чистой 25.12: ставит ровно то, что просят. curl — заглушка, openssl —
   // настоящий: подпись, которую проверяет пустышка, не проверена никем.
-  put(path.join(bin, 'apk'), sh(`printf '%s\\n' "$*" >> '${log('apk')}'
+  put(path.join(bin, 'apk'), sh(`if [ "$1" = --repositories-file ]; then
+  printf '%s %s\\n' "\${http_proxy:-}" "$3" >> '${log('apk-gate')}'
+  cp "$2" '${log('apk-gate-feeds')}'
+  [ -z "\${GATE_DOWN:-}" ] || exit 1
+  shift 2
+fi
+printf '%s\\n' "$*" >> '${log('apk')}'
 case "$1" in
   --print-arch) printf 'x86_64\\n' ;;
   info) shift; [ "$1" = -e ] && shift
@@ -149,7 +161,8 @@ exit 0`));
     D2K_OPENWRT_APK: path.join(bin, 'apk'), D2K_OPENWRT_OPKG: path.join(tmp, 'no-opkg'),
   };
   const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
-  const reset = () => { for (const f of [calls, log('apk'), log('wget'), log('curl')]) fs.rmSync(f, { force: true }); };
+  const reset = () => { for (const f of [calls, log('apk'), log('wget'), log('curl'), log('curl-gate'),
+    log('apk-gate'), log('apk-gate-feeds')]) fs.rmSync(f, { force: true }); };
   const run = (extra = {}) => spawnSync('/bin/sh', [path.join(tmp, 'install.sh')],
     { env: { ...env, ...extra }, encoding: 'utf8', timeout: 30000 });
   const ok = (r) => { assert.equal(r.status, 0, r.stderr || r.stdout); return r.stdout + r.stderr; };
@@ -170,6 +183,12 @@ exit 0`));
     ['http://fixture.test/latest/latest.json', 'http://fixture.test/latest/latest.json.sig',
       `http://fixture.test/${rid}/d2k-amd64.tar.gz`],
     'выпуск берётся перечнем, подписью и архивом — в этом порядке');
+  // Каждая загрузка выпуска сперва идёт через проводник на VPS (CONNECT).
+  const GATE = 'http://213.176.74.63:9444';
+  const releaseUrls = ['http://fixture.test/latest/latest.json', 'http://fixture.test/latest/latest.json.sig',
+    `http://fixture.test/${rid}/d2k-amd64.tar.gz`];
+  assert.deepEqual(read(log('curl-gate')).trim().split('\n'), releaseUrls.map((u) => `${GATE} ${u}`),
+    'выпуск сперва качается через проводник на VPS');
   assert.match(fresh, /подпись сошлась/, 'установка должна сказать, что подпись проверена');
   assert(fs.existsSync(d2kd), 'комплект должен встать');
   assert.equal(read(releaseId).trim(), rid,
@@ -232,7 +251,54 @@ exit 0`));
     'D2K_SOURCE=ref берёт бинарники из builds/ ветки');
   assert.equal(read(releaseId).trim(), '', 'установка из ветки номера выпуска не знает');
 
-  console.log('install: signed release, bad signature, bad hash, missing arch, /tmp room, Keenetic, ref: PASS');
+  // 8. Проводник недоступен: каждая загрузка повторяется напрямую, установка
+  //    не страдает.
+  reset();
+  ok(run({ GATE_DOWN: '1' }));
+  // curl к этому случаю уже «поставлен» прошлым прогоном, поэтому через него
+  // идёт и определение арки: проверяется каждая загрузка, а не только выпуск.
+  const direct = read(log('curl')).trim().split('\n');
+  assert.deepEqual(read(log('curl-gate')).trim().split('\n'), direct.map((u) => `${GATE} ${u}`),
+    'каждой прямой загрузке предшествует попытка через проводник');
+  for (const u of releaseUrls) assert(direct.includes(u), `после отказа проводника — напрямую: ${u}`);
+  assert.equal(read(releaseId).trim(), rid, 'упавший проводник не мешает установке');
+
+  // 9. D2K_GATE= — без проводника: только напрямую.
+  reset();
+  ok(run({ D2K_GATE: '' }));
+  assert.equal(read(log('curl-gate')), '', 'пустой D2K_GATE выключает проводник');
+  for (const u of releaseUrls) assert(read(log('curl')).includes(u), `напрямую: ${u}`);
+
+  // 10. Пакеты OpenWrt через проводник: в попытке только штатные зеркала
+  //     downloads.openwrt.org, переписанные на http:// (подписи сверяет apk);
+  //     чужой источник в неё не попадает.
+  const apkEtc = path.join(tmp, 'apk-etc');
+  put(path.join(apkEtc, 'repositories.d/distfeeds.list'),
+    'https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/packages/packages.adb\n' +
+    'https://downloads.openwrt.org/releases/25.12.5/packages/x86_64/base/packages.adb\n', 0o644);
+  put(path.join(apkEtc, 'repositories.d/customfeeds.list'),
+    '# add your custom package feeds here\nhttps://example.org/feed/packages.adb\n', 0o644);
+  reset();
+  ok(run({ D2K_OPENWRT_APK_ETC: apkEtc }));
+  assert.match(read(log('apk-gate')), new RegExp(`^${GATE} update$`, 'm'), 'индекс — через проводник');
+  assert.match(read(log('apk-gate')),
+    new RegExp(`^${GATE} add$`, 'm'), 'пакеты — через проводник');
+  assert.equal(read(log('apk-gate-feeds')),
+    'http://downloads.openwrt.org/releases/25.12.5/targets/x86/64/packages/packages.adb\n' +
+    'http://downloads.openwrt.org/releases/25.12.5/packages/x86_64/base/packages.adb\n',
+    'в попытке через проводник — только штатные зеркала по http://');
+  assert.match(read(log('apk')), /^add kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle/m);
+  assert.equal(read(releaseId).trim(), rid);
+
+  // 11. Проводник лёг и для пакетов: apk ставит напрямую, как прежде.
+  reset();
+  ok(run({ D2K_OPENWRT_APK_ETC: apkEtc, GATE_DOWN: '1' }));
+  assert.match(read(log('apk-gate')), new RegExp(`^${GATE} update$`, 'm'), 'попытка через проводник была');
+  assert.match(read(log('apk')), /^add kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle/m,
+    'после отказа проводника пакеты ставятся напрямую');
+  assert.equal(read(releaseId).trim(), rid);
+
+  console.log('install: signed release, bad signature, bad hash, missing arch, /tmp room, Keenetic, ref, VPS gate: PASS');
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

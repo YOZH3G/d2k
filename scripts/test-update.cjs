@@ -24,8 +24,10 @@ assert(openssl, 'нужен OpenSSL 3');
 fs.symlinkSync(openssl, path.join(stub, 'openssl'));
 // curl: адрес → файл из feed/, как отдал бы GitHub.
 fs.writeFileSync(path.join(stub, 'curl'), `#!/bin/sh
-out=; url=
-while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; --proto|--max-time) shift 2 ;; -*) shift ;; *) url=$1; shift ;; esac; done
+out=; url=; proxy=
+while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; --proxy) proxy=$2; shift 2 ;; --proto|--max-time|--connect-timeout) shift 2 ;; -*) shift ;; *) url=$1; shift ;; esac; done
+# Попытка через проводник на VPS — в свой журнал; GATE_DOWN=1 её роняет.
+if [ -n "$proxy" ]; then echo "$proxy $url" >> "${feed}/../gate.log"; [ -z "\${GATE_DOWN:-}" ] || exit 7; fi
 f="${feed}/\${url#https://example.test/}"
 [ -f "$f" ] || exit 22
 cp "$f" "$out"
@@ -182,7 +184,20 @@ try {
     assert.equal(spawnSync('/bin/sh', [updater, 'install'], { env: owrt, encoding: 'utf8' }).status, 0);
     assert(read(path.join(tmp, 'installer-path')).startsWith(path.join(dir, '.update') + '/'), 'OpenWrt с USB под /opt: рабочий каталог на USB');
   }
-  console.log('d2k-update: signature, install, health rollback, bad release, toggle: PASS');
+  // Проводник на VPS: проверка выпуска сперва идёт через него, а когда он
+  // недоступен — напрямую, без отказа.
+  const gateLog = path.join(feed, '..', 'gate.log');
+  fs.rmSync(gateLog, { force: true });
+  assert.equal(run('check').status, 0);
+  assert.match(read(gateLog), /^http:\/\/213\.176\.74\.63:9444 https:\/\/example\.test\/.*latest\.json$/m,
+    'перечень выпуска сперва через проводник');
+  fs.rmSync(gateLog, { force: true });
+  assert.equal(spawnSync('/bin/sh', [updater, 'check'], { env: { ...env, GATE_DOWN: '1' }, encoding: 'utf8' }).status, 0,
+    'упавший проводник не мешает проверке выпуска');
+  assert.equal(state().check_ok, true);
+  assert.match(read(gateLog), /latest\.json/, 'попытка через проводник была и при его отказе');
+  assert.equal(spawnSync('/bin/sh', [updater, 'check'], { env: { ...env, D2K_GATE: '' }, encoding: 'utf8' }).status, 0);
+  console.log('d2k-update: signature, install, health rollback, bad release, toggle, VPS gate: PASS');
 } finally {
   try { process.kill(Number(live)); } catch (_) {}
   if (!process.env.KEEP) fs.rmSync(tmp, { recursive: true, force: true }); else console.log(tmp);

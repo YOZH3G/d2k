@@ -7,17 +7,26 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 mkdir "$WORK/bin"
 export RUN_MARKER="$WORK/executed" CURL_TARGET="$WORK/target" CURL_URL="$WORK/url"
+# Попытка через проводник на VPS (--proxy) пишется в GATE_LOG; GATE_FAIL=1
+# роняет только её, DOWNLOAD_FAIL=1 — любую загрузку.
+export GATE_LOG="$WORK/gate"
 cat > "$WORK/bin/curl" <<'EOF'
 #!/bin/sh
+proxy=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -o) shift; target=$1 ;;
+        --proxy) shift; proxy=$1 ;;
         https://*) printf '%s\n' "$1" > "$CURL_URL" ;;
     esac
     shift
 done
 printf '%s\n' "$target" > "$CURL_TARGET"
 printf 'printf "executed:%%s\\n" "${D2K_REF:-unset}" >> "$RUN_MARKER"\n' > "$target"
+if [ -n "$proxy" ]; then
+    printf '%s\n' "$proxy" >> "$GATE_LOG"
+    [ "${GATE_FAIL:-0}" = 0 ] || exit 7
+fi
 [ "${DOWNLOAD_FAIL:-0}" = 0 ] || exit 22
 EOF
 chmod +x "$WORK/bin/curl"
@@ -44,13 +53,20 @@ export PATH="$WORK/bin:$PATH"
 # документированная однострочная команда обязана запускаться, отвергать
 # неполную загрузку и убирать за собой временный файл. Теперь проверяются все
 # четыре — curl и wget, установка и удаление, — и порядок разделов свободен.
+#
+# 14.10.2026: команда одна для Keenetic и OpenWrt — curl (на OpenWrt он
+# ставится на шаге подготовки через VPS проекта). Вариант с wget убран
+# сознательно: uclient-fetch шлёт прокси «GET https://…» вместо CONNECT, и
+# пройти через VPS со сквозным TLS он не может. Требования те же — запуск,
+# отказ от неполной загрузки, уборка, — плюс новое: сперва через проводник
+# на VPS, при его отказе напрямую.
 block_for() {   # $1 — загрузчик (curl|wget), $2 — скрипт (install|uninstall)
     awk -v tool="$1" -v want="$2" '
         /^```sh$/ { getline; if ($0 ~ tool " " && $0 ~ "/" want "\\.sh") { print; exit } }
     ' "$ROOT/README.md"
 }
 
-for tool in curl wget; do
+tool=curl
     for script in install uninstall; do
         command=$(block_for "$tool" "$script")
         [ -n "$command" ] || { echo "в README нет команды: $tool $script" >&2; exit 1; }
@@ -74,6 +90,15 @@ for tool in curl wget; do
             [ "$(cat "$RUN_MARKER")" = executed:main ] \
                 || { echo "установка $tool идёт не с ветки main" >&2; exit 1; }
         fi
+        # Сперва через проводник на VPS.
+        [ "$(head -1 "$GATE_LOG")" = "http://213.176.74.63:9444" ] \
+            || { echo "команда $tool $script не идёт сперва через VPS" >&2; exit 1; }
+        # Проводник лёг — загрузка повторяется напрямую и исполняется.
+        rm -f "$RUN_MARKER" "$GATE_LOG"
+        GATE_FAIL=1 sh -c "$command" || { echo "отказ VPS сорвал команду $tool $script" >&2; exit 1; }
+        [ -s "$RUN_MARKER" ] && [ -s "$GATE_LOG" ] \
+            || { echo "после отказа VPS команда $tool $script не пошла напрямую" >&2; exit 1; }
+        [ ! -e "$(cat "$CURL_TARGET")" ] || { echo "временный файл остался: $tool $script" >&2; exit 1; }
+        rm -f "$GATE_LOG"
     done
-done
-echo 'README install/uninstall (curl и wget): запуск, защита от неполной загрузки и уборка прошли'
+echo 'README install/uninstall (curl): запуск через VPS и напрямую, защита от неполной загрузки и уборка прошли'

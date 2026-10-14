@@ -158,6 +158,19 @@ for c in out in_rules; do
         /queue num/ { q = 1 }
         END { exit !seen }' || fail "chain $c: no 'ct status dnat return' before the first queue rule"
 done
+# The VPS install gate is D2K's own channel (field 14.10.2026): RETURN in
+# both chains before the first queue rule; an empty D2K_GATE removes it.
+want 'ip daddr 213.176.74.63 tcp dport 9444 return'
+want 'ip saddr 213.176.74.63 tcp sport 9444 return'
+for c in out in_rules; do
+    printf '%s\n' "$r" | sed -n "/chain $c {/,/^	}/p" | awk '
+        /213\.176\.74\.63 tcp [ds]port 9444 return/ { if (!q) seen = 1 }
+        /queue num/ { q = 1 }
+        END { exit !seen }' || fail "chain $c: no gate return before the first queue rule"
+done
+S99_SNIPPET='fw_up' s99 "$TMP/nftonly" D2K_GATE= || fail "nft fw_up without a gate failed"
+if table d2k | grep -q 9444; then fail "empty D2K_GATE must leave no gate rule in nft"; fi
+S99_SNIPPET='fw_up' s99 "$TMP/nftonly" || fail "nft fw_up (restore) failed"
 rst=$(table d2k_rst)
 # Ключ — кортеж зонда (порт . цель . порт цели), не один порт (ревью 07.10).
 printf '%s\n' "$rst" | grep -qF 'set rst4 { type inet_service . ipv4_addr . inet_service; flags timeout; }' || fail "inet d2k_rst rst4 set"

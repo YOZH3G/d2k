@@ -151,6 +151,19 @@ LIVE=$RUNTIME_DIR/live.json
 # Keep standard DNS/DoT/DoQ ports out of the packet classifier even when PORTS
 # is 0:65535; this does not alter resolver settings or DNS routing.
 DNS_PORTS=53,853
+# ПРОВОДНИК УСТАНОВКИ НА VPS (relay-gate/) — канал самого D2K, а не цель.
+# Через него идут установка и ночное обновление (D2K_GATE — та же настройка,
+# что у установщика и d2k-update.sh). Без исключения датапат принимал туннель
+# CONNECT за поток к «github.com» на адресе VPS, и контроллер начинал искать
+# обход собственному каналу (поле 14.10.2026: «по github.com начинаю поиск:
+# 213.176.74.63:9444»). Исключается только IPv4-адрес с портом.
+GATE_IP=
+GATE_PORT=
+gate_hp=${D2K_GATE-http://213.176.74.63:9444}
+gate_hp=${gate_hp#http://}; gate_hp=${gate_hp%%/*}
+if printf '%s\n' "$gate_hp" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$'; then
+    GATE_IP=${gate_hp%:*}; GATE_PORT=${gate_hp##*:}
+fi
 TG_ENABLED=${TG_ENABLED:-0}
 TG_PORT=${TG_PORT:-1443}
 TGBIN=/opt/sbin/d2ktg
@@ -416,6 +429,11 @@ fw_family_up() (
     for chain in "$CHAIN_OUT" "$CHAIN_IN"; do
         "$fw_tool" -t mangle -A "$chain" -m conntrack --ctstate DNAT -j RETURN || return 1
     done
+    # Канал самого D2K — проводник установки на VPS (GATE_IP выше).
+    if [ -n "$GATE_IP" ] && [ "$fw_tool" = iptables ]; then
+        "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -d "$GATE_IP" --dport "$GATE_PORT" -j RETURN || return 1
+        "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -s "$GATE_IP" --sport "$GATE_PORT" -j RETURN || return 1
+    fi
 
     # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
     # останавливать его (§10). Это касается и UDP-правил ниже в той же мере,
@@ -661,6 +679,13 @@ nft_ruleset() (
     voice=$(nft_list "$VOICE_PORTS")
     voicewin=$(nft_count "$VOICE_CONNBYTES")
     q="queue num $QUEUE_NUM bypass"
+    # Канал самого D2K — проводник установки на VPS (GATE_IP выше).
+    gate_out=
+    gate_in=
+    if [ -n "$GATE_IP" ]; then
+        gate_out="ip daddr $GATE_IP tcp dport $GATE_PORT return"
+        gate_in="ip saddr $GATE_IP tcp sport $GATE_PORT return"
+    fi
     cat <<EOF
 table inet $NFT_TABLE {
 	chain out {
@@ -676,6 +701,7 @@ table inet $NFT_TABLE {
 		meta mark $MEASURE_MARK return
 		meta l4proto { tcp, udp } th dport { $dns } return
 		ct status dnat return
+		$gate_out
 		meta l4proto tcp ct direction original th dport { $ports } ct original packets $win $q
 		meta l4proto tcp ct direction original th dport { $ports } ct original packets $late tcp flags & rst == rst $q
 		meta l4proto tcp ct direction original th dport { $ports } ct original packets $late tcp flags & fin == fin $q
@@ -690,6 +716,7 @@ table inet $NFT_TABLE {
 		ip6 daddr ::1 return
 		meta l4proto { tcp, udp } th sport { $dns } return
 		ct status dnat return
+		$gate_in
 		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $late tcp flags & rst == rst $q
 		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $late tcp flags & fin == fin $q
 		meta l4proto tcp ct direction reply th sport { $(nft_list "$HTTP_KEEPALIVE_PORTS") } ct reply packets $late $q
@@ -910,6 +937,10 @@ fw_family_installed() (
     for chain in "$CHAIN_OUT" "$CHAIN_IN"; do
         "$fw_tool" -t mangle -C "$chain" -m conntrack --ctstate DNAT -j RETURN 2>/dev/null || return 1
     done
+    if [ -n "$GATE_IP" ] && [ "$fw_tool" = iptables ]; then
+        "$fw_tool" -t mangle -C "$CHAIN_OUT" -p tcp -d "$GATE_IP" --dport "$GATE_PORT" -j RETURN 2>/dev/null || return 1
+        "$fw_tool" -t mangle -C "$CHAIN_IN" -p tcp -s "$GATE_IP" --sport "$GATE_PORT" -j RETURN 2>/dev/null || return 1
+    fi
     for proto in tcp udp; do
         "$fw_tool" -t mangle -C "$CHAIN_OUT" -p "$proto" -m conntrack --ctdir ORIGINAL -m multiport --dports "$PORTS" \
             -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \

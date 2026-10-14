@@ -81,7 +81,15 @@ defaults() {
     [ -n "$(field last_ok)" ] || S_LAST_OK=${S_LAST_OK:-false}
 }
 
-fetch() { curl -fsL --proto '=https' --max-time "${3:-120}" -o "$2" "$1"; }
+# Проводник через VPS — свой C-сервис D2K (relay-gate/): сперва через него
+# (CONNECT, TLS сквозной до GitHub), затем напрямую. D2K_GATE= — без него.
+GATE=${D2K_GATE-http://213.176.74.63:9444}
+fetch() {
+    { [ -n "$GATE" ] &&
+        curl -fsL --proto '=https' --proxy "$GATE" --connect-timeout 8 \
+             --max-time "${3:-120}" -o "$2" "$1"; } ||
+        curl -fsL --proto '=https' --max-time "${3:-120}" -o "$2" "$1"
+}
 
 # Скачивает и проверяет latest.json в $WORK. Ноль — подпись сошлась.
 check() {

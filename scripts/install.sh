@@ -46,6 +46,19 @@ OPENWRT_RELEASE=${D2K_OPENWRT_RELEASE:-/etc/openwrt_release}
 # Штатный менеджер пакетов OpenWrt: apk с 25.12, opkg до неё. Entware-opkg
 # для системных пакетов не годится никогда — у него свои пакеты и своя арка.
 OPENWRT_APK=${D2K_OPENWRT_APK:-/usr/bin/apk}
+# ПРОВОДНИК УСТАНОВКИ ЧЕРЕЗ VPS — свой C-сервис D2K (relay-gate/). Каждая
+# загрузка сперва идёт через него и только потом напрямую: с части линий
+# GitHub, Entware и сервер пакетов OpenWrt не доходят.
+#   - GitHub — через CONNECT: TLS остаётся между роутером и GitHub, сервис
+#     ответ не видит и подменить не может;
+#   - пакеты OpenWrt — штатными зеркалами downloads.openwrt.org по http://
+#     через тот же сервис: apk и opkg сами сверяют подписи индексов и
+#     пакетов, открытый отрезок их не подменит.
+# D2K_GATE= (пусто) — без проводника, только напрямую.
+GATE=${D2K_GATE-http://213.176.74.63:9444}
+# Где лежат источники пакетов OpenWrt (тесты подставляют свои).
+OPENWRT_APK_ETC=${D2K_OPENWRT_APK_ETC:-/etc/apk}
+OPENWRT_OPKG_ETC=${D2K_OPENWRT_OPKG_ETC:-/etc}
 OPENWRT_OPKG=${D2K_OPENWRT_OPKG:-/bin/opkg}
 OPENWRT_STAGE=
 openwrt_check() {
@@ -122,8 +135,37 @@ openwrt_has() {
         *) return 1 ;;
     esac
 }
+# Сперва через проводник: только зеркала downloads.openwrt.org, переписанные
+# на http:// (их индексы и пакеты подписаны). Прочие источники в этой попытке
+# не участвуют — их подписи могут и не проверяться. Неудача — 1, и
+# openwrt_add идёт напрямую, как прежде.
+openwrt_gate_add() {
+    [ -n "$GATE" ] || return 1
+    gfeeds=$TMP/gate-feeds
+    # shellcheck disable=SC2048,SC2086  # список пакетов, нарочно словами
+    case "$(openwrt_pm)" in
+        apk)
+            cat "$OPENWRT_APK_ETC"/repositories.d/*.list "$OPENWRT_APK_ETC"/repositories 2>/dev/null |
+                sed -n 's|^https://downloads\.openwrt\.org/|http://downloads.openwrt.org/|p' > "$gfeeds"
+            [ -s "$gfeeds" ] || return 1
+            http_proxy=$GATE "$OPENWRT_APK" --repositories-file "$gfeeds" update >/dev/null 2>&1 &&
+                http_proxy=$GATE "$OPENWRT_APK" --repositories-file "$gfeeds" add $* >/dev/null 2>&1 ;;
+        opkg)
+            # Свои src идут первыми: штатные https-строки с теми же именами
+            # opkg затем пропускает как повтор.
+            { grep -v '^src' "$OPENWRT_OPKG_ETC"/opkg.conf 2>/dev/null
+              cat "$OPENWRT_OPKG_ETC"/opkg/*.conf 2>/dev/null |
+                sed -n 's|^\(src/gz [^ ]*\) https://downloads\.openwrt\.org/|\1 http://downloads.openwrt.org/|p'; } > "$gfeeds"
+            grep -q '^src' "$gfeeds" || return 1
+            http_proxy=$GATE "$OPENWRT_OPKG" -f "$gfeeds" update >/dev/null 2>&1 &&
+                http_proxy=$GATE "$OPENWRT_OPKG" -f "$gfeeds" install $* >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
 # $* — пакеты словами.
 openwrt_add() {
+    # shellcheck disable=SC2048,SC2086  # список пакетов, нарочно словами
+    openwrt_gate_add $* && return 0
     # shellcheck disable=SC2048,SC2086  # список пакетов, нарочно словами
     case "$(openwrt_pm)" in
         apk) "$OPENWRT_APK" add $* >/dev/null 2>&1 ||
@@ -277,11 +319,17 @@ esac
 # $1 — адрес, $2 — куда положить, $3 — предел в секундах.
 fetch_url() {
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --proto '=https' --max-time "${3:-120}" -o "$2" "$1" ||
+        # Сперва через проводник (CONNECT, TLS сквозной), затем напрямую.
+        { [ -n "$GATE" ] &&
+            curl -fsSL --proto '=https' --proxy "$GATE" --connect-timeout 8 \
+                 --max-time "${3:-120}" -o "$2" "$1"; } ||
+            curl -fsSL --proto '=https' --max-time "${3:-120}" -o "$2" "$1" ||
             die "не скачать $1"
     else
         # OpenWrt без curl: wget образа (uclient-fetch, HTTPS с ca-bundle);
         # curl ставит штатный менеджер (openwrt_tools) до первой загрузки.
+        # Без проводника: uclient-fetch шлёт прокси «GET https://…» вместо
+        # CONNECT, и ответ шёл бы открытым текстом — подменяемо.
         wget -q -T "${3:-120}" -O "$2" "$1" || die "не скачать $1"
     fi
     [ -s "$2" ] || die "$1 оказался пустым"

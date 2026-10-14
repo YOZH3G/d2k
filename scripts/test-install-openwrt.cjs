@@ -57,7 +57,15 @@ case "$1" in
        done ;;
 esac
 exit 0`));
-  put(path.join(tmp, 'opkg'), sh(`printf '%s\\n' "$*" >> '${log('opkg')}'
+  // opkg -f <конфиг>: попытка через проводник на VPS — в свой журнал;
+  // GATE_DOWN=1 её роняет, как недоступный VPS.
+  put(path.join(tmp, 'opkg'), sh(`if [ "$1" = -f ]; then
+  printf '%s %s\\n' "\${http_proxy:-}" "$3" >> '${log('opkg-gate')}'
+  cp "$2" '${log('opkg-gate-conf')}'
+  [ -z "\${GATE_DOWN:-}" ] || exit 1
+  shift 2
+fi
+printf '%s\\n' "$*" >> '${log('opkg')}'
 case "$1" in
   list-installed) for p in \${APK_HAVE:-}; do echo "$p - 1"; done ;;
   install) shift
@@ -139,7 +147,8 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
     D2K_OPENWRT_APK: path.join(bin, 'apk'), D2K_OPENWRT_OPKG: path.join(tmp, 'no-opkg'), D2K_KEEP_STATE: '1',
   };
   const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
-  const reset = () => { for (const f of [calls, log('apk'), log('opkg'), log('nft'), log('wget'), log('curl')]) fs.rmSync(f, { force: true }); };
+  const reset = () => { for (const f of [calls, log('apk'), log('opkg'), log('nft'), log('wget'), log('curl'),
+    log('opkg-gate'), log('opkg-gate-conf')]) fs.rmSync(f, { force: true }); };
   function run(name, extra = {}) {
     return spawnSync('/bin/sh', [path.join(tmp, `${name}.sh`)], { env: { ...env, ...extra }, encoding: 'utf8', timeout: 20000 });
   }
@@ -268,6 +277,32 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   assert.match(read(log('opkg')), /^install kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle openssl-util$/m,
     'opkg must install the missing packages');
 
+  // 6b. 24.10 через проводник на VPS: свой конфиг opkg — строки opkg.conf без
+  //     src и штатные зеркала downloads.openwrt.org по http:// (подписи сверяет
+  //     opkg); чужой источник в попытку не входит. Проводник лёг — напрямую.
+  const opkgEtc = path.join(tmp, 'opkg-etc');
+  put(path.join(opkgEtc, 'opkg.conf'), 'dest root /\nlists_dir ext /var/opkg-lists\noption check_signature\n', 0o644);
+  put(path.join(opkgEtc, 'opkg/distfeeds.conf'),
+    'src/gz openwrt_core https://downloads.openwrt.org/releases/24.10.8/targets/x86/64/packages\n' +
+    'src/gz openwrt_base https://downloads.openwrt.org/releases/24.10.8/packages/x86_64/base\n', 0o644);
+  put(path.join(opkgEtc, 'opkg/customfeeds.conf'), 'src/gz mine https://example.org/feed\n', 0o644);
+  fs.rmSync(path.join(bin, 'openssl'));
+  reset();
+  ok(run('install', { ...opkgEnv, D2K_OPENWRT_OPKG_ETC: opkgEtc }));
+  assert.match(read(log('opkg-gate')), /^http:\/\/213\.176\.74\.63:9444 update$/m, 'opkg list update via the gate');
+  assert.match(read(log('opkg-gate')), /^http:\/\/213\.176\.74\.63:9444 install$/m, 'opkg install via the gate');
+  assert.equal(read(log('opkg-gate-conf')),
+    'dest root /\nlists_dir ext /var/opkg-lists\noption check_signature\n' +
+    'src/gz openwrt_core http://downloads.openwrt.org/releases/24.10.8/targets/x86/64/packages\n' +
+    'src/gz openwrt_base http://downloads.openwrt.org/releases/24.10.8/packages/x86_64/base\n',
+    'gate attempt: opkg.conf without src plus official feeds over http:// only');
+  fs.rmSync(path.join(bin, 'openssl'));
+  reset();
+  ok(run('install', { ...opkgEnv, D2K_OPENWRT_OPKG_ETC: opkgEtc, GATE_DOWN: '1' }));
+  assert.match(read(log('opkg-gate')), /update$/m, 'the gate was tried first');
+  assert.match(read(log('opkg')), /^install kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle openssl-util$/m,
+    'with the gate down opkg installs directly');
+
   // 7. FW_BACKEND=iptables in the config keeps the iptables path: it needs iptables.
   const config = path.join(tmp, 'opt/d2k/config');
   const configText = read(config);
@@ -302,7 +337,7 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   put(path.join(tmp, 'opt/bin/opkg'), sh('exit 0'));
   ok(run('uninstall', { D2K_KEEP_STATE: '0' }));
   assert(fs.existsSync(path.join(tmp, 'opt/etc/init.d')) && fs.existsSync(path.join(tmp, 'opt/sbin')), 'uninstall must not remove Entware directories');
-  console.log('OpenWrt without Entware: wget bootstrap, apk/opkg packages, nft preflight, space, uninstall: PASS');
+  console.log('OpenWrt without Entware: wget bootstrap, apk/opkg packages, VPS gate, nft preflight, space, uninstall: PASS');
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

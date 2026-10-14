@@ -92,6 +92,12 @@ Keenetic. Другие модели проверки не прошли. Подр
 Сделайте подготовку до установки. Установщик проверяет всё это сам. Если
 чего-то нет, установщик останавливается и ничего не меняет.
 
+**Загрузки через VPS проекта.** Все команды ниже и сам установщик сначала
+скачивают через VPS проекта (`213.176.74.63:9444`), а если он не отвечает —
+напрямую. Так D2K ставится и там, где GitHub, Entware или сервер пакетов
+OpenWrt напрямую не открываются. Подробно — в разделе
+[«Загрузки через VPS»](#загрузки-через-vps).
+
 ### Keenetic
 
 1. Установите Entware.
@@ -100,7 +106,8 @@ Keenetic. Другие модели проверки не прошли. Подр
 4. Установите пакеты:
 
    ```sh
-   opkg update && opkg install curl ca-bundle iptables ipset kmod_ndms xtables-addons_legacy openssl-util
+   p=http://213.176.74.63:9444; pk="curl ca-bundle iptables ipset kmod_ndms xtables-addons_legacy openssl-util"
+   { http_proxy=$p opkg update && http_proxy=$p opkg install $pk; } || { opkg update && opkg install $pk; }
    ```
 
 5. Остановите z2k, Zapret и другие программы, которые меняют тот же трафик.
@@ -115,9 +122,22 @@ Keenetic. Другие модели проверки не прошли. Подр
 1. Подключитесь к роутеру по SSH от пользователя root.
 2. Проверьте свободное место: `df -h /opt /tmp`.
 3. Если места мало, подключите USB-накопитель и разместите на нём `/opt`.
+4. Установите `curl`. В OpenWrt 25.12 команда использует `apk`, в 24.10 —
+   `opkg`:
 
-Пакеты для OpenWrt ставит установщик. Он использует `apk` в OpenWrt 25.12 и
-`opkg` в OpenWrt 24.10.
+   ```sh
+   p=http://213.176.74.63:9444; f=/tmp/d2k-feeds
+   if [ -x /usr/bin/apk ]; then
+     cat /etc/apk/repositories.d/*.list | sed -n 's|^https://downloads.openwrt.org/|http://downloads.openwrt.org/|p' > $f
+     { http_proxy=$p apk --repositories-file $f update && http_proxy=$p apk --repositories-file $f add curl ca-bundle; } || { apk update && apk add curl ca-bundle; }
+   else
+     { grep -v '^src' /etc/opkg.conf; sed -n 's|^\(src/gz [^ ]*\) https://downloads.openwrt.org/|\1 http://downloads.openwrt.org/|p' /etc/opkg/*.conf; } > $f
+     { http_proxy=$p opkg -f $f update && http_proxy=$p opkg -f $f install curl ca-bundle; } 2>/dev/null || { opkg update && opkg install curl ca-bundle; }
+   fi; rm -f $f
+   ```
+
+Остальные пакеты для OpenWrt ставит установщик — тем же путём, сначала
+через VPS проекта.
 
 ---
 
@@ -126,29 +146,23 @@ Keenetic. Другие модели проверки не прошли. Подр
 **ВНИМАНИЕ:** Выполняйте команду на роутере. Не выполняйте её на компьютере.
 На Keenetic не выполняйте её в командной строке KeeneticOS.
 
-### Keenetic
+### Keenetic и OpenWrt
 
-Выполните команду в SSH-терминале Entware:
-
-```sh
-(f=$(mktemp) && curl -fsSL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/necronicle/d2k/main/scripts/install.sh -o "$f" && D2K_REF=main sh "$f"; r=$?; rm -f "$f"; exit "$r")
-```
-
-### OpenWrt
-
-В OpenWrt нет `curl`. Команда использует `wget`.
-
-Выполните команду в SSH-терминале роутера:
+Команда одна. Выполните её в SSH-терминале роутера (на Keenetic — в
+терминале Entware):
 
 ```sh
-(f=$(mktemp) && wget -q -T 120 -O "$f" https://raw.githubusercontent.com/necronicle/d2k/main/scripts/install.sh && D2K_REF=main sh "$f"; r=$?; rm -f "$f"; exit "$r")
+(f=$(mktemp); u=https://raw.githubusercontent.com/necronicle/d2k/main/scripts/install.sh; { curl -fsSL --proxy http://213.176.74.63:9444 --connect-timeout 8 --max-time 120 "$u" -o "$f" || curl -fsSL --connect-timeout 10 --max-time 120 "$u" -o "$f"; } && D2K_REF=main sh "$f"; r=$?; rm -f "$f"; exit "$r")
 ```
+
+Команда сначала скачивает установщик через VPS проекта, а если он не
+отвечает — напрямую. На OpenWrt нужен `curl` из шага 4 подготовки.
 
 ### Что делает установщик
 
 1. Определяет архитектуру роутера.
 2. Берёт последний выпуск: перечень выпуска с подписью и архив своей
-   архитектуры.
+   архитектуры. Сначала через VPS проекта, потом напрямую.
 3. Проверяет подпись перечня и контрольную сумму архива. Не сошлось —
    ничего не меняет.
 4. Проверяет пакеты, модули ядра и свободное место.
@@ -158,6 +172,25 @@ Keenetic. Другие модели проверки не прошли. Подр
 
 Ручная установка и ночное обновление ставят один и тот же подписанный
 выпуск. Поэтому новая установка не бывает старее обновлённого роутера.
+
+### Загрузки через VPS
+
+Каждая загрузка — пакеты, установщик, выпуск, ночное обновление — сначала
+идёт через VPS проекта, а если он не отвечает — напрямую.
+
+- На VPS работает отдельный сервис D2K: [relay-gate](relay-gate/README.md).
+  Он пропускает загрузки только с GitHub, Entware и сервера пакетов
+  OpenWrt. Другие адреса он не пропускает.
+- GitHub VPS не видит. Соединение с GitHub шифруется на всём пути до GitHub,
+  и роутер проверяет сертификат GitHub. VPS не может подменить установщик
+  или выпуск. Выпуск дополнительно проверяется подписью.
+- Пакеты OpenWrt идут штатными зеркалами по HTTP. `apk` и `opkg` проверяют
+  подписи пакетов сами.
+- Entware и без VPS ходит по HTTP. VPS этот путь не ухудшает.
+- D2K не обрабатывает трафик к этому сервису: это канал самого D2K.
+
+Выключить загрузки через VPS: `D2K_GATE=` перед командой установки или
+строка `D2K_GATE=` в `/opt/d2k/config`.
 
 Код установщика: [scripts/install.sh](scripts/install.sh).
 
@@ -219,7 +252,7 @@ D2K обновляет себя сам.
 
 1. Роутер проверяет новый выпуск ночью, между 03:00 и 05:00.
 2. Роутер проверяет подпись выпуска. Если подпись неверна, роутер ничего не
-   ставит.
+   ставит. Выпуск роутер скачивает сначала через VPS проекта, потом напрямую.
 3. Роутер сохраняет текущую версию.
 4. Роутер ставит выпуск.
 5. Через минуту роутер проверяет, что движок, контроллер и панель работают.
@@ -279,16 +312,10 @@ D2K обновляет себя сам.
 
 **ВНИМАНИЕ:** Удаление стирает подобранное. Восстановить его нельзя.
 
-### Keenetic
+### Keenetic и OpenWrt
 
 ```sh
-(f=$(mktemp) && curl -fsSL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh -o "$f" && sh "$f"; r=$?; rm -f "$f"; exit "$r")
-```
-
-### OpenWrt
-
-```sh
-(f=$(mktemp) && wget -q -T 120 -O "$f" https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh && sh "$f"; r=$?; rm -f "$f"; exit "$r")
+(f=$(mktemp); u=https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh; { curl -fsSL --proxy http://213.176.74.63:9444 --connect-timeout 8 --max-time 120 "$u" -o "$f" || curl -fsSL --connect-timeout 10 --max-time 120 "$u" -o "$f"; } && sh "$f"; r=$?; rm -f "$f"; exit "$r")
 ```
 
 ### Что удаляет команда
