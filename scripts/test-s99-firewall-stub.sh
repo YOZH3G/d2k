@@ -375,4 +375,28 @@ i=0; while kill -0 "$HU_OTHER" 2>/dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((
 if kill -0 "$HU_OTHER" 2>/dev/null; then kill "$HU_OTHER"; fail "a live d2khttp was not stopped"; fi
 ok "legacy d2khttp cleanup checks the process name, not the pid alone"
 
+# --- Только политика Keenetic (задача 59) -------------------------------------
+# Заглушка ndmc повторяет вывод роутера владельца 14.10.2026: управляющий
+# символ в начале, внутреннее имя Policy0 и описание «VPN политика» с
+# двоеточием в конце. Имя принимается в обоих видах; неизвестное — none и
+# предупреждение; без KEENETIC_POLICY ключа нет.
+printf '%s\n' '#!/bin/sh' "printf '\033[K\n           policy, name = Policy0, description = VPN политика: \n                 mark: ffffaaa\n               table4: 4096\n           policy, name = Policy1, description = D2K: \n                 mark: ffffaab\n           policy, name = D2Ktest: \n                 mark: ffffaac\n'" > "$TMP/bin/ndmc"
+chmod +x "$TMP/bin/ndmc"
+# shellcheck disable=SC2016  # expanded by the inner shell
+[ "$(S99_SNIPPET='policy_args 2>/dev/null' s99 KEENETIC_POLICY=Policy0)" = "--only-mark 0xffffaaa/0xffffffff" ] \
+    || fail "policy by internal name: wrong datapath key"
+[ "$(S99_SNIPPET='policy_args 2>/dev/null' s99 KEENETIC_POLICY='VPN политика')" = "--only-mark 0xffffaaa/0xffffffff" ] \
+    || fail "policy by its web-interface description: wrong datapath key"
+[ "$(S99_SNIPPET='policy_args 2>/dev/null' s99 KEENETIC_POLICY=D2K)" = "--only-mark 0xffffaab/0xffffffff" ] \
+    || fail "second policy: wrong mark"
+[ "$(S99_SNIPPET='policy_args 2>/dev/null' s99 KEENETIC_POLICY=D2Ktest)" = "--only-mark 0xffffaac/0xffffffff" ] \
+    || fail "a policy without a description (name ends with a colon) must be found"
+[ "$(S99_SNIPPET='policy_args 2>/dev/null' s99 KEENETIC_POLICY=Нет)" = "--only-mark none" ] \
+    || fail "unknown policy must serve no device"
+S99_SNIPPET='policy_args 2>&1 >/dev/null' s99 KEENETIC_POLICY=Нет | grep -q 'не найдена' \
+    || fail "unknown policy must be reported"
+[ -z "$(S99_SNIPPET='policy_args 2>/dev/null' s99)" ] || fail "no KEENETIC_POLICY: no key"
+rm -f "$TMP/bin/ndmc"
+ok "KEENETIC_POLICY: the policy mark from ndmc goes to the datapath; unknown — none"
+
 echo "S99d2k firewall (stub): all checks passed"

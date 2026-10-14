@@ -709,6 +709,8 @@ static void usage(void) {
         "  --mode observe|apply   умолчание observe: ничего не менять\n"
         "  --mark M           SO_MARK на собственных пакетах (умолчание 0)\n"
         "  --probe-mark M     SO_MARK контроллера; его зонды не становятся новыми целями\n"
+        "  --only-mark M[/K]|none  только клиенты политики Keenetic с этой меткой;\n"
+        "                     none — политика не найдена, клиентов не обслуживать\n"
         "  --udp-reverse-hook обратное UDP-направление гарантированно стоит в NFQUEUE\n"
         "  --iface NAME       чей MTU берётся пределом длины посылки\n"
         "  --flows N          предел числа потоков — отдельно на TCP и на\n"
@@ -1007,6 +1009,10 @@ int main(int argc, char **argv) {
     uint32_t journal = 256;
     int fail_open = 1;
     int udp_reverse_hook = 0;
+    /* Только политика Keenetic (задача 59): S99d2k переводит имя политики в
+       её метку (ndmc show ip policy) и отдаёт сюда. */
+    int only_on = 0, only_none = 0;
+    uint32_t only_mark = 0, only_mask = 0xffffffffu;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1019,6 +1025,20 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--control") == 0)     { NEEDV(); ctl_path = v; }
         else if (strcmp(a, "--mark") == 0)        { NEEDV(); if (arg_u32(v, &mark)) goto badval; }
         else if (strcmp(a, "--probe-mark") == 0)  { NEEDV(); if (arg_u32(v, &probe_mark)) goto badval; }
+        else if (strcmp(a, "--only-mark") == 0) {
+            NEEDV();
+            only_on = 1;
+            if (strcmp(v, "none") == 0) { only_none = 1; }
+            else {
+                char mbuf[32];
+                const char *slash = strchr(v, '/');
+                size_t ml = slash ? (size_t)(slash - v) : strlen(v);
+                if (ml == 0 || ml >= sizeof mbuf) goto badval;
+                memcpy(mbuf, v, ml); mbuf[ml] = '\0';
+                if (arg_u32(mbuf, &only_mark) || (slash && arg_u32(slash + 1, &only_mask)) ||
+                    only_mask == 0) goto badval;
+            }
+        }
         else if (strcmp(a, "--udp-reverse-hook") == 0) { udp_reverse_hook = 1; }
         else if (strcmp(a, "--iface") == 0)       { NEEDV(); ifname = v; }
         else if (strcmp(a, "--flows") == 0)       { NEEDV(); if (arg_u32(v, &flows)) goto badval; }
@@ -1264,6 +1284,15 @@ int main(int argc, char **argv) {
     udp_out.routed = routes_routed;
     udp_out.routes = &routes;
     d2k_routemark_init(&routes);
+    if (only_on) {
+        d2k_routemark_set_policy(&routes, only_none, only_mark, only_mask);
+        if (only_none) {
+            printf("d2kd: только политика Keenetic — политика не найдена: клиентов не обслуживаю\n");
+        } else {
+            printf("d2kd: только политика Keenetic: клиенты с меткой 0x%x/0x%x, прочие идут ядром\n",
+                   (unsigned)(only_mark & only_mask), (unsigned)only_mask);
+        }
+    }
     /* Изменения правил и маршрутов — сразу, по уведомлению (финальное ревью
        M-2): правило, добавленное при работающей службе (включили политику
        VPN, переподключение), иначе было бы неизвестно до 30 с. Опрос раз в

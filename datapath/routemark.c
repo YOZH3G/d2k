@@ -266,9 +266,26 @@ int d2k_routemark_merge(d2k_routemark *r, const d2k_fwsel *v4, size_t n4, int ok
     return changed;
 }
 
+void d2k_routemark_set_policy(d2k_routemark *r, int none, uint32_t mark, uint32_t mask) {
+    if (!r) { return; }
+    r->policy_on = 1;
+    r->policy_none = none ? 1 : 0;
+    r->policy_mark = mark & mask;
+    r->policy_mask = mask;
+}
+
+static int policy_match(const d2k_routemark *r, int have_mark, uint32_t mark) {
+    return r->policy_on && !r->policy_none && have_mark &&
+           ((mark ^ r->policy_mark) & r->policy_mask) == 0;
+}
+
 int d2k_routemark_routed(const d2k_routemark *r, uint8_t ipver, uint32_t mark) {
     if (!r || !mark) { return 0; }
-    if (mark == D2K_ROUTE_OTHER_DEV) { return 1; }
+    if (mark == D2K_ROUTE_OTHER_DEV || mark == D2K_ROUTE_OUTSIDE) { return 1; }
+    /* The chosen policy selects its own table by design: that is the traffic
+       the user asked d2k to serve, not a client routed away from it.  Whether
+       the raw send can follow it is the exit device's question (the gate). */
+    if (policy_match(r, 1, mark)) { return 0; }
     uint8_t family = ipver == 6 ? 10 : 2;
     if (!(family == 10 ? r->rules_read6 : r->rules_read4)) { return 1; }   /* fail closed */
     for (size_t i = 0; i < r->n; i++) {
@@ -287,6 +304,16 @@ uint32_t d2k_routemark_client(const d2k_routemark *r, uint8_t ipver, int have_ma
 uint32_t d2k_routemark_gate(const d2k_routemark *r, uint8_t ipver, int outbound,
                             int have_mark, uint32_t mark, uint32_t probe_mark,
                             uint32_t own_mark, int have_outdev, uint32_t outdev) {
+    /* ТОЛЬКО ВЫБРАННАЯ ПОЛИТИКА KEENETIC (задача 59). Исходящий пакет без её
+       метки — клиент вне политики или трафик самого роутера — идёт ядром:
+       ни плана, ни удержания, ни событий контроллеру; ответы следуют потоку.
+       Свои метки (зонды контроллера, посылки датапата) обслуживаются как
+       прежде. Метка политики дальше проходит обычный путь: «уведённым по
+       ip rule» она не считается (d2k_routemark_routed), а выход проверяется. */
+    if (r && r->policy_on && outbound) {
+        int own = have_mark && mark && (mark == probe_mark || mark == own_mark);
+        if (!own && !policy_match(r, have_mark, mark)) { return D2K_ROUTE_OUTSIDE; }
+    }
     uint32_t m = d2k_routemark_client(r, ipver, have_mark, mark, probe_mark, own_mark);
     if (m || !r || !outbound || !have_outdev) { return m; }
     int v6 = ipver == 6;

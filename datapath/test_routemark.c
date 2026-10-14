@@ -310,6 +310,43 @@ int main(void) {
               "a reply (FORWARD/INPUT, out to the LAN) is never gated by its device");
         CHECK(d2k_routemark_gate(&g, 4, 1, 0, 0, 0x2e, 0x2d, 0, 0) == 0,
               "no outdev attribute: no device gate");
+
+        /* ТОЛЬКО ПОЛИТИКА KEENETIC (задача 59). Метка политики 0xffffaaa
+           выбирает свою таблицу правилом ip rule — как у владельца, — и
+           именно её трафик обслуживается; всё прочее исходящее идёт ядром. */
+        d2k_routemark pol = g;
+        d2k_fwsel ps = { 0xffffaaa, 0xffffffff, 2 };
+        (void)d2k_routemark_set(&pol, &ps, 1);
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 1, 0xffffaaa, 0x2e, 0x2d, 1, 5) == 0xffffaaa,
+              "policy: before the mode the policy mark reads as routed (the old exclusion)");
+        d2k_routemark_set_policy(&pol, 0, 0xffffaaa, 0xffffffff);
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 1, 0xffffaaa, 0x2e, 0x2d, 1, 5) == 0,
+              "policy: a client with the policy mark is served");
+        CHECK(!d2k_routemark_routed(&pol, 4, 0xffffaaa),
+              "policy: its own mark is not 'routed away' for the UDP output either");
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 1, 0xffffaaa, 0x2e, 0x2d, 1, 9) == D2K_ROUTE_OTHER_DEV,
+              "policy: a policy leaving through another device (VPN) stays on the kernel path");
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 0, 0, 0x2e, 0x2d, 1, 5) == D2K_ROUTE_OUTSIDE,
+              "policy: an unmarked client (or the router's own traffic) is outside");
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 1, 0x40, 0x2e, 0x2d, 1, 5) == D2K_ROUTE_OUTSIDE,
+              "policy: another mark is outside");
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 1, 0x2e, 0x2e, 0x2d, 1, 5) == 0 &&
+              d2k_routemark_gate(&pol, 4, 1, 1, 0x2d, 0x2e, 0x2d, 1, 5) == 0,
+              "policy: the controller's probes and the datapath's own sends are still served");
+        CHECK(d2k_routemark_gate(&pol, 4, 0, 0, 0, 0x2e, 0x2d, 1, 3) == 0,
+              "policy: a reply carries no mark and follows its flow, never gated here");
+        CHECK(d2k_routemark_routed(&pol, 4, D2K_ROUTE_OUTSIDE),
+              "policy: outside reads as routed (the UDP output keeps it on the kernel path)");
+        (void)d2k_routemark_set(&pol, &ps, 1);
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 0, 0, 0x2e, 0x2d, 1, 5) == D2K_ROUTE_OUTSIDE &&
+              d2k_routemark_gate(&pol, 4, 1, 1, 0xffffaaa, 0x2e, 0x2d, 1, 5) == 0,
+              "policy: the mode survives a rule refresh");
+        d2k_routemark_set_policy(&pol, 1, 0, 0);
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 1, 0xffffaaa, 0x2e, 0x2d, 1, 5) == D2K_ROUTE_OUTSIDE &&
+              d2k_routemark_gate(&pol, 4, 1, 0, 0, 0x2e, 0x2d, 1, 5) == D2K_ROUTE_OUTSIDE,
+              "policy not found: no client is served");
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 1, 0x2e, 0x2e, 0x2d, 1, 5) == 0,
+              "policy not found: the controller's own probes still work");
         CHECK(d2k_routemark_gate(&g, 6, 1, 0, 0, 0x2e, 0x2d, 1, 9) == 0,
               "IPv6 default devices unknown: no IPv6 device gate");
         CHECK(d2k_routemark_routed(&g, 4, D2K_ROUTE_OTHER_DEV),

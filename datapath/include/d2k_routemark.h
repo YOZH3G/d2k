@@ -45,6 +45,11 @@
    nfmark of this value also reads as routed: the safe side. */
 #define D2K_ROUTE_OTHER_DEV 0xffffffffu
 
+/* The route mark of a client outside the configured Keenetic policy
+   (d2k_routemark_set_policy, task 59): its flow takes the kernel path with no
+   plan, hold or controller event.  d2k_routemark_routed() says "routed". */
+#define D2K_ROUTE_OUTSIDE 0xfffffffeu
+
 typedef struct {
     uint32_t mark;
     uint32_t mask;
@@ -58,7 +63,16 @@ typedef struct {
     uint8_t oifs_read4, oifs_read6;     /* that family's routes were read once */
     size_t n_oif4, n_oif6;
     uint32_t oif4[D2K_ROUTEMARK_OIF_MAX], oif6[D2K_ROUTEMARK_OIF_MAX];
+    /* Keenetic policy mode (task 59): only clients whose packets carry this
+       mark are served.  policy_none: the named policy was not found, so no
+       client is served (the user asked for one policy, not for everyone). */
+    uint8_t policy_on, policy_none;
+    uint32_t policy_mark, policy_mask;
 } d2k_routemark;
+
+/* Serve only one Keenetic policy: mark/mask from "ndmc show ip policy"; none
+ * != 0 — the policy is unknown, serve no client.  Survives rule refreshes. */
+void d2k_routemark_set_policy(d2k_routemark *r, int none, uint32_t mark, uint32_t mask);
 
 void d2k_routemark_init(d2k_routemark *r);
 

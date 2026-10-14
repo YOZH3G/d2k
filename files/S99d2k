@@ -1021,6 +1021,44 @@ fastnat_restore() {
     rm -f "$FASTNAT_SAVED"
 }
 
+# ТОЛЬКО ДЛЯ ПОЛИТИКИ KEENETIC (задача 59). KEENETIC_POLICY в конфигурации —
+# имя политики доступа так, как его видно в веб-интерфейсе (описание), или
+# внутреннее имя (Policy0). Метку политики называет ndmc; датапат получает её
+# ключом --only-mark и обслуживает только устройства с этой меткой, прочие и
+# трафик самого роутера идут ядром. Политики нет — «none»: устройств D2K не
+# трогает и говорит об этом, а не обрабатывает молча всех.
+policy_mark() {
+    command -v ndmc >/dev/null 2>&1 || return 0
+    ndmc -c "show ip policy" 2>/dev/null | tr -d '\033' | awk -v want="$1" '
+        /policy, name = / {
+            line = $0; sub(/.*policy, name = /, "", line)
+            name = line; sub(/,.*/, "", name)
+            # Без описания строка кончается двоеточием: «name = D2Ktest: »
+            # (поле 14.10.2026).
+            sub(/:[[:space:]]*$/, "", name); sub(/[[:space:]]+$/, "", name)
+            desc = ""
+            if (line ~ /description = /) {
+                desc = line; sub(/.*description = /, "", desc)
+                sub(/:[[:space:]]*$/, "", desc); sub(/[[:space:]]+$/, "", desc)
+            }
+            cur = (name == want || desc == want)
+            next
+        }
+        cur && /^[[:space:]]*mark:/ { print $2; exit }'
+}
+policy_args() {
+    [ -n "${KEENETIC_POLICY:-}" ] || return 0
+    pm=$(policy_mark "$KEENETIC_POLICY")
+    case "$pm" in
+        ''|*[!0-9a-fA-F]*)
+            echo "d2k: ВНИМАНИЕ: политика Keenetic «${KEENETIC_POLICY}» не найдена (ndmc show ip policy) — устройства не обрабатываются; проверьте KEENETIC_POLICY в $CONF" >&2
+            echo "--only-mark none" ;;
+        *)
+            echo "d2k: только политика Keenetic «${KEENETIC_POLICY}» (метка 0x$pm); остальные устройства идут как без D2K" >&2
+            echo "--only-mark 0x$pm/0xffffffff" ;;
+    esac
+}
+
 # УСКОРЕНИЕ ПОТОКОВ fw4 (OpenWrt) — тот же случай, что ускоритель NAT выше.
 # С flow_offloading поток после рукопожатия уходит в flowtable мимо всех
 # цепочек: лаборатория 07.10.2026 (25.12.5, клиент LAN, HTTPS) — в очередь 4-5
@@ -1148,6 +1186,8 @@ start_engine() {
     if ! { [ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$PROBE_MARK" ]; }; then die "MEASURE_MARK должен отличаться от MARK и PROBE_MARK"; fi
 
     set -- --health-file "$RUNTIME_DIR/d2kd.health"
+    # shellcheck disable=SC2046  # ключ и значение — два слова нарочно
+    set -- "$@" $(policy_args)
     legacy_stats=${STATS_SEC:-900}
     spawn_daemon -S -b -m -p "$DP_PID" -x "$DPBIN" -- \
         --queue "$QUEUE_NUM" --mode "$dpmode" --mark "$MARK" \
@@ -1394,6 +1434,11 @@ status() {
     running "$HL_PID" && echo "  сторож правил: работает (pid $(cat "$HL_PID"))" \
                       || echo "  сторож правил: не работает"
     fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
+    if [ -n "${KEENETIC_POLICY:-}" ]; then
+        pm=$(policy_mark "$KEENETIC_POLICY")
+        if [ -n "$pm" ]; then echo "  политика Keenetic: «${KEENETIC_POLICY}» (метка 0x$pm) — остальные устройства идут как без D2K"
+        else echo "  политика Keenetic: «${KEENETIC_POLICY}» НЕ НАЙДЕНА — устройства не обрабатываются"; fi
+    fi
     [ ! -f "$FW_V4ONLY" ] || echo "  IPv6: не обслуживается — нет ip6tables mangle, работа только по IPv4"
     if [ "$FW_BACKEND" = iptables ] && command -v d2k_ppe_status >/dev/null 2>&1; then
         d2k_ppe_status
