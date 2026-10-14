@@ -7845,8 +7845,13 @@ static void search_report(d2k_sched *s, task *t, int64_t now_ms,
         path = "none";
         if (t->next_plan && t->next_plan <= t->n_plans) {
             const char *p = candidate_path(t);
+            /* RX-лестница — перебор ИМЕНИ по замеренному обрыву ответа, а не
+               запасной список оригинала (владелец, 14.10.2026: «белое имя к
+               перебору не имеет отношения»). Своя подпись: иначе доля
+               перебора в поле считала и её. */
             path = !strcmp(p, "свой план") || t->own_first == 2 ? "own-plan" :
-                   !strcmp(p, "перебор") || !strcmp(p, "RX-лестница") ? "fallback" : "property";
+                   !strcmp(p, "RX-лестница") ? "ladder" :
+                   !strcmp(p, "перебор") ? "fallback" : "property";
         }
     }
     pthread_mutex_lock(&s->mu);

@@ -9674,6 +9674,43 @@ rx_volume_tests:
         d2k_sched_free(s); d2k_catalog_free(&cS);
     }
 
+    /* Успех лестницы SNI — не перебор (поле 15.10.2026, rua.gr: «путь:
+       RX-лестница», а итог «path=fallback»). Подпись итога своя — ladder. */
+    {
+        d2k_catalog cS = {0};
+        snprintf(cS.net.name, sizeof cS.net.name, "learned-white.example");
+        cS.net.searched = 1; cS.net.confirmed_at = 1791593321;
+        d2k_sched *s = d2k_sched_new(&cS, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ver_level old_ver = ver_answer;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 1; vol_rx_at_kb = 14;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0; ver_answer_port = 40090;
+        d2k_ev h = ev_hello(6, 40090, "sni-ok.test"), sh;
+        d2k_sched_event(s, &h);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0, "sni-ok shape fixture");
+        d2k_sched_event(s, &sh);
+        prime_late_rst(s, h.name, 40190);
+        d2k_ev su = ev_suspect(6, 40090); su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su);
+        int installed = 0;
+        for (int i = 0; i < 40000 && !said("итог поиска"); i++) {
+            tick_once(s);
+            int n = sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+            if (n > installed) {
+                installed = n;
+                d2k_ev ap = ev_applied(6, 40090);
+                d2k_sched_event(s, &ap);
+            }
+            if (i % 400 == 399) skip_ahead(s, 6000);
+        }
+        CHECK(said("путь: RX-лестница") && said("path=ladder") && !said("path=fallback"),
+              "sni-ok: успех лестницы SNI записан как запасной перебор");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        vol_rx_cut = 0; vol_rx_at_kb = 24; ver_answer = old_ver;
+        d2k_sched_free(s); d2k_catalog_free(&cS);
+    }
+
     /* ПОДБОР БЕЛОГО ИМЕНИ СЕТИ (поле 10.10.2026). Когда у цели измерен
        RX-обрыв, а белое имя сети не решено, RX-лестница перебирает кандидаты
        из встроенного списка приманкой; решено — берёт готовое/семя. */
