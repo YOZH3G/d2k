@@ -358,6 +358,19 @@ h3.o: h3.c $(HDR)
 volume.o: volume.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# d2kfetch — обращение к цели как у браузера (см. шапку d2kfetch.c): форма и
+# длина приветствия браузерные, обращение непомеченное, поэтому датапат
+# применяет к нему тот же план. Нужен полю вместо curl, чьё короткое
+# приветствие под браузерный план не подходит.
+d2kfetch: d2kfetch.c verify.o verify_quic_replay.o quicconn.o quicwire.o h3.o \
+	compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o tls12.o \
+	p256.o x25519.o crypto.o quic.o quicsnap.o quicsnap_reseal.o quicprobe.o \
+	quicarms.o quichello.o volume.o ipfrag.o net4.o props.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< verify.o verify_quic_replay.o quicconn.o quicwire.o h3.o \
+		compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o tls12.o \
+		p256.o x25519.o crypto.o quic.o quicsnap.o quicsnap_reseal.o quicprobe.o \
+		quicarms.o quichello.o volume.o ipfrag.o net4.o props.o $(TEST_LDFLAGS)
+
 plantlv.o: plantlv.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 

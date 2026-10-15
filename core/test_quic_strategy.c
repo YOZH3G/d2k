@@ -337,6 +337,12 @@ int main(void) {
     CHECK(r.clearance == D2K_PROP_NO && r.split_crypto == D2K_PROP_UNKNOWN);
     CHECK(r.incomplete && r.kind == D2K_QA_NOT_FOUND && ladder_calls == 0);
     CHECK(r.clearance_asked && !r.split_asked); /* адреса не было — вопрос не задан */
+    /* НЕЗАДАННЫЙ ВОПРОС НЕ ВЫДАЁТСЯ ЗА ОТВЕТ КОРОБКИ (поле 15.10.2026).
+       У www.facebook.com вход был ECH-пачкой, разрез CRYPTO не собрался, а в
+       итоге поиска стояло «разрез CRYPTO: ответа нет» — и это читалось как
+       отказ коробки, уводя разбор. «Задан и промолчала» и «не задан вовсе» —
+       разные факты, и слово в отчёте обязано их различать. */
+    CHECK(!strstr(r.reason, "разрез CRYPTO: ответа нет"));
 
     /* 9. Метка не подтверждена — верить нельзя. */
     marked_ok = 0;
