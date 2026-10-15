@@ -117,6 +117,48 @@ int main(void) {
         close(server);
     }
 
+    /* ФОРМА КЛИЕНТА У СОБСТВЕННОГО КЛИЕНТА (задача 66). План подтверждается
+       приветствием того же вида, каким ходит человек: у Chrome с ML-KEM это
+       два Initial по 1200 байт. Своё минимальное приветствие в одной
+       датаграмме — другой вопрос к коробке, и «подтверждено» досталось бы
+       зонду, а не клиенту. */
+    {
+        int server = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        assert(server >= 0 && bind(server, (struct sockaddr *)&a, sizeof a) == 0);
+        socklen_t al = sizeof a;
+        assert(getsockname(server, (struct sockaddr *)&a, &al) == 0);
+        assert(fcntl(server, F_SETFL, O_NONBLOCK) == 0);
+
+        d2k_quic_form form = {2, 1200, 2100};
+        d2k_qc_opts o;
+        memset(&o, 0, sizeof o);
+        o.ip = "127.0.0.1";
+        o.port = ntohs(a.sin_port);
+        o.sni = "rutracker.org";
+        o.alpn = "h3";
+        o.deadline_ms = 50;
+        o.form = &form;
+        d2k_qc *c = NULL;
+        char err[256] = {0};
+        (void)d2k_qc_connect(&o, &c, err, sizeof err); /* сервера нет: важен первый полёт */
+        uint8_t got[2048];
+        size_t seen = 0, lens[4] = {0};
+        for (;;) {
+            ssize_t n = recv(server, got, sizeof got, 0);
+            if (n <= 0) { break; }
+            if (seen < 4) { lens[seen] = (size_t)n; }
+            seen++;
+        }
+        CHECK(seen == 2, "первый полёт ушёл не двумя датаграммами");
+        CHECK(lens[0] == 1200 && lens[1] == 1200, "датаграммы полёта не той длины");
+        if (c) { d2k_qc_close(c); }
+        close(server);
+    }
+
     if (!fails) { puts("QUIC: request retransmit timer survives sliced reads"); }
     return fails != 0;
 }

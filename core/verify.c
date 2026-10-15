@@ -815,6 +815,17 @@ static __thread unsigned g_verify_budget;
 void d2k_verify_budget_set(unsigned budget_packets) { g_verify_budget = budget_packets; }
 unsigned d2k_verify_budget_get(void) { return g_verify_budget; }
 
+/* ФОРМА ПРИВЕТСТВИЯ КЛИЕНТА ДЛЯ ЗОНДА QUIC (задача 66) — поточная настройка,
+   как и бюджет выше: подписи крючков зонда не меняются. Ставится на время
+   одной проверки и снимается сразу после. Ноль — как раньше, своё
+   минимальное приветствие в одной датаграмме. */
+static __thread d2k_quic_form g_verify_quic_form;
+static __thread int g_verify_quic_form_set;
+void d2k_verify_quic_form_set(const d2k_quic_form *f) {
+    if (f && f->n) { g_verify_quic_form = *f; g_verify_quic_form_set = 1; }
+    else { g_verify_quic_form_set = 0; }
+}
+
 /* Почему TCP_INFO, а не счёт в зонде: зонд видит записи TLS и байты, а
    коробка считает ПАКЕТЫ (поле 04.10: от байтов порог не зависит). Сегменты
    с данными знает только ядро: data_segs_in/out (Linux 4.6+, роутеры на 4.9)
@@ -1707,6 +1718,9 @@ d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_
     o.alpn = "h3";
     o.deadline_ms = deadline_ms > 0 ? deadline_ms : 5000;
     o.pad_to = hello_wire;
+    /* Форма клиента, если её поставили на этот поток: приветствие того же
+       вида, каким ходит человек (задача 66). */
+    o.form = g_verify_quic_form_set ? &g_verify_quic_form : NULL;
     o.use_fd = use_fd;
     /* Метки НЕТ намеренно — ровно по той же причине, что у TCP-зонда: к
        помеченному пакету поставленный план не применится, и зонд мерил бы

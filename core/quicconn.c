@@ -961,7 +961,9 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
     uint8_t priv[32];
     uint8_t frame[2600];
     size_t flen = 0;
-    if (first_flight(c, o->sni, o->alpn, o->pad_to, priv, frame, sizeof frame, &flen,
+    /* Длина приветствия — из формы клиента, когда она известна. */
+    size_t want_ch = (o->form && o->form->ch_len) ? (size_t)o->form->ch_len : o->pad_to;
+    if (first_flight(c, o->sni, o->alpn, want_ch, priv, frame, sizeof frame, &flen,
                      err, errcap) != 0) {
         d2k_qc_close(c); return -1;
     }
@@ -1036,7 +1038,28 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
     }
     /* Первая датаграмма клиента обязана быть не короче 1200 байт
        (RFC 9000 §14.1): иначе сервер вправе её не обслуживать. */
-    if (!o->first_send) {
+    if (o->form && o->form->n > 1 && !o->first_send) {
+        /* ПОЛЁТ ИЗ НЕСКОЛЬКИХ ДАТАГРАММ (задача 66). ClientHello режется на
+           form->n кадров CRYPTO по смещениям, каждый уходит своим Initial с
+           номерами 0..n-1 под общим DCID — ровно так его шлёт клиент, чьё
+           приветствие в одну датаграмму не влезло. Размер каждой датаграммы —
+           из формы: он тоже свойство клиента, по которому коробка решает. */
+        size_t parts = o->form->n > D2K_QSNAP_MAX_DGRAMS
+                       ? D2K_QSNAP_MAX_DGRAMS : o->form->n;
+        size_t chunk = (c->tr_len + parts - 1) / parts;
+        size_t pad = o->form->dgram_len ? o->form->dgram_len : 1200;
+        for (size_t i = 0; i < parts; i++) {
+            size_t off = i * chunk;
+            if (off >= c->tr_len) { break; }
+            size_t take = c->tr_len - off < chunk ? c->tr_len - off : chunk;
+            uint8_t part[2600];
+            size_t plen = crypto_frame(part, sizeof part, off, c->transcript + off, take);
+            if (plen == 0 ||
+                send_level(c, D2K_QW_LEVEL_INITIAL, part, plen, pad, err, errcap) != 0) {
+                d2k_qc_close(c); return -1;
+            }
+        }
+    } else if (!o->first_send) {
         if (send_level(c, D2K_QW_LEVEL_INITIAL, frame, flen, 1200, err, errcap) != 0) {
             d2k_qc_close(c); return -1;
         }

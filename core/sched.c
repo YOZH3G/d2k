@@ -63,6 +63,7 @@
 #include "d2k_compose_internal.h"
 #include "d2k_hello.h"
 #include "d2k_quic.h"
+#include "d2k_quicsnap.h"
 #include "d2k_quichello.h"
 #include "d2k_quicconn.h"
 #include "d2k_plantlv.h"
@@ -83,6 +84,14 @@
 /* Одновременных поисков. Больше — и рабочих потоков станет больше, чем у
    роутера есть смысла держать: каждый занят сетевым ожиданием, не счётом. */
 #define SCHED_MAX_TASKS 64
+/* ВХОД ЗАМЕРА — ДО ПАЧКИ ПРИВЕТСТВИЯ (задача 66). У QUIC это весь полёт
+   клиента: приветствие Chrome с ML-KEM около 2,4 КБ в двух датаграммах, и
+   прежних 2048 байт на него не хватало — снимок отсекался первой же
+   проверкой длины. Контроль (ctrl) остаётся прежнего размера: пачку под
+   другое имя не пересобрать, и контролем для неё служит собственный Initial
+   донора (около 1200 байт). 64 задачи × (вход + снимок) — около 800 КБ,
+   выделенных один раз, а не растущих. */
+#define SCHED_TRIG_MAX D2K_SHAPE_MAX
 #define SCHED_COOLDOWN_SLOTS 128
 /* Одновременных сетевых замеров (задачи 29, 38). Замер почти не считает —
    он ждёт сеть, — но держит поток (стек 1 МиБ адресного пространства),
@@ -665,7 +674,7 @@ typedef struct {
 
     /* Приветствия. trigger — снятое датапатом, если уже поймано; иначе
        профиль холодного старта. control — приманка ДРУГИМ именем (§7). */
-    uint8_t    trig[2048];
+    uint8_t    trig[SCHED_TRIG_MAX];
     size_t     trig_len;
     uint8_t    ctrl[2048];
     size_t     ctrl_len;
@@ -695,7 +704,7 @@ typedef struct {
        2 тишина (вердикт address подтверждён без триггеров), 0 не задавался. */
     int        addr_recheck;
     int        addr_ack;
-    uint8_t    snap[2048];
+    uint8_t    snap[SCHED_TRIG_MAX];
     size_t     snap_len;
     /* То же для QUIC: целый Initial клиента ЭТОЙ цели, пойманный во время
        поиска, хранится у задачи — общую ячейку quic_shape к перемеру может
@@ -1185,7 +1194,7 @@ typedef struct {
     /* Для перепроверки: адрес, порт, Initial клиента (вход прогона). */
     char ip[64];
     uint16_t port;
-    uint8_t trig[2048];
+    uint8_t trig[SCHED_TRIG_MAX];
     size_t trig_len;
 } quic_deny_slot;
 
@@ -1317,7 +1326,7 @@ struct d2k_sched {
      * Чего он НЕ даёт: права назвать форму измеренной ДЛЯ ЭТОЙ ЦЕЛИ. Признак
      * trig_snapped остаётся нулевым, снимок этой цели заказывается как
      * прежде, и со следующего обращения мерится уже своим. */
-    uint8_t      quic_shape[2][2048];
+    uint8_t      quic_shape[2][SCHED_TRIG_MAX];
     size_t       quic_shape_len[2];
     char         quic_shape_name[2][256];
     uint64_t     quic_shape_seq[2];
@@ -2072,6 +2081,19 @@ static int fill_hellos(d2k_sched *s, task *t) {
                 memcpy(t->trig, s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6]);
                 t->trig_len = s->quic_shape_len[t->family == 6];
                 t->trig_snapped = 1;
+            } else if (s->quic_shape_len[t->family == 6] > 0 &&
+                       d2k_qsnap_is(s->quic_shape[t->family == 6],
+                                    s->quic_shape_len[t->family == 6])) {
+                /* ЧУЖАЯ ПАЧКА ПОД ДРУГОЕ ИМЯ НЕ ПЕРЕСОБИРАЕТСЯ (задача 66).
+                   Имя сидит внутри ClientHello, разложенного по нескольким
+                   датаграммам: сменить его значит пересобрать весь полёт, и
+                   это уже не форма клиента, а наша. Мерим собственным
+                   Initial — честно и с пометкой PROFILE, пока не придёт
+                   снимок этой цели. */
+                if (d2k_quic_probe_initial(t->name, t->trig, sizeof t->trig,
+                                           &t->trig_len) != 0) { return -1; }
+                say(s, "по %s последний QUIC-снимок — пачка чужого имени, её не "
+                       "переименовать; мерю собственным Initial (PROFILE)", t->name);
             } else if (s->quic_shape_len[t->family == 6] > 0) {
                 int used_sample = 0;
                 if (d2k_quic_prepare_target(s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6],
@@ -2175,7 +2197,7 @@ static int fill_hellos(d2k_sched *s, task *t) {
    обнулить. */
 typedef struct {
     d2k_sched *s; task *t; int use_fd;
-    uint8_t trig[2048], ctrl[2048];
+    uint8_t trig[SCHED_TRIG_MAX], ctrl[2048];
     size_t trig_len, ctrl_len;
     int split_unfit; /* решено главным потоком (quic_split_unfit) */
     unsigned budget; /* бюджет потока испытания (JOB_VERIFY), 0 — без проверки */
@@ -2446,6 +2468,19 @@ static void *worker_run(void *vp) {
         /* Проверка бюджета потока (задача 55) — поточная настройка зонда:
            подписи крючков зонда не меняются. Снимается сразу после. */
         d2k_verify_budget_set(a_budget);
+        /* ФОРМА КЛИЕНТА ДЛЯ ЗОНДА QUIC (задача 66): когда вход замера — пачка
+           снятых датаграмм, собственный полёт зонда идёт тем же числом
+           датаграмм той же длины. Иначе план, снятый с двухдатаграммного
+           приветствия, подтверждался бы одиночным — вопросом, которого
+           клиент не задавал. */
+        d2k_quic_form a_form;
+        int a_form_ok = 0;
+        if (t->transport == 17 && d2k_qsnap_is(trig.bytes, trig.len)) {
+            d2k_qsnap a_pack;
+            a_form_ok = d2k_qsnap_parse(trig.bytes, trig.len, &a_pack) == 0 &&
+                        d2k_qsnap_form(&a_pack, &a_form) == 0;
+        }
+        d2k_verify_quic_form_set(a_form_ok ? &a_form : NULL);
         if (t->transport == 6 && t->ech_offer && t->ech_replay) {
             /* Свидетеля нет: кандидат проверяется теми же байтами клиента. */
             vr = d2k_sched_replay_ver_hook(a_use_fd, t->ip, t->port, trig.bytes, trig.len,
@@ -2477,6 +2512,7 @@ static void *worker_run(void *vp) {
                                                          ? D2K_SHAPE_UNKNOWN
                                                          : d2k_hello_shape(t->trig, t->trig_len)));
         d2k_verify_budget_set(0);
+        d2k_verify_quic_form_set(NULL);
         pthread_mutex_lock(&s->mu);
         t->ver = vr;
         t->res_ready = 1;
@@ -7474,21 +7510,39 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
        TLS: разбор TLS на нём возвращает отказ, и снимок молча пропадал. */
     char name[256];
     if (ev->transport == 17) {
-        if (d2k_quic_sni(ev->shape, ev->shape_len, name, sizeof name) != 0) { return; }
-        /* ОБРЫВОК ПРИВЕТСТВИЯ — не снимок, как и у TCP выше. Датапат отдаёт
-           датаграмму, на которой сборка дала имя; если ClientHello едет двумя
-           Initial, в ней только начало. Сервер такой Initial не дочитает и
-           промолчит, контроль ответит — и молчание стало бы D2K_V_OPAQUE,
-           «доказанной» блокировкой от пакета, которого клиент не слал. Ни
-           вход цели, ни общий quic_shape, ни перемер им не заменяются: цель
-           мерится собственным Initial донора (PROFILE, trig_snapped=0, в
-           привязке D2K_INPUT_PROFILE), как без снимка. */
-        if (d2k_quic_hello_incomplete(ev->shape, ev->shape_len)) {
-            say(s, "снимок QUIC по %s (%zu байт) — обрывок ClientHello, приветствие "
-                   "не в одной датаграмме; не заменяю им вход измерителя, цель "
-                   "мерится собственным Initial (PROFILE)", name, ev->shape_len);
-            quic_note_multi(s, name, ev->family ? ev->family : 4);
-            return;
+        /* ПАЧКА — ВЕСЬ ПОЛЁТ КЛИЕНТА (задача 66). Приветствие Chrome с
+           постквантовым key_share едет двумя Initial, и датапат отдаёт их
+           вместе. Имя берётся из СОБРАННОГО ClientHello: расширение
+           server_name Chrome кладёт последним, и в первой датаграмме его нет
+           вовсе. Пачка, которая не складывается в целое приветствие (Retry,
+           вытесненная из кольца датаграмма), — тот же обрывок, что и
+           одиночная половина ниже. */
+        if (d2k_qsnap_is(ev->shape, ev->shape_len)) {
+            d2k_qsnap pack;
+            if (d2k_qsnap_parse(ev->shape, ev->shape_len, &pack) != 0) { return; }
+            if (d2k_qsnap_sni(&pack, name, sizeof name) != 0) {
+                say(s, "снимок QUIC (%zu датаграмм, %zu байт) не складывается в целое "
+                       "приветствие — обрывок ClientHello; цель мерится собственным "
+                       "Initial (PROFILE)", pack.n, ev->shape_len);
+                return;
+            }
+            say(s, "по %s снят снимок QUIC: %zu датаграмм, %zu байт — мерю снятыми "
+                   "байтами клиента", name, pack.n, ev->shape_len);
+        } else {
+            /* ОДИНОЧНАЯ ДАТАГРАММА — прежний путь (датапат старой сборки,
+               собственный зонд). Обрывок им не становится снимком: сервер
+               такой Initial не дочитает и промолчит, контроль ответит — и
+               молчание стало бы «доказанной» блокировкой от пакета, которого
+               клиент не слал. Цель тогда мерится собственным Initial донора
+               (PROFILE, trig_snapped=0, в привязке D2K_INPUT_PROFILE). */
+            if (d2k_quic_sni(ev->shape, ev->shape_len, name, sizeof name) != 0) { return; }
+            if (d2k_quic_hello_incomplete(ev->shape, ev->shape_len)) {
+                say(s, "снимок QUIC по %s (%zu байт) — обрывок ClientHello, приветствие "
+                       "не в одной датаграмме; не заменяю им вход измерителя, цель "
+                       "мерится собственным Initial (PROFILE)", name, ev->shape_len);
+                quic_note_multi(s, name, ev->family ? ev->family : 4);
+                return;
+            }
         }
     } else {
         size_t off = 0, len = 0;

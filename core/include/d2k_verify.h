@@ -46,6 +46,7 @@
 #define D2K_VERIFY_H
 
 #include <stdint.h>
+#include "d2k_quicsnap.h"
 #include "d2k_resource.h"
 #include "d2k_http_reply.h"
 /* Shared HTTP framing reader; transport owns the connection and request. */
@@ -203,6 +204,11 @@ typedef struct {
  * базовые и объёмные замеры её не делают). Зовёт рабочий поток испытания
  * кандидата перед зондом и снимает после. */
 void d2k_verify_budget_set(unsigned budget_packets);
+/* Форма приветствия клиента для зонда QUIC (задача 66): его собственный
+   первый полёт пойдёт тем же числом датаграмм той же длины, что у клиента.
+   NULL или нулевое n — как раньше. Поточная настройка: ставится перед одной
+   проверкой и снимается сразу после. */
+void d2k_verify_quic_form_set(const d2k_quic_form *form);
 unsigned d2k_verify_budget_get(void);
 
 /* Пакеты TCP с данными обеих сторон на сокете: TCP_INFO data_segs_in +

@@ -36,6 +36,7 @@
 #define D2K_QUICCONN_H
 
 #include <stddef.h>
+#include "d2k_quicsnap.h"
 #include <stdint.h>
 
 typedef struct d2k_qc d2k_qc;
@@ -47,6 +48,13 @@ typedef struct {
     const char *alpn;      /* "h3"; NULL — без ALPN (сервер вправе отказать) */
     int         deadline_ms; /* потолок на ВСЁ рукопожатие */
     size_t      pad_to;    /* добить ClientHello до этой длины; 0 — не добивать */
+    /* ФОРМА ПРИВЕТСТВИЯ КЛИЕНТА (задача 66). NULL — как раньше: одно
+       минимальное приветствие в одной датаграмме. Иначе ClientHello добивается
+       до form->ch_len, а первый полёт уходит form->n датаграммами по
+       form->dgram_len — тем же видом, каким ходит человек. План, снятый с
+       клиента, подтверждается его же формой, иначе «подтверждено» достаётся
+       зонду. */
+    const d2k_quic_form *form;
     uint32_t    mark;      /* SO_MARK на сокете; 0 — не метить */
     /* УЖЕ ЗАНЯТЫЙ сокет (d2k_props_bind_udp): его местный порт вызывающий
      * назвал датапату заранее, чтобы пробный план достался только этому

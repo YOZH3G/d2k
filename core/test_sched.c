@@ -51,6 +51,8 @@
 #include "d2k_quichello.h"
 #include "d2k_sched.h"
 #include "d2k_quic.h"
+#include "d2k_quicsnap.h"
+#include "test_quic_pq.h"
 #include "test_quic_vector.h"
 #include "d2k_tls13.h"
 #include "d2k_meas.h"
@@ -6116,6 +6118,54 @@ admission_only_run:
         CHECK(budp != NULL, "привязка по QUIC не записана — план одного транспорта затёр другой");
         d2k_sched_free(s);
         d2k_catalog_free(&c2);
+    }
+
+    /* ПАЧКА ПРИВЕТСТВИЯ — ВХОД КЛИЕНТА (задача 66). Датапат отдаёт весь полёт
+       Chrome: две Initial-датаграммы, имя во второй. Контроллер обязан
+       собрать по ним ClientHello, взять имя и мерить цель ЭТИМИ байтами, а не
+       уходить на собственный Initial. Неполная пачка остаётся обрывком. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_calls = quic_calls = 0;
+        memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
+
+        uint8_t d1[1500], d2[1500];
+        size_t l1 = 0, l2 = 0;
+        CHECK(d2k_test_pq_initials("пачка.example", d1, &l1, d2, &l2) == 0 ||
+              d2k_test_pq_initials("pack.example", d1, &l1, d2, &l2) == 0,
+              "стенд двух Initial не собрался");
+        const uint8_t *dg[2] = {d1, d2};
+        size_t len[2] = {l1, l2};
+
+        d2k_ev sh;
+        memset(&sh, 0, sizeof sh);
+        sh.kind = D2K_EV_SHAPE;
+        sh.transport = 17;
+        sh.family = 4;
+        sh.shape_len = d2k_qsnap_pack(dg, len, 2, sh.shape, sizeof sh.shape);
+        CHECK(sh.shape_len > 0, "пачка не упаковалась");
+        d2k_sched_event(s, &sh);
+        CHECK(!said("обрывок ClientHello"), "целая пачка принята за обрывок");
+        CHECK(said("снят снимок QUIC") && said("датаграмм"),
+              "о принятой пачке не сказано ни слова");
+
+        /* Обрывок (одна первая датаграмма) по-прежнему отвергается и целую
+           пачку не затирает. */
+        saidbuf[0] = '\0';
+        d2k_ev frag;
+        memset(&frag, 0, sizeof frag);
+        frag.kind = D2K_EV_SHAPE;
+        frag.transport = 17;
+        frag.family = 4;
+        frag.shape_len = d2k_qsnap_pack(dg, len, 1, frag.shape, sizeof frag.shape);
+        d2k_sched_event(s, &frag);
+        CHECK(said("обрывок ClientHello"), "неполная пачка принята за снимок");
+
+        d2k_sched_free(s);
+        d2k_catalog_free(&empty);
     }
 
 shape_test:
