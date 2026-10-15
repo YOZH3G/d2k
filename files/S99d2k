@@ -144,6 +144,27 @@ esac
 # d2kc ставит правило подавления RST сам (detect/raw.c) — тем же способом.
 D2K_FW=$FW_BACKEND
 export D2K_FW
+# БЛОКИРОВКА XTABLES. Без -w iptables на занятой блокировке сразу отвечает
+# кодом 4, как будто правила нет. Поле 15.10.2026 (Keenetic, iptables 1.4.21):
+# сразу после запуска с iptables одновременно работают Telegram, разгрузка
+# PPE и сторож — проверка правил падала в 18 случаях из 300, сторож принимал
+# это за снесённые правила, reapply падал на том же и снимал всё, и роутер
+# оставался без единого правила до следующего круга сторожа (55 с). Поэтому
+# здесь каждый вызов, в каком бы виде он ни был ("$fw_tool", "$1" или
+# напрямую), ждёт блокировку. Голый -w понимают iptables с 1.4.20 (detect/raw.c
+# тоже зовёт его так); прошивке без него отвечает код 2, и тогда вызов
+# повторяется без ключа. Кто уже передал -w сам (d2k-ppe-deoffload.sh), второго
+# не получает.
+xt_wait() {
+    xt_tool=$1; shift
+    [ "${1:-}" != -w ] || shift
+    command "$xt_tool" -w "$@"
+    xt_rc=$?
+    [ "$xt_rc" = 2 ] || return "$xt_rc"
+    command "$xt_tool" "$@"
+}
+iptables() { xt_wait iptables "$@"; }
+ip6tables() { xt_wait ip6tables "$@"; }
 # Frequent live snapshots are volatile. The learned catalog stays on /opt.
 RUNTIME_DIR=${D2K_RUNTIME_DIR:-/tmp/d2k}
 LIVE=$RUNTIME_DIR/live.json
@@ -866,6 +887,92 @@ fw_lock_release() {
     rmdir "$FW_LOCK"
 }
 
+# DNS РОУТЕРА — НЕ ЦЕЛЬ. Поле 15.10.2026: Keenetic резолвит через DoH
+# (https-dns-proxy → geohide.ru:443), и этот поток шёл через очередь D2K как
+# обычный TLS; прокси при всплесках запросов копил зависшие и падал («too
+# many», 2275 ошибок за утро). DNS роутера, какой бы ни был заведён — DoH, DoT
+# или обычный на нестандартном порту, — исключается по адресу и порту: RETURN
+# в обе стороны раньше очереди, по TCP и по UDP (DoH поверх HTTP/3, DoQ).
+# Источник — `ndmc show dns-proxy`: строки dns_server, где после «#» стоит
+# настоящий сервер, а до «#» — локальный прокси (127.0.0.1, не исключается)
+# или сам сервер. Имена DoH разрешаются через DNS роутера на каждом круге
+# сторожа; неразрешившееся имя прежних правил не снимает. Без ndmc (OpenWrt)
+# исключать нечего — список пуст.
+dns_upstreams() {
+    command -v ndmc >/dev/null 2>&1 || return 0
+    ndmc -c "show dns-proxy" 2>/dev/null | tr -d '\033\r' | awk '
+        function emit(s, def,    host, port, t) {
+            host = s; port = def; t = s
+            if (s ~ /^\[/) {
+                sub(/^\[/, "", host); sub(/\].*/, "", host)
+                if (s ~ /\]:[0-9]+$/) { port = s; sub(/.*\]:/, "", port) }
+            } else if (gsub(/:/, ":", t) == 1) {
+                sub(/:.*/, "", host); port = s; sub(/.*:/, "", port)
+            }
+            if (host != "" && port ~ /^[0-9]+$/) print host, port
+        }
+        $1 == "dns_server" && $2 == "=" {
+            a = $3
+            if (a !~ /^127\./ && a !~ /^\[?::1\]?(:|$)/) emit(a, 53)
+            c = ""
+            for (i = 4; i < NF; i++) if ($i == "#") { c = $(i + 1); break }
+            if (c == "") next
+            sub(/@.*/, "", c)
+            if (c ~ /^https:\/\//) { sub(/^https:\/\//, "", c); sub(/\/.*/, "", c); emit(c, 443) }
+            else { sub(/^tls:\/\//, "", c); emit(c, 853) }
+        }'
+}
+dns_excl_rule() { # <-D|-A> <адрес> <порт>
+    dx_tool=iptables
+    case $2 in *:*) dx_tool=ip6tables; [ ! -f "$FW_V4ONLY" ] || return 0 ;; esac
+    for dx_pr in tcp udp; do
+        for dx_dir in out in; do
+            if [ "$dx_dir" = out ]; then set -- "$1" "$2" "$3" "$CHAIN_OUT" -d --dport
+            else set -- "$1" "$2" "$3" "$CHAIN_IN" -s --sport; fi
+            if [ "$1" = -D ]; then
+                while "$dx_tool" -t mangle -C "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN 2>/dev/null; do
+                    "$dx_tool" -t mangle -D "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN || break
+                done
+            else
+                "$dx_tool" -t mangle -C "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN 2>/dev/null ||
+                    "$dx_tool" -t mangle -I "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN
+            fi
+        done
+    done
+}
+dns_excl_sync_unlocked() { # [fresh] — цепочки только что собраны заново
+    [ "$FW_BACKEND" = iptables ] || return 0
+    dx_state=$RUN/dns-excl
+    dx_new=$dx_state.new
+    dns_upstreams | while read -r dx_h dx_p; do
+        case $dx_h in
+            *:*|*[!0-9.]*) ;;
+            *) echo "$dx_h $dx_h $dx_p"; continue ;;
+        esac
+        case $dx_h in *:*) echo "$dx_h $dx_h $dx_p"; continue ;; esac
+        dx_ips=$(nslookup "$dx_h" 127.0.0.1 2>/dev/null |
+            awk '/^Name:/ { n = 1; next } n && /^Address/ { print $3 }')
+        if [ -n "$dx_ips" ]; then
+            for dx_ip in $dx_ips; do echo "$dx_h $dx_ip $dx_p"; done
+        elif [ -f "$dx_state" ]; then
+            awk -v h="$dx_h" '$1 == h' "$dx_state"
+        fi
+    done | sort -u > "$dx_new"
+    if [ "${1:-}" != fresh ] && [ -f "$dx_state" ]; then
+        while read -r dx_h dx_ip dx_p; do
+            awk -v a="$dx_ip" -v p="$dx_p" '$2 == a && $3 == p { f = 1 } END { exit !f }' "$dx_new" ||
+                dns_excl_rule -D "$dx_ip" "$dx_p"
+        done < "$dx_state"
+    fi
+    while read -r dx_h dx_ip dx_p; do dns_excl_rule -A "$dx_ip" "$dx_p"; done < "$dx_new"
+    mv -f "$dx_new" "$dx_state"
+}
+dns_excl_sync() {
+    fw_lock_acquire || return 1
+    dns_excl_sync_unlocked
+    fw_lock_release
+}
+
 fw_up() {
     local rc
     fw_lock_acquire || return 1
@@ -884,6 +991,7 @@ fw_up() {
         fw_down_unlocked
         if fw_up_unlocked; then
             rc=0
+            dns_excl_sync_unlocked fresh || say "исключение DNS роутера встало не целиком"
         else
             fw_down_unlocked
             rc=1
@@ -1529,6 +1637,7 @@ case "$1" in
     reapply) reapply ;;
     clear-found) clear_found ;;
     ppe-ensure) ppe_ensure ;;
+    dns-ensure) if running "$DP_PID" && fw_installed; then dns_excl_sync; fi ;;
     ppe-remove) d2k_ppe_remove ;;
     ppe-status)
         command -v d2k_ppe_status >/dev/null 2>&1 || die "нет $PPE_LIB"

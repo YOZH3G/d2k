@@ -30,9 +30,10 @@ tool=$(basename "$0")
 table=filter
 op= chain=
 spec=
+wait_lock=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        -w) shift ;;
+        -w) wait_lock=1; shift ;;
         -n) shift ;;
         -t) table=$2; shift 2 ;;
         -N|-A|-I|-C|-D|-F|-X|-L) op=$1; chain=${2:-}; shift; [ $# -gt 0 ] && shift; break ;;
@@ -41,6 +42,12 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ $# -eq 0 ] || spec=$(printf '%s ' "$@" | sed -e 's/ $//' -e 's/-m tcp //' -e 's/"//g')
+# Чужой процесс держит блокировку xtables: настоящий iptables 1.4.21 без -w
+# отвечает сразу кодом 4, с -w ждёт её (поле 15.10.2026, Keenetic).
+if [ "${STUB_XTABLES_BUSY:-0}" = 1 ] && [ "$wait_lock" = 0 ]; then
+    echo "Another app is currently holding the xtables lock. Perhaps you want to use the -w option?" >&2
+    exit 4
+fi
 if [ "$tool" = ip6tables ] && [ "$table" = mangle ] && [ "${STUB_V6_MANGLE_BROKEN:-0}" = 1 ]; then
     echo "ip6tables v1.4.21: can't initialize ip6tables table \`mangle': Table does not exist" >&2
     exit 3
@@ -237,6 +244,75 @@ if rules iptables mangle | grep -q '9444'; then fail "empty D2K_GATE must leave 
 S99_SNIPPET='fw_down' s99 D2K_GATE=
 ok "the VPS install gate is D2K's own channel: never queued, in both directions"
 
+# --- DNS роутера — не цель (поле 15.10.2026) ---------------------------------
+# Keenetic резолвит через DoH (https-dns-proxy → geohide.ru:443). Поток к нему
+# шёл через очередь D2K как обычный TLS; прокси при всплесках падал «too
+# many». DNS роутера, какой ни заведён (DoH, DoT, обычный на нестандартном
+# порту), исключается по адресу и порту из `ndmc show dns-proxy`: RETURN в
+# обе стороны, раньше очереди, TCP и UDP. Адреса DoH сверяются на каждом
+# круге сторожа; неразрешившееся имя прежних правил не снимает.
+cat > "$TMP/bin/ndmc" <<'NDMC'
+#!/bin/sh
+printf '\033[K\n     proxy-status: \n              proxy-name: System\n\n'
+printf 'timeout = 7000\n'
+printf 'dns_server = 127.0.0.1:40508 . # https://doh.test/dns-query@dnsm\n'
+printf 'dns_server = 127.0.0.1:40500 . # 9.9.9.9:853@dns.quad9.net\n'
+printf 'dns_server = 192.0.2.53:5353 .\n'
+printf 'static_a = my.keenetic.net 198.51.100.11 1\n'
+NDMC
+cat > "$TMP/bin/nslookup" <<'NSL'
+#!/bin/sh
+[ "$1" = doh.test ] || exit 1
+[ -f "$NSL_FAIL" ] && exit 1
+printf 'Server:    127.0.0.1\nAddress 1: 127.0.0.1 localhost\n\nName:      doh.test\n'
+i=1; for a in $(cat "$NSL_ADDRS"); do printf 'Address %d: %s\n' $i "$a"; i=$((i+1)); done
+NSL
+chmod +x "$TMP/bin/ndmc" "$TMP/bin/nslookup"
+printf '198.51.100.7\n2001:db8::7\n' > "$TMP/nsl-addrs"
+dns_before_queue() { # <tool> <chain> <spec>
+    rules "$1" mangle | grep -- "-A $2 " | awk -v want="-A $2 $3" '
+        $0 == want { if (!q) seen = 1 }
+        /NFQUEUE/ { q = 1 }
+        END { exit !seen }'
+}
+rm -rf "$TMP/fw" "$TMP/run/dns-excl"; mkdir -p "$TMP/fw"
+S99_SNIPPET='fw_up && fw_installed' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail" \
+    || fail "fw_up with router DNS exclusions failed"
+for want in "iptables 198.51.100.7 443" "ip6tables 2001:db8::7 443" "iptables 9.9.9.9 853" \
+            "iptables 192.0.2.53 5353"; do
+    set -- $want
+    for pr in tcp udp; do
+        dns_before_queue "$1" D2K_OUT "-p $pr -d $2 --dport $3 -j RETURN" \
+            || fail "$1: no $pr RETURN to router DNS $2:$3 before the queue"
+        dns_before_queue "$1" D2K_IN "-p $pr -s $2 --sport $3 -j RETURN" \
+            || fail "$1: no $pr RETURN from router DNS $2:$3 before the queue"
+    done
+done
+if rules iptables mangle | grep -q '127.0.0.1 --dport 40508\|198.51.100.11'; then
+    fail "local proxy port or static_a records must not become exclusions"
+fi
+# DoH сменил адрес — старое снято, новое стоит.
+printf '198.51.100.8\n' > "$TMP/nsl-addrs"
+S99_SNIPPET='dns_excl_sync' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail"
+dns_before_queue iptables D2K_OUT "-p tcp -d 198.51.100.8 --dport 443 -j RETURN" \
+    || fail "a new DoH address was not excluded"
+if rules iptables mangle | grep -q '198.51.100.7'; then fail "a stale DoH address stayed excluded"; fi
+if rules ip6tables mangle | grep -q '2001:db8::7'; then fail "a stale IPv6 DoH address stayed excluded"; fi
+# Имя сейчас не разрешилось — прежнее исключение остаётся.
+: > "$TMP/nsl-fail"
+S99_SNIPPET='dns_excl_sync' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail"
+dns_before_queue iptables D2K_OUT "-p tcp -d 198.51.100.8 --dport 443 -j RETURN" \
+    || fail "a failed lookup removed the DoH exclusion"
+rm -f "$TMP/nsl-fail"
+# Сброс извне снёс исключение — круг сторожа его возвращает.
+FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -D D2K_OUT -p tcp -d 9.9.9.9 --dport 853 -j RETURN
+S99_SNIPPET='dns_excl_sync' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail"
+dns_before_queue iptables D2K_OUT "-p tcp -d 9.9.9.9 --dport 853 -j RETURN" \
+    || fail "the watchdog round did not restore a lost DNS exclusion"
+S99_SNIPPET='fw_down' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail"
+rm -f "$TMP/bin/ndmc" "$TMP/bin/nslookup" "$TMP/run/dns-excl"
+ok "router DNS servers (DoH, DoT, plain) from ndmc are excluded both ways, kept fresh"
+
 # A working ip6tables whose rule fails half-way is still a real error: both
 # families roll back, as before.
 rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
@@ -259,6 +335,20 @@ printf '%s\n' "$out" | grep -q "нет xt_addrtype" || fail "missing xt_addrtype
 rules iptables mangle | grep -qx -- "-A D2K_OUT -d 255.255.255.255 -j RETURN" || fail "explicit broadcast RETURN missing"
 ! rules iptables mangle | grep -q addrtype || fail "addrtype rule present although unsupported"
 ok "without xt_addrtype the service starts with explicit broadcast exclusions"
+
+# --- Блокировка xtables занята чужим процессом (поле 15.10.2026) -------------
+# Сразу после запуска Telegram и разгрузка PPE работают с iptables
+# одновременно со сторожем. iptables без -w на занятой блокировке отвечает
+# кодом 4 (на роутере 18 из 300 проверок): fw_installed принимал это за
+# пропажу правил, сторож звал reapply, тот падал на том же и снимал всё —
+# установка 15.10 оставила роутер без единого правила на 55 с.
+S99_SNIPPET='fw_up && fw_installed' s99 STUB_XTABLES_BUSY=1 \
+    || fail "busy xtables lock: fw_up/fw_installed must wait for it, not fail"
+S99_SNIPPET='fw_down' s99 STUB_XTABLES_BUSY=1
+for tool in iptables ip6tables; do
+    if rules "$tool" mangle | grep -q 'NFQUEUE'; then fail "$tool: fw_down left queue rules under a busy lock"; fi
+done
+ok "a busy xtables lock is waited for, not mistaken for missing rules"
 
 # Модули ядра лежат файлами в прошивке, но не загружены (Keenetic: modprobe из
 # Entware ищет в /opt/lib/modules) — служба загружает их сама через insmod.

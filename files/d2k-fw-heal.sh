@@ -61,6 +61,9 @@ printf '%s\n' "$state" | grep -q "датапат: работает" || exit 0
 # недостающее и молчит, если цели PPE в прошивке нет.
 if printf '%s\n' "$state" | grep -q "правила: стоят"; then
     "$INIT_SCRIPT" ppe-ensure >/dev/null 2>&1
+    # DNS роутера (DoH/DoT) — исключение по адресам, которые меняются: сверка
+    # каждый круг, недостающее ставится, устаревшее снимается (S99d2k).
+    "$INIT_SCRIPT" dns-ensure >/dev/null 2>&1
     exit 0
 fi
 
