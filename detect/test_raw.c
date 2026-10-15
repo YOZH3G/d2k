@@ -134,6 +134,7 @@ static void test_disorder_pos2_emits_exact_reverse_segments(void)
  * network); the receive socket answers our own SYN with a SYN-ACK. */
 static int dial_recv_fd = -1;
 static int dial_silent, payload_recv_error;
+static size_t dial_drop_syns; /* сколько первых SYN «теряет путь» */
 static int mock_family = AF_INET;
 static int peer_timestamps = 1;
 static int raw_test_socket(int domain, int type, int proto)
@@ -188,6 +189,7 @@ ssize_t raw_test_recvfrom(int fd, void *buf, size_t len, int flags,
         const uint8_t *syn = outgoing[0];
         size_t n;
         if (outgoing_count == 0) { return -1; }
+        if (outgoing_count <= dial_drop_syns) { errno = EAGAIN; return -1; }
         uint8_t packet[128];
         int ipv6 = (syn[0] >> 4) == 6;
         size_t iplen = ipv6 ? 40 : 20;
@@ -959,6 +961,33 @@ static void test_connect_timeout_is_not_a_trigger_result(void) {
     dial_silent = 0;
 }
 
+/* Поле 15.10.2026, flibusta.is: путь до сервера эпизодами теряет SYN
+ * (17-19 % и до половины в эпизоде около минуты; от триггера не зависит —
+ * 10 циклов с контролем). Сырой зонд слал SYN ОДИН раз и ждал весь срок:
+ * каждая потеря становилась «SYN-ACK не пришёл», и замер бросался — до
+ * отравления меткой времени, которым флибуста открывается, он не доходил ни
+ * разу. TCP ядра (и браузер) повторяют SYN по RFC 6298: через 1 с, затем
+ * удваивая. Сырой стек обязан вести себя так же, тем же номером. */
+static void test_lost_syn_is_retransmitted(void) {
+    d2k_raw_rule_hook = test_rule_hook;
+    rule_rc = 0; dial_silent = 0; payload_recv_error = 0;
+    uint8_t ip[16] = {198, 51, 100, 1}; char err[160] = "";
+    outgoing_count = 0; dial_recv_fd = -1; dial_drop_syns = 1;
+    int rc = d2k_raw_probe_handshake_family(ip, 4, 443, 2500, 0x2d, NULL, err, sizeof err);
+    CHECK(rc == 1);
+    CHECK(outgoing_count >= 2);
+    if (outgoing_count >= 2) {
+        CHECK((outgoing[0][33] & (TCP_SYN | TCP_ACK)) == TCP_SYN);
+        CHECK((outgoing[1][33] & (TCP_SYN | TCP_ACK)) == TCP_SYN);
+        CHECK(rd32(outgoing[0] + 24) == rd32(outgoing[1] + 24));
+    }
+    /* Короткий срок — повтора нет: RTO начинается с секунды. */
+    outgoing_count = 0; dial_recv_fd = -1; dial_drop_syns = 1;
+    CHECK(d2k_raw_probe_handshake_family(ip, 4, 443, 300, 0x2d, NULL, err, sizeof err) == -2);
+    CHECK(outgoing_count == 1);
+    dial_drop_syns = 0;
+}
+
 int main(void)
 {
     {
@@ -1018,6 +1047,7 @@ int main(void)
         printf("runtime equality: family C + %d catalog hypotheses, 6 lengths, IPv4/IPv6, complete packets and delays\n", count - 1);
     }
     test_connect_timeout_is_not_a_trigger_result();
+    test_lost_syn_is_retransmitted();
     test_plan_rejection_has_error();
     test_concurrent_ports_are_unique();
     test_checksum_matches_original();

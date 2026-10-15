@@ -992,6 +992,15 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
         return -1;
     }
     deadline = d2k_now_ms() + timeout_ms;
+    /* ПОТЕРЯННЫЙ SYN ПОВТОРЯЕТСЯ, КАК У TCP ЯДРА (RFC 6298: RTO с секунды,
+     * затем вдвое), тем же номером. Поле 15.10.2026, flibusta.is: путь
+     * эпизодами теряет SYN (17-19 %, в эпизоде до половины), а единственный
+     * SYN на весь срок делал каждую потерю «SYN-ACK не пришёл» — замер
+     * бросался, не дойдя до вопросов, которыми цель берётся. Настоящий
+     * клиент повторяет SYN; зонд, который этого не делает, мерит не коробку,
+     * а потери пути. */
+    int rto_ms = 1000;
+    int64_t next_syn = d2k_now_ms() + rto_ms;
     while (d2k_now_ms() < deadline) {
         uint8_t flags;
         uint32_t seq, ack;
@@ -1001,7 +1010,16 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
             snprintf(err, errcap, "context canceled");
             return -1;
         }
-        int received = raw_recv(c, &flags, &seq, &ack, &pay, &plen, deadline, cancel);
+        if (d2k_now_ms() >= next_syn) {
+            if (raw_send_syn(c) != 0) {
+                snprintf(err, errcap, "%s", strerror(errno));
+                return -1;
+            }
+            rto_ms *= 2;
+            next_syn = d2k_now_ms() + rto_ms;
+        }
+        int received = raw_recv(c, &flags, &seq, &ack, &pay, &plen,
+                                next_syn < deadline ? next_syn : deadline, cancel);
         if (received == RAW_RECV_ERROR) {
             snprintf(err, errcap, "classify: recvfrom: %s", strerror(errno));
             return -1;
