@@ -231,16 +231,23 @@ static long build_origin_request(const gate_req *r, const char *head,
 /* Только публичные адреса: имена из списка публичные, но адрес решает DNS
    VPS, и в частную сеть самого VPS сервис ходить не должен ни при каком
    ответе резолвера. */
+/* Адрес IPv4 в порядке хоста. Отдельной функцией, а не рекурсией через
+   struct sockaddr: собранный на стеке sockaddr_in, прочитанный как sockaddr,
+   нарушает строгий алиасинг, и gcc -O2 на Linux вправе прочитать sa_family
+   до записи — ::ffff:8.8.8.8 становился «не публичным» (CI 15.10.2026). */
+static int v4_public(uint32_t a) {
+    uint8_t b0 = (uint8_t)(a >> 24), b1 = (uint8_t)(a >> 16);
+    if (b0 == 0 || b0 == 10 || b0 == 127 || b0 >= 224) return 0;
+    if (b0 == 169 && b1 == 254) return 0;
+    if (b0 == 172 && (b1 & 0xf0) == 16) return 0;
+    if (b0 == 192 && b1 == 168) return 0;
+    if (b0 == 100 && (b1 & 0xc0) == 64) return 0;   /* 100.64.0.0/10 */
+    return 1;
+}
+
 static int addr_public(const struct sockaddr *sa) {
     if (sa->sa_family == AF_INET) {
-        uint32_t a = ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr);
-        uint8_t b0 = (uint8_t)(a >> 24), b1 = (uint8_t)(a >> 16);
-        if (b0 == 0 || b0 == 10 || b0 == 127 || b0 >= 224) return 0;
-        if (b0 == 169 && b1 == 254) return 0;
-        if (b0 == 172 && (b1 & 0xf0) == 16) return 0;
-        if (b0 == 192 && b1 == 168) return 0;
-        if (b0 == 100 && (b1 & 0xc0) == 64) return 0;   /* 100.64.0.0/10 */
-        return 1;
+        return v4_public(ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr));
     }
     if (sa->sa_family == AF_INET6) {
         const uint8_t *b = ((const struct sockaddr_in6 *)sa)->sin6_addr.s6_addr;
@@ -251,9 +258,8 @@ static int addr_public(const struct sockaddr *sa) {
         if ((b[0] & 0xfe) == 0xfc) return 0;                 /* fc00::/7 */
         static const uint8_t mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
         if (!memcmp(b, mapped, 12)) {
-            struct sockaddr_in v4; memset(&v4, 0, sizeof v4);
-            v4.sin_family = AF_INET; memcpy(&v4.sin_addr, b + 12, 4);
-            return addr_public((const struct sockaddr *)&v4);
+            return v4_public((uint32_t)b[12] << 24 | (uint32_t)b[13] << 16 |
+                             (uint32_t)b[14] << 8 | b[15]);
         }
         return 1;
     }
