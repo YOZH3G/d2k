@@ -585,6 +585,87 @@ int d2k_quic_client_hello(const uint8_t *p, size_t n,
     return 0;
 }
 
+/* CLIENTHELLO ИЗ НЕСКОЛЬКИХ INITIAL ОДНОГО ПОЛЁТА (задача 66).
+ *
+ * Поле 15.10.2026: Chrome с постквантовым key_share шлёт приветствие двумя
+ * Initial, и кадры CRYPTO второй датаграммы продолжают поток первой. Разбор
+ * по одной датаграмме видит обрывок — именно поэтому цель уходила мериться
+ * собственным профилем, а планы, подтверждённые им, Chrome не открывали.
+ *
+ * Ключи выводятся из DCID ПЕРВОЙ датаграммы, и каждая следующая обязана
+ * нести тот же DCID и ту же версию. Это не придирка: после Retry клиент
+ * начинает новый полёт с другим DCID, и склейка двух полётов дала бы
+ * «приветствие», которого никто не слал. Разные DCID — отказ, а не догадка.
+ *
+ * Поток CRYPTO здесь шире, чем у одиночного разбора (D2K_QUIC_MAX_DGRAM):
+ * приветствие с ML-KEM около 2 КБ, и собирать его в буфер размером с одну
+ * датаграмму нечем. Буферы статические на поток выполнения: функция зовётся
+ * и из рабочих потоков планировщика, и из датапата. */
+int d2k_quic_dgrams_hello(const uint8_t *const *dg, const size_t *len, size_t n,
+                          uint8_t *out, size_t cap, size_t *out_len) {
+    enum { STREAM_MAX = 8192 };
+    static __thread uint8_t stream[STREAM_MAX];
+    static __thread uint8_t seen[(STREAM_MAX + 7) / 8];
+    if (!dg || !len || !out || !out_len || n == 0) {
+        return -1;
+    }
+    memset(stream, 0, sizeof stream);
+    memset(seen, 0, sizeof seen);
+
+    quic_hdr first;
+    if (parse_initial_header(dg[0], len[0], &first) != 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        quic_hdr h;
+        if (parse_initial_header(dg[i], len[i], &h) != 0) {
+            return -1;
+        }
+        /* ОДИН ПОЛЁТ — ОДИН DCID И ОДНА ВЕРСИЯ. */
+        if (h.version != first.version || h.dcid_len != first.dcid_len ||
+            memcmp(dg[i] + h.dcid_off, dg[0] + first.dcid_off, first.dcid_len) != 0) {
+            return -1;
+        }
+        uint8_t plain[D2K_QUIC_MAX_DGRAM];
+        size_t plain_len = 0;
+        if (decrypt_initial(dg[i], &h, plain, &plain_len) != 0) {
+            return -1;
+        }
+        (void)collect_crypto_frames(plain, plain_len, stream, seen, sizeof stream);
+    }
+
+    /* Непрерывный префикс потока: дыра раньше конца сообщения значит, что
+       полёт собран не весь. */
+    size_t filled = 0;
+    while (filled < sizeof stream && (seen[filled / 8] & (uint8_t)(1u << (filled % 8)))) {
+        filled++;
+    }
+    if (filled < HS_HDR || stream[0] != HS_CLIENT_HELLO) {
+        return -1;
+    }
+    size_t claimed = ((size_t)stream[1] << 16) | ((size_t)stream[2] << 8) | stream[3];
+    size_t whole = HS_HDR + claimed;
+    if (whole > filled || whole > cap) {
+        return -1;
+    }
+    memcpy(out, stream, whole);
+    *out_len = whole;
+    return 0;
+}
+
+/* Имя из УЖЕ СОБРАННОГО ClientHello (его собирает d2k_quic_dgrams_hello).
+   Тот же разбор расширений, что у d2k_quic_sni, — второй копии нет. */
+int d2k_quic_hello_name(const uint8_t *ch, size_t n, char *out, size_t cap) {
+    size_t off = 0, len = 0;
+    if (!ch || !out || cap == 0 || find_client_hello_sni(ch, n, &off, &len) != 0 ||
+        len == 0 || len + 1 > cap) {
+        return -1;
+    }
+    memcpy(out, ch + off, len);
+    out[len] = '\0';
+    return 0;
+}
+
 int d2k_quic_hello_incomplete(const uint8_t *p, size_t n) {
     if (!p) {
         return 0;

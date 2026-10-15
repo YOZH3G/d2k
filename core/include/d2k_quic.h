@@ -129,6 +129,19 @@ int d2k_quic_client_hello(const uint8_t *p, size_t n,
  * остальное (целое приветствие, не Initial, не ClientHello). */
 int d2k_quic_hello_incomplete(const uint8_t *p, size_t n);
 
+/* ClientHello из НЕСКОЛЬКИХ Initial одного полёта (задача 66): приветствие
+ * Chrome с ML-KEM едет двумя датаграммами. Все датаграммы обязаны нести один
+ * DCID и одну версию — иначе это разные полёты (Retry), и склейки нет. 0 —
+ * сообщение собрано целиком по своей заявленной длине; половина
+ * приветствия — -1, out не трогается. */
+D2K_WARN_UNUSED
+int d2k_quic_dgrams_hello(const uint8_t *const *dg, const size_t *len, size_t n,
+                          uint8_t *out, size_t cap, size_t *out_len);
+
+/* Имя (SNI) из уже собранного ClientHello. 0 — успех, -1 — имени нет. */
+D2K_WARN_UNUSED
+int d2k_quic_hello_name(const uint8_t *ch, size_t n, char *out, size_t cap);
+
 /* РАЗРЕЗ CLIENTHELLO НА КАДРЫ CRYPTO ВНУТРИ ОДНОГО INITIAL (задача 40).
  *
  * Раскрывает первый пакет датаграммы ключами из его DCID и перекладывает

@@ -47,7 +47,7 @@ MIPS_LE_ZIG ?= -target mipsel-linux-musleabi -mcpu=mips32+soft_float
 
 SRC     = stun.c net4.c voice.c voice_discovery.c meas.c verdict.c crypto.c quicwire.c tls13core.c quicconn.c h3.c quic.c quicprobe.c quicarms.c ipfrag.c props.c hello.c catalog.c match.c compose.c measured.c link.c plantlv.c x25519.c tls13.c tls12.c p256.c volume.c sched.c quichello.c verify.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
-          include/d2k_quicprobe.h include/d2k_quic_arms.h include/d2k_ipfrag.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
+          include/d2k_quicsnap.h include/d2k_quicprobe.h include/d2k_quic_arms.h include/d2k_ipfrag.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
           include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
           include/d2k_verify.h include/d2k_arm.h include/d2k_stun.h include/d2k_net4.h include/d2k_voice.h ../datapath/include/d2k_plan.h ../datapath/include/d2k_ctl.h ../datapath/include/d2k_ctlsrv.h
 HDR += ../datapath/include/d2k_http_response.h ../datapath/include/d2k_http_request_stream.h
@@ -445,6 +445,16 @@ test_quicwire: test_quicwire.c quicwire.o crypto.o $(HDR)
 
 test_quic: test_quic.c quic.o quicwire.o crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quic.c quic.o quicwire.o crypto.o $(TEST_LDFLAGS)
+
+# Задача 66: пачка Initial-датаграмм клиента — приветствие Chrome с ML-KEM не
+# помещается в одну датаграмму, и снимком обязан стать весь полёт.
+test_quicsnap: test_quicsnap.c quicsnap.o quic.o quicwire.o crypto.o tls13core.o x25519.o $(HDR) test_quic_pq.h
+	$(CC) $(CFLAGS) -o $@ test_quicsnap.c quicsnap.o quic.o quicwire.o crypto.o tls13core.o x25519.o $(TEST_LDFLAGS)
+
+.PHONY: test-quicsnap
+check: test-quicsnap
+test-quicsnap: test_quicsnap
+	./test_quicsnap
 
 # Задача 40: разрез ClientHello на кадры CRYPTO — одна функция ядра для
 # вопроса замера и исполнителя датапата.
