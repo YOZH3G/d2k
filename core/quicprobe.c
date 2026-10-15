@@ -787,7 +787,23 @@ static int qp_send_one(const char *addr, uint16_t port,
    (похож, но не доказывает, либо вовсе не похож). */
 typedef int (*qp_verify_fn)(const uint8_t *p, size_t n, d2k_hello msg);
 
+/* ЧТО УШЛО НА ПРОВОД, ЕСЛИ УШЛА ПАЧКА (задача 66). Ответ сервера адресован
+   соединению, а соединение задают DCID и SCID — у всех датаграмм пачки они
+   общие (перезапечатка ставит один свежий DCID на всю пачку). Разбирать
+   сами байты пачки как Initial нельзя: у неё свой заголовок, и разбор не
+   проходил — любой ответ сервера отвергался как чужой, и каждый замер
+   пачкой читал «имя молчит» (стенд 15.10.2026). */
+static d2k_hello qp_head_of(d2k_hello msg) {
+    d2k_qsnap pk;
+    if (msg.bytes && d2k_qsnap_is(msg.bytes, msg.len) &&
+        d2k_qsnap_parse(msg.bytes, msg.len, &pk) == 0 && pk.n > 0) {
+        return (d2k_hello){pk.dg[0], pk.len[0]};
+    }
+    return msg;
+}
+
 static int qp_verify_aead(const uint8_t *p, size_t n, d2k_hello msg) {
+    msg = qp_head_of(msg);
     uint32_t version;
     size_t dcid_off, dcid_len;
     if (qp_dcid_of(msg.bytes, msg.len, &version, &dcid_off, &dcid_len) != 0) {
@@ -807,6 +823,7 @@ static int qp_verify_aead(const uint8_t *p, size_t n, d2k_hello msg) {
    приманку несёт её собственный DCID и сюда не проходит; VN и Retry с
    неверным тегом или чужим CID — тишина этого вопроса, а не его успех. */
 static int qp_verify_bound(const uint8_t *p, size_t n, d2k_hello msg) {
+    msg = qp_head_of(msg);
     uint32_t version;
     size_t dcid_off, dcid_len;
     if (qp_dcid_of(msg.bytes, msg.len, &version, &dcid_off, &dcid_len) != 0) {

@@ -44,6 +44,8 @@
 #include "d2k_quic.h"
 #include "d2k_quic_arms.h"
 #include "d2k_quicprobe.h"
+#include "test_quic_pq.h"
+#include "d2k_quicsnap.h"
 #include "d2k_quichello.h"
 #include "d2k_quicwire.h"
 #include "test_quic_vector.h"
@@ -683,7 +685,16 @@ static void *rs_run(void *arg) {
         }
         const uint8_t *dcid = NULL;
         size_t dcid_len = QP_DCID_LEN;
-        if (is_trig) {
+        if (g_rs_respond == 10) {
+            /* РЕЖИМ 10: как настоящий сервер — отвечает на любой Initial его
+               же DCID. Нужен замеру пачкой: пачка перезапечатана свежим DCID
+               и ни с одним заранее известным триггером не совпадает. */
+            d2k_qw_hdr hdr;
+            if (d2k_qw_hdr_parse(buf, (size_t)n, 0, &hdr) == 0) {
+                dcid = buf + hdr.dcid_off;
+                dcid_len = hdr.dcid_len;
+            }
+        } else if (is_trig) {
             dcid = g_trig_bytes + QP_DCID_OFF;
         } else if (is_ctl) {
             if ((size_t)n == g_ctl_len && memcmp(buf, g_ctl_bytes, (size_t)n) == 0) {
@@ -1622,6 +1633,32 @@ int main(int argc, char **argv) {
         uint16_t port = rs_start();
         d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
         CHECK(r.verdict == D2K_V_CLEAR, "настоящий аутентичный ответ с CRYPTO на триггер — должен быть CLEAR");
+        close(g_rs_fd);
+    }
+
+    /* --- ВХОД ЗАМЕРА — ПАЧКА ДАТАГРАММ КЛИЕНТА (задача 66) --------------
+     *
+     * Приветствие Chrome с ML-KEM занимает два Initial, и снимком становится
+     * весь полёт. Ответ сервера на пачку обязан засчитываться: проверщик
+     * разбирал байты пачки как одиночный Initial, разбор не проходил, и
+     * любой ответ отвергался — замер пачкой на отвечающем сервере читал
+     * «имя молчит», то есть ложную блокировку (стенд 15.10.2026). */
+    {
+        uint8_t d1[1500], d2[1500];
+        size_t l1 = 0, l2 = 0;
+        CHECK(d2k_test_pq_initials("x.example", d1, &l1, d2, &l2) == 0, "стенд двух Initial");
+        const uint8_t *dgs[2] = {d1, d2};
+        size_t lens[2] = {l1, l2};
+        static uint8_t pack[D2K_SHAPE_MAX];
+        size_t pl = d2k_qsnap_pack(dgs, lens, 2, pack, sizeof pack);
+        CHECK(pl > 0, "пачка не упаковалась");
+        g_rs_respond = 10;
+        uint16_t port = rs_start();
+        d2k_hello ptrig = {pack, pl};
+        d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", ptrig, ctl_hello(), 0);
+        if (r.verdict != D2K_V_CLEAR)
+            fprintf(stderr, "пачка: verdict=%d reason=%s\n", (int)r.verdict, r.reason);
+        CHECK(r.verdict == D2K_V_CLEAR, "замер пачкой на отвечающем стенде не дал CLEAR");
         close(g_rs_fd);
     }
 
