@@ -228,6 +228,17 @@ static void init_ring_add(d2k_session *s, const d2k_key *key,
     if (s->init_ring_n < D2K_SESSION_INIT_RING) { s->init_ring_n++; }
 }
 
+/* Забывает датаграммы потока: его полёт уже собран и снят. */
+static void init_ring_drop(d2k_session *s, const d2k_key *key) {
+    for (size_t i = 0; i < s->init_ring_n; i++) {
+        if (d2k_key_equal(&s->init_ring[i].key, key)) {
+            s->init_ring[i].len = 0;
+            s->init_ring[i].dcid_len = 0;
+            memset(&s->init_ring[i].key, 0, sizeof s->init_ring[i].key);
+        }
+    }
+}
+
 /* Пачка полёта: все датаграммы этого потока с тем же DCID, по порядку
    прихода. 0 — пачка не собралась (вытеснена, не поместилась) и вызывающий
    кладёт одну датаграмму, как раньше: контроллер отвергнет её как обрывок, и
@@ -248,7 +259,8 @@ static size_t init_ring_pack(const d2k_session *s, const d2k_key *key,
     for (size_t k = 0; k < s->init_ring_n && n < D2K_QSNAP_MAX_DGRAMS; k++) {
         size_t i = (s->init_ring_next + D2K_SESSION_INIT_RING - s->init_ring_n + k)
                    % D2K_SESSION_INIT_RING;
-        if (!d2k_key_equal(&s->init_ring[i].key, key) ||
+        if (s->init_ring[i].len == 0 ||
+            !d2k_key_equal(&s->init_ring[i].key, key) ||
             s->init_ring[i].dcid_len != dcid_len ||
             memcmp(s->init_ring[i].dcid, dcid, dcid_len) != 0) {
             continue;
@@ -1010,8 +1022,14 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        то есть на следующем соединении. Поле 15.10.2026: с записью «только
        пока ловушка взведена» первый полёт целей не собирался вовсе, и снимок
        оставался обрывком (kinozal.me, 1038 байт). Цена — memcpy датаграммы
-       на клиентский Initial, которых у соединения один-два. */
-    if (!voice && !fl->controller_probe) {
+       на клиентский Initial, которых у соединения один-два.
+
+       ТОЛЬКО ДО СБОРКИ ИМЕНИ. После рукопожатия клиент шлёт по тому же DCID
+       ещё Initial — с подтверждениями, без добивки до 1200. Они часть
+       соединения, но не часть ПРИВЕТСТВИЯ, и в пачке делали полёт из двух
+       датаграмм полётом из четырёх (поле 15.10.2026: lostfilm.tv, 4488 байт
+       вместо примерно 2400). */
+    if (!voice && !fl->controller_probe && !fl->saw_hello) {
         init_ring_add(s, &key, pkt + payload_off, payload_len);
     }
 
@@ -1132,6 +1150,12 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         uint8_t pack[D2K_SHAPE_MAX];
         size_t pack_len = init_ring_pack(s, &key, pkt + payload_off, payload_len,
                                          pack, sizeof pack);
+        /* Полёт собран — записи этого потока кольцу больше не нужны. Без
+           этого кольцо занимали уже ненужные полёты, и датаграмма цели, чьё
+           имя ещё не собралось, вытеснялась: снимок оставался обрывком
+           (поле 15.10.2026, enimerosi и mailsuite — пачка из одной
+           датаграммы в 1044 байта). */
+        init_ring_drop(s, &key);
         const uint8_t *snap = pack_len ? pack : pkt + payload_off;
         size_t snap_len = pack_len ? pack_len : payload_len;
         if (snap_len <= sizeof s->last_hello[k]) {

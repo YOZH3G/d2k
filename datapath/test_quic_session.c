@@ -563,6 +563,21 @@ static void test_quic_snapshot_is_every_initial(void) {
     /* Повтор по таймеру PTO: та же датаграмма не удлиняет полёт. */
     d2k_session_packet(s, pkt, n, 1200, buf, sizeof buf, &r);
 
+    /* ПОСЛЕ РУКОПОЖАТИЯ клиент шлёт по тому же DCID ещё Initial — с
+       подтверждениями и без добивки до 1200. Они часть соединения, но не
+       часть ПРИВЕТСТВИЯ: в пачке они делали полёт из двух датаграмм полётом
+       из четырёх (поле 15.10.2026, lostfilm.tv). */
+    {
+        uint8_t later[1500], payload[16];
+        memset(payload, 0x01, sizeof payload);   /* PING, не CRYPTO */
+        size_t ll = d2k_test_pq_dgram(d1 + 6, 2, 0, payload, sizeof payload,
+                                      later, sizeof later);
+        if (ll) {
+            n = build_udp_pkt(pkt, 50010, 443, later, ll);
+            d2k_session_packet(s, pkt, n, 1300, buf, sizeof buf, &r);
+        }
+    }
+
     const uint8_t *sh = d2k_session_shape_family(s, 17, 4, &sl);
     CHECK(sh != NULL && d2k_qsnap_is(sh, sl), "снимок QUIC — не пачка");
     d2k_qsnap p;
