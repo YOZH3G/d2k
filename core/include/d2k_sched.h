@@ -60,6 +60,7 @@
 #include "d2k_quicprobe.h"
 #include "d2k_verify.h"
 #include "d2k_volume.h"
+#include "d2k_volprops.h"
 #include "d2k_voice.h"
 
 typedef struct d2k_sched d2k_sched;
@@ -104,6 +105,13 @@ extern d2k_sched_vol_fn  d2k_sched_vol_hook;
 typedef d2k_vol_result (*d2k_sched_vol_path_fn)(const char *, uint16_t,
     const char *, int, int, size_t, uint32_t, const char *);
 extern d2k_sched_vol_path_fn d2k_sched_vol_path_hook;
+
+/* Опрос свойств по обрыву объёма (core/volprops.c). Крючком по той же
+ * причине, что и остальные оракулы: тест обязан утверждать поведение
+ * планировщика, не выходя в сеть. */
+typedef d2k_props (*d2k_sched_volprops_fn)(const d2k_volprops_in *in,
+                                           d2k_volprops_step *steps);
+extern d2k_sched_volprops_fn d2k_sched_volprops_hook;
 
 /* ЗАНЯТЬ ПОРТ ДЛЯ ОПЫТА. Крючок, а не прямой вызов, по той же причине, что и
  * у сетевых оракулов: отказ bind обязан быть ВОСПРОИЗВОДИМ в тесте. Именно на

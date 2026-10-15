@@ -242,6 +242,31 @@ static int vol_rx_cut_first_only;
    другой публичный путь имени (resource_retry_path), и наверх путь идёт полем
    результата. Пусто — зонд путь не называл (мерил «/»). */
 static const char *vol_measured_path;
+/* ОПРОС СВОЙСТВ ПО ОБРЫВУ ОБЪЁМА (volprops.c). volprops_pass — номер вопроса,
+   который «прошёл» (лестница под ним перестала рваться); -1 — не прошёл ни
+   один, и тогда измеренного свойства нет. */
+/* По умолчанию «перекрытие слева» помогает — так ведёт себя коробка в поле
+   (15.10.2026: на целях с обрывом объёма проходит seqovl-1). Тест, которому
+   нужно «не помогло ничего», ставит -1 сам. */
+static int volprops_calls, volprops_pass = 0, volprops_asked = 5;
+static d2k_props stub_volprops(const d2k_volprops_in *in, d2k_volprops_step *steps) {
+    (void)in;
+    volprops_calls++;
+    d2k_props pr;
+    memset(&pr, 0, sizeof pr);
+    if (steps) {
+        memset(steps, 0, sizeof *steps * D2K_PROPS_QUESTIONS);
+        for (int q = 0; q < D2K_PROPS_QUESTIONS; q++) {
+            steps[q].rc = q < volprops_asked ? D2K_VP_STILL_CUT : D2K_VP_NOT_ASKED;
+        }
+    }
+    if (volprops_pass >= 0 && volprops_pass < D2K_PROPS_QUESTIONS) {
+        if (steps) { steps[volprops_pass].rc = D2K_VP_PASSED; }
+        d2k_props_question_passed(volprops_pass, &pr);
+    }
+    return pr;
+}
+
 static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
                                int plain, int tls12, size_t hello_wire,
                                uint32_t mark) {
@@ -2092,6 +2117,7 @@ int main(int argc, char **argv) {
         if (lfd >= 0) { close(lfd); }
     }
     d2k_sched_vol_hook = stub_vol;
+    d2k_sched_volprops_hook = stub_volprops;
     d2k_sched_tcp_hook = stub_tcp;
     d2k_sched_quic_hook = stub_quic;
     /* Зонд подтверждения тоже подменён: настоящий пошёл бы к 127.0.0.1 своим
@@ -8905,6 +8931,55 @@ lifecycle_test:
         snapshot_enabled = 0;
         vol_answer = D2K_VOL_PASSED; tcp_answer = D2K_V_OPAQUE;
     }
+    /* ОБРЫВ ОБЪЁМА СПРАШИВАЕТСЯ СВОИМ СИГНАЛОМ (поле 15.10.2026).
+     *
+     * Было: вопросы рукопожатия на этом пути не задавались (их критерий —
+     * обмен с ServerHello — при обрыве объёма проходит сам и ничего не
+     * меряет), вектор свойств оставался пустым, а план всё равно собирался
+     * из нулей — «всё сразу». В поле он не прошёл ни разу из шестнадцати
+     * (plan-8bd1393f), тогда как первый кандидат запасного перебора,
+     * seqovl-1, проходил за 5-10 с.
+     *
+     * Стало: те же пять вопросов судит та самая лестница. Прошедший вопрос
+     * даёт измеренное свойство и план по нему; не прошёл ни один — плана
+     * из пустого вектора НЕ собирается вовсе. */
+    for (int pass = 0; pass < 2; pass++) {
+        d2k_catalog cv = {0};
+        d2k_sched *s = d2k_sched_new(&cv, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = ver_calls = 0;
+        volprops_calls = 0; volprops_asked = 5;
+        volprops_pass = pass ? 0 : -1;   /* 0 — «перекрытие слева» */
+        vol_answer = D2K_VOL_CUT; vol_rx_cut = 0; vol_at_kb = 23;
+        tcp_answer = D2K_V_CLEAR;
+        ver_answer = D2K_VER_NOT_MEASURED;
+        uint16_t port = (uint16_t)(40310 + pass);
+        d2k_ev h = ev_hello(6, port, "объём.вопросы.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, port);
+        d2k_sched_event(s, &su);
+        settle(s);
+
+        CHECK(volprops_calls == 1,
+              "обрыв объёма не задал вопросы своим сигналом");
+        CHECK(said("исходящая лестница оборвалась"), "обрыв объёма потерян");
+        if (pass) {
+            CHECK(said("вопрос «перекрытие слева» прошёл"),
+                  "прошедший вопрос не назван в журнале");
+            CHECK(!said("измеренного свойства нет"),
+                  "прошедший вопрос объявлен отсутствием свойства");
+        } else {
+            CHECK(said("измеренного свойства нет"),
+                  "пустой вектор не назван отсутствием измерения");
+            CHECK(!said("вопрос «"), "непрошедший вопрос объявлен прошедшим");
+        }
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&cv);
+        vol_answer = D2K_VOL_PASSED; vol_at_kb = 0; tcp_answer = D2K_V_OPAQUE;
+        volprops_pass = 0;   /* вернуть умолчание для следующих тестов */
+    }
+
     for (int other_shape = 0; other_shape < 2; other_shape++) {
         /* Подтверждено заготовкой TLS 1.3 после обрыва объёма; затем пришёл
            снимок клиента, и поиск повторяется его байтами. Тот же вход

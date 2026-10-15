@@ -753,6 +753,27 @@ int d2k_props_question_plan(int q, d2k_hello control, size_t truth_len,
 
 /* ЧТО означает проход вопроса q. Пишется ТОЛЬКО по проходу — промах не пишет
  * ничего (§2.4, каждый Set в Go начинается с `if !passed { return }`). */
+const char *d2k_props_question_name(int q) {
+    /* Порядок тот же, что у d2k_props_question_plan. */
+    switch (q) {
+    case 0: return "перекрытие слева";
+    case 1: return "счёт дубликатов";
+    case 2: return "порядок сегментов";
+    case 3: return "контрольная сумма";
+    case 4: return "разбор протокола";
+    default: return "неизвестный вопрос";
+    }
+}
+
+int d2k_props_all_unknown(const d2k_props *pr) {
+    if (!pr) { return 1; }
+    return pr->tolerates_left_overlap == D2K_P_UNKNOWN &&
+           pr->tolerates_reorder == D2K_P_UNKNOWN &&
+           pr->validates_checksum == D2K_P_UNKNOWN &&
+           pr->parses_l7 == D2K_P_UNKNOWN &&
+           pr->counts_duplicates == D2K_P_UNKNOWN;
+}
+
 void d2k_props_question_passed(int q, d2k_props *pr) {
     if (!pr) { return; }
     /* Порядок тот же, что у d2k_props_question_plan, и меняться они обязаны

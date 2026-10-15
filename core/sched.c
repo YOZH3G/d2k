@@ -72,6 +72,7 @@
 #include "d2k_voice_discovery.h"
 #include "d2k_verify.h"
 #include "d2k_volume.h"
+#include "d2k_volprops.h"
 #include "d2k_domain.h"
 #include "d2k_meas.h"
 
@@ -424,6 +425,7 @@ static int mark_default(int fd, uint32_t mark) {
 
 d2k_sched_bind_fn d2k_sched_bind_hook = bind_default;
 d2k_sched_mark_fn d2k_sched_mark_hook = mark_default;
+d2k_sched_volprops_fn d2k_sched_volprops_hook = d2k_props_ask_volume;
 d2k_sched_vol_fn  d2k_sched_vol_hook  = d2k_volume_probe;
 d2k_sched_vol_path_fn d2k_sched_vol_path_hook = d2k_volume_probe_path;
 d2k_sched_path_ver_fn d2k_sched_path_ver_hook = d2k_verify_probe_path_on;
@@ -5091,7 +5093,52 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
         }
         return;
     }
-    if (t->n_plans < cap) {
+    /* ОБРЫВ ОБЪЁМА СПРАШИВАЕТСЯ СВОИМ СИГНАЛОМ (поле 15.10.2026). Вопросы
+       рукопожатия на этом пути не задавались вовсе: при обрыве объёма
+       рукопожатие проходит само, и их критерий («обмен с ServerHello»)
+       засчитал бы первый же вопрос, ничего не померив. Вектор оставался
+       пустым, а план всё равно собирался — d2k_compose на нулевом векторе
+       даёт «всё сразу», и в поле он не прошёл НИ РАЗУ из шестнадцати, тогда
+       как первый кандидат запасного перебора (seqovl-1) проходил за 5-10 с.
+       Теперь те же пять вопросов судит та самая лестница, которой блокировка
+       и была измерена (core/volprops.c). */
+    int vol_cut_path = t->transport == 6 && t->vol.verdict == D2K_VOL_CUT;
+    if (vol_cut_path && d2k_props_all_unknown(&t->props) && t->trig_len && t->ctrl_len) {
+        d2k_volprops_in vin;
+        memset(&vin, 0, sizeof vin);
+        vin.link_fd = s->link_fd;
+        vin.ip = t->ip;
+        vin.port = t->port;
+        vin.trigger = (d2k_hello){t->trig, t->trig_len};
+        vin.control = (d2k_hello){t->ctrl, t->ctrl_len};
+        vin.plain = t->port == 80;
+        vin.tls12 = sh == D2K_SHAPE_LEGACY;
+        vin.hello_wire = t->trig_len;
+        vin.path = t->measure_path[0] ? t->measure_path : NULL;
+        d2k_volprops_step vsteps[D2K_PROPS_QUESTIONS];
+        t->props = d2k_sched_volprops_hook(&vin, vsteps);
+        int asked = 0, passed = -1;
+        for (int q = 0; q < D2K_PROPS_QUESTIONS; q++) {
+            if (vsteps[q].rc != D2K_VP_NOT_ASKED) { asked++; }
+            if (vsteps[q].rc == D2K_VP_PASSED) { passed = q; }
+        }
+        t->probes += asked;
+        if (passed >= 0) {
+            say(s, "по %s обрыв объёма: вопрос «%s» прошёл — лестница под ним "
+                   "больше не рвётся; строю план по измеренному свойству",
+                t->name, d2k_props_question_name(passed));
+        } else {
+            say(s, "по %s обрыв объёма: %d %s задано, лестница рвётся под каждым — "
+                   "измеренного свойства нет", t->name, asked, probes_word(asked));
+        }
+    }
+    /* ПУСТОЙ ВЕКТОР ПЛАНА НЕ ДАЁТ — ТОЛЬКО НА ПУТИ ОБРЫВА ОБЪЁМА. Собранное
+       из одних «не измерено» там — не вывод из замера, а догадка под его
+       подписью: в поле 15.10.2026 такой план (plan-8bd1393f) провалился 16
+       раз из 16. На прочих путях пустой вектор остаётся как был: там он
+       означает другое (вопросы задавались и не прошли), и трогать это
+       поведение без своего полевого основания нельзя. */
+    if (t->n_plans < cap && !(vol_cut_path && d2k_props_all_unknown(&t->props))) {
         t->n_plans += d2k_compose(&t->props, sh, SCHED_DECOY, s->send_cap,
                                   t->plans + t->n_plans, cap - t->n_plans);
     }

@@ -254,8 +254,14 @@ static void fill_pad(char *out, size_t n) {
     if (f) { fclose(f); }
 }
 
-static int connect_bounded(const char *ip, uint16_t port, uint32_t mark,
-                           char *reason, size_t cap) {
+/* use_fd — УЖЕ ЗАНЯТЫЙ сокет (d2k_props_bind_family), ещё не подключённый.
+   Нужен опросу свойств по обрыву объёма (volprops.c): план вопроса ставится
+   на КОНКРЕТНЫЙ местный порт, и порт обязан быть занят ДО установки плана,
+   иначе вопрос подействовал бы на чужие соединения к тому же имени. Меньше
+   нуля — завести свой сокет, как раньше. Метку на чужой сокет не ставим:
+   её смысл («мерить линию, а не план») противоположен смыслу вопроса. */
+static int connect_bounded_on(int use_fd, const char *ip, uint16_t port, uint32_t mark,
+                              char *reason, size_t cap) {
     struct sockaddr_storage addr;
     socklen_t addrlen;
     int family;
@@ -272,14 +278,14 @@ static int connect_bounded(const char *ip, uint16_t port, uint32_t mark,
         snprintf(reason, cap, "адрес \"%s\" не разбирается", ip);
         return -1;
     }
-    int fd = socket(family, SOCK_STREAM, 0);
+    int fd = use_fd >= 0 ? use_fd : socket(family, SOCK_STREAM, 0);
     if (fd < 0) { snprintf(reason, cap, "сокет: %s", strerror(errno)); return -1; }
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 #ifdef SO_NOSIGPIPE
     (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
-    if (mark != 0 && d2k_mark_hook(fd, mark) != 0) {
+    if (use_fd < 0 && mark != 0 && d2k_mark_hook(fd, mark) != 0) {
         /* Метка не поставилась — проба пойдёт ПО ОБЩИМ ПРАВИЛАМ, то есть
            через уже поставленный план. Это меряло бы работу плана, а не линию,
            и молча так делать нельзя. */
@@ -318,6 +324,7 @@ static int connect_bounded(const char *ip, uint16_t port, uint32_t mark,
     (void)fcntl(fd, F_SETFL, flags);
     return fd;
 }
+
 
 /* Читает заголовки ответа до пустой строки. 0 — прочитано, -1 — обрыв. */
 static int drain_head_tls(d2k_tls *t, d2k_tls12 *t12, int wait_ms, char *reason, size_t cap) {
@@ -565,9 +572,9 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     snprintf(res->rx_reason, sizeof res->rx_reason, "%.102s: %.150s", lead, measured);
 }
 
-d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *sni,
-                                int plain, int tls12, size_t hello_wire,
-                                uint32_t mark, const char *path) {
+d2k_vol_result d2k_volume_probe_on(int use_fd, const char *ip, uint16_t port,
+                                   const char *sni, int plain, int tls12,
+                                   size_t hello_wire, uint32_t mark, const char *path) {
     d2k_vol_result res;
     memset(&res, 0, sizeof res);
     res.verdict = D2K_VOL_UNREACHABLE;
@@ -578,7 +585,7 @@ d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *
     }
 
     int64_t started = now_ms();
-    int fd = connect_bounded(ip, port, mark, res.reason, sizeof res.reason);
+    int fd = connect_bounded_on(use_fd, ip, port, mark, res.reason, sizeof res.reason);
     if (fd < 0) { return res; }
 
     d2k_tls *tls = NULL;
@@ -697,6 +704,12 @@ d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *
         probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark, path);
     }
     return res;
+}
+
+d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *sni,
+                                int plain, int tls12, size_t hello_wire,
+                                uint32_t mark, const char *path) {
+    return d2k_volume_probe_on(-1, ip, port, sni, plain, tls12, hello_wire, mark, path);
 }
 
 d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,

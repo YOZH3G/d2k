@@ -130,6 +130,17 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
 d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *sni,
     int plain, int tls12, size_t hello_wire, uint32_t mark, const char *path);
 
+/* То же, но на УЖЕ ЗАНЯТОМ сокете (d2k_props_bind_family), ещё не
+ * подключённом: опрос свойств по обрыву объёма (volprops.c) ставит план
+ * вопроса на конкретный местный порт, и порт обязан быть занят ДО установки
+ * плана — иначе вопрос подействует на чужие соединения к тому же имени.
+ * use_fd < 0 — ровно d2k_volume_probe_path. На чужой сокет метка не
+ * ставится: её смысл («мерить линию, а не план») противоположен смыслу
+ * вопроса, который спрашивает, сработал ли ЕГО план. */
+d2k_vol_result d2k_volume_probe_on(int use_fd, const char *ip, uint16_t port,
+    const char *sni, int plain, int tls12, size_t hello_wire, uint32_t mark,
+    const char *path);
+
 /* Чистая проверка трёх уже полученных ответов: две повторные identity-обрезки
  * и полный gzip-контроль. Нужна также тестам, чтобы границы RX-диагноза были
  * проверяемы без сетевых прогонов. Возвращает 1 только при подтверждённой
