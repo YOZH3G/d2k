@@ -10,6 +10,9 @@
 #define send mock_send
 #define nanosleep mock_sleep
 #include "quicprobe.c"
+#undef send
+#include "test_quic_pq.h"
+#define send mock_send
 #undef getsockname
 #undef getpeername
 #undef getsockopt
@@ -41,6 +44,27 @@ int main(void){
         const uint8_t zeros[D2K_QUIC_LENGTH_INCREMENT]={0};
         CHECK(!memcmp(sent[0].bytes+n,zeros,sizeof zeros));
         a.q=&q;
+    }
+    /* ПАЧКА УЕЗЖАЕТ ЦЕЛИКОМ И ПО ПОРЯДКУ (задача 66). Приветствие Chrome с
+       ML-KEM — две Initial-датаграммы; одна посылка на пачку означала бы
+       датаграмму в 2,4 КБ, которой клиент не слал и которую сеть порежет. */
+    {
+        uint8_t d1[1500],d2[1500];
+        size_t l1=0,l2=0;
+        CHECK(d2k_test_pq_initials("rutracker.org",d1,&l1,d2,&l2)==0);
+        const uint8_t *dgs[2]={d1,d2};
+        size_t lens[2]={l1,l2};
+        static uint8_t blob[D2K_SHAPE_MAX];
+        size_t bl=d2k_qsnap_pack(dgs,lens,2,blob,sizeof blob);
+        CHECK(bl>0);
+        ctx(4);current_ttl=47;sent_count=lower_count=elapsed=0;
+        int marked=0;
+        d2k_hello msg={blob,bl};
+        int fd=qp_send_one("127.0.0.1",443,NULL,0,0,0,0,msg,0,&marked,0,0);
+        CHECK(sent_count==2);
+        CHECK(sent[0].len==l1 && sent[1].len==l2);
+        CHECK(!memcmp(sent[0].bytes,d1,l1) && !memcmp(sent[1].bytes,d2,l2));
+        if(fd>=0)close(fd);
     }
     printf("QUIC actual first-send sink: %d failures\n",fails);return fails?1:0;
 }

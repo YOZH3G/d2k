@@ -13,6 +13,7 @@
 #include "d2k_hello.h"
 #include "d2k_quic.h"
 #include "d2k_quichello.h"
+#include "d2k_quicsnap.h"
 #include "d2k_quicwire.h"
 #include "d2k_tls13core.h"
 #include "d2k_crypto.h"
@@ -286,6 +287,12 @@ int d2k_quic_probe_initial_longer(const char *sni, uint8_t *out, size_t cap,
 int d2k_quic_prepare_target(const uint8_t *sample, size_t sample_len,
                             const char *sni, uint8_t *out, size_t cap,
                             size_t *out_len, int *used_sample) {
+    /* ПАЧКА СЮДА НЕ ХОДИТ (задача 66). Вопрос собран для одиночной
+       датаграммы: он пересобирает ОДИН пакет. Приветствие клиента с ML-KEM
+       занимает два Initial, и подменить его одиночным пакетом значило бы
+       задать другой вопрос под тем же именем. Честный отказ — вызывающий
+       скажет «вопрос не задан». */
+    if (d2k_qsnap_is(sample, sample_len)) { return -1; }
     if (!sni || !sni[0] || !out || !out_len) { return -1; }
     *out_len = 0;
     if (used_sample) { *used_sample = 0; }
@@ -304,6 +311,12 @@ int d2k_quic_prepare_target(const uint8_t *sample, size_t sample_len,
 
 int d2k_quic_hello_rename(const uint8_t *in, size_t n, const char *sni,
                           uint8_t *out, size_t cap, size_t *out_len) {
+    /* ПАЧКА СЮДА НЕ ХОДИТ (задача 66). Вопрос собран для одиночной
+       датаграммы: он пересобирает ОДИН пакет. Приветствие клиента с ML-KEM
+       занимает два Initial, и подменить его одиночным пакетом значило бы
+       задать другой вопрос под тем же именем. Честный отказ — вызывающий
+       скажет «вопрос не задан». */
+    if (d2k_qsnap_is(in, n)) { return -1; }
     return d2k_quic_hello_ask(in, n, D2K_QASK_PLAIN, sni, out, cap, out_len);
 }
 
@@ -316,6 +329,12 @@ int d2k_quic_hello_rename(const uint8_t *in, size_t n, const char *sni,
  * правке, и разошёлся бы молча: оба собирают «похожий» пакет. */
 int d2k_quic_hello_ask(const uint8_t *in, size_t n, d2k_quic_ask ask,
                        const char *sni, uint8_t *out, size_t cap, size_t *out_len) {
+    /* ПАЧКА СЮДА НЕ ХОДИТ (задача 66). Вопрос собран для одиночной
+       датаграммы: он пересобирает ОДИН пакет. Приветствие клиента с ML-KEM
+       занимает два Initial, и подменить его одиночным пакетом значило бы
+       задать другой вопрос под тем же именем. Честный отказ — вызывающий
+       скажет «вопрос не задан». */
+    if (d2k_qsnap_is(in, n)) { return -1; }
     if (!in || !sni || !out || !out_len) { return -1; }
 
     uint8_t ch2[D2K_QW_MAX_DGRAM];
@@ -393,6 +412,12 @@ int d2k_quic_hello_ask(const uint8_t *in, size_t n, d2k_quic_ask ask,
 int d2k_quic_hello_split(const uint8_t *in, size_t n, const char *sni,
                          uint8_t *head, size_t head_cap, size_t *head_len,
                          uint8_t *tail, size_t tail_cap, size_t *tail_len) {
+    /* ПАЧКА СЮДА НЕ ХОДИТ (задача 66). Вопрос собран для одиночной
+       датаграммы: он пересобирает ОДИН пакет. Приветствие клиента с ML-KEM
+       занимает два Initial, и подменить его одиночным пакетом значило бы
+       задать другой вопрос под тем же именем. Честный отказ — вызывающий
+       скажет «вопрос не задан». */
+    if (d2k_qsnap_is(in, n)) { return -1; }
     if (!in || !sni || !head || !head_len || !tail || !tail_len) { return -1; }
 
     uint8_t ch2[D2K_QW_MAX_DGRAM];
@@ -431,6 +456,12 @@ int d2k_quic_hello_split(const uint8_t *in, size_t n, const char *sni,
 
 int d2k_quic_hello_recid(const uint8_t *in, size_t n,
                          uint8_t *out, size_t cap, size_t *out_len) {
+    /* ПАЧКА СЮДА НЕ ХОДИТ (задача 66). Вопрос собран для одиночной
+       датаграммы: он пересобирает ОДИН пакет. Приветствие клиента с ML-KEM
+       занимает два Initial, и подменить его одиночным пакетом значило бы
+       задать другой вопрос под тем же именем. Честный отказ — вызывающий
+       скажет «вопрос не задан». */
+    if (d2k_qsnap_is(in, n)) { return -1; }
     if (!in || !out || !out_len) { return -1; }
 
     d2k_qw_hdr h;

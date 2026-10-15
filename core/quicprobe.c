@@ -143,6 +143,7 @@
 #include "d2k_quic.h"       /* d2k_quic_is_initial — канонический разбор заголовка Task 2 */
 #include "d2k_net4.h"
 #include "d2k_quichello.h"
+#include "d2k_quicsnap.h"
 #include "d2k_quicwire.h"
 #include "d2k_udpruntime.h"
 #include "d2k_quicprobe.h"
@@ -744,7 +745,29 @@ static int qp_send_one(const char *addr, uint16_t port,
         (void)setsockopt(fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on, sizeof on);
     }
     int rc=0;
-    if((prefix && prefix_len) || split || longer){
+    /* ПАЧКА — ПО ДАТАГРАММЕ НА ПОСЫЛКУ (задача 66). Приветствие клиента с
+       постквантовым key_share занимает два Initial, и уехать одной посылкой
+       они не могут: получилась бы датаграмма в 2,4 КБ, которой клиент не
+       слал. Воздействие (приманка, разрез, длина) относится к ГОЛОВЕ полёта —
+       так же, как его применяет датапат; хвост уходит как есть. */
+    d2k_qsnap pack;
+    int packed = d2k_qsnap_is(msg.bytes, msg.len) &&
+                 d2k_qsnap_parse(msg.bytes, msg.len, &pack) == 0;
+    if(packed){
+        d2k_hello head = {pack.dg[0], pack.len[0]};
+        if((prefix && prefix_len) || split || longer){
+            char plan[16384];d2k_quic_arm_question q={0};
+            q.blob=prefix;q.blob_len=prefix_len;q.ttl=prefix_ttl;q.copies=prefix_copies;q.split=split;
+            q.udplen=longer;
+            rc=d2k_quic_question_plan(&q,plan,sizeof plan);
+            if(!rc)rc=d2k_udp_plan_send(fd,plan,head.bytes,head.len,mark);
+        }else if(send(fd,head.bytes,head.len,0)!=(ssize_t)head.len)
+            rc=errno==ECONNREFUSED?-2:-1;
+        for(size_t i=1;!rc && i<pack.n;i++){
+            if(send(fd,pack.dg[i],pack.len[i],0)!=(ssize_t)pack.len[i])
+                rc=errno==ECONNREFUSED?-2:-1;
+        }
+    }else if((prefix && prefix_len) || split || longer){
         char plan[16384];d2k_quic_arm_question q={0};
         q.blob=prefix;q.blob_len=prefix_len;q.ttl=prefix_ttl;q.copies=prefix_copies;q.split=split;
         q.udplen=longer;
@@ -1098,6 +1121,10 @@ static d2k_tally quic_ask_core(const char *addr, uint16_t port,
      * вопрос не отправляется. */
     static const size_t COPY_CAP = D2K_QW_MAX_DGRAM;
     uint8_t copies[D2K_QUIC_MAX_ADDRS][D2K_QW_MAX_DGRAM];
+    /* Пачка на попытку — отдельный буфер: она в разы длиннее одиночного
+       снимка, и класть её в copies значило бы раздуть кадр на стеке для всех
+       вопросов. Статический: рабочий поток у замера свой. */
+    static __thread uint8_t packs[D2K_QUIC_MAX_ADDRS][D2K_SHAPE_MAX];
     uint8_t tails[D2K_QUIC_MAX_ADDRS][D2K_QW_MAX_DGRAM];
     const uint8_t *pfx[D2K_QUIC_MAX_ADDRS];
     size_t pfx_len[D2K_QUIC_MAX_ADDRS];
@@ -1156,6 +1183,19 @@ static d2k_tally quic_ask_core(const char *addr, uint16_t port,
             } else {
                 sent[i].bytes = NULL;
                 sent[i].len = 0;
+            }
+        } else if (msg.bytes && msg.len && d2k_qsnap_is(msg.bytes, msg.len)) {
+            /* ПАЧКА: свежий идентификатор на всю пачку разом (задача 66).
+               Половинки обязаны нести ОДИН DCID, иначе сервер увидит два
+               соединения по половине приветствия; поштучное обновление, как
+               у одиночного снимка, здесь невозможно по устройству. */
+            d2k_qsnap in;
+            if (d2k_qsnap_parse(msg.bytes, msg.len, &in) == 0 &&
+                d2k_qsnap_recid(&in, packs[i], sizeof packs[i], &clen) == 0) {
+                sent[i].bytes = packs[i];
+                sent[i].len = clen;
+            } else {
+                sent[i] = (d2k_hello){NULL, 0};
             }
         } else if (msg.bytes && msg.len &&
                    d2k_quic_hello_recid(msg.bytes, msg.len, copies[i], COPY_CAP, &clen) == 0) {

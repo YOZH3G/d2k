@@ -17,6 +17,8 @@
 #include "d2k_hello.h"
 #include "d2k_quic.h"
 #include "d2k_quichello.h"
+#include "test_quic_pq.h"
+#include "d2k_quicsnap.h"
 #include "d2k_quicconn.h"
 #include "d2k_quicwire.h"
 #include "test_quic_vector.h"
@@ -592,6 +594,31 @@ int main(int argc, char **argv) {
         printf("ПРОВАЛОВ: %d\n", fails);
         return 1;
     }
+    /* ВОПРОС, СОБРАННЫЙ ДЛЯ ОДИНОЧНОЙ ДАТАГРАММЫ, ОБЯЗАН ОТКАЗАТЬ НА ПАЧКЕ
+       (задача 66), а не вернуть молча один пакет вместо полёта клиента: это
+       был бы другой вопрос под тем же именем. */
+    {
+        uint8_t d1[1500], d2[1500];
+        size_t l1 = 0, l2 = 0;
+        CHECK(d2k_test_pq_initials("rutracker.org", d1, &l1, d2, &l2) == 0,
+              "стенд двух Initial");
+        const uint8_t *dgs[2] = {d1, d2};
+        size_t lens[2] = {l1, l2};
+        static uint8_t blob[D2K_SHAPE_MAX], o1[D2K_SHAPE_MAX], o2[D2K_SHAPE_MAX];
+        size_t bl = d2k_qsnap_pack(dgs, lens, 2, blob, sizeof blob), n1 = 0, n2 = 0;
+        CHECK(bl > 0, "пачка не упаковалась");
+        CHECK(d2k_quic_hello_rename(blob, bl, "example.org", o1, sizeof o1, &n1) != 0,
+              "переименование пачки обязано отказать");
+        CHECK(d2k_quic_hello_split(blob, bl, "rutracker.org", o1, sizeof o1, &n1,
+                                   o2, sizeof o2, &n2) != 0,
+              "разрез пачки обязан отказать");
+        CHECK(d2k_quic_hello_recid(blob, bl, o1, sizeof o1, &n1) != 0,
+              "одиночная пересборка пачки обязана отказать");
+        int used = 0;
+        CHECK(d2k_quic_prepare_target(blob, bl, "example.org", o1, sizeof o1, &n1, &used) != 0,
+              "перенос пачки на другое имя обязан отказать");
+    }
+
     printf("приветствие QUIC с другим именем: все проверки прошли\n");
     return 0;
 }
