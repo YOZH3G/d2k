@@ -258,6 +258,8 @@ typedef d2k_ver_result (*d2k_sched_replay_ver_fn)(int use_fd, const char *ip, ui
                                                   const uint8_t *hello, size_t hello_len,
                                                   int deadline_ms);
 extern d2k_sched_replay_ver_fn d2k_sched_replay_ver_hook;
+/* Повтор пачки QUIC клиента (QUIC с ECH); по умолчанию d2k_verify_quic_replay_on. */
+extern d2k_sched_replay_ver_fn d2k_sched_quic_replay_ver_hook;
 
 /* Запуск рабочего потока задачи. NULL (умолчание) — поток заводится как
  * обычно; ненулевой ответ крючка изображает отказ pthread_create. Нужен,

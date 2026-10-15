@@ -448,6 +448,7 @@ static d2k_vres classify_unconfigured(const char *ip, uint16_t port,
 d2k_sched_tcp_fn d2k_sched_tcp_hook = classify_unconfigured;
 d2k_sched_ech_resolve_fn d2k_sched_ech_resolve_hook = d2k_ech_resolve;
 d2k_sched_replay_ver_fn d2k_sched_replay_ver_hook = d2k_verify_replay_on;
+d2k_sched_replay_ver_fn d2k_sched_quic_replay_ver_hook = d2k_verify_quic_replay_on;
 d2k_sched_tcp_fn  d2k_sched_tcp_base_hook = NULL;
 d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook = NULL;
 d2k_sched_tcp_white_fn d2k_sched_tcp_white_hook = NULL;
@@ -996,6 +997,12 @@ typedef struct {
        проверяем кандидатов байтами клиента — его ECH-приветствием повтором
        на тот же адрес. Подтверждение — уровень рукопожатия (replay_proof). */
     int        ech_replay;
+    /* QUIC с ECH (поле 15.10.2026): вход — пачка клиента с расширением ECH.
+       Заготовка ECH не воспроизводит, и коробка её пропускает, а полёт
+       клиента глушит. План подтверждается только повтором этой пачки под
+       планом (уровень рукопожатия). Отдельно от ech_offer: тот означает
+       форму TCP-ECH и выводит форму привязки ECH_TCP. */
+    int        quic_ech;
     /* GREASE распознан рабочим потоком, а свои планы ещё не спрашивались
        (задача 49): поток вернулся без замера, решение own_first принимает
        главный поток (каталог не под s->mu) и запускает поиск заново. */
@@ -1245,6 +1252,15 @@ struct d2k_sched {
     struct { char name[256]; uint8_t bytes[SCHED_TRIG_MAX]; size_t len;
              uint8_t family; int64_t observed_ms; } ech_inputs[8];
     size_t ech_input_next;
+    /* ПАЧКИ QUIC ПО ИМЕНИ (поле 15.10.2026). Общая ячейка quic_shape держит
+       только последнюю пачку любого имени, и к поиску цели в ней почти
+       всегда лежала чужая («пачка чужого имени — мерю собственным
+       Initial»). Для имени, чей клиент шлёт ECH, это значило мерить
+       заготовкой без ECH — она коробку проходит, и поиск кончался ложным
+       «напрямую проходит». */
+    struct { char name[256]; uint8_t bytes[SCHED_TRIG_MAX]; size_t len;
+             uint8_t family; uint8_t ech; int64_t observed_ms; } quic_named[16];
+    size_t quic_named_next;
     /* ИМЕНА, ЧЕЙ КЛИЕНТ ШЛЁТ QUIC ClientHello ШИРЕ ДАТАГРАММЫ (финальное
        ревью core, I1): снимок пришёл обрывком (on_shape). Разрез CRYPTO
        такому клиенту не исполнится — датапат режет только датаграмму с
@@ -2057,6 +2073,28 @@ static int hello_fits_client(const task *t, const uint8_t *b, size_t n) {
     return got == D2K_SHAPE_UNKNOWN || got == want;
 }
 
+/* ECH в приветствии пачки QUIC: собранный ClientHello оборачивается в
+   заголовок записи TLS, чтобы его прочёл тот же разбор, что у TCP. */
+static int quic_pack_ech(const uint8_t *b, size_t n) {
+    d2k_qsnap pk;
+    static __thread uint8_t rec[5 + SCHED_TRIG_MAX];
+    size_t chl = 0;
+    if (!d2k_qsnap_is(b, n) || d2k_qsnap_parse(b, n, &pk) != 0 ||
+        d2k_qsnap_client_hello(&pk, rec + 5, sizeof rec - 5, &chl) != 0 ||
+        chl == 0 || chl > 0xffff) return 0;
+    rec[0] = 0x16; rec[1] = 0x03; rec[2] = 0x01;
+    rec[3] = (uint8_t)(chl >> 8); rec[4] = (uint8_t)chl;
+    return d2k_hello_ech_offer(rec, chl + 5, NULL) == 1;
+}
+
+static int quic_named_find(const d2k_sched *s, const char *name, uint8_t family) {
+    for (size_t k = 0; k < sizeof s->quic_named / sizeof s->quic_named[0]; k++)
+        if (s->quic_named[k].len && s->quic_named[k].family == family &&
+            !strcmp(s->quic_named[k].name, name) &&
+            s->quic_named[k].observed_ms + 600000 >= s->now_ms) return (int)k;
+    return -1;
+}
+
 static int fill_hellos(d2k_sched *s, task *t) {
     if (t->transport == 17) {
         /* Донор quicprobe.buildInitial начинает замер собственным QUIC
@@ -2078,7 +2116,15 @@ static int fill_hellos(d2k_sched *s, task *t) {
                переписываем в нём имя: форма — свойство клиента, а не цели
                (см. quic_shape в структуре планировщика). Признак «форма
                измерена» НЕ ставится: измерена она не здесь. */
-            if (s->quic_shape_len[t->family == 6] > 0 &&
+            int own = quic_named_find(s, t->name, t->family ? t->family : 4);
+            if (own >= 0) {
+                /* Пачка ЭТОГО имени за последние 10 минут — вход клиента. */
+                memcpy(t->trig, s->quic_named[own].bytes, s->quic_named[own].len);
+                t->trig_len = s->quic_named[own].len;
+                t->trig_snapped = 1;
+                say(s, "по %s мерю снятой пачкой этого имени (%zu байт%s)", t->name,
+                    t->trig_len, s->quic_named[own].ech ? ", с ECH" : "");
+            } else if (s->quic_shape_len[t->family == 6] > 0 &&
                 strcmp(s->quic_shape_name[t->family == 6], t->name) == 0) {
                 memcpy(t->trig, s->quic_shape[t->family == 6], s->quic_shape_len[t->family == 6]);
                 t->trig_len = s->quic_shape_len[t->family == 6];
@@ -2487,7 +2533,12 @@ static void *worker_run(void *vp) {
                         d2k_qsnap_form(&a_pack, &a_form) == 0;
         }
         d2k_verify_quic_form_set(a_form_ok ? &a_form : NULL);
-        if (t->transport == 6 && t->ech_offer && t->ech_replay) {
+        if (t->transport == 17 && t->quic_ech) {
+            /* QUIC с ECH: свой клиент ECH не повторит — кандидат проверяется
+               повтором пачки клиента под планом. */
+            vr = d2k_sched_quic_replay_ver_hook(a_use_fd, t->ip, t->port, trig.bytes,
+                                                trig.len, SCHED_VERIFY_STEP_MS);
+        } else if (t->transport == 6 && t->ech_offer && t->ech_replay) {
             /* Свидетеля нет: кандидат проверяется теми же байтами клиента. */
             vr = d2k_sched_replay_ver_hook(a_use_fd, t->ip, t->port, trig.bytes, trig.len,
                                            SCHED_VERIFY_STEP_MS);
@@ -6212,6 +6263,10 @@ static int start_search(d2k_sched *s, task *t) {
        базовый вопрос донора. Шаг один на задачу: пройденный (3) не
        повторяется перезапуском поиска; брошенный ради снимка (1) задаётся
        заново его байтами. Семейный путь и база другого семейства — свои. */
+    t->quic_ech = t->transport == 17 && t->trig_snapped && quic_pack_ech(t->trig, t->trig_len);
+    if (t->quic_ech)
+        say(s, "по %s (QUIC) вход — пачка клиента с ECH: план подтверждается только "
+               "повтором этой пачки (уровень рукопожатия)", t->name);
     if (t->own_first <= 1)
         t->own_first = (t->transport == 17 ? d2k_sched_quic_base_hook != NULL
                                            : d2k_sched_tcp_base_hook != NULL) &&
@@ -7532,8 +7587,37 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
                        "Initial (PROFILE)", pack.n, ev->shape_len);
                 return;
             }
-            say(s, "по %s снят снимок QUIC: %zu датаграмм, %zu байт — мерю снятыми "
-                   "байтами клиента", name, pack.n, ev->shape_len);
+            int ech = quic_pack_ech(ev->shape, ev->shape_len);
+            uint8_t fam = ev->family ? ev->family : 4;
+            size_t nslot = sizeof s->quic_named / sizeof s->quic_named[0];
+            size_t slot = nslot;
+            for (size_t k = 0; k < nslot; k++)
+                if (s->quic_named[k].len && s->quic_named[k].family == fam &&
+                    !strcmp(s->quic_named[k].name, name)) { slot = k; break; }
+            int admitted = slot == nslot || !s->quic_named[slot].ech;
+            /* ECH-пачки датапат шлёт без заказа, по одной на соединение: о
+               каждой повторной пачке того же имени журнал молчит минуту. */
+            if (slot == nslot || s->quic_named[slot].observed_ms + 60000 < s->now_ms ||
+                (ech && admitted))
+                say(s, "по %s снят снимок QUIC: %zu датаграмм, %zu байт%s — мерю снятыми "
+                       "байтами клиента", name, pack.n, ev->shape_len, ech ? ", с ECH" : "");
+            if (slot == nslot) slot = s->quic_named_next++ % nslot;
+            if (ech && admitted) {
+                /* Прежний «напрямую проходит» по этому имени мерился без ECH —
+                   заготовкой. Он не говорит ничего о полёте клиента; отсрочку
+                   снимаем один раз на допуск пачки, не на каждый повтор. */
+                if (cooldown_find(s, name, 17, fam)) {
+                    cooldown_clear(s, name, 17, fam);
+                    say(s, "по %s клиент шлёт QUIC с ECH — прежний «напрямую проходит» "
+                           "мерился без ECH; отсрочку снимаю, мерю пачкой клиента", name);
+                }
+            }
+            snprintf(s->quic_named[slot].name, sizeof s->quic_named[slot].name, "%s", name);
+            memcpy(s->quic_named[slot].bytes, ev->shape, ev->shape_len);
+            s->quic_named[slot].len = ev->shape_len;
+            s->quic_named[slot].family = fam;
+            s->quic_named[slot].ech = (uint8_t)ech;
+            s->quic_named[slot].observed_ms = s->now_ms;
         } else {
             /* ОДИНОЧНАЯ ДАТАГРАММА — прежний путь (датапат старой сборки,
                собственный зонд). Обрывок им не становится снимком: сервер
@@ -7959,6 +8043,12 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         trial_retire(s, t); ver_close(t); t->state = T_PLANNING;
         return;
     }
+    if (t->transport == 17 && t->quic_ech &&
+        (!t->ver.replay_proof || t->ver.level != D2K_VER_HANDSHAKE)) {
+        say(s, "по %s QUIC-план для ECH не подтверждён: нет ответа на повтор пачки клиента",
+            t->name);
+        trial_retire(s, t); ver_close(t); t->state = T_PLANNING; return;
+    }
     if (t->ech_offer && t->ech_replay) {
         /* Свидетеля нет: доказательство — только ServerHello на повтор байт
            клиента под планом. Принятый ECH и ответ origin здесь не
@@ -8143,7 +8233,12 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         say(s, "по %s белое имя сети подобрано: «%s» снимает RX-обрыв — сохраняю как "
                "свойство сети, подбор больше не повторяю", t->name, nw->name);
     }
-    if (t->ver.replay_proof)
+    if (t->ver.replay_proof && t->transport == 17)
+        say(s, "по %s (QUIC, ECH) ПОДТВЕРЖДЕНО повтором пачки клиента на уровне "
+               "рукопожатия: %s (путь: %s) — сервер ответил нашему соединению под планом "
+               "(план применён к потоку зонда); без ключей клиента прикладной уровень не измерен",
+            t->name, plan_id, candidate_path(t));
+    else if (t->ver.replay_proof)
         say(s, "по %s (TCP, ECH) ПОДТВЕРЖДЕНО повтором приветствия клиента на уровне "
                "рукопожатия: %s (путь: %s) — ServerHello под планом (план применён к потоку "
                "зонда); без ключей клиента прикладной уровень не измерен",

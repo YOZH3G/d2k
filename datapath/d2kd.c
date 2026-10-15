@@ -51,6 +51,9 @@
 #include "d2k_http_trace.h"
 #include "d2k_icmpguard.h"
 
+/* Сколько решений по клиентскому QUIC пишется в журнал за запуск. */
+#define D2K_CLIENT_QUIC_LOG 300u
+
 #define RECV_BUF   65536
 #define MAX_PKT     1600
 #define OUT_BUF    (D2K_RESULT_MAX * MAX_PKT)
@@ -1642,6 +1645,41 @@ int main(int argc, char **argv) {
                     int udp_how = udp_holding
                         ? d2k_udp_path_post(&udp_path, udp_fed, &udp_key, &res, &udp_batch)
                         : D2K_UDP_PATH_NORMAL;
+                    /* РЕШЕНИЯ ПО КЛИЕНТСКОМУ QUIC — В ЖУРНАЛ (поле 15.10.2026).
+                       Строки исполнения писались только для зондов контроллера,
+                       и о потоке Chrome, на который план не лёг, датапат не
+                       сказал ни слова: ни «удержан», ни «нет плана», ни отказ.
+                       Первые D2K_CLIENT_QUIC_LOG решений на запуск, дальше
+                       только счётчик. */
+                    if (!controller_probe && np.payload && np.payload_len >= 28 &&
+                        np.payload[9] == 17 && (np.payload[0] >> 4) == 4) {
+                        size_t ihl = (size_t)(np.payload[0] & 15u) * 4u;
+                        if (ihl >= 20 && ihl + 8 <= np.payload_len) {
+                            const uint8_t *udp = np.payload + ihl;
+                            unsigned sport = ((unsigned)udp[0] << 8) | udp[1];
+                            unsigned dport = ((unsigned)udp[2] << 8) | udp[3];
+                            static unsigned client_quic_logged;
+                            if (dport == 443 && client_quic_logged < D2K_CLIENT_QUIC_LOG) {
+                                client_quic_logged++;
+                                const char *how =
+                                    udp_how == D2K_UDP_PATH_HELD ? "удержан" :
+                                    udp_how == D2K_UDP_PATH_RECLAIMED ? "выпущен из удержания" :
+                                    udp_how == D2K_UDP_PATH_REPLAY ? "собран, повтор головы" :
+                                    udp_how == D2K_UDP_PATH_LOST ? "удержание потеряно" :
+                                    udp_holding ? "без удержания" : "удержание выключено";
+                                fprintf(stderr, "d2kd: клиент QUIC %u -> %u len=%zu%s%s%s: %s; %s; "
+                                                "applied=%u emits=%zu%s\n",
+                                        sport, dport, np.payload_len - ihl - 8,
+                                        res.quic_name[0] ? " имя=" : "", res.quic_name,
+                                        res.quic_shape_miss ? " (имя в таблице, формы QUIC нет)" : "",
+                                        how,
+                                        res.skipped ? res.skipped : "решение без отказа",
+                                        (unsigned)res.applied, res.n_out,
+                                        client_quic_logged == D2K_CLIENT_QUIC_LOG
+                                            ? " (дальше без журнала)" : "");
+                            }
+                        }
+                    }
                     if (udp_how == D2K_UDP_PATH_HELD || udp_how == D2K_UDP_PATH_RECLAIMED) {
                         continue;
                     }
@@ -1676,6 +1714,12 @@ int main(int argc, char **argv) {
                         }
                         if (controller_probe) {
                             fprintf(stderr, "d2kd: verifier QUIC replay: %s; applied=%u emits=%zu\n",
+                                    res.skipped ? res.skipped : "план исполнен",
+                                    (unsigned)res.applied, res.n_out);
+                        } else {
+                            fprintf(stderr, "d2kd: клиент QUIC replay головы имя=%s%s: %s; applied=%u emits=%zu\n",
+                                    res.quic_name,
+                                    res.quic_shape_miss ? " (имя в таблице, формы QUIC нет)" : "",
                                     res.skipped ? res.skipped : "план исполнен",
                                     (unsigned)res.applied, res.n_out);
                         }

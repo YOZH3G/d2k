@@ -1176,13 +1176,35 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
                 s->last_name_len[k] = name_len;
             }
         }
-        if (s->shape_armed[k] && snap_len <= sizeof s->shape[k] &&
+        /* ECH ВНЕ ОЧЕРЕДИ (поле 15.10.2026), как у TCP: внешнее приветствие
+           с ECH заготовкой не воспроизвести, а коробка, глушащая полёт
+           клиента, пропускает заготовку — и поиск кончался ложным
+           «напрямую проходит». Такую пачку контроллер получает сразу, не
+           дожидаясь заказа, пока следующее соединение её не перекрыло. */
+        int ech = 0;
+        if (pack_len) {
+            d2k_qsnap pk;
+            static uint8_t rec[5 + D2K_SHAPE_MAX];
+            size_t chl = 0;
+            if (d2k_qsnap_parse(pack, pack_len, &pk) == 0 &&
+                d2k_qsnap_client_hello(&pk, rec + 5, sizeof rec - 5, &chl) == 0 &&
+                chl > 0 && chl <= 0xffff) {
+                rec[0] = 0x16; rec[1] = 0x03; rec[2] = 0x01;
+                rec[3] = (uint8_t)(chl >> 8); rec[4] = (uint8_t)chl;
+                d2k_tls_info ti;
+                memset(&ti, 0, sizeof ti);
+                (void)d2k_tls_parse(rec, chl + 5, &ti);
+                ech = ti.is_client_hello && ti.ech_offer;
+            }
+        }
+        int requested = s->shape_armed[k] &&
             (s->shape_name_len[k] == 0 ||
              name_same((const uint8_t *)name, name_len,
-                       s->shape_name[k], s->shape_name_len[k]))) {
+                       s->shape_name[k], s->shape_name_len[k]));
+        if ((requested || ech) && snap_len <= sizeof s->shape[k]) {
             memcpy(s->shape[k], snap, snap_len);
             s->shape_len[k] = snap_len;
-            s->shape_armed[k] = 0;
+            if (requested) s->shape_armed[k] = 0;
             d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
                             (uint32_t)snap_len, NULL, NULL, 0, NULL);
         }
@@ -1229,10 +1251,15 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         use = d2k_plantab_find_voice_probe(s->plans, &probe_flow, now_ns, trial_id);
     }
     if (!use) { memset(trial_id, 0, sizeof trial_id); }
+    size_t misses_before = d2k_plantab_shape_misses(s->plans);
     if (!use) { use = d2k_plantab_find_target(s->plans,
                                                  named ? (const uint8_t *)name : NULL,
                                                  name_len, ip->dst.bytes, ip->family, now_ns,
                                                  seen_shape, controller_probe ? sport_be : 0); }
+    if (named && !voice) {
+        snprintf(out->quic_name, sizeof out->quic_name, "%.*s", (int)name_len, name);
+        out->quic_shape_miss = d2k_plantab_shape_misses(s->plans) != misses_before;
+    }
     if (!use) {
         use = s->plan;
     }

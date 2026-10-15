@@ -101,6 +101,10 @@ typedef struct {
        пропускается. Удержанная пачка снимается целиком, хвосты не
        переотправляются. */
     uint8_t  quic_deny;
+    /* Для журнала решений по клиентскому QUIC (поле 15.10.2026): имя потока
+       и признак «имя в таблице есть, но плана этой формы у него нет». */
+    char     quic_name[64];
+    uint8_t  quic_shape_miss;
     /* Task 47: the first packet of a flow whose client carries a routing mark
        (d2k_session_set_route_mark) — the caller logs it once per flow. */
     uint8_t  routed_first;

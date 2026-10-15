@@ -329,6 +329,16 @@ void d2k_verify_close(d2k_ver_result *r);
 d2k_ver_result d2k_verify_replay_on(int use_fd, const char *ip, uint16_t port,
     const uint8_t *hello, size_t hello_len, int deadline_ms);
 
+/* ПОВТОР СНЯТОЙ ПАЧКИ QUIC КЛИЕНТА (поле 15.10.2026: Chrome ходит на сайты
+ * Cloudflare по QUIC с ECH, внешнее имя cloudflare-ech.com; заготовка без ECH
+ * коробку проходит, полёт Chrome — нет). Та же пачка со свежим DCID уходит
+ * датаграммами с use_fd (порт пробного плана; <0 — свой сокет). Успех —
+ * ответ сервера, привязанный к нашему соединению: level D2K_VER_HANDSHAKE,
+ * replay_proof = 1, budget = D2K_BUDGET_NOT_APPLICABLE. Тишина, чужие
+ * датаграммы — D2K_VER_TRANSPORT. Сокет открыт до d2k_verify_close. */
+d2k_ver_result d2k_verify_quic_replay_on(int use_fd, const char *ip, uint16_t port,
+    const uint8_t *pack, size_t pack_len, int deadline_ms);
+
 /* Explicit origin witness: outer SNI is config.public_name, HTTP authority
  * and certificate-name observation are origin. Never follows another host. */
 d2k_ver_result d2k_verify_probe_ech_on(int use_fd, const char *ip, uint16_t port,
