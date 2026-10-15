@@ -96,8 +96,9 @@ tool=curl
         # Проводник лёг — загрузка повторяется напрямую и исполняется.
         rm -f "$RUN_MARKER" "$GATE_LOG"
         GATE_FAIL=1 sh -c "$command" || { echo "отказ VPS сорвал команду $tool $script" >&2; exit 1; }
-        [ -s "$RUN_MARKER" ] && [ -s "$GATE_LOG" ] \
-            || { echo "после отказа VPS команда $tool $script не пошла напрямую" >&2; exit 1; }
+        if [ ! -s "$RUN_MARKER" ] || [ ! -s "$GATE_LOG" ]; then
+            echo "после отказа VPS команда $tool $script не пошла напрямую" >&2; exit 1
+        fi
         [ ! -e "$(cat "$CURL_TARGET")" ] || { echo "временный файл остался: $tool $script" >&2; exit 1; }
         rm -f "$GATE_LOG"
     done
