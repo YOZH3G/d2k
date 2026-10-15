@@ -1240,7 +1240,9 @@ struct d2k_sched {
        вытесняется упоминанием (задача 26). */
     struct { d2k_resource ref; int64_t expires_ms; int proven; } resources[8];
     size_t resource_next;
-    struct { char name[256]; uint8_t bytes[2048]; size_t len;
+    /* Ячейка — размером со вход задачи: датапат снимает TCP-приветствие до
+       4096 байт, и с провода v20 длинное ECH-приветствие доходит целиком. */
+    struct { char name[256]; uint8_t bytes[SCHED_TRIG_MAX]; size_t len;
              uint8_t family; int64_t observed_ms; } ech_inputs[8];
     size_t ech_input_next;
     /* ИМЕНА, ЧЕЙ КЛИЕНТ ШЛЁТ QUIC ClientHello ШИРЕ ДАТАГРАММЫ (финальное
@@ -2407,7 +2409,11 @@ static void *worker_run(void *vp) {
     int a_use_fd = a->use_fd;
     int a_split_unfit = a->split_unfit;
     unsigned a_budget = a->budget;
-    uint8_t trigger_bytes[2048], control_bytes[2048];
+    /* КОПИЯ ВХОДА — РАЗМЕРОМ С ВХОД. Вход QUIC — пачка датаграмм клиента до
+       SCHED_TRIG_MAX байт (задача 66), и копия на 2048 переполняла стек
+       потока на первой же пачке Chrome (2508 байт): поле 15.10.2026,
+       контроллер умирал молча, ровно на «начинаю поиск». */
+    uint8_t trigger_bytes[sizeof a->trig], control_bytes[sizeof a->ctrl];
     memcpy(trigger_bytes, a->trig, a->trig_len);
     memcpy(control_bytes, a->ctrl, a->ctrl_len);
     d2k_hello trig = {trigger_bytes, a->trig_len};
@@ -7552,7 +7558,8 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         name[len] = '\0';
     }
     if (name[0] == '\0') { return; }
-    if (ev->transport == 6 && d2k_hello_ech_offer(ev->shape, ev->shape_len, NULL) == 1) {
+    if (ev->transport == 6 && ev->shape_len <= sizeof s->ech_inputs[0].bytes &&
+        d2k_hello_ech_offer(ev->shape, ev->shape_len, NULL) == 1) {
         size_t slot = 8;
         uint8_t family = ev->family ? ev->family : 4;
         for (size_t k = 0; k < 8; k++)

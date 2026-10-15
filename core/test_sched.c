@@ -90,7 +90,7 @@ static d2k_verdict quic_answer = D2K_V_OPAQUE;
    (финальное ревью core, I1); -1 — не звали. */
 static int quic_last_split_unfit = -1;
 static char tcp_last_ip[64], quic_last_sni[256], quic_last_ip[64];
-static uint8_t quic_seen_triggers[2][2048];
+static uint8_t quic_seen_triggers[2][D2K_SHAPE_MAX];
 static size_t quic_seen_trigger_lens[2];
 static char quic_seen_ips[2][64], quic_seen_snis[2][256];
 static char quic_seen_targets[2][256], quic_seen_controls[2][256];
@@ -1964,7 +1964,13 @@ static int said_count(const char *needle) {
    типа outer со случайными config_id, enc и payload — ровно так выглядит и
    GREASE Chromium (RFC 9849 §6.2), и настоящее предложение: по байтам они
    неотличимы намеренно. Отличает их только то, чьё имя снаружи. */
+static int ech_offer_hello_sized(const char *name, size_t payload, uint8_t *out,
+                                 size_t cap, size_t *len);
 static int ech_offer_hello(const char *name, uint8_t *out, size_t cap, size_t *len) {
+    return ech_offer_hello_sized(name, 144, out, cap, len);
+}
+static int ech_offer_hello_sized(const char *name, size_t payload, uint8_t *out,
+                                 size_t cap, size_t *len) {
     size_t n = 0;
     if (d2k_hello_from_profile(D2K_SHAPE_MODERN, name, out, cap, &n) != 0) return -1;
     size_t p = 9 + 2 + 32;
@@ -1972,7 +1978,7 @@ static int ech_offer_hello(const char *name, uint8_t *out, size_t cap, size_t *l
     p += 2 + ((size_t)out[p] << 8 | out[p + 1]);
     p += 1 + out[p];
     size_t ext_len_off = p;
-    const size_t enc = 32, payload = 144, elen = 10 + enc + payload;
+    const size_t enc = 32, elen = 10 + enc + payload;
     if (n + 4 + elen > cap) return -1;
     uint8_t *e = out + n;
     e[0] = 0xfe; e[1] = 0x0d; e[2] = (uint8_t)(elen >> 8); e[3] = (uint8_t)elen;
@@ -2847,6 +2853,72 @@ int main(int argc, char **argv) {
             CHECK(bd && !strcmp(bd->plan_id, pid), "ECH replay (o): подтверждён не свой план коробки");
         CHECK(said("уровне рукопожатия") && said("прикладной уровень не измерен"),
               "ECH replay: граница доказательства не названа");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        d2k_sched_tcp_base_hook = saved_base;
+        d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* ECH-ВХОД ДЛИННЕЕ 2048 БАЙТ (провод v20). Датапат снимает TCP-приветствие
+     * до 4096 байт, и до v20 провод срезал снимок на 2048; теперь длинное
+     * ECH-приветствие (ML-KEM плюс ECH) доходит целиком. Ячейка ECH-входа
+     * была на 2048 байт без проверки длины: такой вход затирал соседнюю
+     * ячейку, и чужое имя теряло снятые байты клиента — замер шёл не ими. */
+    {
+        const char *nm = "ech-public.example";
+        d2k_catalog c = {0};
+        d2k_sched_tcp_fn saved_base = d2k_sched_tcp_base_hook;
+        d2k_sched_tcp_base_hook = NULL;
+        base_blocked_answer = 1;
+        d2k_sched_replay_ver_hook = stub_replay;
+        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        replay_answer_ok = 1; replay_calls = 0; replay_last_len = 0;
+        tcp_answer = D2K_V_PREFIX;
+        tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0; ver_app_after_tcp_search = 0;
+        base_calls = tcp_calls = ver_calls = vol_calls = 0; tcp_last_wire = 0;
+        uint16_t port = 41240;
+        ver_answer_port = port;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        static uint8_t small_a[2048], big_a[4096], eb[2048];
+        size_t sl = 0, bl = 0, el = 0;
+        /* Длинный вход — около 2800 байт при любом размере профиля: полезная
+           нагрузка ECH добирает разницу (у малого входа она 144 байта). */
+        int fx = ech_offer_hello("long.ech.example", small_a, sizeof small_a, &sl) == 0 &&
+                 sl < 2800 &&
+                 ech_offer_hello_sized("long.ech.example", 144 + (2800 - sl), big_a,
+                                       sizeof big_a, &bl) == 0 &&
+                 ech_offer_hello(nm, eb, sizeof eb, &el) == 0;
+        CHECK(fx && bl > 2048 && bl <= sizeof big_a, "ECH long input: fixture");
+        d2k_ev sh; memset(&sh, 0, sizeof sh);
+        sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        memcpy(sh.shape, small_a, sl); sh.shape_len = sl;
+        d2k_sched_event(s, &sh);                                  /* ячейка 0 */
+        memcpy(sh.shape, eb, el); sh.shape_len = el;
+        d2k_sched_event(s, &sh);                                  /* ячейка 1 */
+        /* Общую TCP-ячейку снимка занимает третье имя: байты клиента у
+           ech-public.example остаются только в ячейке ECH-входа. */
+        uint8_t other[2048]; size_t ol = 0;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "other.example", other,
+                                     sizeof other, &ol) == 0, "ECH long input: third name");
+        memcpy(sh.shape, other, ol); sh.shape_len = ol;
+        d2k_sched_event(s, &sh);
+        memcpy(sh.shape, big_a, bl); sh.shape_len = bl;
+        d2k_sched_event(s, &sh);                                  /* снова 0 */
+        d2k_ev h = ev_hello(6, port, nm); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+        for (int i = 0; i < 40 && !said("ПОДТВЕРЖДЕНО"); i++) {
+            spin(s, 200);
+            d2k_ev ap = ev_applied(6, port); d2k_sched_event(s, &ap);
+        }
+        spin(s, 40);
+        CHECK(tcp_calls == 1 && tcp_last_wire == el,
+              "ECH long input: длинный вход соседа затёр ECH-вход имени — замер шёл не байтами клиента");
+        CHECK(replay_calls >= 1 && replay_last_len == el,
+              "ECH long input: кандидат проверен не повтором приветствия клиента");
         if (fails) fprintf(stderr, "%s\n", saidbuf);
         d2k_sched_free(s); d2k_catalog_free(&c);
         d2k_sched_tcp_base_hook = saved_base;
@@ -6134,8 +6206,7 @@ admission_only_run:
 
         uint8_t d1[1500], d2[1500];
         size_t l1 = 0, l2 = 0;
-        CHECK(d2k_test_pq_initials("пачка.example", d1, &l1, d2, &l2) == 0 ||
-              d2k_test_pq_initials("pack.example", d1, &l1, d2, &l2) == 0,
+        CHECK(d2k_test_pq_initials("pack.example", d1, &l1, d2, &l2) == 0,
               "стенд двух Initial не собрался");
         const uint8_t *dg[2] = {d1, d2};
         size_t len[2] = {l1, l2};
@@ -6163,6 +6234,20 @@ admission_only_run:
         frag.shape_len = d2k_qsnap_pack(dg, len, 1, frag.shape, sizeof frag.shape);
         d2k_sched_event(s, &frag);
         CHECK(said("обрывок ClientHello"), "неполная пачка принята за снимок");
+
+        /* ЗАМЕР ПАЧКОЙ ДОХОДИТ ДО ВОПРОСНИКА ЦЕЛИКОМ. Пачка Chrome длиннее
+           2048 байт, и рабочий поток копировал вход в стековый буфер на 2048:
+           поле 15.10.2026 — контроллер умирал молча на первом же QUIC-поиске
+           пачкой. Стенд обязан провести пачку через рабочий поток. */
+        CHECK(sh.shape_len > 2048, "стенд: пачка не длиннее 2048 — путь не проверяется");
+        quic_calls = 0;
+        memset(quic_seen_trigger_lens, 0, sizeof quic_seen_trigger_lens);
+        d2k_ev h = ev_hello(17, 41260, "pack.example"); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 41260); d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(quic_calls >= 1 && quic_seen_trigger_lens[0] == sh.shape_len &&
+              memcmp(quic_seen_triggers[0], sh.shape, sh.shape_len) == 0,
+              "замер пачкой: вопросник получил не всю пачку клиента");
 
         d2k_sched_free(s);
         d2k_catalog_free(&empty);
