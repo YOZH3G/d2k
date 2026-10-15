@@ -199,6 +199,26 @@ static void check_name_in_second_datagram(void) {
     int r2 = d2k_quic_assembly_feed(&a, d2, l2, name, sizeof name);
     CHECK(r1 == 0 && r2 == 1 && !strcmp(name, "example.com"),
           "fixture настоящий: имя собирается только из обеих датаграмм");
+    /* ЦЕЛОЕ ПРИВЕТСТВИЕ — НЕ ТО ЖЕ, ЧТО ИМЯ (задача 66). Chrome переставляет
+       расширения: имя бывает в первой датаграмме, а приветствие кончается во
+       второй. Снимок по имени уходил обрывком (поле 15.10.2026: пачка из
+       одной датаграммы в 1206 байт «не складывается»). */
+    {
+        uint8_t f1[1500], f2[1500];
+        size_t fl1 = 0, fl2 = 0;
+        CHECK(d2k_test_pq_initials_sni_first("example.com", f1, &fl1, f2, &fl2) == 0,
+              "fixture: имя в первой датаграмме");
+        d2k_quic_assembly b;
+        d2k_quic_assembly_init(&b);
+        char nm[64];
+        int q1 = d2k_quic_assembly_feed(&b, f1, fl1, nm, sizeof nm);
+        CHECK(q1 == 1 && !strcmp(nm, "example.com"), "имя собралось из первой датаграммы");
+        CHECK(!d2k_quic_assembly_complete(&b), "приветствие объявлено целым по одному имени");
+        int q2 = d2k_quic_assembly_feed(&b, f2, fl2, nm, sizeof nm);
+        CHECK(q2 == 1 && d2k_quic_assembly_complete(&b),
+              "приветствие не объявлено целым после последней датаграммы");
+        CHECK(d2k_quic_assembly_complete(&a), "целое приветствие (имя во второй) не признано целым");
+    }
     CHECK(d2k_quic_initial_split_crypto(d1, l1, out, sizeof out, &out_len) ==
           D2K_QUIC_SPLIT_NO_NAME, "первая датаграмма без имени: разрез отказан");
     CHECK(d2k_quic_initial_split_crypto(d2, l2, out, sizeof out, &out_len) != 0,

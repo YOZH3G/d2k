@@ -234,9 +234,11 @@ static int decrypt_initial(const uint8_t *p, const quic_hdr *h, uint8_t *plain, 
  * останавливается насовсем — гадать, где начинается следующий кадр, нельзя
  * ни для неизвестного типа, ни для битого известного: оба случая одинаково
  * лишают нас точки, откуда продолжать. */
+/* max_end (может быть NULL) — дальний конец кадров CRYPTO, включая те, что
+   в буфер не легли: по нему судят, кончилось ли приветствие, длиннее буфера. */
 static size_t collect_crypto_frames(const uint8_t *plain, size_t plen,
                                      uint8_t *stream, uint8_t *seen,
-                                     size_t cap) {
+                                     size_t cap, uint64_t *max_end) {
     /* Цена ограничена байтами, не произвольным числом кадров. Клиент вправе
        прислать сотни однобайтовых CRYPTO в обратном порядке: прежние восемь
        слотов теряли SNI в совершенно корректном Initial. Карта занятости
@@ -332,6 +334,7 @@ static size_t collect_crypto_frames(const uint8_t *plain, size_t plen,
             if (flen > (uint64_t)(plen - j)) {
                 break; /* кадр заявляет больше данных, чем есть в расшифрованном payload, — противоречие кадра */
             }
+            if (max_end && foff + flen > *max_end) { *max_end = foff + flen; }
             if (foff < (uint64_t)cap) {
                 size_t off = (size_t)foff;
                 size_t take = (size_t)flen;
@@ -558,7 +561,7 @@ static size_t crypto_stream_of(const uint8_t *p, size_t n,
         return 0;
     }
     uint8_t seen[(D2K_QUIC_MAX_DGRAM + 7) / 8] = {0};
-    return collect_crypto_frames(plain, plain_len, stream, seen, cap);
+    return collect_crypto_frames(plain, plain_len, stream, seen, cap, NULL);
 }
 
 int d2k_quic_client_hello(const uint8_t *p, size_t n,
@@ -631,7 +634,7 @@ int d2k_quic_dgrams_hello(const uint8_t *const *dg, const size_t *len, size_t n,
         if (decrypt_initial(dg[i], &h, plain, &plain_len) != 0) {
             return -1;
         }
-        (void)collect_crypto_frames(plain, plain_len, stream, seen, sizeof stream);
+        (void)collect_crypto_frames(plain, plain_len, stream, seen, sizeof stream, NULL);
     }
 
     /* Непрерывный префикс потока: дыра раньше конца сообщения значит, что
@@ -756,7 +759,7 @@ int d2k_quic_assembly_feed(d2k_quic_assembly *a, const uint8_t *p, size_t n,
         next.have_pn = 1;
     }
     (void)collect_crypto_frames(plain, plain_len, next.stream, next.seen,
-                                sizeof next.stream);
+                                sizeof next.stream, &next.crypto_end);
     *a = next;
 
     size_t sni_off = 0, sni_len = 0;
@@ -771,6 +774,25 @@ int d2k_quic_assembly_feed(d2k_quic_assembly *a, const uint8_t *p, size_t n,
     if (sni_len + 1 > cap) { return -1; }
     memcpy(out, a->stream + sni_off, sni_len);
     out[sni_len] = '\0';
+    return 1;
+}
+
+int d2k_quic_assembly_complete(const d2k_quic_assembly *a) {
+    if (!a || !a->active) { return 0; }
+    /* Длина сообщения — из заголовка Handshake в первых четырёх байтах. */
+    for (size_t i = 0; i < 4; i++) {
+        if (!(a->seen[i / 8] & (uint8_t)(1u << (i % 8)))) { return 0; }
+    }
+    if (a->stream[0] != 0x01) { return 0; }  /* не ClientHello */
+    uint64_t total = 4 + ((uint64_t)a->stream[1] << 16 |
+                          (uint64_t)a->stream[2] << 8 | a->stream[3]);
+    if (a->crypto_end < total) { return 0; }
+    /* Внутри буфера — без дыр; за его пределами судим по дальнему концу
+       кадров: «вероятно целый», строгую проверку делает контроллер. */
+    size_t need = total < sizeof a->stream ? (size_t)total : sizeof a->stream;
+    for (size_t i = 0; i < need; i++) {
+        if (!(a->seen[i / 8] & (uint8_t)(1u << (i % 8)))) { return 0; }
+    }
     return 1;
 }
 

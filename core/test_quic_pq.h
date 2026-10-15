@@ -15,7 +15,15 @@
 
 #define D2K_TEST_PQ_CUT 1000u /* где кончается CRYPTO первой датаграммы */
 
-static size_t d2k_test_pq_hello(uint8_t *ch, size_t cap, const char *name) {
+/* sni_first — server_name ПЕРВЫМ, key_share последним: Chrome переставляет
+   расширения, и имя бывает в первой датаграмме при неполном приветствии. */
+static inline size_t d2k_test_pq_hello_order(uint8_t *ch, size_t cap, const char *name,
+                                      int sni_first);
+static inline size_t d2k_test_pq_hello(uint8_t *ch, size_t cap, const char *name) {
+    return d2k_test_pq_hello_order(ch, cap, name, 0);
+}
+static inline size_t d2k_test_pq_hello_order(uint8_t *ch, size_t cap, const char *name,
+                                      int sni_first) {
     size_t m = strlen(name), n = 0;
     size_t ks = 1220; /* key_share X25519MLKEM768: 1216 байт ключа + заголовки */
     size_t sni_ext = 2 + 2 + 2 + 1 + 2 + m;
@@ -30,20 +38,25 @@ static size_t d2k_test_pq_hello(uint8_t *ch, size_t cap, const char *name) {
     ch[n++] = 0; ch[n++] = 2; ch[n++] = 0x13; ch[n++] = 0x01; /* cipher suites */
     ch[n++] = 1; ch[n++] = 0;                           /* compression */
     ch[n++] = (uint8_t)(exts >> 8); ch[n++] = (uint8_t)exts;
-    ch[n++] = 0x00; ch[n++] = 0x33;                     /* key_share — первым */
-    ch[n++] = (uint8_t)(ks >> 8); ch[n++] = (uint8_t)ks;
-    memset(ch + n, 0x5a, ks); n += ks;
-    ch[n++] = 0x00; ch[n++] = 0x00;                     /* server_name — последним */
-    ch[n++] = (uint8_t)((sni_ext - 4) >> 8); ch[n++] = (uint8_t)(sni_ext - 4);
-    ch[n++] = (uint8_t)((m + 3) >> 8); ch[n++] = (uint8_t)(m + 3);
-    ch[n++] = 0;
-    ch[n++] = (uint8_t)(m >> 8); ch[n++] = (uint8_t)m;
-    memcpy(ch + n, name, m); n += m;
+    for (int pass = 0; pass < 2; pass++) {
+        if ((pass == 0) != (sni_first != 0)) {
+            ch[n++] = 0x00; ch[n++] = 0x33;                 /* key_share */
+            ch[n++] = (uint8_t)(ks >> 8); ch[n++] = (uint8_t)ks;
+            memset(ch + n, 0x5a, ks); n += ks;
+        } else {
+            ch[n++] = 0x00; ch[n++] = 0x00;                 /* server_name */
+            ch[n++] = (uint8_t)((sni_ext - 4) >> 8); ch[n++] = (uint8_t)(sni_ext - 4);
+            ch[n++] = (uint8_t)((m + 3) >> 8); ch[n++] = (uint8_t)(m + 3);
+            ch[n++] = 0;
+            ch[n++] = (uint8_t)(m >> 8); ch[n++] = (uint8_t)m;
+            memcpy(ch + n, name, m); n += m;
+        }
+    }
     return n;
 }
 
 /* Одна Initial-датаграмма с кадром CRYPTO [off, off+len), добитая до 1200. */
-static size_t d2k_test_pq_dgram(const uint8_t dcid[8], uint64_t pn, uint64_t off,
+static inline size_t d2k_test_pq_dgram(const uint8_t dcid[8], uint64_t pn, uint64_t off,
                                 const uint8_t *data, size_t len, uint8_t *out, size_t cap) {
     uint8_t sec[32], body[1200], hdr[64];
     d2k_qw_keys k;
@@ -68,12 +81,25 @@ static size_t d2k_test_pq_dgram(const uint8_t dcid[8], uint64_t pn, uint64_t off
     return d2k_qw_seal(&k, 1, hdr, hl, pn, 4, body, plain, out, cap);
 }
 
+static inline int d2k_test_pq_initials_order(const char *name, int sni_first,
+                                      uint8_t *d1, size_t *l1,
+                                      uint8_t *d2, size_t *l2);
 /* Обе датаграммы: первая без имени, вторая с ним. 0 — собрано. */
-static int d2k_test_pq_initials(const char *name, uint8_t *d1, size_t *l1,
+static inline int d2k_test_pq_initials(const char *name, uint8_t *d1, size_t *l1,
                                 uint8_t *d2, size_t *l2) {
+    return d2k_test_pq_initials_order(name, 0, d1, l1, d2, l2);
+}
+/* Имя в ПЕРВОЙ датаграмме, приветствие целиком — только с обеими. */
+static inline int d2k_test_pq_initials_sni_first(const char *name, uint8_t *d1, size_t *l1,
+                                          uint8_t *d2, size_t *l2) {
+    return d2k_test_pq_initials_order(name, 1, d1, l1, d2, l2);
+}
+static inline int d2k_test_pq_initials_order(const char *name, int sni_first,
+                                      uint8_t *d1, size_t *l1,
+                                      uint8_t *d2, size_t *l2) {
     static const uint8_t dcid[8] = {0xd1, 0x2a, 3, 4, 5, 6, 7, 8};
     uint8_t ch[2048];
-    size_t chl = d2k_test_pq_hello(ch, sizeof ch, name);
+    size_t chl = d2k_test_pq_hello_order(ch, sizeof ch, name, sni_first);
     if (chl <= D2K_TEST_PQ_CUT) return -1;
     *l1 = d2k_test_pq_dgram(dcid, 0, 0, ch, D2K_TEST_PQ_CUT, d1, 1500);
     *l2 = d2k_test_pq_dgram(dcid, 1, D2K_TEST_PQ_CUT, ch + D2K_TEST_PQ_CUT,

@@ -451,6 +451,7 @@ test_quic: test_quic.c quic.o quicwire.o crypto.o $(HDR)
 test_quicsnap: test_quicsnap.c quicsnap.o quicsnap_reseal.o quic.o quicwire.o crypto.o tls13core.o x25519.o $(HDR) test_quic_pq.h
 	$(CC) $(CFLAGS) -o $@ test_quicsnap.c quicsnap.o quicsnap_reseal.o quic.o quicwire.o crypto.o tls13core.o x25519.o $(TEST_LDFLAGS)
 
+TESTS += test_quicsnap
 .PHONY: test-quicsnap
 check: test-quicsnap
 test-quicsnap: test_quicsnap
@@ -1216,7 +1217,7 @@ measured.o: measured.c $(HDR) profiles/rx_fake.h
 
 # Shared UDP compiler/executor archive. Selective extraction avoids duplicate
 # plan/wire objects in tests which already link those runtime sources directly.
-UDP_ENGINE_SRC = udpplan.c udpruntime.c plantlv.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c ipfrag.c quic.c quicwire.c crypto.c
+UDP_ENGINE_SRC = udpplan.c udpruntime.c plantlv.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c ipfrag.c quic.c quicsnap.c quicwire.c crypto.c
 UDP_ENGINE_OBJ = $(addprefix .udp-engine/,$(notdir $(UDP_ENGINE_SRC:.c=.o)))
 UDP_ENGINE_HDR = $(HDR) $(wildcard ../datapath/include/*.h) ../datapath/plan_internal.h
 udpplan.o: udpplan.c $(UDP_ENGINE_HDR)
@@ -1276,7 +1277,7 @@ san: san-udp-runtime
 san-udp-runtime: hello_profiles.inc
 	$(CC) $(SANFLAGS) -o /tmp/d2k-san-udp-runtime test_udp_runtime.c $(UDP_SESSION_SRC) $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c -lpthread
 	/tmp/d2k-san-udp-runtime
-	$(CC) $(SANFLAGS) -o /tmp/d2k-san-quic-sink test_quic_sink.c $(UDP_SESSION_SRC) $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c quicconn.c h3.c net4.c props.c -lpthread
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-quic-sink test_quic_sink.c $(UDP_SESSION_SRC) $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c quicconn.c h3.c net4.c props.c quicsnap_reseal.c -lpthread
 	/tmp/d2k-san-quic-sink
 	$(CC) $(SANFLAGS) -o /tmp/d2k-san-http-runtime test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
 	/tmp/d2k-san-http-runtime
@@ -1289,7 +1290,7 @@ san-http-live: hello_profiles.inc d2kc
 cross: cross-runtime-gates
 cross-runtime-gates: hello_profiles.inc
 	@for t in test_udp_runtime test_quic_sink; do \
-		extra=""; if test "$$t" = test_quic_sink; then extra="quicconn.c h3.c net4.c props.c"; fi; \
+		extra=""; if test "$$t" = test_quic_sink; then extra="quicconn.c h3.c net4.c props.c quicsnap_reseal.c"; fi; \
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-$$t-a64 $$t.c $(UDP_SESSION_SRC) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c $$extra $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1; \
 		$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-$$t-mipsel $$t.c $(UDP_SESSION_SRC) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c $$extra $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1; \
 	done

@@ -592,6 +592,36 @@ static void test_quic_snapshot_is_every_initial(void) {
     d2k_session_free(s);
 }
 
+/* ИМЯ В ПЕРВОЙ ДАТАГРАММЕ — ЕЩЁ НЕ ПРИВЕТСТВИЕ (поле 15.10.2026). Chrome
+ * переставляет расширения, и имя бывает в первой датаграмме, а ClientHello
+ * кончается во второй. Снимок по имени уходил пачкой из одной датаграммы,
+ * и контроллер отвергал её: «не складывается в целое приветствие». Снимок
+ * обязан ждать конца приветствия. */
+static void test_quic_snapshot_waits_for_whole_hello(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    uint8_t d1[1500], d2[1500], pkt[2200], buf[4096];
+    d2k_result r;
+    size_t l1 = 0, l2 = 0;
+    CHECK(s != NULL && d2k_test_pq_initials_sni_first("rutracker.org", d1, &l1, d2, &l2) == 0,
+          "не собрался стенд: имя в первой датаграмме");
+    if (!s || !l1 || !l2) { d2k_session_free(s); return; }
+    CHECK(d2k_session_want_shape_family(s, (const uint8_t *)"rutracker.org", 13, 17, 4) == 0,
+          "ловушка снимка QUIC не взвелась");
+    size_t n = build_udp_pkt(pkt, 50020, 443, d1, l1);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    size_t sl = 0;
+    CHECK(d2k_session_shape_family(s, 17, 4, &sl) == NULL,
+          "снимок снят по имени, до конца приветствия");
+    n = build_udp_pkt(pkt, 50020, 443, d2, l2);
+    d2k_session_packet(s, pkt, n, 1100, buf, sizeof buf, &r);
+    const uint8_t *sh = d2k_session_shape_family(s, 17, 4, &sl);
+    d2k_qsnap p;
+    CHECK(sh && d2k_qsnap_is(sh, sl) && d2k_qsnap_parse(sh, sl, &p) == 0 && p.n == 2 &&
+          p.len[0] == l1 && p.len[1] == l2,
+          "снимок целого приветствия — не обе датаграммы");
+    d2k_session_free(s);
+}
+
 /* Чужое соединение, пришедшее между датаграммами полёта, в пачку не попадает:
  * склейка двух полётов дала бы приветствие, которого никто не слал. */
 static void test_quic_snapshot_skips_other_flow(void) {
@@ -2468,6 +2498,7 @@ int main(void) {
     test_quic_non443_client_hold();
     test_quic_cross_datagram_assembly();
     test_quic_snapshot_is_every_initial();
+    test_quic_snapshot_waits_for_whole_hello();
     test_quic_snapshot_skips_other_flow();
     test_quic_split_hold_handshake();
     test_quic_held_initial_replay_is_first_packet();

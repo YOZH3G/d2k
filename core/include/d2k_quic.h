@@ -56,6 +56,10 @@ typedef struct {
     uint8_t have_pn;
     uint8_t stream[D2K_QUIC_ASSEMBLY_MAX];
     uint8_t seen[(D2K_QUIC_ASSEMBLY_MAX + 7) / 8];
+    /* Дальний конец кадров CRYPTO, в том числе не легших в буфер (задача 66):
+       приветствие с постквантовым key_share длиннее буфера, и судить о его
+       конце по одному префиксу нельзя. */
+    uint64_t crypto_end;
 } d2k_quic_assembly;
 
 /* Узнаёт QUIC Initial ПО ЗАЩИЩЁННЫМ байтам — ключи не выводятся, крипто не
@@ -177,5 +181,11 @@ void d2k_quic_assembly_init(d2k_quic_assembly *a);
 D2K_WARN_UNUSED
 int d2k_quic_assembly_feed(d2k_quic_assembly *a, const uint8_t *p, size_t n,
                            char *out, size_t cap);
+
+/* 1 — ClientHello «вероятно целый»: кадры CRYPTO дошли до конца, заявленного
+ * заголовком Handshake, и в буфере нет дыр. Имя — не то же самое: Chrome
+ * переставляет расширения, и имя бывает в первой датаграмме, а приветствие
+ * кончается во второй. */
+int d2k_quic_assembly_complete(const d2k_quic_assembly *a);
 
 #endif
