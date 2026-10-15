@@ -280,6 +280,8 @@ S99_SNIPPET='fw_up && fw_installed' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TM
     || fail "fw_up with router DNS exclusions failed"
 for want in "iptables 198.51.100.7 443" "ip6tables 2001:db8::7 443" "iptables 9.9.9.9 853" \
             "iptables 192.0.2.53 5353"; do
+    # Разбиение по словам намеренное: «инструмент адрес порт» в одной строке.
+    # shellcheck disable=SC2086
     set -- $want
     for pr in tcp udp; do
         dns_before_queue "$1" D2K_OUT "-p $pr -d $2 --dport $3 -j RETURN" \

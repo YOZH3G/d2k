@@ -292,6 +292,16 @@ check "конфигурация: D2K_PPE_TCP_PORTS описан в files/config"
 # --- встраивание в S99d2k: порядок в FORWARD, снятие при остановке ---------
 # Функции службы без диспетчера команд — как в scripts/test-runtime-files.cjs.
 sed '/^case "\$1" in/,$d' "$ROOT/files/S99d2k" > "$TMP/init"
+# Обёртки S99d2k ждут блокировку xtables через `command iptables -w` — мимо
+# заглушки-функции этого теста, прямо в настоящий бинарь. Здесь тот же вызов
+# с тем же ключом -w уходит в заглушку.
+cat >> "$TMP/init" <<'SHIM'
+xt_wait() {
+    xt_tool=$1; shift
+    [ "${1:-}" != -w ] || shift
+    case "$xt_tool" in iptables) _ipt v4 -w "$@" ;; *) _ipt v6 -w "$@" ;; esac
+}
+SHIM
 reset_rules
 targets 1 1
 FOREIGN="-p tcp -m multiport --dports 80,443 -m connskip --connskip 30 -j PPE"
