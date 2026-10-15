@@ -448,8 +448,8 @@ test_quic: test_quic.c quic.o quicwire.o crypto.o $(HDR)
 
 # Задача 66: пачка Initial-датаграмм клиента — приветствие Chrome с ML-KEM не
 # помещается в одну датаграмму, и снимком обязан стать весь полёт.
-test_quicsnap: test_quicsnap.c quicsnap.o quic.o quicwire.o crypto.o tls13core.o x25519.o $(HDR) test_quic_pq.h
-	$(CC) $(CFLAGS) -o $@ test_quicsnap.c quicsnap.o quic.o quicwire.o crypto.o tls13core.o x25519.o $(TEST_LDFLAGS)
+test_quicsnap: test_quicsnap.c quicsnap.o quicsnap_reseal.o quic.o quicwire.o crypto.o tls13core.o x25519.o $(HDR) test_quic_pq.h
+	$(CC) $(CFLAGS) -o $@ test_quicsnap.c quicsnap.o quicsnap_reseal.o quic.o quicwire.o crypto.o tls13core.o x25519.o $(TEST_LDFLAGS)
 
 .PHONY: test-quicsnap
 check: test-quicsnap

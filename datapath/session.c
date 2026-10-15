@@ -15,7 +15,8 @@
 
 #include "d2k_plans.h"
 #include "d2k_packet.h"
-#include "d2k_quic.h" /* core/ — разбор QUIC линкуется исходниками, см. Makefile */
+#include "d2k_quic.h"
+#include "d2k_quicsnap.h" /* core/ — разбор QUIC линкуется исходниками, см. Makefile */
 #include "d2k_nat.h"
 #include "d2k_session.h"
 #include "d2k_http80.h"
@@ -29,6 +30,11 @@
  * ClientHello приходит первым или почти первым; после этого разбор — чистая
  * трата на каждом пакете загрузки. */
 #define D2K_HELLO_WINDOW 8
+
+/* Сколько последних клиентских Initial держит сессия. Полёт — не больше
+   четырёх датаграмм, и шестнадцать записей дают запас на несколько
+   одновременных целей, пока контроллер ждёт снимок. Около 24 КБ на сессию. */
+#define D2K_SESSION_INIT_RING 16
 
 struct d2k_session {
     /* Event-loop owned; random initial value, nonzero counter per datagram.
@@ -124,7 +130,7 @@ struct d2k_session {
        QUIC шла мерить, держа в руках TLS-приветствие, и первый же разбор его
        отвергал. Индексы 0/1 — IPv4 TCP/UDP; 2/3 — IPv6 TCP/UDP.
        Семейства не делят снимок: опыт сохраняет контекст исходного потока. */
-    uint8_t  last_hello[4][2048];
+    uint8_t  last_hello[4][D2K_SHAPE_MAX];
     size_t   last_hello_len[4];
     uint8_t  last_name[4][256];
     size_t   last_name_len[4];
@@ -161,9 +167,99 @@ struct d2k_session {
     int      shape_armed[4];
     uint8_t  shape_name[4][256];
     size_t   shape_name_len[4];
-    uint8_t  shape[4][2048];
+    uint8_t  shape[4][D2K_SHAPE_MAX];
     size_t   shape_len[4];
+
+    /* КОЛЬЦО ПОСЛЕДНИХ INITIAL КЛИЕНТА (задача 66).
+       Приветствие Chrome с постквантовым key_share едет ДВУМЯ Initial, и
+       снимком обязан стать весь полёт: по одной датаграмме контроллер видит
+       обрывок и уходит мерить встроенным профилем. Кольцо одно на сессию, а
+       не буфер на поток: потоков 2048, и копия приветствия в каждом стоила бы
+       мегабайты. Пишется, только пока ловушка снимка взведена, и живёт до
+       сборки имени — то есть доли секунды. */
+    struct {
+        d2k_key  key;
+        uint8_t  dcid[D2K_QW_CID_MAX];
+        uint8_t  dcid_len;
+        uint16_t len;
+        uint8_t  dg[D2K_QW_MAX_DGRAM];
+    } init_ring[D2K_SESSION_INIT_RING];
+    size_t init_ring_n;      /* сколько записей заполнено (растёт до предела) */
+    size_t init_ring_next;   /* куда писать следующую */
 };
+
+/* DCID датаграммы Initial: он лежит в открытом виде (RFC 9001 §5.2), и по
+   нему датаграммы одного полёта отличаются от чужого соединения. 0 — успех. */
+static int initial_dcid(const uint8_t *p, size_t n, uint8_t *out, uint8_t *out_len) {
+    d2k_qw_hdr h;
+    if (d2k_qw_hdr_parse(p, n, 0, &h) != 0 || !h.long_hdr ||
+        h.type != D2K_QW_LT_INITIAL || h.dcid_len > D2K_QW_CID_MAX) {
+        return -1;
+    }
+    memcpy(out, p + h.dcid_off, h.dcid_len);
+    *out_len = (uint8_t)h.dcid_len;
+    return 0;
+}
+
+/* Запоминает датаграмму полёта. Повтор по таймеру PTO (те же байты того же
+   потока) не удваивает запись: полёт от повторов не удлиняется. */
+static void init_ring_add(d2k_session *s, const d2k_key *key,
+                          const uint8_t *dg, size_t len) {
+    uint8_t dcid[D2K_QW_CID_MAX];
+    uint8_t dcid_len = 0;
+    if (len == 0 || len > D2K_QW_MAX_DGRAM || initial_dcid(dg, len, dcid, &dcid_len) != 0) {
+        return;
+    }
+    for (size_t i = 0; i < s->init_ring_n; i++) {
+        if (s->init_ring[i].len == len && d2k_key_equal(&s->init_ring[i].key, key) &&
+            memcmp(s->init_ring[i].dg, dg, len) == 0) {
+            return;
+        }
+    }
+    size_t at = s->init_ring_next;
+    s->init_ring[at].key = *key;
+    memcpy(s->init_ring[at].dcid, dcid, dcid_len);
+    s->init_ring[at].dcid_len = dcid_len;
+    s->init_ring[at].len = (uint16_t)len;
+    memcpy(s->init_ring[at].dg, dg, len);
+    s->init_ring_next = (at + 1) % D2K_SESSION_INIT_RING;
+    if (s->init_ring_n < D2K_SESSION_INIT_RING) { s->init_ring_n++; }
+}
+
+/* Пачка полёта: все датаграммы этого потока с тем же DCID, по порядку
+   прихода. 0 — пачка не собралась (вытеснена, не поместилась) и вызывающий
+   кладёт одну датаграмму, как раньше: контроллер отвергнет её как обрывок, и
+   это честнее выдуманной склейки. */
+static size_t init_ring_pack(const d2k_session *s, const d2k_key *key,
+                             const uint8_t *last, size_t last_len,
+                             uint8_t *out, size_t cap) {
+    uint8_t dcid[D2K_QW_CID_MAX];
+    uint8_t dcid_len = 0;
+    if (initial_dcid(last, last_len, dcid, &dcid_len) != 0) {
+        return 0;
+    }
+    const uint8_t *dg[D2K_QSNAP_MAX_DGRAMS];
+    size_t len[D2K_QSNAP_MAX_DGRAMS];
+    size_t n = 0;
+    /* Кольцевой обход от самой старой записи: порядок в пачке — порядок на
+       проводе, иначе номера пакетов пойдут вспять. */
+    for (size_t k = 0; k < s->init_ring_n && n < D2K_QSNAP_MAX_DGRAMS; k++) {
+        size_t i = (s->init_ring_next + D2K_SESSION_INIT_RING - s->init_ring_n + k)
+                   % D2K_SESSION_INIT_RING;
+        if (!d2k_key_equal(&s->init_ring[i].key, key) ||
+            s->init_ring[i].dcid_len != dcid_len ||
+            memcmp(s->init_ring[i].dcid, dcid, dcid_len) != 0) {
+            continue;
+        }
+        dg[n] = s->init_ring[i].dg;
+        len[n] = s->init_ring[i].len;
+        n++;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    return d2k_qsnap_pack(dg, len, n, out, cap);
+}
 
 /* Номер слота снимка по транспорту. Всё, кроме UDP, живёт в слоте TCP: других
    транспортов у нас нет, а заводить третий слот под несуществующее значило бы
@@ -906,6 +1002,14 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         return;
     }
 
+    /* ДАТАГРАММА ПОЛЁТА — В КОЛЬЦО, пока имя ещё не собрано (задача 66).
+       Позже её взять неоткуда: к моменту, когда ClientHello сложился, первая
+       датаграмма уже прошла. Пишем, только пока контроллер ждёт снимок, и
+       только свои, непробные потоки. */
+    if (!voice && !fl->controller_probe && s->shape_armed[shape_slot(17, key.family)]) {
+        init_ring_add(s, &key, pkt + payload_off, payload_len);
+    }
+
     /* Stateful assembly осознанно не различает «не расшифровалось этими
        ключами» и «расшифровалось, но server_name нет» — оба случая
        дают отсутствие готового имени (0 или -1). Различать их здесь тоже
@@ -1016,24 +1120,33 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        разной формы, и отдавать одно вместо другого нельзя. */
     if (named && !voice && !fl->controller_probe) {
         size_t k = shape_slot(17, key.family);
-        if (payload_len <= sizeof s->last_hello[k]) {
-            memcpy(s->last_hello[k], pkt + payload_off, payload_len);
-            s->last_hello_len[k] = payload_len;
+        /* ВЕСЬ ПОЛЁТ, А НЕ ПОСЛЕДНЯЯ ДАТАГРАММА (задача 66): приветствие с
+           постквантовым key_share едет двумя Initial. Пачка не собралась —
+           кладём одну датаграмму, как прежде: контроллер отвергнет её как
+           обрывок, и это честнее склейки наугад. */
+        uint8_t pack[D2K_SHAPE_MAX];
+        size_t pack_len = init_ring_pack(s, &key, pkt + payload_off, payload_len,
+                                         pack, sizeof pack);
+        const uint8_t *snap = pack_len ? pack : pkt + payload_off;
+        size_t snap_len = pack_len ? pack_len : payload_len;
+        if (snap_len <= sizeof s->last_hello[k]) {
+            memcpy(s->last_hello[k], snap, snap_len);
+            s->last_hello_len[k] = snap_len;
             s->last_name_len[k] = 0;
             if (name_len > 0 && name_len <= sizeof s->last_name[k]) {
                 memcpy(s->last_name[k], name, name_len);
                 s->last_name_len[k] = name_len;
             }
         }
-        if (s->shape_armed[k] && payload_len <= sizeof s->shape[k] &&
+        if (s->shape_armed[k] && snap_len <= sizeof s->shape[k] &&
             (s->shape_name_len[k] == 0 ||
              name_same((const uint8_t *)name, name_len,
                        s->shape_name[k], s->shape_name_len[k]))) {
-            memcpy(s->shape[k], pkt + payload_off, payload_len);
-            s->shape_len[k] = payload_len;
+            memcpy(s->shape[k], snap, snap_len);
+            s->shape_len[k] = snap_len;
             s->shape_armed[k] = 0;
             d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
-                            (uint32_t)payload_len, NULL, NULL, 0, NULL);
+                            (uint32_t)snap_len, NULL, NULL, 0, NULL);
         }
     }
 

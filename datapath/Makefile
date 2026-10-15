@@ -34,8 +34,8 @@ MIPS_BE_ZIG ?= -target mips-linux-musleabi -mcpu=mips32+soft_float
 # портило бы зависимости другого молча.
 CORE_DIR = ../core
 CORESRC  = $(CORE_DIR)/quic.c $(CORE_DIR)/quicwire.c $(CORE_DIR)/crypto.c $(CORE_DIR)/ipfrag.c $(CORE_DIR)/httpup_logic.c
-COREOBJ  = core_quic.o core_quicwire.o core_crypto.o core_ipfrag.o core_httpup_logic.o
-COREHDR  = $(CORE_DIR)/include/d2k_arm.h $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_quicwire.h $(CORE_DIR)/include/d2k_crypto.h $(CORE_DIR)/include/d2k_ipfrag.h $(CORE_DIR)/include/d2k_httpup.h
+COREOBJ  = core_quic.o core_quicwire.o core_quicsnap.o core_crypto.o core_ipfrag.o core_httpup_logic.o
+COREHDR  = $(CORE_DIR)/include/d2k_quicsnap.h $(CORE_DIR)/include/d2k_arm.h $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_quicwire.h $(CORE_DIR)/include/d2k_crypto.h $(CORE_DIR)/include/d2k_ipfrag.h $(CORE_DIR)/include/d2k_httpup.h
 QUIC_FIXTURE_OBJ = core_quichello.o core_hello.o core_tls13core.o core_x25519.o
 
 # Переносимый датапат: собирается и проверяется на любой машине.
@@ -175,6 +175,9 @@ test_tls: test_tls.c tls.o $(HDR)
 # core_crypto.o — см. большой комментарий у CORE_DIR выше про то, почему не
 # в ../core/.
 core_quic.o: $(CORE_DIR)/quic.c $(COREHDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+core_quicsnap.o: $(CORE_DIR)/quicsnap.c $(COREHDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 core_quicwire.o: $(CORE_DIR)/quicwire.c $(COREHDR)

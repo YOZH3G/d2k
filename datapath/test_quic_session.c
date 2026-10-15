@@ -26,6 +26,7 @@
 #include "d2k_quichello.h"
 #include "d2k_nat.h"
 #include "../core/test_quic_pq.h"
+#include "d2k_quicsnap.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -410,8 +411,13 @@ static void test_direction_by_hook(void) {
               "реальный клиентский QUIC snapshot не удовлетворил ARM_SHAPE после probe");
         size_t shape_len = 0;
         const uint8_t *shape = d2k_session_shape(s, 17, &shape_len);
-        CHECK(shape && shape_len == sizeof v1_initial &&
-              memcmp(shape, v1_initial, sizeof v1_initial) == 0,
+        /* Снимок QUIC — пачка полёта (задача 66): у одиночного Initial в ней
+           одна датаграмма, и это ровно байты клиента. */
+        d2k_qsnap probe_pack;
+        CHECK(shape && d2k_qsnap_is(shape, shape_len) &&
+              d2k_qsnap_parse(shape, shape_len, &probe_pack) == 0 &&
+              probe_pack.n == 1 && probe_pack.len[0] == sizeof v1_initial &&
+              memcmp(probe_pack.dg[0], v1_initial, sizeof v1_initial) == 0,
               "после controller probe вернута не исходная форма клиента");
         d2k_session_free(s);
     }
@@ -524,6 +530,78 @@ static void test_quic_cross_datagram_assembly(void) {
           "ClientHello между датаграммами не дошёл до session");
     CHECK(r.applied && r.n_out > 0,
           "после сборки имени план не применился к распознанной QUIC-цели");
+    d2k_session_free(s);
+}
+
+/* СНИМОК QUIC — ВЕСЬ ПОЛЁТ КЛИЕНТА, А НЕ ПОСЛЕДНЯЯ ДАТАГРАММА (задача 66).
+ *
+ * Поле 15.10.2026: Chrome с постквантовым key_share шлёт ClientHello двумя
+ * Initial. Снимком раньше становилась одна датаграмма — та, на которой
+ * собралось имя, — и контроллер честно отвергал её как обрывок: цель уходила
+ * мериться встроенным профилем, а планы, подтверждённые профилем, Chrome не
+ * открывали. Снимок обязан нести обе датаграммы, по порядку и с их
+ * размерами. */
+static void test_quic_snapshot_is_every_initial(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    uint8_t d1[1500], d2[1500], pkt[2200], buf[4096];
+    d2k_result r;
+    size_t l1 = 0, l2 = 0;
+    CHECK(s != NULL && d2k_test_pq_initials("rutracker.org", d1, &l1, d2, &l2) == 0,
+          "не собрался стенд двух Initial");
+    if (!s || !l1 || !l2) { d2k_session_free(s); return; }
+    CHECK(d2k_session_want_shape_family(s, (const uint8_t *)"rutracker.org", 13, 17, 4) == 0,
+          "ловушка снимка QUIC не взвелась");
+
+    size_t n = build_udp_pkt(pkt, 50010, 443, d1, l1);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    size_t sl = 0;
+    CHECK(d2k_session_shape_family(s, 17, 4, &sl) == NULL,
+          "обрывок приветствия стал снимком до сборки имени");
+
+    n = build_udp_pkt(pkt, 50010, 443, d2, l2);
+    d2k_session_packet(s, pkt, n, 1100, buf, sizeof buf, &r);
+    /* Повтор по таймеру PTO: та же датаграмма не удлиняет полёт. */
+    d2k_session_packet(s, pkt, n, 1200, buf, sizeof buf, &r);
+
+    const uint8_t *sh = d2k_session_shape_family(s, 17, 4, &sl);
+    CHECK(sh != NULL && d2k_qsnap_is(sh, sl), "снимок QUIC — не пачка");
+    d2k_qsnap p;
+    if (sh && d2k_qsnap_is(sh, sl) && d2k_qsnap_parse(sh, sl, &p) == 0) {
+        CHECK(p.n == 2, "в снимке не обе датаграммы");
+        CHECK(p.len[0] == l1 && p.len[1] == l2, "длины датаграмм снимка не те");
+        CHECK(!memcmp(p.dg[0], d1, l1) && !memcmp(p.dg[1], d2, l2),
+              "датаграммы снимка не те или не по порядку");
+    } else {
+        CHECK(0, "снимок не разбирается как пачка");
+    }
+    d2k_session_free(s);
+}
+
+/* Чужое соединение, пришедшее между датаграммами полёта, в пачку не попадает:
+ * склейка двух полётов дала бы приветствие, которого никто не слал. */
+static void test_quic_snapshot_skips_other_flow(void) {
+    d2k_session *s = d2k_session_new(64, 32);
+    uint8_t a1[1500], a2[1500], b1[1500], b2[1500], pkt[2200], buf[4096];
+    d2k_result r;
+    size_t al1 = 0, al2 = 0, bl1 = 0, bl2 = 0;
+    CHECK(s != NULL && d2k_test_pq_initials("rutracker.org", a1, &al1, a2, &al2) == 0 &&
+          d2k_test_pq_initials("example.org", b1, &bl1, b2, &bl2) == 0, "стенды");
+    if (!s || !al2 || !bl1) { d2k_session_free(s); return; }
+    CHECK(d2k_session_want_shape_family(s, (const uint8_t *)"rutracker.org", 13, 17, 4) == 0,
+          "ловушка");
+    size_t n = build_udp_pkt(pkt, 50020, 443, a1, al1);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    n = build_udp_pkt(pkt, 50021, 443, b1, bl1);      /* другой поток */
+    d2k_session_packet(s, pkt, n, 1050, buf, sizeof buf, &r);
+    n = build_udp_pkt(pkt, 50020, 443, a2, al2);
+    d2k_session_packet(s, pkt, n, 1100, buf, sizeof buf, &r);
+
+    size_t sl = 0;
+    const uint8_t *sh = d2k_session_shape_family(s, 17, 4, &sl);
+    d2k_qsnap p;
+    CHECK(sh && d2k_qsnap_is(sh, sl) && d2k_qsnap_parse(sh, sl, &p) == 0 && p.n == 2 &&
+          !memcmp(p.dg[0], a1, al1) && !memcmp(p.dg[1], a2, al2),
+          "в пачке датаграммы чужого потока");
     d2k_session_free(s);
 }
 
@@ -2374,6 +2452,8 @@ int main(void) {
     test_direction_by_hook();
     test_quic_non443_client_hold();
     test_quic_cross_datagram_assembly();
+    test_quic_snapshot_is_every_initial();
+    test_quic_snapshot_skips_other_flow();
     test_quic_split_hold_handshake();
     test_quic_held_initial_replay_is_first_packet();
     test_quic_first_packet_skips_conntrack_scan();
