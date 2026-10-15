@@ -512,8 +512,8 @@ test_match: test_match.c match.o catalog.o groups.o domain.o $(HDR)
 
 test_compose: test_compose.c compose.o measured.o hello.o meas.o link.o $(HDR) $(TESTHDR)
 	$(CC) $(CFLAGS) -o $@ test_compose.c compose.o measured.o hello.o meas.o link.o $(TEST_LDFLAGS)
-test_link: test_link.c link.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_link.c link.o $(TEST_LDFLAGS)
+test_link: test_link.c link.o quicsnap.o quic.o quicwire.o crypto.o $(HDR) test_quic_pq.h
+	$(CC) $(CFLAGS) -o $@ test_link.c link.o quicsnap.o quic.o quicwire.o crypto.o $(TEST_LDFLAGS)
 
 # d2kask (задача 5в) — командная утилита: спросить настоящую коробку с
 # командной строки. Собирается ПРЯМО в свой бинарник, тем же приёмом, что

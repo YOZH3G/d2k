@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "d2k_ctlsrv.h"
+#include "d2k_quicsnap.h"
 #include "../runtime/d2k_runtime.h"
 
 /* Кладёт ключ потока в тело события ПОЛЯМИ, а не наложением структуры на
@@ -347,7 +348,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             size_t slen = 0;
             const uint8_t *sh = d2k_session_shape_family(cx->sess, want_tr, want_family, &slen);
             if (sh && slen > 0 && cx->ctl) {
-                uint8_t body[D2K_KEY_WIRE_LEN + 2048];
+                uint8_t body[D2K_KEY_WIRE_LEN + D2K_SHAPE_MAX];
                 memset(body, 0, D2K_KEY_WIRE_LEN);
                 body[0] = want_family;
                 /* Транспорт кладётся в ключ, а не рядом: место под него на
@@ -512,7 +513,7 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             continue;
         }
         /* Хватает и на приветствие целиком: форма приезжает сюда же. */
-        uint8_t body[D2K_KEY_WIRE_LEN + 2048 + 8 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN];
+        uint8_t body[D2K_KEY_WIRE_LEN + D2K_SHAPE_MAX + 8 + D2K_PLAN_ID_LEN + D2K_TRIAL_ID_LEN];
         size_t n = put_key(body, &e->key);
         uint16_t type = 0;
         switch (e->kind) {

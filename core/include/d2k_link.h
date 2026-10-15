@@ -34,6 +34,7 @@ int d2k_link_del_bypass_family(int, const char *, uint8_t transport,
  * датапат. d2k_ev.kind сравнивается с D2K_EV_*, d2k_link_next возвращает
  * ошибки, различимые по D2K_ACK_* через err (см. ниже). */
 #include "d2k_ctl.h"
+#include "d2k_quicsnap.h"
 
 /* Разобранное событие датапата. Поля общие для всех видов события, но
  * заполнены только те, что данный вид события несёт (см. комментарии у
@@ -196,7 +197,9 @@ typedef struct {
     char     name[256];     /* HELLO, HTTP_PORTAL: имя цели, NUL-терминировано.
                                HTTP_PORTAL: low_* — клиент, high_* — сервер,
                                code — 1, если клиенту ушёл 307 на https */
-    uint8_t  shape[2048];   /* SHAPE: байты приветствия */
+    /* SHAPE: байты приветствия. У QUIC это пачка Initial-датаграмм клиента
+       (d2k_quicsnap.h): приветствие Chrome с ML-KEM в одну не влезает. */
+    uint8_t  shape[D2K_SHAPE_MAX];
     size_t   shape_len;
 } d2k_ev;
 

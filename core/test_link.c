@@ -27,6 +27,8 @@
 #include <unistd.h>
 
 #include "d2k_link.h"
+#include "d2k_quicsnap.h"
+#include "test_quic_pq.h"
 /* Только ради D2K_KEY_WIRE_LEN — строим синтетические кадры руками (см.
  * send_synthetic ниже), тем же приёмом, что datapath/test_ctl.c: ширина
  * ключа нужна настоящая, а не переизобретённая здесь копией. */
@@ -63,7 +65,7 @@ static void to_hex(const uint8_t *b, size_t n, char *out) {
  * переполненных событий не шлёт — а разбор обязан отказывать на них не
  * только на бумаге. rest может быть NULL при rest_len == 0. */
 static void send_synthetic(int fd, uint16_t kind, const uint8_t *rest, size_t rest_len) {
-    static uint8_t frame[6 + D2K_KEY_WIRE_LEN + 4096];
+    static uint8_t frame[6 + D2K_KEY_WIRE_LEN + D2K_SHAPE_MAX + 64];
     size_t body_len = D2K_KEY_WIRE_LEN + rest_len;
     uint32_t plen = (uint32_t)(2 + body_len);
     frame[0] = (uint8_t)(plen >> 24);
@@ -280,6 +282,34 @@ int main(void) {
               "legacy frame fabricated execution context");
         close(sv[0]); close(sv[1]);
     }
+    /* v20 (задача 66): снимок QUIC — пачка Initial-датаграмм клиента.
+       Приветствие Chrome с ML-KEM длиннее прежнего предела 2048, и обрезка
+       снимка на проводе означала бы замер половиной приветствия. */
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (пачка QUIC) не создался");
+        if (sv[0] >= 0) {
+            uint8_t d1[1500], d2[1500];
+            size_t l1 = 0, l2 = 0;
+            CHECK(d2k_test_pq_initials("rutracker.org", d1, &l1, d2, &l2) == 0,
+                  "стенд двух Initial");
+            const uint8_t *dg[2] = {d1, d2};
+            size_t len[2] = {l1, l2};
+            static uint8_t rest[D2K_SHAPE_MAX];
+            size_t bl = d2k_qsnap_pack(dg, len, 2, rest, sizeof rest);
+            CHECK(bl > 2048, "пачка двух датаграмм не длиннее прежнего предела");
+            send_synthetic(sv[1], D2K_EV_SHAPE, rest, bl);
+            d2k_ev ev;
+            char e[200] = {0};
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0 &&
+                  ev.kind == D2K_EV_SHAPE && ev.shape_len == bl &&
+                  d2k_qsnap_is(ev.shape, ev.shape_len) &&
+                  memcmp(ev.shape, rest, bl) == 0,
+                  "пачка приехала не целиком");
+            close(sv[0]); close(sv[1]);
+        }
+    }
+
     /* v10 (задача 51): вставка провайдера в HTTP и имя с HTTPS. */
     {
         int sv[2];
@@ -312,6 +342,16 @@ int main(void) {
               ev.code==1 && ev.live_http_status==200 && ev.live_body_bytes==258 && ev.live_request_no==2 &&
               ev.execution_binding.generation==9 && ev.execution_binding.epoch[0]==7 && ev.live_execution==72,
               "complete live response keeps framing and binding over control socket");
+        /* v19: код 4 — обрыв ответа без плана (поле 15.10.2026, cdnbase). */
+        response[0]=4;
+        send_synthetic(sv[0],D2K_EV_HTTP_RESPONSE,response,sizeof response);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.kind==D2K_EV_HTTP_RESPONSE &&
+              ev.code==4 && ev.live_body_bytes==258 && !strcmp(ev.live_http_path,"/False/"),
+              "a cut (code 4) is decoded with its path and received body");
+        response[0]=5;
+        send_synthetic(sv[0],D2K_EV_HTTP_RESPONSE,response,sizeof response);
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)==-1,"unknown HTTP response code accepted");
+        response[0]=1;
         for(size_t k=sizeof bound;k<sizeof response;k++) {
             send_synthetic(sv[0],D2K_EV_HTTP_RESPONSE,response,k);
             CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)==-1,"truncated live response evidence accepted");
@@ -868,26 +908,26 @@ int main(void) {
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (SHAPE переполнение) не создался");
         if (sv[0] >= 0) {
-            static uint8_t rest[2049]; /* на 1 больше буфера out->shape */
+            static uint8_t rest[D2K_SHAPE_MAX + 1]; /* на 1 больше буфера out->shape */
             memset(rest, 0x16, sizeof rest);
             send_synthetic(sv[1], D2K_EV_SHAPE, rest, sizeof rest);
             d2k_ev ev; char e[200] = {0};
             CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == -1,
-                  "форма приветствия длиннее буфера (2049 байт) должна отклоняться, а не переполнять его");
+                  "форма приветствия длиннее буфера должна отклоняться, а не переполнять его");
             close(sv[0]); close(sv[1]);
         }
     }
     {
         int sv[2];
-        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (SHAPE ровно 2048) не создался");
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (SHAPE во весь буфер) не создался");
         if (sv[0] >= 0) {
-            static uint8_t rest[2048]; /* ровно во весь буфер out->shape */
+            static uint8_t rest[D2K_SHAPE_MAX]; /* ровно во весь буфер out->shape */
             memset(rest, 0x16, sizeof rest);
             send_synthetic(sv[1], D2K_EV_SHAPE, rest, sizeof rest);
             d2k_ev ev; char e[200] = {0};
             CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
-                  "форма приветствия ровно 2048 байт (граница буфера) должна приниматься");
-            CHECK(ev.shape_len == 2048, "shape_len не 2048 на границе буфера");
+                  "форма приветствия во весь буфер (граница) должна приниматься");
+            CHECK(ev.shape_len == D2K_SHAPE_MAX, "shape_len не во весь буфер на границе");
             close(sv[0]); close(sv[1]);
         }
     }
