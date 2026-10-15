@@ -653,6 +653,19 @@ static int http80_io_rst(void *c, const uint8_t *p, size_t n) {
 /* Пакет очереди глазами http80. 1 — пакет обработан здесь (вердикт уже
    отправлен), 0 — дальше обычным путём. Заменять и снимать — только в
    режиме apply с сырым сокетом: в наблюдении трафик не трогается. */
+/* ОБРЫВ ОТВЕТА БЕЗ ПОРТАЛА (поле 15.10.2026, media5.cdnbase.com): ответ с
+   заявленной длиной встал раньше конца. Контроллеру — всегда, и без плана:
+   иначе имя не попадает в замер вовсе. */
+static void http80_cut(void *ctx, const d2k_http80_res *r) {
+    d2k_ctl *ctl = ctx;
+    fprintf(stderr, "d2kd: HTTP обрыв ответа host=%s path=%s: тело %llu байт, до заявленной длины "
+                    "не дошло (запрос %llu потока, RTT %llu мс)\n",
+            r->host, r->request_path[0] ? r->request_path : "-",
+            (unsigned long long)r->body_bytes, (unsigned long long)r->request_no,
+            (unsigned long long)(r->rtt_ns / 1000000ull));
+    d2k_ctlsrv_http80_event(ctl, r);
+}
+
 static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
                        const uint8_t *p, size_t n, uint64_t t, uint64_t kstamp, d2k_http80_res *observation) {
     if (!http80) { return 0; }
@@ -663,6 +676,7 @@ static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
     d2k_http80_packet(http80, p, n, t, kstamp, raw ? out : NULL, raw ? sizeof out : 0,
                       rst, sizeof rst, &r);
     *observation=r;
+    if (r.response == D2K_HTTP80_CUT) { http80_cut(ctl, &r); }
     /* Событие — после исхода замены (ревью N1): признак «307 ушёл» в нём
        верный, и контроллер не повторяет SET_HTTPS зря. */
     if (r.injection && (r.action != D2K_HTTP80_REPLACE || !raw)) { d2k_ctlsrv_http80_event(ctl, &r); }
@@ -1985,7 +1999,8 @@ int main(int argc, char **argv) {
                         d2k_http80_delivered(http80,np.payload,np.payload_len,
                             !original_failed && !delayed_originals && verdict==D2K_NF_ACCEPT,
                             &http_observation);
-                        if(http_observation.response && http_observation.execution_id)
+                        if(http_observation.response && http_observation.execution_id &&
+                           http_observation.response!=D2K_HTTP80_CUT) /* обрыв уже сообщён */
                             d2k_ctlsrv_http80_event(ctl,&http_observation);
                     }
                     /* One live-request result after the actual raw sends and
@@ -2099,6 +2114,7 @@ int main(int argc, char **argv) {
                означал бы, что о молчании узнаём только при забвении потока —
                через две минуты, когда человек уже ушёл со страницы. */
             d2k_session_sweep(sess, t);
+            if (http80) { (void)d2k_http80_sweep(http80, t, http80_cut, ctl); }
             d2k_session_expire(sess, t, idle_ns);
             /* Окно следования — миллисекунды: всё старше и из прежних пачек
                приёма убирается (финальное ревью M-5). */

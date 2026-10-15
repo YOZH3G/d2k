@@ -41,6 +41,11 @@
 #define D2K_HTTP80_NAMES 256
 /* Путь запроса длиннее не храним: такой поток не переводим на https. */
 #define D2K_HTTP80_TARGET_MAX 1024
+/* Исход «обрыв»: ответ с заявленной длиной встал раньше конца. */
+#define D2K_HTTP80_CUT 4
+/* Тишина, после которой недокачанный ответ считается оборванным: не меньше
+   этого и не меньше трёх RTT потока. */
+#define D2K_HTTP80_CUT_MIN_NS (2ull * 1000000000ull)
 /* Поток без движения дольше этого забывается. */
 #define D2K_HTTP80_IDLE_NS (60ull * 1000000000ull)
 
@@ -48,7 +53,8 @@ typedef struct d2k_http80 d2k_http80;
 
 typedef struct {
     int action;            /* D2K_HTTP80_* */
-    int response;          /* 1: complete framing, 2: unknown, 3: portal (no timing claim) */
+    int response;          /* 1: complete framing, 2: unknown, 3: portal (no timing claim),
+                              4: cut — a body with a length claim stopped short (D2K_HTTP80_CUT) */
     unsigned status;       /* final HTTP status, if observed */
     uint64_t body_bytes;    /* observed body excluding chunk framing */
     uint64_t request_no;    /* request ordinal within this observed connection */
@@ -113,6 +119,16 @@ void d2k_http80_executed(d2k_http80 *h, const uint8_t *pkt, size_t len,
     uint64_t now_ns, uint64_t execution_id,
     const uint8_t plan_id[16], const uint8_t trial_id[16], const d2k_binding_context *);
 
+/* ОБРЫВ ОТВЕТА БЕЗ ПОРТАЛА (поле 15.10.2026, media5.cdnbase.com: 33120 из
+ * 106050 байт, ни портала, ни RST). Ответ с заявленной длиной
+ * (Content-Length), у которого ни байты сервера, ни ACK клиента не двигаются
+ * дольше max(3·RTT, D2K_HTTP80_CUT_MIN_NS), отдаётся в cb с response=4 —
+ * один раз, без плана тоже. ACK клиента — второй свидетель: под PPE Keenetic
+ * тело ответа после ~30 пакетов идёт мимо очереди. Закрытие клиентом до
+ * конца тела сообщается сразу, через d2k_http80_packet. Возвращает число
+ * сообщённых обрывов. */
+size_t d2k_http80_sweep(d2k_http80 *h, uint64_t now_ns,
+                        void (*cb)(void *ctx, const d2k_http80_res *r), void *ctx);
 /* Finalize a response observation after this original packet's NFQUEUE
  * verdict. Any failed/non-ACCEPT delivery invalidates the response witness. */
 void d2k_http80_delivered(d2k_http80 *,const uint8_t *,size_t,int accepted,d2k_http80_res *);

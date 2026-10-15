@@ -151,14 +151,14 @@ static d2k_hs_answer probe_local(const char *answer, int close_only, char *statu
     return r.answer;
 }
 
-typedef struct { int fd; const char *first, *second; const char *path; int matched; } ka_srv;
+typedef struct { int fd; const char *first, *second; const char *path; int matched; int check_first; } ka_srv;
 static void *serve_keepalive(void *arg) {
     ka_srv *v=arg; int c=accept(v->fd,NULL,NULL); if(c<0)return NULL;
     struct timeval tv={1,0}; setsockopt(c,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     char buf[2048];
     for(int i=0;i<2;i++) {
         ssize_t got=recv(c,buf,sizeof buf,0);if(got<=0)break;
-        if(i==1) {
+        if(i==1 || (i==0 && v->check_first)) {
             char expected[1100];int en=snprintf(expected,sizeof expected,"GET %s HTTP/1.1\r\n",v->path?v->path:"/");
             v->matched=got>=en&&!memcmp(buf,expected,(size_t)en);
         }
@@ -171,7 +171,7 @@ static void *serve_keepalive(void *arg) {
     close(c);return NULL;
 }
 static d2k_hs_result keepalive_path(const char *first,const char *second,const char *path) {
-    ka_srv v={socket(AF_INET,SOCK_STREAM,0),first,second,path,0};
+    ka_srv v={socket(AF_INET,SOCK_STREAM,0),first,second,path,0,0};
     struct sockaddr_in a={0};a.sin_family=AF_INET;a.sin_addr.s_addr=htonl(0x7f000001u);
     socklen_t al=sizeof a; CHECK(!bind(v.fd,(struct sockaddr *)&a,sizeof a)&&!listen(v.fd,1),"keepalive listen");
     getsockname(v.fd,(struct sockaddr *)&a,&al);d2k_hs_probe_port=ntohs(a.sin_port);d2k_hs_probe_ms=800;
@@ -296,6 +296,27 @@ static void f_say(void *c, const char *line) {
     if (n < sizeof f->said - 2) { snprintf(f->said + n, sizeof f->said - n, "%s\n", line); }
 }
 static void f_changed(void *c) { ((fake *)c)->changed_n++; }
+
+/* ОБРЫВ ОТВЕТА (поле 15.10.2026, media5.cdnbase.com): заголовки ответа
+   сервера пришли, тело оборвалось раньше Content-Length. Это не «мусор», а
+   свой исход — D2K_HS_CUT; в режиме обрыва первый запрос идёт на путь
+   ресурса клиента, а не на «/». */
+static void test_probe_cut(void) {
+    ka_srv v={socket(AF_INET,SOCK_STREAM,0),"HTTP/1.1 200 OK\r\nContent-Length: 30\r\n\r\nshort",NULL,
+              "/media/theme/fast.5.css",0,1};
+    struct sockaddr_in a={0};a.sin_family=AF_INET;a.sin_addr.s_addr=htonl(0x7f000001u);
+    socklen_t al=sizeof a; CHECK(!bind(v.fd,(struct sockaddr *)&a,sizeof a)&&!listen(v.fd,1),"cut listen");
+    getsockname(v.fd,(struct sockaddr *)&a,&al);d2k_hs_probe_port=ntohs(a.sin_port);d2k_hs_probe_ms=800;
+    pthread_t th;pthread_create(&th,NULL,serve_keepalive,&v);
+    d2k_hs_job job={0};job.fd=socket(AF_INET,SOCK_STREAM,0);job.family=4;job.addr[0]=127;job.addr[3]=1;
+    snprintf(job.host,sizeof job.host,"media5.cdnbase.com");
+    snprintf(job.repeat_path,sizeof job.repeat_path,"/media/theme/fast.5.css");job.cut=1;
+    d2k_hs_result r;d2k_hs_probe_run(&job,&r);
+    close(job.fd);pthread_join(th,NULL);close(v.fd);
+    CHECK(v.matched,"cut mode: the first request goes to the client's resource path");
+    CHECK(r.answer==D2K_HS_CUT && !r.complete_responses,"a real header with a short body is a cut, not garbage");
+    d2k_hs_probe_port=80;d2k_hs_probe_ms=6000;
+}
 
 static d2k_hs_ops ops_of(fake *f) {
     d2k_hs_ops o = {f_open, f_close, f_set_probe, f_del_probe, f_set_plan, f_del_plan,
@@ -438,6 +459,51 @@ static void test_search(void) {
     CHECK(f.del_probe_n == dp + 1 && f.set_probe_n == spn + 1, "срок подтверждения не соблюдён");
     d2k_httpsearch_free(hs);
     CHECK(f.open_n == f.close_n, "сокеты зондов не закрыты при освобождении");
+}
+
+/* Обрыв без плана (код 4) — поиск на том же пути: база своим зондом,
+   воспроизведённый обрыв ведёт к вопросам, обрыв под кандидатом — отказ,
+   два полных ответа подряд — план. Полный ответ в базе — поиска нет. */
+static void test_cut_search(void) {
+    fake f;
+    memset(&f, 0, sizeof f);
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    int64_t now = 1000;
+    d2k_ev e = {0};
+    e.kind = D2K_EV_HTTP_RESPONSE; e.code = 4; e.family = 4; e.transport = 6; e.high_port = 80;
+    memcpy(e.high_ip, IP, 16);
+    snprintf(e.name, sizeof e.name, "media5.cdnbase.com");
+    snprintf(e.live_http_path, sizeof e.live_http_path, "/media/theme/fast.5.css");
+    e.live_request_no = 1; e.live_body_bytes = 33120; e.live_http_status = 200;
+    CHECK(d2k_httpsearch_control(hs, &e, now) == 1 && f.start_n == 1 && f.job.cut == 1 &&
+          !strcmp(f.job.repeat_path, "/media/theme/fast.5.css"),
+          "a cut without a plan starts the base on the client's resource path");
+    CHECK(strstr(f.said, "обрыв") != NULL, "the base says it is a cut, not a portal");
+    d2k_hs_result r = res(&f, D2K_HS_CUT);
+    r.seq = f.job.seq; r.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r, now += 100);
+    CHECK(f.set_probe_n == 1, "a reproduced cut leads to the questions");
+    int sp = f.set_probe_n;
+    trial(hs, &f, &now, 1, D2K_HS_CUT);
+    CHECK(f.set_probe_n == sp + 1, "a cut under a candidate is a negative outcome, next candidate");
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    CHECK(f.set_plan_n == 1 && !strcmp(f.last_plan_host, "media5.cdnbase.com") &&
+          d2k_httpsearch_plan_of(hs, "media5.cdnbase.com", 4) != NULL,
+          "two complete bodies under a candidate install the plan");
+    /* Повтор обрыва по тому же имени во время поиска нового не начинает. */
+    int st = f.start_n;
+    snprintf(e.name, sizeof e.name, "free.example");
+    CHECK(d2k_httpsearch_control(hs, &e, now += 1000) == 1 && f.start_n == st + 1, "second cut name starts");
+    sp = f.set_probe_n;
+    r = res(&f, D2K_HS_REAL);
+    r.seq = f.job.seq; r.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r, now += 100);
+    CHECK(f.set_probe_n == sp && !d2k_httpsearch_busy(hs) && strstr(f.said, "не воспроизвод"),
+          "a complete body in the base starts no search");
+    d2k_httpsearch_free(hs);
+    CHECK(f.open_n == f.close_n, "cut probe sockets closed");
 }
 
 /* Ревью I-2: неизмеренный поиск не снимает план и не ставит часовую паузу. */
@@ -972,6 +1038,8 @@ static void test_execution_identity(void) {
 }
 
 int main(void) {
+    test_probe_cut();
+    test_cut_search();
     test_execution_identity();
     test_each_request_execution();
 #ifdef D2K_HS_KEEPALIVE_PROOF

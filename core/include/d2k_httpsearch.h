@@ -68,7 +68,10 @@ typedef enum {
     D2K_HS_CONNECT_FAIL,  /* соединение не установилось */
     D2K_HS_DECOY          /* ответ на приманку: имя приманки в ответе или
                              400/421 — сервер получил склейку приманки с
-                             запросом, а не запрос цели */
+                             запросом, а не запрос цели */,
+    D2K_HS_CUT            /* обрыв: заголовки ответа сервера пришли, тело
+                             оборвалось раньше заявленной длины (поле 15.10.2026,
+                             media5.cdnbase.com: 33120 из 106050 байт) */
 } d2k_hs_answer;
 
 const char *d2k_hs_answer_name(d2k_hs_answer a);
@@ -86,6 +89,7 @@ typedef struct {
     uint8_t addr[16];
     char host[256];
     char repeat_path[1024]; /* empty only for generic initial GET / experience */
+    int cut;                /* поиск по обрыву ответа: первый запрос — тоже repeat_path */
 } d2k_hs_job;
 
 typedef struct {
@@ -172,6 +176,9 @@ size_t d2k_hs_plan_poisons(const char *plan_text, char out[][64], size_t cap);
  * Unknown/stale identity is ignored; plan hash and timestamps alone are not proof. */
 int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t family,
                                 const uint8_t *addr, const uint8_t plan_id[16], const d2k_binding_context *, uint64_t execution_id, int64_t request_ms, const char *path, int64_t now_ms);
+/* Обрыв ответа без портала (код 4 HTTP_RESPONSE): поиск на пути ресурса. */
+void d2k_httpsearch_cut(d2k_httpsearch *hs, const char *host, uint8_t family,
+                        const uint8_t *addr, const char *path, uint64_t got, int64_t now);
 void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
                            const uint8_t *addr, int64_t now_ms);
 int d2k_httpsearch_control(d2k_httpsearch *, const d2k_ev *, int64_t now_ms);

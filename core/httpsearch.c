@@ -52,6 +52,7 @@ const char *d2k_hs_answer_name(d2k_hs_answer a) {
     case D2K_HS_CLOSED:       return "закрытие без ответа";
     case D2K_HS_CONNECT_FAIL: return "соединение не установилось";
     case D2K_HS_DECOY:        return "ответ на приманку, не на запрос цели";
+    case D2K_HS_CUT:          return "обрыв тела ответа";
     default:                  return "нет";
     }
 }
@@ -202,7 +203,7 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
 
     char req[1536];
     for(unsigned request=0;request<2;request++) {
-        const char *path=request&&job->repeat_path[0]?job->repeat_path:"/";
+        const char *path=(request||job->cut)&&job->repeat_path[0]?job->repeat_path:"/";
         int rl=snprintf(req,sizeof req,"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",path,job->host);
         if(rl<=0||(size_t)rl>=sizeof req){r->answer=D2K_HS_GARBAGE;return;}
         hs_reader reader={0};reader.fd=fd;clock_gettime(CLOCK_MONOTONIC,&reader.sent);
@@ -234,7 +235,10 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
         const char *eol=strstr(reader.head,"\r\n");
         if(eol){size_t n=(size_t)(eol-reader.head);if(n>=sizeof r->status)n=sizeof r->status-1;memcpy(r->status,reader.head,n);r->status[n]=0;}
         if(r->answer!=D2K_HS_REAL)return;
-        if(!response.complete){r->answer=D2K_HS_GARBAGE;return;}
+        if(!response.complete) {
+            /* Заголовки настоящего ответа пришли, тело — нет: обрыв, не мусор. */
+            r->answer=D2K_HS_CUT;return;
+        }
         r->complete_responses++;
         if(response.connection_close) {
             snprintf(r->why,sizeof r->why,"server closed connection: keep-alive not confirmed");return;
@@ -370,6 +374,7 @@ typedef struct {
     uint8_t family;
     char key[40];          /* подтверждённый кандидат; "" — нет */
     char repeat_path[1024];
+    int cut;               /* поиск идёт по обрыву ответа, не по порталу */
     int repro_gap, evidence_lost;
     live_failure *failures;
     size_t n_failures;
@@ -400,6 +405,7 @@ struct d2k_httpsearch {
         char repeat_path[1024];
         uint8_t family, addr[16];
         int recheck;
+        int cut;
         char cands[N_CANDS * 4 + 8][40];
         size_t n_cands, idx;
         int ok;            /* настоящих ответов подряд у текущего кандидата */
@@ -642,6 +648,7 @@ static int open_job(d2k_httpsearch *hs, d2k_hs_job *job) {
     memcpy(job->addr, hs->cur.addr, sizeof job->addr);
     snprintf(job->host, sizeof job->host, "%s", hs->cur.host);
     snprintf(job->repeat_path,sizeof job->repeat_path,"%s",hs->cur.repeat_path);
+    job->cut=hs->cur.cut;
     return 0;
 }
 
@@ -799,7 +806,8 @@ static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now)
         next_candidate(hs, now);
         return;
     }
-    if ((r->answer == D2K_HS_REAL && r->complete_responses >= 2) || r->answer == D2K_HS_INJECTED) { hs->cur.judged++; }
+    if ((r->answer == D2K_HS_REAL && r->complete_responses >= 2) || r->answer == D2K_HS_INJECTED ||
+        r->answer == D2K_HS_CUT) { hs->cur.judged++; }
     if (r->answer == D2K_HS_REAL && r->complete_responses >= 2) {
         hs->cur.ok++;
         say(hs, "HTTP %s: «%s» — ответ сервера (%s), RTT %lld мкс, ответ через %lld мкс",
@@ -926,6 +934,7 @@ static void start(d2k_httpsearch *hs, const char *host, uint8_t family, const ui
         say(hs,"HTTP %s: контекст запроса утрачен или не поддержан — воспроизведение не начато",host);return;
     }
     if(context)snprintf(hs->cur.repeat_path,sizeof hs->cur.repeat_path,"%s",context->repeat_path);
+    if(context)hs->cur.cut=context->cut;
     d2k_hs_job job;
     hs->cur.job_seq = ++hs->job_seq;
     int opened = open_job(hs, &job) == 0;
@@ -941,8 +950,10 @@ static void start(d2k_httpsearch *hs, const char *host, uint8_t family, const ui
     hs->cur.phase = PH_BASE;
     hs->cur.deadline = now + (int64_t)d2k_hs_probe_ms * 3;
     say(hs, "HTTP %s: %s — база: тот же запрос своим зондом без плана", host,
-        recheck ? "вставка при подтверждённом плане, перепроверка"
-                : "вставка провайдера, HTTPS у имени нет — поиск обхода HTTP");
+        hs->cur.cut ? (recheck ? "обрыв ответа при подтверждённом плане, перепроверка"
+                               : "обрыв ответа без портала — поиск обхода HTTP")
+        : recheck ? "вставка при подтверждённом плане, перепроверка"
+                  : "вставка провайдера, HTTPS у имени нет — поиск обхода HTTP");
 }
 
 static void start_next(d2k_httpsearch *hs, int64_t now) {
@@ -1003,6 +1014,10 @@ int d2k_httpsearch_control(d2k_httpsearch *hs,const d2k_ev *ev,int64_t now) {
             ev->code==2?"unknown":"response-complete",(unsigned)ev->live_http_status,(unsigned long long)ev->live_body_bytes);
         return 1;
     }
+    if(ev->kind==D2K_EV_HTTP_RESPONSE && ev->code==4 && ev->transport==6 && ev->high_port==80) {
+        d2k_httpsearch_cut(hs,ev->name,ev->family,ev->high_ip,ev->live_http_path,ev->live_body_bytes,now);
+        return 1;
+    }
     if(((ev->kind==D2K_EV_HTTP_PORTAL && !ev->code) ||
         (ev->kind==D2K_EV_HTTP_RESPONSE && ev->code==3)) && ev->transport==6 && ev->high_port==80) {
         static const uint8_t zero[16];
@@ -1011,6 +1026,31 @@ int d2k_httpsearch_control(d2k_httpsearch *hs,const d2k_ev *ev,int64_t now) {
                 &ev->execution_binding,ev->live_execution,ev->live_request_ms,ev->live_http_path,now);
     }
     return 0;
+}
+
+/* ОБРЫВ ОТВЕТА БЕЗ ПОРТАЛА (поле 15.10.2026, media5.cdnbase.com: стили
+   fast-torrent рвались на 33120 из 106050 байт, ни портала, ни RST). Датапат
+   сообщил ответ с заявленной длиной, вставший раньше конца (код 4). Поиск —
+   тем же путём, что у портала, но база и кандидаты мерят ресурс клиента, и
+   «не взят» значит обрыв тела, а успех — два полных тела подряд. */
+void d2k_httpsearch_cut(d2k_httpsearch *hs, const char *host, uint8_t family,
+                        const uint8_t *addr, const char *path, uint64_t got, int64_t now) {
+    if (!hs || !addr || (family != 4 && family != 6) || !host_ok(host)) { return; }
+    if (!hs_path_ok(path)) {
+        say(hs, "HTTP %s: обрыв ответа на пути, который зонд не повторит, — поиск не начат", host);
+        return;
+    }
+    rec *r = rec_get(hs, host, family);
+    if (!r) { return; }
+    if (hs->cur.phase != PH_IDLE && hs->cur.family == family && !strcasecmp(hs->cur.host, host)) { return; }
+    if (!r->cut || !r->repeat_path[0]) {
+        r->cut = 1;
+        snprintf(r->repeat_path, sizeof r->repeat_path, "%s", path);
+    }
+    r->repro_gap = 0;
+    say(hs, "HTTP %s: обрыв ответа на %s после %llu байт тела — до заявленной длины не дошло",
+        host, path, (unsigned long long)got);
+    d2k_httpsearch_portal(hs, host, family, addr, now);
 }
 
 void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
@@ -1067,6 +1107,7 @@ void d2k_httpsearch_ack(d2k_httpsearch *hs, const uint8_t trial[16], int ok, int
     memcpy(job.addr, hs->cur.addr, sizeof job.addr);
     snprintf(job.host, sizeof job.host, "%s", hs->cur.host);
     snprintf(job.repeat_path,sizeof job.repeat_path,"%s",hs->cur.repeat_path);
+    job.cut=hs->cur.cut;
     if (!hs->ops.start_probe || hs->ops.start_probe(hs->ops.ctx, &job) != 0) {
         say(hs, "HTTP %s: зонд не запустился — поиск остановлен", hs->cur.host);
         drop_probe(hs);
@@ -1116,18 +1157,20 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
     }
     if (hs->cur.phase == PH_BASE) {
         drop_socket(hs);
-        if (r->answer == D2K_HS_INJECTED) {
+        if (r->answer == (hs->cur.cut ? D2K_HS_CUT : D2K_HS_INJECTED)) {
             build_cands(hs);
-            say(hs, "HTTP %s: база — вставка провайдера воспроизведена; своих планов %zu, затем вопросы разреза и checksum-приманки",
-                hs->cur.host, hs->cur.n_cands);
+            say(hs, "HTTP %s: база — %s воспроизведён%s; своих планов %zu, затем вопросы разреза и checksum-приманки",
+                hs->cur.host, hs->cur.cut ? "обрыв тела ответа" : "вставка провайдера",
+                hs->cur.cut ? "" : "а", hs->cur.n_cands);
             next_candidate(hs, now);
             return;
         }
         rec *rr = rec_get(hs, hs->cur.host, hs->cur.family);
         if (rr) { rr->no_before_ms = now + D2K_HS_RECHECK_MS; }
-        say(hs, "HTTP %s: база — %s%s%s: вставка с роутера не воспроизводится, поиск HTTP "
+        say(hs, "HTTP %s: база — %s%s%s: %s с роутера не воспроизводится, поиск HTTP "
                 "не начат (подозрение не равно блокировке)", hs->cur.host,
-            d2k_hs_answer_name(r->answer), r->status[0] ? ", " : "", r->status);
+            d2k_hs_answer_name(r->answer), r->status[0] ? ", " : "", r->status,
+            hs->cur.cut ? "обрыв" : "вставка");
         finish(hs, now);
         return;
     }

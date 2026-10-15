@@ -41,6 +41,11 @@ typedef struct {
     uint32_t reply_next;
     uint64_t reply_time, reply_kstamp, request_no;
     int reply_started, reply_segments;
+    /* Обрыв ответа: конец тела по Content-Length (seq сервера), докуда
+       подтвердил клиент, когда ответ последний раз продвинулся. */
+    uint32_t body_start, body_end, acked;
+    int body_end_known, cut_told;
+    uint64_t progress;
     d2k_binding_context binding;
     uint64_t execution_id;
     uint8_t plan_id[16], trial_id[16];
@@ -270,6 +275,53 @@ void d2k_http80_delivered(d2k_http80 *h,const uint8_t *p,size_t n,int accepted,d
     request_result(f,r);r->response=2;
 }
 
+
+/* --- обрыв ответа без портала ------------------------------------------- */
+
+static int seq_after(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0; }
+
+/* Докуда ответ дошёл до клиента: дальний из увиденных байтов сервера и ACK
+   клиента. */
+static uint32_t delivered(const flow *f) {
+    return seq_after(f->acked, f->reply_next) ? f->acked : f->reply_next;
+}
+
+static int cut_pending(const flow *f) {
+    return f->state == ST_REQUEST && f->body_end_known && !f->cut_told &&
+           f->reply.header_done && !f->reply.complete && !f->reply.invalid &&
+           seq_after(f->body_end, delivered(f));
+}
+
+static void cut_result(flow *f, d2k_http80_res *r) {
+    request_result(f, r);
+    r->response = D2K_HTTP80_CUT;
+    uint32_t got = delivered(f) - f->body_start;
+    if (seq_after(delivered(f), f->body_start) && (uint64_t)got > r->body_bytes) { r->body_bytes = got; }
+    r->rtt_ns = f->rtt;
+    f->cut_told = 1;
+    f->state = ST_DONE;
+}
+
+size_t d2k_http80_sweep(d2k_http80 *h, uint64_t now,
+                        void (*cb)(void *ctx, const d2k_http80_res *r), void *ctx) {
+    size_t told = 0;
+    if (!h) { return 0; }
+    for (size_t i = 0; i < D2K_HTTP80_FLOWS; i++) {
+        flow *f = &h->flows[i];
+        if (!cut_pending(f) || now <= f->progress) { continue; }
+        uint64_t quiet = 3 * f->rtt;
+        if (quiet < D2K_HTTP80_CUT_MIN_NS) { quiet = D2K_HTTP80_CUT_MIN_NS; }
+        if (now - f->progress <= quiet) { continue; }
+        d2k_http80_res r;
+        memset(&r, 0, sizeof r);
+        r.action = D2K_HTTP80_PASS;
+        cut_result(f, &r);
+        told++;
+        if (cb) { cb(ctx, &r); }
+    }
+    return told;
+}
+
 /* Recognize identity in a prefix; framing is completed by the shared stream
  * parser. This is not the stricter complete-request HTTPS upgrade API. */
 static int request_prefix(const uint8_t *p,size_t n,flow *f) {
@@ -338,6 +390,14 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
             return;
         }
         f->touched = now;
+        if (f->state == ST_REQUEST && (flags & 0x10) && seq_after(ack, f->acked)) {
+            f->acked = ack;               /* клиент подтвердил ещё байты ответа */
+            f->progress = now;
+        }
+        if (f->state == ST_REQUEST && (flags & 0x05) && cut_pending(f)) {
+            cut_result(f, r);             /* клиент закрыл, не дождавшись конца тела */
+            return;
+        }
         if (plen > 0 && f->state != ST_OPEN && f->state != ST_SYN) { h->st.later++; }
         if(f->state==ST_REQUEST && plen)request_feed(f,seq,pay,plen);
         if ((f->state == ST_OPEN || f->state == ST_IDLE) && plen > 0) {
@@ -361,6 +421,9 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
                 memset(f->plan_id, 0, sizeof f->plan_id);
                 memset(f->trial_id, 0, sizeof f->trial_id);
                 f->state = ST_REQUEST;
+                f->acked = f->reply_next;
+                f->body_end_known = 0; f->cut_told = 0;
+                f->progress = now;
                 f->t_req = now;
                 f->k_req = ks;
                 f->client_next = seq + (uint32_t)plen;
@@ -411,6 +474,13 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
     if(plen)f->reply_segments++;
     d2k_http_response_feed(&f->reply,pay,plen,(flags&0x01)!=0);
     f->reply_next=seq+(uint32_t)plen;
+    if(plen)f->progress=now;
+    if(f->reply.header_done && f->reply.state==D2K_HR_FIXED && !f->reply.invalid) {
+        /* Конец тела по Content-Length в seq сервера: отсюда ещё remaining. */
+        f->body_end=f->reply_next+(uint32_t)f->reply.remaining;
+        f->body_start=f->body_end-(uint32_t)(f->reply.body_bytes+f->reply.remaining);
+        f->body_end_known=1;
+    }
     uint64_t dt=f->reply_time>=f->t_req?f->reply_time-f->t_req:0;
     uint64_t rtt=f->rtt;
     if(f->krtt && f->k_req && f->reply_kstamp>=f->k_req) {

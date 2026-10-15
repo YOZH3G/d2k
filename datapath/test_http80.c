@@ -730,6 +730,90 @@ static void test_request_stream(void) {
     CHECK(st.invalid,"partial overlap cannot establish boundary");
 }
 
+/* ОБРЫВ ОТВЕТА БЕЗ ПОРТАЛА (поле 15.10.2026, fast-torrent.ru). Стили и
+ * скрипты страницы идут с http://media5.cdnbase.com, и коробка обрывает
+ * ответ на 23 пакетах (33120 из 106050 байт): ни портала, ни RST — сервер
+ * просто замолкает. Наблюдатель это видел и молчал: исход был только у
+ * запроса под планом, а таймера не было вовсе. Обрыв — ответ с заявленной
+ * длиной встал раньше конца: ни байты сервера, ни ACK клиента не двигаются
+ * дольше max(3·RTT, 2 с), либо клиент закрыл соединение, не дождавшись.
+ * ACK клиента — второй свидетель: под PPE Keenetic тело ответа после ~30
+ * пакетов идёт мимо очереди, а пакеты клиента к :80 видны всегда. */
+static d2k_http80_res cut_seen;
+static int cut_count;
+static void cut_cb(void *ctx, const d2k_http80_res *res) { (void)ctx; cut_seen = *res; cut_count++; }
+
+static void test_response_cut(void) {
+    static const char CSS[] = "GET /media/theme/fast.5.css HTTP/1.1\r\nHost: media5.cdnbase.com\r\n"
+                              "User-Agent: t\r\n\r\n";
+    static char body[1441];
+    memset(body, 'x', 1440); body[1440] = 0;
+    const char *fixed = "HTTP/1.1 200 OK\r\nContent-Length: 106050\r\n\r\n";
+    for (int mode = 0; mode < 5; mode++) {
+        /* 0 сервер встал, 1 видны только ACK клиента, 2 клиент закрыл,
+           3 полный ответ, 4 длина не заявлена */
+        d2k_http80 *h = d2k_http80_new();
+        flow f = flow4((uint16_t)(53000 + mode));
+        uint64_t t = 20000 * MS;
+        open_flow(h, &f, t, CSS);
+        uint32_t ack = CISN + 1 + (uint32_t)strlen(CSS), seq = SISN + 1;
+        const char *hd = mode == 3 ? "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" :
+                         mode == 4 ? "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" : fixed;
+        size_t n = pkt(&f, 0, F_ACK | F_PSH, seq, ack, hd, b);
+        PKT(h, b, n, t + 197 * MS, &r);
+        seq += (uint32_t)strlen(hd);
+        uint64_t last = t + 197 * MS;
+        if (mode != 3) {
+            for (int i = 0; i < 22; i++) {
+                n = pkt(&f, 0, F_ACK, seq, ack, body, b);
+                PKT(h, b, n, t + (uint64_t)(198 + i) * MS, &r);
+                CHECK(r.response == 0, "a body in progress has no outcome yet");
+                seq += 1440; last = t + (uint64_t)(198 + i) * MS;
+            }
+        }
+        cut_count = 0;
+        d2k_http80_sweep(h, last + 1900 * MS, cut_cb, NULL);
+        CHECK(cut_count == 0, "a stall shorter than max(3 RTT, 2 s) is not a cut");
+        if (mode == 1) {
+            uint32_t a = seq;
+            for (int i = 1; i <= 10; i++) {
+                a += 2 * 1440;
+                n = pkt(&f, 1, F_ACK, ack, a, NULL, b);
+                PKT(h, b, n, last + (uint64_t)i * 1000 * MS, &r);
+            }
+            d2k_http80_sweep(h, last + 11500 * MS, cut_cb, NULL);
+            CHECK(cut_count == 0, "advancing client ACKs keep an unseen response alive");
+            last += 10000 * MS; seq = a;
+        }
+        if (mode == 2) {
+            n = pkt(&f, 1, F_ACK | F_FIN, ack, seq, NULL, b);
+            PKT(h, b, n, last + 500 * MS, &r);
+            CHECK(r.response == 4 && strcmp(r.host, "media5.cdnbase.com") == 0 &&
+                  strcmp(r.request_path, "/media/theme/fast.5.css") == 0 && r.body_bytes == 22u * 1440u,
+                  "client close mid-body is a cut with Host, path and received body");
+            d2k_http80_sweep(h, last + 5000 * MS, cut_cb, NULL);
+            CHECK(cut_count == 0, "a cut told on close is not told again by the sweep");
+            d2k_http80_free(h);
+            continue;
+        }
+        d2k_http80_sweep(h, last + 2100 * MS, cut_cb, NULL);
+        if (mode == 3 || mode == 4) {
+            CHECK(cut_count == 0, mode == 3 ? "a complete response is never a cut"
+                                            : "without a length claim a stall is not a cut");
+        } else {
+            CHECK(cut_count == 1 && cut_seen.response == 4 &&
+                  strcmp(cut_seen.host, "media5.cdnbase.com") == 0 &&
+                  strcmp(cut_seen.request_path, "/media/theme/fast.5.css") == 0,
+                  "a stalled fixed-length body is a cut");
+            CHECK(cut_seen.body_bytes == (uint64_t)(seq - (SISN + 1) - (uint32_t)strlen(fixed)),
+                  "the cut reports the received body (by client ACK when server bytes are unseen)");
+            d2k_http80_sweep(h, last + 9000 * MS, cut_cb, NULL);
+            CHECK(cut_count == 1, "a cut is told once");
+        }
+        d2k_http80_free(h);
+    }
+}
+
 int main(void) {
     test_field_injection(0);
     test_field_injection(1);
@@ -752,6 +836,7 @@ int main(void) {
     test_unseen_counted();
     test_segmented_headers();
     test_request_stream();
+    test_response_cut();
     if (fails) {
         printf("test_http80: провалов %d\n", fails);
         return 1;

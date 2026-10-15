@@ -312,7 +312,7 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
                 out->live_body_bytes=(out->live_body_bytes<<8)|meta[2+i];
                 out->live_request_no=(out->live_request_no<<8)|meta[10+i];
             }
-            if(!out->live_request_no || rest[0]<1 || rest[0]>3 || out->live_http_status>599 ||
+            if(!out->live_request_no || rest[0]<1 || rest[0]>4 || out->live_http_status>599 ||
                (rest[0]==1 && out->live_http_status<200))return -1;
         }
         if (rlen < 2 || rlen < 2u + rest[1]) {
