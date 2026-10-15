@@ -8128,9 +8128,42 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     uint8_t rec_input = transferred ? (uint8_t)D2K_INPUT_TRANSFER :
                         t->trig_snapped ? (uint8_t)D2K_INPUT_CLIENT
                                         : (uint8_t)D2K_INPUT_PROFILE;
+    /* QUIC С ECH — ПРИВЯЗКА К АДРЕСУ, А НЕ К ВНЕШНЕМУ ИМЕНИ (поле 15.10.2026).
+       При ECH все цели Cloudflare приходят к датапату под одним именем
+       cloudflare-ech.com, и привязка этого имени раздавала ОДИН план,
+       измеренный на одном адресе, всем сразу: rutracker, lostfilm и enimerosi
+       он открывал (28-79 КБ по QUIC на проводе), а katzauction, spzh и
+       nnmclub — нет, у них адреса другие. Имя тут не различает цели, адрес
+       различает: привязываем к нему, и каждый адрес получает СВОЙ измеренный
+       план. Поиск по-прежнему идёт по имени — меняется только то, чем
+       помечено доказательство. */
+    int quic_ech_bind = t->transport == 17 && t->quic_ech && !t->by_addr && t->ip[0];
+    if (quic_ech_bind) {
+        /* Старая привязка этого имени ушла бы вперёд адресной (имя ищется
+           первым, plans.c) и закрыла бы её собой. */
+        for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+            d2k_cat_box *b = &s->cat->boxes[bi];
+            for (size_t j = 0; j < b->n_binds;) {
+                d2k_cat_binding *bd = &b->binds[j];
+                if (!strcmp(bd->kind, "name") && bd->transport == 17 &&
+                    bd->family == t->family && !strcmp(bd->target, t->name)) {
+                    memmove(bd, bd + 1, (b->n_binds - j - 1) * sizeof *bd);
+                    b->n_binds--;
+                    b->updated = wall_s(s, now_ms);
+                    continue;
+                }
+                j++;
+            }
+        }
+        say(s, "по %s (QUIC, ECH) доказательство привязываю к адресу %s: под внешним "
+               "именем ECH приходят разные цели, и один план на имя раздавался всем",
+            t->name, t->ip);
+    }
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
-                         t->name, t->by_addr ? "addr" : "name", t->transport, t->family, rec_shape,
+                         quic_ech_bind ? t->ip : t->name,
+                         (quic_ech_bind || t->by_addr) ? "addr" : "name",
+                         t->transport, t->family, rec_shape,
                          t->ver.replay_proof ? D2K_VERBY_REPLAY_HANDSHAKE :
                          t->ver.handshake_proof ? D2K_VERBY_PROBE_HANDSHAKE
                                                 : D2K_VERBY_PROBE, rec_input,
