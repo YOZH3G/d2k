@@ -2043,7 +2043,11 @@ int main(int argc, char **argv) {
                         d2k_http80_delivered(http80,np.payload,np.payload_len,
                             !original_failed && !delayed_originals && verdict==D2K_NF_ACCEPT,
                             &http_observation);
-                        if(http_observation.response && http_observation.execution_id &&
+                        /* A late known portal is a suspicion even before any
+                           plan exists. Complete responses still need their
+                           execution identity to become plan evidence. */
+                        if(http_observation.response &&
+                           (http_observation.execution_id || http_observation.response == 3) &&
                            http_observation.response!=D2K_HTTP80_CUT) /* обрыв уже сообщён */
                             d2k_ctlsrv_http80_event(ctl,&http_observation);
                     }
