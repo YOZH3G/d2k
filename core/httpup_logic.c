@@ -4,6 +4,7 @@
 #include <strings.h>
 
 #include "d2k_httpup.h"
+#include "d2k_http_reply.h"
 
 typedef struct {
     char host[256];
@@ -143,7 +144,7 @@ static int build_redirect(const http_request *req, const char *reason,
 static int portal_marker(const char *host) {
     static const char *const markers[] = {
         "lawfilter", "blockpage", "blocked", "censorship", "access-denied",
-        "provider-filter"
+        "provider-filter", "megafonpro", "blackhole"
     };
     const char *start = host;
     for (const char *p = host;; p++) {
@@ -161,7 +162,29 @@ static int portal_marker(const char *host) {
     return 0;
 }
 
-static int redirect_location_host(const char *value, size_t len, char *host, size_t cap) {
+static int is_known_portal_host(const char *host) {
+    if (!host) { return 0; }
+    for (size_t i = 0; i < d2k_http_portal_count(); i++) {
+        const char *p = d2k_http_portal(i);
+        if (p && strcasecmp(host, p) == 0) { return 1; }
+    }
+    return 0;
+}
+
+static int is_portal_path(const char *path, size_t path_len) {
+    if (!path || path_len < 4) { return 0; }
+    if (strncasecmp(path, "/rkn", 4) == 0) {
+        if (path_len == 4 || path[4] == '-' || path[4] == '/' ||
+            path[4] == '?' || path[4] == '_' || path[4] == '.') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int redirect_location_parts(const char *value, size_t len,
+                                   char *host, size_t cap,
+                                   const char **path, size_t *path_len) {
     const char *scheme = NULL;
     size_t scheme_len = 0;
     if (len >= 7 && strncasecmp(value, "http://", 7) == 0) {
@@ -178,6 +201,10 @@ static int redirect_location_host(const char *value, size_t len, char *host, siz
     if (n == 0 || n >= cap) { return 0; }
     memcpy(host, scheme, n); host[n] = '\0';
     if (!dns_host(host, n)) { return 0; }
+    const char *p = authority_end;
+    while (p < end && *p != '/' && *p != '?' && *p != '#') { p++; }
+    if (path) { *path = p; }
+    if (path_len) { *path_len = (size_t)(end - p); }
     return 1;
 }
 
@@ -195,6 +222,8 @@ static int portal_answer(const char *req_host, const char *upstream, size_t upst
          upstream[11] != '7' && upstream[11] != '8')) { return 0; }
 
     int location_seen = 0;
+    const char *loc_path = NULL;
+    size_t loc_path_len = 0;
     const char *p = line_end + 2;
     while ((line_end = find_crlf(p, end)) != NULL && line_end != p) {
         const char *colon = memchr(p, ':', (size_t)(line_end - p));
@@ -204,13 +233,15 @@ static int portal_answer(const char *req_host, const char *upstream, size_t upst
             while (v < line_end && (*v == ' ' || *v == '\t')) { v++; }
             const char *ve = line_end;
             while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t')) { ve--; }
-            if (!redirect_location_host(v, (size_t)(ve - v), location_host,
-                                        location_cap)) { return 0; }
+            if (!redirect_location_parts(v, (size_t)(ve - v), location_host,
+                                         location_cap, &loc_path, &loc_path_len)) { return 0; }
         }
         p = line_end + 2;
     }
     return location_seen && line_end && line_end == p &&
-           !host_equal(req_host, location_host) && portal_marker(location_host);
+           !host_equal(req_host, location_host) &&
+           (is_known_portal_host(location_host) || portal_marker(location_host) ||
+            is_portal_path(loc_path, loc_path_len));
 }
 
 int d2k_httpup_portal_response(const char *request, size_t request_len,

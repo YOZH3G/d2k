@@ -30,6 +30,21 @@ int main(void) {
     static const char deceptive_marker[] =
         "HTTP/1.1 302 Found\r\nLocation: https://unblocked.example/continue\r\n"
         "Content-Length: 0\r\n\r\n";
+    static const char megafon_portal[] =
+        "HTTP/1.1 302 Found\r\nLocation: https://m.megafonpro.ru/rkn-auth?channel=2m\r\n"
+        "Content-Length: 0\r\n\r\n";
+    static const char rt_portal[] =
+        "HTTP/1.1 302 Found\r\nLocation: http://warning.rt.ru/\r\n"
+        "Content-Length: 0\r\n\r\n";
+    static const char beeline_portal[] =
+        "HTTP/1.1 302 Found\r\nLocation: http://warn.beeline.ru/\r\n"
+        "Content-Length: 0\r\n\r\n";
+    static const char megafon_deny[] =
+        "HTTP/1.1 302 Found\r\nLocation: http://deny.megafon.ru/blocked\r\n"
+        "Content-Length: 0\r\n\r\n";
+    static const char path_rkn_portal[] =
+        "HTTP/1.1 302 Found\r\nLocation: http://isp.example.org/rkn-landing/rkn?id=1\r\n"
+        "Content-Length: 0\r\n\r\n";
     static const char not_redirect[] =
         "HTTP/1.1 200 OK\r\nLocation: https://lawfilter.example/\r\n"
         "Content-Length: 0\r\n\r\n";
@@ -44,6 +59,37 @@ int main(void) {
           strstr(out, "Location: https://RuTracker.org/forum/index.php?q=1\r\n") &&
           strstr(out, "provider-portal"),
           "explicit provider portal redirect did not restart navigation over HTTPS");
+    CHECK(d2k_httpup_portal_response(get, sizeof get - 1, megafon_portal,
+                                     sizeof megafon_portal - 1, out, sizeof out) &&
+          strstr(out, "Location: https://RuTracker.org/forum/index.php?q=1\r\n") &&
+          strstr(out, "provider-portal"),
+          "Megafon RKN portal redirect did not restart navigation over HTTPS");
+    char portal_host[256];
+    CHECK(d2k_httpup_portal_location("rutracker.org", megafon_portal,
+                                     sizeof megafon_portal - 1, portal_host,
+                                     sizeof portal_host) &&
+          strcmp(portal_host, "m.megafonpro.ru") == 0,
+          "Megafon RKN portal host not extracted");
+    CHECK(d2k_httpup_portal_location("rutracker.org", rt_portal,
+                                     sizeof rt_portal - 1, portal_host,
+                                     sizeof portal_host) &&
+          strcmp(portal_host, "warning.rt.ru") == 0,
+          "Rostelecom warning.rt.ru portal not extracted");
+    CHECK(d2k_httpup_portal_location("rutracker.org", beeline_portal,
+                                     sizeof beeline_portal - 1, portal_host,
+                                     sizeof portal_host) &&
+          strcmp(portal_host, "warn.beeline.ru") == 0,
+          "Beeline warn.beeline.ru portal not extracted");
+    CHECK(d2k_httpup_portal_location("rutracker.org", megafon_deny,
+                                     sizeof megafon_deny - 1, portal_host,
+                                     sizeof portal_host) &&
+          strcmp(portal_host, "deny.megafon.ru") == 0,
+          "Megafon deny.megafon.ru portal not extracted");
+    CHECK(d2k_httpup_portal_location("rutracker.org", path_rkn_portal,
+                                     sizeof path_rkn_portal - 1, portal_host,
+                                     sizeof portal_host) &&
+          strcmp(portal_host, "isp.example.org") == 0,
+          "RKN path portal not extracted");
     CHECK(!d2k_httpup_portal_response(get, sizeof get - 1, ordinary_cross_host,
                                       sizeof ordinary_cross_host - 1, out, sizeof out),
           "ordinary cross-host login redirect was mistaken for a filter portal");

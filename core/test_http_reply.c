@@ -22,6 +22,8 @@ int main(void) {
         {403,"","https://eais.rkn.gov.ru.evil.example/",0,D2K_HTTP_NEUTRAL},
         {403,"","not-eais.rkn.gov.ru",0,D2K_HTTP_NEUTRAL},
         {200,"","article: access blocked by rkn",0,D2K_HTTP_POSITIVE},
+        {302,"https://m.megafonpro.ru/rkn-auth?channel=2m","",0,D2K_HTTP_BLOCKED},
+        {302,"http://isp.example.org/rkn-auth?channel=2m","",0,D2K_HTTP_BLOCKED},
         {451,"","",0,D2K_HTTP_LEGAL_DENIAL},
     };
     for (size_t i=0;i<sizeof cases/sizeof cases[0];i++) {
@@ -34,7 +36,7 @@ int main(void) {
     CHECK(d2k_http_reply_classify(403,"",0,(const unsigned char *)cut,
         strlen(cut),strlen(cut)+20).outcome==D2K_HTTP_NEUTRAL);
     CHECK(d2k_http_reply_classify(403,"",0,NULL,0,0).outcome==D2K_HTTP_NEUTRAL);
-    for (size_t i=0;i<6;i++) {
+    for (size_t i=0;i<d2k_http_portal_count();i++) {
         char location[160];
         snprintf(location,sizeof location,"https://user@%s:443/blocked",d2k_http_portal(i));
         CHECK(d2k_http_reply_classify(307,location,0,NULL,0,0).outcome==D2K_HTTP_BLOCKED);

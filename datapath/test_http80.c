@@ -142,6 +142,24 @@ static void test_field_injection(int v6) {
     d2k_http80_free(h);
 }
 
+static const char INJECT_MEGAFON[] =
+    "HTTP/1.1 302 Found\r\nLocation: https://m.megafonpro.ru/rkn-auth?channel=2m\r\n"
+    "Connection: close\r\nContent-Length: 0\r\n\r\n";
+
+static void test_field_injection_megafon(void) {
+    d2k_http80 *h = d2k_http80_new();
+    flow f = flow4(51500);
+    uint32_t req_end = CISN + 1 + (uint32_t)strlen(GET);
+    open_flow(h, &f, 1000 * MS, GET);
+    size_t n = pkt(&f, 0, F_ACK | F_PSH | F_FIN, SISN + 1, req_end, INJECT_MEGAFON, b);
+    PKT(h, b, n, 1000 * MS + 99 * MS + 700000ull, &r);
+    CHECK(r.injection, "вставка 302→m.megafonpro.ru/rkn-auth через 0,7 мс не узнана");
+    CHECK(r.action == D2K_HTTP80_PASS, "без знания об HTTPS вставка обязана пройти как есть");
+    CHECK(strcmp(r.host, "RuTracker.org") == 0, "Host запроса не передан");
+    CHECK(strcmp(r.portal, "m.megafonpro.ru") == 0, "хост блокировки не передан");
+    d2k_http80_free(h);
+}
+
 /* То, что вставкой не является, — молча проходит. */
 static void test_not_injection(void) {
     static const char own_redirect[] =
@@ -817,6 +835,7 @@ static void test_response_cut(void) {
 int main(void) {
     test_field_injection(0);
     test_field_injection(1);
+    test_field_injection_megafon();
     test_not_injection();
     test_table_bound();
     test_garbage();
