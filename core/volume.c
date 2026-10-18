@@ -476,6 +476,12 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
                 d2k_verify_close(&a);
                 return 1;
             }
+        } else if ((a.status == 0 || !a.body_complete) &&
+                   !res->rx_direct_complete && !res->rx_tls_unavailable && !a.local_limit) {
+            /* ОТВЕТ НЕ НАЧАЛСЯ ИЛИ НЕ ДОШЁЛ ДО ПОЛНЫХ ЗАГОЛОВКОВ (поле 19.10.2026,
+             * mailsuite.com): статус 0 или обрыв до заголовков при согласованном TLS.
+             * Бюджет не проверен, и выдавать это за «проходит напрямую» нельзя. */
+            res->rx_unmeasured = 1;
         }
         d2k_verify_close(&a);
         return 0;
@@ -566,6 +572,7 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     uint64_t was = res->rx_short_bytes;
     res->rx_short = 0;
     res->rx_short_bytes = 0;
+    res->rx_unmeasured = 0;
     nap_ms(RESPONSE_PROBE_GAP_MS);
     (void)measure_response_volume(res, ip, port, sni, tls12, hello_wire, mark, retry,
                                   NULL, 0);
@@ -575,9 +582,10 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
        честный rx_short и возвращался ложным «обрыв не воспроизвёлся».
        Завершённый ответ повтора ВЫШЕ полосы — наоборот, настоящее
        отрицательное измерение: его не подменяем. */
-    if (res->rx_tls_unavailable && !res->rx_cut && !res->rx_short) {
+    if ((res->rx_tls_unavailable || res->rx_unmeasured) && !res->rx_cut && !res->rx_short) {
         res->rx_short = 1;
         res->rx_short_bytes = was;
+        res->rx_unmeasured = 0;
     }
     /* Журнал обязан называть путь повтора: иначе обрыв прочитают как обрыв
        на «/», которого там не было. Причина складывается в два приёма и с

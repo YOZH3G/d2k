@@ -232,6 +232,7 @@ static int vol_rx_packets; /* задача 55: пакеты на обрыве id
 static int vol_rx_packet_only; /* gzip оборван на том же бюджете пакетов */
 static int vol_rx_short;              /* ответ завершён, но короче полосы */
 static uint64_t vol_rx_short_bytes;   /* его тело */
+static int vol_rx_unmeasured;         /* ответ не начался/не дошёл до статуса */
 /* ОБРЫВ ДОКАЗАН ТОЛЬКО ПЕРВЫМ ПРОГОНОМ. Поле 12.10.2026,
    www.tampermonkey.net: парная проба сошлась (identity 15627/15627), а
    назначенный следом повтор дал непарный результат — одно измерение
@@ -263,6 +264,7 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     r.rx_short = vol_rx_short;
     r.rx_short_bytes = vol_rx_short_bytes;
     r.rx_direct_complete = vol_direct_complete;
+    r.rx_unmeasured = vol_rx_unmeasured;
     r.rx_partial_bytes = vol_partial_bytes;
     r.rx_partial_wire_bytes = vol_partial_wire_bytes;
     r.rx_at_kb = vol_rx_at_kb;
@@ -9234,6 +9236,80 @@ rx_volume_tests:
         CHECK(!said("напрямую проходит") && said("результат неубедителен"),
               "partial RX body was incorrectly classified as direct success");
         vol_partial_bytes = vol_partial_wire_bytes = 0; vol_answer = D2K_VOL_PASSED;
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    /* Поле 19.10.2026, mailsuite.com: подозрение позднего обрыва (D2K_SUSPECT_RST_AFTER_APP),
+       рукопожатие CLEAR, а RX-проба ничего не измерила (rx_unmeasured, status 0).
+       Неизмеренный объём не должен становиться probe-direct или снимать привязку. */
+    {
+        d2k_catalog c = {0};
+        char pid[40];
+        own_box(&c, "box-mailsuite", pid, 2, 3, "mailsuite.example", 6, D2K_SHAPE_MODERN, 4,
+                1790000000, 0);
+        CHECK(total_bindings(&c) == 1, "начальная привязка не создана");
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        vol_rx_unmeasured = 1; vol_rx_cut = 0; vol_direct_complete = 0;
+        vol_answer = D2K_VOL_UNREACHABLE;
+        tcp_answer = D2K_V_CLEAR; tcp_calls = 0;
+        uint8_t ech_bytes[2048]; size_t ech_len = 0;
+        CHECK(ech_offer_hello("mailsuite.example", ech_bytes, sizeof ech_bytes, &ech_len) == 0 &&
+              d2k_hello_ech_offer(ech_bytes, ech_len, NULL) == 1,
+              "ECH: приветствие с ECH offer не собралось");
+        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        d2k_ev h = ev_hello(6, 40380, "mailsuite.example");
+        d2k_sched_event(s, &h);
+        d2k_ev sh; memset(&sh, 0, sizeof sh);
+        sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        memcpy(sh.shape, ech_bytes, ech_len); sh.shape_len = ech_len;
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40380); su.code = D2K_SUSPECT_RST_AFTER_APP; su.planned = D2K_LINK_PLANNED_YES;
+        d2k_sched_event(s, &su);
+        settle(s);
+        if (tcp_calls == 0) fprintf(stderr, "mailsuite test said:\n%s\n", saidbuf);
+        CHECK(tcp_calls == 1, "замер не выполнился");
+        CHECK(total_bindings(&c) == 1, "неизмеренный замер удалил подтверждённую привязку");
+        CHECK(!said("напрямую проходит"), "неизмеренный объём объявлен прямым успехом");
+        CHECK(said("объём ответа измерить не удалось"), "причина не объяснила отсутствие замера объёма");
+        CHECK(said("результат неубедителен"), "не установлен неубедительный исход");
+        vol_rx_unmeasured = 0; vol_answer = D2K_VOL_PASSED;
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    /* Доказанный TX-обрыв (D2K_VOL_CUT) имеет строгий приоритет над rx_unmeasured */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        vol_rx_unmeasured = 1; vol_rx_cut = 0; vol_direct_complete = 0;
+        vol_answer = D2K_VOL_CUT; vol_at_kb = 16;
+        tcp_answer = D2K_V_CLEAR; tcp_calls = 0;
+        d2k_ev h = ev_hello(6, 40382, "cut-priority.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40382); su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(!said("напрямую проходит") && !said("объём ответа измерить не удалось"),
+              "доказанный обрыв лестницы был подавлен rx_unmeasured");
+        vol_rx_unmeasured = 0; vol_answer = D2K_VOL_PASSED;
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    /* Затвор 1: FLAKY рукопожатия при позднем обрыве не отменяет замер объёма.
+       Если объём доказан — берём его. */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        vol_rx_unmeasured = 0; vol_rx_cut = 1; vol_rx_at_kb = 18; vol_direct_complete = 0;
+        vol_answer = D2K_VOL_PASSED; vol_calls = 0;
+        tcp_answer = D2K_V_FLAKY; tcp_calls = 0;
+        d2k_ev h = ev_hello(6, 40383, "flaky-vol.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40383); su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(vol_calls >= 1, "FLAKY рукопожатия не запустил замер объёма при позднем обрыве");
+        CHECK(!said("напрямую проходит"), "обрыв не должен давать прямой проход");
+        vol_rx_cut = 0; vol_answer = D2K_VOL_PASSED;
         d2k_sched_free(s); d2k_catalog_free(&c);
     }
     if (partial_only) goto voice_only_done;

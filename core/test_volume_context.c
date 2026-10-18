@@ -29,6 +29,7 @@ static unsigned unstarted;
 /* Поле 17.10.2026, LR-rx8-1, rua.gr: «identity-1 HTTP 200, тело 4497/0,
    complete=0» — поток встал на ~6 КБ, ниже полосы: тоже нечем мерить. */
 static unsigned early_cut;
+static int full_non_2xx;
 static int expected_gzip_call2 = -1;
 static const char *hint_host, *hint_for_path, *cut_path, *last_path;
 static int expected_gzip_call = 2;
@@ -74,6 +75,16 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
     CHECK(encoding == (baseline_calls == expected_gzip_call ||
                        baseline_calls == expected_gzip_call2));
     d2k_ver_result r = {0};
+    if (full_non_2xx) {
+        r.fd = -1; r.level = D2K_VER_APPLICATION; r.name_ok = 1;
+        r.negotiated_tls = expected_legacy ? 0x0303 : 0x0304;
+        r.status = 403; r.body_has_length = 1; r.body_framing_valid = 1;
+        r.body_complete = 1;
+        r.body_bytes = r.body_expected = 20000;
+        r.rx_tls_wire_bytes = 20500;
+        baseline_calls++;
+        return r;
+    }
     r.fd = -1; r.status = 200; r.body_has_length = 1;
     r.body_framing_valid = 1; r.body_expected = 96460;
     r.body_bytes = 23900 + baseline_calls * 10;
@@ -340,13 +351,13 @@ int main(void) {
     unstarted = 0x1; expected_gzip_call = 3; baseline_calls = 0;
     d2k_vol_result late = {0};
     probe_response_volume(&late, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
-    CHECK(baseline_calls == 4 && late.rx_cut && late.rx_at_kb == 23);
+    CHECK(baseline_calls == 4 && late.rx_cut && late.rx_at_kb == 23 && !late.rx_unmeasured);
     /* Повтор тоже пуст — измерения нет, третьего вопроса не задаём; это не
        отрицание и не непроверенный бюджет завершённого ответа. */
     unstarted = 0x3; expected_gzip_call = 2; baseline_calls = 0;
     d2k_vol_result mute = {0};
     probe_response_volume(&mute, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
-    CHECK(baseline_calls == 2 && !mute.rx_cut && !mute.rx_short);
+    CHECK(baseline_calls == 2 && !mute.rx_cut && !mute.rx_short && mute.rx_unmeasured);
     CHECK(strstr(mute.rx_reason, "HTTP 0") != NULL);
     /* Поле 17.10.2026, LR-rx2-1, rua.gr: пара identity сошлась (22577/22292),
        а gzip-контроль вернул 0 байт — и замер пропал. Пустой контроль, как и
@@ -365,6 +376,13 @@ int main(void) {
     probe_response_volume(&early, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
     CHECK(baseline_calls == 4 && early.rx_cut && early.rx_at_kb == 23);
     early_cut = 0; expected_gzip_call = 2;
+    /* Завершённый не-2xx ответ выше полосы (403 на 20 КБ) — не rx_unmeasured,
+       не rx_short, и не rx_direct_complete. */
+    full_non_2xx = 1; baseline_calls = 0;
+    d2k_vol_result fn2 = {0};
+    probe_response_volume(&fn2, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 1 && !fn2.rx_cut && !fn2.rx_short && !fn2.rx_unmeasured && !fn2.rx_direct_complete);
+    full_non_2xx = 0;
     if (failures) return 1;
     puts("test_volume_context: OK"); return 0;
 }

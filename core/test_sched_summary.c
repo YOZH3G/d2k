@@ -464,6 +464,33 @@ int main(void) {
     if (fails) fprintf(stderr, "%s\n", rows);
     task_reset(s, t);
 
+    /* Поле 19.10.2026, mailsuite.com: подозрение позднего обрыва,
+       базовый вопрос рукопожатия CLEAR, а RX-проба не измерена (rx_unmeasured).
+       Неизмеренный объём не должен становиться probe-direct. */
+    t = fixture(s);
+    t->state = T_ASKING; t->transport = 6; t->trigger_code = D2K_SUSPECT_RST_AFTER_APP;
+    t->res_ready = 1; t->res.verdict = D2K_V_CLEAR;
+    t->vol.rx_unmeasured = 1; t->vol.rx_cut = 0; t->vol.verdict = D2K_VOL_UNREACHABLE;
+    s->sync_pending = 0;
+    rows[0] = '\0';
+    (void)d2k_sched_tick(s, 900);
+    CHECK(strstr(rows, "outcome=inconclusive path=none") != NULL);
+    CHECK(strstr(rows, "outcome=probe-direct") == NULL);
+    CHECK(strstr(rows, "объём ответа измерить не удалось; прямой замер не подтверждён") != NULL);
+    task_reset(s, t);
+
+    /* Доказанный TX-обрыв (D2K_VOL_CUT) имеет строгий приоритет над rx_unmeasured */
+    t = fixture(s);
+    t->state = T_ASKING; t->transport = 6; t->trigger_code = D2K_SUSPECT_RST_AFTER_APP;
+    t->res_ready = 1; t->res.verdict = D2K_V_CLEAR;
+    t->vol.rx_unmeasured = 1; t->vol.verdict = D2K_VOL_CUT; t->vol.at_kb = 16;
+    s->sync_pending = 0;
+    rows[0] = '\0';
+    (void)d2k_sched_tick(s, 900);
+    CHECK(strstr(rows, "outcome=inconclusive") == NULL);
+    CHECK(strstr(rows, "объём ответа измерить не удалось") == NULL);
+    task_reset(s, t);
+
     /* ЗАДАЧА 26, П.3: ДОКАЗАННЫЙ ПУТЬ ПЕРЕЖИВАЕТ ЭПИЗОД. Поле 12.10.2026,
        style.sndcdn.com: обрыв доказывает повтор зонда по /css/soehne-*.css, а
        следующий эпизод снова просил «/» и получал завершённый 403 на 243

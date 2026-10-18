@@ -1827,6 +1827,12 @@ static void dead_clear(d2k_sched *s, const task *t) {
     if (d) { memset(d, 0, sizeof *d); }
 }
 
+static inline int is_late_volume_suspicion(uint8_t code) {
+    return code == D2K_SUSPECT_RST_AFTER_APP ||
+           code == D2K_SUSPECT_FIN_RETRY ||
+           code == D2K_SUSPECT_TCP_STALL;
+}
+
 static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
                            uint8_t family, uint8_t signal_code, int64_t *remaining_ms) {
     target_cooldown *c = cooldown_find(s, name, transport, family);
@@ -1836,8 +1842,7 @@ static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
        обрыве ответа. Блокировка на рукопожатии (обычный RST, таймаут SNI) —
        другое наблюдение и мерится сразу (финальное ревью, п.4). */
     if (c->late_rst_only && !c->challenge &&
-        signal_code != D2K_SUSPECT_RST_AFTER_APP && signal_code != D2K_SUSPECT_FIN_RETRY &&
-        signal_code != D2K_SUSPECT_TCP_STALL) {
+        !is_late_volume_suspicion(signal_code)) {
         return 0;
     }
     /* A changed symptom after a direct CLEAR is fresh evidence. Do not let a
@@ -2925,10 +2930,15 @@ static void *worker_run(void *vp) {
     }
 
     if (volume_after) {
-        if (r.verdict == D2K_V_CLEAR && !t->stop) {
-            /* Рукопожатие и запись прошли — теперь блок по объёму. Обрыв
-               ведёт той же веткой, что и прежде: направленная улика и
-               кандидат, без вердикта CLEAR. */
+        int allow_vol = (r.verdict == D2K_V_CLEAR ||
+                         (r.verdict == D2K_V_FLAKY &&
+                          is_late_volume_suspicion(t->trigger_code) &&
+                          !strstr(r.reason, "замер не состоялся"))) && !t->stop;
+        if (allow_vol) {
+            /* Рукопожатие и запись прошли (или для подозрения позднего
+               обрыва дали FLAKY, не отменяющий замер объёма) — теперь
+               блок по объёму. Обрыв ведёт той же веткой, что и прежде:
+               направленная улика и кандидат, без вердикта CLEAR. */
             worker_volume(s, t, trig);
             if (worker_volume_cut(s, t)) { return NULL; }
         } else {
@@ -7360,8 +7370,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     }
     task *t = task_of(s, name, ev->transport, ev->family);
     int ordinary_tcp_rst = ev->transport == 6 && ev->code == D2K_SUSPECT_RST;
-    const int late_app_rst = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
-        ev->code == D2K_SUSPECT_FIN_RETRY || ev->code == D2K_SUSPECT_TCP_STALL;
+    const int late_app_rst = is_late_volume_suspicion(ev->code);
     if (t && t->state == T_VOICE_TRIAL && voice_trial_owned(t) &&
         is_voice_class(t->name, t->transport) && !voice_trial_same_context(t, ev)) {
         /* ОПЫТ ЖДЁТ РАЗГОВОРА К ДРУГОЙ ТОЧКЕ (финальное ревью, п.1). Задача
@@ -10097,6 +10106,14 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     t->vol.rx_partial_wire_bytes ? "TLS wire" : "HTTP body",
                     (unsigned long long)(t->vol.rx_partial_wire_bytes
                         ? t->vol.rx_partial_wire_bytes : t->vol.rx_partial_bytes));
+            }
+            if (r.verdict == D2K_V_CLEAR && is_late_volume_suspicion(t->trigger_code) &&
+                t->transport == 6 && !volume_proven &&
+                (t->vol.rx_unmeasured ||
+                 (t->vol.verdict == D2K_VOL_SHORT && !t->vol.rx_direct_complete))) {
+                r.verdict = D2K_V_INCONCLUSIVE;
+                snprintf(r.reason, sizeof r.reason,
+                         "объём ответа измерить не удалось; прямой замер не подтверждён");
             }
             if (!verdict_proves_block(r.verdict) && !volume_proven && !t->ech_trial) {
                 say(s, "по %s прямой замер не подтвердил блокировку (%s: %s) — "
