@@ -512,6 +512,122 @@ static void base_injected(d2k_httpsearch *hs, fake *f, int64_t *now) {
     r.seq = f->job.seq; r.fd = f->job.fd;
     d2k_httpsearch_result(hs, &r, *now += 100);
 }
+
+static void permanent_id(const fake *f,uint8_t id[16]) {
+    const char *p=strstr(f->last_plan,"\nid ");
+    CHECK(p!=NULL,"installed plan has identity");
+    memset(id,0,16);
+    if(p)for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(p[4+2*i])*16+hexval(p[5+2*i]));
+}
+
+/* Обрыв тела после полноценного ответа сервера: один диагностический повтор,
+   сброс ok, требование двух REAL подряд и 5 минут паузы при неудаче. */
+static void test_cut_retry_and_inconclusive(void) {
+    fake f;
+    memset(&f, 0, sizeof f);
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    int64_t now = 1000;
+    d2k_httpsearch_portal(hs, "cut.example", 4, IP, now);
+    base_injected(hs, &f, &now);
+
+    /* Кандидат 1: "split" */
+    CHECK(f.set_probe_n == 1 && strstr(f.last_probe_plan, "split"), "первый кандидат split");
+    /* 1. Первый опыт успешен: REAL */
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    CHECK(f.set_probe_n == 2 && strstr(f.last_probe_plan, "split"), "тот же кандидат split на второй опыт");
+    CHECK(f.set_plan_n == 0, "один REAL ещё не подтверждает");
+
+    /* 2. Второй опыт: обрыв тела (CUT) */
+    trial(hs, &f, &now, 1, D2K_HS_CUT);
+    /* Должен получить ОДИН диагностический повтор ДЛЯ ТОГО ЖЕ кандидата split */
+    CHECK(f.set_probe_n == 3 && strstr(f.last_probe_plan, "split"), "CUT после REAL даёт диагностический повтор того же кандидата");
+    CHECK(strstr(f.said, "диагностический повтор") != NULL, "в журнале зафиксирован диагностический повтор");
+    CHECK(f.set_plan_n == 0, "CUT не подтверждает");
+
+    /* 3. Третий опыт: снова REAL (цепочка REAL -> CUT -> REAL) */
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    /* ok был сброшен в 0, поэтому теперь ok == 1, план НЕ должен подтвердиться! */
+    CHECK(f.set_plan_n == 0, "REAL после CUT не подтверждает (ok был сброшен в 0)");
+    CHECK(f.set_probe_n == 4 && strstr(f.last_probe_plan, "split"), "тот же кандидат split ждёт подтверждения (второго REAL подряд)");
+
+    /* 4. Четвёртый опыт: снова REAL (цепочка REAL -> CUT -> REAL -> REAL) */
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    /* Теперь ok == 2, подтверждено! */
+    CHECK(f.set_plan_n == 1 && !strcmp(f.last_plan_host, "cut.example"), "REAL -> CUT -> REAL -> REAL подтверждает план");
+    d2k_httpsearch_free(hs);
+
+    /* Тест 5: REAL -> CUT -> CUT (второй CUT не даёт повтора и переходит дальше),
+       а при исчерпании списка candidates с any_had_real назначается 5 минут (D2K_HS_INCONCLUSIVE_MS) */
+    memset(&f, 0, sizeof f);
+    ops = ops_of(&f);
+    hs = d2k_httpsearch_new(&ops);
+    now = 1000;
+    d2k_httpsearch_portal(hs, "retry.example", 4, IP, now);
+    base_injected(hs, &f, &now);
+
+    /* Кандидат 1: REAL, затем CUT (даёт повтор), затем снова CUT (больше повторов нет) */
+    CHECK(f.set_probe_n == 1 && strstr(f.last_probe_plan, "split"), "кандидат split");
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    trial(hs, &f, &now, 1, D2K_HS_CUT);
+    CHECK(f.set_probe_n == 3 && strstr(f.last_probe_plan, "split"), "диагностический повтор split");
+    /* Второй CUT подряд на split */
+    trial(hs, &f, &now, 1, D2K_HS_CUT);
+    /* Теперь кандидат split должен отпасть, переход к вопросу 2 (fake-badsum-whole) */
+    CHECK(f.set_probe_n == 4 && !strstr(f.last_probe_plan, "split"), "второй CUT переводит к следующему кандидату");
+
+    /* Все остальные кандидаты проваливаются тишиной */
+    while (d2k_httpsearch_busy(hs)) {
+        trial(hs, &f, &now, 1, D2K_HS_SILENT);
+    }
+    CHECK(f.set_plan_n == 0, "план не подтверждён");
+    CHECK(strstr(f.said, "устойчивость не подтверждена") != NULL, "честное сообщение в журнале о неподтверждённой устойчивости");
+    CHECK(strstr(f.said, "5 мин") != NULL, "в журнале 5 минут отсрочки");
+
+    /* Проверка отсрочки: до истечения 5 минут новый поиск по retry.example не начинается */
+    int st = f.start_n;
+    d2k_httpsearch_portal(hs, "retry.example", 4, IP, now + 1000);
+    CHECK(f.start_n == st, "поиск до истечения 5 минут не начат");
+    /* После истечения D2K_HS_INCONCLUSIVE_MS — поиск разрешён */
+    d2k_httpsearch_portal(hs, "retry.example", 4, IP, now + D2K_HS_INCONCLUSIVE_MS + 10);
+    CHECK(f.start_n == st + 1, "поиск после 5 минут начат");
+
+    d2k_httpsearch_free(hs);
+
+    /* Тест 6: any_had_real + conflicts: конфликт с живым отказом имеет приоритет над 5 минутами (получает 60 мин) */
+    memset(&f, 0, sizeof f);
+    ops = ops_of(&f);
+    hs = d2k_httpsearch_new(&ops);
+    now = 1000;
+    d2k_httpsearch_portal(hs, "conflict-real.example", 4, IP, now);
+    base_injected(hs, &f, &now);
+    /* Кандидат 1 дал REAL (any_had_real = 1) */
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    CHECK(f.set_plan_n == 1, "первый кандидат подтверждён");
+    uint8_t id[16];
+    permanent_id(&f, id);
+    /* Вносим живой отказ под этой привязкой */
+    CHECK(d2k_httpsearch_bound_failure(hs, "conflict-real.example", 4, IP, id, &f.binding,
+          999, now + 1, "/test", now + 2), "bound failure registered");
+    /* Запускаем новый поиск */
+    base_injected(hs, &f, &now);
+    /* Кандидат 1 (свой план) снова даёт REAL, но у него конфликт с живым отказом -> conflicts++ */
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    /* Все остальные проваливаются тишиной */
+    while (d2k_httpsearch_busy(hs)) {
+        trial(hs, &f, &now, 1, D2K_HS_SILENT);
+    }
+    CHECK(strstr(f.said, "живой отказ в области привязки") != NULL, "приоритет сообщения о конфликте");
+    /* Проверяем, что отсрочка именно 60 минут, а не 5 минут: через 5 минут поиск ещё НЕ должен начинаться */
+    st = f.start_n;
+    d2k_httpsearch_portal(hs, "conflict-real.example", 4, IP, now + D2K_HS_INCONCLUSIVE_MS + 10);
+    CHECK(f.start_n == st, "при конфликте отсрочка не 5 минут, а 60 минут");
+    d2k_httpsearch_portal(hs, "conflict-real.example", 4, IP, now + D2K_HS_RETRY_MS + 10);
+    CHECK(f.start_n == st + 1, "после 60 минут поиск разрешён");
+    d2k_httpsearch_free(hs);
+}
 static void test_inconclusive(void) {
     fake f;
     memset(&f, 0, sizeof f);
@@ -757,13 +873,6 @@ static void test_pending_revoke(void) {
     d2k_httpsearch_install_ack(hs,token,1,&f.binding);
     CHECK(f.del_plan_n==deleted+1&&!f.unknown_delete,"late SET ACK must complete pending exact revocation");
     d2k_httpsearch_free(hs);
-}
-
-static void permanent_id(const fake *f,uint8_t id[16]) {
-    const char *p=strstr(f->last_plan,"\nid ");
-    CHECK(p!=NULL,"installed plan has identity");
-    memset(id,0,16);
-    if(p)for(int i=0;i<16;i++)id[i]=(uint8_t)(hexval(p[4+2*i])*16+hexval(p[5+2*i]));
 }
 
 static void test_live_failure_outweighs_probe(void) {
@@ -1062,6 +1171,7 @@ int main(void) {
     test_silent_base_after_portal();
     test_probe_cut();
     test_cut_search();
+    test_cut_retry_and_inconclusive();
     test_execution_identity();
     test_each_request_execution();
 #ifdef D2K_HS_KEEPALIVE_PROOF
