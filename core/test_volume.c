@@ -145,6 +145,26 @@ int main(void) {
     memset(&out, 0, sizeof out);
     CHECK(!d2k_volume_rx_evidence(&a, &b, &gz, &out) && !out.rx_cut,
           "несжатый «контроль» принят за пакетную примету");
+    /* ПОЛЕ 17.10.2026, LR-rx3-1, rua.gr: «RX identity 18187/22292 (пакетов
+       26/26); gzip тело 20272, complete=0, пакетов 26». Бюджет коробки —
+       ПАКЕТЫ, и при одном бюджете байты законно расходятся (поле 04.10:
+       25–27 пакетов при 5,9–29,6 КБ). Байтовый допуск отверг пакетную
+       примету, и поиск ушёл в покой на 10 минут. */
+    a = identity_cut(18187, 219136, 1, 0);
+    b = identity_cut(22292, 219136, 1, 0);
+    gz = identity_cut(20272, 0, 0, 1);
+    gz.body_encoding = 1;
+    a.data_packets = 26; b.data_packets = 26; gz.data_packets = 26;
+    memset(&out, 0, sizeof out);
+    CHECK(d2k_volume_rx_evidence(&a, &b, &gz, &out) && out.rx_cut &&
+          out.rx_cut_packets == 26 && !out.rx_compressed_complete,
+          "rua.gr 17.10: один бюджет пакетов при разных байтах — примета не принята");
+    /* Байтовая примета (gzip завершился) байтового допуска не теряет. */
+    gz = identity_cut(18000, 18000, 1, 0);
+    gz.body_complete = 1; gz.body_encoding = 1; gz.data_packets = 14;
+    memset(&out, 0, sizeof out);
+    CHECK(!d2k_volume_rx_evidence(&a, &b, &gz, &out) && !out.rx_cut,
+          "байтовая примета с расхождением 4 КБ принята без пакетного бюджета");
 
     /* A complete TLS handshake can be followed by 14 KiB of an unfinished
        encrypted record: HTTP status/body remain zero, not the RX progress.

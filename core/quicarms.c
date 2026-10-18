@@ -245,18 +245,6 @@ static const char *prop_word(int8_t v) {
     return v==D2K_PROP_YES ? "прошло" : v==D2K_PROP_NO ? "не прошло" : "ответа нет";
 }
 
-/* То же, но с различением ДВУХ «не измерено». «Ответа нет» — вопрос задан, и
-   коробка промолчала: это наблюдение о НЕЙ. «Не задан» — вопрос до провода не
-   дошёл (приём невыразим для этого входа: у приветствия из нескольких
-   датаграмм разрез CRYPTO не собирается), и о коробке это не говорит НИЧЕГО.
-   Поле 15.10.2026: www.facebook.com, ECH-пачка — разрез не собрался дважды,
-   а в итоге поиска стояло «разрез CRYPTO: ответа нет», и это читалось как
-   отказ коробки. Разные вещи, слитые в одно слово, увели разбор на полдня. */
-static const char *prop_word_asked(int8_t v, int8_t asked) {
-    if (v == D2K_PROP_UNKNOWN && !asked) { return "не задан (невыразим)"; }
-    return prop_word(v);
-}
-
 d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
     d2k_quic_arm r; memset(&r,0,sizeof r);
     r.kind=D2K_QA_NOT_FOUND; r.original=1; r.strategy=D2K_QS_NONE;
@@ -398,8 +386,7 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *c) {
             } else {
                 snprintf(r.reason,sizeof r.reason,
                          "ответа нет (разрешение: %s, разрез CRYPTO: %s) — запасной перебор: %.90s",
-                         prop_word_asked(cl, r.clearance_asked),
-                         prop_word_asked(sp, r.split_asked), l.reason);
+                         prop_word(cl),prop_word(sp),l.reason);
             }
             return r;
         }

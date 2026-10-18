@@ -86,3 +86,19 @@ test-identity: $(BUILD_DIR)/test-identity
 $(BUILD_DIR)/test-identity: test_identity.c src/identity.c include/tg_identity.h
 	mkdir -p $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -o $@ test_identity.c src/identity.c $(OPENSSL_LIBS)
+
+# Real local socket closure and output backpressure exercise private ownership.
+TUNNEL_TEST_SRC = test_tunnel_lifetime.c src/ws.c src/ws_pump.c src/listener.c src/streams.c src/queue.c src/wire.c src/session.c src/identity.c
+TUNNEL_TEST_HDR = include/tg_tunnel.h include/tg_ws.h include/tg_streams.h include/tg_listener.h include/tg_session.h include/tg_wire.h
+.PHONY: test-tunnel-lifetime san-tunnel-lifetime
+test: test-tunnel-lifetime
+test-tunnel-lifetime: $(BUILD_DIR)/test-tunnel-lifetime
+	./$(BUILD_DIR)/test-tunnel-lifetime
+$(BUILD_DIR)/test-tunnel-lifetime: $(TUNNEL_TEST_SRC) src/tunnel.c $(TUNNEL_TEST_HDR)
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -o $@ $(TUNNEL_TEST_SRC) $(OPENSSL_LIBS)
+san-tunnel-lifetime: $(BUILD_DIR)/test-tunnel-lifetime-san
+	./$(BUILD_DIR)/test-tunnel-lifetime-san
+$(BUILD_DIR)/test-tunnel-lifetime-san: $(TUNNEL_TEST_SRC) src/tunnel.c $(TUNNEL_TEST_HDR)
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -o $@ $(TUNNEL_TEST_SRC) $(OPENSSL_LIBS)

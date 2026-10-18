@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <netinet/tcp.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -166,15 +167,16 @@ static void service_local_fd(const tg_tunnel_config *cfg,tg_stream_table *table,
             ssize_t n=recv(s->fd,data,want,0);
             if(n>0) {
                 s->last_activity_ms=monotonic_ms();
-                if(tg_stream_send_data(s,data,(size_t)n)!=0 || queue_mux(pump,s->id,MUX_DATA,data,(size_t)n)!=0)
-                    close_local_stream(table,s,1,pump);
+                if(tg_stream_send_data(s,data,(size_t)n)!=0 || queue_mux(pump,s->id,MUX_DATA,data,(size_t)n)!=0) {
+                    close_local_stream(table,s,1,pump);return;
+                }
             } else if(n==0){tg_stream_local_eof(s);close_local_stream(table,s,1,pump);return;}
             else if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR){close_local_stream(table,s,1,pump);return;}
         }
     }
     if(revents&POLLHUP) {
         uint8_t data[1];ssize_t n=recv(s->fd,data,sizeof(data),MSG_PEEK);
-        if(n==0)close_local_stream(table,s,1,pump);
+        if(n==0){close_local_stream(table,s,1,pump);return;}
     }
     if(s->remote_closed&&tg_stream_ready_to_close(s)&&s->local_pending_len==0)tg_stream_remove(table,s);
 }
@@ -194,8 +196,15 @@ int tg_tunnel_run(const tg_tunnel_config *cfg) {
         uint64_t loop_now=monotonic_ms();
         for(size_t i=0;i<streams.capacity;i++) {
             tg_stream *s=streams.items[i];if(!s||!s->connected)continue;
-            if(loop_now>=s->last_activity_ms&&loop_now-s->last_activity_ms>=TG_STREAM_IDLE_TIMEOUT_MS)
+            if(loop_now>=s->last_activity_ms&&loop_now-s->last_activity_ms>=TG_STREAM_IDLE_TIMEOUT_MS) {
+                time_t wall=time(NULL);struct tm tmv;char stamp[32]="unknown-time";
+                if(localtime_r(&wall,&tmv))strftime(stamp,sizeof(stamp),"%Y-%m-%d %H:%M:%S",&tmv);
+                fprintf(stderr,"%s d2ktg: stream=%u closed reason=idle idle_ms=%llu queued=%zu pending=%zu\n",
+                    stamp,(unsigned)s->id,(unsigned long long)(loop_now-s->last_activity_ms),
+                    s->to_local.bytes,s->local_pending_len-s->local_pending_offset);
+                fflush(stderr);
                 close_local_stream(&streams,s,1,&pump);
+            }
         }
         struct pollfd fds[TG_STREAM_MAX+2];tg_stream *map[TG_STREAM_MAX];nfds_t count=2;
         fds[0]=(struct pollfd){.fd=cfg->listener_fd,.events=POLLIN};

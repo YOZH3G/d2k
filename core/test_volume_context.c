@@ -21,6 +21,15 @@ static int short_then_hint, hint_status;
 /* Что отдаёт подсказанный ресурс: 0 — обрыв, 1 — нет TLS, 2 — завершённый
    ответ ВЫШЕ полосы (настоящее отрицательное измерение). */
 static int retry_outcome;
+/* Поле 17.10.2026, rua.gr, вход без ECH: TLS 1.3 согласован, а на GET не
+   пришло ни байта (HTTP 0, wire=0) — с роутера так 2 из 5 замеров подряд,
+   при этом остальные identity режутся на ~23 КБ. Ответ не начался — мерить
+   было нечем. Маска номеров вызовов, которые вернут пустой ответ. */
+static unsigned unstarted;
+/* Поле 17.10.2026, LR-rx8-1, rua.gr: «identity-1 HTTP 200, тело 4497/0,
+   complete=0» — поток встал на ~6 КБ, ниже полосы: тоже нечем мерить. */
+static unsigned early_cut;
+static int expected_gzip_call2 = -1;
 static const char *hint_host, *hint_for_path, *cut_path, *last_path;
 static int expected_gzip_call = 2;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "volume-context:%d: %s\n", __LINE__, #c); failures++; } } while (0)
@@ -62,7 +71,8 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
     (void)ip; (void)port; (void)ms;
     CHECK(strcmp(sni, "context.test") == 0 && legacy == expected_legacy &&
           wire == expected_wire && mark == 0x2f);
-    CHECK(encoding == (baseline_calls == expected_gzip_call));
+    CHECK(encoding == (baseline_calls == expected_gzip_call ||
+                       baseline_calls == expected_gzip_call2));
     d2k_ver_result r = {0};
     r.fd = -1; r.status = 200; r.body_has_length = 1;
     r.body_framing_valid = 1; r.body_expected = 96460;
@@ -98,6 +108,18 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
             r.negotiated_tls = expected_legacy ? 0x0303 : 0x0304;
             r.body_expected = r.body_bytes = 4000; r.rx_tls_wire_bytes = 4500;
         }
+    }
+    if (unstarted & (1u << baseline_calls)) {
+        memset(&r, 0, sizeof r); r.fd = -1;
+        r.level = D2K_VER_HANDSHAKE; r.name_ok = 1; r.negotiated_tls = 0x0304;
+        snprintf(r.reason, sizeof r.reason,
+                 "нет полных заголовков окончательного HTTP-ответа: не дождались 5 байт");
+    }
+    if (early_cut & (1u << baseline_calls)) {
+        memset(&r, 0, sizeof r); r.fd = -1;
+        r.level = D2K_VER_HANDSHAKE; r.name_ok = 1; r.negotiated_tls = 0x0304;
+        r.status = 200; r.body_framing_valid = 1; r.body_chunked = 1;
+        r.body_bytes = 4497; r.rx_tls_wire_bytes = 6063; r.rx_tls_record_missing = 1342;
     }
     if (repeat_missing && baseline_calls == 1) {
         memset(&r, 0, sizeof r); r.fd = -1;
@@ -311,6 +333,38 @@ int main(void) {
     probe_response_volume(&same, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, hint_for_path);
     CHECK(baseline_calls == 1 && !same.rx_cut && same.rx_short);
     short_then_hint = 0; hint_host = NULL; expected_gzip_call = 2;
+    /* ОТВЕТ НЕ НАЧАЛСЯ — ОДИН ПОВТОР (поле 17.10.2026, rua.gr). Пустой
+       identity-1 не говорит об обрыве ничего; прежде поиск закрывался
+       «позднее закрытие не подтвердилось» и отдыхом на 10 минут, хотя
+       следующий же поток резался на 23 КБ. */
+    unstarted = 0x1; expected_gzip_call = 3; baseline_calls = 0;
+    d2k_vol_result late = {0};
+    probe_response_volume(&late, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 4 && late.rx_cut && late.rx_at_kb == 23);
+    /* Повтор тоже пуст — измерения нет, третьего вопроса не задаём; это не
+       отрицание и не непроверенный бюджет завершённого ответа. */
+    unstarted = 0x3; expected_gzip_call = 2; baseline_calls = 0;
+    d2k_vol_result mute = {0};
+    probe_response_volume(&mute, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 2 && !mute.rx_cut && !mute.rx_short);
+    CHECK(strstr(mute.rx_reason, "HTTP 0") != NULL);
+    /* Поле 17.10.2026, LR-rx2-1, rua.gr: пара identity сошлась (22577/22292),
+       а gzip-контроль вернул 0 байт — и замер пропал. Пустой контроль, как и
+       пустой identity-2, — не ответ: один повтор того же вопроса. */
+    unstarted = 0x4; expected_gzip_call = 2; expected_gzip_call2 = 3; baseline_calls = 0;
+    d2k_vol_result gzmute = {0};
+    probe_response_volume(&gzmute, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 4 && gzmute.rx_cut && gzmute.rx_at_kb == 23);
+    unstarted = 0x2; expected_gzip_call = 3; expected_gzip_call2 = -1; baseline_calls = 0;
+    d2k_vol_result idmute = {0};
+    probe_response_volume(&idmute, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 4 && idmute.rx_cut && idmute.rx_at_kb == 23);
+    unstarted = 0; expected_gzip_call = 2;
+    early_cut = 0x1; expected_gzip_call = 3; baseline_calls = 0;
+    d2k_vol_result early = {0};
+    probe_response_volume(&early, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 4 && early.rx_cut && early.rx_at_kb == 23);
+    early_cut = 0; expected_gzip_call = 2;
     if (failures) return 1;
     puts("test_volume_context: OK"); return 0;
 }

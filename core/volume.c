@@ -151,7 +151,6 @@ int d2k_volume_rx_evidence(const d2k_ver_result *a,
                                b->body_expected <= b->body_bytes)) { return 0; }
     uint64_t delta = a->body_bytes > b->body_bytes
                    ? a->body_bytes - b->body_bytes : b->body_bytes - a->body_bytes;
-    if (delta > (uint64_t)D2K_VOLUME_SLACK * 1024) { return 0; }
     if (gzip->status < 200 || gzip->status >= 300 || !gzip->body_framing_valid ||
         gzip->body_encoding != 1 || gzip->body_bytes == 0) { return 0; }
     /* ДВЕ ПРИМЕТЫ ОДНОГО И ТОГО ЖЕ: ОБРЫВ ПО БАЙТАМ И ОБРЫВ ПО ПАКЕТАМ.
@@ -175,6 +174,10 @@ int d2k_volume_rx_evidence(const d2k_ver_result *a,
         if (hi - lo > D2K_VOLUME_PACKET_SLACK) { return 0; }
         packet_budget = 1;
     }
+    /* Байтовый допуск — только байтовой примете. При пакетной байты одного
+       бюджета законно расходятся (25–27 пакетов при 5,9–29,6 КБ; поле
+       17.10.2026, rua.gr: 18187/22292 байт на 26/26/26 пакетах). */
+    if (!packet_budget && delta > (uint64_t)D2K_VOLUME_SLACK * 1024) { return 0; }
 
     out->rx_cut = 1; out->rx_wire_basis = 0;
     uint64_t midpoint = (a->body_bytes < b->body_bytes ? a->body_bytes : b->body_bytes)
@@ -254,14 +257,8 @@ static void fill_pad(char *out, size_t n) {
     if (f) { fclose(f); }
 }
 
-/* use_fd — УЖЕ ЗАНЯТЫЙ сокет (d2k_props_bind_family), ещё не подключённый.
-   Нужен опросу свойств по обрыву объёма (volprops.c): план вопроса ставится
-   на КОНКРЕТНЫЙ местный порт, и порт обязан быть занят ДО установки плана,
-   иначе вопрос подействовал бы на чужие соединения к тому же имени. Меньше
-   нуля — завести свой сокет, как раньше. Метку на чужой сокет не ставим:
-   её смысл («мерить линию, а не план») противоположен смыслу вопроса. */
-static int connect_bounded_on(int use_fd, const char *ip, uint16_t port, uint32_t mark,
-                              char *reason, size_t cap) {
+static int connect_bounded(const char *ip, uint16_t port, uint32_t mark,
+                           char *reason, size_t cap) {
     struct sockaddr_storage addr;
     socklen_t addrlen;
     int family;
@@ -278,14 +275,14 @@ static int connect_bounded_on(int use_fd, const char *ip, uint16_t port, uint32_
         snprintf(reason, cap, "адрес \"%s\" не разбирается", ip);
         return -1;
     }
-    int fd = use_fd >= 0 ? use_fd : socket(family, SOCK_STREAM, 0);
+    int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) { snprintf(reason, cap, "сокет: %s", strerror(errno)); return -1; }
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 #ifdef SO_NOSIGPIPE
     (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
-    if (use_fd < 0 && mark != 0 && d2k_mark_hook(fd, mark) != 0) {
+    if (mark != 0 && d2k_mark_hook(fd, mark) != 0) {
         /* Метка не поставилась — проба пойдёт ПО ОБЩИМ ПРАВИЛАМ, то есть
            через уже поставленный план. Это меряло бы работу плана, а не линию,
            и молча так делать нельзя. */
@@ -324,7 +321,6 @@ static int connect_bounded_on(int use_fd, const char *ip, uint16_t port, uint32_
     (void)fcntl(fd, F_SETFL, flags);
     return fd;
 }
-
 
 /* Читает заголовки ответа до пустой строки. 0 — прочитано, -1 — обрыв. */
 static int drain_head_tls(d2k_tls *t, d2k_tls12 *t12, int wait_ms, char *reason, size_t cap) {
@@ -410,6 +406,32 @@ static int resource_retry_path(const d2k_ver_result *a, const char *sni,
     return 0;
 }
 
+/* ОТВЕТ НЕ НАЧАЛСЯ — МЕРИТЬ БЫЛО НЕЧЕМ (поле 17.10.2026, rua.gr, вход без
+   ECH). TLS согласован, а на GET не пришло ни одного полного заголовка: с
+   роутера так 2 замера из 5 подряд, остальные identity резались на ~23 КБ, и
+   так же пустым приходил gzip-контроль сошедшейся пары. Об обрыве такой ответ
+   не говорит ничего; один повтор того же вопроса по названной причине, не
+   перебор. */
+static d2k_ver_result rx_probe(const char *ip, uint16_t port, const char *sni,
+                               size_t hello_wire, int tls12, int encoding,
+                               uint32_t mark, const char *path) {
+    d2k_ver_result r = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
+                                                  hello_wire, tls12, encoding, mark, path);
+    /* Тот же шум — и ответ, вставший раньше полосы (поле 17.10.2026, LR-rx8-1:
+       «HTTP 200, тело 4497/0, complete=0»): ни обрыва в полосе, ни отрицания. */
+    int early = r.status >= 200 && r.status < 300 && !r.body_complete &&
+                r.body_bytes < (uint64_t)D2K_VOL_MIN_KB * 1024;
+    if ((r.status == 0 || early) && r.level == D2K_VER_HANDSHAKE && r.name_ok == 1 &&
+        (r.negotiated_tls == 0x0303 || r.negotiated_tls == 0x0304) &&
+        !r.local_limit && !d2k_volume_rx_partial(&r)) {
+        d2k_verify_close(&r);
+        nap_ms(RESPONSE_PROBE_GAP_MS);
+        r = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
+                                     hello_wire, tls12, encoding, mark, path);
+    }
+    return r;
+}
+
 /* Входящее измерение — другой вопрос, чем лестница исходящих HEAD выше.
    Ищем воспроизводимую асимметрию: два identity-ответа с одним framing видом
    обрываются на близком объёме, а gzip-представление той же страницы доходит
@@ -426,8 +448,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
                                    size_t hello_wire, uint32_t mark, const char *path,
                                    char *retry, size_t retry_cap) {
     if (!res || !ip || !sni || !sni[0] || port == 80) { return 0; }
-    d2k_ver_result a = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
-                                                  hello_wire, tls12, 0, mark, path);
+    d2k_ver_result a = rx_probe(ip, port, sni, hello_wire, tls12, 0, mark, path);
     res->rx_tls_unavailable = a.level == D2K_VER_TRANSPORT && a.status == 0;
     if (a.body_complete && a.status >= 200 && a.status < 300 &&
         a.http_outcome != D2K_HTTP_BLOCKED && a.http_outcome != D2K_HTTP_LEGAL_DENIAL) {
@@ -462,8 +483,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
     if (rx_wire_partial(&a)) res->rx_partial_wire_bytes = a.rx_tls_wire_bytes;
     else res->rx_partial_bytes = a.body_bytes;
     nap_ms(RESPONSE_PROBE_GAP_MS);
-    d2k_ver_result b = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
-                                                  hello_wire, tls12, 0, mark, path);
+    d2k_ver_result b = rx_probe(ip, port, sni, hello_wire, tls12, 0, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity-1 partial=%llu/%llu TLS=%04x wire=%llu missing=%u; "
              "identity-2 HTTP %d body=%llu complete=%d TLS=%04x wire=%llu missing=%u: %.40s",
@@ -482,8 +502,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
         /* Повтор дошёл до конца, пройдя полосу: измерения РАСХОДЯТСЯ. Судит
            третий identity-прогон того же домена — см. d2k_volume_rx_needs_repeat. */
         nap_ms(RESPONSE_PROBE_GAP_MS);
-        d2k_ver_result c = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
-                                                      hello_wire, tls12, 0, mark, path);
+        d2k_ver_result c = rx_probe(ip, port, sni, hello_wire, tls12, 0, mark, path);
         int agreed = d2k_volume_rx_pair_agrees(&a, &c);
         snprintf(res->rx_reason, sizeof res->rx_reason,
                  "identity-1 partial=%llu wire=%llu; identity-2 HTTP %d body=%llu "
@@ -507,8 +526,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
         settled_by_third = "; пару решил identity-3";
     }
     nap_ms(RESPONSE_PROBE_GAP_MS);
-    d2k_ver_result gz = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
-                                                   hello_wire, tls12, 1, mark, path);
+    d2k_ver_result gz = rx_probe(ip, port, sni, hello_wire, tls12, 1, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity %llu/%llu (пакетов %u/%u); gzip HTTP %d, тело %llu, complete=%d, "
              "encoding=%d, пакетов %u; TLS RX wire=%llu/%llu/%llu missing=%u/%u/%u%s",
@@ -572,9 +590,9 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     snprintf(res->rx_reason, sizeof res->rx_reason, "%.102s: %.150s", lead, measured);
 }
 
-d2k_vol_result d2k_volume_probe_on(int use_fd, const char *ip, uint16_t port,
-                                   const char *sni, int plain, int tls12,
-                                   size_t hello_wire, uint32_t mark, const char *path) {
+d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *sni,
+                                int plain, int tls12, size_t hello_wire,
+                                uint32_t mark, const char *path) {
     d2k_vol_result res;
     memset(&res, 0, sizeof res);
     res.verdict = D2K_VOL_UNREACHABLE;
@@ -585,7 +603,7 @@ d2k_vol_result d2k_volume_probe_on(int use_fd, const char *ip, uint16_t port,
     }
 
     int64_t started = now_ms();
-    int fd = connect_bounded_on(use_fd, ip, port, mark, res.reason, sizeof res.reason);
+    int fd = connect_bounded(ip, port, mark, res.reason, sizeof res.reason);
     if (fd < 0) { return res; }
 
     d2k_tls *tls = NULL;
@@ -704,12 +722,6 @@ d2k_vol_result d2k_volume_probe_on(int use_fd, const char *ip, uint16_t port,
         probe_response_volume(&res, ip, port, sni, tls12, hello_wire, mark, path);
     }
     return res;
-}
-
-d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *sni,
-                                int plain, int tls12, size_t hello_wire,
-                                uint32_t mark, const char *path) {
-    return d2k_volume_probe_on(-1, ip, port, sni, plain, tls12, hello_wire, mark, path);
 }
 
 d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,

@@ -934,6 +934,60 @@ int main(void) {
         }
     }
 
+    /* Регрессионный тест (Claude review rx12, п. 2):
+       Имя с QUIC-записью, на адресе — TCP-план другого имени (соседа по CDN).
+       TCP-поток к имени с QUIC-планом НЕ ДОЛЖЕН получать TCP-план адреса!
+       QUIC-поток к имени находит свой QUIC-план имени.
+       QUIC-поток к имени с TCP-планом (например, ECH QUIC) находит QUIC-план адреса. */
+    {
+        d2k_plantab *t = d2k_plantab_new(8);
+        uint32_t ip = addr(104, 21, 50, 1);
+        const uint8_t name_quic[] = "quiconly.example";
+        size_t nq_len = sizeof name_quic - 1;
+        d2k_plan *p_name_quic = mkplan();
+        d2k_plan *p_addr_tcp = mkplan();
+
+        CHECK(d2k_plantab_set_name_family(t, name_quic, nq_len, 1, p_name_quic,
+                                          D2K_PLAN_SHAPE_QUIC, 0, 4) == 0,
+              "quic name install failed");
+        CHECK(d2k_plantab_set_addr_shaped(t, (const uint8_t *)&ip, 4, 2, p_addr_tcp,
+                                          D2K_PLAN_SHAPE_MODERN) == 0,
+              "tcp addr install failed");
+
+        /* 1. QUIC поток к name_quic находит p_name_quic */
+        CHECK(d2k_plantab_find_target(t, name_quic, nq_len, (const uint8_t *)&ip, 4,
+                                      10, D2K_PLAN_SHAPE_QUIC, 0) == p_name_quic,
+              "quic stream did not find name quic plan");
+
+        /* 2. TCP поток к name_quic НЕ должен подхватить TCP-план соседа по CDN с адреса */
+        CHECK(d2k_plantab_find_target(t, name_quic, nq_len, (const uint8_t *)&ip, 4,
+                                      11, D2K_PLAN_SHAPE_MODERN, 0) == NULL,
+              "TCP stream to quic-only name incorrectly inherited neighbor CDN TCP plan from address");
+
+        /* 3. Безымянный TCP поток к адресу получает p_addr_tcp */
+        CHECK(d2k_plantab_find_target(t, NULL, 0, (const uint8_t *)&ip, 4,
+                                      12, D2K_PLAN_SHAPE_MODERN, 0) == p_addr_tcp,
+              "anonymous TCP stream did not find addr tcp plan");
+
+        /* 4. Имя с TCP-планом (например, домен с ECH): QUIC-поток находит QUIC-план адреса */
+        const uint8_t name_tcp[] = "tcponly.example";
+        size_t nt_len = sizeof name_tcp - 1;
+        d2k_plan *p_name_tcp = mkplan();
+        d2k_plan *p_addr_quic = mkplan();
+        CHECK(d2k_plantab_set_name_family(t, name_tcp, nt_len, 3, p_name_tcp,
+                                          D2K_PLAN_SHAPE_MODERN, 0, 4) == 0,
+              "tcp name install failed");
+        CHECK(d2k_plantab_set_addr_shaped(t, (const uint8_t *)&ip, 4, 4, p_addr_quic,
+                                          D2K_PLAN_SHAPE_QUIC) == 0,
+              "quic addr install failed");
+
+        CHECK(d2k_plantab_find_target(t, name_tcp, nt_len, (const uint8_t *)&ip, 4,
+                                      13, D2K_PLAN_SHAPE_QUIC, 0) == p_addr_quic,
+              "quic stream to tcp-only name did not fall through to quic address plan");
+
+        d2k_plantab_free(t);
+    }
+
     if (fails) {
         printf("ПРОВАЛОВ: %d\n", fails);
         return 1;
