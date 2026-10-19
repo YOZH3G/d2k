@@ -2933,7 +2933,7 @@ static void *worker_run(void *vp) {
         int allow_vol = (r.verdict == D2K_V_CLEAR ||
                          (r.verdict == D2K_V_FLAKY &&
                           is_late_volume_suspicion(t->trigger_code) &&
-                          !strstr(r.reason, "замер не состоялся"))) && !t->stop;
+                          !r.not_measured)) && !t->stop;
         if (allow_vol) {
             /* Рукопожатие и запись прошли (или для подозрения позднего
                обрыва дали FLAKY, не отменяющий замер объёма) — теперь
@@ -10138,7 +10138,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            "это временный ограничитель, а не запись в каталоге",
                         t->name, (long long)((delay_ms + 59999) / 60000));
                 } else if (r.verdict == D2K_V_FLAKY && t->transport == 6 &&
-                           strstr(r.reason, "замер не состоялся")) {
+                           r.not_measured) {
                     /* АДРЕС НЕ ПРИНИМАЛ СОЕДИНЕНИЙ ПОСРЕДИ ЗАМЕРА (поле 17.10.2026,
                        flibusta.is): после серии приветствий с триггером коробка
                        глушит SYN к адресу — с роутера после 40 таких запросов

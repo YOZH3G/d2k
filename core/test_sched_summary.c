@@ -491,6 +491,33 @@ int main(void) {
     CHECK(strstr(rows, "объём ответа измерить не удалось") == NULL);
     task_reset(s, t);
 
+    /* Машинный флаг not_measured (истёк срок подключения, d2k_dial_deadline_err):
+       FLAKY + not_measured=1 даёт исход outcome=unknown path=none ("замер не состоялся").
+       FLAKY + not_measured=0 даёт исход outcome=inconclusive path=none даже с тем же текстом reason. */
+    t = fixture(s);
+    t->state = T_ASKING; t->transport = 6;
+    t->res_ready = 1; t->res.verdict = D2K_V_FLAKY; t->res.not_measured = 1;
+    snprintf(t->res.reason, sizeof t->res.reason, "наш срок на подключение 6000 мс истёк — замер не состоялся");
+    s->sync_pending = 0;
+    rows[0] = '\0';
+    (void)d2k_sched_tick(s, 900);
+    CHECK(strstr(rows, "outcome=unknown path=none") != NULL);
+    CHECK(strstr(rows, "замер не состоялся: адрес не принимал соединений") != NULL);
+    task_reset(s, t);
+
+    /* Тот же текст без машинного флага не имитирует этот исход: машинный признак, а не строка. */
+    t = fixture(s);
+    t->state = T_ASKING; t->transport = 6;
+    t->res_ready = 1; t->res.verdict = D2K_V_FLAKY; t->res.not_measured = 0;
+    snprintf(t->res.reason, sizeof t->res.reason, "наш срок на подключение 6000 мс истёк — замер не состоялся");
+    s->sync_pending = 0;
+    rows[0] = '\0';
+    (void)d2k_sched_tick(s, 900);
+    CHECK(strstr(rows, "outcome=inconclusive path=none") != NULL);
+    CHECK(strstr(rows, "outcome=unknown") == NULL);
+    CHECK(strstr(rows, "замер не состоялся: адрес не принимал соединений") == NULL);
+    task_reset(s, t);
+
     /* ЗАДАЧА 26, П.3: ДОКАЗАННЫЙ ПУТЬ ПЕРЕЖИВАЕТ ЭПИЗОД. Поле 12.10.2026,
        style.sndcdn.com: обрыв доказывает повтор зонда по /css/soehne-*.css, а
        следующий эпизод снова просил «/» и получал завершённый 403 на 243
