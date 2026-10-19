@@ -164,7 +164,7 @@ static int portal_marker(const char *host) {
 
 static int is_known_portal_host(const char *host) {
     if (!host) { return 0; }
-    for (size_t i = 0; i < d2k_http_portal_count(); i++) {
+    for (size_t i = 0; d2k_http_portal(i) != NULL; i++) {
         const char *p = d2k_http_portal(i);
         if (p && strcasecmp(host, p) == 0) { return 1; }
     }

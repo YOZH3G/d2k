@@ -19,9 +19,6 @@ static inline int d2k_http_hostchar(unsigned char c) {
     return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
         c == '_' || c == '.' || c == '-';
 }
-static inline size_t d2k_http_portal_count(void) {
-    return 8;
-}
 static inline const char *d2k_http_portal(size_t i) {
     static const char *const hosts[] = {"eais.rkn.gov.ru", "lawfilter.ertelecom.ru",
         "blackhole.svyaztelecom.ru", "warning.rt.ru", "warn.beeline.ru", "deny.megafon.ru",
@@ -49,16 +46,9 @@ static inline const char *d2k_http_location_portal(const char *location) {
         if (numeric) end = colon;
     }
     if (end > p && end[-1] == '.') end--;
-    for (size_t i = 0; i < d2k_http_portal_count(); i++) {
+    for (size_t i = 0; d2k_http_portal(i) != NULL; i++) {
         const char *host = d2k_http_portal(i);
         if ((size_t)(end - p) == strlen(host) && d2k_http_equal(p, host, strlen(host))) return host;
-    }
-    if (*end == '/' && end + 4 <= (const unsigned char *)location + n) {
-        if (d2k_http_equal(end, "/rkn", 4)) {
-            unsigned char next = end[4];
-            if (next == '-' || next == '/' || next == '?' || next == '_' || next == '.' || next <= 32)
-                return "rkn";
-        }
     }
     return NULL;
 }
@@ -83,7 +73,7 @@ static inline d2k_http_reply_result d2k_http_reply_classify(int code,
         if (d2k_http_equal(body + p, phrase, pn)) {
             r.outcome = D2K_HTTP_BLOCKED; r.evidence = phrase; return r;
         }
-    for (size_t i = 0; i < d2k_http_portal_count(); i++) {
+    for (size_t i = 0; d2k_http_portal(i) != NULL; i++) {
         const char *host = d2k_http_portal(i); size_t hn = strlen(host);
         for (size_t p = 0; p + hn <= length; p++) {
             if (p && d2k_http_hostchar(body[p-1])) continue;
