@@ -240,7 +240,7 @@ typedef struct {
     int  stopped;
     /* Замер НЕ СОСТОЯЛСЯ из-за истечения нашего срока на подключение
      * (d2k_dial_deadline_err): это не отказ цели и не неубедительный замер. */
-    int  not_measured;
+    int  dial_deadline;
 
     int  trigger_len;
     int  boundary;    /* первая позиция разреза, которая УЖЕ не проходит */

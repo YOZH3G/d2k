@@ -491,12 +491,41 @@ int main(void) {
     CHECK(strstr(rows, "объём ответа измерить не удалось") == NULL);
     task_reset(s, t);
 
-    /* Машинный флаг not_measured (истёк срок подключения, d2k_dial_deadline_err):
-       FLAKY + not_measured=1 даёт исход outcome=unknown path=none ("замер не состоялся").
-       FLAKY + not_measured=0 даёт исход outcome=inconclusive path=none даже с тем же текстом reason. */
+    /* Полный не-2xx ответ выше полосы (напр. 403 на 20 КБ) при позднем обрыве:
+       рукопожатие CLEAR, TX PASSED, rx_direct_complete = 0.
+       Не должен давать probe-direct и не должен стирать привязку. */
+    t = fixture(s);
+    t->state = T_ASKING; t->transport = 6; t->trigger_code = D2K_SUSPECT_RST_AFTER_APP;
+    t->res_ready = 1; t->res.verdict = D2K_V_CLEAR;
+    t->vol.verdict = D2K_VOL_PASSED;
+    t->vol.rx_cut = 0; t->vol.rx_short = 0; t->vol.rx_unmeasured = 0; t->vol.rx_direct_complete = 0;
+    s->sync_pending = 0;
+    rows[0] = '\0';
+    (void)d2k_sched_tick(s, 900);
+    CHECK(strstr(rows, "outcome=inconclusive path=none") != NULL);
+    CHECK(strstr(rows, "outcome=probe-direct") == NULL);
+    CHECK(strstr(rows, "прямой ответ не подтвердил прикладной успех; прямой замер не подтверждён") != NULL);
+    task_reset(s, t);
+
+    /* Полный 2xx ответ (rx_direct_complete = 1) при позднем обрыве:
+       рукопожатие CLEAR, TX PASSED -> probe-direct. */
+    t = fixture(s);
+    t->state = T_ASKING; t->transport = 6; t->trigger_code = D2K_SUSPECT_RST_AFTER_APP;
+    t->res_ready = 1; t->res.verdict = D2K_V_CLEAR;
+    t->vol.verdict = D2K_VOL_PASSED;
+    t->vol.rx_direct_complete = 1;
+    s->sync_pending = 0;
+    rows[0] = '\0';
+    (void)d2k_sched_tick(s, 900);
+    CHECK(strstr(rows, "outcome=probe-direct path=direct") != NULL);
+    task_reset(s, t);
+
+    /* Машинный флаг dial_deadline (истёк срок подключения, d2k_dial_deadline_err):
+       FLAKY + dial_deadline=1 даёт исход outcome=unknown path=none ("замер не состоялся").
+       FLAKY + dial_deadline=0 даёт исход outcome=inconclusive path=none даже с тем же текстом reason. */
     t = fixture(s);
     t->state = T_ASKING; t->transport = 6;
-    t->res_ready = 1; t->res.verdict = D2K_V_FLAKY; t->res.not_measured = 1;
+    t->res_ready = 1; t->res.verdict = D2K_V_FLAKY; t->res.dial_deadline = 1;
     snprintf(t->res.reason, sizeof t->res.reason, "наш срок на подключение 6000 мс истёк — замер не состоялся");
     s->sync_pending = 0;
     rows[0] = '\0';
@@ -508,7 +537,7 @@ int main(void) {
     /* Тот же текст без машинного флага не имитирует этот исход: машинный признак, а не строка. */
     t = fixture(s);
     t->state = T_ASKING; t->transport = 6;
-    t->res_ready = 1; t->res.verdict = D2K_V_FLAKY; t->res.not_measured = 0;
+    t->res_ready = 1; t->res.verdict = D2K_V_FLAKY; t->res.dial_deadline = 0;
     snprintf(t->res.reason, sizeof t->res.reason, "наш срок на подключение 6000 мс истёк — замер не состоялся");
     s->sync_pending = 0;
     rows[0] = '\0';

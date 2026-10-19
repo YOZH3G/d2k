@@ -2933,7 +2933,7 @@ static void *worker_run(void *vp) {
         int allow_vol = (r.verdict == D2K_V_CLEAR ||
                          (r.verdict == D2K_V_FLAKY &&
                           is_late_volume_suspicion(t->trigger_code) &&
-                          !r.not_measured)) && !t->stop;
+                          !r.dial_deadline)) && !t->stop;
         if (allow_vol) {
             /* Рукопожатие и запись прошли (или для подозрения позднего
                обрыва дали FLAKY, не отменяющий замер объёма) — теперь
@@ -10108,12 +10108,18 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                         ? t->vol.rx_partial_wire_bytes : t->vol.rx_partial_bytes));
             }
             if (r.verdict == D2K_V_CLEAR && is_late_volume_suspicion(t->trigger_code) &&
-                t->transport == 6 && !volume_proven &&
-                (t->vol.rx_unmeasured ||
-                 (t->vol.verdict == D2K_VOL_SHORT && !t->vol.rx_direct_complete))) {
+                t->transport == 6 && !volume_proven && !t->vol.rx_direct_complete) {
                 r.verdict = D2K_V_INCONCLUSIVE;
-                snprintf(r.reason, sizeof r.reason,
-                         "объём ответа измерить не удалось; прямой замер не подтверждён");
+                if (t->vol.rx_unmeasured) {
+                    snprintf(r.reason, sizeof r.reason,
+                             "объём ответа измерить не удалось; прямой замер не подтверждён");
+                } else if (t->vol.verdict == D2K_VOL_SHORT) {
+                    snprintf(r.reason, sizeof r.reason,
+                             "объём ответа меньше полосы; прямой замер не подтверждён");
+                } else {
+                    snprintf(r.reason, sizeof r.reason,
+                             "прямой ответ не подтвердил прикладной успех; прямой замер не подтверждён");
+                }
             }
             if (!verdict_proves_block(r.verdict) && !volume_proven && !t->ech_trial) {
                 say(s, "по %s прямой замер не подтвердил блокировку (%s: %s) — "
@@ -10138,7 +10144,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            "это временный ограничитель, а не запись в каталоге",
                         t->name, (long long)((delay_ms + 59999) / 60000));
                 } else if (r.verdict == D2K_V_FLAKY && t->transport == 6 &&
-                           r.not_measured) {
+                           r.dial_deadline) {
                     /* АДРЕС НЕ ПРИНИМАЛ СОЕДИНЕНИЙ ПОСРЕДИ ЗАМЕРА (поле 17.10.2026,
                        flibusta.is): после серии приветствий с триггером коробка
                        глушит SYN к адресу — с роутера после 40 таких запросов

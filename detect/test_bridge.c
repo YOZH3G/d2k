@@ -516,9 +516,9 @@ int main(void)
         CHECK(seen.accept(&p, seen.accept_ctx) == 1);
         sweep_pass = NULL;
         memset(&answer, 0, sizeof answer);
-        answer.verdict = D2K_DV_FLAKY; answer.not_measured = 1;
+        answer.verdict = D2K_DV_FLAKY; answer.dial_deadline = 1;
         r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
-        CHECK(r.verdict == D2K_V_FLAKY && r.not_measured == 1);
+        CHECK(r.verdict == D2K_V_FLAKY && r.dial_deadline == 1);
         memset(&answer, 0, sizeof answer);
     }
     {

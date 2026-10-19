@@ -171,17 +171,6 @@ static int is_known_portal_host(const char *host) {
     return 0;
 }
 
-static int is_portal_path(const char *path, size_t path_len) {
-    if (!path || path_len < 4) { return 0; }
-    if (strncasecmp(path, "/rkn", 4) == 0) {
-        if (path_len == 4 || path[4] == '-' || path[4] == '/' ||
-            path[4] == '?' || path[4] == '_' || path[4] == '.') {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static int redirect_location_parts(const char *value, size_t len,
                                    char *host, size_t cap,
                                    const char **path, size_t *path_len) {
@@ -222,8 +211,6 @@ static int portal_answer(const char *req_host, const char *upstream, size_t upst
          upstream[11] != '7' && upstream[11] != '8')) { return 0; }
 
     int location_seen = 0;
-    const char *loc_path = NULL;
-    size_t loc_path_len = 0;
     const char *p = line_end + 2;
     while ((line_end = find_crlf(p, end)) != NULL && line_end != p) {
         const char *colon = memchr(p, ':', (size_t)(line_end - p));
@@ -234,14 +221,13 @@ static int portal_answer(const char *req_host, const char *upstream, size_t upst
             const char *ve = line_end;
             while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t')) { ve--; }
             if (!redirect_location_parts(v, (size_t)(ve - v), location_host,
-                                         location_cap, &loc_path, &loc_path_len)) { return 0; }
+                                         location_cap, NULL, NULL)) { return 0; }
         }
         p = line_end + 2;
     }
     return location_seen && line_end && line_end == p &&
            !host_equal(req_host, location_host) &&
-           (is_known_portal_host(location_host) || portal_marker(location_host) ||
-            is_portal_path(loc_path, loc_path_len));
+           (is_known_portal_host(location_host) || portal_marker(location_host));
 }
 
 int d2k_httpup_portal_response(const char *request, size_t request_len,

@@ -1180,7 +1180,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
                (core/sched.c). Поле 12.10: цель отвечала за 7,16 с при нашем
                сроке 6 с, и 218 поисков подряд закончились ничем. */
             res->verdict = D2K_DV_FLAKY;
-            res->not_measured = 1;
+            res->dial_deadline = 1;
             snprintf(res->reason, sizeof(res->reason),
                      "наш срок на подключение %d мс истёк — замер не состоялся: %.160s",
                      opt->timeout_ms, base.err);

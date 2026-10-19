@@ -85,11 +85,13 @@ int main(void) {
                                      sizeof portal_host) &&
           strcmp(portal_host, "deny.megafon.ru") == 0,
           "Megafon deny.megafon.ru portal not extracted");
-    CHECK(d2k_httpup_portal_location("rutracker.org", path_rkn_portal,
-                                     sizeof path_rkn_portal - 1, portal_host,
-                                     sizeof portal_host) &&
-          strcmp(portal_host, "isp.example.org") == 0,
-          "RKN path portal not extracted");
+    CHECK(!d2k_httpup_portal_location("rutracker.org", path_rkn_portal,
+                                      sizeof path_rkn_portal - 1, portal_host,
+                                      sizeof portal_host),
+          "foreign redirect with /rkn path was mistaken for a portal host");
+    CHECK(!d2k_httpup_portal_response(get, sizeof get - 1, path_rkn_portal,
+                                      sizeof path_rkn_portal - 1, out, sizeof out),
+          "foreign redirect with /rkn path was mistaken for a filter portal");
     CHECK(!d2k_httpup_portal_response(get, sizeof get - 1, ordinary_cross_host,
                                       sizeof ordinary_cross_host - 1, out, sizeof out),
           "ordinary cross-host login redirect was mistaken for a filter portal");

@@ -82,7 +82,7 @@ static int voice_calls;
 static int voice_discovery_fixture;
 static int voice_seen_known;
 static d2k_verdict tcp_answer = D2K_V_OPAQUE;
-static int tcp_not_measured;
+static int tcp_dial_deadline;
 static int tcp_owns_search;
 static int tcp_found_arm;
 static size_t tcp_last_wire;
@@ -176,7 +176,7 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
     d2k_vres r;
     memset(&r, 0, sizeof r);
     r.verdict = tcp_answer;
-    r.not_measured = tcp_not_measured;
+    r.dial_deadline = tcp_dial_deadline;
     r.owns_search = tcp_owns_search;
     r.split_pos = tcp_owns_search ? 1 : 0;
     r.split_gap_us = 60000;
@@ -9299,51 +9299,40 @@ rx_volume_tests:
        Если объём доказан — берём его. */
     {
         d2k_catalog c = {0};
-        char pid[40];
-        own_box(&c, "box-flaky-vol", pid, 2, 3, "flaky-vol.example", 6, D2K_SHAPE_MODERN, 4,
-                1790000000, 0);
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
         vol_rx_unmeasured = 0; vol_rx_cut = 1; vol_rx_at_kb = 18; vol_direct_complete = 0;
         vol_answer = D2K_VOL_PASSED; vol_calls = 0;
-        tcp_answer = D2K_V_FLAKY; tcp_not_measured = 0; tcp_calls = 0;
-        uint8_t ech_bytes[2048]; size_t ech_len = 0;
-        CHECK(ech_offer_hello("flaky-vol.example", ech_bytes, sizeof ech_bytes, &ech_len) == 0 &&
-              d2k_hello_ech_offer(ech_bytes, ech_len, NULL) == 1,
-              "ECH: приветствие с ECH offer не собралось");
-        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        tcp_answer = D2K_V_FLAKY; tcp_calls = 0;
         d2k_ev h = ev_hello(6, 40383, "flaky-vol.example");
         d2k_sched_event(s, &h);
-        d2k_ev sh; memset(&sh, 0, sizeof sh);
-        sh.kind = D2K_EV_SHAPE; sh.transport = 6;
-        memcpy(sh.shape, ech_bytes, ech_len); sh.shape_len = ech_len;
-        d2k_sched_event(s, &sh);
-        d2k_ev su = ev_suspect(6, 40383); su.code = D2K_SUSPECT_RST_AFTER_APP; su.planned = D2K_LINK_PLANNED_YES;
+        d2k_ev su = ev_suspect(6, 40383); su.code = D2K_SUSPECT_RST_AFTER_APP;
         d2k_sched_event(s, &su);
         settle(s);
-        CHECK(tcp_calls == 1, "FLAKY рукопожатия: TCP-замер не вызвался");
         CHECK(vol_calls >= 1, "FLAKY рукопожатия не запустил замер объёма при позднем обрыве");
         CHECK(!said("напрямую проходит"), "обрыв не должен давать прямой проход");
         vol_rx_cut = 0; vol_answer = D2K_VOL_PASSED;
         d2k_sched_free(s); d2k_catalog_free(&c);
     }
-    /* Затвор 1: FLAKY рукопожатия с not_measured = 1 НЕ должен запускать замер объёма. */
+    /* Затвор 1: FLAKY рукопожатия с dial_deadline = 1 НЕ должен запускать замер объёма
+       и не должен удалять подтверждённую привязку каталога. */
     {
         d2k_catalog c = {0};
         char pid[40];
-        own_box(&c, "box-flaky-not-meas", pid, 2, 3, "flaky-not-measured.example", 6, D2K_SHAPE_MODERN, 4,
+        own_box(&c, "box-flaky-dial-dead", pid, 2, 3, "flaky-dial-dead.example", 6, D2K_SHAPE_MODERN, 4,
                 1790000000, 0);
+        CHECK(total_bindings(&c) == 1, "начальная привязка не создана");
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
         vol_rx_unmeasured = 0; vol_rx_cut = 1; vol_rx_at_kb = 18; vol_direct_complete = 0;
         vol_answer = D2K_VOL_PASSED; vol_calls = 0;
-        tcp_answer = D2K_V_FLAKY; tcp_not_measured = 1; tcp_calls = 0;
+        tcp_answer = D2K_V_FLAKY; tcp_dial_deadline = 1; tcp_calls = 0;
         uint8_t ech_bytes[2048]; size_t ech_len = 0;
-        CHECK(ech_offer_hello("flaky-not-measured.example", ech_bytes, sizeof ech_bytes, &ech_len) == 0 &&
+        CHECK(ech_offer_hello("flaky-dial-dead.example", ech_bytes, sizeof ech_bytes, &ech_len) == 0 &&
               d2k_hello_ech_offer(ech_bytes, ech_len, NULL) == 1,
               "ECH: приветствие с ECH offer не собралось");
         d2k_sched_ech_resolve_hook = stub_ech_resolve;
-        d2k_ev h = ev_hello(6, 40384, "flaky-not-measured.example");
+        d2k_ev h = ev_hello(6, 40384, "flaky-dial-dead.example");
         d2k_sched_event(s, &h);
         d2k_ev sh; memset(&sh, 0, sizeof sh);
         sh.kind = D2K_EV_SHAPE; sh.transport = 6;
@@ -9352,11 +9341,47 @@ rx_volume_tests:
         d2k_ev su = ev_suspect(6, 40384); su.code = D2K_SUSPECT_RST_AFTER_APP; su.planned = D2K_LINK_PLANNED_YES;
         d2k_sched_event(s, &su);
         settle(s);
-        CHECK(tcp_calls == 1, "FLAKY + not_measured: TCP-замер не вызвался");
-        CHECK(vol_calls == 0, "FLAKY + not_measured запустил замер объёма при позднем обрыве");
-        CHECK(said("замер не состоялся: адрес не принимал соединений"), "не сработала ветка not_measured для FLAKY");
-        CHECK(said("outcome=unknown path=none"), "не выдан итог unknown для not_measured");
-        tcp_not_measured = 0; vol_rx_cut = 0; vol_answer = D2K_VOL_PASSED;
+        CHECK(tcp_calls == 1, "FLAKY + dial_deadline: TCP-замер не вызвался");
+        CHECK(vol_calls == 0, "FLAKY + dial_deadline запустил замер объёма при позднем обрыве");
+        CHECK(total_bindings(&c) == 1, "FLAKY + dial_deadline удалил подтверждённую привязку");
+        CHECK(said("замер не состоялся: адрес не принимал соединений"), "не сработала ветка dial_deadline для FLAKY");
+        CHECK(said("outcome=unknown path=none"), "не выдан итог unknown для dial_deadline");
+        tcp_dial_deadline = 0; vol_rx_cut = 0; vol_answer = D2K_VOL_PASSED;
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    /* Поздний обрыв: полный не-2xx выше полосы (напр. 403 на 20 КБ), rx_direct_complete = 0.
+       CLEAR рукопожатия + не-2xx объём не должен становиться probe-direct и не должен
+       стирать подтверждённую привязку каталога (Astra §1). */
+    {
+        d2k_catalog c = {0};
+        char pid[40];
+        own_box(&c, "box-complete-403", pid, 2, 3, "complete-403.example", 6, D2K_SHAPE_MODERN, 4,
+                1790000000, 0);
+        CHECK(total_bindings(&c) == 1, "начальная привязка не создана");
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        vol_rx_unmeasured = 0; vol_rx_cut = 0; vol_direct_complete = 0;
+        vol_answer = D2K_VOL_PASSED;
+        tcp_answer = D2K_V_CLEAR; tcp_calls = 0;
+        uint8_t ech_bytes[2048]; size_t ech_len = 0;
+        CHECK(ech_offer_hello("complete-403.example", ech_bytes, sizeof ech_bytes, &ech_len) == 0 &&
+              d2k_hello_ech_offer(ech_bytes, ech_len, NULL) == 1,
+              "ECH: приветствие с ECH offer не собралось");
+        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        d2k_ev h = ev_hello(6, 40385, "complete-403.example");
+        d2k_sched_event(s, &h);
+        d2k_ev sh; memset(&sh, 0, sizeof sh);
+        sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        memcpy(sh.shape, ech_bytes, ech_len); sh.shape_len = ech_len;
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40385); su.code = D2K_SUSPECT_RST_AFTER_APP; su.planned = D2K_LINK_PLANNED_YES;
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(tcp_calls == 1, "замер не выполнился");
+        CHECK(total_bindings(&c) == 1, "полный не-2xx ответ удалил подтверждённую привязку");
+        CHECK(!said("напрямую проходит"), "полный не-2xx ответ объявлен прямым успехом");
+        CHECK(said("прямой ответ не подтвердил прикладной успех"), "не указана причина неубедительного прямого замера");
+        CHECK(said("результат неубедителен"), "не установлен неубедительный исход");
         d2k_sched_free(s); d2k_catalog_free(&c);
     }
     if (partial_only) goto voice_only_done;
