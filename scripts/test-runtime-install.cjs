@@ -38,6 +38,7 @@ exit 1
   for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, '#!/bin/sh\nexit 0\n');
   fixture('builds/d2kpanel-linux-amd64', '#!/bin/sh\necho features=telegram-control\n');
   fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3\n');
+  fixture('builds/d2kfetch-linux-amd64', '#!/bin/sh\necho d2kfetch ${D2K_RELEASE_ID:-dev}\n');
   fixture('builds/d2kd-linux-amd64', '#!/bin/sh\nexit 0\n');
   for (const name of ['d2kc']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
   fixture('files/S99d2k', '#!/bin/sh\nprintf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
@@ -77,6 +78,7 @@ exit 1
   fs.mkdirSync(path.join(tmp, 'opt/sbin'), { recursive: true });
   fs.writeFileSync(path.join(tmp, 'opt/sbin/d2khttp'), '#!/bin/sh\nexit 2\n', { mode: 0o755 });
   const installOut = run('install');
+  assert(fs.existsSync(path.join(tmp, 'opt/sbin/d2kfetch')), 'diagnostic tool must be installed');
   assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2khttp')), 'upgrade must remove the old d2khttp proxy binary');
   // The first DNS refresh (15 names, possibly silent edges) must not hold the
   // installer: the service's scheduler runs it in the background with a log.
@@ -258,6 +260,7 @@ exit 1
   assert(!fs.existsSync(ppe), 'uninstall must remove the PPE de-offload helper');
   assert(fs.readFileSync(path.join(tmp, 'calls'), 'utf8').includes('ppe-remove'), 'uninstall must remove own PPE rules even without init');
   assert(!fs.existsSync(path.join(runtime, 'live.json')), 'uninstall must remove volatile live snapshot');
+  assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2kfetch')), 'uninstall must remove diagnostic tool');
   for (const binary of ['d2kd','d2kc','d2kpanel','d2ktg']) assert(!fs.existsSync(path.join(runtime, `${binary}.health`)), 'uninstall must remove owned heartbeat');
   assert(!fs.existsSync(path.join(runtime, 'log-tail.ABCDEF')), 'uninstall must remove owned abandoned stage');
   assert.equal(fs.readFileSync(path.join(runtime, 'unrelated'), 'utf8'), 'keep');

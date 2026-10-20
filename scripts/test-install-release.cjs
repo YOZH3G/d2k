@@ -95,6 +95,7 @@ exit 0`));
   fixture('builds/d2ktg-linux-amd64', sh('echo features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3'));
   fixture('builds/d2kd-linux-amd64', sh('exit 0'));
   fixture('builds/d2kc-linux-amd64', sh('exit 2'));
+  fixture('builds/d2kfetch-linux-amd64', sh('echo d2kfetch ${D2K_RELEASE_ID:-dev}'));
   fixture('files/S99d2k', sh('printf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0'));
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
   fixture('files/d2k-ppe-deoffload.sh', sh('d2k_ppe_remove() { :; }'));
@@ -191,6 +192,7 @@ exit 0`));
     'выпуск сперва качается через проводник на VPS');
   assert.match(fresh, /подпись сошлась/, 'установка должна сказать, что подпись проверена');
   assert(fs.existsSync(d2kd), 'комплект должен встать');
+  assert(fs.existsSync(path.join(tmp, 'opt/sbin/d2kfetch')), 'прибор устанавливается вместе с выпуском');
   assert.equal(read(releaseId).trim(), rid,
     'номер выпуска пишется на роутер: иначе ночное обновление поставит то же самое заново');
   assert.equal(read(path.join(tmp, 'opt/d2k/release-arch')).trim(), 'amd64');
@@ -201,6 +203,15 @@ exit 0`));
   assert(read(calls).includes('service-start'), 'служба должна запуститься');
 
   // 2. Подпись не сошлась: прежняя версия остаётся как была.
+  // A mismatched tool must fail before stopping the installed service.
+  fixture('builds/d2kfetch-linux-amd64', sh('echo d2kfetch wrong-release'));
+  publish(); reset();
+  const wrongFetch = run({ GATE_DOWN: '1' });
+  assert.notEqual(wrongFetch.status, 0);
+  assert.match(wrongFetch.stdout + wrongFetch.stderr, /версия прибора не совпадает/);
+  assert(!read(calls).includes('service-stop'), 'отказ версии прибора до остановки службы');
+  fixture('builds/d2kfetch-linux-amd64', sh('echo d2kfetch ${D2K_RELEASE_ID:-dev}'));
+
   const before = fs.readFileSync(d2kd);
   publish({ sign: false });
   reset();

@@ -51,6 +51,7 @@ function release(id, { installOk = true, pid = live } = {}) {
 printf '%s\\n' "$0" > "${tmp}/installer-path"
 printf '%s\\n' "$D2K_RELEASE_ID" > "${dir}/release-id"
 printf 'binary ${id}\\n' > "${sbin}/d2kd"
+printf 'fetch ${id}\\n' > "${sbin}/d2kfetch"
 printf 'panel ${id}\\n' > "${dir}/panel/index.html"
 echo ${pid} > "${dir}/run/d2kd.pid"; echo ${pid} > "${dir}/run/d2k.pid"
 exit ${installOk ? 0 : 1}
@@ -99,6 +100,7 @@ try {
   s = state();
   assert.equal(s.last_ok, true); assert.equal(s.current, 'r2'); assert.equal(s.busy, '');
   assert.equal(read(path.join(sbin, 'd2kd')), 'binary r2\n');
+  assert.equal(read(path.join(sbin, 'd2kfetch')), 'fetch r2\n', 'прибор возвращается вместе с контроллером');
   assert(!fs.existsSync(path.join(dir, '.update/previous.tar')), 'копия прежней версии осталась');
   assert(!fs.existsSync(path.join(dir, '.update/release')), 'распакованный выпуск остался');
   assert.equal(run('install').status, 0, 'повтор того же выпуска не сводится к «уже установлен»');
@@ -112,6 +114,7 @@ try {
   s = state();
   assert.equal(s.last_ok, false); assert.equal(s.bad_release, 'r3'); assert.equal(s.current, 'r2');
   assert.equal(read(path.join(sbin, 'd2kd')), 'binary r2\n');
+  assert.equal(read(path.join(sbin, 'd2kfetch')), 'fetch r2\n', 'прибор возвращается вместе с контроллером');
   assert.equal(read(path.join(dir, 'panel/index.html')), 'panel r2\n');
   assert.deepEqual(read(initLog).trim().split('\n'), ['stop', 'start']);
   assert(!fs.existsSync(path.join(dir, '.update/previous.tar')));
@@ -120,11 +123,13 @@ try {
   release('r4', { pid: dead });
   assert.notEqual(run('install').status, 0);
   assert.equal(state().bad_release, 'r4'); assert.equal(read(path.join(sbin, 'd2kd')), 'binary r2\n');
+  assert.equal(read(path.join(sbin, 'd2kfetch')), 'fetch r2\n', 'прибор возвращается вместе с контроллером');
 
   // Не прошедший проверку выпуск ночью не ставится, вручную — да.
   release('r4');
   assert.notEqual(run('install').status, 0, 'ночная установка повторила плохой выпуск');
   assert.equal(read(path.join(sbin, 'd2kd')), 'binary r2\n');
+  assert.equal(read(path.join(sbin, 'd2kfetch')), 'fetch r2\n', 'прибор возвращается вместе с контроллером');
   assert.equal(run('install', 'manual').status, 0);
   assert.equal(state().current, 'r4');
 

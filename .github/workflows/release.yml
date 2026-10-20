@@ -94,7 +94,7 @@ jobs:
       # OpenSSL for d2ktg is built from source here, also without a cache.
       # It took 26 of the 28 minutes when the nine CPUs ran one after another
       # (12.10.2026); in parallel the wall time is one CPU's share.
-      - name: Build d2kd, d2kc, d2kpanel, d2ktg
+      - name: Build d2kd, d2kc, d2kfetch, d2kpanel, d2ktg
         run: sh scripts/build-router.sh
       - name: Test the binaries under QEMU
         run: |

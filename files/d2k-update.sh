@@ -127,7 +127,7 @@ do_check() {
 
 # Файлы, которые меняет установщик. Состояние, журнал и каталог знаний — нет.
 installed_paths() {
-    for p in "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$INIT" "$NDM_HOOK" \
+    for p in "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$INIT" "$NDM_HOOK" \
              "$DIR/config" "$DIR/release-id" "$DIR/release-arch" "$DIR/panel" "$DIR/files"; do
         [ ! -e "$ROOT$p" ] || printf '%s\n' "${p#/}"
     done

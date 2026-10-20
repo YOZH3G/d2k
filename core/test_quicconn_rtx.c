@@ -6,7 +6,27 @@
  * переотправлялся (подтверждено трассой). Состояние таймера обязано жить в
  * соединении. Соединение собирается прямо здесь, на петле, с ключами из
  * постоянного секрета: проверяется счёт датаграмм, а не разбор у сервера. */
+#define _DEFAULT_SOURCE 1
+#include <sys/socket.h>
+#include <errno.h>
+
+#ifdef SO_NOSIGPIPE
+static int fail_socket_property;
+static int property_fd = -1;
+static int test_setsockopt(int fd, int level, int option, const void *value, socklen_t len) {
+    if (fail_socket_property && level == SOL_SOCKET && option == SO_NOSIGPIPE) {
+        property_fd = fd;
+        errno = ENOPROTOOPT;
+        return -1;
+    }
+    return setsockopt(fd, level, option, value, len);
+}
+#define setsockopt test_setsockopt
+#endif
 #include "quicconn.c"
+#ifdef SO_NOSIGPIPE
+#undef setsockopt
+#endif
 
 #include <assert.h>
 #include <fcntl.h>
@@ -51,6 +71,24 @@ static d2k_qc *app_conn(int *server) {
 
 int main(void) {
     char err[200];
+#ifdef SO_NOSIGPIPE
+    /* A local socket setup failure must not become a measured network failure.
+       Exercise owned and supplied descriptors; neither may survive the error. */
+    for (int supplied = 0; supplied < 2; supplied++) {
+        d2k_qc_opts o = {0};
+        o.ip = "127.0.0.1"; o.port = 1; o.sni = "example.org";
+        o.alpn = "h3"; o.deadline_ms = 20;
+        o.use_fd = supplied ? socket(AF_INET, SOCK_DGRAM, 0) : -1;
+        d2k_qc *failed = NULL;
+        fail_socket_property = 1;
+        int rc = d2k_qc_connect(&o, &failed, err, sizeof err);
+        fail_socket_property = 0;
+        CHECK(rc == -2 && failed == NULL, "socket property failure is local");
+        CHECK(strstr(err, "SO_NOSIGPIPE") != NULL, "local failure retains cause");
+        CHECK(fcntl(property_fd, F_GETFD) == -1 && errno == EBADF,
+              "failed descriptor closed");
+    }
+#endif
     uint8_t buf[256];
     uint64_t sid = 0;
     static const uint8_t req[] = {0x01, 0x02, 0x03};

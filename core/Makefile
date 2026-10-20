@@ -205,7 +205,7 @@ test_ech: test_ech.c verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.
 test-ech: test_ech
 	./test_ech
 
-check: test-ech
+check: test-ech d2kfetch
 
 .PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-rst-trigger test-voice-sched test-verify FORCE
 
@@ -357,6 +357,32 @@ h3.o: h3.c $(HDR)
 # настоящей TLS-сессии, отсюда зависимость от tls13.o tls13core.o.
 volume.o: volume.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# d2kfetch — обращение к цели как у браузера (см. шапку d2kfetch.c): форма и
+# длина приветствия браузерные, обращение непомеченное, поэтому датапат
+# применяет к нему тот же план. Нужен полю вместо curl, чьё короткое
+# приветствие под браузерный план не подходит.
+D2KFETCH_OBJ = verify.o verify_quic_replay.o quicconn.o quicwire.o h3.o \
+	compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o tls12.o \
+	p256.o x25519.o crypto.o quic.o quicsnap.o quicsnap_reseal.o quicprobe.o \
+	quicarms.o quichello.o volume.o ipfrag.o net4.o props.o
+
+d2kfetch: d2kfetch.c $(D2KFETCH_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(D2KFETCH_OBJ) $(TEST_LDFLAGS)
+
+# Same sources as the host tool, linked (not merely compiled) for the router.
+.PHONY: fetch-release
+fetch-release: hello_profiles.inc tcp1620_whitelist.inc
+	@mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -static -Wl,-S \
+		-o $(BUILDDIR)/d2kfetch-linux-$(ARCH) d2kfetch.c \
+		$(sort $(D2KFETCH_OBJ:.o=.c) $(UDP_ENGINE_SRC)) -lpthread
+
+.PHONY: test-field-report
+check: test-field-report
+test-field-report: d2kfetch
+	python3 ../scripts/field19/test-router-round.py
+	python3 ../scripts/field19/test-d2kfetch-cli.py
 
 plantlv.o: plantlv.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -764,8 +790,8 @@ gcc-warn: hello_profiles.inc tcp1620_whitelist.inc
 # той же причине, что d2kd в датапате: раздельная компиляция объектников не
 # доказывает, что именно эта комбинация (включая pthread на musl и glibc)
 # слинкуется.
-cross: hello_profiles.inc
-	@for f in $(SRC) d2kask.c d2kvoice.c; do \
+cross: hello_profiles.inc tcp1620_whitelist.inc
+	@for f in $(SRC) d2kask.c d2kvoice.c d2kfetch.c; do \
 		echo "== $$f =="; \
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /tmp/d2k-core-a64.o $$f || exit 1; \
 		$(ZIG) cc $(MIPS_BE_ZIG) $(CFLAGS) -c -o /tmp/d2k-core-mips.o $$f || exit 1; \
@@ -946,7 +972,7 @@ TARGET_FLAGS ?=
 ARCH ?= arm64
 .PHONY: release check-release
 d2kc-linux-arm64: release
-release: hello_profiles.inc tcp1620_whitelist.inc
+release: fetch-release hello_profiles.inc tcp1620_whitelist.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -static -Wl,-S \
 		-o $(BUILDDIR)/d2kc-linux-$(ARCH) d2kc.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c \
@@ -1148,7 +1174,7 @@ d2kc: d2kc.c httpsprobe.o httpsearch.o httpup_logic.o sched.o verify_quic_replay
 		$(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
 
 clean:
-	rm -f *.o $(TESTS) d2kask d2kc hello_profiles.inc libd2k_udp.a
+	rm -f *.o $(TESTS) d2kask d2kc d2kfetch hello_profiles.inc libd2k_udp.a
 	rm -rf .udp-engine
 
 test_quic_original_arms: test_quic_original_arms.c quicarms.o $(HDR)
@@ -1337,4 +1363,4 @@ san-sched-quic-yield: hello_profiles.inc tcp1620_whitelist.inc
 # test_ip6frag_send_live) не получали её вовсе. Последовательная сборка этого
 # не замечала — библиотека успевала собраться раньше. `make -j` падал за
 # секунду: «no such file or directory: libd2k_udp.a».
-$(TESTS) d2kask d2kc d2kvoice test_tls12 test_d2kc_proto test_ip6frag_send_live: libd2k_udp.a
+$(TESTS) d2kask d2kc d2kvoice d2kfetch test_tls12 test_d2kc_proto test_ip6frag_send_live: libd2k_udp.a

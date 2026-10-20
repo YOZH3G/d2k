@@ -29,6 +29,9 @@
  * В СЕТЬ НЕ ХОДИТ: всё на 127.0.0.1, порт назначает ядро (bind на 0).
  */
 #define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -751,10 +754,28 @@ static void *parallel_probe(void *arg) {
    (files/S99d2k), поставленный план к нему не применится, и зонд мерил бы
    линию БЕЗ обхода, считая, что мерит с обходом. Счётчик ловит ровно это. */
 static int mark_calls;
+static uint32_t last_mark;
 static int counting_mark(int fd, uint32_t mark) {
-    (void)fd; (void)mark;
+    (void)fd;
+    last_mark = mark;
     mark_calls++;
     return 0;
+}
+static int protected_udp_mark(int fd, uint32_t mark) {
+#ifdef SO_NOSIGPIPE
+    int enabled = 0;
+    socklen_t len = sizeof enabled;
+    CHECK(getsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, &len) == 0 && enabled,
+          "QUIC socket must suppress SIGPIPE before its first send");
+#endif
+    (void)fd; (void)mark;
+    return -1; /* Stop before network I/O, for both owned and supplied sockets. */
+}
+static int failing_mark(int fd, uint32_t mark) {
+    (void)fd;
+    last_mark = mark;
+    mark_calls++;
+    return -1;
 }
 
 /* Свободный порт, на котором заведомо никто не слушает: занимаем и сразу
@@ -865,6 +886,68 @@ int main(int argc,char **argv) {
             100, 0, 0, 0, 0, "/app.css?private=yes");
         CHECK(r.fd == -1 && r.level == D2K_VER_NOT_MEASURED,
               "invalid witness opened a socket");
+    }
+    {
+        /* Проверка изоляции метки QUIC: зонд d2k_verify_probe_quic_path_on идёт
+           НЕПОМЕЧЕННЫМ (mark_calls == 0), а d2k_verify_probe_quic_path_mark_on с
+           mark > 0 зовёт mark hook до отправки Initial. */
+        mark_calls = 0;
+        last_mark = 0;
+        d2k_ver_result r = d2k_verify_probe_quic_path_on(-1, "127.0.0.1", 1,
+                                                         "stand.example", 1, 0, "/");
+        CHECK(mark_calls == 0, "QUIC probe without mark must not call mark hook");
+        d2k_verify_close(&r);
+
+        mark_calls = 0;
+        last_mark = 0;
+        r = d2k_verify_probe_quic_path_mark_on(-1, "127.0.0.1", 1,
+                                               "stand.example", 1, 0, 0x1234, "/");
+        CHECK(mark_calls > 0, "QUIC probe with mark must call mark hook");
+        CHECK(last_mark == 0x1234, "QUIC probe mark hook received wrong mark");
+        CHECK(r.negotiated_tls == 0, "unsuccessful QUIC probe must not report negotiated TLS");
+        d2k_verify_close(&r);
+
+        /* Регрессия: ошибка установки метки (SO_MARK) обязана прекратить контроль
+           с локальной ошибкой, без отправки пакетов, без сетевого вердикта и без
+           скрытого отката на непомеченный сокет. */
+        d2k_mark_hook = failing_mark;
+        mark_calls = 0;
+        last_mark = 0;
+        r = d2k_verify_probe_quic_path_mark_on(-1, "127.0.0.1", 1,
+                                               "stand.example", 1, 0, 0x1234, "/");
+        CHECK(mark_calls > 0, "failing mark hook was invoked");
+        CHECK(last_mark == 0x1234, "failing mark hook got requested mark");
+        CHECK(r.level == D2K_VER_NOT_MEASURED, "mark failure must not advance level");
+        CHECK(r.fd == -1, "mark failure must close socket");
+        CHECK(r.local_refusal == 1, "mark failure must set local_refusal flag");
+        CHECK(r.negotiated_tls == 0, "mark failure must leave negotiated_tls 0");
+        CHECK(strstr(r.reason, "метка измерительного сокета не поставилась") != NULL,
+              "mark failure reason mismatch");
+        d2k_verify_close(&r);
+
+        d2k_mark_hook = protected_udp_mark;
+        r = d2k_verify_probe_quic_path_mark_on(-1, "127.0.0.1", 1,
+                                               "stand.example", 1, 0, 0x1234, "/");
+        d2k_verify_close(&r);
+        int supplied = socket(AF_INET, SOCK_DGRAM, 0);
+        CHECK(supplied >= 0, "supplied UDP socket");
+        r = d2k_verify_probe_quic_path_mark_on(supplied, "127.0.0.1", 1,
+                                               "stand.example", 1, 0, 0x1234, "/");
+        d2k_verify_close(&r);
+        close(supplied);
+        d2k_mark_hook = failing_mark;
+
+        /* Проверяем, что и на TCP отказ SO_MARK даёт машинный флаг local_refusal */
+        mark_calls = 0;
+        last_mark = 0;
+        r = d2k_verify_probe_path_on(-1, "127.0.0.1", 1, "stand.example",
+                                     100, 0, 0, 0, 0x1234, NULL);
+        CHECK(mark_calls > 0, "failing TCP mark hook was invoked");
+        CHECK(r.level == D2K_VER_NOT_MEASURED, "TCP mark failure must not advance level");
+        CHECK(r.fd == -1, "TCP mark failure must close socket");
+        CHECK(r.local_refusal == 1, "TCP mark failure must set local_refusal flag");
+        d2k_verify_close(&r);
+        d2k_mark_hook = counting_mark;
     }
     {
         struct stand s;

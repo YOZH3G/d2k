@@ -5,16 +5,30 @@
 # цели и входа: код curl (0 — ответ полный), HTTP-код, размер, протокол; плюс
 # журнал d2kc за прогон.
 #   EXPECT=<release-id> — остановиться, если на роутере другая сборка.
+#   EXPECT_FETCH=<release-id> — версия прибора (по умолчанию EXPECT).
+#   D2KFETCH=<path>      — отдельный диагностический бинарь на роутере.
+#   Diagnostic build: make -C core fetch-release RELEASE_ID=<id>;
+#   copy builds/d2kfetch-linux-arm64 and set D2KFETCH/EXPECT_FETCH to that id.
 #   WAIT=<s>            — от t0 до контроля (по умолчанию 240).
 #   CLEAR=0             — каталог не чистить.
 # Инструмент: /opt/d2k-tools/curl-impersonate (Chrome 150 с ECH, Safari 26, HTTP/3).
 # Подресурсы страниц не грузятся — ключевые ресурсы перечислены отдельными целями.
 set -u
-L=$1
+L=${1:?run label}
+case "$L" in *[!a-zA-Z0-9._-]*|''|.|..) echo "invalid label" >&2; exit 4;; esac
 RUNS=${D2K_FIELD_RUNS:-/Library/Zapret2/d2k-field-runs}
 R=$RUNS/$L; rm -rf "$R"; mkdir -p "$R"
 SSH="ssh -n -o BatchMode=yes -o ConnectTimeout=10 -p 222 root@192.168.1.1"
 W=${WAIT:-240}
+FETCH=${D2KFETCH:-/opt/sbin/d2kfetch}
+case "$FETCH" in *[!a-zA-Z0-9/._-]*|'') echo "invalid D2KFETCH path"; exit 4;; esac
+FV=$($SSH "$FETCH --version") || { echo "round-stopped $L: не удалось получить версию $FETCH" >&2; exit 4; }
+FE=${EXPECT_FETCH:-${EXPECT:-}}
+if [ -n "$FE" ] && [ "$FV" != "d2kfetch $FE" ]; then
+    echo "round-stopped $L: прибор $FV, ожидался d2kfetch $FE"; exit 4
+fi
+printf '%s\n' "$FV" > "$R/instrument.txt"
+$SSH "sha256sum $FETCH" >> "$R/instrument.txt" || exit 4
 RID=$($SSH "cat /opt/d2k/release-id")
 if [ -n "${EXPECT:-}" ] && [ "$RID" != "$EXPECT" ]; then
     echo "round-stopped $L: на роутере $RID, ожидалась $EXPECT"; exit 4
@@ -65,10 +79,8 @@ fetch() { # host mode path tag
             # HTTP/3 curl-impersonate на ядре роутера не отправляет — свой d2kfetch;
             # адрес — тем же DoH, что у curl (DNS роутера может отдать чужой прокси).
             ip=\$(/opt/d2k-tools/curl-impersonate -s -m 8 --cacert /opt/d2k-tools/cacert.pem -H 'accept: application/dns-json' "https://1.1.1.1/dns-query?name=\$1&type=A" | tr ',' '\n' | sed -n 's/.*"data":"\([0-9.]*\)".*/\1/p' | head -1)
-            j=\$(/opt/sbin/d2kfetch --name "\$1" --ip "\$ip" --path "\$3" --quic --deadline 15000 --json 2>/dev/null | tail -1)
-            code=\$(echo "\$j" | sed -n 's/.*"http_status":\([0-9]*\).*/\1/p'); size=\$(echo "\$j" | sed -n 's/.*"quic_stream_bytes":\([0-9]*\).*/\1/p')
-            case "\$j" in *'"response_complete":true'*) rc=0 ;; *) rc=1 ;; esac
-            r="\"code\":\${code:-0},\"ver\":\"3\",\"size\":\${size:-0},\"t\":0,\"ip\":\"\$ip\""
+            D2KFETCH="${D2KFETCH:-/opt/sbin/d2kfetch}" sh /tmp/rr-$L.record "\$OUT" "\$1" "\$ip" "\$3" "\$4"
+            return
         else
             r=\$(\$C \$a -w '"code":%{http_code},"ver":"%{http_version}","size":%{size_download},"t":%{time_total},"ip":"%{remote_ip}","loc":"%{redirect_url}"' "\$u" 2>/dev/null); rc=\$?
         fi
@@ -88,14 +100,35 @@ done < /tmp/rr-$L.targets
 wait
 date +%T > \$OUT/t1
 EOF
-ssh -o BatchMode=yes -p 222 root@192.168.1.1 "cat > /tmp/rr-$L.targets" < "$R/targets.txt"
-ssh -o BatchMode=yes -p 222 root@192.168.1.1 "cat > /tmp/rr-$L.sh" < "$R/round-router.sh"
-$SSH "sh /tmp/rr-$L.sh"
-$SSH "cat /tmp/rr-$L/t0" > "$R/t0.txt"; echo "$RID" >> "$R/t0.txt"
-$SSH "cat /tmp/rr-$L/learn.jsonl" > "$R/learn.jsonl"
-$SSH "cat /tmp/rr-$L/control.jsonl" > "$R/control.jsonl"
+ssh -o BatchMode=yes -p 222 root@192.168.1.1 "cat > /tmp/rr-$L.record" < "$(dirname "$0")/d2kfetch-record.sh" || exit 4
+ssh -o BatchMode=yes -p 222 root@192.168.1.1 "cat > /tmp/rr-$L.targets" < "$R/targets.txt" || exit 4
+ssh -o BatchMode=yes -p 222 root@192.168.1.1 "cat > /tmp/rr-$L.sh" < "$R/round-router.sh" || exit 4
+transfer_rc=0
+$SSH "sh /tmp/rr-$L.sh" || transfer_rc=4
+$SSH "cat /tmp/rr-$L/t0" > "$R/t0.txt" || transfer_rc=4
+echo "$RID" >> "$R/t0.txt"
+$SSH "cat /tmp/rr-$L/learn.jsonl" > "$R/learn.jsonl" || transfer_rc=4
+$SSH "cat /tmp/rr-$L/control.jsonl" > "$R/control.jsonl" || transfer_rc=4
+# One transfer preserves raw bytes; even a failed transfer must not lose d2kc.log.
+ssh -o BatchMode=yes -p 222 root@192.168.1.1 "sh -s -- /tmp/rr-$L" < "$(dirname "$0")/d2kfetch-export.sh" > "$R/probes.bundle" || transfer_rc=4
+python3 -I "$(dirname "$0")/d2kfetch-import.py" "$R/probes.bundle" "$R" || transfer_rc=4
 T0=$(head -1 "$R/t0.txt")
-$SSH "awk -v t0=$T0 '{ t = substr(\$0, 1, 8); ts = t ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\$/ } ts { if (t < p) n = 0; p = t } n || (ts && t >= t0) { b[++n] = \$0 } END { for (i = 1; i <= n; i++) print b[i] }' /opt/d2k/log/d2kc.log" > "$R/d2kc.log"
-$SSH "rm -rf /tmp/rr-$L /tmp/rr-$L.sh /tmp/rr-$L.targets"
+case "$T0" in
+    [0-2][0-9]:[0-5][0-9]:[0-5][0-9])
+$SSH "awk -v t0=$T0 '{ t = substr(\$0, 1, 8); ts = t ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\$/ } ts { if (t < p) n = 0; p = t } n || (ts && t >= t0) { b[++n] = \$0 } END { for (i = 1; i <= n; i++) print b[i] }' /opt/d2k/log/d2kc.log" > "$R/d2kc.log" || transfer_rc=4
+        ;;
+    *)
+        # No trustworthy time boundary: retain evidence, but do not count it.
+        $SSH "cat /opt/d2k/log/d2kc.log" > "$R/d2kc-unbounded.log"
+        transfer_rc=4
+        ;;
+esac
+if [ "$transfer_rc" = 0 ]; then
+    $SSH "rm -rf /tmp/rr-$L /tmp/rr-$L.sh /tmp/rr-$L.targets /tmp/rr-$L.record"
+else
+    echo "неполный сбор; исходники оставлены на роутере" > "$R/collection-error.txt"
+    echo "round-incomplete $L: исходники оставлены на роутере /tmp/rr-$L" >&2
+fi
 python3 -I "$(dirname "$0")/router-round-report.py" "$R" | tee "$R/report.txt"
+[ "$transfer_rc" = 0 ] || exit "$transfer_rc"
 echo "round-done $L"

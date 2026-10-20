@@ -118,18 +118,19 @@ echo "арка: $(uname -m) -> $ARCH"
 echo "== сборка того, что будет установлено =="
 # Сборка НАТИВНАЯ: контейнер той же арки, что и роутер Марка (aarch64).
 # Кросс-сборка проверяется отдельно, гейтом; здесь проверяется установка.
-make -s -C core d2kc
+make -s -C core d2kc d2kfetch
 make -s -C datapath d2kd
 cc -Wall -Wextra -Werror -o /tmp/d2k-ipv6-direct tests/ipv6-direct.c
 
 mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets" "$REL/scripts"
 cp scripts/select-panel-ip.sh scripts/architecture.sh scripts/check-cpu.sh "$REL/scripts/"
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
+cp core/d2kfetch "$REL/builds/d2kfetch-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
 # d2ktg берётся готовым из builds/ — единственный бинарник, который там
 # остался в git. Его собирают со статическим OpenSSL, это минуты на арку, а
-# лаборатория проверяет установку, не сам туннель. Остальные три собираются
-# выше нативно; на роутер все четыре идут только подписанным выпуском.
+# лаборатория проверяет установку, не сам туннель. Остальные четыре собираются
+# выше нативно; на роутер все пять идут только подписанным выпуском.
 cp builds/d2ktg-linux-arm64 "$REL/builds/d2ktg-linux-$ARCH"
 make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel
