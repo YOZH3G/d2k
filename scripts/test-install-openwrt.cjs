@@ -107,6 +107,7 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   fixture('builds/d2ktg-linux-amd64', sh('echo features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3'));
   fixture('builds/d2kd-linux-amd64', sh('exit 0'));
   fixture('builds/d2kc-linux-amd64', sh('exit 2'));
+  fixture('builds/d2kfetch-linux-amd64', sh('echo d2kfetch dev'));
   fixture('files/S99d2k', sh('printf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0'));
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
   // Sourced by uninstall.sh: definitions only, no exit.
@@ -165,6 +166,7 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   assert.match(read(log('nft')), /^-c -f .*preflight\.nft$/m, 'kernel support must be checked with nft -c before the switch');
   assert.match(read(calls), /^arch \S+ aarch64_generic$/m, 'architecture must come from DISTRIB_ARCH, not Entware');
   assert(fs.existsSync(d2kd), 'runtime must be installed');
+  assert(fs.existsSync(path.join(tmp, 'opt/sbin/d2kfetch')), 'measurement tool must be installed');
   assert(read(calls).includes('service-start'), 'service must be started');
   assert(fs.existsSync(path.join(tmp, 'etc/init.d/d2k')) && read(calls).includes('host-enable'), 'boot bridge must be installed and enabled');
   assert.doesNotMatch(fresh, /Entware/, 'nothing may ask for Entware');
