@@ -7446,7 +7446,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
        закрытия на 10 мин, и шторма замеров на одном имени не будет. */
     if ((ev->code == D2K_SUSPECT_RST_AFTER_APP ||
          (ev->code == D2K_SUSPECT_FIN_RETRY && ev->planned == D2K_LINK_PLANNED_NO)) &&
-        (!t || t->state == T_WATCHING)) {
+        (!t || (t->state == T_WATCHING && ev->planned != D2K_LINK_PLANNED_NO))) {
         char quiet_key[300];
         snprintf(quiet_key, sizeof quiet_key, "late %u %s", ev->transport, name);
         say_quiet(s, quiet_key, "по %s позднее закрытие (%s) — проверяю обрыв ответа сам, "
@@ -7466,20 +7466,34 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         }
         if (late_app_rst) {
             if (t->state != T_WATCHING) { return 0; }
-            /* Keep the confirmed catalog binding, but replace its passive
-               watcher with a targeted measurement task. */
-            say(s, "по %s позднее закрытие после app-data — проверяю повторяемость обрыва ответа",
-                t->name);
-            task_done(s, t);
-            t = NULL;
+            /* ПОЗДНЕЕ ЗАКРЫТИЕ НА ПОТОКЕ БЕЗ ПЛАНА У ПОДТВЕРЖДЁННОЙ ЦЕЛИ — НЕ
+               УЛИКА (issue #5, station-drivers.com, 19.10.2026). Соединение
+               браузера, открытое до того, как план доехал, режется на объёме
+               как и прежде; датапат честно говорит «план не применялся».
+               Прежде ветвь сносила наблюдателя и перемеряла: 18 с, 4 зонда,
+               тот же план подтверждён снова — 10 кругов за вечер, и ни одного
+               подозрения с применённым планом. О плане такой поток не говорит
+               ничего — он идёт общей ветвью ниже: наблюдение продолжается,
+               просится снимок. Поток ПОД планом меряется сразу, как и было. */
+            if (ev->planned != D2K_LINK_PLANNED_NO) {
+                /* Keep the confirmed catalog binding, but replace its passive
+                   watcher with a targeted measurement task. */
+                say(s, "по %s позднее закрытие после app-data — проверяю повторяемость обрыва ответа",
+                    t->name);
+                task_done(s, t);
+                t = NULL;
+            }
         }
     }
     if (t) {
         /* Поиск уже идёт — но примета всё равно наша: отпечаток растёт по мере
            того, как коробка себя проявляет, и первое подозрение редко
-           показывает её целиком. */
-        d2k_cat_signal sig = signal_of(ev);
-        fp_add(&t->fp, &sig);
+           показывает её целиком. Позднее закрытие приметой коробки не
+           является (как и у новой задачи ниже). */
+        if (!late_app_rst) {
+            d2k_cat_signal sig = signal_of(ev);
+            fp_add(&t->fp, &sig);
+        }
         if (t->state != T_WATCHING) { return 0; }
         /* А эта задача уже подтверждена и только смотрела на живой трафик.
            Новое подозрение по той же цели означает, что коробка вмешалась

@@ -7637,6 +7637,50 @@ recheck_test:
         d2k_sched_tcp_base_hook = saved_base;
         d2k_sched_ech_resolve_hook = d2k_ech_resolve;
     }
+    {
+        /* 9. Issue #5 (station-drivers.com, 19.10.2026): после каждого
+           подтверждения через 2 с приходил поздний RST на потоке, к которому
+           план НЕ применялся (исполнение плана 2) — соединение браузера,
+           открытое до того, как план доехал. Ветвь позднего закрытия сносила
+           наблюдателя и перемеряла (18 с, 4 зонда), снова подтверждала тот же
+           план — 10 кругов за вечер, ни одного подозрения с применённым планом.
+           Поток без плана говорит о плане ровно ничего (та же логика у общей
+           ветви: «уликой против плана не считаю»): наблюдение продолжается,
+           просится снимок. Поздний RST ПОД планом по-прежнему меряется сразу. */
+        const char *nm = "late-unplanned.example";
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0;
+        confirm_once(&c, sv[0], nm, 40661);
+        d2k_cat_binding *m = binding_shape(&c, nm, 6, D2K_SHAPE_MODERN);
+        CHECK(m != NULL, "late/unplanned: fixture not confirmed");
+        if (m) m->input = D2K_INPUT_CLIENT;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        ver_answer_port = 40662;
+        d2k_ev h = ev_hello(6, 40662, nm); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40662); d2k_sched_event(s, &su); settle(s);
+        d2k_ev ap = ev_applied(6, 40662); d2k_sched_event(s, &ap); spin(s, 40);
+        CHECK(said("ПОДТВЕРЖДЕНО"), "late/unplanned: цель не подтверждена — наблюдать нечего");
+        vol_calls = tcp_calls = 0; saidbuf[0] = '\0'; forget_sent();
+        h.high_port++; su.high_port++;
+        su.code = D2K_SUSPECT_RST_AFTER_APP; su.planned = D2K_LINK_PLANNED_NO;
+        d2k_sched_event(s, &h); d2k_sched_event(s, &su); settle(s);
+        CHECK(!said("проверяю повторяемость обрыва ответа") && vol_calls == 0 && tcp_calls == 0,
+              "late/unplanned: поздний RST на потоке без плана снёс наблюдателя и перемерил");
+        CHECK(said("НЕ ПРИМЕНЯЛСЯ") && sent_command_count(D2K_CMD_ARM_SHAPE, NULL, 0) == 1,
+              "late/unplanned: наблюдение не продолжено / снимок не запрошен");
+        /* Контроль: тот же сигнал ПОД планом — улика, замер объёма идёт. */
+        saidbuf[0] = '\0';
+        h.high_port++; su.high_port++; su.planned = D2K_LINK_PLANNED_YES;
+        d2k_sched_event(s, &h); d2k_sched_event(s, &su); settle(s);
+        CHECK(said("проверяю повторяемость обрыва ответа") && vol_calls == 1,
+              "late/unplanned: поздний RST под планом не перемерен");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
     if (recheck_only) { goto voice_only_done; }
 lifecycle_test:
     /* --- ЗАДАЧА 24: жизненный цикл задачи --------------------------------
