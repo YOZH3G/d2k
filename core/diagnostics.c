@@ -5,6 +5,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <limits.h>
+#include <dirent.h>
+#include <errno.h>
 #ifndef D2K_RELEASE_ID
 #define D2K_RELEASE_ID "dev"
 #endif
@@ -21,7 +23,15 @@ typedef struct {
 typedef struct {
     int64_t at,mono,total,available,conntrack;d2k_diag_counts counts;proc_mem procs[PROCESS_COUNT];
 } sample;
+/* Two fixed snapshots per process; never retain raw maps or file names.
+ * Groups follow kernel labels, not allocator ownership: unlabelled thread
+ * stacks and malloc mappings can both appear in anonymous. */
+typedef struct {
+    long pid; int64_t at,mono,rss,start_ticks,vm[4],fds;
+    int smaps_ok; int64_t groups[4][5];
+} memory_detail;
 struct d2k_diag {
+    memory_detail first[PROCESS_COUNT],latest[PROCESS_COUNT];
     event events[EVENTS];sample samples[SAMPLES];
     size_t ne,ns;uint64_t event_total,sample_total;int64_t last_ms;int sampled;
 };
@@ -83,6 +93,75 @@ static void read_proc(proc_mem *m,const char *proc,const char *run,size_t i) {
         if((v=value(line,"Threads:"))>=0)m->threads=v;
     }fclose(f);
 }
+static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms,const char *proc) {
+    memset(m,0,sizeof *m);m->pid=p->pid;m->rss=p->rss;m->at=at;m->mono=ms;
+    m->start_ticks=m->fds=-1;for(size_t k=0;k<4;k++)m->vm[k]=-1;
+    if(!p->pid)return;
+    char path[512],line[512];FILE *f;
+    if(snprintf(path,sizeof path,"%s/%ld/stat",proc,p->pid)>=(int)sizeof path)return;
+    f=fopen(path,"r");if(f){
+        if(fgets(line,sizeof line,f)) {
+            char *end=strrchr(line,')'),*save=NULL;
+            if(end){char *t=strtok_r(end+1," ", &save);
+                for(int field=3;t && field<22;field++)t=strtok_r(NULL," ",&save);
+                if(t){char *tail;errno=0;long long n=strtoll(t,&tail,10);
+                    if(!errno && tail!=t && (*tail==0 || *tail=='\n') && n>=0)m->start_ticks=n;}
+            }
+        }fclose(f);
+    }
+    const char *keys[]={"VmSize:","VmData:","VmStk:","VmSwap:"};
+    snprintf(path,sizeof path,"%s/%ld/status",proc,p->pid);
+    f=fopen(path,"r");if(f){while(fgets(line,sizeof line,f)){for(size_t k=0;k<4;k++){
+        int64_t n=value(line,keys[k]);if(n>=0)m->vm[k]=n;
+    }}fclose(f);}
+    snprintf(path,sizeof path,"%s/%ld/fd",proc,p->pid);
+    DIR *dir=opendir(path);if(dir){
+        struct dirent *entry;m->fds=0;errno=0;
+        while((entry=readdir(dir)))if(entry->d_name[0]!='.')m->fds++;
+        if(errno)m->fds=-1;
+        closedir(dir);
+    }
+    snprintf(path,sizeof path,"%s/%ld/smaps",proc,p->pid);
+    f=fopen(path,"r");if(!f)return;
+    int group=-1,valid=1;int64_t maps=0,fields=0;
+    const char *metrics[]={"Size:","Rss:","Anonymous:","Private_Dirty:"};
+    while(fgets(line,sizeof line,f)) {
+        unsigned long long a,b,off,inode;unsigned major,minor;char perms[5];int n=0;
+        if(sscanf(line,"%llx-%llx %4s %llx %x:%x %llu %n",&a,&b,perms,&off,&major,&minor,&inode,&n)==7 && n>0){
+            char *label=line+n;label[strcspn(label,"\r\n")]=0;
+            group=!label[0]?0:!strcmp(label,"[heap]")?1:!strncmp(label,"[stack",6)?2:3;
+            m->groups[group][0]++;maps++;continue;
+        }
+        if(group<0)continue;
+        for(size_t k=0;k<4;k++){
+            int64_t v=value(line,metrics[k]);if(v<0)continue;
+            if(v>INT64_MAX-m->groups[group][k+1])valid=0;
+            else m->groups[group][k+1]+=v;
+            fields++;
+        }
+    }
+    m->smaps_ok=valid && maps>0 && fields==maps*4 && !ferror(f);
+    fclose(f);
+}
+static void write_detail(FILE *f,const memory_detail *m) {
+    if(!m->pid){fputs("null",f);return;}
+    fprintf(f,"{\"pid\":%ld,\"at\":%lld,\"mono_ms\":%lld,\"rss_kib\":",m->pid,(long long)m->at,(long long)m->mono);
+    number(f,m->rss);fputs(",\"start_ticks\":",f);number(f,m->start_ticks);
+    const char *keys[]={"vm_size_kib","vm_data_kib","vm_stack_kib","vm_swap_kib"};
+    for(size_t k=0;k<4;k++){fprintf(f,",\"%s\":",keys[k]);number(f,m->vm[k]);}
+    fputs(",\"fd_count\":",f);number(f,m->fds);fputs(",\"smaps\":",f);
+    if(!m->smaps_ok)fputs("null",f);
+    else {
+        const char *groups[]={"anonymous","heap","stack","other"};
+        const char *metrics[]={"maps","size_kib","rss_kib","anonymous_kib","private_dirty_kib"};
+        fputc('{',f);
+        for(size_t g=0;g<4;g++){
+            fprintf(f,"%s\"%s\":{",g?",":"",groups[g]);
+            for(size_t k=0;k<5;k++){fprintf(f,"%s\"%s\":",k?",":"",metrics[k]);number(f,m->groups[g][k]);}
+            fputc('}',f);
+        }fputc('}',f);
+    }fputc('}',f);
+}
 void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char *proc,const char *run) {
     if(!d||!c||(d->sampled&&ms>=d->last_ms&&ms-d->last_ms<60000))return;
     d->last_ms=ms;d->sampled=1;
@@ -99,7 +178,13 @@ void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char 
     if(snprintf(path,sizeof path,"%s/sys/net/netfilter/nf_conntrack_count",proc)<(int)sizeof path) {
         FILE *f=fopen(path,"r");if(f){long long v;if(fscanf(f,"%lld",&v)==1 && v>=0)s->conntrack=v;fclose(f);}
     }
-    for(size_t i=0;i<PROCESS_COUNT;i++)read_proc(&s->procs[i],proc,run,i);
+    for(size_t i=0;i<PROCESS_COUNT;i++){
+        read_proc(&s->procs[i],proc,run,i);
+        read_detail(&d->latest[i],&s->procs[i],s->at,ms,proc);
+        const memory_detail *m=&d->latest[i];
+        if(m->pid && (d->first[i].pid!=m->pid ||
+           (m->start_ticks>=0 && d->first[i].start_ticks!=m->start_ticks)))d->first[i]=*m;
+    }
     if(d->ns<SAMPLES)d->ns++;
 }
 int d2k_diag_write(const d2k_diag *d,FILE *f) {
@@ -133,5 +218,10 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
             fprintf(f,",\"pid\":%ld,\"rss_kib\":",p->pid);number(f,p->rss);fputs(",\"hwm_kib\":",f);number(f,p->hwm);
             fputs(",\"anon_kib\":",f);number(f,p->anon);fputs(",\"threads\":",f);number(f,p->threads);fputc('}',f);
         }fputs("]}",f);
+    }fputs("],\"memory_details\":[",f);
+    for(size_t i=0;i<PROCESS_COUNT;i++){
+        if(i)fputc(',',f);
+        fputs("{\"name\":",f);js(f,names[i]);fputs(",\"first\":",f);write_detail(f,&d->first[i]);
+        fputs(",\"latest\":",f);write_detail(f,&d->latest[i]);fputc('}',f);
     }fputs("]}\n",f);return ferror(f)?-1:0;
 }

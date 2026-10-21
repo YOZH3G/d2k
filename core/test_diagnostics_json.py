@@ -18,3 +18,18 @@ with tempfile.TemporaryDirectory() as directory:
     assert sample['datapath_flows'] is None
     assert sample['system_conntrack'] is None
 print('diagnostics JSON: real serializer PASS')
+
+details = report['memory_details'][0]
+assert details['name'] == 'd2kc'
+assert details['first']['mono_ms'] == 0
+assert details['first']['rss_kib'] == 1024
+assert details['latest']['mono_ms'] == 60000
+assert details['latest']['rss_kib'] == 4096
+assert details['latest']['vm_size_kib'] == 8192
+assert details['latest']['smaps']['heap']['rss_kib'] == 8
+assert details['latest']['smaps']['anonymous']['rss_kib'] == 24
+assert details['latest']['smaps']['other']['rss_kib'] == 4
+assert details['latest']['fd_count'] is None
+assert report['memory_details'][1]['latest'] is None
+assert 'never-export-me' not in json.dumps(report)
+print('memory detail snapshot contract PASS')
