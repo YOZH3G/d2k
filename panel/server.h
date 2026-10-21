@@ -5,6 +5,7 @@
 
 typedef struct {
     const char *live_path;
+    const char *diagnostics_dir; /* default private /tmp directory */
     const char *asset_dir;
     const char *version;
     const char *commit;

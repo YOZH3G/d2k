@@ -252,6 +252,8 @@ async function main(){
    const b=await evaluate('(()=>{const r=document.querySelector("#telegram-body").getBoundingClientRect();return {x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}})()');
    const s=await call('Page.captureScreenshot',{format:'png',clip:{...b,scale:2}});fs.writeFileSync(path.join(process.env.D2K_TUNNEL_SHOTS,'9-reduced-motion-connected.png'),Buffer.from(s.data,'base64'))}
   await call('Emulation.setEmulatedMedia',{features:[]});
+  await until('document.querySelector("#diagnostic-status").textContent.includes("Сбор выключен")','diagnostic collector is off by default');
+  assert.equal(await evaluate('document.querySelector("#diagnostic-download").hidden'),true,'no diagnostic download while disabled');
   assert.deepEqual(exceptions,[]);
   console.log('Browser + C panel: rendering, honesty, polling, layout and all six commands passed.');
  }finally{await panel.close()}

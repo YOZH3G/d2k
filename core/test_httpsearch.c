@@ -366,11 +366,20 @@ static void trial(d2k_httpsearch *hs, fake *f, int64_t *now, int applied, d2k_hs
     if(!f->hold_install_ack)d2k_httpsearch_install_ack(hs,f->install_id,1,&f->binding);
 }
 
+static unsigned diag_failed,diag_confirmed,diag_direct;
+static void diagnostic_capture(void *ctx,const d2k_diag_event *e) {
+    (void)ctx;CHECK(!strcmp(e->protocol,"http"),"HTTP diagnostics protocol");
+    CHECK(e->id>0 && e->elapsed_ms>=0,"HTTP diagnostic identity/time");
+    if(!strcmp(e->outcome,"probe-direct"))diag_direct++;
+    if(!strcmp(e->outcome,"failed"))diag_failed++;
+    if(!strcmp(e->outcome,"probe-confirmed"))diag_confirmed++;
+}
 static void test_search(void) {
     fake f;
     memset(&f, 0, sizeof f);
     d2k_hs_ops ops = ops_of(&f);
     d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    d2k_httpsearch_diagnostics(hs,diagnostic_capture,NULL);
     int64_t now = 1000;
     d2k_httpsearch_portal(hs, "www.fast-torrent.ru", 4, IP, now);
     CHECK(f.start_n == 1 && f.set_probe_n == 0, "база: зонд без плана не запущен");
@@ -434,6 +443,7 @@ static void test_search(void) {
     d2k_httpsearch_result(hs, &r, now += 100);
     CHECK(f.set_probe_n == sp && !d2k_httpsearch_busy(hs) && strstr(f.said, "не воспроизвод"),
           "поиск начат без воспроизведённой вставки");
+    CHECK(diag_direct>0,"working direct HTTP is not a diagnostic failure");
     /* Вставка по имени с планом — перепроверка: план испытан первым. */
     sp = f.set_probe_n;
     d2k_httpsearch_portal(hs, "rutracker.org", 4, IP, now += D2K_HS_RECHECK_MS + 1);
@@ -445,6 +455,7 @@ static void test_search(void) {
     for (int i = 0; i < 8 && d2k_httpsearch_busy(hs); i++) { trial(hs, &f, &now, 1, D2K_HS_INJECTED); }
     CHECK(!d2k_httpsearch_busy(hs) && f.del_plan_n == 1 && !d2k_httpsearch_plan_of(hs, "rutracker.org", 4),
           "неработающий план не снят после перепроверки");
+    CHECK(diag_failed>0 && diag_confirmed>0,"both HTTP terminal outcomes observed");
     int st = f.start_n;
     d2k_httpsearch_portal(hs, "rutracker.org", 4, IP, now += 1000);
     CHECK(f.start_n == st, "имя без обхода перепроверено раньше срока");
