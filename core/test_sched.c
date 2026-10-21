@@ -7681,6 +7681,97 @@ recheck_test:
         if (fails) fprintf(stderr, "%s\n", saidbuf);
         d2k_sched_free(s); d2k_catalog_free(&c);
     }
+    {
+        /* п. 10 — ПОТОК БЕЗ ПЛАНА У ПОДТВЕРЖДЁННОЙ ЦЕЛИ, КОГДА НАБЛЮДАТЕЛЯ УЖЕ НЕТ
+           (issue #5 после 3f9a43e, журнал репортёра 21.10.2026). Наблюдатель
+           снимается первым же последующим TLS-ответом (D2K_EV_EXCHANGE), и
+           подозрение о потоке, к которому датапат план НЕ применял, приходило к
+           t==NULL: заводился полный поиск, 20 с и 4 зонда, тот же план
+           подтверждался снова — 7 кругов за 15 минут; после рестарта так же.
+           Поток без плана о плане не говорит ничего; поиск нужен, только если
+           форма потока привязкой не покрыта (TLS 1.2 при записи TLS 1.3).
+           Контроли — в своих каталогах: поиск одного шага оставляет отдых
+           имени, и соседний шаг мерил бы не своё. */
+        const char *nm = "unplanned-nowatch.example";
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0;
+        confirm_once(&c, sv[0], nm, 40671);
+        d2k_cat_binding *m = binding_shape(&c, nm, 6, D2K_SHAPE_MODERN);
+        CHECK(m != NULL, "unplanned/nowatch: fixture not confirmed");
+        if (m) m->input = D2K_INPUT_CLIENT;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        ver_answer_port = 40672;
+        d2k_ev h = ev_hello(6, 40672, nm); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40672); d2k_sched_event(s, &su); settle(s);
+        d2k_ev ap = ev_applied(6, 40672); d2k_sched_event(s, &ap); spin(s, 40);
+        CHECK(said("ПОДТВЕРЖДЕНО"), "unplanned/nowatch: цель не подтверждена — опыт не о том");
+        /* Последующий TLS-ответ на другом потоке снимает наблюдателя (так в коде). */
+        saidbuf[0] = '\0';
+        h.high_port++;
+        d2k_ev ex = ev_exchange(6, h.high_port, 1);
+        d2k_sched_event(s, &h); d2k_sched_event(s, &ex); settle(s);
+        CHECK(said("замечен последующий TLS-ответ"),
+              "unplanned/nowatch: наблюдатель не снят — опыт не о том");
+        /* Подозрение о потоке без плана; форма покрыта: ECH offer GREASE-клиента
+           при записи TLS 1.3 — датапат применяет её (plans.c). */
+        vol_calls = tcp_calls = 0; saidbuf[0] = '\0'; forget_sent();
+        h.high_port++; su.high_port++;
+        su.code = D2K_SUSPECT_RST_AFTER_APP; su.planned = D2K_LINK_PLANNED_NO;
+        su.client_shape = D2K_LINK_SHAPE_ECH_TCP;
+        d2k_sched_event(s, &h); d2k_sched_event(s, &su); settle(s);
+        CHECK(!said("источник нового замера") && vol_calls == 0 && tcp_calls == 0,
+              "unplanned/nowatch: поток без плана у подтверждённой цели завёл поиск");
+        CHECK(said("не улика, поиск не начинаю"), "unplanned/nowatch: причина не названа");
+        /* Контроль формы: TLS 1.2 при записи TLS 1.3 не покрыт — это другой вход,
+           поиск идёт как прежде. */
+        saidbuf[0] = '\0';
+        h.high_port++; su.high_port++;
+        su.client_shape = D2K_SHAPE_LEGACY;
+        d2k_sched_event(s, &h); d2k_sched_event(s, &su); settle(s);
+        CHECK(said("источник нового замера"),
+              "unplanned/nowatch: непокрытая форма без плана не замерена");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    {
+        /* п. 10, контроль плана: тот же сигнал ПОД планом у цели без наблюдателя
+           — улика, поиск идёт. Свой каталог: отдых имени после чужого шага сюда
+           не доезжает. */
+        const char *nm = "unplanned-nowatch-planned.example";
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0;
+        confirm_once(&c, sv[0], nm, 40681);
+        d2k_cat_binding *m = binding_shape(&c, nm, 6, D2K_SHAPE_MODERN);
+        CHECK(m != NULL, "unplanned/nowatch/planned: fixture not confirmed");
+        if (m) m->input = D2K_INPUT_CLIENT;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        ver_answer_port = 40682;
+        d2k_ev h = ev_hello(6, 40682, nm); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40682); d2k_sched_event(s, &su); settle(s);
+        d2k_ev ap = ev_applied(6, 40682); d2k_sched_event(s, &ap); spin(s, 40);
+        CHECK(said("ПОДТВЕРЖДЕНО"), "unplanned/nowatch/planned: цель не подтверждена");
+        saidbuf[0] = '\0';
+        h.high_port++;
+        d2k_ev ex = ev_exchange(6, h.high_port, 1);
+        d2k_sched_event(s, &h); d2k_sched_event(s, &ex); settle(s);
+        CHECK(said("замечен последующий TLS-ответ"), "unplanned/nowatch/planned: наблюдатель не снят");
+        saidbuf[0] = '\0';
+        h.high_port++; su.high_port++;
+        su.code = D2K_SUSPECT_RST_AFTER_APP; su.planned = D2K_LINK_PLANNED_YES;
+        su.client_shape = D2K_LINK_SHAPE_ECH_TCP;
+        d2k_sched_event(s, &h); d2k_sched_event(s, &su); settle(s);
+        CHECK(said("источник нового замера"), "unplanned/nowatch/planned: сигнал под планом не замерен");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
     if (recheck_only) { goto voice_only_done; }
 lifecycle_test:
     /* --- ЗАДАЧА 24: жизненный цикл задачи --------------------------------

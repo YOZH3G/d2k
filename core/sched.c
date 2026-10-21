@@ -4426,6 +4426,36 @@ static const d2k_cat_binding *binding_for(const d2k_sched *s, const char *name,
     return NULL;
 }
 
+/* ПОКРЫВАЕТ ЛИ ПОДТВЕРЖДЁННАЯ ПРИВЯЗКА ЭТУ ФОРМУ — ПО ПРАВИЛУ ДАТАПАТА
+   (plans.c: shape_fits и порядок scan_name). Своя форма; запись TLS 1.3 годится
+   потоку с ECH offer, пока у имени нет отдельной ECH-привязки — GREASE по
+   байтам неотличим от ECH; ноль с любой стороны — «не измерено», не
+   противоречит (так же d2k_cat_shape_fits). Берутся только привязки, которые
+   стоят на проводе: включённые, подтверждённые, без пометки повторной
+   проверки. Нужна там, где контроллер судит о потоке, к которому датапат план
+   не применял: судить он обязан той же меркой, которой датапат выбирал план. */
+static const d2k_cat_binding *binding_covering(const d2k_sched *s, const char *name,
+                                               uint8_t transport, uint8_t family,
+                                               uint8_t shape) {
+    const d2k_cat_binding *exact = NULL, *modern = NULL, *unshaped = NULL;
+    if (!s->cat || !name || !name[0]) { return NULL; }
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        const d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t i = 0; i < b->n_binds; i++) {
+            const d2k_cat_binding *bd = &b->binds[i];
+            if (!bd->enabled || bd->level < 3 || bd->recheck_since ||
+                strcmp(bd->kind, "name") != 0 || strcmp(bd->target, name) != 0 ||
+                (bd->transport ? bd->transport : 6) != transport ||
+                (bd->family ? bd->family : 4) != family) { continue; }
+            if (shape == 0 || bd->shape == shape) { if (!exact) { exact = bd; } }
+            else if (bd->shape == 0) { if (!unshaped) { unshaped = bd; } }
+            else if (bd->shape == (uint8_t)D2K_SHAPE_MODERN &&
+                     shape == D2K_LINK_SHAPE_ECH_TCP) { if (!modern) { modern = bd; } }
+        }
+    }
+    return exact ? exact : modern ? modern : unshaped;
+}
+
 static size_t known_plans(d2k_sched *s, task *t) {
     t->fb_queue = 0;
     if (t->fp.n_sig == 0) { return 0; }
@@ -7435,6 +7465,30 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         !tcp_stall_in_name_band(s, name, ev)) {
         return 0;
     }
+    /* ПОТОК БЕЗ ПЛАНА У ПОДТВЕРЖДЁННОЙ ЦЕЛИ — НЕ УЛИКА И БЕЗ НАБЛЮДАТЕЛЯ
+       (issue #5 после 3f9a43e, журнал репортёра 21.10.2026). Наблюдатель
+       снимается первым же последующим TLS-ответом (D2K_EV_EXCHANGE ниже), и
+       подозрение о потоке, к которому датапат план НЕ применял, приходило уже
+       к t==NULL: заводился полный поиск, 20 с и 4 зонда, тот же план
+       подтверждался снова — 7 кругов за 15 минут; после рестарта так же
+       (soundcloud). Правило то же, что у ветки T_WATCHING ниже: такой поток о
+       плане не говорит ничего. Поиск нужен, только если форма потока привязкой
+       не покрыта (TLS 1.2, QUIC) — это другой вход, и он меряется как прежде.
+       Почему план не применён, отвечает журнал датапата, а не новый замер.
+       Только TCP: у QUIC неприменённый разрез CRYPTO проверяется снимком
+       пачки, и это делает ветка наблюдателя. */
+    if (!t && !by_addr && ev->transport == 6 && ev->planned == D2K_LINK_PLANNED_NO) {
+        const d2k_cat_binding *bd = binding_covering(s, name, 6, ev->family ? ev->family : 4,
+                                                     ev->client_shape);
+        if (bd) {
+            char quiet_key[300];
+            snprintf(quiet_key, sizeof quiet_key, "unplanned %u %s", ev->transport, name);
+            say_quiet(s, quiet_key, "по %s план %s уже подтверждён, а к этому потоку датапат "
+                      "его не применял — не улика, поиск не начинаю (причина — в журнале "
+                      "датапата)", name, bd->plan_id);
+            return 0;
+        }
+    }
     /* ПОЗДНЕЕ ЗАКРЫТИЕ — ЗАМЕР С ПЕРВОГО СИГНАЛА (владелец, 15.10.2026).
        Прежде здесь ждали второго такого закрытия на независимом потоке за
        30 с. Клиент с одним соединением (старые телевизоры на webOS тянут
@@ -7574,6 +7628,19 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         size_t len = s->tcp_shape_len[t->family == 6];
         t->trigger_shape = d2k_hello_ech_offer(hello,len,NULL)==1 ?
                 D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(hello,len);
+        /* GREASE-клиент: ECH offer есть, а привязка имени — TLS 1.3 и отдельной
+           ECH-привязки нет. Датапат применит к нему запись TLS 1.3 (plans.c), и
+           форма задачи обязана совпадать с тем, что применится: иначе покрытие
+           семейства и снимка расходятся с проводом (issue #7, 21.10.2026).
+           Настоящий ECH доказывает только HTTPS RR — у цели с ECH-привязкой
+           форма остаётся ECH. */
+        if (t->trigger_shape == D2K_LINK_SHAPE_ECH_TCP) {
+            const d2k_cat_binding *bd = binding_covering(s, name, 6, t->family,
+                                                         D2K_LINK_SHAPE_ECH_TCP);
+            if (bd && bd->shape == (uint8_t)D2K_SHAPE_MODERN) {
+                t->trigger_shape = (uint8_t)D2K_SHAPE_MODERN;
+            }
+        }
     }
     if (t->trigger_planned == D2K_LINK_PLANNED_NO &&
         installed_family_ready(s, t, 0, 0)) {
