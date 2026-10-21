@@ -7636,6 +7636,20 @@ static int quic_own_initial(const d2k_sched *s, const task *t,
     return 0;
 }
 
+/* ФОРМА ПРИВЕТСТВИЯ ДЛЯ ПРОВЕРКИ ПОКРЫТИЯ — ТЕМ ЖЕ ПРАВИЛОМ, ЧТО У ПРИВЯЗКИ
+   (record_shape). ECH offer по байтам неотличим от GREASE (RFC 9849 §6.2):
+   настоящий ECH доказывает только HTTPS RR, и задача это уже выяснила
+   (ech_grease). Привязка GREASE-клиента записана формой TLS 1.3; считать его
+   же снимок формой ECH значило бы не найти у него покрытия и перемерять
+   подтверждённую цель на каждое подозрение без плана (issue #7, журналы #5
+   и #7, 21.10.2026: soundcloud.com — 18 поисков за 35 минут, gateway.instagram.com
+   — 53). */
+static d2k_shape watch_shape(const task *t, const uint8_t *b, size_t n) {
+    if (!t->ech_grease && d2k_hello_ech_offer(b, n, NULL) == 1)
+        return (d2k_shape)D2K_LINK_SHAPE_ECH_TCP;
+    return d2k_hello_shape(b, n);
+}
+
 static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_t len) {
     if (len == 0 || len > sizeof t->trig) { return; }
     search_report(s, t, s->now_ms, "superseded", NULL);
@@ -7937,9 +7951,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
             strcmp(t->name, name) == 0) {
             if (t->watch_shape_pending && t->transport == 6) {
                 t->watch_shape_pending = 0;
-                d2k_shape shape = d2k_hello_shape(ev->shape, ev->shape_len);
-                if (d2k_hello_ech_offer(ev->shape, ev->shape_len, NULL) == 1)
-                    shape = (d2k_shape)D2K_LINK_SHAPE_ECH_TCP;
+                d2k_shape shape = watch_shape(t, ev->shape, ev->shape_len);
                 int covered = 0;
                 for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
                     const d2k_cat_box *b = &s->cat->boxes[bi];
@@ -7957,7 +7969,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
                     }
                 }
                 if (!covered && shape != D2K_SHAPE_UNKNOWN &&
-                    shape != d2k_hello_shape(t->trig, t->trig_len)) {
+                    shape != watch_shape(t, t->trig, t->trig_len)) {
                     snprintf(t->ip, sizeof t->ip, "%s", t->watch_shape_ip);
                     t->port = t->watch_shape_port;
                     t->started_ms = s->now_ms;

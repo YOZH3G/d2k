@@ -7579,6 +7579,64 @@ recheck_test:
         d2k_sched_free(s);
         d2k_catalog_free(&c);
     }
+    {
+        /* 8. Issue #7 (soundcloud.com, 21.10.2026; тот же круг в журналах #5 и
+           #7: gateway.instagram.com — 53 поиска, www.youtube.com — 11). Клиент
+           с ECH offer GREASE (Chromium шлёт его почти всем) подтверждён своим
+           планом переносом; привязка записана формой TLS 1.3 (record_shape при
+           ech_grease). Наблюдение же считало снимок ТОГО ЖЕ клиента формой ECH:
+           покрытия нет, форма «не та» — перемер. Перемер — новый поиск, потоки
+           клиента во время него идут без плана, подозрение без плана приходит
+           снова, и так по кругу: soundcloud.com — 18 поисков за 35 минут, сайт
+           «безрезультатно подбирается». Снимок GREASE-клиента покрыт его же
+           привязкой TLS 1.3 — перемера быть не должно. */
+        const char *nm = "grease-watch.example";
+        d2k_catalog c = {0};
+        char pid[40];
+        own_box(&c, "box-grease-watch", pid, 71, 3, "grease-watch.own", 6, D2K_SHAPE_MODERN, 4,
+                1790000000, 0);
+        d2k_sched_tcp_fn saved_base = d2k_sched_tcp_base_hook;
+        d2k_sched_tcp_base_hook = stub_base;
+        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+        base_blocked_answer = 1; base_wait_until_stop = 0;
+        base_calls = tcp_calls = ver_calls = 0;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev sh; memset(&sh, 0, sizeof sh);
+        sh.kind = D2K_EV_SHAPE; sh.transport = 6; sh.family = 4;
+        CHECK(ech_offer_hello(nm, sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+              "grease/watch: fixture");
+        ver_answer_port = 40651;
+        d2k_ev h = ev_hello(6, 40651, nm); d2k_sched_event(s, &h);
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40651); d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev ap = ev_applied(6, 40651); d2k_sched_event(s, &ap);
+        spin(s, 40);
+        CHECK(said("GREASE") && said("ПОДТВЕРЖДЕНО"),
+              "grease/watch: GREASE-клиент не подтверждён своим планом");
+        const d2k_cat_binding *bd = binding_of(&c, nm, 6);
+        CHECK(bd && bd->shape == D2K_SHAPE_MODERN && bd->input == D2K_INPUT_TRANSFER,
+              "grease/watch: привязка GREASE-клиента не TLS 1.3/перенос");
+        int base_before = base_calls, tcp_before = tcp_calls;
+        saidbuf[0] = '\0';
+        forget_sent();
+        h.high_port++; su.high_port++;
+        d2k_sched_event(s, &h);
+        su.planned = D2K_LINK_PLANNED_NO;
+        d2k_sched_event(s, &su); drain();
+        CHECK(sent_command_count(D2K_CMD_ARM_SHAPE, NULL, 0) == 1,
+              "grease/watch: поток без плана не запросил снимок");
+        d2k_sched_event(s, &sh); settle(s);
+        CHECK(!said("перемеряю снимком") && base_calls == base_before && tcp_calls == tcp_before,
+              "grease/watch: снимок того же GREASE-клиента завёл перемер подтверждённой цели");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        d2k_sched_tcp_base_hook = saved_base;
+        d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+    }
     if (recheck_only) { goto voice_only_done; }
 lifecycle_test:
     /* --- ЗАДАЧА 24: жизненный цикл задачи --------------------------------
