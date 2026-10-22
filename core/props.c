@@ -12,7 +12,13 @@
  *     (d2k_ipfrag_shape/d2k_udpfrag_build_ex) — the same code the datapath
  *     puts on the wire, measured by core/test_ipfrag.c. A second builder that
  *     nothing sent could only drift away from the one that ships. */
+/* Файл включают и как текст в составные тесты — после системных заголовков,
+   где glibc (с 2026) уже задал _POSIX_C_SOURCE сам: голый #define там —
+   переопределение под -Werror (CI 22.10.2026). Отдельной единицей трансляции
+   значение задаётся как прежде. */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #define _DARWIN_C_SOURCE /* IP_TTL на macOS — см. тот же приём в quicprobe.c */
 #include <arpa/inet.h>
 #include <netinet/in.h>

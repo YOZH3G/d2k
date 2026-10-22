@@ -23,7 +23,13 @@
  * подмены client_random: иначе наш Finished считался бы по байтам, которых
  * сервер не видел.
  */
+/* Файл включают и как текст в составные тесты — после системных заголовков,
+   где glibc (с 2026) уже задал _POSIX_C_SOURCE сам: голый #define там —
+   переопределение под -Werror (CI 22.10.2026). Отдельной единицей трансляции
+   значение задаётся как прежде. */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include <errno.h>
 #include <poll.h>
 #include <stdarg.h>

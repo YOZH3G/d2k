@@ -29,7 +29,13 @@
  * `c.remember(ev.Key, ev.Name)` на EvHello). Поэтому каждый случай ниже сперва
  * шлёт приветствие и лишь затем подозрение: тест, который клал бы имя прямо в
  * подозрение, проверял бы путь, которого на проводе не существует. */
+/* Файл включают и как текст в составные тесты — после системных заголовков,
+   где glibc (с 2026) уже задал _POSIX_C_SOURCE сам: голый #define там —
+   переопределение под -Werror (CI 22.10.2026). Отдельной единицей трансляции
+   значение задаётся как прежде. */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #define _XOPEN_SOURCE 700 /* strptime under -std=c99 on glibc/musl */
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE

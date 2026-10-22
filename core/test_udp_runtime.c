@@ -1,7 +1,13 @@
 /* Two production runtimes: actual measurement Plan/sink versus session Plan.
  * Socket-generated IP headers are not packet-capture evidence. The full-IP
  * comparison covers lowering; the syscall capture separately covers its sink. */
+/* Файл включают и как текст в составные тесты — после системных заголовков,
+   где glibc (с 2026) уже задал _POSIX_C_SOURCE сам: голый #define там —
+   переопределение под -Werror (CI 22.10.2026). Отдельной единицей трансляции
+   значение задаётся как прежде. */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #define _DARWIN_C_SOURCE
 #define _DEFAULT_SOURCE 1
 #include <stdio.h>
