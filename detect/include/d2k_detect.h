@@ -425,6 +425,10 @@ int d2k_raw_probe_handshake_family(const uint8_t *ip, uint8_t family, uint16_t p
 int d2k_raw_probe_poison_family(const uint8_t *ip, uint8_t family, uint16_t port,
     const d2k_trigger *tr, const d2k_poison *p, int timeout_ms, uint32_t mark,
     const d2k_detect_stop *cancel, char *err, size_t errcap);
+/* Потолок сегмента сырого отправителя замера. Ядро ставит d2k_arm_segment(предел
+ * датапата), чтобы измеренное уходило теми же сегментами, что исполненное
+ * (поле 22.10.2026, issue #5/#7). 0 — вернуть прежние 1400 (D2K_ARM_SEGMENT_MAX). */
+void d2k_raw_set_segment_max(unsigned seg);
 /* Ответ вопроса о свойствах — большинством повторов (props.c): при N = 3 —
  * два прохода, при N = 1 — один. Общий для измерителя и моста (bridge.c). */
 static inline int d2k_prop_majority(int pass, int repeats)

@@ -803,8 +803,15 @@ static int raw_sendto(raw_conn *c, const uint8_t *pkt, size_t n)
  * замечали: он просыпается ровно тогда, когда мерят теми байтами, которыми
  * ходит настоящий браузер. То есть в продукте — всегда.
  *
- * 1400 — с запасом под PPPoE (1492) и под опции TCP в нашем же заголовке. */
-#define D2K_SEG_MAX D2K_ARM_SEGMENT_MAX
+ * 1400 — с запасом под PPPoE (1492) и под опции TCP в нашем же заголовке.
+ *
+ * Потолок — переменная, а не константа (поле 22.10.2026, issue #5/#7): ядро
+ * ставит его по пределу датапата (d2k_arm_segment), и замер уходит теми же
+ * сегментами, какими потом пойдёт план. Иначе на узком канале (туннель, LTE)
+ * замер шёл сегментами 1400, а план с таким сегментом датапат отвергал — и
+ * измеренное расходилось с исполнимым. По умолчанию — прежние 1400. */
+static unsigned seg_max = D2K_ARM_SEGMENT_MAX;
+void d2k_raw_set_segment_max(unsigned seg) { seg_max = seg ? seg : D2K_ARM_SEGMENT_MAX; }
 
 /* send кладёт нагрузку на провод. Номер последовательности НЕ двигается при
  * отравленной посылке: фальшивка обязана занять ту же область, что займут
@@ -833,8 +840,8 @@ static int raw_send(raw_conn *c, const uint8_t *payload, size_t plen,
     do {
         size_t take = plen - off;
         size_t n;
-        if (take > D2K_SEG_MAX) {
-            take = D2K_SEG_MAX;
+        if (take > seg_max) {
+            take = seg_max;
         }
         n = build_ip_tcp(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
                            seq + (uint32_t)off, c->ack, flags,
@@ -1304,6 +1311,7 @@ senderr:
  * результат отравления без сырых сокетов не означает ничего, и вердикт обязан
  * это сказать (см. res.RawUsable в эталоне), а не промолчать. */
 int d2k_raw_supported(void) { return 0; }
+void d2k_raw_set_segment_max(unsigned seg) { (void)seg; }
 unsigned long d2k_raw_rst_fail_count(void) { return 0; }
 unsigned long d2k_raw_dial_count(void) { return 0; }
 void d2k_raw_flush_pending(void) {}

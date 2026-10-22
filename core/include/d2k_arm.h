@@ -47,6 +47,29 @@ typedef struct {
 #define D2K_ARM_DECOY_MAX 2048
 /* Existing raw sender's segment ceiling, shared rather than copied. */
 #define D2K_ARM_SEGMENT_MAX 1400
+/* Заголовки поверх сегмента в посылке: IPv6 40 + TCP 20 + метка времени 12.
+ * Берётся худший случай, а не IPv4: при обычном канале (1500, 1492) это ничего
+ * не меняет — 1400 остаётся 1400, — а на узком не обещает лишних 20 байт.
+ * Датапат при активации считает IPv4 (plan_apply.c emit_overhead), так что
+ * сегмент, уложенный под этот запас, у него проходит всегда. */
+#define D2K_ARM_SEGMENT_HEADS 72
+
+/* Сегмент посылок плана под объявленный предел канала. send_cap — предел
+ * длины посылки целиком, с заголовком IP, как его объявляет датапат
+ * (D2K_EV_PROTO); 0 — не объявлен, тогда прежняя константа.
+ *
+ * Поле 22.10.2026 (issue #5, #7): сегмент константой 1400 при пределе ниже
+ * 1472 означал отказ датапата на активации и «план отвергнут исполнителем»
+ * на каждом кандидате — у человека с узким каналом измеренных TCP-планов не
+ * было вовсе. Ту же величину ставит себе отправитель замера (detect/raw.c,
+ * d2k_raw_set_segment_max): измеренное и исполненное уходят одними сегментами.
+ * 0 — предел так мал, что сегмента нет; плечо не задать. */
+static inline unsigned d2k_arm_segment(size_t send_cap) {
+    if (send_cap == 0) { return D2K_ARM_SEGMENT_MAX; }
+    if (send_cap <= D2K_ARM_SEGMENT_HEADS) { return 0; }
+    size_t room = send_cap - D2K_ARM_SEGMENT_HEADS;
+    return room < D2K_ARM_SEGMENT_MAX ? (unsigned)room : D2K_ARM_SEGMENT_MAX;
+}
 typedef struct {
     size_t trigger_len;
     size_t sni_off, sni_len;
