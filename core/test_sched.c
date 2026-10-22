@@ -8501,6 +8501,95 @@ lifecycle_test:
         }
     }
 
+    /* --- план, не влезающий в посылку датапата, на провод не едет --------
+     *
+     * Поле 22.10.2026 (issue #5/#7): предел датапата 1280 (туннель), план
+     * каталога с фальшивкой в сегмент 1400 — посылка 1440. Датапат отвергал его
+     * на активации каждый проход, контроллер ставил заново, цель оставалась
+     * без обхода и без нового замера: привязка «подтверждена». Теперь такой
+     * план не ставится, привязка помечается на повторную проверку (снята с
+     * провода), а при пределе 1500 или без объявленного предела — ставится
+     * как прежде. */
+    for (int round = 0; round < 3; round++) {
+        d2k_catalog c9;
+        memset(&c9, 0, sizeof c9);
+        c9.boxes = calloc(1, sizeof *c9.boxes);
+        CHECK(c9.boxes != NULL, "каталог для невлезающего плана не завёлся");
+        if (!c9.boxes) { continue; }
+        c9.n_boxes = 1;
+        snprintf(c9.boxes[0].id, sizeof c9.boxes[0].id, "box-узкий");
+        c9.boxes[0].plans = calloc(1, sizeof *c9.boxes[0].plans);
+        c9.boxes[0].n_plans = 1;
+        snprintf(c9.boxes[0].plans[0].id, sizeof c9.boxes[0].plans[0].id, "plan-1440");
+        snprintf(c9.boxes[0].plans[0].proto, sizeof c9.boxes[0].plans[0].proto, "tls");
+        c9.boxes[0].plans[0].enabled = 1;
+        /* Фальшивка в полный сегмент: 1400 + 20 + 20 = 1440 байт посылки. */
+        c9.boxes[0].plans[0].text = strdup(
+            "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
+            "wire detect-tcp-v1\ninput tls-sni\npayload-pad 1 1400 15\npoison 1 badsum\n"
+            "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n"
+            "segment 1400\norder forward\n");
+        c9.boxes[0].binds = calloc(1, sizeof *c9.boxes[0].binds);
+        c9.boxes[0].n_binds = 1;
+        snprintf(c9.boxes[0].binds[0].plan_id, sizeof c9.boxes[0].binds[0].plan_id, "plan-1440");
+        c9.boxes[0].binds[0].transport = 6;
+        c9.boxes[0].binds[0].level = 3;
+        snprintf(c9.boxes[0].binds[0].kind, sizeof c9.boxes[0].binds[0].kind, "name");
+        snprintf(c9.boxes[0].binds[0].target, sizeof c9.boxes[0].binds[0].target, "узкий.example");
+        c9.boxes[0].binds[0].enabled = 1;
+        uint64_t revision_before = c9.revision;
+
+        d2k_sched *s = d2k_sched_new(&c9, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        uint32_t cap = round == 0 ? 1280u : round == 1 ? 1500u : 0u;
+        d2k_sched_set_send_cap(s, cap);
+        drain(); forget_sent();
+        (void)d2k_sched_sync(s);
+        int rounds = 0;
+        while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+        drain();
+        if (round == 0) {
+            CHECK(sent_command_count(D2K_CMD_SET_NAME, NULL, 0) == 0,
+                  "план с посылкой 1440 поставлен при пределе 1280");
+            CHECK(said("план plan-1440 для узкий.example не влезает в посылку датапата "
+                       "(1440 байт при пределе 1280)"),
+                  "невлезающий план не назван");
+            CHECK(said("не поставлено планов, не влезающих в посылку датапата: 1"),
+                  "сводка прохода не считает невлезающие планы");
+            CHECK(c9.boxes[0].binds[0].recheck_since != 0,
+                  "привязка невлезающего плана не помечена на повторную проверку");
+            CHECK(c9.revision != revision_before,
+                  "пометка на повторную проверку не сохраняется в каталоге");
+            CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 1,
+                  "привязка невлезающего плана не снята с провода");
+            /* Второй проход: привязка уже на повторной проверке — считается там,
+               а не как невлезающая, и не снимается второй раз. */
+            saidbuf[0] = '\0';
+            forget_sent();
+            (void)d2k_sched_sync(s);
+            rounds = 0;
+            while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+            drain();
+            CHECK(said("ждущих повторной проверки после прямого прохода: 1"),
+                  "помеченная привязка не учтена как ждущая повторной проверки");
+            CHECK(!said("не влезает в посылку датапата"),
+                  "помеченная привязка второй раз объявлена невлезающей");
+            CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0,
+                  "помеченная привязка снята с провода второй раз");
+        } else {
+            CHECK(sent_command_count(D2K_CMD_SET_NAME, NULL, 0) == 1,
+                  round == 1 ? "план с посылкой 1440 не поставлен при пределе 1500"
+                             : "план с посылкой 1440 не поставлен без объявленного предела");
+            CHECK(!said("не влезает в посылку датапата"),
+                  "влезающий план объявлен невлезающим");
+            CHECK(c9.boxes[0].binds[0].recheck_since == 0,
+                  "влезающий план помечен на повторную проверку");
+        }
+        d2k_sched_free(s);
+        d2k_catalog_free(&c9);
+    }
+
     /* Старый каталог записывал любой UDP EXCHANGE как CLIENT/level=3.
        Более высокий level сам по себе не добавляет доказательства. Эти записи
        не восстанавливаются автоматически даже при level=5. Подтверждения

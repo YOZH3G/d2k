@@ -73,6 +73,7 @@
 #include "d2k_quichello.h"
 #include "d2k_quicconn.h"
 #include "d2k_plantlv.h"
+#include "d2k_plan.h"
 #include "d2k_quicprobe.h"
 #include "d2k_sched.h"
 #include "d2k_voice_discovery.h"
@@ -1322,6 +1323,7 @@ struct d2k_sched {
     int          sync_unshaped; /* адресные привязки без однозначной формы протокола */
     int          sync_recheck;  /* привязки «требует повторной проверки» (задача 21) */
     int          sync_refused;  /* отказы датапата (ACK ok=0) на планах каталога с прошлой сводки */
+    int          sync_unfit;    /* планы, не влезающие в посылку датапата: не поставлены, привязки на повторную проверку */
     unsigned     sync_refused_code; /* причина последнего такого отказа (D2K_ACK_*) */
     installed_area *areas;
     size_t n_areas;
@@ -5614,6 +5616,7 @@ int d2k_sched_sync(d2k_sched *s) {
     s->sync_weak = 0;
     s->sync_unshaped = 0;
     s->sync_recheck = 0;
+    s->sync_unfit = 0;
     s->area_sync_failed = 0;
     return 0;
 }
@@ -5896,6 +5899,22 @@ static int sync_areas(d2k_sched *s) {
     return 0;
 }
 
+/* Самая длинная посылка плана каталога — тем же шлюзом, что у датапата на
+   активации (d2k_plan_max_emit, ctlsrv.c d2k_plan_fits). 0 — текст не
+   собрался (такую запись ниже отвергнет d2k_plan_text_to_hex) либо у плана
+   нет собственных посылок. */
+static size_t plan_text_max_emit(const char *text) {
+    static uint8_t tlv[D2K_PLAN_TLV_MAX];
+    size_t n = 0;
+    char err[200];
+    d2k_plan *p = NULL;
+    if (d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &n, err, sizeof err) != 0 ||
+        d2k_plan_load(tlv, n, &p, err, sizeof err) != 0) { return 0; }
+    size_t m = d2k_plan_max_emit(p);
+    d2k_plan_free(p);
+    return m;
+}
+
 int d2k_sched_sync_step(d2k_sched *s) {
     if (!s || !s->cat || !s->sync_active) { return 0; }
     static char hex[2 * D2K_PLAN_TLV_MAX + 1];
@@ -5995,6 +6014,46 @@ int d2k_sched_sync_step(d2k_sched *s) {
             s->sync_skipped++;
             continue;
         }
+        /* ПЛАН, КОТОРЫЙ ДАТАПАТ НЕ УНЕСЁТ, НА ПРОВОД НЕ ЕДЕТ (поле 22.10.2026,
+           issue #5/#7). Предел длины посылки датапат объявляет приветствием
+           (send_cap); план, чья самая длинная посылка в него не укладывается,
+           он отвергнет на активации (ctlsrv.c, d2k_plan_fits) — и так каждый
+           проход: 3302 отказа за ночь у репортёра, а цель всё это время без
+           обхода и без нового замера, потому что привязка «подтверждена».
+           Считаем тем же шлюзом до отправки: такой план не ставим, привязку
+           помечаем «требует повторной проверки» и снимаем с провода (там его,
+           как правило, и нет) — тогда следующее подозрение по цели ведёт к
+           новому замеру с сегментом под предел (d2k_arm_segment), а правило
+           «план уже подтверждён — не улика» (binding_covering пропускает
+           recheck_since) её не прикрывает. Каталог цел: запись и план
+           остаются, подтверждение того же или нового плана снимает пометку. */
+        if (s->send_cap > 0) {
+            size_t need = plan_text_max_emit(text);
+            if (need > s->send_cap) {
+                d2k_cat_box *bx = &s->cat->boxes[s->sync_box];
+                d2k_cat_binding *bdm = &bx->binds[s->sync_bind - 1];
+                bdm->recheck_since = wall_s(s, s->now_ms);
+                bdm->recheck_mono_ms = s->now_ms ? s->now_ms : 1;
+                bx->updated = bdm->recheck_since;
+                s->cat->revision++;
+                s->sync_unfit++;
+                if (strcmp(bd->kind, "name") == 0) {
+                    uint8_t tr = bd->transport ? bd->transport : 6;
+                    uint8_t wire_shape = bd->shape ? (uint8_t)bd->shape
+                                                   : (uint8_t)D2K_LINK_SHAPE_GRANDFATHER;
+                    if (d2k_link_del_name_family(s->link_fd, bd->target, tr, wire_shape,
+                                                 family, err, sizeof err) != 0) {
+                        say(s, "по %s привязку %s не удалось снять с провода: %s",
+                            bd->target, bd->plan_id, err);
+                    }
+                }
+                say(s, "каталог: план %s для %s не влезает в посылку датапата (%zu байт при "
+                       "пределе %u) — не ставлю, привязка помечена на повторную проверку: "
+                       "следующее подозрение перемерит цель сегментом под предел",
+                    p->id, bd->target, need, (unsigned)s->send_cap);
+                continue;
+            }
+        }
         if (strcmp(bd->kind, "addr") == 0) {
             uint8_t addr_shape = addr_binding_shape(bd);
             if (!addr_shape) {
@@ -6057,7 +6116,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
         s->sync_active = 0;
         stall_budgets_push(s);
         if (s->sync_sent > 0 || s->sync_skipped > 0 || s->sync_weak > 0 ||
-            s->sync_unshaped > 0 || s->sync_recheck > 0) {
+            s->sync_unshaped > 0 || s->sync_recheck > 0 || s->sync_unfit > 0) {
             say(s, "каталог: поставлено планов по подтверждённым привязкам: %d%s",
                 s->sync_sent, s->sync_skipped ? " (пропущено негодных: см. выше)" : "");
             if (s->sync_weak > 0) {
@@ -6073,6 +6132,11 @@ int d2k_sched_sync_step(d2k_sched *s) {
             if (s->sync_recheck > 0) {
                 say(s, "каталог: не поставлено привязок, ждущих повторной проверки "
                        "после прямого прохода: %d", s->sync_recheck);
+            }
+            if (s->sync_unfit > 0) {
+                say(s, "каталог: не поставлено планов, не влезающих в посылку датапата: %d "
+                       "(привязки помечены на повторную проверку, каталог сохранён)",
+                    s->sync_unfit);
             }
         }
         if (s->sync_refused > 0) {
