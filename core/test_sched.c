@@ -8413,6 +8413,88 @@ lifecycle_test:
         }
     }
 
+    /* --- датапат отверг план каталога — это видно в сводке прохода ---------
+     *
+     * Поле 22.10.2026 (issue #5/#7): датапат отвечал на каждый план каталога
+     * ACK ok=0 «план не годится способу отправки» (посылка 1440 байт при
+     * пределе 1280) — 3302 раза за ночь — а в журнале контроллера не было ни
+     * строки: подтверждение не несёт имени, и отказ никуда не считался.
+     * Контроллер молча ставил тот же каталог заново каждые полторы минуты.
+     * Теперь отказы считаются между сводками и выдаются строкой. */
+    {
+        d2k_catalog c8;
+        memset(&c8, 0, sizeof c8);
+        c8.boxes = calloc(1, sizeof *c8.boxes);
+        CHECK(c8.boxes != NULL, "каталог для отказов не завёлся");
+        if (c8.boxes) {
+            c8.n_boxes = 1;
+            snprintf(c8.boxes[0].id, sizeof c8.boxes[0].id, "box-отказ");
+            c8.boxes[0].plans = calloc(1, sizeof *c8.boxes[0].plans);
+            c8.boxes[0].n_plans = 1;
+            snprintf(c8.boxes[0].plans[0].id, sizeof c8.boxes[0].plans[0].id, "plan-отказ");
+            snprintf(c8.boxes[0].plans[0].proto, sizeof c8.boxes[0].plans[0].proto, "tls");
+            c8.boxes[0].plans[0].enabled = 1;
+            c8.boxes[0].plans[0].text = strdup(
+                "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\n"
+                "split payload_start +1\norder reverse\n");
+            c8.boxes[0].binds = calloc(1, sizeof *c8.boxes[0].binds);
+            c8.boxes[0].n_binds = 1;
+            snprintf(c8.boxes[0].binds[0].plan_id, sizeof c8.boxes[0].binds[0].plan_id, "plan-отказ");
+            c8.boxes[0].binds[0].transport = 6;
+            snprintf(c8.boxes[0].binds[0].kind, sizeof c8.boxes[0].binds[0].kind, "name");
+            snprintf(c8.boxes[0].binds[0].target, sizeof c8.boxes[0].binds[0].target, "отвергнутая.example");
+            c8.boxes[0].binds[0].enabled = 1;
+
+            d2k_sched *s = d2k_sched_new(&c8, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            /* Отказ датапата на план каталога: ok=0, причина BAD_PLAN. Имени
+               в нём нет — ровно как на проводе. */
+            d2k_ev nak = {0};
+            nak.kind = D2K_EV_ACK;
+            nak.code = D2K_CMD_SET_NAME;
+            nak.num = (0u << 8) | D2K_ACK_BAD_PLAN;
+            d2k_sched_event(s, &nak);
+            d2k_sched_event(s, &nak);
+            CHECK(!said("датапат отверг планов"),
+                  "отказ объявлен до сводки прохода — ему нечего подытоживать");
+            (void)d2k_sched_sync(s);
+            int rounds = 0;
+            while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+            drain();
+            CHECK(said("поставлено планов по подтверждённым привязкам: 1"),
+                  "проход по каталогу с отказами не сказал, сколько поставил");
+            CHECK(said("датапат отверг планов с прошлой сводки: 2 (план не разобран или не "
+                       "годится способу отправки)"),
+                  "два отказа датапата на планы каталога не попали в сводку прохода");
+            /* Следующий проход без отказов — строки нет: счёт обнулён. */
+            saidbuf[0] = '\0';
+            (void)d2k_sched_sync(s);
+            rounds = 0;
+            while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+            drain();
+            CHECK(said("поставлено планов по подтверждённым привязкам: 1"),
+                  "второй проход по каталогу не подытожен");
+            CHECK(!said("датапат отверг планов"),
+                  "отказы прошлой сводки объявлены второй раз");
+            /* Успешное подтверждение отказом не считается. */
+            d2k_ev ok = {0};
+            ok.kind = D2K_EV_ACK;
+            ok.code = D2K_CMD_SET_NAME;
+            ok.num = 1u << 8;
+            d2k_sched_event(s, &ok);
+            saidbuf[0] = '\0';
+            (void)d2k_sched_sync(s);
+            rounds = 0;
+            while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+            drain();
+            CHECK(!said("датапат отверг планов"),
+                  "успешное подтверждение посчитано отказом");
+            d2k_sched_free(s);
+            d2k_catalog_free(&c8);
+        }
+    }
+
     /* Старый каталог записывал любой UDP EXCHANGE как CLIENT/level=3.
        Более высокий level сам по себе не добавляет доказательства. Эти записи
        не восстанавливаются автоматически даже при level=5. Подтверждения
