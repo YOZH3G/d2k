@@ -39,6 +39,9 @@ datapath/*
 !datapath/*.c
 !datapath/*.h
 !datapath/Makefile
+# Единственный сценарий в datapath: Linux-тест предела длины посылки в своём
+# сетевом пространстве имён (make test-raw-cap-linux); остальные *.sh — в scripts/.
+!datapath/test_raw_cap.sh
 !datapath/include/
 !datapath/testdata/
 

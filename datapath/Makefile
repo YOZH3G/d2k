@@ -79,6 +79,14 @@ test-raw6-linux: test_raw6.c raw.c wire_udp.c $(HDR)
 	$(CC) $(CFLAGS) -o test_raw6 test_raw6.c raw6_test.o wire_udp.c ../core/ipfrag.c $(LDFLAGS)
 	./test_raw6
 
+# Предел длины посылки — по выходу сырой посылки, а не по туннелю (поле
+# 22.10.2026, issue #5/#7). Linux, root, своё сетевое пространство имён:
+# dummy-интерфейсы живут только внутри unshare -n, хост не трогается.
+.PHONY: test-raw-cap-linux
+test-raw-cap-linux: test_raw_cap.c raw.c wire_udp.c $(HDR)
+	$(CC) $(CFLAGS) -o test_raw_cap test_raw_cap.c raw.c wire_udp.c ../core/ipfrag.c $(LDFLAGS)
+	sh test_raw_cap.sh
+
 check: test-addr
 
 # ICMP time-exceeded на собственные фальшивки (поле 04.10.2026, icmp-rua.pcap).
@@ -523,4 +531,4 @@ test-ctlprobe: test_ctlprobe
 check: all test-hold test-udp-hold test-udp-release test-udp-path test-routemark test-capture test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-stun-session test-quic-session test-ctlprobe
 
 clean:
-	rm -f *.o $(TESTS) test_ctlprobe planlab ctlprobe d2kd
+	rm -f *.o $(TESTS) test_ctlprobe test_raw6 test_raw_cap planlab ctlprobe d2kd
