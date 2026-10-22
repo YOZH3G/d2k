@@ -1431,6 +1431,13 @@ int main(int argc, char **argv) {
     }
     routes_refresh();
     cap_refresh(raw, &cx, ctl);
+    if (raw) {
+        /* Один раз при старте, всегда: по журналам репортёров предел был виден
+           только по отказам планов (поле 22.10.2026, issue #5/#7). */
+        fprintf(stderr, "d2kd: предел длины посылки %zu байт (%s)\n", d2k_raw_maxlen(raw),
+                ifname ? "назван --iface" : "угадан: MTU выхода сырой посылки, "
+                                            "иначе наименьший среди поднятых");
+    }
     uint64_t last_routes = now_ns();
     uint64_t next_routes = last_routes + D2K_ROUTEMARK_REFRESH_NS;
     udp_path.sess = sess;
