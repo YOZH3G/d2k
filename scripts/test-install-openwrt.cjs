@@ -26,7 +26,12 @@ try {
     try { names = fs.readdirSync(dir); } catch { continue; }
     for (const name of names) {
       const target = path.join(sys, name);
-      if (!hidden.has(name) && !fs.existsSync(target)) fs.symlinkSync(path.join(dir, name), target);
+      // existsSync follows the link: a name whose first copy is a dangling symlink
+      // (new runner image, 22.10.2026: grub-ntldr-img) read as absent and the second
+      // directory tried to link it again — EEXIST. The link itself decides.
+      if (hidden.has(name)) continue;
+      try { fs.symlinkSync(path.join(dir, name), target); }
+      catch (e) { if (e.code !== "EEXIST") throw e; }
     }
   }
   const bin = path.join(tmp, 'owrt');
