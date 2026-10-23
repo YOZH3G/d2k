@@ -1048,6 +1048,31 @@ static void test_syn_follows_client_tcp_profile(void) {
     CHECK(!d2k_trigger_allows_poison(&tr, &ts) && d2k_trigger_allows_poison(&tr, &none));
     tr.client_tcp_known = 0;
     CHECK(d2k_trigger_allows_poison(&tr, &ts));
+
+    /* НАБОР ОПЦИЙ КЛИЕНТА НЕ СНЯТ — СПРАШИВАЕМ СВОЙ СТЕК, А НЕ УГАДЫВАЕМ.
+     *
+     * Поле 23.10.2026 (`cand-32e84f2-nots-1`, rutracker.org 16:31:44):
+     * составной вопрос семейства C прошёл 2/2, план из него построен, и его
+     * отверг датапат причиной 6 — испытательный поток зонда идёт обычным
+     * сокетом и метку не несёт, потому что её нет у локального стека.
+     * Ответ «метка есть» при неизвестном клиенте был догадкой, и она стоила
+     * цели всех её планов: «выведенные планы исчерпаны (зондов 1)».
+     *
+     * Правило: клиент известен — решает он; не известен — решает стек, чьим
+     * сокетом зонд и пойдёт. На роутере с включённой меткой это то же самое,
+     * что прежде, поэтому обычный случай не меняется. */
+    tr.client_tcp_known = 0; tr.client_tcp_options_len = 0;
+    d2k_trigger_host_ts_override(0);
+    CHECK(!d2k_trigger_offers_ts(&tr)); /* стек без метки, клиент не известен */
+    CHECK(!d2k_trigger_allows_poison(&tr, &ts)); /* приём с меткой не задаётся */
+    d2k_trigger_host_ts_override(1);
+    CHECK(d2k_trigger_offers_ts(&tr)); /* стек с меткой — как прежде */
+    CHECK(d2k_trigger_allows_poison(&tr, &ts)); /* приём доступен */
+    /* Известный клиент сильнее стека: он и есть тот, для кого мы мерим. */
+    tr.client_tcp_known = 1; tr.client_tcp_options_len = 0;
+    d2k_trigger_host_ts_override(1);
+    CHECK(!d2k_trigger_offers_ts(&tr)); /* клиент сильнее стека */
+    d2k_trigger_host_ts_override(-1);
     peer_timestamps = 1;
 }
 
