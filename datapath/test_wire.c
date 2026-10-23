@@ -74,6 +74,58 @@ static void check_golden(void) {
 }
 
 int main(void) {
+    /* --- ip_autottl: TTL ИЗ ИЗМЕРЕННОГО ПУТИ ------------------------------
+     * Документация zapret2, standard fooling: «изменить TTL в ipv4 заголовке
+     * на автоматически определяемый по шаблону autottl delta,min-max. При
+     * невозможности определения TTL берётся ip_ttl, если есть. Иначе TTL не
+     * меняется», и «autottl производит эвристическую догадку о длине в хопах
+     * на базе TTL входящих пакетов». Константа приметна сама: у донора жёсткий
+     * ip_ttl=8 палился с роутера в 50 хопах от назначения. */
+    {
+        const uint8_t data[] = {1, 2, 3};
+        uint8_t out[128];
+        /* Сервер ответил с TTL 57: исходный 64, значит путь 7 хопов.
+           delta=+1 → 8, в диапазоне [2,12] → TTL фальшивки 8. */
+        d2k_conn c = {.family = 4, .ttl = 64, .rev_ttl = 57, .window = 1024};
+        d2k_emit e = {.bytes = data, .len = sizeof data, .seq = 9,
+                      .autottl = 1, .autottl_delta = 1,
+                      .autottl_min = 2, .autottl_max = 12};
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) == 43 && out[8] == 8,
+              "autottl: TTL не вычислен по пути (ждали 8)");
+        /* Исходный 128 (Windows-сервер): 128-120 = 8 хопов, +1 → 9. */
+        c.rev_ttl = 120;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 9,
+              "autottl: догадка об исходном TTL 128 не сработала");
+        /* Исходный 255: 255-250 = 5 хопов, +1 → 6. */
+        c.rev_ttl = 250;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 6,
+              "autottl: догадка об исходном TTL 255 не сработала");
+        /* Диапазон зажимает: путь 30 хопов, +1 = 31 > max 12 → 12. */
+        c.rev_ttl = 34;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 12,
+              "autottl: верхняя граница диапазона не применена");
+        /* И снизу: путь 0 хопов, +1 = 1 < min 2 → 2. */
+        c.rev_ttl = 64;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 2,
+              "autottl: нижняя граница диапазона не применена");
+        /* Ответа не было (rev_ttl 0): берём заданный ttl. */
+        c.rev_ttl = 0; e.ttl = 5;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 5,
+              "autottl: без ответа не взят заданный ttl");
+        /* Ответа не было и ttl не задан: TTL не меняется (как обычно). */
+        e.ttl = 0;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 64,
+              "autottl: без ответа и без ttl TTL всё равно подменён");
+        /* IPv6: то же поле hop limit. */
+        d2k_conn c6 = {.family = 6, .ttl = 64, .rev_ttl = 57, .window = 1024,
+            .src_ip6 = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,1},
+            .dst_ip6 = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,2}};
+        d2k_emit e6 = {.bytes = data, .len = sizeof data, .seq = 9,
+                       .autottl = 1, .autottl_delta = 1,
+                       .autottl_min = 2, .autottl_max = 12};
+        CHECK(d2k_wire_build(&c6, &e6, out, sizeof out) && out[7] == 8,
+              "autottl: IPv6 hop limit не вычислен по пути");
+    }
     {
         d2k_conn v6 = {.family = 6, .ttl = 57, .window = 1024,
             .src_ip6 = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,1},

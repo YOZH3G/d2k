@@ -32,6 +32,7 @@ typedef enum {
     SET_TIMESTAMPS,     /* ТОЛЬКО по проходу */
     SET_OVERLAP_SNI,    /* ТОЛЬКО по проходу */
     SET_DUP_DENSE,      /* ТОЛЬКО по проходу, то же поле, что SET_DUPLICATES */
+    SET_SHORT_TTL,      /* ТОЛЬКО по проходу: TTL по измеренному пути */
     SET_WHITE_TS        /* проход → не сверяет метку И разбирает L7 (белое имя) */
 } prop_set;
 
@@ -41,13 +42,18 @@ typedef struct {
     prop_set    set;
 } prop_probe;
 
+/* СКОЛЬКО ВОПРОСОВ О СВОЙСТВАХ. Одна константа на массив, его обнуление и
+   вызов: прежде число 12 стояло в четырёх местах, и добавление вопроса писало
+   за границу массива молча. */
+#define PROP_QUESTIONS 13
+
 static int prop_probes(prop_probe *out, int cap)
 {
     int k = 0;
-    if (cap < 12) {
+    if (cap < PROP_QUESTIONS) {
         return 0;
     }
-    memset(out, 0, sizeof(*out) * 12);
+    memset(out, 0, sizeof(*out) * PROP_QUESTIONS);
 
     out[k].label = "перекрытие слева";
     snprintf(out[k].p.name, sizeof(out[k].p.name), "seqovl-1");
@@ -112,6 +118,23 @@ static int prop_probes(prop_probe *out, int cap)
     out[k].set = SET_TIMESTAMPS;
     k++;
 
+    /* TTL ПО ИЗМЕРЕННОМУ ПУТИ (ip_autottl документации zapret2, standard
+     * fooling). Спрашивается рядом с меткой времени и по той же причине —
+     * «сервер фальшивку не увидит», — но НИЧЕГО не требует от клиентской ОС:
+     * метка в Windows выключена по умолчанию, и план с ней такому клиенту
+     * неисполним (поле issue #7, 13 отказов из 13 при работающих телефонах).
+     * Шаблон delta,min-max: +1 хоп за коробкой, и зажим 2..12 — чтобы и на
+     * короткой линии фальшивка не дошла до сервера, и TTL не стал сам
+     * приметой (у донора жёсткий ip_ttl=8 палился с роутера в 50 хопах). */
+    out[k].label = "TTL по пути";
+    snprintf(out[k].p.name, sizeof(out[k].p.name), "autottl");
+    out[k].p.autottl = 1;
+    out[k].p.autottl_delta = 1;
+    out[k].p.autottl_min = 2;
+    out[k].p.autottl_max = 12;
+    out[k].set = SET_SHORT_TTL;
+    k++;
+
     /* Размер перекрытия не перебирается (прежде seqovl 2…681): длина —
      * до конца имени в приветствии, её задаёт run_properties по триггеру. */
     out[k].label = "перекрытие до конца имени";
@@ -173,7 +196,9 @@ static int prop_probes(prop_probe *out, int cap)
     out[k].set = SET_SYN;
     k++;
 
-    return k;
+    /* Если вопрос добавили, а константу забыли — ломаемся здесь, а не молча
+       за границей массива. */
+    return k <= PROP_QUESTIONS ? k : 0;
 }
 
 static void apply_set(d2k_dprops *pr, prop_set s, int ok, const d2k_poison *p)
@@ -215,6 +240,11 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok, const d2k_poison *p)
     case SET_TIMESTAMPS:
         if (ok) { pr->validates_timestamps = D2K_TRI_FALSE; }
         break;
+    case SET_SHORT_TTL:
+        /* Проход: коробка взяла фальшивку, которой сервер не видел, значит
+           TTL по пути — рабочая ось для ЛЮБОГО клиента. Только по проходу. */
+        if (ok) { pr->takes_short_ttl = D2K_TRI_TRUE; }
+        break;
     case SET_OVERLAP_SNI:
         if (ok) { pr->overlap_covers_sni = D2K_TRI_TRUE; }
         break;
@@ -249,8 +279,8 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                        const d2k_trigger *tr, const d2k_opts *opt,
                        d2k_result *res, d2k_poison *hit)
 {
-    prop_probe pp[12];
-    int n = prop_probes(pp, 12);
+    prop_probe pp[PROP_QUESTIONS];
+    int n = prop_probes(pp, PROP_QUESTIONS);
     int i, j;
     char err[160];
 

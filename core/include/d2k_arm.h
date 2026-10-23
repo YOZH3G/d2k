@@ -28,6 +28,14 @@ typedef struct {
     unsigned    disorder_pos;/* одиночный абсолютный разрез reverse-disorder */
     int         between;     /* фальшивка МЕЖДУ кусками, а не перед ними */
     unsigned    ttl;         /* TTL фальшивки, 0 — не задан */
+    /* TTL ПО ИЗМЕРЕННОМУ ПУТИ (ip_autottl документации zapret2): считает
+     * датапат на исполнении по TTL ответной стороны потока. Константа в ttl
+     * сама приметна — у донора жёсткий ip_ttl=8 палился с роутера в 50 хопах.
+     * autottl == 0 — поля не значимы. */
+    int         autottl;
+    int         autottl_delta;
+    unsigned    autottl_min;
+    unsigned    autottl_max;
     int         seq_out;     /* номер вне окна */
     int         decoy_hello; /* телом фальшивки идёт приветствие, не набивка */
     int         md5;         /* нулевая TCP-MD5 подпись, как у сырого зонда */

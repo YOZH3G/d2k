@@ -44,7 +44,7 @@
  * чтобы клиент ушёл на TCP; это не обход QUIC. Старый исполнитель такие
  * планы не принимает. */
 /* Version 12: raw TCP-MD5 poison in detect-tcp-v1. */
-#define D2K_EXEC_VERSION 12
+#define D2K_EXEC_VERSION 13
 #define D2K_PLAN_PROTO_HTTP 4
 /* Shared result capacity for measured and live packet programs. */
 #define D2K_WIRE_BATCH_MAX 26
@@ -106,6 +106,16 @@ typedef struct {
     uint32_t delay_us;   /* от предыдущей посылки */
     uint32_t seq;        /* абсолютный номер последовательности */
     uint8_t  ttl;        /* 0 — как обычно */
+    /* TTL ПО ИЗМЕРЕННОМУ ПУТИ (ip_autottl документации zapret2). Константа в
+     * ttl сама становится приметой: у донора жёсткий ip_ttl=8 палился с
+     * роутера в 50 хопах от назначения. Здесь TTL считается на исполнении из
+     * TTL ответной стороны потока: угадать исходный TTL сервера (64/128/255),
+     * получить длину пути в хопах, прибавить delta и зажать в [min, max].
+     * autottl == 0 — поля не значимы. */
+    uint8_t  autottl;    /* 1 — считать TTL по пути */
+    int8_t   autottl_delta;
+    uint8_t  autottl_min;
+    uint8_t  autottl_max;
     uint8_t  poison;     /* биты D2K_POISON_* */
     int32_t  seq_shift;
     uint8_t  wire_profile; /* 0 legacy, D2K_WIRE_DETECT_TCP measured raw TCP */

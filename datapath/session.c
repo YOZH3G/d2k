@@ -2488,6 +2488,10 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     c.ack = rd32(t + 8);
     c.window = rd16(t + 14);
     c.ttl = ip.hop_limit;
+    /* TTL ТОГО, ЧТО ОТВЕЧАЛО по этому соединению — вход эвристики autottl
+       (d2k_wire.h). Ноль, пока ответа не было: сборщик тогда возьмёт заданный
+       ttl, а без него TTL не тронет. */
+    c.rev_ttl = fl->rev_ttl;
     c.ip_id = ip.ip_id;
 
     if (acts.n > sizeof out->out / sizeof out->out[0]) {

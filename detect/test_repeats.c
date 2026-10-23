@@ -397,16 +397,22 @@ static int after_count(const char *name)
        d2k_prop_majority): промах стоит два зонда вместо одного, проход —
        два вместо трёх; «flaky» (приём через раз) берётся вопросом, а не
        перебором. */
+    /* 23.10.2026: добавлен вопрос «TTL по пути» (ip_autottl документации
+       zapret2) — ось, которой от клиентской ОС не нужно ничего, в отличие от
+       метки времени (поле issue #7). Цена названа прямо, а не спрятана:
+       промах вопроса стоит два зонда большинством, поэтому у целей, доходящих
+       до конца списка вопросов, счёт вырос на 1–2. Это и есть причина, по
+       которой зонды здесь добавлены. */
     static const struct { const char *n; int a; } A[] = {
-        {"youtube", 12}, {"rutracker", 64}, {"flaky", 14}, {"prop-l7", 16},
-        {"none-pass", 105}, {"selftest-fail", 10}, {"selftest-late", 14},
-        {"ctl-late", 13}, {"ctl-dead", 108}, {"ctl-dead-vouched", 108},
-        {"ctl-dead-hit", 15}, {"errors", 104},
+        {"youtube", 12}, {"rutracker", 66}, {"flaky", 14}, {"prop-l7", 16},
+        {"none-pass", 107}, {"selftest-fail", 10}, {"selftest-late", 14},
+        {"ctl-late", 13}, {"ctl-dead", 110}, {"ctl-dead-vouched", 110},
+        {"ctl-dead-hit", 15}, {"errors", 105},
         /* Задача 54: молчащий контроль добавляет ОДИН вопрос — нейтральный
          * байт; подтверждённый с первого раза, он стоит один зонд. Молчание
          * адреса стоит три (единогласие) и снимает весь перебор отравлений. */
-        {"addr-silent", 12}, {"addr-silent-late", 109},
-        {"addr-ack-unseen", 107}, {"addr-ack-err", 108}};
+        {"addr-silent", 12}, {"addr-silent-late", 111},
+        {"addr-ack-unseen", 109}, {"addr-ack-err", 110}};
     size_t i;
     for (i = 0; i < sizeof A / sizeof A[0]; i++) {
         if (strcmp(A[i].n, name) == 0) { return A[i].a; }
@@ -514,9 +520,12 @@ static const script_ent S_FIELD_SEQ[] = {{"seq-out-of-window", "+"}, {NULL, NULL
 static const script_ent S_FIELD_TS[]  = {{"ts", "+"}, {NULL, NULL}};
 static void test_syndata_last(void)
 {
-    prop_probe pp[12];
-    int n = prop_probes(pp, 12);
-    CHECK(n == 12 && pp[n - 1].p.syn_data,
+    /* 23.10.2026: вопросов стало 13 — добавлена ось «TTL по пути»
+       (ip_autottl). Число берётся из той же константы, что и массив в
+       props.c, через prop_probes: иначе список и тест расходятся молча. */
+    prop_probe pp[16];
+    int n = prop_probes(pp, 16);
+    CHECK(n == 13 && pp[n - 1].p.syn_data,
           "syndata должен быть последним вопросом о свойствах");
     for (int i = 0; i < n - 1; i++) {
         CHECK(!pp[i].p.syn_data, "syndata перед выразимыми вопросами");
@@ -597,11 +606,12 @@ static void test_syndata_after_misses(void)
     fresh_process();
     run(&syn, &r);
     CHECK(r.has_hit && r.hit.syn_data, "последний вопрос syndata не задан");
-    /* The fixture has no SNI: ten questions, nine misses (two probes each
-     * under the majority rule) and two positive syndata repeats, plus eight
-     * baseline/self-test probes = 28. */
-    CHECK(r.probes == 28, "syndata: зондов %d, ждали 28", r.probes);
-    CHECK(r.nanswered == 10 && r.answered[r.nanswered - 1].syn_data,
+    /* The fixture has no SNI: ELEVEN questions since 23.10.2026 (the new
+     * "TTL по пути" axis, ip_autottl), ten misses (two probes each under the
+     * majority rule) and two positive syndata repeats, plus eight
+     * baseline/self-test probes = 30. */
+    CHECK(r.probes == 30, "syndata: зондов %d, ждали 30", r.probes);
+    CHECK(r.nanswered == 11 && r.answered[r.nanswered - 1].syn_data,
           "syndata не последний отвеченный вопрос");
     CHECK(r.props.inspects_syn == D2K_TRI_FALSE, "ответ SYN не записан");
 }

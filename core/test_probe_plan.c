@@ -119,7 +119,7 @@ int main(void) {
             tr.payload[5] = 1; tr.payload[6] = 0;
             tr.payload[7] = (uint8_t)((tr.len - 9) >> 8); tr.payload[8] = (uint8_t)(tr.len - 9);
             for (int i = 0; i < np; i++) { run_case(ps[i], &tr, decoy, sizeof decoy); }
-            prop_probe pp[12]; int nq = prop_probes(pp, 12);
+            prop_probe pp[16]; int nq = prop_probes(pp, 16);
             for (int i = 0; i < nq; i++) {
                 if (pp[i].set == SET_OVERLAP_SNI) {
                     if (!named) { continue; }
@@ -136,8 +136,8 @@ int main(void) {
        прямой порядок. Здесь сравниваются весь текст, TLV и каталожный ID;
        detect/test_raw.c независимо сравнивает полные runtime-пакеты. */
     {
-        prop_probe pp[12];
-        int nq = prop_probes(pp, 12), found = 0, i;
+        prop_probe pp[16];
+        int nq = prop_probes(pp, 16), found = 0, i;
         d2k_trigger tr = {0};
         tr.len = 1400; tr.sni_off = 466; tr.sni_len = 11;
         for (size_t j = 0; j < tr.len; j++) { tr.payload[j] = (uint8_t)(j * 13 + 3); }
@@ -187,8 +187,8 @@ int main(void) {
         }
         if (!found) { printf("семейство C: вопрос «white-hello-ts» не найден\n"); failures++; }
     }
-    prop_probe allq[12];
-    int n_questions = prop_probes(allq, 12);
+    prop_probe allq[16];
+    int n_questions = prop_probes(allq, 16);
     printf("probe-plan: %u inputs, %d catalog hypotheses, %d questions, %u skipped, %u mismatches\n",
            cases, np, n_questions, skipped, failures);
     return failures ? 1 : 0;

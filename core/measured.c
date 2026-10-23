@@ -202,7 +202,12 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
     int between = a->between;
     /* Метка времени — тоже подделка (сервер отбросит её по PAWS): вопрос о
        ней задаётся без битой суммы (§0.1, 07.10.2026). */
-    int fake = !between && (a->badsum || a->md5 || a->ttl || a->seq_out || a->tcpts);
+    /* TTL по измеренному пути — подделка того же класса, что заданный ttl:
+       пакет умрёт по дороге, сервер его не увидит. Без autottl в этом условии
+       плечо с одной этой осью не выпускало фальшивку вовсе и план не
+       собирался (поймано test_probe_plan на 12 входах). */
+    int fake = !between && (a->badsum || a->md5 || a->ttl || a->autottl ||
+                            a->seq_out || a->tcpts);
     int disorder = !between && a->disorder;
     /* raw.c prioritizes fake_between over disorder/seqovl; it uses SNI
      * START, not the old Plan builder's two cuts at 1 and SNI middle. */
@@ -301,11 +306,11 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         if (append_fmt(buf, cap, &pos,
             "d2k-plan 1 %u\nid 00000000000000000000000000000000\nproto tcp tls\n"
             "wire detect-tcp-v1\ninput tls-sni\nsegment %u\n",
-            a->md5 ? 12u : 5u, seg)) { return -1; }
+            a->autottl ? 13u : a->md5 ? 12u : 5u, seg)) { return -1; }
     } else if (append_fmt(buf, cap, &pos,
         "d2k-plan 1 %u\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\n"
         "input %zu %zu %zu\nsegment %u\n",
-        a->md5 ? 12u : 4u, n, in->sni_off, in->sni_len, seg)) { return -1; }
+        a->autottl ? 13u : a->md5 ? 12u : 4u, n, in->sni_off, in->sni_len, seg)) { return -1; }
     size_t flen = between ? n - mid : 2 * n;
     const uint8_t *prefix = in->decoy;
     size_t prefix_len = in->decoy_len;
@@ -315,6 +320,9 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         if (append_fmt(buf, cap, &pos, "poison 1")) { return -1; }
         if (a->badsum && append_fmt(buf, cap, &pos, " badsum")) { return -1; }
         if (a->ttl && append_fmt(buf, cap, &pos, " ttl=%u", a->ttl)) { return -1; }
+        if (a->autottl &&
+            append_fmt(buf, cap, &pos, " autottl=%d,%u-%u", a->autottl_delta,
+                       a->autottl_min, a->autottl_max)) { return -1; }
         if (!between) {
             if (a->md5 && append_fmt(buf, cap, &pos, " md5")) { return -1; }
             if (a->tcpts && append_fmt(buf, cap, &pos, " tcpts")) { return -1; }

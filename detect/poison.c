@@ -31,7 +31,12 @@ int d2k_poison_has_fake(const d2k_poison *p)
     /* Метка времени со сдвигом назад — тоже подделка: сервер отбросит её по
      * PAWS (§0.1, поле 07.10.2026 — вопрос «метка времени» без неё слал
      * обычное приветствие, и «проход» был ложным). */
-    return p->badsum || p->md5 || p->ttl > 0 || p->seq_shift != 0 || p->tcp_ts;
+    /* TTL по измеренному пути — такая же подделка, как заданный ttl: сервер
+     * её не увидит, потому что пакет умрёт по дороге. Без этого плечо с одним
+     * autottl не получало даже одной копии фальшивки, и план не собирался
+     * (поймано test_probe_plan на 12 входах). */
+    return p->badsum || p->md5 || p->ttl > 0 || p->autottl ||
+           p->seq_shift != 0 || p->tcp_ts;
 }
 
 #define POISON_CAP 128
@@ -434,6 +439,10 @@ int d2k_arm_from_poison(const d2k_poison *p, d2k_arm *a, char *why, size_t whyca
     a->disorder_pos = p->disorder_pos > 0 ? (unsigned)p->disorder_pos : 0u;
     a->between      = p->fake_between;
     a->ttl          = p->ttl > 0 ? (unsigned)p->ttl : 0u;
+    a->autottl      = p->autottl;
+    a->autottl_delta = p->autottl_delta;
+    a->autottl_min  = p->autottl_min > 0 ? (unsigned)p->autottl_min : 0u;
+    a->autottl_max  = p->autottl_max > 0 ? (unsigned)p->autottl_max : 0u;
     a->seq_out      = p->seq_shift != 0;
     a->decoy_hello  = p->decoy_hello;
     a->tcpts        = p->tcp_ts;
