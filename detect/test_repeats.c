@@ -397,25 +397,21 @@ static int after_count(const char *name)
        d2k_prop_majority): промах стоит два зонда вместо одного, проход —
        два вместо трёх; «flaky» (приём через раз) берётся вопросом, а не
        перебором. */
-    /* 23.10.2026: добавлен вопрос «TTL по пути» (ip_autottl документации
-       zapret2) — ось, которой от клиентской ОС не нужно ничего, в отличие от
-       метки времени (поле issue #7), и вопрос «метка первой в опциях»
-       (tcp_ts_up): документация сообщает, что сервер отбрасывает наш сегмент
-       только при метке первой, значит промах обычного вопроса о метке мог
-       означать не свойство коробки, а наш порядок опций. Цена названа прямо, а
-       не спрятана: промах вопроса стоит два зонда большинством, поэтому у
-       целей, доходящих до конца списка, счёт вырос на 2–4. Это и есть причина,
-       по которой зонды здесь добавлены. */
+    /* 23.10.2026: вопросы «TTL по пути» (ip_autottl) и «метка первой в
+       опциях» (tcp_ts_up) добавлялись в конец списка и СНЯТЫ прогоном
+       `ttl-ae30825-1` того же дня: ни одного исполнения, +4 зонда у целей,
+       доходящих до конца списка. Числа ниже — те же, что до их появления.
+       Механизм остался в языке плана, см. test_unreachable_axes_not_asked. */
     static const struct { const char *n; int a; } A[] = {
-        {"youtube", 12}, {"rutracker", 68}, {"flaky", 14}, {"prop-l7", 16},
-        {"none-pass", 109}, {"selftest-fail", 10}, {"selftest-late", 14},
-        {"ctl-late", 13}, {"ctl-dead", 112}, {"ctl-dead-vouched", 112},
-        {"ctl-dead-hit", 15}, {"errors", 106},
+        {"youtube", 12}, {"rutracker", 64}, {"flaky", 14}, {"prop-l7", 16},
+        {"none-pass", 105}, {"selftest-fail", 10}, {"selftest-late", 14},
+        {"ctl-late", 13}, {"ctl-dead", 108}, {"ctl-dead-vouched", 108},
+        {"ctl-dead-hit", 15}, {"errors", 104},
         /* Задача 54: молчащий контроль добавляет ОДИН вопрос — нейтральный
          * байт; подтверждённый с первого раза, он стоит один зонд. Молчание
          * адреса стоит три (единогласие) и снимает весь перебор отравлений. */
-        {"addr-silent", 12}, {"addr-silent-late", 113},
-        {"addr-ack-unseen", 111}, {"addr-ack-err", 112}};
+        {"addr-silent", 12}, {"addr-silent-late", 109},
+        {"addr-ack-unseen", 107}, {"addr-ack-err", 108}};
     size_t i;
     for (i = 0; i < sizeof A / sizeof A[0]; i++) {
         if (strcmp(A[i].n, name) == 0) { return A[i].a; }
@@ -523,12 +519,13 @@ static const script_ent S_FIELD_SEQ[] = {{"seq-out-of-window", "+"}, {NULL, NULL
 static const script_ent S_FIELD_TS[]  = {{"ts", "+"}, {NULL, NULL}};
 static void test_syndata_last(void)
 {
-    /* 23.10.2026: вопросов стало 13 — добавлена ось «TTL по пути»
-       (ip_autottl). Число берётся из той же константы, что и массив в
-       props.c, через prop_probes: иначе список и тест расходятся молча. */
+    /* Число берётся из той же константы, что и массив в props.c, через
+       prop_probes: иначе список и тест расходятся молча. Вопросов снова 12 —
+       оси `ip_autottl` и `tcp_ts_up` сняты полем 23.10.2026, см.
+       test_unreachable_axes_not_asked. */
     prop_probe pp[16];
     int n = prop_probes(pp, 16);
-    CHECK(n == 14 && pp[n - 1].p.syn_data,
+    CHECK(n == 12 && pp[n - 1].p.syn_data,
           "syndata должен быть последним вопросом о свойствах");
     for (int i = 0; i < n - 1; i++) {
         CHECK(!pp[i].p.syn_data, "syndata перед выразимыми вопросами");
@@ -609,14 +606,48 @@ static void test_syndata_after_misses(void)
     fresh_process();
     run(&syn, &r);
     CHECK(r.has_hit && r.hit.syn_data, "последний вопрос syndata не задан");
-    /* The fixture has no SNI: ELEVEN questions since 23.10.2026 (the new
-     * "TTL по пути" and "метка первой в опциях" axes), eleven misses (two
-     * probes each under the majority rule) and two positive syndata repeats,
-     * plus eight baseline/self-test probes = 32. */
-    CHECK(r.probes == 32, "syndata: зондов %d, ждали 32", r.probes);
-    CHECK(r.nanswered == 12 && r.answered[r.nanswered - 1].syn_data,
+    /* The fixture has no SNI: ten questions, nine misses (two probes each
+     * under the majority rule) and two positive syndata repeats, plus eight
+     * baseline/self-test probes = 28. The "TTL по пути" and "метка первой в
+     * опциях" axes were asked here on 23.10.2026 and removed the same day:
+     * the field round never reached them. */
+    CHECK(r.probes == 28, "syndata: зондов %d, ждали 28", r.probes);
+    CHECK(r.nanswered == 10 && r.answered[r.nanswered - 1].syn_data,
           "syndata не последний отвеченный вопрос");
     CHECK(r.props.inspects_syn == D2K_TRI_FALSE, "ответ SYN не записан");
+}
+
+/* ОСИ, КОТОРЫЕ ПОЛЕ ПРИЗНАЛО НЕДОСТИЖИМЫМИ, НЕ СПРАШИВАЮТСЯ.
+ *
+ * Прогон 23.10.2026 `ttl-ae30825-1` (t0 15:30:40) со сборкой
+ * `lab-1023-ttlaxis-ae30825`: 12 провалов контроля из 56 против 10 у выпуска,
+ * и НИ ОДНОГО исполнения новых осей — в журнале раунда ноль упоминаний
+ * «TTL по пути», «метка первой», `autottl`, `ts-up`. Все находки пути
+ * «свойство» в раунде — `seqovl-1`, ПЕРВЫЙ вопрос списка; до восьмого
+ * (о метке) замер не дошёл ни на одной из 22 целей, значит и до девятого с
+ * десятым тоже.
+ *
+ * Значит вопросы в КОНЦЕ списка на этой линии стоят 2–4 зонда у целей,
+ * доходящих до конца, и не дают ответа. «Лишние зонды убирать по причине»
+ * (решение владельца) — причина измерена, зонды снимаются.
+ *
+ * Снимается ВОПРОС, а не механизм: `ip_autottl` остаётся записью языка плана
+ * (REC_AUTOTTL, minexec 13), исполняется датапатом и выбирается RX-лестницей
+ * для клиента без метки времени — там он закрывает issue #7. `tcp_ts_up`
+ * остаётся битом порчи. Вернуть вопрос можно, когда поле покажет цель,
+ * доходящую до конца списка. */
+static void test_unreachable_axes_not_asked(void)
+{
+    prop_probe pp[16];
+    int n = prop_probes(pp, 16);
+    for (int i = 0; i < n; i++) {
+        CHECK(strcmp(pp[i].p.name, "ts-up") != 0,
+              "вопрос «метка первой» снят полем: не спрашивать");
+        CHECK(strcmp(pp[i].p.name, "autottl") != 0,
+              "вопрос «TTL по пути» снят полем: не спрашивать");
+        CHECK(!pp[i].p.autottl, "порча autottl в вопросе о свойствах");
+        CHECK(!pp[i].p.tcp_ts_up, "порча tcp_ts_up в вопросе о свойствах");
+    }
 }
 
 static void test_props_fields(void)
@@ -1056,6 +1087,7 @@ int main(void)
     test_composite_assembled_for_client_without_ts();
     test_selftest_uses_client_tcp_profile();
     test_syndata_after_misses();
+    test_unreachable_axes_not_asked();
     test_props_fields();
     test_sweep_skips_answered();
     test_props_skip_unplannable();
