@@ -1168,6 +1168,7 @@ typedef struct {
     uint8_t    negative_streak;
     int64_t    until_ms;
     int        challenge;
+    int        denied;      /* сервис отказал по закону (451): остывание как у антибота */
     int        exhausted;
     int        ech_input;
     int        late_rst_only; /* глушит только поздние RST/объёмные триггеры */
@@ -1953,8 +1954,16 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
         c->family = t->family;
         c->used = 1;
     }
-    if (kind == 1) {
+    if (kind == 1 || kind == 4) {
+        /* ВИД 4 — ЮРИДИЧЕСКИЙ ОТКАЗ СЕРВИСА (HTTP 451). Срок тот же, что у
+           антибот-ответа, и признак `challenge` тот же, чтобы правила
+           `cooldown_blocks` не раздваивались; отличается только слово в
+           журнале, потому что это РАЗНЫЕ наблюдения и путать их нельзя.
+           Поле 23.10.2026, x-minus.pro: без остывания тот же сервис
+           перемерялся каждые пару минут (поиски 33 и 36 за 145 с, по 4 зонда
+           и установке плана каждый) и каждый раз отвечал тем же 451. */
         c->challenge = 1;
+        c->denied = kind == 4;
         c->exhausted = 0;
         c->late_rst_only = 0;
         c->until_ms = s->now_ms + SCHED_CHALLENGE_BACKOFF_MS;
@@ -1976,6 +1985,7 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
            or advance the CLEAR 10/30/60-minute escalation. */
         c->negative_streak = 0;
         c->challenge = 0;
+        c->denied = 0;
         c->exhausted = 1;
         c->ech_input = t->trig_snapped && t->transport == 6 &&
             d2k_hello_ech_offer(t->trig, t->trig_len, NULL) == 1;
@@ -1985,6 +1995,7 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     }
     if (c->negative_streak < UINT8_MAX) { c->negative_streak++; }
     c->challenge = 0;
+    c->denied = 0;   /* иначе позже причина читалась бы «юридический отказ» */
     c->exhausted = 0;
     c->signal_code = t->trigger_code;
     c->until_ms = s->now_ms + clear_backoff_ms(c->negative_streak);
@@ -7608,7 +7619,8 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     }
     if (cooldown_blocks(s, name, ev->transport, ev->family, ev->code, &cooldown_left_ms)) {
         target_cooldown *cool = cooldown_find(s, name, ev->transport, ev->family);
-        const char *reason = cool && cool->challenge ? "антибот-ответа" :
+        const char *reason = cool && cool->denied ? "юридического отказа сервиса" :
+                             cool && cool->challenge ? "антибот-ответа" :
                              cool && cool->exhausted ? "неподтверждённого прошлого замера" :
                              "повторного CLEAR";
         /* Транспорт — часть ключа отдыха и называется вслух: поле 03.10,
@@ -11006,6 +11018,19 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (t->ver.level == D2K_VER_DENIED) {
                 say(s, "по %s HTTP 451: юридический отказ, не доказательство блокировки провайдера; перебор остановлен",
                     t->name);
+                /* ОТКАЗАЛ СЕРВИС, А НЕ КОРОБКА — значит перемерять эту цель
+                   сейчас же бессмысленно: следующий замер получит тот же 451.
+                   Остывание такое же, как у антибот-ответа рядом; без него
+                   поле 23.10.2026 показало два полных поиска одной цели за
+                   145 секунд с одинаковым исходом. Что опыт при этом
+                   выбрасывается целиком (план снял блок рукопожатия, а
+                   пользователь получает разорванное соединение вместо
+                   страницы отказа) — отдельный вопрос, см. замысел
+                   2026-10-23 «HTTP 451: приём снял блок рукопожатия». */
+                cooldown_record(s, t, 4);
+                say(s, "по %s юридический отказ сервиса: активный замер этой цели "
+                       "поставлен на паузу на %lld мин", t->name,
+                    (long long)(SCHED_CHALLENGE_BACKOFF_MS / 60000));
                 ver_close(t);
                 task_fail(s, t, now_ms);
                 moved++;
