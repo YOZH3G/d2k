@@ -79,8 +79,12 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
             if (n > D2K_ARM_SEGMENT_MAX) { n = D2K_ARM_SEGMENT_MAX; }
             REQUIRE(index < out.n);
             const d2k_emit *e = &out.v[index++];
+            /* Зеркало порчи: план обязан нести РОВНО те биты, что описаны в
+               гипотезе — ни больше (иначе исполнение разойдётся с замером),
+               ни меньше. tcp_ts_up добавлен 23.10.2026 отдельной осью. */
             unsigned flags = (s->poison.badsum ? D2K_POISON_BADSUM : 0) |
                 (s->poison.tcp_ts ? D2K_POISON_TCPTS_BACK : 0) |
+                (s->poison.tcp_ts_up ? D2K_POISON_TS_UP : 0) |
                 (s->poison.ip_id_zero ? D2K_POISON_IPID_ZERO : 0) |
                 (s->poison.md5 ? D2K_POISON_MD5 : 0);
             REQUIRE(e->seq == (uint32_t)(BASE + s->seq_off + (int64_t)off));

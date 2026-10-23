@@ -33,6 +33,7 @@ typedef enum {
     SET_OVERLAP_SNI,    /* ТОЛЬКО по проходу */
     SET_DUP_DENSE,      /* ТОЛЬКО по проходу, то же поле, что SET_DUPLICATES */
     SET_SHORT_TTL,      /* ТОЛЬКО по проходу: TTL по измеренному пути */
+    SET_TS_FIRST,       /* ТОЛЬКО по проходу: метка первой в опциях */
     SET_WHITE_TS        /* проход → не сверяет метку И разбирает L7 (белое имя) */
 } prop_set;
 
@@ -45,7 +46,7 @@ typedef struct {
 /* СКОЛЬКО ВОПРОСОВ О СВОЙСТВАХ. Одна константа на массив, его обнуление и
    вызов: прежде число 12 стояло в четырёх местах, и добавление вопроса писало
    за границу массива молча. */
-#define PROP_QUESTIONS 13
+#define PROP_QUESTIONS 14
 
 static int prop_probes(prop_probe *out, int cap)
 {
@@ -116,6 +117,21 @@ static int prop_probes(prop_probe *out, int cap)
     snprintf(out[k].p.name, sizeof(out[k].p.name), "ts");
     out[k].p.tcp_ts = 1;
     out[k].set = SET_TIMESTAMPS;
+    k++;
+
+    /* МЕТКА ВРЕМЕНИ, ПОДНЯТАЯ В НАЧАЛО ОПЦИЙ (tcp_ts_up документации zapret2).
+     * Задаётся СРАЗУ ЗА обычным вопросом о метке и отличается от него только
+     * порядком опций. Нужен потому, что документация прямо говорит: сервер на
+     * linux отбрасывает пакет с валидным seq и невалидным ack только когда
+     * опция метки идёт первой, а наш профиль копирует опции потока как есть.
+     * Значит промах обычного вопроса о метке может означать не «коробка метку
+     * сверяет», а «сервер нашу фальшивку не отбросил» — и тогда этот вопрос
+     * даёт настоящий ответ там, где первый дал ложный. */
+    out[k].label = "метка первой в опциях";
+    snprintf(out[k].p.name, sizeof(out[k].p.name), "ts-up");
+    out[k].p.tcp_ts = 1;
+    out[k].p.tcp_ts_up = 1;
+    out[k].set = SET_TS_FIRST;
     k++;
 
     /* TTL ПО ИЗМЕРЕННОМУ ПУТИ (ip_autottl документации zapret2, standard
@@ -239,6 +255,12 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok, const d2k_poison *p)
         break;
     case SET_TIMESTAMPS:
         if (ok) { pr->validates_timestamps = D2K_TRI_FALSE; }
+        break;
+    case SET_TS_FIRST:
+        /* Проход: коробка взяла фальшивку, а сервер её отбросил ИМЕННО при
+           метке первой. Про validates_timestamps это ничего не говорит —
+           порядок опций там был другой. */
+        if (ok) { pr->takes_ts_first = D2K_TRI_TRUE; }
         break;
     case SET_SHORT_TTL:
         /* Проход: коробка взяла фальшивку, которой сервер не видел, значит
