@@ -2338,6 +2338,7 @@ typedef struct {
     uint8_t trig[SCHED_TRIG_MAX], ctrl[2048];
     size_t trig_len, ctrl_len;
     uint8_t client_opts[40]; size_t client_opts_len; int client_opts_known;
+    int trig_snapped; /* вход снят с провода: приманка строится клоном */
     int split_unfit; /* решено главным потоком (quic_split_unfit) */
     unsigned budget; /* бюджет потока испытания (JOB_VERIFY), 0 — без проверки */
 } worker_arg;
@@ -2556,8 +2557,8 @@ static void *worker_run(void *vp) {
     uint8_t opts_bytes[sizeof a->client_opts];
     memcpy(opts_bytes, a->client_opts, a->client_opts_len);
     d2k_hello trig = {trigger_bytes, a->trig_len, opts_bytes, a->client_opts_len,
-                      a->client_opts_known};
-    d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len, NULL, 0, 0};
+                      a->client_opts_known, a->trig_snapped};
+    d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len, NULL, 0, 0, 0};
     free(a);
     /* Ход сообщает только прогон измерителя (JOB_CLASSIFY); поток живёт ровно
        одну задачу, поэтому снимать приёмник не нужно. */
@@ -3127,6 +3128,7 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     a->client_opts_known = t->client_opts_known;
     a->client_opts_len = t->client_opts_known ? t->client_opts_len : 0;
     memcpy(a->client_opts, t->client_opts, a->client_opts_len);
+    a->trig_snapped = t->trig_snapped;
     /* Сокет вопроса забирается ЗДЕСЬ, в главном потоке, и поле задачи
        очищается сразу: два владельца одного дескриптора — двойное закрытие. */
     a->use_fd = job == JOB_CONTACT ? t->prop_bound_fd : job == JOB_VERIFY ? t->probe_fd : -1;

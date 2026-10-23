@@ -257,8 +257,9 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
     for (i = 0; i < n; i++) {
         d2k_poison p = pp[i].p;
         d2k_obs *obs;
-        char label[160];
+        char label[200];
         int pass = 0, done = 0, local_err = 0, got;
+        int decoy_cloned = 0;
 
         if (d2k_detect_stopped(&opt->cancel)) {
             break;
@@ -321,6 +322,7 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
             const d2k_trigger *d = d2k_opts_decoy(opt);
             p.decoy = d->payload;
             p.decoy_len = d->len;
+            decoy_cloned = d == &opt->decoy;
         }
         /* Паузу и число копий кладём в наблюдение явно: без этого трасса
          * показывала «пауза=0мс» у зонда, который её честно выдерживает, и
@@ -332,6 +334,13 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
          * нему ведётся учёт заданных и пропущенных вопросов. */
         if (pp[i].set == SET_WHITE_TS && !p.tcp_ts) {
             snprintf(label, sizeof(label), "свойство:ECH-приветствие под битой суммой");
+        } else if (decoy_cloned) {
+            /* КАКОЙ ПРИМАНКОЙ ЗАДАН ВОПРОС — В ЗАПИСЬ ОПЫТА. Клон приветствия
+             * клиента и встроенный шаблон (fallback) — разные стимулы для
+             * коробки, разбирающей L7, и в журнале их обязано быть видно:
+             * иначе два разных опыта выглядят одинаково (ТЗ §5). */
+            snprintf(label, sizeof(label), "свойство:%s (приманка — клон клиента)",
+                     pp[i].label);
         } else {
             snprintf(label, sizeof(label), "свойство:%s", pp[i].label);
         }

@@ -1279,7 +1279,7 @@ int main(int argc, char **argv) {
         g_mock_poison_on_trigger = 0;
         g_extra_n = 0;
         g_mock_len_1300 = 0;
-        d2k_hello snap = {big, big_len, NULL, 0, 0};
+        d2k_hello snap = {big, big_len, NULL, 0, 0, 0};
         d2k_vres r = d2k_quic_classify("10.0.20.1", 443, "www.example.com", snap, ctl_hello(), 0);
         CHECK(r.verdict == D2K_V_OPAQUE, "большой снимок: контроль жив, решает содержимое");
         CHECK(r.qprops.longer != D2K_PROP_UNKNOWN,
@@ -1654,7 +1654,7 @@ int main(int argc, char **argv) {
         CHECK(pl > 0, "пачка не упаковалась");
         g_rs_respond = 10;
         uint16_t port = rs_start();
-        d2k_hello ptrig = {pack, pl, NULL, 0, 0};
+        d2k_hello ptrig = {pack, pl, NULL, 0, 0, 0};
         d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", ptrig, ctl_hello(), 0);
         if (r.verdict != D2K_V_CLEAR)
             fprintf(stderr, "пачка: verdict=%d reason=%s\n", (int)r.verdict, r.reason);
