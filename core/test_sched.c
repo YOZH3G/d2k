@@ -13705,7 +13705,55 @@ client_tcp_test:
         if (fails) fprintf(stderr, "%s\n", saidbuf);
         d2k_sched_free(s); d2k_catalog_free(&c);
         tcp_answer = D2K_V_OPAQUE;
-        if (client_tcp_only && !with_opts) { goto voice_only_done; }
+    }
+
+    /* --- ОТВЕРГНУТЫЙ СНИМОК НЕ СЪЕДАЕТ И НЕ ПОДМЕНЯЕТ НАБОР ОПЦИЙ (ревью
+       ветки, находка 1). Связывание стояло в начале on_shape — ДО ранних
+       return по неполному приветствию. Обрезанный снимок (датапат успел снять
+       половину) тогда: (а) привязывал опции СВОЕГО приветствия к ранее
+       сохранённому снимку другого приветствия — то есть зонд здоровался бы
+       набором одного клиента, повторяя байты другого; (б) гасил набор,
+       ожидавший следующий, годный снимок. Правило: набор связывается только с
+       тем снимком, который действительно сохранён. */
+    {
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        tcp_calls = 0; tcp_last_opts_known = -1; tcp_last_opts_len = 99;
+        const char *nm = "cut.client.example";
+        uint16_t port = 40440;
+        ver_answer_port = port;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; drain(); forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+
+        /* Годный снимок БЕЗ набора опций: набор не снят. */
+        d2k_ev h = ev_hello(6, port, nm); d2k_sched_event(s, &h);
+        d2k_ev sh = h; sh.kind = D2K_EV_SHAPE; sh.name[0] = 0;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, nm, sh.shape, sizeof sh.shape,
+                                     &sh.shape_len) == 0, "cut: снимок");
+        d2k_sched_event(s, &sh);
+
+        /* Набор опций ЧУЖОГО (обрезанного) приветствия и сам обрезанный снимок. */
+        d2k_ev ct = h; ct.kind = D2K_EV_CLIENT_TCP; ct.name[0] = 0;
+        memcpy(ct.tcp_options, (uint8_t[]){1, 1, 8, 10, 0, 0, 0x23, 0x28, 0, 0, 0, 0}, 12);
+        ct.tcp_options_len = 12;
+        d2k_sched_event(s, &ct);
+        d2k_ev cut = sh; cut.shape_len = sh.shape_len / 2;   /* целого ClientHello нет */
+        d2k_sched_event(s, &cut);
+
+        d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+        for (int i = 0; i < 40 && !said("ПОДТВЕРЖДЕНО"); i++) {
+            spin(s, 200);
+            d2k_ev ap = ev_applied(6, port); d2k_sched_event(s, &ap);
+        }
+        spin(s, 40);
+        CHECK(tcp_calls >= 1, "cut: замер не шёл");
+        CHECK(tcp_last_opts_known == 0,
+              "cut: опции обрезанного приветствия привязаны к ранее снятому снимку");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+        if (client_tcp_only) { goto voice_only_done; }
     }
 
 unfit_test:
@@ -13750,6 +13798,73 @@ unfit_test:
         d2k_ev unfit2 = unfit; unfit2.high_port = 40422; d2k_sched_event(s, &unfit2);
         bd = binding_of(&c, "pc.unfit.net", 6);
         CHECK(bd && bd->recheck_since == marked, "unfit: повторный отказ перепометил привязку");
+
+        /* --- ОТКАЗ КЛИЕНТА НЕ НАКЛАДЫВАЕТ ВЕТО НА ПОДТВЕРЖДЕНИЕ (ревью, находка 2).
+           FLOW_UNFIT уходил ещё и в on_refused_foreign, а тот писал план в
+           t->unfit_plan_id[], по которому verify_confirm отказывался
+           подтверждать: «обход, который не достаётся человеку, обходом не
+           является». Это про НЕПОМЕСТИВШУЮСЯ посылку; здесь же план
+           исполняется всем, кто несёт метку, и один ПК без метки отменял бы
+           подтверждение для телефонов — прямо против решения 5.3 (с провода
+           план не снимаем). Замер по этой цели обязан дойти до подтверждения. */
+        ver_answer_port = 40423;
+        for (int i = 0; i < 40 && !said("ПОДТВЕРЖДЕНО"); i++) {
+            spin(s, 200);
+            d2k_ev ap = ev_applied(6, 40423); d2k_sched_event(s, &ap);
+        }
+        spin(s, 40);
+        CHECK(!said("потоку клиента — нет"),
+              "unfit: отказ клиента зачтён как непереносимость плана");
+        CHECK(said("ПОДТВЕРЖДЕНО"), "unfit: перемер не дошёл до подтверждения");
+        /* Человек получает обход: есть годная (не помеченная) привязка цели с
+           подтверждённым планом. Помеченная запись прошлой коробки при этом
+           остаётся — перемер пришёл с подозрением без отпечатка и лёг в другую
+           коробку; проход каталога её пропускает со счётом (см. журнал работ). */
+        int clean_rows = 0;
+        char clean_plan[40] = "";
+        for (size_t bi = 0; bi < c.n_boxes; bi++)
+            for (size_t j = 0; j < c.boxes[bi].n_binds; j++) {
+                const d2k_cat_binding *q = &c.boxes[bi].binds[j];
+                if (strcmp(q->target, "pc.unfit.net") || q->transport != 6) { continue; }
+                if (q->enabled && q->level >= 3 && !q->recheck_since) {
+                    clean_rows++;
+                    snprintf(clean_plan, sizeof clean_plan, "%s", q->plan_id);
+                }
+            }
+        CHECK(clean_rows >= 1 && clean_plan[0],
+              "unfit: после перемера у цели нет ни одной годной подтверждённой привязки");
+
+        /* --- ПЕРЕМЕР НЕ ЗАЦИКЛИВАЕТСЯ (ревью, находка 3). Подтверждение
+           снимает пометку (bind_confirmed), и следующее соединение того же ПК
+           помечало цель заново — поиск на КАЖДОЕ соединение, ровно та
+           патология, что в журналах #5/#7. Тот же план на том же клиенте
+           отказывает детерминированно: перемерять его второй раз нечем. */
+        /* Причина названа в журнале ОДИН раз на цель (say_quiet), а не на
+           каждое соединение: сказана она была уже на втором отказе. */
+        CHECK(said("уже перемеряна"),
+              "unfit: детерминированность повторного отказа не названа в журнале");
+        saidbuf[0] = 0;
+        size_t active_before = d2k_sched_active(s);
+        d2k_ev h3 = ev_hello(6, 40424, "pc.unfit.net"); d2k_sched_event(s, &h3);
+        d2k_ev unfit3 = unfit; unfit3.high_port = 40424;
+        memset(unfit3.plan_id, 0, sizeof unfit3.plan_id);
+        memcpy(unfit3.plan_id, clean_plan, strlen(clean_plan));
+        d2k_sched_event(s, &unfit3);
+        spin(s, 40);
+        CHECK(!said("помечена на повторную проверку"),
+              "unfit: тот же отказ того же плана снова помечает цель — цикл перемера");
+        CHECK(d2k_sched_active(s) <= active_before,
+              "unfit: тот же отказ того же плана завёл второй замер");
+        int still_clean = 0;
+        for (size_t bi = 0; bi < c.n_boxes; bi++)
+            for (size_t j = 0; j < c.boxes[bi].n_binds; j++) {
+                const d2k_cat_binding *q = &c.boxes[bi].binds[j];
+                if (!strcmp(q->target, "pc.unfit.net") && q->transport == 6 &&
+                    q->enabled && q->level >= 3 && !q->recheck_since &&
+                    !strcmp(q->plan_id, clean_plan)) { still_clean = 1; }
+            }
+        CHECK(still_clean,
+              "unfit: повторный отказ снял с провода работающую привязку");
         if (fails) fprintf(stderr, "%s\n", saidbuf);
         settle(s); d2k_sched_free(s); d2k_catalog_free(&c);
         tcp_answer = D2K_V_OPAQUE;

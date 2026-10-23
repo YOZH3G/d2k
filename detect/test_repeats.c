@@ -17,7 +17,7 @@ static int transport_getaddrinfo(const char *, const char *, const struct addrin
 static int transport_setsockopt(int, int, int, const void *, socklen_t);
 #define getaddrinfo transport_getaddrinfo
 #define setsockopt transport_setsockopt
-#define d2k_raw_probe_handshake_family fake_handshake
+#define d2k_raw_probe_handshake_as     fake_handshake
 #define d2k_raw_probe_poison_family    fake_poison
 #define d2k_raw_supported              fake_raw_supported
 #define d2k_raw_rst_fail_count         fake_rst_fail_count
@@ -90,11 +90,16 @@ static int next_rep(void)
 int fake_raw_supported(void) { return 1; }
 unsigned long fake_rst_fail_count(void) { return 0; }
 
+/* Самопроверка слоя зовётся тем же набором опций, что и вопросы (ревью ветки,
+   находка 7): стенд запоминает, предлагалась ли метка времени. */
+static int g_hs_offer_ts = -1;
 int fake_handshake(const uint8_t *ip, uint8_t family, uint16_t port, int timeout_ms,
-                   uint32_t mark, const d2k_detect_stop *cancel, char *err, size_t errcap)
+                   uint32_t mark, const d2k_detect_stop *cancel, int offer_ts,
+                   char *err, size_t errcap)
 {
     int rc;
     (void)ip; (void)family; (void)port; (void)timeout_ms; (void)mark; (void)cancel;
+    g_hs_offer_ts = offer_ts;
     g_hs_calls++;
     rc = pat_rc(g_selftest, next_rep());
     if (rc < 0) { snprintf(err, errcap, "classify: SYN-ACK не пришёл"); }
@@ -849,7 +854,8 @@ static void test_timestamp_questions_follow_client_profile(void) {
         g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
         CHECK(d2k_run_properties((uint8_t[]){192,0,2,1}, 443, &tr, &opt, &r, &hit) == 0,
               "клиентский профиль: вопросы дали находку на стенде промахов");
-        int ts = trace_count(&r, "метка времени"), white = trace_count(&r, "под меткой");
+        int ts = trace_count(&r, "метка времени");
+        int white = trace_count(&r, "ECH-приветствие под");
         if (known) {
             /* Одиночный вопрос о метке — нет; составной (п. 5.2) — да, без метки. */
             CHECK(ts == 0 && white == 1,
@@ -878,8 +884,10 @@ static void test_composite_assembled_for_client_without_ts(void) {
     run(&sc, &r);
     CHECK(find_obs(&r, "свойство:метка времени") == NULL,
           "клиенту без метки задан одиночный вопрос о метке времени");
-    CHECK(find_obs(&r, "свойство:ECH-приветствие под меткой") != NULL,
+    CHECK(find_obs(&r, "свойство:ECH-приветствие под битой суммой") != NULL,
           "клиенту без метки составной вопрос семейства C не задан вовсе");
+    CHECK(find_obs(&r, "свойство:ECH-приветствие под меткой") == NULL,
+          "трасса называет метку времени, которой в зонде не было");
     CHECK(r.has_hit && !strcmp(r.hit.name, "white-hello-ts"),
           "составной вопрос без метки не стал находкой");
     CHECK(!r.hit.tcp_ts, "находка клиента без метки несёт метку времени");
@@ -890,6 +898,25 @@ static void test_composite_assembled_for_client_without_ts(void) {
           "проход составного вопроса не записал «разбирает L7»");
     CHECK(r.props.validates_timestamps == D2K_TRI_UNSET,
           "по проходу без метки записано «метку не сверяет» — метки в зонде не было");
+}
+
+/* РЕВЬЮ ВЕТКИ, НАХОДКА 7: самопроверка сырого слоя ручается за ТУ форму
+   потока, которой идут вопросы. Прежде она всегда предлагала метку времени, а
+   вопросы клиента без метки — нет: путь, не отвечающий на SYN без метки, дал
+   бы промахи во всех вопросах и живой слой в самопроверке, и промахи зачлись
+   бы ответами коробки (запрет §2.4). */
+static void test_selftest_uses_client_tcp_profile(void) {
+    d2k_result r;
+    scenario with_ts = {"selftest-ts", NULL, "-", NULL, NULL, 0, NULL, 0, 0};
+    scenario no_ts   = {"selftest-no-ts", NULL, "-", NULL, NULL, 0, NULL, 0, 1};
+    fresh_process();
+    g_hs_offer_ts = -1;
+    run(&with_ts, &r);
+    CHECK(g_hs_offer_ts == 1, "клиент с меткой: самопроверка пошла без метки (%d)", g_hs_offer_ts);
+    fresh_process();
+    g_hs_offer_ts = -1;
+    run(&no_ts, &r);
+    CHECK(g_hs_offer_ts == 0, "клиент без метки: самопроверка пошла С меткой (%d)", g_hs_offer_ts);
 }
 
 static void test_split_uses_runtime(void) {
@@ -1014,6 +1041,7 @@ int main(void)
     test_syndata_last();
     test_white_ts();
     test_composite_assembled_for_client_without_ts();
+    test_selftest_uses_client_tcp_profile();
     test_syndata_after_misses();
     test_props_fields();
     test_sweep_skips_answered();

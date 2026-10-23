@@ -1188,12 +1188,13 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
  * 2026-08-28, googlevideo: тот фронтенд обслуживает только заблокированные
  * имена, безобидной нагрузки для него не существует, и самопроверка падала не
  * потому, что слой сломан, а потому, что отвечать было не на что. */
-int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t port,
+int d2k_raw_probe_handshake_as(const uint8_t *ip4, uint8_t family, uint16_t port,
                             int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
-                            char *err, size_t errcap)
+                            int offer_ts, char *err, size_t errcap)
 {
     raw_conn c;
-    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, 1, err, errcap);
+    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel,
+                           offer_ts ? 1 : 0, err, errcap);
     if (dial_rc != 0) return dial_rc;
     raw_close(&c);
     return 1;
@@ -1345,11 +1346,12 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
     return -1;
 }
 
-int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t port,
+int d2k_raw_probe_handshake_as(const uint8_t *ip4, uint8_t family, uint16_t port,
                             int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
-                            char *err, size_t errcap)
+                            int offer_ts, char *err, size_t errcap)
 {
     (void)family; (void)ip4; (void)port; (void)timeout_ms; (void)mark; (void)cancel;
+    (void)offer_ts;
     snprintf(err, errcap, "classify: сырой слой доступен только на Linux");
     return -1;
 }
@@ -1360,6 +1362,15 @@ int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
     int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel, char *err, size_t errcap)
 {
     return d2k_raw_probe_handshake_family(ip4, 4, port, timeout_ms, mark, cancel, err, errcap);
+}
+
+/* Прежняя подпись — прежний набор с меткой времени. */
+int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t port,
+                            int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
+                            char *err, size_t errcap)
+{
+    return d2k_raw_probe_handshake_as(ip4, family, port, timeout_ms, mark, cancel, 1,
+                                      err, errcap);
 }
 
 int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,

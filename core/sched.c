@@ -1341,6 +1341,17 @@ struct d2k_sched {
     int          sync_recheck;  /* привязки «требует повторной проверки» (задача 21) */
     int          sync_refused;  /* отказы датапата (ACK ok=0) на планах каталога с прошлой сводки */
     int          sync_unfit;    /* планы, не влезающие в посылку датапата: не поставлены, привязки на повторную проверку */
+    /* ЦЕЛИ, УЖЕ ПЕРЕМЕРЕННЫЕ ПО ОТКАЗУ «ПОТОК НЕ НЕСЁТ ТРЕБУЕМОГО» (ревью
+       ветки, находка 3). Подтверждение снимает пометку повторной проверки
+       (bind_confirmed), и следующее соединение того же клиента помечало цель
+       заново — полный поиск на КАЖДОЕ соединение, ровно патология журналов
+       #5/#7. Тот же план на том же клиенте отказывает детерминированно, и
+       перемерять его второй раз нечем: помним пару «цель + план», для которой
+       перемер уже заводили. ДРУГОЙ план той же цели (каталог сменился) заводит
+       перемер снова — он ещё не проверялся. */
+    struct { char name[256]; uint8_t family, transport;
+             uint8_t plan_id[D2K_PLAN_ID_LEN]; } unfit_done[8];
+    size_t       unfit_done_next;
     unsigned     sync_refused_code; /* причина последнего такого отказа (D2K_ACK_*) */
     installed_area *areas;
     size_t n_areas;
@@ -7983,22 +7994,6 @@ static void quic_note_multi(d2k_sched *s, const char *name, uint8_t family) {
 }
 
 static void on_shape(d2k_sched *s, const d2k_ev *ev) {
-    if (ev->transport == 6) {
-        /* Набор опций клиента (CLIENT_TCP) ждал ЭТОТ снимок — связываем по
-           ключу потока; снимок без набора — known = 0 (замысел 2026-10-23,
-           п. 5.1). Решается до любого разбора: от этого зависит, чем
-           здоровается зонд и как помечается привязка. */
-        int f = ev->family == 6;
-        if (s->tcp_opts_wait[f] && ev_matches_flow(ev, &s->tcp_opts_wait_flow[f])) {
-            s->tcp_shape_opts_known[f] = 1;
-            s->tcp_shape_opts_len[f] = s->tcp_opts_wait_len[f];
-            memcpy(s->tcp_shape_opts[f], s->tcp_opts_wait_bytes[f], s->tcp_opts_wait_len[f]);
-        } else {
-            s->tcp_shape_opts_known[f] = 0;
-            s->tcp_shape_opts_len[f] = 0;
-        }
-        s->tcp_opts_wait[f] = 0;
-    }
     if (ev->shape_len == 0 || ev->shape_len > sizeof s->tasks[0].trig) { return; }
     if (ev->transport == 6 && !d2k_hello_complete(ev->shape, ev->shape_len)) {
         say(s, "снимок TCP (%zu байт) не содержит целого ClientHello — "
@@ -8082,6 +8077,35 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         name[len] = '\0';
     }
     if (name[0] == '\0') { return; }
+    if (ev->transport == 6) {
+        /* НАБОР ОПЦИЙ СВЯЗЫВАЕТСЯ ТОЛЬКО С ТЕМ СНИМКОМ, КОТОРЫЙ СОХРАНЯЕТСЯ
+           (ревью ветки, находка 1; замысел 2026-10-23, п. 5.1). Датапат шлёт
+           CLIENT_TCP ровно перед своим SHAPE, и связывать их надо ПОСЛЕ всех
+           ранних отказов: прежде это стояло в начале on_shape, и обрезанный
+           снимок (целого ClientHello в нём нет) успевал привязать опции СВОЕГО
+           приветствия к ранее сохранённому снимку ДРУГОГО — зонд здоровался бы
+           набором одного клиента, повторяя байты другого, — а заодно гасил
+           набор, ожидавший следующий годный снимок. Отвергнутый снимок теперь
+           не трогает ожидание вовсе. Снимок без своего набора — known = 0:
+           зонд идёт прежним набором. */
+        int f = ev->family == 6;
+        if (s->tcp_opts_wait[f] && ev_matches_flow(ev, &s->tcp_opts_wait_flow[f])) {
+            s->tcp_shape_opts_known[f] = 1;
+            s->tcp_shape_opts_len[f] = s->tcp_opts_wait_len[f];
+            memcpy(s->tcp_shape_opts[f], s->tcp_opts_wait_bytes[f], s->tcp_opts_wait_len[f]);
+        } else {
+            s->tcp_shape_opts_known[f] = 0;
+            s->tcp_shape_opts_len[f] = 0;
+        }
+        /* Ожидание гаснет на ПЕРВОМ сохранённом снимке, совпал ключ или нет:
+           набор, чей снимок так и не доехал (кадр управления потерян), не
+           должен позже достаться чужому снимку. Полностью это закрывает только
+           неподдельный ключ: немедленный ответ на ARM_SHAPE кладёт в оба
+           события нулевой ключ (datapath/ctlsrv.c), и при ПОТЕРЕ двух кадров
+           подряд — снимка одной цели и набора следующей — нулевой ключ
+           совпадёт с нулевым. Остаток названного риска в журнале работ. */
+        s->tcp_opts_wait[f] = 0;
+    }
     if (ev->transport == 6 && ev->shape_len <= sizeof s->ech_inputs[0].bytes &&
         d2k_hello_ech_offer(ev->shape, ev->shape_len, NULL) == 1) {
         size_t slot = 8;
@@ -9174,14 +9198,6 @@ static void on_refused_foreign(d2k_sched *s, const d2k_ev *ev) {
     size_t slot = s->unfit_next % (sizeof s->unfit_names / sizeof s->unfit_names[0]);
     snprintf(s->unfit_names[slot], sizeof s->unfit_names[slot], "%s", name);
     s->unfit_next++;
-    if (ev->code == D2K_REFUSE_FLOW_UNFIT) {
-        say(s, "по %s план НЕ ИСПОЛНЯЕТСЯ потоку клиента: поток не несёт того, что "
-               "план требует (причина %u; у tcp-template-v1 это метка времени TCP). "
-               "Зонд здоровался иначе, чем этот клиент, — подтверждение зонда на "
-               "этот поток не переносится",
-            name, (unsigned)ev->code);
-        return;
-    }
     say(s, "по %s план НЕ ИСПОЛНЯЕТСЯ потоку клиента: не помещается в посылку "
            "(причина %u). Приветствие браузера длиннее зондового — подтверждение "
            "зонда на этот поток не переносится",
@@ -9216,6 +9232,22 @@ static void on_refused_unfit(d2k_sched *s, const d2k_ev *ev) {
     uint8_t family = ev->family ? ev->family : 4;
     uint8_t present = 0;
     for (size_t i = 0; i < D2K_PLAN_ID_LEN; i++) { present |= ev->plan_id[i]; }
+    /* ЭТУ ПАРУ «ЦЕЛЬ + ПЛАН» УЖЕ ПЕРЕМЕРЯЛИ — второй раз нечем (находка 3). */
+    size_t n_done = sizeof s->unfit_done / sizeof s->unfit_done[0];
+    for (size_t i = 0; i < n_done; i++) {
+        if (!s->unfit_done[i].name[0] || s->unfit_done[i].transport != transport ||
+            s->unfit_done[i].family != family ||
+            strcmp(s->unfit_done[i].name, name) != 0) { continue; }
+        if (memcmp(s->unfit_done[i].plan_id, ev->plan_id, D2K_PLAN_ID_LEN) == 0) {
+            char quiet_key[300];
+            snprintf(quiet_key, sizeof quiet_key, "unfit-done %u %s", transport, name);
+            say_quiet(s, quiet_key, "по %s поток этого клиента не несёт того, что план "
+                      "требует, и цель по этому плану уже перемеряна — второй раз "
+                      "перемерять нечем, отказ детерминирован (причина %u)",
+                      name, (unsigned)ev->code);
+            return;
+        }
+    }
     size_t marked = 0, waiting = 0;
     for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
         d2k_cat_box *b = &s->cat->boxes[bi];
@@ -9235,15 +9267,27 @@ static void on_refused_unfit(d2k_sched *s, const d2k_ev *ev) {
             bd->recheck_mono_ms = s->now_ms ? s->now_ms : 1;
             b->updated = bd->recheck_since;
             marked++;
+            /* НЕ «для этого клиента» (ревью, находка 4): событие отказа не
+               несёт набор опций отказавшего потока, и замер пойдёт тем
+               снимком и набором, который попадёт в ячейку первым — может
+               оказаться другой клиент той же цели. Говорим ровно то, что
+               делаем: цель перемеряется заново. */
             say(s, "по %s привязка %s помечена на повторную проверку: поток клиента не "
                    "несёт того, что план требует (причина %u; у tcp-template-v1 это "
-                   "метка времени TCP) — перемеряю цель для этого клиента, план с "
-                   "провода не снимаю (каталог сохранён)",
+                   "метка времени TCP) — перемеряю цель заново тем клиентом, чьё "
+                   "приветствие снимется первым, план с провода не снимаю "
+                   "(каталог сохранён)",
                 name, bd->plan_id, (unsigned)ev->code);
         }
     }
     if (marked) { s->cat->revision++; }
     if (waiting || task_of(s, name, transport, family)) { return; }
+    /* Запоминаем пару до завода замера: он один на эту пару (находка 3). */
+    size_t slot = s->unfit_done_next++ % n_done;
+    snprintf(s->unfit_done[slot].name, sizeof s->unfit_done[slot].name, "%s", name);
+    s->unfit_done[slot].transport = transport;
+    s->unfit_done[slot].family = family;
+    memcpy(s->unfit_done[slot].plan_id, ev->plan_id, D2K_PLAN_ID_LEN);
     d2k_ev suspicion = *ev;
     suspicion.kind = D2K_EV_SUSPECT;
     suspicion.code = D2K_SUSPECT_REPEAT;
@@ -9298,8 +9342,17 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
        кто-то в доме. План при этом применялся — значит он стоит на цели, а
        браузер под него не подошёл. */
     if (ev->code == D2K_REFUSE_FLOW_UNFIT) {
+        /* ТОЛЬКО on_refused_unfit. on_refused_foreign здесь ЗАПРЕЩЁН (ревью
+           ветки, находка 2): он пишет план в t->unfit_plan_id[], и
+           verify_confirm по этому идентификатору отказывается подтверждать
+           («обход, который не достаётся человеку, обходом не является»). Это
+           верно для НЕПОМЕСТИВШЕЙСЯ посылки — там план не исполнится никому с
+           таким приветствием. Здесь же план исполняется каждому, кто несёт
+           метку времени, и один ПК без метки накладывал бы вето на
+           подтверждение tcpts-плана по любой цели: телефоны теряли бы рабочий
+           обход. Это прямо против решения 5.3 — с провода план не снимаем
+           именно потому, что он работает у остальных. */
         on_refused_unfit(s, ev);
-        on_refused_foreign(s, ev);
         return;
     }
     if (refuse_is_permanent((uint8_t)ev->code) && s->cat->groups) {

@@ -133,9 +133,10 @@ typedef struct {
      * (D2K_EV_CLIENT_TCP); зонд здоровается этим набором, а не своим
      * литералом: вопрос «коробка глотает устаревшую метку времени» задаётся
      * только клиенту, который метку предлагает. client_tcp_known == 0 — набор
-     * не снят (холодный старт, старый датапат): зонд идёт прежним набором, и
-     * выведенная привязка помечается PROFILE, не CLIENT. Пустой известный набор
-     * (known, len 0) — клиент без опций в данных, и это честный профиль. */
+     * не снят (холодный старт, старый датапат): зонд идёт прежним набором, с
+     * меткой времени, как раньше. Пустой известный набор (known, len 0) —
+     * клиент без опций в данных, и это честный профиль. Полноту входа привязки
+     * (CLIENT/PROFILE) это поле не решает — см. core/include/d2k_meas.h. */
     int           client_tcp_known;
     uint8_t       client_tcp_options[40];
     size_t        client_tcp_options_len;
@@ -440,6 +441,15 @@ int d2k_probe_data_ack(const char *host, const char *port, const d2k_opts *opt,
 /* --- гипотезы (poison.c) ------------------------------------------------ */
 int d2k_raw_probe_handshake_family(const uint8_t *ip, uint8_t family, uint16_t port,
     int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel, char *err, size_t errcap);
+/* ТА ЖЕ САМОПРОВЕРКА НАБОРОМ ОПЦИЙ КЛИЕНТА (ревью ветки, находка 7). Прежняя
+ * подпись всегда предлагала метку времени, а вопросы клиента без метки её не
+ * предлагают: путь, который не отвечает на SYN без метки, давал промахи во
+ * всех вопросах и живой слой в самопроверке — промахи зачлись бы ответами
+ * коробки, а это запрет §2.4. Слой обязан ручаться за ТУ форму потока,
+ * которой идут вопросы. offer_ts — из d2k_trigger_offers_ts. */
+int d2k_raw_probe_handshake_as(const uint8_t *ip, uint8_t family, uint16_t port,
+    int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel, int offer_ts,
+    char *err, size_t errcap);
 int d2k_raw_probe_poison_family(const uint8_t *ip, uint8_t family, uint16_t port,
     const d2k_trigger *tr, const d2k_poison *p, int timeout_ms, uint32_t mark,
     const d2k_detect_stop *cancel, char *err, size_t errcap);
