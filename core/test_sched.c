@@ -10444,6 +10444,40 @@ rx_volume_tests:
         d2k_sched_free(s); d2k_catalog_free(&cN);
     }
     {
+        /* --- БЕЛОЕ ИМЯ СЕТИ: TX-ДОКАЗАТЕЛЬСТВО НЕ ГОДИТСЯ ДЛЯ ВХОДЯЩЕГО ОБРЫВА
+           Поле 23.10.2026 (парный прогон rel-166840a-1 / cand-c570778-1): имя
+           «9gag.com» приняли как свойство сети по проходу ИСХОДЯЩЕЙ лестницы
+           на spzh.eu, подбор закрылся, и семь целей, чья беда — ВХОДЯЩИЙ обрыв
+           тела, унаследовали имя, против их обрыва не проверенное: тела рвались
+           на 13–17 КБ при ответе 200. Само поле определено как имя, под которым
+           коробка пропускает поток за RX-обрыв (d2k_catalog.h).
+           Требование: имя с пометкой tx_only при измеренном RX-обрыве подбор
+           открывает заново. Зеркало (tx_only=0 — подбора нет) проверяет
+           соседний блок «net.name известно». */
+        d2k_catalog cT = {0};
+        snprintf(cT.net.name, sizeof cT.net.name, "learned-white.example");
+        cT.net.searched = 1; cT.net.tx_only = 1; cT.net.confirmed_at = 1791593321;
+        d2k_sched *s = d2k_sched_new(&cT, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 1;
+        d2k_ev h = ev_hello(6, 40098, "tx-only.test"), sh;
+        d2k_sched_event(s, &h);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0, "tx-only shape fixture");
+        d2k_sched_event(s, &sh);
+        prime_late_rst(s, h.name, 40198);
+        d2k_ev su = ev_suspect(6, 40098); su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(said("белое имя сети не известно — подбираю"),
+              "имя доказано лишь исходящей лестницей, но подбор под входящий "
+              "обрыв не открылся — цель наследует непроверенное имя");
+        CHECK(sent_contains_plan_payload("9gag.com"),
+              "подбор не пошёл по списку имён");
+        vol_rx_cut = 0;
+        d2k_sched_free(s); d2k_catalog_free(&cT);
+    }
+    {
         /* net.name известно → лестница берёт его, подбора нет. */
         d2k_catalog cL = {0};
         snprintf(cL.net.name, sizeof cL.net.name, "learned-white.example");

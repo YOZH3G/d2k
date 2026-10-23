@@ -3933,6 +3933,17 @@ static int net_whitelist_undecided(const d2k_sched *s) {
     return s->cat && !s->cat->net.searched && !s->cat->net.name[0];
 }
 
+/* Нужен ли подбор ИМЕННО ЭТОЙ задаче (поле 23.10.2026). Кроме нерешённого
+   имени подбор открывает ещё один случай: имя записано, но доказано только
+   проходом ИСХОДЯЩЕЙ лестницы, а у этой задачи обрыв ВХОДЯЩИЙ — против него
+   имя не проверялось. Семь целей парного прогона наследовали такое имя и
+   рвали тело на 13–17 КБ при ответе 200. Цена названа: список имён, и потолок
+   зондов на время подбора уже расширен (sched_probe_cap). */
+static int net_whitelist_needs_probe(const d2k_sched *s, const task *t) {
+    if (net_whitelist_undecided(s)) { return 1; }
+    return t->vol.rx_cut && s->cat && s->cat->net.name[0] && s->cat->net.tx_only;
+}
+
 /* Потолок зондов задачи. Подбор белого имени сети перебирает до сотен
    кандидатов (цена названа прямо, §0 «искусственных бюджетов нет»): пока он
    идёт, потолок расширен на длину списка — только для этой задачи, обычный
@@ -5222,7 +5233,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
         char text[sizeof t->plans[0]];
         /* Белое имя сети не решено — RX-лестница сперва перебирает кандидаты
            как приманку (поле 10.10.2026); решено — берёт готовое/семя. */
-        t->net_probing = net_whitelist_undecided(s);
+        t->net_probing = net_whitelist_needs_probe(s, t);
         /* При одном TX-обрыве сразу — одна ступень: места в очереди остаются
            кандидатам, выведенным из замера, как в выпуске (их вытесняла
            лестница, тесты коробок задачи 23). Остальные ступени долива —
@@ -8790,14 +8801,25 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         (t->vol.rx_cut || t->ver.budget == D2K_BUDGET_PASSED)) {
         d2k_net_whitelist *nw = &s->cat->net;
         snprintf(nw->name, sizeof nw->name, "%s", t->net_probe_name[t->next_plan - 1]);
-        nw->searched = 1;
+        /* ДОКАЗАТЕЛЬСТВО СВЯЗЫВАЕТСЯ С ТИПОМ ОБРЫВА (поле 23.10.2026). Подбор
+           закрывает только проход ВХОДЯЩЕГО обрыва: поле определено как имя,
+           под которым коробка пропускает поток за RX-обрыв. Проход исходящей
+           лестницы имя запоминает — он настоящая находка для этой цели, — но
+           подбор держит открытым: иначе цели с входящим обрывом наследуют
+           имя, против их обрыва не проверенное (семь целей, тела 13–17 КБ при
+           ответе 200). */
+        nw->tx_only = t->vol.rx_cut ? 0 : 1;
+        nw->searched = t->vol.rx_cut ? 1 : 0;
         nw->confirmed_at = wall_s(s, now_ms);
         s->cat->revision++;
         s->sync_pending = 1;
         t->net_probing = 0;
         say(s, "по %s белое имя сети подобрано: «%s» снимает %s — сохраняю как "
-               "свойство сети, подбор больше не повторяю", t->name, nw->name,
-            t->vol.rx_cut ? "RX-обрыв" : "обрыв исходящей лестницы (бюджет потока пройден)");
+               "свойство сети, %s", t->name, nw->name,
+            t->vol.rx_cut ? "RX-обрыв" : "обрыв исходящей лестницы (бюджет потока пройден)",
+            t->vol.rx_cut ? "подбор больше не повторяю"
+                          : "но подбор остаётся открытым: входящий обрыв этим именем "
+                            "не проверялся");
     }
     if (t->ver.replay_proof && t->transport == 17)
         say(s, "по %s (QUIC, ECH) ПОДТВЕРЖДЕНО повтором пачки клиента на уровне "
@@ -11124,7 +11146,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                         if (!t->vol.rx_cut && ech_witness_rx_cut(t)) {
                             t->vol.rx_cut = 1;
                             t->vol.rx_at_kb = (int)(t->ver.body_bytes / 1024);
-                            t->net_probing = net_whitelist_undecided(s);
+                            t->net_probing = net_whitelist_needs_probe(s, t);
                             t->rx_volume_candidate_pending = rx_ladder_pending(t);
                             say(s, "по %s под планом через принятый ECH ответ свидетеля %s "
                                    "оборвался около %d КБ — это объёмный обрыв; добавляю "
