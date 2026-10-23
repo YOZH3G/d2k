@@ -2073,8 +2073,9 @@ int main(int argc, char **argv) {
     int lifecycle_only = argc == 2 && strcmp(argv[1], "--lifecycle-only") == 0;
     int own_first_only = argc == 2 && strcmp(argv[1], "--own-first-only") == 0;
     int measured_only = argc == 2 && strcmp(argv[1], "--measured-only") == 0;
+    int unfit_only = argc == 2 && strcmp(argv[1], "--unfit-only") == 0;
     int ech_only = argc == 2 && strcmp(argv[1], "--ech-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !measured_only && !ech_only) {
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !measured_only && !unfit_only && !ech_only) {
         fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only|--measured-only|--ech-only]\n");
         return 2;
     }
@@ -2552,6 +2553,7 @@ int main(int argc, char **argv) {
     if (lifecycle_only) { goto lifecycle_test; }
     if (own_first_only) { goto own_first_test; }
     if (measured_only) { goto measured_test; }
+    if (unfit_only) { goto unfit_test; }
     if (shape_only) { goto shape_test; }
     {
         d2k_catalog empty = {0};
@@ -13643,6 +13645,54 @@ measured_test:
             vol_rx_cut = 0; tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
         }
         if (measured_only) { goto voice_only_done; }
+    }
+
+unfit_test:
+    /* --- ЗАМЫСЕЛ 23.10.2026, п. 5.3: ПОТОК КЛИЕНТА НЕ НЕСЁТ ТРЕБУЕМОГО ПЛАНОМ.
+       Поле issue #7 (22.10.2026): план с меткой времени подтверждён зондом,
+       телефоны его исполняют, а ПК без метки времени получает 13 из 13 «план
+       не применён». Датапат теперь отвечает на таком потоке кодом
+       D2K_REFUSE_FLOW_UNFIT. Ядро обязано: не писать свойство коробки и не
+       судить план, а пометить привязку на повторную проверку и начать замер
+       цели для этого клиента — вместо «план подтверждён, датапат его не
+       применял». Привязка при этом цела (каталог сохранён, план не стёрт). */
+    {
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        confirm_once(&c, sv[0], "pc.unfit.net", 40420);
+        const d2k_cat_binding *bd0 = binding_of(&c, "pc.unfit.net", 6);
+        CHECK(bd0 && bd0->level >= 3 && bd0->enabled && !bd0->recheck_since,
+              "unfit: fixture — привязка не подтверждена");
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; drain(); forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev h = ev_hello(6, 40421, "pc.unfit.net"); d2k_sched_event(s, &h);
+        d2k_ev unfit = h; unfit.kind = D2K_EV_REFUSED; unfit.code = D2K_REFUSE_FLOW_UNFIT;
+        unfit.client_shape = bd0 ? bd0->shape : 0;
+        memset(unfit.plan_id, 0, sizeof unfit.plan_id);
+        if (bd0) memcpy(unfit.plan_id, bd0->plan_id, strlen(bd0->plan_id));
+        d2k_sched_event(s, &unfit);
+        const d2k_cat_binding *bd = binding_of(&c, "pc.unfit.net", 6);
+        CHECK(bd && bd->enabled && bd->level >= 3 && bd->plan_id[0],
+              "unfit: привязка стёрта или понижена — отказ клиента не улика против плана");
+        CHECK(bd && bd->recheck_since,
+              "unfit: привязка не помечена на повторную проверку");
+        CHECK(said("метк") || said("не несёт"),
+              "unfit: причина не названа — клиент без того, что план требует");
+        CHECK(!said("не помещается в посылку"),
+              "unfit: отказ клиента выдан за непоместившуюся посылку");
+        CHECK(d2k_sched_active(s) > 0,
+              "unfit: замер цели для этого клиента не начат");
+        /* Второй такой же отказ (следующее соединение того же ПК) не плодит
+           ни второй пометки, ни второй строки. */
+        int64_t marked = bd ? bd->recheck_since : 0;
+        d2k_ev h2 = ev_hello(6, 40422, "pc.unfit.net"); d2k_sched_event(s, &h2);
+        d2k_ev unfit2 = unfit; unfit2.high_port = 40422; d2k_sched_event(s, &unfit2);
+        bd = binding_of(&c, "pc.unfit.net", 6);
+        CHECK(bd && bd->recheck_since == marked, "unfit: повторный отказ перепометил привязку");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        settle(s); d2k_sched_free(s); d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+        if (unfit_only) { goto voice_only_done; }
     }
 
 own_first_test:

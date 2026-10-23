@@ -298,7 +298,13 @@ static int refuse_is_permanent(uint8_t code) {
     /* NOT_APPLIED постоянен в том же смысле, что TOO_LONG: тот же план на том
        же приветствии будет отвергнут исполнителем снова. Повторять нечего,
        кандидат не виноват, свойство коробки не пишется. */
-    return code == D2K_REFUSE_TOO_LONG || code == D2K_REFUSE_NOT_APPLIED;
+    /* FLOW_UNFIT — поток клиента не несёт того, что план требует (метка
+       времени у tcp-template-v1): тот же план на том же потоке будет отвергнут
+       снова. Для чужого потока это знак перемерить цель для этого клиента
+       (on_refused_unfit), для зондового — опыт невозможен, кандидат не
+       виноват. Замысел 2026-10-23, п. 5.3. */
+    return code == D2K_REFUSE_TOO_LONG || code == D2K_REFUSE_NOT_APPLIED ||
+           code == D2K_REFUSE_FLOW_UNFIT;
 }
 
 /* Поток испорчен недоисполнением: часть плана ушла, остаток нет. Отличается
@@ -4157,6 +4163,9 @@ static int local_refusal_verdict(d2k_sched *s, task *t) {
             t->unsent_code == D2K_REFUSE_NOT_APPLIED
                 ? "исполнитель отверг план на приветствии зонда: зонд ушёл БЕЗ "
                   "плана, и ответ линии о плане ничего не говорит"
+            : t->unsent_code == D2K_REFUSE_FLOW_UNFIT
+                ? "поток зонда не несёт того, что план требует (метка времени "
+                  "TCP у tcp-template-v1): зонд ушёл БЕЗ плана"
                 : "план не помещается в посылку",
             (unsigned)t->unsent_code);
         t->unsent_code = 0;
@@ -8520,7 +8529,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     }
     if (unfit_here) {
         say(s, "по %s план %s зонду исполнился, а потоку клиента — нет "
-               "(не помещается в посылку). Подтверждать не буду: обход, "
+               "(не помещается в посылку либо поток не несёт того, что план "
+               "требует). Подтверждать не буду: обход, "
                "который не достаётся человеку, обходом не является. "
                "Беру следующего кандидата",
             t->name, plan_id);
@@ -9089,10 +9099,81 @@ static void on_refused_foreign(d2k_sched *s, const d2k_ev *ev) {
     size_t slot = s->unfit_next % (sizeof s->unfit_names / sizeof s->unfit_names[0]);
     snprintf(s->unfit_names[slot], sizeof s->unfit_names[slot], "%s", name);
     s->unfit_next++;
+    if (ev->code == D2K_REFUSE_FLOW_UNFIT) {
+        say(s, "по %s план НЕ ИСПОЛНЯЕТСЯ потоку клиента: поток не несёт того, что "
+               "план требует (причина %u; у tcp-template-v1 это метка времени TCP). "
+               "Зонд здоровался иначе, чем этот клиент, — подтверждение зонда на "
+               "этот поток не переносится",
+            name, (unsigned)ev->code);
+        return;
+    }
     say(s, "по %s план НЕ ИСПОЛНЯЕТСЯ потоку клиента: не помещается в посылку "
            "(причина %u). Приветствие браузера длиннее зондового — подтверждение "
            "зонда на этот поток не переносится",
         name, (unsigned)ev->code);
+}
+
+/* ПОТОК КЛИЕНТА НЕ НЕСЁТ ТОГО, ЧТО ПЛАН ТРЕБУЕТ (D2K_REFUSE_FLOW_UNFIT) —
+ * перемерить цель для этого клиента, а не докладывать «подтверждено».
+ *
+ * Поле issue #7, 22.10.2026: план tcp-template-v1 со сдвигом метки времени
+ * подтверждён зондом (зонд метку предлагает всегда — detect/raw.c), телефоны
+ * его исполняют, ПК без метки времени — 13 из 13 «план не применён». Привязка
+ * при этом числилась подтверждённой, и правило «план уже подтверждён — не
+ * улика» (on_suspect, binding_covering) закрывало цель от нового замера.
+ *
+ * Что делается: привязка этого плана на эту цель помечается «требует
+ * повторной проверки» (задача 21: каталог цел, план не стёрт, подтверждение
+ * того же или нового плана снимает пометку) и по цели заводится подозрение —
+ * оно и ведёт к замеру. С провода план НЕ снимается: клиентам с меткой он
+ * исполняется, и отнять у них обход до нового замера — вред без пользы.
+ * Повторный такой отказ (следующее соединение того же ПК) пометку не
+ * обновляет и второй строки не пишет.
+ *
+ * Чего НЕ делается: свойство коробки не пишется и план не бракуется — отказ
+ * говорит о клиенте, не о коробке (§2.4). Замысел 2026-10-23, п. 5.3. */
+static void on_refused_unfit(d2k_sched *s, const d2k_ev *ev) {
+    const char *found = recall(s, ev);
+    if (!found || found[0] == '\0' || !s->cat) { return; }
+    char name[256];
+    snprintf(name, sizeof name, "%s", found);
+    uint8_t transport = ev->transport ? ev->transport : 6;
+    uint8_t family = ev->family ? ev->family : 4;
+    uint8_t present = 0;
+    for (size_t i = 0; i < D2K_PLAN_ID_LEN; i++) { present |= ev->plan_id[i]; }
+    size_t marked = 0, waiting = 0;
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t j = 0; j < b->n_binds; j++) {
+            d2k_cat_binding *bd = &b->binds[j];
+            if (!bd->enabled || strcmp(bd->kind, "name") || strcmp(bd->target, name) ||
+                (bd->transport ? bd->transport : 6) != transport ||
+                (bd->family ? bd->family : 4) != family) { continue; }
+            if (present) {
+                uint8_t id[D2K_PLAN_ID_LEN] = {0};
+                size_t n = strlen(bd->plan_id); if (n > sizeof id) { n = sizeof id; }
+                memcpy(id, bd->plan_id, n);
+                if (memcmp(id, ev->plan_id, sizeof id) != 0) { continue; }
+            }
+            if (bd->recheck_since) { waiting++; continue; }
+            bd->recheck_since = wall_s(s, s->now_ms);
+            bd->recheck_mono_ms = s->now_ms ? s->now_ms : 1;
+            b->updated = bd->recheck_since;
+            marked++;
+            say(s, "по %s привязка %s помечена на повторную проверку: поток клиента не "
+                   "несёт того, что план требует (причина %u; у tcp-template-v1 это "
+                   "метка времени TCP) — перемеряю цель для этого клиента, план с "
+                   "провода не снимаю (каталог сохранён)",
+                name, bd->plan_id, (unsigned)ev->code);
+        }
+    }
+    if (marked) { s->cat->revision++; }
+    if (waiting || task_of(s, name, transport, family)) { return; }
+    d2k_ev suspicion = *ev;
+    suspicion.kind = D2K_EV_SUSPECT;
+    suspicion.code = D2K_SUSPECT_REPEAT;
+    suspicion.planned = D2K_LINK_PLANNED_NO;
+    (void)on_suspect(s, &suspicion);
 }
 
 static void on_refused(d2k_sched *s, const d2k_ev *ev) {
@@ -9141,6 +9222,11 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
     /* Ни одна задача этот отказ своим не признала: поток не наш, его открыл
        кто-то в доме. План при этом применялся — значит он стоит на цели, а
        браузер под него не подошёл. */
+    if (ev->code == D2K_REFUSE_FLOW_UNFIT) {
+        on_refused_unfit(s, ev);
+        on_refused_foreign(s, ev);
+        return;
+    }
     if (refuse_is_permanent((uint8_t)ev->code) && s->cat->groups) {
         const char *name = recall(s, ev);
         if (name) {

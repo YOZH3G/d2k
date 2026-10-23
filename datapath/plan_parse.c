@@ -565,6 +565,13 @@ uint8_t d2k_plan_poison_used(const d2k_plan *p) {
     return used;
 }
 
+uint8_t d2k_plan_flow_needs(const d2k_plan *p) {
+    if (!p || p->wire_profile != D2K_WIRE_TCP_TEMPLATE) {
+        return 0;
+    }
+    return (d2k_plan_poison_used(p) & D2K_POISON_TCPTS_BACK) ? D2K_FLOW_NEED_TCPTS : 0;
+}
+
 int d2k_plan_quic_deny(const d2k_plan *p) {
     return p && p->qdeny;
 }
