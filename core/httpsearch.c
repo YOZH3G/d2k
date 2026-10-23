@@ -424,6 +424,7 @@ struct d2k_httpsearch {
         int judged;        /* судимых испытаний: ответ сервера или вставка под планом */
         size_t conflicts;  /* passing probes contradicted by owned live failures */
         uint32_t job_seq;  /* номер текущего запуска зонда */
+        int base_retries;  /* повторов базы после МЕСТНОГО отказа (поле 23.10.2026) */
         int fd;
         uint16_t sport;
         uint8_t trial[16], plan_id[16];
@@ -1244,8 +1245,44 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
             next_candidate(hs, now);
             return;
         }
+        /* МЕСТНЫЙ ОТКАЗ — НЕ ОТВЕТ О КОРОБКЕ (поле 23.10.2026, media5.cdnbase.com).
+           Наш сокет не соединился: это «не измерено», а не «блока нет». Клиент
+           при этом получал обрыв 33 120 Б из 106 050 трижды подряд, и приём,
+           которым тот же билд в повторе отдал полный ответ, не был опробован —
+           цель закрылась на 10 минут по НАШЕМУ сбою. Повторяем базу тем же
+           поиском; если и повтор местный — короткий срок «не измерено». */
+        if (r->answer == D2K_HS_CONNECT_FAIL &&
+            hs->cur.base_retries < D2K_HS_BASE_RETRIES) {
+            hs->cur.base_retries++;
+            d2k_hs_job job;
+            hs->cur.job_seq = ++hs->job_seq;
+            int opened = open_job(hs, &job) == 0;
+            job.seq = hs->cur.job_seq;
+            if (opened && hs->ops.start_probe && hs->ops.start_probe(hs->ops.ctx, &job) == 0) {
+                hs->cur.sport = 0;
+                hs->cur.phase = PH_BASE;
+                hs->cur.deadline = now + (int64_t)d2k_hs_probe_ms * 3;
+                say(hs, "HTTP %s: база — соединение своего зонда не установилось "
+                        "(попытка %d из %d): это НАШ отказ, не ответ коробки — "
+                        "повторяю базу", hs->cur.host, hs->cur.base_retries + 1,
+                    D2K_HS_BASE_RETRIES + 1);
+                return;
+            }
+            drop_socket(hs);
+        }
         rec *rr = rec_get(hs, hs->cur.host, hs->cur.family);
-        if (rr) { rr->no_before_ms = now + D2K_HS_RECHECK_MS; }
+        int local = r->answer == D2K_HS_CONNECT_FAIL;
+        if (rr) {
+            rr->no_before_ms = now + (local ? D2K_HS_INCONCLUSIVE_MS : D2K_HS_RECHECK_MS);
+        }
+        if (local) {
+            say(hs, "HTTP %s: база не измерена — соединение своего зонда не "
+                    "установилось %d раза подряд; о коробке это не говорит ничего, "
+                    "повтор не раньше чем через %lld мин", hs->cur.host,
+                D2K_HS_BASE_RETRIES + 1, (long long)(D2K_HS_INCONCLUSIVE_MS / 60000));
+            finish(hs, now, "inconclusive", "baseline-local-failure");
+            return;
+        }
         say(hs, "HTTP %s: база — %s%s%s: %s с роутера не воспроизводится, поиск HTTP "
                 "не начат (подозрение не равно блокировке)", hs->cur.host,
             d2k_hs_answer_name(r->answer), r->status[0] ? ", " : "", r->status,

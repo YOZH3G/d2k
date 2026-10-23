@@ -1184,7 +1184,48 @@ static void test_silent_base_after_portal(void) {
     d2k_httpsearch_free(hs);
 }
 
+/* МЕСТНЫЙ ОТКАЗ СОЕДИНЕНИЯ НА БАЗЕ — «НЕ ИЗМЕРЕНО», А НЕ «НЕ ВОСПРОИЗВОДИТСЯ».
+ *
+ * Поле 23.10.2026. `media5.cdnbase.com` отдавал клиенту 33 120 Б из 106 050
+ * трижды подряд, то есть обрыв был. Базовый зонд один раз не установил
+ * соединение, и поиск закрылся:
+ *
+ *   16:34:27 база — соединение не установилось: обрыв с роутера не
+ *            воспроизводится, поиск HTTP не начат (подозрение не равно блокировке)
+ *
+ * Приём `fake-badsum`, которым тот же билд в повторе того же вечера
+ * (`cand-32e84f2-2`, 16:41:03) отдал полные 106 050 Б, не был даже опробован,
+ * и цель ушла на 10 минут штрафа.
+ *
+ * Отказ НАШЕГО сокета не говорит о коробке ничего (§2.4). Его цена не должна
+ * равняться цене измеренного «блока нет»: повтор базы в том же поиске, а если
+ * и он местный — короткий срок «не измерено», а не длинный «не воспроизводится».
+ */
+static void test_base_connect_fail_is_unmeasured(void) {
+    fake f;
+    memset(&f, 0, sizeof f);
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    int64_t now = 1000;
+    d2k_httpsearch_cut(hs, "media5.cdnbase.com", 4, IP, "/media/theme/fast.5.css", 33120, now);
+    CHECK(f.start_n == 1, "база не запущена");
+    d2k_hs_result r = res(&f, D2K_HS_CONNECT_FAIL);
+    r.seq = f.job.seq; r.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r, now += 100);
+    CHECK(strstr(f.said, "не воспроизводится") == NULL,
+          "местный отказ соединения назван «не воспроизводится»");
+    CHECK(f.start_n == 2, "база не повторена после местного отказа");
+    CHECK(d2k_httpsearch_busy(hs), "поиск брошен после местного отказа базы");
+    /* Повтор базы увидел обрыв — поиск идёт своим чередом. */
+    d2k_hs_result r2 = res(&f, D2K_HS_CUT);
+    r2.seq = f.job.seq; r2.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r2, now += 100);
+    CHECK(f.set_probe_n >= 1, "после повтора базы вопросы не начались");
+    d2k_httpsearch_free(hs);
+}
+
 int main(void) {
+    test_base_connect_fail_is_unmeasured();
     test_silent_base_after_portal();
     test_probe_cut();
     test_cut_search();
