@@ -326,6 +326,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         if (!between) {
             if (a->md5 && append_fmt(buf, cap, &pos, " md5")) { return -1; }
             if (a->tcpts && append_fmt(buf, cap, &pos, " tcpts")) { return -1; }
+            if (a->tcpts_up && append_fmt(buf, cap, &pos, " tsup")) { return -1; }
             if (a->ipidzero && append_fmt(buf, cap, &pos, " ipidzero")) { return -1; }
             if (a->seq_out && append_fmt(buf, cap, &pos, " seqshift=-66000")) { return -1; }
         }

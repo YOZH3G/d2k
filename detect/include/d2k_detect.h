@@ -168,6 +168,7 @@ typedef struct {
     int     disorder;      /* слать сегменты НЕ ПО ПОРЯДКУ */
     int     disorder_pos;  /* одиночный абсолютный разрез для reverse-disorder */
     int     tcp_ts;        /* метка времени со сдвигом назад */
+    int     tcp_ts_up;     /* и поднять её в начало опций (tcp_ts_up) */
     int     ip_id_zero;    /* обнулить идентификатор IP */
     int     gap_ms;        /* пауза между копиями фальшивки */
     int     syn_data;      /* приветствие ПРЯМО В SYN */

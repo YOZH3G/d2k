@@ -149,6 +149,31 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
             off += native_options[off + 1];
         }
         if ((e->poison & D2K_POISON_TCPTS_BACK) && !found_timestamp) return 0;
+        /* МЕТКУ — ПЕРВОЙ (tcp_ts_up документации zapret2): linux отбрасывает
+           пакет с валидным seq и невалидным ack только когда опция метки идёт
+           первой, и nfqws1 случайно соблюдал это всегда. Переносим опцию
+           целиком в начало, остальные сдвигаем вправо: длина опций не меняется,
+           значит и заголовок остаётся того же размера, а сдвиг значения назад
+           уже применён выше. Ищем заново, потому что смещение после правки
+           значения то же, но код выше его не сохранял. */
+        if (e->ts_up && found_timestamp) {
+            uint8_t reordered[40];
+            size_t at = opt_len;
+            for (size_t off = 0; off + 1 < opt_len;) {
+                uint8_t kind = native_options[off];
+                if (kind == 0) { break; }
+                if (kind == 1) { off++; continue; }
+                if (kind == 8 && native_options[off + 1] == 10) { at = off; break; }
+                off += native_options[off + 1];
+            }
+            if (at + 10 <= opt_len) {
+                memcpy(reordered, native_options + at, 10);
+                memcpy(reordered + 10, native_options, at);
+                memcpy(reordered + 10 + at, native_options + at + 10,
+                       opt_len - at - 10);
+                memcpy(native_options, reordered, opt_len);
+            }
+        }
     }
     /* TTL по пути считается ОДИН раз на посылку: оба заголовка берут его. */
     uint8_t auto_hl = e->autottl ? auto_ttl(e, c->rev_ttl) : 0;

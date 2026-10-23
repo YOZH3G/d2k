@@ -454,6 +454,7 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 else if (strcmp(f[i], "tcpts") == 0) { v->flags |= 1u << 1; }
                 else if (strcmp(f[i], "ipidzero") == 0) { v->flags |= 1u << 2; }
                 else if (strcmp(f[i], "md5") == 0) { v->flags |= 1u << 3; }
+                else if (strcmp(f[i], "tsup") == 0) { v->flags |= 1u << 4; }
                 else if (strncmp(f[i], "autottl=", 8) == 0) {
                     /* Формат документации: delta,min-max. Дельта со знаком. */
                     int d = 0; unsigned lo = 0, hi = 0;

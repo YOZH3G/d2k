@@ -74,6 +74,56 @@ static void check_golden(void) {
 }
 
 int main(void) {
+    /* --- tcp_ts_up: МЕТКА ВРЕМЕНИ ПЕРВОЙ В ОПЦИЯХ ------------------------
+     * Документация zapret2, standard fooling: «поднять tcp timestamp опцию в
+     * самое начало, если она есть», и там же объяснение — «если есть tcp опция
+     * timestamp, linux стабильно отбрасывает пакеты с валидным seq и
+     * инвалидным ack ТОЛЬКО ЕСЛИ ОПЦИЯ ИДЁТ ПЕРВОЙ. nfqws1 не соблюдал
+     * порядок tcp опций, timestamp получался первым всегда. Поэтому
+     * оказалось, что старая версия работает стабильно, а новая нет».
+     *
+     * Профиль tcp-template-v1 копирует опции потока КАК ЕСТЬ, то есть условие
+     * срабатывания наших tcpts-планов зависит от того, где клиент поставил
+     * метку, и от нас это скрыто. Приём поднимает её в начало. */
+    {
+        /* Опции клиента: SACK-permitted, затем метка времени (не первая). */
+        static const uint8_t opts[] = {1, 1, 4, 2, 8, 10, 0x11, 0x22, 0x33, 0x44,
+                                       0, 0, 0, 0, 1, 1};
+        const uint8_t data[] = {7, 8, 9};
+        uint8_t out[128];
+        d2k_conn c = {.family = 4, .ttl = 64, .window = 1024};
+        memcpy(c.tcp_options, opts, sizeof opts);
+        c.tcp_options_len = sizeof opts;
+        d2k_emit e = {.bytes = data, .len = sizeof data, .seq = 9,
+                      .wire_profile = D2K_WIRE_TCP_TEMPLATE,
+                      .poison = D2K_POISON_TCPTS_BACK, .ts_up = 1};
+        size_t n = d2k_wire_build(&c, &e, out, sizeof out);
+        CHECK(n > 40, "tcp_ts_up: посылка не собралась");
+        if (n > 40) {
+            const uint8_t *o = out + 20 + 20;
+            CHECK(o[0] == 8 && o[1] == 10,
+                  "tcp_ts_up: метка времени не поднята в начало опций");
+            /* Значение по-прежнему сдвинуто назад: приём не отменяет порчу. */
+            uint32_t ts = (uint32_t)o[2] << 24 | (uint32_t)o[3] << 16 |
+                          (uint32_t)o[4] << 8 | o[5];
+            CHECK(ts == 0x11223344u - 1000u,
+                  "tcp_ts_up: сдвиг метки назад потерян");
+            /* Длина опций не изменилась — заголовок тот же размер. */
+            CHECK(((size_t)(out[20 + 12] >> 4) * 4 - 20) == sizeof opts,
+                  "tcp_ts_up: длина опций изменилась");
+            /* Остальные опции не потеряны: SACK-permitted на месте. */
+            int sack = 0;
+            for (size_t i = 0; i + 1 < sizeof opts; i++) {
+                if (o[i] == 4 && o[i + 1] == 2) { sack = 1; }
+            }
+            CHECK(sack, "tcp_ts_up: прочие опции клиента потеряны");
+        }
+        /* Без признака порядок опций клиента не меняется. */
+        e.ts_up = 0;
+        n = d2k_wire_build(&c, &e, out, sizeof out);
+        CHECK(n > 40 && out[40] == 1 && out[40 + 1] == 1,
+              "tcp_ts_up: без признака порядок опций всё равно изменён");
+    }
     /* --- ip_autottl: TTL ИЗ ИЗМЕРЕННОГО ПУТИ ------------------------------
      * Документация zapret2, standard fooling: «изменить TTL в ipv4 заголовке
      * на автоматически определяемый по шаблону autottl delta,min-max. При

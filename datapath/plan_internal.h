@@ -80,6 +80,8 @@ struct d2k_poison {
     int32_t  seq_shift;
     /* autottl: 1 — TTL считается на исполнении по TTL ответной стороны
        потока, delta/min/max из записи REC_AUTOTTL. */
+    /* tcp_ts_up: поднять опцию метки времени в начало (см. d2k_plan.h). */
+    uint8_t  ts_up;
     uint8_t  autottl;
     int8_t   autottl_delta;
     uint8_t  autottl_min;

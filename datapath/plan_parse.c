@@ -466,6 +466,7 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
             po->id = rd16(v);
             po->ttl = v[2];
             po->flags = v[3];
+            po->ts_up = (v[3] & D2K_POISON_TS_UP) ? 1 : 0;
             po->seq_shift = (int32_t)rd32(v + 4);
             break;
         }
