@@ -723,10 +723,11 @@ static void bind_decoy(d2k_poison *p, const d2k_opts *opt)
     if (!p->decoy_hello) {
         return;
     }
-    p->decoy = opt->control.payload;
-    p->decoy_len = opt->control.len;
+    const d2k_trigger *d = d2k_opts_decoy(opt);
+    p->decoy = d->payload;
+    p->decoy_len = d->len;
     if (p->seqovl_exact) {
-        p->seqovl = (int)opt->control.len;
+        p->seqovl = (int)d->len;
     }
 }
 
@@ -965,8 +966,10 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
             !raw_recheck(ip4, family, pnum, opt, res, &props0, d2k_trigger_offers_ts(tr))) {
             return 0;
         }
-        ncands = d2k_compose_from_props(&res->props, opt->control.payload,
-                                        opt->control.len, cands, 8);
+        {
+            const d2k_trigger *d = d2k_opts_decoy(opt);
+            ncands = d2k_compose_from_props(&res->props, d->payload, d->len, cands, 8);
+        }
         for (k = 0; k < ncands; k++) {
             d2k_obs *obs;
             int pass = 0, done = 0;

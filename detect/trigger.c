@@ -127,6 +127,14 @@ int d2k_trigger_control(const char *tag, d2k_trigger *out, char *err, size_t err
     return 0;
 }
 
+const d2k_trigger *d2k_opts_decoy(const d2k_opts *o)
+{
+    if (!o) {
+        return NULL;
+    }
+    return o->decoy.len >= 2 ? &o->decoy : &o->control;
+}
+
 /* --- клиентский профиль TCP (замысел 2026-10-23, п. 5.1) ------------------ */
 int d2k_trigger_offers_ts(const d2k_trigger *t)
 {

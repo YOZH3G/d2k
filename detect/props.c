@@ -318,8 +318,9 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
             p.decoy = opt->white.payload;
             p.decoy_len = opt->white.len;
         } else if (p.decoy_hello) {
-            p.decoy = opt->control.payload;
-            p.decoy_len = opt->control.len;
+            const d2k_trigger *d = d2k_opts_decoy(opt);
+            p.decoy = d->payload;
+            p.decoy_len = d->len;
         }
         /* Паузу и число копий кладём в наблюдение явно: без этого трасса
          * показывала «пауза=0мс» у зонда, который её честно выдерживает, и
