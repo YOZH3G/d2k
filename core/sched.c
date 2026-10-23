@@ -2167,6 +2167,32 @@ static int quic_named_find(const d2k_sched *s, const char *name, uint8_t family)
     return -1;
 }
 
+/* НЕСЁТ ЛИ ПОТОК КЛИЕНТА МЕТКУ ВРЕМЕНИ TCP (вид 8, длина 10).
+ *
+ * От этого зависит, исполним ли для него план с порчей «метка времени назад»:
+ * датапат копирует опции потока и сдвигает метку в них, а если метки нет —
+ * отказывается кодом FLOW_UNFIT (поле issue #7: ПК на Windows, 13 отказов из
+ * 13 при работающих телефонах). Набор не снят — считаем, что метка есть: так
+ * было всегда, и прежнее поведение сохраняется.
+ *
+ * Разбор побайтный, тот же, что у датапата и у зонда: NOP и EOL отдельно,
+ * кривая длина — «нет». */
+static int client_offers_ts(const task *t) {
+    if (!t->client_opts_known) { return 1; }
+    const uint8_t *o = t->client_opts;
+    size_t n = t->client_opts_len;
+    if (n > sizeof t->client_opts) { return 0; }
+    for (size_t off = 0; off < n;) {
+        uint8_t kind = o[off];
+        if (kind == 0) { break; }
+        if (kind == 1) { off++; continue; }
+        if (off + 2 > n || o[off + 1] < 2 || o[off + 1] > n - off) { return 0; }
+        if (kind == 8 && o[off + 1] == 10) { return 1; }
+        off += o[off + 1];
+    }
+    return 0;
+}
+
 /* Набор опций клиента — задаче вместе со снимком (замысел 2026-10-23, п. 5.1). */
 static void take_shape_opts(const d2k_sched *s, task *t) {
     int f = t->family == 6;
@@ -3983,7 +4009,8 @@ static int next_rx_volume_plan(d2k_sched *s, task *t, d2k_shape sh,
     if (t->net_probing) {
         while (t->net_probe_next < d2k_net_whitelist_count()) {
             const char *name = d2k_net_whitelist_name(t->net_probe_next++);
-            if (!name || d2k_rx_volume_plan_named(0, sh, s->send_cap, name, text, cap) != 0) {
+            if (!name || d2k_rx_volume_plan_client(0, sh, s->send_cap, name,
+                                                  client_offers_ts(t), text, cap) != 0) {
                 continue;
             }
             uint32_t h = fnv1a(text);
@@ -4004,7 +4031,8 @@ static int next_rx_volume_plan(d2k_sched *s, task *t, d2k_shape sh,
     const char *decoy = rx_decoy_name(s);
     while (t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS) {
         unsigned variant = t->rx_volume_next_variant++;
-        if (d2k_rx_volume_plan_named(variant, sh, s->send_cap, decoy, text, cap) != 0) { continue; }
+        if (d2k_rx_volume_plan_client(variant, sh, s->send_cap, decoy,
+                                      client_offers_ts(t), text, cap) != 0) { continue; }
         uint32_t h = fnv1a(text);
         int seen = 0;
         for (size_t i = 0; i < t->n_plans && !seen; i++) {
@@ -5249,6 +5277,16 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
             t->n_plans++;
         }
         t->rx_volume_candidate_pending = rx_ladder_pending(t);
+        /* КАКОЙ ПРОГРАММОЙ ПОШЛА ЛЕСТНИЦА — В ЖУРНАЛ (поле issue #7). У
+           клиента без метки времени восстановленная программа поля неисполнима
+           (датапат отказывает кодом FLOW_UNFIT), и лестница идёт с TTL по
+           измеренному пути. Разные программы — разные опыты, и в журнале их
+           обязано быть видно. */
+        if (t->n_plans > 0 && !client_offers_ts(t)) {
+            say(s, "по %s поток клиента не несёт метку времени — лестница идёт "
+                   "с TTL по измеренному пути вместо метки (план с меткой "
+                   "датапат этому клиенту не исполнит)", t->name);
+        }
         if (t->net_probing) {
             say(s, "по %s белое имя сети не известно — подбираю его из %zu имён "
                    "списка приманкой под измеренный %s около %d КБ",

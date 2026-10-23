@@ -55,29 +55,41 @@ int d2k_white_decoy_hello(const char *name, uint8_t *out, size_t cap, size_t *le
  * считать нельзя — сервер соберёт поток из неё, и измеренного воздействия на
  * проводе не будет. */
 static int template_plan(const uint8_t *hello, size_t hello_len, unsigned split,
-                         int tcpts, int badsum, size_t send_cap, char *buf, size_t cap) {
+                         int tcpts, int badsum, int autottl,
+                         size_t send_cap, char *buf, size_t cap) {
     size_t pos = 0;
     if (!hello || !hello_len || !split) return -1;
-    if (!tcpts && !badsum) return -1;
+    if (!tcpts && !badsum && !autottl) return -1;
     if (send_cap > 0 && (hello_len > send_cap || send_cap - hello_len < 132)) return -1;
     unsigned seg = d2k_arm_segment(send_cap);
     if (!seg) return -1;
+    /* minexec: autottl исполняет только датапат версии 13 и выше. */
     if (append_fmt(buf, cap, &pos,
-            "d2k-plan 1 8\nid 00000000000000000000000000000000\n"
+            "d2k-plan 1 %u\nid 00000000000000000000000000000000\n"
             "proto tcp tls\nwire tcp-template-v1\ninput tls-sni\nsegment %u\n",
-            seg) ||
+            autottl ? 13u : 8u, seg) ||
         append_fmt(buf, cap, &pos, "payload 1 ") ||
         append_hex(buf, cap, &pos, hello, hello_len) ||
+        append_fmt(buf, cap, &pos, "\npoison 1%s%s",
+            badsum ? " badsum" : "", tcpts ? " tcpts" : "") ||
+        (autottl && append_fmt(buf, cap, &pos, " autottl=%d,%u-%u",
+                               D2K_RX_AUTOTTL_DELTA, D2K_RX_AUTOTTL_MIN,
+                               D2K_RX_AUTOTTL_MAX)) ||
         append_fmt(buf, cap, &pos,
-            "\npoison 1%s%s\n"
-            "fake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n"
-            "split payload_start +%u\norder forward\n",
-            badsum ? " badsum" : "", tcpts ? " tcpts" : "", split)) return -1;
+            "\nfake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n"
+            "split payload_start +%u\norder forward\n", split)) return -1;
     return 0;
 }
 
 int d2k_rx_volume_plan_named(unsigned variant, d2k_shape shape, size_t send_cap,
                              const char *name, char *buf, size_t cap) {
+    /* Прежняя подпись — прежняя программа с меткой времени. */
+    return d2k_rx_volume_plan_client(variant, shape, send_cap, name, 1, buf, cap);
+}
+
+int d2k_rx_volume_plan_client(unsigned variant, d2k_shape shape, size_t send_cap,
+                              const char *name, int client_has_ts,
+                              char *buf, size_t cap) {
     static const unsigned split_at[D2K_RX_VOLUME_PLAN_VARIANTS] = {2, 1, 3, 4, 5};
     uint8_t hello[D2K_ARM_DECOY_MAX];
     size_t hello_len = 0;
@@ -85,8 +97,16 @@ int d2k_rx_volume_plan_named(unsigned variant, d2k_shape shape, size_t send_cap,
         shape != D2K_SHAPE_MODERN ||
         d2k_white_decoy_hello(name, hello, sizeof hello, &hello_len)) return -1;
     /* Запасная лестница — ВОССТАНОВЛЕННАЯ ПРОГРАММА ПОЛЯ (plan-680fbe00): её
-       порча измерена не здесь и не этим клиентом, она часть самой программы. */
-    return template_plan(hello, hello_len, split_at[variant], 1, 0, send_cap, buf, cap);
+       порча измерена не здесь и не этим клиентом, она часть самой программы.
+       Но программа держится на метке времени, а метку даёт КЛИЕНТ: у клиента
+       без неё (Windows по умолчанию) датапат такой план исполнить не может —
+       поле issue #7, 13 отказов из 13 при работающих телефонах. Для такого
+       клиента та же программа идёт с TTL по измеренному пути: ему от
+       клиентской ОС не нужно ничего (ip_autottl документации zapret2).
+       Множители программы — приманка, серия ×8, разрез — не меняются. */
+    return client_has_ts
+        ? template_plan(hello, hello_len, split_at[variant], 1, 0, 0, send_cap, buf, cap)
+        : template_plan(hello, hello_len, split_at[variant], 0, 0, 1, send_cap, buf, cap);
 }
 
 /* Имя приманки по умолчанию, пока белое имя сети не подобрано (поле
@@ -164,7 +184,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         !a->seqovl_hello && !a->ipidzero && !a->oob) {
         if (!in->sni_off || in->sni_len <= 1) return -1;
         return template_plan(in->decoy, in->decoy_len, 2, a->tcpts, a->badsum,
-                             send_cap, buf, cap);
+                             a->autottl, send_cap, buf, cap);
     }
     if (a->disorder_pos) {
         if (!a->disorder || a->disorder_pos >= in->trigger_len || a->seqovl ||

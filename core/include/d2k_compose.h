@@ -162,6 +162,19 @@ int d2k_rx_volume_plan(unsigned variant, d2k_shape shape, size_t send_cap,
  * имя — отказ: план без приманки смысла не имеет. */
 int d2k_rx_volume_plan_named(unsigned variant, d2k_shape shape, size_t send_cap,
                              const char *name, char *buf, size_t cap);
+/* ТА ЖЕ ЛЕСТНИЦА, НО ПОД КЛИЕНТА (поле issue #7, 23.10.2026). client_has_ts —
+ * несёт ли поток клиента метку времени TCP. Несёт: прежняя восстановленная
+ * программа поля с tcpts, байт в байт. Не несёт: та же программа с TTL по
+ * измеренному пути (ip_autottl документации zapret2) — ему от клиентской ОС
+ * не нужно ничего, а план с меткой датапат такому клиенту исполнить не может.
+ * Множители программы (приманка, серия ×8, разрез) не меняются. */
+int d2k_rx_volume_plan_client(unsigned variant, d2k_shape shape, size_t send_cap,
+                              const char *name, int client_has_ts,
+                              char *buf, size_t cap);
+/* Шаблон autottl запасной лестницы: +1 хоп за коробкой, зажим 2..12. */
+#define D2K_RX_AUTOTTL_DELTA 1
+#define D2K_RX_AUTOTTL_MIN   2u
+#define D2K_RX_AUTOTTL_MAX   12u
 /* Полный TLS-record ClientHello с name в SNI (приманка). 0 — собрано в out,
  * *len — длина; -1 — имя пустое или не поместилось. */
 int d2k_white_decoy_hello(const char *name, uint8_t *out, size_t cap, size_t *len);

@@ -711,6 +711,47 @@ static void template_poison_from_arm(void) {
     CHECK(strstr(text, "badsum") == NULL);
 }
 
+/* ЗАПАСНАЯ ЛЕСТНИЦА ПОД КЛИЕНТА (поле issue #7, 23.10.2026). Программа поля
+ * держится на метке времени, а метку даёт КЛИЕНТ: у ПК на Windows её нет, и
+ * датапат такой план исполнить не может — 13 отказов из 13 при работающих
+ * телефонах. Для такого клиента та же программа идёт с TTL по измеренному
+ * пути. Клиент с меткой получает прежний план БАЙТ В БАЙТ. */
+static void rx_ladder_follows_client(void) {
+    char with_ts[4096], no_ts[4096], legacy[4096];
+    case_name = "RX ladder follows the client's TCP options";
+    CHECK(d2k_rx_volume_plan_client(0, D2K_SHAPE_MODERN, 1492, "hcaptcha.com", 1,
+                                    with_ts, sizeof with_ts) == 0);
+    CHECK(d2k_rx_volume_plan_named(0, D2K_SHAPE_MODERN, 1492, "hcaptcha.com",
+                                   legacy, sizeof legacy) == 0);
+    /* Прежняя подпись и клиент с меткой — одно и то же, байт в байт. */
+    CHECK(!strcmp(with_ts, legacy));
+    CHECK(strstr(with_ts, "poison 1 tcpts\n") != NULL);
+    CHECK(strstr(with_ts, "autottl") == NULL);
+    CHECK(strstr(with_ts, "d2k-plan 1 8\n") != NULL);
+
+    CHECK(d2k_rx_volume_plan_client(0, D2K_SHAPE_MODERN, 1492, "hcaptcha.com", 0,
+                                    no_ts, sizeof no_ts) == 0);
+    /* Клиент без метки: метки в плане нет, есть TTL по пути, minexec поднят. */
+    CHECK(strstr(no_ts, "tcpts") == NULL);
+    CHECK(strstr(no_ts, "poison 1 autottl=1,2-12\n") != NULL);
+    CHECK(strstr(no_ts, "d2k-plan 1 13\n") != NULL);
+    /* Множители программы те же: приманка, серия ×8, разрез. */
+    CHECK(strstr(no_ts, "fake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n") != NULL);
+    CHECK(strstr(no_ts, "split payload_start +2\norder forward\n") != NULL);
+    CHECK(strstr(no_ts, "wire tcp-template-v1\n") != NULL);
+    /* И такой план ДОЕЗЖАЕТ до исполнителя: это и есть закрытие issue #7. */
+    uint8_t tlv[D2K_PLAN_TLV_MAX];
+    size_t tn = 0;
+    char err[200];
+    d2k_plan *pl = NULL;
+    CHECK(d2k_plan_text_to_tlv(no_ts, tlv, sizeof tlv, &tn, err, sizeof err) == 0);
+    CHECK(d2k_plan_load(tlv, tn, &pl, err, sizeof err) == 0 && pl);
+    /* Главное: плану НЕ нужна метка времени от потока, значит датапат его не
+       отвергнет кодом FLOW_UNFIT, как отвергал прежний. */
+    CHECK(pl && (d2k_plan_flow_needs(pl) & D2K_FLOW_NEED_TCPTS) == 0);
+    d2k_plan_free(pl);
+}
+
 static void rx_volume_named(void) {
     case_name = "rx-volume named decoy";
     char def[4096], hc[4096], other[4096], empty[4096];
@@ -728,6 +769,7 @@ static void rx_volume_named(void) {
 
 int main(void) {
     template_poison_from_arm();
+    rx_ladder_follows_client();
     whitelist_names();
     rx_volume_named();
     md5_plan_contract();

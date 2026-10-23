@@ -10478,6 +10478,47 @@ rx_volume_tests:
         d2k_sched_free(s); d2k_catalog_free(&cT);
     }
     {
+        /* --- ЗАПАСНАЯ ЛЕСТНИЦА ИДЁТ ПОД КЛИЕНТА (поле issue #7, 23.10.2026).
+           Программа лестницы держится на метке времени, а метку даёт КЛИЕНТ:
+           у ПК на Windows её нет, и датапат такой план отвергает кодом
+           FLOW_UNFIT (13 отказов из 13 при работающих телефонах). Клиент без
+           метки обязан получить ту же программу с TTL по измеренному пути. */
+        d2k_catalog cC = {0};
+        snprintf(cC.net.name, sizeof cC.net.name, "learned-white.example");
+        cC.net.searched = 1; cC.net.confirmed_at = 1791593321;
+        d2k_sched *s = d2k_sched_new(&cC, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent();
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 1;
+        d2k_ev h = ev_hello(6, 40099, "no-ts.client.test"), sh;
+        d2k_sched_event(s, &h);
+        /* Набор опций клиента БЕЗ метки времени — как у ПК репортёра. */
+        d2k_ev ct = h; ct.kind = D2K_EV_CLIENT_TCP; ct.name[0] = 0;
+        ct.tcp_options_len = 0;
+        d2k_sched_event(s, &ct);
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0, "no-ts shape fixture");
+        /* Ключ снимка — тот же, что у набора опций: датапат шлёт их парой по
+           одному потоку, и связывает их именно ключ (on_shape). */
+        sh.family = h.family;
+        memcpy(sh.low_ip, h.low_ip, 16); memcpy(sh.high_ip, h.high_ip, 16);
+        sh.low_port = h.low_port; sh.high_port = h.high_port;
+        sh.transport = 6;
+        d2k_sched_event(s, &sh);
+        prime_late_rst(s, h.name, 40199);
+        d2k_ev su = ev_suspect(6, 40099); su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_sched_event(s, &su);
+        settle(s);
+        /* Журнал обязан называть программу: разные программы — разные опыты. */
+        CHECK(said("лестница идёт с TTL по измеренному пути"),
+              "клиент без метки: лестница не перешла на TTL по пути");
+        /* Содержимое самого плана (запись autottl, отсутствие метки и то, что
+           датапат его не отвергнет) проверено точно в core/test_measured
+           (rx_ladder_follows_client); здесь проверяется ВЫБОР программы. */
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        vol_rx_cut = 0;
+        d2k_sched_free(s); d2k_catalog_free(&cC);
+    }
+    {
         /* net.name известно → лестница берёт его, подбора нет. */
         d2k_catalog cL = {0};
         snprintf(cL.net.name, sizeof cL.net.name, "learned-white.example");
