@@ -712,7 +712,7 @@ int d2k_props_question_plan(int q, d2k_hello control, size_t truth_len,
     /* Тело фальшивки собирается на стеке: 2× приветствия браузера — три
        килобайта, и держать их статически ради трёх вопросов незачем. */
     static uint8_t fake[2 * D2K_COMPOSE_HELLO_MAX];
-    d2k_hello nodecoy; nodecoy.bytes = NULL; nodecoy.len = 0;
+    d2k_hello nodecoy = {0}; nodecoy.bytes = NULL; nodecoy.len = 0;
     size_t flen = 0;
     /* ПОРЯДОК — ДОНОРСКИЙ (propProbes, z2k-detect/internal/classify/
        compose.go:33-91): перекрытие, порядок сегментов, контрольная сумма,

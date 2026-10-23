@@ -138,7 +138,7 @@ static size_t build_hello(uint8_t *o, const char *sni);
 static d2k_vres measure_base(int pass, int fail, const char *err)
 {
     uint8_t hello[300], ctl[] = {0x16, 0x03, 0x01};
-    d2k_hello tr = {hello, build_hello(hello, "base.example")}, control = {ctl, sizeof ctl};
+    d2k_hello tr = {hello, build_hello(hello, "base.example"), NULL, 0, 0}, control = {ctl, sizeof ctl, NULL, 0, 0};
     memset(&answer, 0, sizeof answer);
     answer.verdict = D2K_DV_PREFIX; /* дальше дерево не идёт — вердикт не берётся */
     answer.repeats = 2;
@@ -156,7 +156,7 @@ static d2k_vres measure(void)
 {
     uint8_t hello[] = {0x16, 0x03};
     uint8_t ctl[] = {0x16, 0x03, 0x01};
-    d2k_hello tr = {hello, sizeof hello}, control = {ctl, sizeof ctl};
+    d2k_hello tr = {hello, sizeof hello, NULL, 0, 0}, control = {ctl, sizeof ctl, NULL, 0, 0};
     return d2k_detect_sched_tcp("192.0.2.1", 443, tr, control,
                                 0x2d, 2, 12000, 321, NULL);
 }
@@ -196,7 +196,7 @@ int main(void)
         /* The response-direction probe takes its SNI from tr.name; it must be
          * the client's name, never the address being measured. */
         uint8_t h[300], c[] = {0x16, 0x03, 0x01};
-        d2k_hello tr, ctl = {c, sizeof c};
+        d2k_hello tr, ctl = {c, sizeof c, NULL, 0, 0};
         tr.bytes = h;
         tr.len = build_hello(h, "blocked.example");
         answer.verdict = D2K_DV_INCONCLUSIVE; answer.has_hit = 0;
@@ -393,7 +393,7 @@ int main(void)
     {
         /* Полный прогон с ответом базы: подсказка доходит до измерителя. */
         uint8_t hello[] = {0x16, 0x03};
-        d2k_hello tr = {hello, sizeof hello}, none = {0};
+        d2k_hello tr = {hello, sizeof hello, NULL, 0, 0}, none = {0};
         d2k_base_seed seed;
         memset(&seed, 0, sizeof seed);
         seed.valid = 1; seed.repeats = 2; seed.pass = 0; seed.fail = 2;
@@ -470,7 +470,7 @@ int main(void)
         static const char *const only_unexpr[] = {"syndata", NULL};
         static const char *const box_oob[] = {"oob", NULL};
         uint8_t h[300], c[] = {0x16, 0x03, 0x01};
-        d2k_hello tr = {h, 0}, ctl = {c, sizeof c};
+        d2k_hello tr = {h, 0, NULL, 0, 0}, ctl = {c, sizeof c, NULL, 0, 0};
         tr.len = build_hello(h, "rutracker.org");
         memset(&answer, 0, sizeof answer);
         sweep_pass = box_takes;

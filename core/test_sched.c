@@ -152,6 +152,8 @@ static int tcp_release_waiters;
 static int tcp_saw_stop;
 static int tcp_stop_count;
 static uint8_t tcp_last_trig[2048];
+static int tcp_last_opts_known;       /* чем здоровался зонд: набор клиента снят? */
+static size_t tcp_last_opts_len;
 
 static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
                          d2k_hello control, uint32_t mark, int repeats,
@@ -161,6 +163,8 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
     (void)repeats; (void)gap_us; (void)wait_ms;
     tcp_calls++;
     tcp_last_wire = trigger.len;
+    tcp_last_opts_known = trigger.tcp_known;
+    tcp_last_opts_len = trigger.tcp_options_len;
     if (trigger.bytes && trigger.len <= sizeof tcp_last_trig)
         memcpy(tcp_last_trig, trigger.bytes, trigger.len);
     if (tcp_wait_until_stop) {
@@ -2074,8 +2078,9 @@ int main(int argc, char **argv) {
     int own_first_only = argc == 2 && strcmp(argv[1], "--own-first-only") == 0;
     int measured_only = argc == 2 && strcmp(argv[1], "--measured-only") == 0;
     int unfit_only = argc == 2 && strcmp(argv[1], "--unfit-only") == 0;
+    int client_tcp_only = argc == 2 && strcmp(argv[1], "--client-tcp-only") == 0;
     int ech_only = argc == 2 && strcmp(argv[1], "--ech-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !measured_only && !unfit_only && !ech_only) {
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !measured_only && !unfit_only && !client_tcp_only && !ech_only) {
         fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only|--measured-only|--ech-only]\n");
         return 2;
     }
@@ -2554,6 +2559,7 @@ int main(int argc, char **argv) {
     if (own_first_only) { goto own_first_test; }
     if (measured_only) { goto measured_test; }
     if (unfit_only) { goto unfit_test; }
+    if (client_tcp_only) { goto client_tcp_test; }
     if (shape_only) { goto shape_test; }
     {
         d2k_catalog empty = {0};
@@ -13645,6 +13651,61 @@ measured_test:
             vol_rx_cut = 0; tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
         }
         if (measured_only) { goto voice_only_done; }
+    }
+
+client_tcp_test:
+    /* --- ЗАМЫСЕЛ 2026-10-23, п. 5.1: ЗОНД ЗДОРОВАЕТСЯ НАБОРОМ ОПЦИЙ КЛИЕНТА.
+       Датапат отдаёт набор опций TCP событием CLIENT_TCP ровно перед SHAPE
+       того же потока. Замер снимком идёт с этим набором (зонд предлагает
+       метку времени только если её несёт клиент), и привязка помечается
+       CLIENT. Снимок без набора (старый датапат, холодный старт) — зонд
+       прежним набором, привязка PROFILE, не CLIENT. */
+    for (int with_opts = 1; with_opts >= 0; with_opts--) {
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        tcp_calls = 0; tcp_last_opts_known = -1; tcp_last_opts_len = 99;
+        uint16_t port = (uint16_t)(40430 + with_opts);
+        ver_answer_port = port;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; drain(); forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        const char *nm = with_opts ? "opts.client.example" : "noopts.client.example";
+        d2k_ev h = ev_hello(6, port, nm); d2k_sched_event(s, &h);
+        if (with_opts) {
+            d2k_ev ct = h; ct.kind = D2K_EV_CLIENT_TCP; ct.name[0] = 0;
+            memcpy(ct.tcp_options, (uint8_t[]){1, 1, 8, 10, 0, 0, 0x23, 0x28, 0, 0, 0, 0}, 12);
+            ct.tcp_options_len = 12;
+            d2k_sched_event(s, &ct);
+        }
+        d2k_ev sh = h; sh.kind = D2K_EV_SHAPE; sh.name[0] = 0;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, nm, sh.shape, sizeof sh.shape,
+                                     &sh.shape_len) == 0, "client-tcp: снимок");
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
+        for (int i = 0; i < 40 && !said("ПОДТВЕРЖДЕНО"); i++) {
+            spin(s, 200);
+            d2k_ev ap = ev_applied(6, port); d2k_sched_event(s, &ap);
+        }
+        spin(s, 40);
+        CHECK(tcp_calls >= 1, "client-tcp: замер не шёл");
+        const d2k_cat_binding *bd = binding_of(&c, nm, 6);
+        if (with_opts) {
+            CHECK(tcp_last_opts_known == 1 && tcp_last_opts_len == 12,
+                  "client-tcp: зонд пошёл не набором клиента");
+        } else {
+            CHECK(tcp_last_opts_known == 0,
+                  "client-tcp: без снятого набора зонд объявил набор известным");
+        }
+        /* Полнота входа — о БАЙТАХ приветствия: снимок клиента остаётся CLIENT
+           независимо от того, доехал ли набор опций (решение ниже в журнале
+           работ). Набор не снят бывает только у старой пары провода, которую
+           сверка версии (v21) и так не допускает. */
+        CHECK(bd && bd->input == D2K_INPUT_CLIENT,
+              "client-tcp: привязка по снимку клиента не CLIENT");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
+        if (client_tcp_only && !with_opts) { goto voice_only_done; }
     }
 
 unfit_test:

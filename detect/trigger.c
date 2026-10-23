@@ -126,3 +126,33 @@ int d2k_trigger_control(const char *tag, d2k_trigger *out, char *err, size_t err
     out->accept = D2K_ACCEPT_TLSRECORD;
     return 0;
 }
+
+/* --- клиентский профиль TCP (замысел 2026-10-23, п. 5.1) ------------------ */
+int d2k_trigger_offers_ts(const d2k_trigger *t)
+{
+    if (!t || !t->client_tcp_known) {
+        return 1;
+    }
+    const uint8_t *o = t->client_tcp_options;
+    size_t n = t->client_tcp_options_len;
+    if (n > sizeof t->client_tcp_options) {
+        return 0;
+    }
+    for (size_t off = 0; off < n;) {
+        uint8_t kind = o[off];
+        if (kind == 0) { break; }
+        if (kind == 1) { off++; continue; }
+        if (off + 2 > n || o[off + 1] < 2 || o[off + 1] > n - off) { return 0; }
+        if (kind == 8 && o[off + 1] == 10) { return 1; }
+        off += o[off + 1];
+    }
+    return 0;
+}
+
+int d2k_trigger_allows_poison(const d2k_trigger *t, const d2k_poison *p)
+{
+    if (!p) {
+        return 0;
+    }
+    return !p->tcp_ts || d2k_trigger_offers_ts(t);
+}

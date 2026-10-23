@@ -702,6 +702,16 @@ typedef struct {
        по заготовке — то есть выдавалась бы за измерение то, что им не
        является (§2.4). Ноль означает «форма клиента не измерена». */
     int        trig_snapped;
+    /* Набор опций TCP клиента снимка в trig (замысел 2026-10-23, п. 5.1):
+       едет зонду вместе с байтами; known == 0 — снимок без набора, зонд
+       здоровался прежним набором, и привязка помечается PROFILE. snap_* —
+       то же для снимка, ждущего перезапуска в snap. */
+    uint8_t    client_opts[40];
+    size_t     client_opts_len;
+    int        client_opts_known;
+    uint8_t    snap_opts[40];
+    size_t     snap_opts_len;
+    int        snap_opts_known;
     /* ПРОГОН ОСТАНОВЛЕН РАДИ СНИМКА КЛИЕНТА (задача 31). Взводит on_shape,
        когда приветствие клиента приходит во время профильного замера; байты
        снимка лежат здесь, у задачи, а не только в общей ячейке tcp_shape:
@@ -1277,7 +1287,8 @@ struct d2k_sched {
     /* Ячейка — размером со вход задачи: датапат снимает TCP-приветствие до
        4096 байт, и с провода v20 длинное ECH-приветствие доходит целиком. */
     struct { char name[256]; uint8_t bytes[SCHED_TRIG_MAX]; size_t len;
-             uint8_t family; int64_t observed_ms; } ech_inputs[8];
+             uint8_t family; int64_t observed_ms;
+             uint8_t opts[40]; size_t opts_len; int opts_known; } ech_inputs[8];
     size_t ech_input_next;
     /* ПАЧКИ QUIC ПО ИМЕНИ (поле 15.10.2026). Общая ячейка quic_shape держит
        только последнюю пачку любого имени, и к поиску цели в ней почти
@@ -1396,6 +1407,18 @@ struct d2k_sched {
     size_t       tcp_shape_len[2];
     char         tcp_shape_name[2][256];
     d2k_flowkey   tcp_shape_flow[2];
+    /* НАБОР ОПЦИЙ TCP КЛИЕНТА рядом со снимком (замысел 2026-10-23, п. 5.1).
+       Датапат шлёт его событием CLIENT_TCP ровно перед SHAPE того же потока:
+       wait — набор пришёл и ждёт свой снимок; known — снимок связан с набором
+       (ноль: снимок без набора — старый датапат, зонд пойдёт прежним набором,
+       привязка PROFILE). Нулевая длина при known — клиент без опций. */
+    uint8_t      tcp_shape_opts[2][40];
+    size_t       tcp_shape_opts_len[2];
+    int          tcp_shape_opts_known[2];
+    uint8_t      tcp_opts_wait_bytes[2][40];
+    size_t       tcp_opts_wait_len[2];
+    int          tcp_opts_wait[2];
+    d2k_flowkey  tcp_opts_wait_flow[2];
 
     /* Для вида панели: сколько подтверждено и сколько зондов потрачено за
        жизнь процесса, и отметка стенных часов, от которой считается «с
@@ -2133,6 +2156,18 @@ static int quic_named_find(const d2k_sched *s, const char *name, uint8_t family)
     return -1;
 }
 
+/* Набор опций клиента — задаче вместе со снимком (замысел 2026-10-23, п. 5.1). */
+static void take_shape_opts(const d2k_sched *s, task *t) {
+    int f = t->family == 6;
+    t->client_opts_known = s->tcp_shape_opts_known[f];
+    t->client_opts_len = t->client_opts_known ? s->tcp_shape_opts_len[f] : 0;
+    if (t->client_opts_len) { memcpy(t->client_opts, s->tcp_shape_opts[f], t->client_opts_len); }
+}
+static void drop_client_opts(task *t) {
+    t->client_opts_known = 0;
+    t->client_opts_len = 0;
+}
+
 static int fill_hellos(d2k_sched *s, task *t) {
     if (t->transport == 17) {
         /* Донор quicprobe.buildInitial начинает замер собственным QUIC
@@ -2233,7 +2268,11 @@ static int fill_hellos(d2k_sched *s, task *t) {
                 !strcmp(s->ech_inputs[k].name, t->name) &&
                 hello_fits_client(t, s->ech_inputs[k].bytes, s->ech_inputs[k].len)) {
                 memcpy(t->trig, s->ech_inputs[k].bytes, s->ech_inputs[k].len);
-                t->trig_len = s->ech_inputs[k].len; t->trig_snapped = 1; break;
+                t->trig_len = s->ech_inputs[k].len; t->trig_snapped = 1;
+                t->client_opts_known = s->ech_inputs[k].opts_known;
+                t->client_opts_len = t->client_opts_known ? s->ech_inputs[k].opts_len : 0;
+                if (t->client_opts_len) memcpy(t->client_opts, s->ech_inputs[k].opts, t->client_opts_len);
+                break;
             }
         }
     }
@@ -2246,8 +2285,10 @@ static int fill_hellos(d2k_sched *s, task *t) {
         memcpy(t->trig, s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]);
         t->trig_len = s->tcp_shape_len[t->family == 6];
         t->trig_snapped = 1;
+        take_shape_opts(s, t);
     }
     if (t->trig_len == 0) {
+        drop_client_opts(t);
         /* Холодный старт: снимка ещё нет. Профиль — это заведомо НЕ те байты,
            что шлёт настоящий клиент (§4), и вердикт на нём слабее; но
            альтернатива — не измерять вовсе, пока цель не откроют второй раз.
@@ -2285,6 +2326,7 @@ typedef struct {
     d2k_sched *s; task *t; int use_fd;
     uint8_t trig[SCHED_TRIG_MAX], ctrl[2048];
     size_t trig_len, ctrl_len;
+    uint8_t client_opts[40]; size_t client_opts_len; int client_opts_known;
     int split_unfit; /* решено главным потоком (quic_split_unfit) */
     unsigned budget; /* бюджет потока испытания (JOB_VERIFY), 0 — без проверки */
 } worker_arg;
@@ -2500,8 +2542,11 @@ static void *worker_run(void *vp) {
     uint8_t trigger_bytes[sizeof a->trig], control_bytes[sizeof a->ctrl];
     memcpy(trigger_bytes, a->trig, a->trig_len);
     memcpy(control_bytes, a->ctrl, a->ctrl_len);
-    d2k_hello trig = {trigger_bytes, a->trig_len};
-    d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len};
+    uint8_t opts_bytes[sizeof a->client_opts];
+    memcpy(opts_bytes, a->client_opts, a->client_opts_len);
+    d2k_hello trig = {trigger_bytes, a->trig_len, opts_bytes, a->client_opts_len,
+                      a->client_opts_known};
+    d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len, NULL, 0, 0};
     free(a);
     /* Ход сообщает только прогон измерителя (JOB_CLASSIFY); поток живёт ровно
        одну задачу, поэтому снимать приёмник не нужно. */
@@ -3068,6 +3113,9 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
                 ? task_budget(s, t) : 0;
     memcpy(a->trig, t->trig, t->trig_len);
     memcpy(a->ctrl, t->ctrl, t->ctrl_len);
+    a->client_opts_known = t->client_opts_known;
+    a->client_opts_len = t->client_opts_known ? t->client_opts_len : 0;
+    memcpy(a->client_opts, t->client_opts, a->client_opts_len);
     /* Сокет вопроса забирается ЗДЕСЬ, в главном потоке, и поле задачи
        очищается сразу: два владельца одного дескриптора — двойное закрытие. */
     a->use_fd = job == JOB_CONTACT ? t->prop_bound_fd : job == JOB_VERIFY ? t->probe_fd : -1;
@@ -3537,7 +3585,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
        опросника из командной строки. */
     static uint8_t planbuf[2 * 1800 + 256];
     static char hex[2 * sizeof planbuf + 1];
-    d2k_hello ctl; ctl.bytes = t->ctrl_len ? t->ctrl : NULL; ctl.len = t->ctrl_len;
+    d2k_hello ctl = {0}; ctl.bytes = t->ctrl_len ? t->ctrl : NULL; ctl.len = t->ctrl_len;
 
     /* План ПРЕЖНЕГО вопроса снимается до следующего (задача 20): иначе на
        датапате копились пробные записи по уже свободным портам вопросов. */
@@ -7831,6 +7879,10 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     /* Байты могут лежать в самой задаче (t->snap): memmove, и копия
        гасится — перемер у задачи один. */
     memmove(t->trig, bytes, len);
+    /* Набор опций — вместе с байтами: у TCP это набор последнего снимка
+       семейства (SHAPE и его CLIENT_TCP уже связаны в on_shape), у QUIC
+       набора нет. */
+    if (t->transport == 6) { take_shape_opts(s, t); } else { drop_client_opts(t); }
     t->snap_len = 0;
     t->snap_stop = 0;
     t->trig_len = len;
@@ -7931,6 +7983,22 @@ static void quic_note_multi(d2k_sched *s, const char *name, uint8_t family) {
 }
 
 static void on_shape(d2k_sched *s, const d2k_ev *ev) {
+    if (ev->transport == 6) {
+        /* Набор опций клиента (CLIENT_TCP) ждал ЭТОТ снимок — связываем по
+           ключу потока; снимок без набора — known = 0 (замысел 2026-10-23,
+           п. 5.1). Решается до любого разбора: от этого зависит, чем
+           здоровается зонд и как помечается привязка. */
+        int f = ev->family == 6;
+        if (s->tcp_opts_wait[f] && ev_matches_flow(ev, &s->tcp_opts_wait_flow[f])) {
+            s->tcp_shape_opts_known[f] = 1;
+            s->tcp_shape_opts_len[f] = s->tcp_opts_wait_len[f];
+            memcpy(s->tcp_shape_opts[f], s->tcp_opts_wait_bytes[f], s->tcp_opts_wait_len[f]);
+        } else {
+            s->tcp_shape_opts_known[f] = 0;
+            s->tcp_shape_opts_len[f] = 0;
+        }
+        s->tcp_opts_wait[f] = 0;
+    }
     if (ev->shape_len == 0 || ev->shape_len > sizeof s->tasks[0].trig) { return; }
     if (ev->transport == 6 && !d2k_hello_complete(ev->shape, ev->shape_len)) {
         say(s, "снимок TCP (%zu байт) не содержит целого ClientHello — "
@@ -8034,6 +8102,10 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         s->ech_inputs[slot].len = ev->shape_len;
         s->ech_inputs[slot].family = family;
         s->ech_inputs[slot].observed_ms = s->now_ms;
+        s->ech_inputs[slot].opts_known = s->tcp_shape_opts_known[family == 6];
+        s->ech_inputs[slot].opts_len = s->ech_inputs[slot].opts_known ? s->tcp_shape_opts_len[family == 6] : 0;
+        if (s->ech_inputs[slot].opts_len)
+            memcpy(s->ech_inputs[slot].opts, s->tcp_shape_opts[family == 6], s->ech_inputs[slot].opts_len);
     }
     /* СНИМОК QUIC СОХРАНЯЕТСЯ ОБЩИМ, а не только задаче своего имени.
        Собственный Initial позволяет начать без него, но не является
@@ -8099,6 +8171,9 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
                    announced once per run. */
                 memcpy(t->snap, ev->shape, ev->shape_len);
                 t->snap_len = ev->shape_len;
+                t->snap_opts_known = s->tcp_shape_opts_known[ev->family == 6];
+                t->snap_opts_len = t->snap_opts_known ? s->tcp_shape_opts_len[ev->family == 6] : 0;
+                if (t->snap_opts_len) memcpy(t->snap_opts, s->tcp_shape_opts[ev->family == 6], t->snap_opts_len);
                 t->stop = 1;
                 if (!t->snap_stop) {
                     t->snap_stop = 1;
@@ -9524,6 +9599,19 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
     case D2K_EV_SHAPE:
         on_shape(s, ev);
         return 0;
+    case D2K_EV_CLIENT_TCP: {
+        /* Набор опций TCP клиента — ждёт свой SHAPE (тот же поток), см. on_shape. */
+        int f = ev->family == 6;
+        if (ev->tcp_options_len > sizeof s->tcp_opts_wait_bytes[f]) { return 0; }
+        memcpy(s->tcp_opts_wait_bytes[f], ev->tcp_options, ev->tcp_options_len);
+        s->tcp_opts_wait_len[f] = ev->tcp_options_len;
+        d2k_flowkey *flow = &s->tcp_opts_wait_flow[f];
+        memcpy(flow->a_ip, ev->low_ip, 16); memcpy(flow->b_ip, ev->high_ip, 16);
+        flow->a_port = ev->low_port; flow->b_port = ev->high_port;
+        flow->transport = 6; flow->family = ev->family ? ev->family : 4;
+        s->tcp_opts_wait[f] = 1;
+        return 0;
+    }
     case D2K_EV_APPLIED:
         on_applied(s, ev);
         return 0;
@@ -9590,6 +9678,7 @@ static void own_first_continue(d2k_sched *s, task *t) {
         memcpy(t->trig, s->tcp_shape[f], s->tcp_shape_len[f]);
         t->trig_len = s->tcp_shape_len[f];
         t->trig_snapped = 1;
+        take_shape_opts(s, t);
         t->reasked = 1;
         t->ctrl_len = 0;
         say(s, "по %s снимок клиента пришёл во время проверки своих планов — "
@@ -10277,6 +10366,13 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 memcpy(t->trig, snap, snap_len);
                 t->trig_len = snap_len;
                 t->trig_snapped = 1;
+                if (snap_restart) {
+                    t->client_opts_known = t->snap_opts_known;
+                    t->client_opts_len = t->snap_opts_known ? t->snap_opts_len : 0;
+                    if (t->client_opts_len) memcpy(t->client_opts, t->snap_opts, t->client_opts_len);
+                } else {
+                    take_shape_opts(s, t);
+                }
                 t->ctrl_len = 0;   /* контроль соберётся из новых байт */
                 if (other_form) {
                     say(s, "по %s замер шёл приветствием другой формы, чем у клиента "

@@ -142,6 +142,15 @@ static int bridge_input(const char *ip, uint16_t port,
     memcpy(trp->payload, trigger.bytes, trigger.len);
     trp->len = trigger.len;
     trp->accept = D2K_ACCEPT_SERVERHELLO;
+    /* Набор опций TCP клиента — вместе с его приветствием: зонд здоровается
+     * им, а не литералом (замысел 2026-10-23, п. 5.1). */
+    if (trigger.tcp_known && trigger.tcp_options_len <= sizeof trp->client_tcp_options) {
+        trp->client_tcp_known = 1;
+        trp->client_tcp_options_len = trigger.tcp_options_len;
+        if (trigger.tcp_options_len) {
+            memcpy(trp->client_tcp_options, trigger.tcp_options, trigger.tcp_options_len);
+        }
+    }
     if (d2k_hello_sni(trp->payload, trp->len, &off, &len) == 0) {
         trp->sni_off = (int)off;
         trp->sni_len = (int)len;

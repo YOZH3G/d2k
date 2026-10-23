@@ -134,6 +134,13 @@ struct d2k_session {
        Семейства не делят снимок: опыт сохраняет контекст исходного потока. */
     uint8_t  last_hello[4][D2K_SHAPE_MAX];
     size_t   last_hello_len[4];
+    /* Опции TCP пакета, с которого снят last_hello / shape (слоты TCP; у
+       QUIC нули): набор клиента едет контроллеру рядом со снимком, чтобы
+       зонд здоровался им, а не литералом (замысел 2026-10-23, п. 5.1). */
+    uint8_t  last_opts[4][40];
+    uint8_t  last_opts_len[4];
+    uint8_t  shape_opts[4][40];
+    uint8_t  shape_opts_len[4];
     uint8_t  last_name[4][256];
     size_t   last_name_len[4];
 
@@ -2207,6 +2214,9 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                 if (!fl->controller_probe) {
                     memcpy(s->last_hello[k], hello, hello_len);
                     s->last_hello_len[k] = hello_len;
+                    /* Опции — с ЭТОГО пакета: они у потока одни на все сегменты. */
+                    s->last_opts_len[k] = (uint8_t)(doff - 20);
+                    memcpy(s->last_opts[k], t + 20, doff - 20);
                     s->last_name_len[k] = 0;
                     if (complete.have_sni && complete.sni_len <= sizeof s->last_name[k]) {
                         memcpy(s->last_name[k], hello + complete.sni_off, complete.sni_len);
@@ -2241,6 +2251,8 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                 if (!fl->controller_probe && (requested_shape || complete.ech_offer)) {
                     memcpy(s->shape[k], hello, hello_len);
                     s->shape_len[k] = hello_len;
+                    s->shape_opts_len[k] = (uint8_t)(doff - 20);
+                    memcpy(s->shape_opts[k], t + 20, doff - 20);
                     if (requested_shape) s->shape_armed[k] = 0;
                     d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
                                     (uint32_t)hello_len, NULL, NULL, 0, NULL);
@@ -2909,6 +2921,8 @@ int d2k_session_want_shape_family(d2k_session *s, const uint8_t *name, size_t le
         (len == 0 || name_same(s->last_name[k], s->last_name_len[k], name, len))) {
         memcpy(s->shape[k], s->last_hello[k], s->last_hello_len[k]);
         s->shape_len[k] = s->last_hello_len[k];
+        memcpy(s->shape_opts[k], s->last_opts[k], s->last_opts_len[k]);
+        s->shape_opts_len[k] = s->last_opts_len[k];
         s->shape_armed[k] = 0;
         return 1;
     }
@@ -2939,6 +2953,16 @@ const uint8_t *d2k_session_shape_family(const d2k_session *s, uint8_t transport,
         *len = s->shape_len[k];
     }
     return s->shape[k];
+}
+
+const uint8_t *d2k_session_shape_tcp_options_family(const d2k_session *s, uint8_t family,
+                                                    size_t *len) {
+    if (len) { *len = 0; }
+    if (!s || (family != 4 && family != 6)) { return NULL; }
+    size_t k = shape_slot(6, family);
+    if (s->shape_len[k] == 0) { return NULL; }
+    if (len) { *len = s->shape_opts_len[k]; }
+    return s->shape_opts[k];
 }
 
 d2k_plantab *d2k_session_plans(d2k_session *s) {

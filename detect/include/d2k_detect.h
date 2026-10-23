@@ -128,6 +128,17 @@ typedef struct {
     int           sni_off;   /* где в нагрузке лежит имя, 0 если неизвестно */
     int           sni_len;
     d2k_accept_t  accept;
+    /* НАБОР ОПЦИЙ TCP КЛИЕНТА, ЧЬЁ ПРИВЕТСТВИЕ ЭТО (замысел 2026-10-23,
+     * п. 5.1). Снят датапатом с того же пакета, что и приветствие
+     * (D2K_EV_CLIENT_TCP); зонд здоровается этим набором, а не своим
+     * литералом: вопрос «коробка глотает устаревшую метку времени» задаётся
+     * только клиенту, который метку предлагает. client_tcp_known == 0 — набор
+     * не снят (холодный старт, старый датапат): зонд идёт прежним набором, и
+     * выведенная привязка помечается PROFILE, не CLIENT. Пустой известный набор
+     * (known, len 0) — клиент без опций в данных, и это честный профиль. */
+    int           client_tcp_known;
+    uint8_t       client_tcp_options[40];
+    size_t        client_tcp_options_len;
 } d2k_trigger;
 
 int d2k_trigger_accepts(const d2k_trigger *t, const uint8_t *b, size_t n);
@@ -165,6 +176,13 @@ typedef struct {
 } d2k_poison;
 
 int d2k_poison_has_fake(const d2k_poison *p);
+/* Предлагает ли клиент триггера метку времени TCP (вид 8). Неизвестный набор
+ * — да: прежний зонд метку предлагал всегда. */
+int d2k_trigger_offers_ts(const d2k_trigger *t);
+/* Задаётся ли приём этому клиенту: порча «метка времени назад» требует
+ * метки в потоке, и клиенту без неё вопрос не задаётся вовсе — ни в вопросах
+ * о свойствах, ни в запасном переборе. */
+int d2k_trigger_allows_poison(const d2k_trigger *t, const d2k_poison *p);
 /* Одна и та же гипотеза по всем параметрам, кроме имени. */
 int d2k_poison_same(const d2k_poison *a, const d2k_poison *b);
 

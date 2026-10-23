@@ -653,7 +653,7 @@ int main(void) {
         d2k_sched_vol_hook = stub_vol_root;
         vol_cut_path = "/observed.css";
         vol_asks = 0;
-        d2k_hello trig;
+        d2k_hello trig = {0};
         trig.bytes = t->trig; trig.len = t->trig_len;
         worker_volume(s, t, trig);
         CHECK(vol_asks == 2 && !strcmp(vol_asked[0], "/witness.css") &&

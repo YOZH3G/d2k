@@ -1479,9 +1479,61 @@ static void test_template_plan_needs_client_timestamp(void) {
     d2k_nat_hook = saved;
 }
 
+/* ЗАМЫСЕЛ 2026-10-23, п. 5.1: СНИМОК ПРИВЕТСТВИЯ НЕСЁТ НАБОР ОПЦИЙ TCP КЛИЕНТА.
+ * Датапат уже снимает приветствие по запросу (ARM_SHAPE); набор опций TCP того
+ * же пакета (тот, что профиль tcp-template-v1 копирует в фальшивки) отдаётся
+ * рядом, чтобы зонд здоровался этим набором, а не литералом. Пустой набор —
+ * честный профиль клиента без опций (ПК репортёра #7), не «нет данных». */
+static void test_shape_carries_client_tcp_options(void) {
+    uint8_t hello[512], pkt[1024], buf[4096];
+    size_t hlen = build_hello(hello);
+    const uint8_t name[] = "hetzner.com";
+    d2k_result r;
+    size_t olen = 77;
+
+    /* Снимка ещё нет — набора тоже. */
+    d2k_session *g = d2k_session_new(8, 8);
+    CHECK(d2k_session_shape_tcp_options_family(g, 4, &olen) == NULL && olen == 0,
+          "опции без снимка: не NULL");
+
+    /* Ловушка взведена, приветствие с меткой времени: набор 12 байт, вид 8. */
+    CHECK(d2k_session_want_shape(g, name, sizeof name - 1, 6) == 0, "ловушка не взвелась");
+    size_t n = build_pkt_ts(pkt, 41500, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(d2k_session_shape(g, 6, &olen) != NULL, "снимок с меткой не снят");
+    const uint8_t *o = d2k_session_shape_tcp_options_family(g, 4, &olen);
+    CHECK(o != NULL && olen == 12 && o[2] == 8 && o[3] == 10,
+          "опции снимка с меткой: не те байты");
+    d2k_session_free(g);
+
+    /* Приветствие без опций: набор известен и пуст. */
+    g = d2k_session_new(8, 8);
+    CHECK(d2k_session_want_shape(g, name, sizeof name - 1, 6) == 0, "ловушка не взвелась");
+    n = build_pkt(pkt, 41501, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(d2k_session_shape(g, 6, &olen) != NULL, "снимок без опций не снят");
+    olen = 77;
+    o = d2k_session_shape_tcp_options_family(g, 4, &olen);
+    CHECK(o != NULL && olen == 0, "опции снимка без опций: не пустой известный набор");
+    d2k_session_free(g);
+
+    /* Снимок отдан из последнего приветствия (ловушка после пакета): набор с ним. */
+    g = d2k_session_new(8, 8);
+    n = build_pkt_ts(pkt, 41502, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(d2k_session_want_shape(g, name, sizeof name - 1, 6) == 1, "последнее приветствие не отдано");
+    olen = 77;
+    o = d2k_session_shape_tcp_options_family(g, 4, &olen);
+    CHECK(o != NULL && olen == 12 && o[2] == 8, "опции последнего приветствия не отданы со снимком");
+    /* IPv6-слот чужой: там ничего нет. */
+    CHECK(d2k_session_shape_tcp_options_family(g, 6, &olen) == NULL, "IPv6-слот отдал чужие опции");
+    d2k_session_free(g);
+}
+
 int main(void) {
     D2K_TEST_NAT_NO_TABLE();
     test_template_plan_needs_client_timestamp();
+    test_shape_carries_client_tcp_options();
     test_tcp_stall();
     test_route_mark_does_not_leak();
     test_routed_flag_reset_on_new_syn();

@@ -194,6 +194,10 @@ typedef struct {
     int      rule_up;
     uint8_t tcp_options[12];
     uint8_t tcp_options_len;
+    /* Предлагать ли метку времени в SYN — по набору опций клиента, чьё
+     * приветствие повторяет зонд (d2k_trigger_offers_ts; замысел 2026-10-23,
+     * п. 5.1). Прежде метка стояла литералом, и зонд здоровался не как клиент. */
+    uint8_t offer_ts;
     /* raw_recv returns a slice which must survive until the next receive
      * on THIS connection, without being overwritten by another worker. */
     raw_buffers *buffers; /* heap-owned: do not grow the router worker stack */
@@ -863,20 +867,32 @@ static int raw_send(raw_conn *c, const uint8_t *payload, size_t plen,
  * коробка вправе относиться к такому потоку иначе. */
 static int raw_send_syn(raw_conn *c)
 {
-    static const uint8_t opts[] = {
+    /* Набор с меткой времени — прежний литерал; без метки — как здоровается
+     * клиент, метку не предлагающий (MSS, окно, SACK): так ответ сервера не
+     * принесёт эха метки, и данные пойдут без неё, как у этого клиента. */
+    static const uint8_t opts_ts[] = {
         2, 4, 0x05, 0xac,               /* MSS 1452 */
         4, 2,                           /* SACK permitted */
         8, 10, 0, 0, 0, 1, 0, 0, 0, 0,  /* timestamps */
         1,                              /* NOP */
         3, 3, 7                         /* window scale 7 */
     };
+    static const uint8_t opts_plain[] = {
+        2, 4, 0x05, 0xac,               /* MSS 1452 */
+        1,                              /* NOP */
+        3, 3, 7,                        /* window scale 7 */
+        1, 1,                           /* NOP, NOP */
+        4, 2                            /* SACK permitted */
+    };
+    const uint8_t *opts = c->offer_ts ? opts_ts : opts_plain;
+    size_t optlen = c->offer_ts ? sizeof(opts_ts) : sizeof(opts_plain);
     uint8_t pkt[256];
     d2k_poison none;
     size_t n;
 
     memset(&none, 0, sizeof(none));
     n = build_ip_tcp(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
-                       c->seq, 0, TCP_SYN, NULL, 0, &none, opts, sizeof(opts));
+                       c->seq, 0, TCP_SYN, NULL, 0, &none, opts, optlen);
     if (n == 0) {
         return -1;
     }
@@ -1079,13 +1095,14 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
 /* dialRaw поднимает соединение своими руками и возвращает его установленным. */
 static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dport,
                     int timeout_ms, uint32_t mark_val, const d2k_detect_stop *cancel,
-                    char *err, size_t errcap)
+                    int offer_ts, char *err, size_t errcap)
 {
     int one = 1;
     int mark = (int)mark_val;
     struct timeval tv;
 
     memset(c, 0, sizeof(*c));
+    c->offer_ts = offer_ts ? 1 : 0;
     c->send_fd = -1;
     c->recv_fd = -1;
     if (family != 4 && family != 6) return -1;
@@ -1176,7 +1193,7 @@ int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t 
                             char *err, size_t errcap)
 {
     raw_conn c;
-    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap);
+    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, 1, err, errcap);
     if (dial_rc != 0) return dial_rc;
     raw_close(&c);
     return 1;
@@ -1265,7 +1282,8 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
     size_t resp_len = 0;
     int rc = 0;
 
-    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap);
+    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel,
+                          d2k_trigger_offers_ts(tr), err, errcap);
     if (dial_rc != 0) return dial_rc;
     resp = c.buffers->resp;
 

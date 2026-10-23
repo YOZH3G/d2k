@@ -1008,7 +1008,8 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         }
         if (!d2k_poison_supports_family(&p, family) ||
             (p.disorder_pos > 0 && (size_t)p.disorder_pos >= tr->len) ||
-            d2k_opts_skipped(opt, p.name)) {
+            d2k_opts_skipped(opt, p.name) ||
+            !d2k_trigger_allows_poison(tr, &p)) { /* как клиент: без метки — без tcpts */
             continue;
         }
         bind_decoy(&p, opt);
