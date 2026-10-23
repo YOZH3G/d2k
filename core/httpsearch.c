@@ -1251,7 +1251,27 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
            которым тот же билд в повторе отдал полный ответ, не был опробован —
            цель закрылась на 10 минут по НАШЕМУ сбою. Повторяем базу тем же
            поиском; если и повтор местный — короткий срок «не измерено». */
-        if (r->answer == D2K_HS_CONNECT_FAIL &&
+        /* ТИШИНА НА БАЗЕ ОБРЫВА — ТОЖЕ НЕ ОТВЕТ О КОРОБКЕ (поле 23.10.2026,
+           media5.cdnbase.com, прогон final-e861d26-1). Клиент получал обрыв
+           33 120 Б из 106 050 и до, и после базы, а на НАШ запрос ответа не
+           было вовсе. Ветка портала читает тишину как «блокировку в другой
+           форме» с 16.10.2026, но была закрыта условием `!cur.cut`, то есть
+           для цели с обрывом не работала — и цель уходила на 10 минут с
+           вердиктом «не воспроизводится», которого никто не измерял.
+           Повторяем базу; повторная тишина — сигнал, и поиск начинается
+           (ниже, тем же правилом, что у портала). */
+        if (r->answer == D2K_HS_SILENT && hs->cur.cut &&
+            hs->cur.base_retries >= D2K_HS_BASE_RETRIES) {
+            build_cands(hs);
+            say(hs, "HTTP %s: база — тишина на свой запрос ДВАЖДЫ при обрыве у "
+                    "клиента: ответа нет вовсе, значит это отсутствие замера, а не "
+                    "измеренное «блока нет»; своих планов %zu, затем вопросы разреза "
+                    "и checksum-приманки", hs->cur.host, hs->cur.n_cands);
+            next_candidate(hs, now);
+            return;
+        }
+        if ((r->answer == D2K_HS_CONNECT_FAIL ||
+             (r->answer == D2K_HS_SILENT && hs->cur.cut)) &&
             hs->cur.base_retries < D2K_HS_BASE_RETRIES) {
             hs->cur.base_retries++;
             d2k_hs_job job;
@@ -1262,10 +1282,11 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
                 hs->cur.sport = 0;
                 hs->cur.phase = PH_BASE;
                 hs->cur.deadline = now + (int64_t)d2k_hs_probe_ms * 3;
-                say(hs, "HTTP %s: база — соединение своего зонда не установилось "
-                        "(попытка %d из %d): это НАШ отказ, не ответ коробки — "
-                        "повторяю базу", hs->cur.host, hs->cur.base_retries + 1,
-                    D2K_HS_BASE_RETRIES + 1);
+                say(hs, "HTTP %s: база — %s (попытка %d из %d): ответа о коробке "
+                        "здесь нет — повторяю базу", hs->cur.host,
+                    r->answer == D2K_HS_SILENT ? "тишина на свой запрос"
+                                               : "соединение своего зонда не установилось",
+                    hs->cur.base_retries + 1, D2K_HS_BASE_RETRIES + 1);
                 return;
             }
             drop_socket(hs);
