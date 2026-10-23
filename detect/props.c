@@ -176,7 +176,7 @@ static int prop_probes(prop_probe *out, int cap)
     return k;
 }
 
-static void apply_set(d2k_dprops *pr, prop_set s, int ok)
+static void apply_set(d2k_dprops *pr, prop_set s, int ok, const d2k_poison *p)
 {
     switch (s) {
     case SET_LEFT_OVERLAP:
@@ -222,12 +222,16 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok)
         if (ok) { pr->counts_duplicates = D2K_TRI_TRUE; }
         break;
     case SET_WHITE_TS:
-        /* Проход: коробка приняла пакет со старой меткой (метку не сверяет) И
-         * разобрала фальшивое ECH-приветствие (разбирает L7), зацепившись за
-         * ECH-поток вместо имени. Оба вывода — только по проходу (§2.4). */
+        /* Проход: коробка разобрала фальшивое ECH-приветствие (разбирает L7),
+         * зацепившись за ECH-поток вместо имени. Про ПОРЧУ утверждаем только
+         * то, что в этом вопросе действительно было: у клиента без метки
+         * времени её в зонде нет, и «метку не сверяет» по такому проходу —
+         * выдумка о коробке (§2.4, замысел 2026-10-23 п. 5.2). Все выводы —
+         * только по проходу. */
         if (ok) {
-            pr->validates_timestamps = D2K_TRI_FALSE;
             pr->parses_l7 = D2K_TRI_TRUE;
+            if (p && p->tcp_ts) { pr->validates_timestamps = D2K_TRI_FALSE; }
+            if (p && p->badsum) { pr->validates_checksum = D2K_TRI_FALSE; }
         }
         break;
     }
@@ -261,6 +265,31 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         }
         if (d2k_opts_skipped(opt, p.name)) {
             continue;
+        }
+        /* ВОПРОС ЗАДАЁТСЯ КАК КЛИЕНТ (замысел 2026-10-23, п. 5.1 и 5.2).
+         *
+         * Порча «метка времени назад» исполнима только на потоке, который
+         * метку предлагает: датапат копирует опции потока и сдвигает метку в
+         * них (datapath/wire.c, профиль tcp-template-v1). Клиенту без метки
+         * одиночный вопрос о метке не задаётся вовсе — его «нет» говорило бы
+         * о нашем зонде, а не о коробке.
+         *
+         * СОСТАВНОЙ ВОПРОС СЕМЕЙСТВА C при этом НЕ ПРОПАДАЕТ, А СОБИРАЕТСЯ:
+         * множители (приманка ECH, серия ×8, разрез +2) остаются, а порча
+         * берётся из того, что уже измерено, — тем же правилом, которым
+         * d2k_compose_from_props берёт битую сумму (пробуем, пока коробка не
+         * доказала, что сумму сверяет). Доказала — вопрос не задаётся: нечем
+         * сделать фальшивку отвергаемой сервером, а приём, который сервер
+         * примет, обходом не является. */
+        if (p.tcp_ts && !d2k_trigger_offers_ts(tr)) {
+            if (pp[i].set != SET_WHITE_TS) {
+                continue;
+            }
+            p.tcp_ts = 0;
+            if (res->props.validates_checksum == D2K_TRI_TRUE) {
+                continue;
+            }
+            p.badsum = 1;
         }
         if (pp[i].set == SET_OVERLAP_SNI) {
             /* До конца имени: без имени в приветствии вопрос не задаётся. */
@@ -329,7 +358,7 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
         got = d2k_prop_majority(pass, opt->repeats);
         /* A local compile/apply/send refusal is not an answer from the box. */
-        if (!local_err) apply_set(&res->props, pp[i].set, got);
+        if (!local_err) apply_set(&res->props, pp[i].set, got, &p);
         /* Находку, которую план не выражает (фильтр дерева, d2k_opts.accept),
          * не берём и не останавливаемся: ответ уже в векторе, а следующие
          * вопросы могут найти выразимый приём — в переборе их может не быть. */

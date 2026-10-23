@@ -216,6 +216,7 @@ typedef struct {
     int               vouched;
     const char       *ack;
     int               white;   /* 1 — задать opt.white (белое имя сети приманкой) */
+    int               no_ts;   /* 1 — клиент триггера метку времени НЕ предлагает */
 } scenario;
 
 /* Фильтр находок, как plannable_hit в bridge.c: NULL — берётся любая. */
@@ -253,6 +254,10 @@ static void run(const scenario *s, d2k_result *res)
         snprintf(opt.white.name, sizeof opt.white.name, "white");
     }
     memset(&t, 0, sizeof t);
+    /* Набор опций TCP клиента (замысел 2026-10-23, п. 5.1): известный пустой
+       набор — клиент без метки времени. */
+    t.client_tcp_known = s->no_ts;
+    t.client_tcp_options_len = 0;
     snprintf(t.name, sizeof t.name, "test");
     memcpy(t.payload, PAY, sizeof(PAY) - 1);
     t.len = sizeof(PAY) - 1;
@@ -310,25 +315,25 @@ static script_ent S_FLAKY[] = {
 static const script_ent S_PROPHIT_L7[] = {{"badsum+hello", "+"}, {NULL, NULL}};
 
 static scenario SC[] = {
-    {"youtube", S_YOUTUBE, NULL, NULL, NULL, 0, NULL, 0},
-    {"rutracker", S_RUTRACKER, NULL, NULL, NULL, 0, NULL, 0},
-    {"flaky", S_FLAKY, NULL, NULL, NULL, 0, NULL, 0},
-    {"prop-l7", S_PROPHIT_L7, NULL, NULL, NULL, 0, NULL, 0},
-    {"none-pass", NULL, "-", NULL, NULL, 0, NULL, 0},
-    {"selftest-fail", NULL, "-", "e", NULL, 0, NULL, 0},
-    {"selftest-late", S_YOUTUBE, NULL, "-e+", NULL, 0, NULL, 0},
-    {"ctl-late", S_YOUTUBE, NULL, NULL, "-+", 0, NULL, 0},
-    {"ctl-dead", NULL, "-", NULL, "-", 0, NULL, 0},
-    {"ctl-dead-vouched", NULL, "-", NULL, "-", 1, NULL, 0},
-    {"ctl-dead-hit", S_YOUTUBE, NULL, NULL, "-", 1, NULL, 0},
-    {"errors", NULL, "e", NULL, NULL, 0, NULL, 0},
+    {"youtube", S_YOUTUBE, NULL, NULL, NULL, 0, NULL, 0, 0},
+    {"rutracker", S_RUTRACKER, NULL, NULL, NULL, 0, NULL, 0, 0},
+    {"flaky", S_FLAKY, NULL, NULL, NULL, 0, NULL, 0, 0},
+    {"prop-l7", S_PROPHIT_L7, NULL, NULL, NULL, 0, NULL, 0, 0},
+    {"none-pass", NULL, "-", NULL, NULL, 0, NULL, 0, 0},
+    {"selftest-fail", NULL, "-", "e", NULL, 0, NULL, 0, 0},
+    {"selftest-late", S_YOUTUBE, NULL, "-e+", NULL, 0, NULL, 0, 0},
+    {"ctl-late", S_YOUTUBE, NULL, NULL, "-+", 0, NULL, 0, 0},
+    {"ctl-dead", NULL, "-", NULL, "-", 0, NULL, 0, 0},
+    {"ctl-dead-vouched", NULL, "-", NULL, "-", 1, NULL, 0, 0},
+    {"ctl-dead-hit", S_YOUTUBE, NULL, NULL, "-", 1, NULL, 0, 0},
+    {"errors", NULL, "e", NULL, NULL, 0, NULL, 0, 0},
     /* Задача 54 (поле 04.10, cdn.cookielaw.org, 104.18.86.0/24): рукопожатие
      * проходит, а сервер не подтверждает ни одного байта данных — ни
      * приветствия, ни контроля, ни одного нейтрального байта. */
-    {"addr-silent", NULL, "-", NULL, "-", 0, "-", 0},
-    {"addr-silent-late", NULL, "-", NULL, "-", 0, "-+", 0},
-    {"addr-ack-unseen", NULL, "-", NULL, "-", 0, "u", 0},
-    {"addr-ack-err", NULL, "-", NULL, "-", 0, "e", 0},
+    {"addr-silent", NULL, "-", NULL, "-", 0, "-", 0, 0},
+    {"addr-silent-late", NULL, "-", NULL, "-", 0, "-+", 0, 0},
+    {"addr-ack-unseen", NULL, "-", NULL, "-", 0, "u", 0, 0},
+    {"addr-ack-err", NULL, "-", NULL, "-", 0, "e", 0, 0},
 };
 #define NSC ((int)(sizeof SC / sizeof SC[0]))
 
@@ -539,7 +544,7 @@ static void test_white_ts(void)
 {
     static const script_ent s_white[] = {
         {"ts", "-"}, {"white-hello-ts", "+"}, {NULL, NULL}};
-    scenario sc = {"white-ts", s_white, "-", NULL, NULL, 0, NULL, 1};
+    scenario sc = {"white-ts", s_white, "-", NULL, NULL, 0, NULL, 1, 0};
     d2k_result r;
     memset(&r, 0, sizeof r);
     run(&sc, &r);
@@ -570,7 +575,7 @@ static void test_white_ts(void)
     g_silent=g_timeout_seed=0;
 
     /* Без ECH-приманки вопрос пропускается: та же раскладка, white=0. */
-    scenario sc0 = {"white-ts-none", s_white, "-", NULL, NULL, 0, NULL, 0};
+    scenario sc0 = {"white-ts-none", s_white, "-", NULL, NULL, 0, NULL, 0, 0};
     memset(&r, 0, sizeof r);
     run(&sc0, &r);
     CHECK(find_obs(&r, "свойство:ECH-приветствие под меткой") == NULL,
@@ -582,7 +587,7 @@ static void test_white_ts(void)
 static const script_ent S_FIELD_SYN[] = {{"syndata", "+"}, {NULL, NULL}};
 static void test_syndata_after_misses(void)
 {
-    static const scenario syn = {"props-syn-last", S_FIELD_SYN, NULL, NULL, NULL, 0, NULL, 0};
+    static const scenario syn = {"props-syn-last", S_FIELD_SYN, NULL, NULL, NULL, 0, NULL, 0, 0};
     d2k_result r;
     fresh_process();
     run(&syn, &r);
@@ -598,9 +603,9 @@ static void test_syndata_after_misses(void)
 
 static void test_props_fields(void)
 {
-    static const scenario md5 = {"props-md5", S_FIELD_MD5, NULL, NULL, NULL, 0, NULL, 0};
-    static const scenario seq = {"props-seq", S_FIELD_SEQ, NULL, NULL, NULL, 0, NULL, 0};
-    static const scenario ts  = {"props-ts",  S_FIELD_TS,  NULL, NULL, NULL, 0, NULL, 0};
+    static const scenario md5 = {"props-md5", S_FIELD_MD5, NULL, NULL, NULL, 0, NULL, 0, 0};
+    static const scenario seq = {"props-seq", S_FIELD_SEQ, NULL, NULL, NULL, 0, NULL, 0, 0};
+    static const scenario ts  = {"props-ts",  S_FIELD_TS,  NULL, NULL, NULL, 0, NULL, 0, 0};
     d2k_result r;
     printf("свойства: сверка полей подделки\n");
     fresh_process();
@@ -636,7 +641,7 @@ static int no_syn_md5(const d2k_poison *p, void *ctx)
 static const script_ent S_SYN_TS[] = {{"syndata", "+"}, {"md5", "+"}, {"ts", "+"}, {NULL, NULL}};
 static void test_props_skip_unplannable(void)
 {
-    static const scenario sc = {"syn-ts", S_SYN_TS, "-", NULL, NULL, 0, NULL, 0};
+    static const scenario sc = {"syn-ts", S_SYN_TS, "-", NULL, NULL, 0, NULL, 0, 0};
     d2k_result r;
     printf("свойства: невыразимая находка не останавливает вопросы\n");
     fresh_process();
@@ -662,7 +667,7 @@ static void test_sweep_skips_answered(void)
     static const char *const dup[] = {
         "seqovl-1", "disorder", "badsum", "badsum+hello", "badsum-x2-g20",
         "syndata", "md5", "seq-out-of-window", "badsum-x7"};
-    static const scenario err = {"md5-err", S_MD5_ERR, "-", NULL, NULL, 0, NULL, 0};
+    static const scenario err = {"md5-err", S_MD5_ERR, "-", NULL, NULL, 0, NULL, 0, 0};
     d2k_result r;
     char nm[96];
     size_t i;
@@ -777,7 +782,7 @@ static void test_selftest_cache(void)
     /* Кэш есть, а сырой слой сломался: первые же отказы этого прогона
      * перепроверяют слой, и провал ведёт себя ровно как провал самопроверки. */
     {
-        scenario broken = {"broken", NULL, "e", "e", NULL, 0, NULL, 0};
+        scenario broken = {"broken", NULL, "e", "e", NULL, 0, NULL, 0, 0};
         fresh_process();
         run(find_sc("youtube"), &r);
         run(&broken, &r);
@@ -821,8 +826,74 @@ static void test_local_plan_error_is_not_a_property(void) {
     CHECK(r.nanswered == 0, "локальный отказ стал ответом сети");
 }
 
+/* ЗАМЫСЕЛ 2026-10-23, п. 5.1 и 5.2: СОСТАВ ВОПРОСОВ ИДЁТ ОТ КЛИЕНТА.
+   Одиночный вопрос о метке времени задаётся только клиенту, который метку
+   предлагает: порча требует метки в потоке (datapath/wire.c), и у клиента без
+   метки (ПК репортёра #7) её «нет» говорило бы о зонде, а не о коробке.
+   Составной вопрос семейства C при этом задаётся обоим — у клиента без метки
+   он собирается с порчей, которую поток несёт (см. тест ниже). Набор опций не
+   снят — весь прежний состав вопросов, как раньше. */
+static int trace_count(const d2k_result *r, const char *needle) {
+    int n = 0;
+    for (int i = 0; i < r->ntrace; i++) if (strstr(r->trace[i].probe, needle)) n++;
+    return n;
+}
+static void test_timestamp_questions_follow_client_profile(void) {
+    d2k_result r; d2k_opts opt; d2k_trigger tr; d2k_poison hit;
+    for (int known = 0; known < 2; known++) {
+        memset(&r, 0, sizeof r); memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr);
+        memset(&hit, 0, sizeof hit);
+        opt.repeats = 3; opt.white.len = 2;
+        tr.len = 300; tr.sni_off = 100; tr.sni_len = 11;
+        tr.client_tcp_known = known; tr.client_tcp_options_len = 0;
+        g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
+        CHECK(d2k_run_properties((uint8_t[]){192,0,2,1}, 443, &tr, &opt, &r, &hit) == 0,
+              "клиентский профиль: вопросы дали находку на стенде промахов");
+        int ts = trace_count(&r, "метка времени"), white = trace_count(&r, "под меткой");
+        if (known) {
+            /* Одиночный вопрос о метке — нет; составной (п. 5.2) — да, без метки. */
+            CHECK(ts == 0 && white == 1,
+                  "клиент без метки времени: не тот состав вопросов (ts=%d, white=%d)", ts, white);
+        } else {
+            CHECK(ts == 1 && white == 1,
+                  "набор не снят: вопросы о метке не заданы (ts=%d, white=%d)", ts, white);
+        }
+        CHECK(trace_count(&r, "плотная серия") == 1, "клиентский профиль: прочие вопросы пропали");
+    }
+}
+
+/* ЗАМЫСЕЛ 2026-10-23, п. 5.2: СОСТАВНОЙ ВОПРОС СОБИРАЕТСЯ, А НЕ ПРИВОЗИТСЯ.
+   Клиент без метки времени (ПК репортёра #7): одиночный вопрос о метке ему не
+   задаётся — его «нет» говорило бы о зонде, а не о коробке. Составной вопрос
+   семейства C при этом НЕ пропадает: множители (приманка ECH, серия ×8, разрез
+   +2) те же, а порча берётся из измеренного — битая сумма, пока коробка не
+   доказала, что сумму сверяет. По такому проходу «метку не сверяет» НЕ
+   записывается: метки в зонде не было. */
+static void test_composite_assembled_for_client_without_ts(void) {
+    static const script_ent s_white[] = {
+        {"white-hello-ts", "+"}, {NULL, NULL}};
+    scenario sc = {"white-ts-noopts", s_white, "-", NULL, NULL, 0, NULL, 1, 1};
+    d2k_result r;
+    memset(&r, 0, sizeof r);
+    run(&sc, &r);
+    CHECK(find_obs(&r, "свойство:метка времени") == NULL,
+          "клиенту без метки задан одиночный вопрос о метке времени");
+    CHECK(find_obs(&r, "свойство:ECH-приветствие под меткой") != NULL,
+          "клиенту без метки составной вопрос семейства C не задан вовсе");
+    CHECK(r.has_hit && !strcmp(r.hit.name, "white-hello-ts"),
+          "составной вопрос без метки не стал находкой");
+    CHECK(!r.hit.tcp_ts, "находка клиента без метки несёт метку времени");
+    CHECK(r.hit.badsum, "порча составного вопроса не взята из измеренного (битая сумма)");
+    CHECK(r.hit.decoy_hello && r.hit.repeats == 8 && r.hit.split_pos == 2,
+          "множители составного вопроса потеряны (приманка/серия/разрез)");
+    CHECK(r.props.parses_l7 == D2K_TRI_TRUE,
+          "проход составного вопроса не записал «разбирает L7»");
+    CHECK(r.props.validates_timestamps == D2K_TRI_UNSET,
+          "по проходу без метки записано «метку не сверяет» — метки в зонде не было");
+}
+
 static void test_split_uses_runtime(void) {
-    scenario sc = {"split-runtime", NULL, "-", NULL, "+", 0, NULL, 0};
+    scenario sc = {"split-runtime", NULL, "-", NULL, "+", 0, NULL, 0, 0};
     d2k_result r;
     g_split_success = 1; g_split_calls = g_split_gaps = 0;
     run(&sc, &r);
@@ -907,7 +978,7 @@ static void test_split_recovers_only_unsent_transport_failure(void) {
     transport_cancel_at = NULL; transport_cancelled = 0; opt.cancel.fn = NULL;
 
     /* Exercise the complete classifier, not only its repeat helper. */
-    scenario sc = {"split-recovered", NULL, "-", NULL, "+", 0, NULL, 0};
+    scenario sc = {"split-recovered", NULL, "-", NULL, "+", 0, NULL, 0, 0};
     d2k_result before, after;
     g_split_connect_failures = 0; g_split_calls = 0;
     run(&sc, &before);
@@ -922,6 +993,7 @@ static void test_split_recovers_only_unsent_transport_failure(void) {
 int main(void)
 {
     test_local_plan_error_is_not_a_property();
+    test_timestamp_questions_follow_client_profile();
     srv_start();
     test_split_uses_runtime();
     test_split_recovers_only_unsent_transport_failure();
@@ -941,6 +1013,7 @@ int main(void)
     test_counts_per_question();
     test_syndata_last();
     test_white_ts();
+    test_composite_assembled_for_client_without_ts();
     test_syndata_after_misses();
     test_props_fields();
     test_sweep_skips_answered();

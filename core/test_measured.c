@@ -664,6 +664,53 @@ static void whitelist_names(void) {
  * зашитого hcaptcha.com. Имя — в бинарном payload, не в тексте плана, поэтому
  * сверяем, что РАЗНЫЕ имена дают разный план, а обёртка по умолчанию равна
  * плану с hcaptcha.com. Пустое имя — отказ. */
+/* ЗАМЫСЕЛ 2026-10-23, п. 5.2: ПОРЧА СОСТАВНОГО ПЛАНА — ИЗ ПЛЕЧА, НЕ ИЗ СТРОКИ.
+ *
+ * template_plan писал «poison 1 tcpts» литералом: план семейства C нёс метку
+ * времени потому, что так написано в файле, а не потому, что это измерено на
+ * этом клиенте. Клиенту без метки времени (ПК репортёра #7, поле 22.10.2026)
+ * такой план датапат исполнить не может. Теперь порча берётся из d2k_arm:
+ * множители (приманка ECH, серия ×8, разрез +2) те же, порча — та, что
+ * измерена. Запасная лестница остаётся прежней программой с меткой. */
+static void template_poison_from_arm(void) {
+    char text[4096];
+    uint8_t decoy[1024];
+    size_t dlen = 0;
+    d2k_arm a;
+    d2k_arm_input in;
+    case_name = "composite template poison from the measured arm";
+    CHECK(d2k_white_decoy_hello("hcaptcha.com", decoy, sizeof decoy, &dlen) == 0);
+    memset(&in, 0, sizeof in);
+    in.trigger_len = 600; in.sni_off = 100; in.sni_len = 11;
+    in.decoy_len = dlen;
+    memcpy(in.decoy, decoy, dlen);
+
+    /* Клиент с меткой времени: прежняя программа, байт в байт. */
+    memset(&a, 0, sizeof a);
+    a.tcpts = 1; a.decoy_hello = 1; a.repeats = 8; a.split_pos = 2;
+    CHECK(d2k_arm_plan_measured_cap(&a, &in, 1492, text, sizeof text) == 0);
+    CHECK(strstr(text, "wire tcp-template-v1\n") != NULL);
+    CHECK(strstr(text, "poison 1 tcpts\n") != NULL);
+    CHECK(strstr(text, "badsum") == NULL);
+    CHECK(strstr(text, "fake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n") != NULL);
+    CHECK(strstr(text, "split payload_start +2\norder forward\n") != NULL);
+
+    /* Клиент без метки времени: ТОТ ЖЕ составной план, порча — битая сумма. */
+    memset(&a, 0, sizeof a);
+    a.badsum = 1; a.decoy_hello = 1; a.repeats = 8; a.split_pos = 2;
+    CHECK(d2k_arm_plan_measured_cap(&a, &in, 1492, text, sizeof text) == 0);
+    CHECK(strstr(text, "wire tcp-template-v1\n") != NULL);
+    CHECK(strstr(text, "poison 1 badsum\n") != NULL);
+    CHECK(strstr(text, "tcpts") == NULL);
+    CHECK(strstr(text, "fake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n") != NULL);
+    CHECK(strstr(text, "split payload_start +2\norder forward\n") != NULL);
+
+    /* Запасная лестница — восстановленная программа поля, с меткой времени. */
+    CHECK(d2k_rx_volume_plan(0, D2K_SHAPE_MODERN, 1492, text, sizeof text) == 0);
+    CHECK(strstr(text, "poison 1 tcpts\n") != NULL);
+    CHECK(strstr(text, "badsum") == NULL);
+}
+
 static void rx_volume_named(void) {
     case_name = "rx-volume named decoy";
     char def[4096], hc[4096], other[4096], empty[4096];
@@ -680,6 +727,7 @@ static void rx_volume_named(void) {
 }
 
 int main(void) {
+    template_poison_from_arm();
     whitelist_names();
     rx_volume_named();
     md5_plan_contract();

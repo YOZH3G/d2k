@@ -43,10 +43,22 @@ int d2k_white_decoy_hello(const char *name, uint8_t *out, size_t cap, size_t *le
     return 0;
 }
 
+/* Составной план семейства C: приманка ECH, серия ×8, разрез настоящего
+ * приветствия. ПОРЧА — ПАРАМЕТР, А НЕ СТРОКА В ФАЙЛЕ (замысел 2026-10-23,
+ * п. 5.2). Прежде здесь стоял литерал «poison 1 tcpts», и план нёс метку
+ * времени потому, что так написано в исходнике: из этой функции выходили и
+ * plan-9d543a55, и plan-680fbe00. Клиенту, который метку не предлагает,
+ * такой план датапат исполнить не может (поле issue #7, 22.10.2026), а замер
+ * его всё равно выдавал за свойство цели.
+ *
+ * Без порчи вовсе плана нет: фальшивку, которую примет и сервер, обходом
+ * считать нельзя — сервер соберёт поток из неё, и измеренного воздействия на
+ * проводе не будет. */
 static int template_plan(const uint8_t *hello, size_t hello_len, unsigned split,
-                         size_t send_cap, char *buf, size_t cap) {
+                         int tcpts, int badsum, size_t send_cap, char *buf, size_t cap) {
     size_t pos = 0;
     if (!hello || !hello_len || !split) return -1;
+    if (!tcpts && !badsum) return -1;
     if (send_cap > 0 && (hello_len > send_cap || send_cap - hello_len < 132)) return -1;
     unsigned seg = d2k_arm_segment(send_cap);
     if (!seg) return -1;
@@ -57,8 +69,10 @@ static int template_plan(const uint8_t *hello, size_t hello_len, unsigned split,
         append_fmt(buf, cap, &pos, "payload 1 ") ||
         append_hex(buf, cap, &pos, hello, hello_len) ||
         append_fmt(buf, cap, &pos,
-            "\npoison 1 tcpts\nfake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n"
-            "split payload_start +%u\norder forward\n", split)) return -1;
+            "\npoison 1%s%s\n"
+            "fake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n"
+            "split payload_start +%u\norder forward\n",
+            badsum ? " badsum" : "", tcpts ? " tcpts" : "", split)) return -1;
     return 0;
 }
 
@@ -70,7 +84,9 @@ int d2k_rx_volume_plan_named(unsigned variant, d2k_shape shape, size_t send_cap,
     if (!buf || !cap || variant >= D2K_RX_VOLUME_PLAN_VARIANTS ||
         shape != D2K_SHAPE_MODERN ||
         d2k_white_decoy_hello(name, hello, sizeof hello, &hello_len)) return -1;
-    return template_plan(hello, hello_len, split_at[variant], send_cap, buf, cap);
+    /* Запасная лестница — ВОССТАНОВЛЕННАЯ ПРОГРАММА ПОЛЯ (plan-680fbe00): её
+       порча измерена не здесь и не этим клиентом, она часть самой программы. */
+    return template_plan(hello, hello_len, split_at[variant], 1, 0, send_cap, buf, cap);
 }
 
 /* Имя приманки по умолчанию, пока белое имя сети не подобрано (поле
@@ -136,12 +152,19 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
     /* The composite ECH question is the recovered field program. The raw
        probe executes this very text, so it cannot measure padded 2*n bytes
        and then arm a different template/TLS modifier/header program. */
-    if (a->tcpts && a->decoy_hello && a->repeats == 8 && a->split_pos == 2 &&
-        !a->badsum && !a->md5 && !a->ttl && !a->seq_out && !a->gap_ms &&
+    /* Узнаём составной вопрос по его МНОЖИТЕЛЯМ (приманка, серия ×8, разрез
+       +2), а порчу берём из плеча: у клиента с меткой времени это метка, у
+       клиента без неё — то, что измерено вместо неё (битая сумма). Прежде
+       условие требовало именно метку, и собранный без неё составной приём
+       уходил общим путём — другим воздействием, чем измеренное. */
+    if (a->decoy_hello && (a->tcpts || a->badsum) &&
+        a->repeats == 8 && a->split_pos == 2 &&
+        !a->md5 && !a->ttl && !a->seq_out && !a->gap_ms &&
         !a->disorder && !a->disorder_pos && !a->between && !a->seqovl &&
         !a->seqovl_hello && !a->ipidzero && !a->oob) {
         if (!in->sni_off || in->sni_len <= 1) return -1;
-        return template_plan(in->decoy, in->decoy_len, 2, send_cap, buf, cap);
+        return template_plan(in->decoy, in->decoy_len, 2, a->tcpts, a->badsum,
+                             send_cap, buf, cap);
     }
     if (a->disorder_pos) {
         if (!a->disorder || a->disorder_pos >= in->trigger_len || a->seqovl ||
