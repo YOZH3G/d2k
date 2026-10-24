@@ -296,8 +296,8 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   fs.rmSync(path.join(bin, 'openssl'));
   reset();
   ok(run('install', { ...opkgEnv, D2K_OPENWRT_OPKG_ETC: opkgEtc }));
-  assert.match(read(log('opkg-gate')), /^http:\/\/213\.176\.74\.63:9444 update$/m, 'opkg list update via the gate');
-  assert.match(read(log('opkg-gate')), /^http:\/\/213\.176\.74\.63:9444 install$/m, 'opkg install via the gate');
+  assert.match(read(log('opkg-gate')), /^http:\/\/85\.192\.60\.175:9444 update$/m, 'opkg list update via the gate');
+  assert.match(read(log('opkg-gate')), /^http:\/\/85\.192\.60\.175:9444 install$/m, 'opkg install via the gate');
   assert.equal(read(log('opkg-gate-conf')),
     'dest root /\nlists_dir ext /var/opkg-lists\noption check_signature\n' +
     'src/gz openwrt_core http://downloads.openwrt.org/releases/24.10.8/targets/x86/64/packages\n' +

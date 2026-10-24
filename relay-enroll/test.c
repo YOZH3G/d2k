@@ -201,6 +201,24 @@ static int post(shared_limits *limits,uint32_t ip,const char *path,const char *b
     assert(n>0&&(size_t)n+length<sizeof(request));memcpy(request+n,body,length);
     return full_request(limits,ip,request,(size_t)n+length,reply,cap);
 }
+static void test_project_sni(void) {
+    make_cert();
+    SSL_CTX *ctx=SSL_CTX_new(TLS_server_method());assert(ctx);
+    SSL *ssl=SSL_new(ctx);assert(ssl);int alert=0;
+    assert(project_sni(ssl,&alert,cert_path)==SSL_TLSEXT_ERR_ALERT_FATAL);
+    assert(alert==SSL_AD_UNRECOGNIZED_NAME);
+    assert(SSL_set_tlsext_host_name(ssl,"unrelated.example")==1);
+    assert(project_sni(ssl,&alert,cert_path)==SSL_TLSEXT_ERR_ALERT_FATAL);
+    assert(SSL_set_tlsext_host_name(ssl,PRIMARY_TLS_NAME)==1);
+    assert(project_sni(ssl,&alert,cert_path)==SSL_TLSEXT_ERR_OK);
+    assert(SSL_set_tlsext_host_name(ssl,LEGACY_TLS_NAME)==1);
+    assert(project_sni(ssl,&alert,cert_path)==SSL_TLSEXT_ERR_OK);
+    assert(SSL_get_certificate(ssl)!=NULL&&SSL_check_private_key(ssl)==1);
+    assert(project_sni(ssl,&alert,"/no/such/certificate")==SSL_TLSEXT_ERR_ALERT_FATAL);
+    assert(alert==SSL_AD_INTERNAL_ERROR);
+    SSL_free(ssl);SSL_CTX_free(ctx);unlink(cert_path);
+}
+
 static void test_full_path(void) {
     make_cert();resolver=fake_resolve;
     shared_limits *limits=shared_limits_create();assert(limits);
@@ -523,4 +541,4 @@ static void test_upstream_contract(void) {
 int main(void){(void)signal(SIGPIPE,SIG_IGN);
     /* Unit tests never reach real DNS servers. */
     public_dns=&no_dns;
-    test_proof();test_resolve_budget_sizes();test_rate_limit();test_conn_pools();test_route_limits();test_http_boundaries();test_resolve();test_resolve_budget();test_dns_parse();test_dns_cname_chain();public_dns=&fake_dns;test_resolver_union();test_silent_resolvers();public_dns=&no_dns;test_lock_recovery();test_answer_cache();test_full_path();test_upstream_contract();puts("C enrollment server: proof, rate limits, HTTP boundaries, /resolve (budget, cache, resolver union, DNS parsing, lock recovery, full TLS path), connection pools and upstream contract passed");return 0;}
+    test_proof();test_resolve_budget_sizes();test_rate_limit();test_conn_pools();test_route_limits();test_http_boundaries();test_resolve();test_resolve_budget();test_dns_parse();test_dns_cname_chain();public_dns=&fake_dns;test_resolver_union();test_silent_resolvers();public_dns=&no_dns;test_lock_recovery();test_answer_cache();test_project_sni();test_full_path();test_upstream_contract();puts("C enrollment server: proof, rate limits, HTTP boundaries, /resolve (budget, cache, resolver union, DNS parsing, lock recovery, full TLS path), connection pools and upstream contract passed");return 0;}

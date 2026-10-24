@@ -198,7 +198,7 @@ NDMC
 cat > /tmp/d2k-test-bin/curl <<'CURL'
 #!/bin/sh
 case "$*" in
-    *https://213.176.74.63.nip.io:9443/resolve*)
+    *https://85.192.60.175.nip.io:9443/resolve*)
         printf '%s' '{"results":{"instagram.com":["157.240.9.174"],"www.instagram.com":["157.240.9.175"],"web.whatsapp.com":["157.240.9.52"]}}'
         exit 0
         ;;

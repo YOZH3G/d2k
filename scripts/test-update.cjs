@@ -194,7 +194,7 @@ try {
   const gateLog = path.join(feed, '..', 'gate.log');
   fs.rmSync(gateLog, { force: true });
   assert.equal(run('check').status, 0);
-  assert.match(read(gateLog), /^http:\/\/213\.176\.74\.63:9444 https:\/\/example\.test\/.*latest\.json$/m,
+  assert.match(read(gateLog), /^http:\/\/85\.192\.60\.175:9444 https:\/\/example\.test\/.*latest\.json$/m,
     'перечень выпуска сперва через проводник');
   fs.rmSync(gateLog, { force: true });
   assert.equal(spawnSync('/bin/sh', [updater, 'check'], { env: { ...env, GATE_DOWN: '1' }, encoding: 'utf8' }).status, 0,

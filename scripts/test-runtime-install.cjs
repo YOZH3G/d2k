@@ -80,6 +80,29 @@ exit 1
   const installOut = run('install');
   assert(fs.existsSync(path.join(tmp, 'opt/sbin/d2kfetch')), 'diagnostic tool must be installed');
   assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2khttp')), 'upgrade must remove the old d2khttp proxy binary');
+  fs.writeFileSync(path.join(tmp, 'bin/mv'), '#!/bin/sh\ncase "$2" in *.migration.*) ls -l "$2" | cut -c1-10 >> "$CALLS.migration-mode";; esac\nexec /bin/mv "$@"\n', { mode: 0o755 });
+  const migrationConfig = path.join(tmp, 'opt/d2k/config');
+  const identityPath = path.join(tmp, 'opt/d2k/state/tg.identity');
+  fs.writeFileSync(identityPath, 'existing-private-identity');
+  const oldIP = '213.176.74.63';
+  for (const quote of ['', "'", '"']) {
+    fs.writeFileSync(migrationConfig, `PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=${quote}wss://${oldIP}.nip.io/ws${quote}\nD2K_GATE=${quote}http://${oldIP}:9444${quote}\nD2K_RELAY_URL=${quote}https://${oldIP}.nip.io:9443/resolve${quote}\n`);
+    run('install');
+    const migrated = fs.readFileSync(migrationConfig, 'utf8');
+    assert(!migrated.includes(oldIP), 'saved project defaults must migrate');
+    assert.equal(fs.statSync(migrationConfig).mode & 0o777, 0o600);
+    assert(fs.readFileSync(path.join(tmp, 'calls.migration-mode'), 'utf8').trim().split('\n').every(mode => mode === '-rw-------'), 'staged config is private before rename');
+    assert.match(migrated, /TG_RELAY_URL=wss:\/\/85\.192\.60\.175\.nip\.io\/ws/);
+    assert.match(migrated, /TG_ENROLL_PORT=9443/);
+    assert.match(migrated, /TG_ENABLED=0/);
+    assert.equal(fs.readFileSync(identityPath, 'utf8'), 'existing-private-identity');
+    run('install');
+    assert.equal(fs.readFileSync(migrationConfig, 'utf8'), migrated, 'migration is idempotent');
+  }
+  const customConfig = `PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://${oldIP}.nip.io/custom\nTG_ENROLL_PORT=9555\nD2K_GATE=\nD2K_RELAY_URL=https://custom.example/resolve\nTG_RELAY_SECRET=preserved\n`;
+  fs.writeFileSync(migrationConfig, customConfig);
+  run('install');
+  assert.equal(fs.readFileSync(migrationConfig, 'utf8'), customConfig, 'custom endpoints and credentials must survive');
   // The first DNS refresh (15 names, possibly silent edges) must not hold the
   // installer: the service's scheduler runs it in the background with a log.
   assert(!calls().includes('dns-refresh'), 'installer must not run the DNS refresh synchronously');

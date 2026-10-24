@@ -153,8 +153,8 @@ env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$DEF/d2k" D2K_CONFIG="$DEF/d2k/config" \
     NDMC_STATE="$DEF/ndmc-state" NDMC_CALLS="$DEF/ndmc-calls" \
     CURL_CALLS="$DEF/curl-calls" OPENSSL_KEY="$DEF/openssl-key" \
     D2K_INSTAGRAM_LOG="$DEF/refresh.log" sh "$SCRIPT" refresh || { cat "$DEF/refresh.log" >&2; fail "refresh against the default resolver failed"; }
-grep -q -- '--resolve 213.176.74.63.nip.io:9443:213.176.74.63 -X POST https://213.176.74.63.nip.io:9443/resolve' "$DEF/curl-calls" \
-    || { cat "$DEF/curl-calls" >&2; fail "default resolver is not d2k's own https://213.176.74.63.nip.io:9443/resolve"; }
+grep -q -- '--resolve 85.192.60.175.nip.io:9443:85.192.60.175 -X POST https://85.192.60.175.nip.io:9443/resolve' "$DEF/curl-calls" \
+    || { cat "$DEF/curl-calls" >&2; fail "default resolver is not d2k's own https://85.192.60.175.nip.io:9443/resolve"; }
 ! grep -q 'nip.io/resolve\|:443:' "$DEF/curl-calls" || fail "refresh still calls the z2k relay /resolve on 443"
 ok "default resolver is d2k's own C /resolve on port 9443 without authentication"
 

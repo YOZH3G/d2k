@@ -190,7 +190,7 @@ exit 0`));
       `http://fixture.test/${rid}/d2k-amd64.tar.gz`],
     'выпуск берётся перечнем, подписью и архивом — в этом порядке');
   // Каждая загрузка выпуска сперва идёт через проводник на VPS (CONNECT).
-  const GATE = 'http://213.176.74.63:9444';
+  const GATE = 'http://85.192.60.175:9444';
   const releaseUrls = ['http://fixture.test/latest/latest.json', 'http://fixture.test/latest/latest.json.sig',
     `http://fixture.test/${rid}/d2k-amd64.tar.gz`];
   assert.deepEqual(read(log('curl-gate')).trim().split('\n'), releaseUrls.map((u) => `${GATE} ${u}`),

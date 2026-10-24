@@ -83,7 +83,7 @@ defaults() {
 
 # Проводник через VPS — свой C-сервис D2K (relay-gate/): сперва через него
 # (CONNECT, TLS сквозной до GitHub), затем напрямую. D2K_GATE= — без него.
-GATE=${D2K_GATE-http://213.176.74.63:9444}
+GATE=${D2K_GATE-http://85.192.60.175:9444}
 fetch() {
     { [ -n "$GATE" ] &&
         curl -fsL --proto '=https' --proxy "$GATE" --connect-timeout 8 \

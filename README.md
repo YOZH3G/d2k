@@ -13,6 +13,17 @@ D2K не использует список заблокированных сай
 
 ---
 
+## Смена адреса VPS 24.10.2026
+
+Адрес инфраструктуры проекта изменился на `85.192.60.175`.
+Обновлены установка, обновление, Telegram и DNS Instagram/WhatsApp.
+При установке этого выпуска прежние стандартные адреса в `config`
+заменяются автоматически; свои серверы, ключи, идентификатор установки
+и найденные решения сохраняются. Проверка TLS и подписи выпуска сохранена.
+
+Если старое автообновление не может скачать выпуск, повторите команду
+установки ниже: она использует новый VPS и ставит подписанный выпуск.
+
 ## Содержание
 
 1. [Что умеет D2K](#что-умеет-d2k)
@@ -100,7 +111,7 @@ ssh root@192.168.1.1 -p 222
 ### 4) Пакеты Entware
 
 ```sh
-p=http://213.176.74.63:9444; pk="curl ca-bundle iptables ipset kmod_ndms xtables-addons_legacy openssl-util"
+p=http://85.192.60.175:9444; pk="curl ca-bundle iptables ipset kmod_ndms xtables-addons_legacy openssl-util"
 { http_proxy=$p opkg update && http_proxy=$p opkg install $pk; } || { opkg update && opkg install $pk; }
 ```
 
@@ -126,7 +137,7 @@ README z2k) или переименуйте файл `/opt/etc/init.d/S99zapret2
 Выполните в том же SSH-терминале Entware:
 
 ```sh
-(f=$(mktemp); u=https://raw.githubusercontent.com/necronicle/d2k/main/scripts/install.sh; { curl -fsSL --proxy http://213.176.74.63:9444 --connect-timeout 8 --max-time 120 "$u" -o "$f" || curl -fsSL --connect-timeout 10 --max-time 120 "$u" -o "$f"; } && D2K_REF=main sh "$f"; r=$?; rm -f "$f"; exit "$r")
+(f=$(mktemp); u=https://raw.githubusercontent.com/necronicle/d2k/main/scripts/install.sh; { curl -fsSL --proxy http://85.192.60.175:9444 --connect-timeout 8 --max-time 120 "$u" -o "$f" || curl -fsSL --connect-timeout 10 --max-time 120 "$u" -o "$f"; } && D2K_REF=main sh "$f"; r=$?; rm -f "$f"; exit "$r")
 ```
 
 В конце установщик печатает адрес панели. Дальше — раздел
@@ -162,7 +173,7 @@ ssh root@192.168.1.1
 В OpenWrt 25.12 команда использует `apk`, в 24.10 и старше — `opkg`:
 
 ```sh
-p=http://213.176.74.63:9444; f=/tmp/d2k-feeds
+p=http://85.192.60.175:9444; f=/tmp/d2k-feeds
 if [ -x /usr/bin/apk ]; then
   cat /etc/apk/repositories.d/*.list | sed -n 's|^https://downloads.openwrt.org/|http://downloads.openwrt.org/|p' > $f
   { http_proxy=$p apk --repositories-file $f update && http_proxy=$p apk --repositories-file $f add curl ca-bundle; } || { apk update && apk add curl ca-bundle; }
@@ -257,7 +268,7 @@ fi; rm -f $f
 ### Загрузки через VPS
 
 Каждая загрузка — пакеты, установщик, выпуск, ночное обновление — сначала
-идёт через VPS проекта (`213.176.74.63:9444`), а если он не отвечает —
+идёт через VPS проекта (`85.192.60.175:9444`), а если он не отвечает —
 напрямую.
 
 - На VPS работает отдельный сервис D2K: [relay-gate](relay-gate/README.md).
@@ -445,7 +456,7 @@ D2K может работать только для устройств одно�
 ### Keenetic и OpenWrt
 
 ```sh
-(f=$(mktemp); u=https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh; { curl -fsSL --proxy http://213.176.74.63:9444 --connect-timeout 8 --max-time 120 "$u" -o "$f" || curl -fsSL --connect-timeout 10 --max-time 120 "$u" -o "$f"; } && sh "$f"; r=$?; rm -f "$f"; exit "$r")
+(f=$(mktemp); u=https://raw.githubusercontent.com/necronicle/d2k/main/scripts/uninstall.sh; { curl -fsSL --proxy http://85.192.60.175:9444 --connect-timeout 8 --max-time 120 "$u" -o "$f" || curl -fsSL --connect-timeout 10 --max-time 120 "$u" -o "$f"; } && sh "$f"; r=$?; rm -f "$f"; exit "$r")
 ```
 
 ### Что удаляет команда

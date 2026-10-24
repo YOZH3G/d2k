@@ -1,5 +1,6 @@
 # Конфигурация d2k. Файл принадлежит владельцу: установщик его не
-# перезаписывает при обновлении.
+# перезаписывает при обновлении; при смене VPS заменяет только прежние
+# стандартные адреса проекта.
 SCHEMA=1
 MODE=apply
 PANEL_LISTEN=127.0.0.1:8090
@@ -17,7 +18,7 @@ D2K_PPE_DEOFFLOAD=1
 MARK=0x2d
 # Each router creates its own private identity and registers its public key.
 TG_ENABLED=1
-TG_RELAY_URL=wss://213.176.74.63.nip.io/ws
+TG_RELAY_URL=wss://85.192.60.175.nip.io/ws
 TG_ENROLL_PORT=9443
 # Custom relays may use TG_RELAY_SECRET instead of the enrollment endpoint.
 # TG_PORT=1443

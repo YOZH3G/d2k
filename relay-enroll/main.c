@@ -608,6 +608,27 @@ static void reply(SSL *ssl,int code) {
     if(n>0&&(size_t)n<sizeof(response))ssl_write_all(ssl,response,(size_t)n);
 }
 
+#define PRIMARY_TLS_NAME "85.192.60.175.nip.io"
+#define LEGACY_TLS_NAME "213.176.74.63.nip.io"
+#define PRIMARY_CERT "/var/lib/z2k-relay/acme/" PRIMARY_TLS_NAME
+#define LEGACY_CERT "/var/lib/z2k-relay/acme/" LEGACY_TLS_NAME
+
+/* Only the project deployment enables this callback; --certificate keeps
+   the custom-server contract. Reload the retained PEM for every handshake. */
+static int project_sni(SSL *ssl,int *alert,void *legacy_certificate) {
+    const char *name=SSL_get_servername(ssl,TLSEXT_NAMETYPE_host_name);
+    if(name&&strcmp(name,PRIMARY_TLS_NAME)==0)return SSL_TLSEXT_ERR_OK;
+    if(!name||strcmp(name,LEGACY_TLS_NAME)!=0){
+        *alert=SSL_AD_UNRECOGNIZED_NAME;return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+    const char *pem=legacy_certificate;
+    if(SSL_use_certificate_chain_file(ssl,pem)!=1||
+       SSL_use_PrivateKey_file(ssl,pem,SSL_FILETYPE_PEM)!=1||SSL_check_private_key(ssl)!=1){
+        *alert=SSL_AD_INTERNAL_ERROR;return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+    return SSL_TLSEXT_ERR_OK;
+}
+
 static void serve_client(int fd,const char *peer,uint32_t peer_ip,shared_limits *limits,int slot,
                          const char *certificate,const char *key,const char *secret,uint16_t upstream_port) {
     /* A short wall-clock limit for the handshake and headers bounds idle and
@@ -620,6 +641,10 @@ static void serve_client(int fd,const char *peer,uint32_t peer_ip,shared_limits 
     if(!ctx||SSL_CTX_set_min_proto_version(ctx,TLS1_2_VERSION)!=1||
        SSL_CTX_use_certificate_chain_file(ctx,certificate)!=1||
        SSL_CTX_use_PrivateKey_file(ctx,key,SSL_FILETYPE_PEM)!=1||SSL_CTX_check_private_key(ctx)!=1)goto done;
+    if(strcmp(certificate,PRIMARY_CERT)==0&&strcmp(key,PRIMARY_CERT)==0){
+        SSL_CTX_set_tlsext_servername_callback(ctx,project_sni);
+        SSL_CTX_set_tlsext_servername_arg(ctx,(void *)LEGACY_CERT);
+    }
     ssl=SSL_new(ctx);if(!ssl||SSL_set_fd(ssl,fd)!=1||SSL_accept(ssl)!=1)goto done;
     char headers[HEADER_LIMIT+1];size_t used=0,length=0;
     while(used<HEADER_LIMIT){size_t n=0;if(SSL_read_ex(ssl,headers+used,1,&n)!=1||n!=1)goto done;used++;
@@ -659,7 +684,7 @@ static void stop_server(int signal_number){(void)signal_number;stopping=1;}
 static void child_exited(int signal_number){(void)signal_number;}
 
 int main(int argc,char **argv) {
-    const char *certificate="/var/lib/z2k-relay/acme/213.176.74.63.nip.io",*key=NULL,*bootstrap=NULL;
+    const char *certificate=PRIMARY_CERT,*key=NULL,*bootstrap=NULL;
     uint16_t port=9443,upstream=8080;
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--certificate")==0&&i+1<argc)certificate=argv[++i];

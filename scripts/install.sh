@@ -55,7 +55,7 @@ OPENWRT_APK=${D2K_OPENWRT_APK:-/usr/bin/apk}
 #     через тот же сервис: apk и opkg сами сверяют подписи индексов и
 #     пакетов, открытый отрезок их не подменит.
 # D2K_GATE= (пусто) — без проводника, только напрямую.
-GATE=${D2K_GATE-http://213.176.74.63:9444}
+GATE=${D2K_GATE-http://85.192.60.175:9444}
 # Где лежат источники пакетов OpenWrt (тесты подставляют свои).
 OPENWRT_APK_ETC=${D2K_OPENWRT_APK_ETC:-/etc/apk}
 OPENWRT_OPKG_ETC=${D2K_OPENWRT_OPKG_ETC:-/etc}
@@ -711,14 +711,39 @@ fi
 # чтение root даже при обновлении ранее установленного файла с более широкими
 # правами.
 chmod 0600 "$DIR/config" || die "не защитить права конфигурации"
+# The VPS kept its identity/database but received a new public address.
+# Rewrite only exact shipped endpoints (also quoted shell assignments).
+# Never evaluate the config or change credentials, custom paths or ports.
+awk '
+function endpoint(line, key, old, new, value) {
+    if (index(line, key "=") != 1) return line
+    value = substr(line, length(key) + 2)
+    if (value == old || value == "\"" old "\"" || value == sprintf("%c%s%c", 39, old, 39))
+        return key "=" new
+    return line
+}
+{
+    line = endpoint($0, "TG_RELAY_URL", "wss://213.176.74.63.nip.io/ws", "wss://85.192.60.175.nip.io/ws")
+    line = endpoint(line, "D2K_GATE", "http://213.176.74.63:9444", "http://85.192.60.175:9444")
+    print endpoint(line, "D2K_RELAY_URL", "https://213.176.74.63.nip.io:9443/resolve", "https://85.192.60.175.nip.io:9443/resolve")
+}' "$DIR/config" > "$TMP/config.endpoint" || die "не обновить адрес VPS"
+# A private sibling keeps credentials private before and after atomic rename.
+(
+    umask 077
+    endpoint_stage=$(mktemp "$DIR/config.migration.XXXXXX") || exit 1
+    trap 'rm -f "$endpoint_stage"' EXIT HUP INT TERM
+    cat "$TMP/config.endpoint" > "$endpoint_stage" || exit 1
+    chmod 0600 "$endpoint_stage" || exit 1
+    mv -f "$endpoint_stage" "$DIR/config"
+) || die "не сохранить адрес VPS"
 # Upgrade the old unconfigured Telegram template without changing a user's
 # enable/disable choice or custom relay. No fleet credential is installed.
 TG_INSTALL_URL=$(sed -n 's/^TG_RELAY_URL=//p' "$DIR/config" | tail -n 1)
 if [ -z "$TG_INSTALL_URL" ]; then
-    printf '\nTG_RELAY_URL=wss://213.176.74.63.nip.io/ws\n' >> "$DIR/config"
-    TG_INSTALL_URL=wss://213.176.74.63.nip.io/ws
+    printf '\nTG_RELAY_URL=wss://85.192.60.175.nip.io/ws\n' >> "$DIR/config"
+    TG_INSTALL_URL=wss://85.192.60.175.nip.io/ws
 fi
-if [ "$TG_INSTALL_URL" = wss://213.176.74.63.nip.io/ws ] &&
+if [ "$TG_INSTALL_URL" = wss://85.192.60.175.nip.io/ws ] &&
    ! grep -q '^TG_ENROLL_PORT=' "$DIR/config"; then
     printf 'TG_ENROLL_PORT=9443\n' >> "$DIR/config"
 fi

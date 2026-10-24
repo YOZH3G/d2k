@@ -160,11 +160,11 @@ for c in out in_rules; do
 done
 # The VPS install gate is D2K's own channel (field 14.10.2026): RETURN in
 # both chains before the first queue rule; an empty D2K_GATE removes it.
-want 'ip daddr 213.176.74.63 tcp dport 9444 return'
-want 'ip saddr 213.176.74.63 tcp sport 9444 return'
+want 'ip daddr 85.192.60.175 tcp dport 9444 return'
+want 'ip saddr 85.192.60.175 tcp sport 9444 return'
 for c in out in_rules; do
     printf '%s\n' "$r" | sed -n "/chain $c {/,/^	}/p" | awk '
-        /213\.176\.74\.63 tcp [ds]port 9444 return/ { if (!q) seen = 1 }
+        /85\.192\.60\.175 tcp [ds]port 9444 return/ { if (!q) seen = 1 }
         /queue num/ { q = 1 }
         END { exit !seen }' || fail "chain $c: no gate return before the first queue rule"
 done

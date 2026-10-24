@@ -219,22 +219,22 @@ S99_SNIPPET='fw_down' s99
 ok "port-forwarded (DNAT) connections never enter the queue, in both directions"
 
 # --- Проводник установки на VPS — канал самого D2K, не цель ------------------
-# Поле 14.10.2026: туннель CONNECT к 213.176.74.63:9444 датапат принял за
+# Поле 14.10.2026: туннель CONNECT к 85.192.60.175:9444 датапат принял за
 # поток к «github.com», и контроллер начал искать обход своему же каналу.
 # RETURN в обе стороны, раньше очереди, только IPv4; сторож замечает пропажу;
 # пустой D2K_GATE исключение снимает.
 rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
 S99_SNIPPET='fw_up && fw_installed' s99 || fail "fw_up with the gate exclusion failed"
-for spec in "D2K_OUT -p tcp -d 213.176.74.63 --dport 9444 -j RETURN" \
-            "D2K_IN -p tcp -s 213.176.74.63 --sport 9444 -j RETURN"; do
+for spec in "D2K_OUT -p tcp -d 85.192.60.175 --dport 9444 -j RETURN" \
+            "D2K_IN -p tcp -s 85.192.60.175 --sport 9444 -j RETURN"; do
     ch=${spec%% *}
     rules iptables mangle | grep -- "-A $ch " | awk -v want="-A $spec" '
         $0 == want { if (!q) seen = 1 }
         /NFQUEUE/ { q = 1 }
         END { exit !seen }' || fail "iptables $ch: no gate RETURN before the first queue rule"
 done
-if rules ip6tables mangle | grep -q '213.176.74.63'; then fail "ip6tables must not carry an IPv4 gate rule"; fi
-FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -D D2K_OUT -p tcp -d 213.176.74.63 --dport 9444 -j RETURN
+if rules ip6tables mangle | grep -q '85.192.60.175'; then fail "ip6tables must not carry an IPv4 gate rule"; fi
+FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -D D2K_OUT -p tcp -d 85.192.60.175 --dport 9444 -j RETURN
 if S99_SNIPPET='fw_installed' s99; then fail "a lost gate exclusion went unnoticed"; fi
 S99_SNIPPET='fw_up' s99 || fail "fw_up did not restore the gate exclusion"
 S99_SNIPPET='fw_down' s99
