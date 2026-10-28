@@ -400,6 +400,12 @@ static int diag_calls;
 static void diag_observe(void *ctx,const d2k_diag_event *e) {
     (void)ctx; CHECK(!strcmp(e->outcome,"failed")); CHECK(e->id==999);diag_calls++;
 }
+/* issue #28: остановка по ответу сервиса (451) называет в отчёте свою причину,
+   а не причину базы классификатора, — иначе «база не проходит» читается итогом. */
+static char diag_reason[512];
+static void diag_reason_observe(void *ctx,const d2k_diag_event *e) {
+    (void)ctx; snprintf(diag_reason,sizeof diag_reason,"%s",e->reason?e->reason:"");
+}
 int main(void) {
     d2k_catalog cat = {0};
     d2k_sched *s = d2k_sched_new(&cat, -1, 0x2d);
@@ -408,6 +414,15 @@ int main(void) {
     search_report(s,&diag_task,10,"failed","none");
     search_report(s,&diag_task,11,"failed","none");
     CHECK(diag_calls==1); /* observation independent of human log; exactly once */
+    d2k_sched_diagnostics(s,diag_reason_observe,NULL);
+    task why_task={0};why_task.report_id=1000;
+    snprintf(why_task.res.reason,sizeof why_task.res.reason,"база не проходит: 0 из 3");
+    search_report(s,&why_task,12,"failed","none");
+    CHECK(!strcmp(diag_reason,"база не проходит: 0 из 3")); /* без причины остановки — как было */
+    why_task.report_id=1001;why_task.report_closed=0;
+    snprintf(why_task.stop_why,sizeof why_task.stop_why,"HTTP 451 под планом plan-1: юридический отказ сервиса");
+    search_report(s,&why_task,13,"inconclusive",NULL);
+    CHECK(!strcmp(diag_reason,"HTTP 451 под планом plan-1: юридический отказ сервиса"));
     d2k_sched_diagnostics(s,NULL,NULL);
 
     CHECK(s != NULL);

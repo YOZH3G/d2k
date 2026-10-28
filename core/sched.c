@@ -655,6 +655,9 @@ typedef struct {
     int        probes;
     uint64_t   report_id;
     int        report_closed;
+    /* Почему поиск остановлен, когда это не вердикт классификатора (451 и т. п.):
+       иначе отчёт диагностики выдаёт причину базы за причину итога. */
+    char       stop_why[192];
     int64_t    report_admitted_ms; /* -1 until scheduler time is known */
     int64_t    report_queue_ms;
 
@@ -8570,7 +8573,7 @@ static void search_report(d2k_sched *s, task *t, int64_t now_ms,
         /* Result fields are published by workers under the same mutex. */
         char reason[D2K_REASON_MAX];
         pthread_mutex_lock(&s->mu);
-        snprintf(reason,sizeof reason,"%s",t->res.reason);
+        snprintf(reason,sizeof reason,"%s",t->stop_why[0] ? t->stop_why : t->res.reason);
         pthread_mutex_unlock(&s->mu);
         d2k_diag_event e={.id=t->report_id,.target=t->name,.protocol=proto,
             .family=t->family,.trigger=t->trigger_code,.outcome=outcome,.reason=reason,
@@ -11016,8 +11019,21 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 continue;
             }
             if (t->ver.level == D2K_VER_DENIED) {
-                say(s, "по %s HTTP 451: юридический отказ, не доказательство блокировки провайдера; перебор остановлен",
-                    t->name);
+                /* ИСХОД КАНДИДАТА ОТДЕЛЬНО ОТ ПРИЧИНЫ ОСТАНОВКИ (issue #28):
+                   под этим планом запрос дошёл до сервиса, отказал сервис. Это
+                   не «обход не найден», поэтому итог — inconclusive, а журнал
+                   называет план и кандидата, на котором встал перебор. */
+                char denied_plan[40] = "?";
+                uint8_t denied_wire[D2K_PLAN_ID_LEN];
+                if (t->next_plan && t->next_plan <= t->n_plans)
+                    plan_ident(t->plans[t->next_plan - 1], denied_plan, sizeof denied_plan, denied_wire);
+                say(s, "по %s HTTP 451 под планом %s (кандидат %zu из %zu): юридический отказ "
+                       "сервиса, не доказательство блокировки провайдера; запрос под планом "
+                       "дошёл до сервиса, остальные кандидаты получат тот же ответ — перебор остановлен",
+                    t->name, denied_plan, t->next_plan, t->n_plans);
+                snprintf(t->stop_why, sizeof t->stop_why,
+                         "HTTP 451 под планом %s: юридический отказ сервиса", denied_plan);
+                search_report(s, t, now_ms, "inconclusive", NULL);
                 /* ОТКАЗАЛ СЕРВИС, А НЕ КОРОБКА — значит перемерять эту цель
                    сейчас же бессмысленно: следующий замер получит тот же 451.
                    Остывание такое же, как у антибот-ответа рядом; без него
