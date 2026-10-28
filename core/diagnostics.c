@@ -43,13 +43,25 @@ static void copy(char *to,size_t cap,const char *s) {
     while(n && ((unsigned char)s[n]&0xc0)==0x80)n--;
     memcpy(to,s,n);to[n]=0;
 }
+/* Length of the valid UTF-8 sequence at p, 0 if none. Producers bound their
+ * text with snprintf, which cuts inside a character: one such byte made the
+ * whole report unreadable to a strict JSON reader (issue #34 attachment). */
+static size_t utf8_len(const unsigned char *p) {
+    size_t n=(p[0]&0xe0)==0xc0&&p[0]>=0xc2?2:(p[0]&0xf0)==0xe0?3:(p[0]&0xf8)==0xf0&&p[0]<=0xf4?4:0;
+    for(size_t i=1;i<n;i++)if((p[i]&0xc0)!=0x80)return 0;
+    /* Overlong forms and surrogates are rejected by strict readers too. */
+    if((p[0]==0xe0&&p[1]<0xa0)||(p[0]==0xed&&p[1]>0x9f)||
+       (p[0]==0xf0&&p[1]<0x90)||(p[0]==0xf4&&p[1]>0x8f))return 0;
+    return n;
+}
 static void js(FILE *f,const char *s) {
     fputc('"',f);
     for(const unsigned char *p=(const unsigned char *)s;*p;p++) {
         if(*p=='"'||*p=='\\'){fputc('\\',f);fputc(*p,f);}
         else if(*p=='\n') fputs("\\n",f);
         else if(*p<32)fputc('?',f);
-        else fputc(*p,f);
+        else if(*p<0x80)fputc(*p,f);
+        else {size_t n=utf8_len(p);if(!n)fputc('?',f);else{fwrite(p,1,n,f);p+=n-1;}}
     }fputc('"',f);
 }
 static void number(FILE *f,int64_t v) {if(v<0)fputs("null",f);else fprintf(f,"%lld",(long long)v);}

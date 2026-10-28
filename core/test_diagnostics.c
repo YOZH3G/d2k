@@ -10,6 +10,16 @@
 static void put(const char *dir,const char *name,const char *text) {
     char p[512];snprintf(p,sizeof p,"%s/%s",dir,name);FILE *f=fopen(p,"w");assert(f);fputs(text,f);assert(!fclose(f));
 }
+/* Strict UTF-8: a JSON reader (python json, jq) rejects the whole report on one bad byte. */
+static int utf8_ok(const char *s) {
+    for(const unsigned char *p=(const unsigned char *)s;*p;) {
+        int n=*p<0x80?0:(*p&0xe0)==0xc0&&*p>=0xc2?1:(*p&0xf0)==0xe0?2:(*p&0xf8)==0xf0&&*p<=0xf4?3:-1;
+        if(n<0)return 0;
+        for(int i=1;i<=n;i++)if((p[i]&0xc0)!=0x80)return 0;
+        p+=n+1;
+    }
+    return 1;
+}
 static char *report(d2k_diag *d) {
     FILE *f=tmpfile();assert(f);assert(!d2k_diag_write(d,f));long n=ftell(f);
     assert(n>0 && n<256*1024);rewind(f);char *s=malloc((size_t)n+1);assert(s);
@@ -43,6 +53,18 @@ int main(void) {
         f=tmpfile();assert(f);assert(!d2k_diag_write(d,f));assert(ftell(f)<256*1024);fclose(f);
         e.target="a\".example";e.reason="local\nerror";
         d2k_diag_free(d);d=NULL;
+    }
+    /* Field 26.10.2026 (issue #34 report): the classifier reason arrives
+       already cut inside a character ("...связ" -> "св\xd1\x8f\xd0"); the
+       report must stay valid UTF-8 whatever the producer hands over. */
+    {
+        d2k_diag *u=d2k_diag_new();assert(u);
+        d2k_diag_event cut={.target="bad\xff.example",.protocol="tcp",.outcome="failed",
+            .reason="\xd0\xbd\xd0\xb5 \xd1\x81\xd0\xb2\xd1\x8f\xd0"};
+        d2k_diag_record(u,&cut);
+        char *all=report(u);assert(utf8_ok(all));
+        assert(strstr(all,"\"reason\":\"\xd0\xbd\xd0\xb5 \xd1\x81\xd0\xb2\xd1\x8f?\""));
+        free(all);d2k_diag_free(u);
     }
     char dir[]="/tmp/d2k-diag-proc-XXXXXX",path[512];assert(mkdtemp(dir));
     snprintf(path,sizeof path,"%s/123",dir);assert(!mkdir(path,0700));
